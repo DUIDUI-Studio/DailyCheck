@@ -5,3 +5,5 @@ inventory.db
 playwright-home.png
 static/icons/icon-192.tmp
 .DS_Store
+access.log
+error.log
