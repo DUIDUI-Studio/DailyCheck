@@ -339,7 +339,7 @@ def export_consumption():
         ])
 
     response = app.response_class(
-        output.getvalue(),
+        output.getvalue().encode("utf-8-sig"),
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment;filename=consumption.csv"},
     )
