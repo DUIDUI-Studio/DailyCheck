@@ -121,6 +121,12 @@ def init_db() -> None:
         created_at TEXT NOT NULL,
         FOREIGN KEY (item_id) REFERENCES items(id)
     );
+
+    CREATE TABLE IF NOT EXISTS daily_revenue (
+        date TEXT NOT NULL PRIMARY KEY,
+        amount REAL NOT NULL,
+        created_at TEXT NOT NULL
+    );
     """
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.executescript(schema)
@@ -197,12 +203,10 @@ def dashboard():
 def summary():
     db = get_db()
 
-    # 进货金额 = 初始库存价值 + 补货入库金额
+    # 进货金额 = 补货入库金额（initial_quantity 历史遗留字段已移除）
     total_inbound_value = db.execute(
         """
-        SELECT
-            COALESCE(SUM(i.initial_quantity * i.unit_cost), 0)
-            + COALESCE(SUM(i.unit_cost * sub.inbound_qty), 0) AS c
+        SELECT COALESCE(SUM(i.unit_cost * sub.inbound_qty), 0) AS c
         FROM items i
         LEFT JOIN (
             SELECT m.item_id, SUM(m.delta) AS inbound_qty
@@ -243,7 +247,7 @@ def summary():
         LEFT JOIN (
             SELECT
                 i.category_id,
-                i.initial_quantity * i.unit_cost AS init_value,
+                0 AS init_value,
                 COALESCE(sub.inbound_qty, 0) * i.unit_cost AS restock_value,
                 COALESCE(out.consumed_qty, 0) * i.unit_cost AS consumed_value,
                 i.quantity * i.unit_cost AS current_stock_value
@@ -298,6 +302,48 @@ def summary():
         category_stats=enriched_stats,
         top_consumed=top_consumed,
     )
+
+
+@app.route("/export/consumption")
+def export_consumption():
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT i.name AS item_name, c.name AS category_name,
+               ABS(SUM(m.delta)) AS consumed_qty,
+               i.unit,
+               ROUND(i.unit_cost, 3) AS unit_cost,
+               ROUND(ABS(SUM(m.delta)) * i.unit_cost, 2) AS consumed_value
+        FROM stock_movements m
+        JOIN items i ON i.id = m.item_id
+        JOIN categories c ON c.id = i.category_id
+        WHERE m.action = '出库'
+        GROUP BY m.item_id
+        ORDER BY c.name, i.name
+        """
+    ).fetchall()
+
+    import csv, io
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["品类", "品项", "消耗数量", "单位", "单价", "消耗金额"])
+    for r in rows:
+        writer.writerow([
+            r["category_name"],
+            r["item_name"],
+            r["consumed_qty"],
+            r["unit"],
+            r["unit_cost"],
+            r["consumed_value"],
+        ])
+
+    response = app.response_class(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=consumption.csv"},
+    )
+    return response
 
 
 @app.route("/categories", methods=["GET"])
@@ -1153,13 +1199,8 @@ def report_inbound():
         item_names_order = [r["name"] for r in all_items_rows]
         all_items = {r["name"]: r["unit"] for r in all_items_rows}
 
-        # Initial stock: stored in initial_quantity column
-        init_stock = {
-            r["name"]: r["initial_quantity"]
-            for r in db.execute(
-                "SELECT name, initial_quantity FROM items"
-            ).fetchall()
-        }
+        # Initial stock no longer tracked in DB; default to 0
+        init_stock = {}
 
         all_dates = sorted({r["created_at"][:10] for r in raw})
         records = []
