@@ -65,6 +65,9 @@
     </main>
 
     <nav class="mobile-nav mobile-only">
+      {% if g.user and g.user['is_admin'] %}
+      <a href="{{ url_for('users.list_users') }}">账号</a>
+      {% endif %}
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       <a href="{{ url_for('core.summary') }}">汇总</a>
       <a href="{{ url_for('items.inventory_view') }}">库存</a>
