@@ -53,14 +53,15 @@ def adjustment_submit():
         if raw == "":
             continue
         qty = int(raw)
-        if qty <= 0:
+        if qty < 0:
             continue
-        if qty > int(item["quantity"]):
-            flash("存在调整数量大于当前库存的品项，请检查后重试")
-            return redirect(url_for("adjustment.adjustment_session"))
+        # No upper bound on adjustment quantity — consistent with
+        # restock.delete which now allows negative stock. Operators
+        # can use adjustments to write off known losses, even when
+        # current stock is already zero or negative.
         rows.append((int(item["id"]), qty))
     if not rows:
-        flash("请至少填写一个调整数量")
+        flash("请至少填写一个调整数量（0 表示无变化但仍会留记录）")
         return redirect(url_for("adjustment.adjustment_session"))
     for item_id, qty in rows:
         cur = db.execute(

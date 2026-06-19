@@ -140,9 +140,13 @@ def delete(req_id: int):
         if item is None:
             flash("库存品不存在，无法删除该记录")
             return redirect(url_for("restock.restock_list"))
-        if int(item["quantity"]) < int(req["requested_quantity"]):
-            flash("当前库存不足，无法通过删除回滚该入库记录")
-            return redirect(url_for("restock.restock_list"))
+        # Always allow rollback. If current quantity is less than the
+        # original restock amount, the resulting stock will go negative
+        # — flag it in the audit detail so the operator notices, but
+        # do not block. (Intentional: if a manager deletes a
+        # mis-recorded restock, refusing the rollback would force them
+        # to first reverse every downstream outbound / adjustment,
+        # which is far more work than accepting the negative balance.)
         db.execute(
             "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
             (int(req["requested_quantity"]), now(), int(req["item_id"])),
@@ -159,6 +163,16 @@ def delete(req_id: int):
         )
     db.execute("DELETE FROM restock_requests WHERE id = ?", (req_id,))
     db.commit()
-    audit("restock.delete", "request", req_id)
+    audit(
+        "restock.delete",
+        "request",
+        req_id,
+        {
+            "item_id": int(req["item_id"]),
+            "qty": int(req["requested_quantity"]),
+            "status_at_delete": req["status"],
+            "quantity_after": int(item["quantity"]) - int(req["requested_quantity"]),
+        },
+    )
     flash("补货记录已删除")
     return redirect(url_for("restock.restock_list"))
