@@ -276,13 +276,14 @@ th, td {
   width: 100%;
   text-align: left;
   background: #fff;
+  color: #1f2d3d;
   border: 1px solid #e5e7eb;
   border-radius: 10px;
   padding: 14px 16px;
   cursor: pointer;
   font-size: 15px;
 }
-.warehouse-list .btn.block strong { display: block; margin-bottom: 4px; }
+.warehouse-list .btn.block strong { display: block; margin-bottom: 4px; color: #1f2d3d; }
 .warehouse-list .btn.block .muted { color: #6b7280; font-size: 12px; }
 
 .mobile-nav {
