@@ -58,22 +58,24 @@ def dashboard():
 def summary():
     db = get_warehouse_db()
 
-    # 口径:进货金额 = 补货入库金额(initial_quantity 历史遗留字段已移除)
+    # 口径:进货金额 = 全部 restock_requests(被删除的不算) × 单价
+    # 用 restock_requests 而不是 stock_movements,因为后者把
+    # '补货删除回滚' 写为独立 action,会与 '补货入库' 抵消混乱。
+    # restock_requests 是用户意图的真理源(被删除就不在表里)。
     total_inbound_value = db.execute(
-        """SELECT COALESCE(SUM(i.unit_cost * sub.inbound_qty), 0) AS c
-           FROM items i
-           LEFT JOIN (
-               SELECT m.item_id, SUM(m.delta) AS inbound_qty
-               FROM stock_movements m WHERE m.action = '补货入库' GROUP BY m.item_id
-           ) sub ON sub.item_id = i.id"""
+        """SELECT COALESCE(SUM(r.requested_quantity * i.unit_cost), 0) AS c
+           FROM restock_requests r
+           JOIN items i ON i.id = r.item_id"""
     ).fetchone()["c"]
 
-    # 口径:消耗金额 = 出库流水数量 × 单价(取绝对值)
+    # 口径:消耗金额 = 全部 outbound_requests(被删除/回退的不算) × 单价
+    # 同理:outbound_requests 是真理源,stock_movements 里的
+    # '出库回退' action 是流水标记,汇总不该看流水。
     total_consumed_value = db.execute(
-        """SELECT COALESCE(SUM(ABS(m.delta) * i.unit_cost), 0) AS c
-           FROM stock_movements m
-           JOIN items i ON i.id = m.item_id
-           WHERE m.action = '出库'"""
+        """SELECT COALESCE(SUM(o.requested_quantity * i.unit_cost), 0) AS c
+           FROM outbound_requests o
+           JOIN items i ON i.id = o.item_id
+           WHERE o.rolled_back = 0"""
     ).fetchone()["c"]
 
     # 口径:库存金额 = 当前 quantity × unit_cost(账面)
@@ -85,11 +87,10 @@ def summary():
         "SELECT COALESCE(SUM(amount), 0) AS c FROM daily_revenue"
     ).fetchone()["c"]
 
-    # 口径:按品类统计 — 先按 item 聚合再 join 品类,避免多对多行重复
+    # 口径:按品类统计 — 同样基于 restock_requests / outbound_requests
     cat_data = db.execute(
         """SELECT
               c.name AS category_name,
-              COALESCE(SUM(item_vals.init_value), 0) AS init_value,
               COALESCE(SUM(item_vals.restock_value), 0) AS restock_value,
               COALESCE(SUM(item_vals.consumed_value), 0) AS consumed_value,
               COALESCE(SUM(item_vals.current_stock_value), 0) AS stock_value
@@ -97,17 +98,18 @@ def summary():
            LEFT JOIN (
               SELECT
                   i.category_id,
-                  0 AS init_value,
-                  COALESCE(sub.inbound_qty, 0) * i.unit_cost AS restock_value,
-                  COALESCE(out.consumed_qty, 0) * i.unit_cost AS consumed_value,
+                  COALESCE(r.total_restock, 0) * i.unit_cost AS restock_value,
+                  COALESCE(o.total_outbound, 0) * i.unit_cost AS consumed_value,
                   i.quantity * i.unit_cost AS current_stock_value
               FROM items i
-              LEFT JOIN (SELECT item_id, SUM(delta) AS inbound_qty
-                         FROM stock_movements WHERE action = '补货入库' GROUP BY item_id) sub
-                  ON sub.item_id = i.id
-              LEFT JOIN (SELECT item_id, SUM(ABS(delta)) AS consumed_qty
-                         FROM stock_movements WHERE action = '出库' GROUP BY item_id) out
-                  ON out.item_id = i.id
+              LEFT JOIN (
+                  SELECT item_id, SUM(requested_quantity) AS total_restock
+                  FROM restock_requests GROUP BY item_id
+              ) r ON r.item_id = i.id
+              LEFT JOIN (
+                  SELECT item_id, SUM(requested_quantity) AS total_outbound
+                  FROM outbound_requests WHERE rolled_back = 0 GROUP BY item_id
+              ) o ON o.item_id = i.id
            ) item_vals ON item_vals.category_id = c.id
            GROUP BY c.id, c.name ORDER BY c.id"""
     ).fetchall()
@@ -116,20 +118,27 @@ def summary():
     for row in cat_data:
         enriched_stats.append({
             "category_name": row["category_name"],
-            "inbound_value": round(row["init_value"] + row["restock_value"], 2),
+            # backward-compat: old code returned a single "inbound_value"
+            # combining init_value + restock_value. init_value is 0
+            # since the column was dropped (commit 940cc22), so the sum
+            # equals restock_value. Keep the same key.
+            "inbound_value": round(row["restock_value"], 2),
             "consumed_value": round(row["consumed_value"], 2),
             "stock_value": round(row["stock_value"], 2),
         })
 
     top_consumed = db.execute(
         """SELECT i.name AS item_name, c.name AS category_name,
-                  ABS(SUM(m.delta)) AS consumed_qty, i.unit,
-                  ROUND(ABS(SUM(m.delta)) * i.unit_cost, 2) AS consumed_value
-           FROM stock_movements m
-           JOIN items i ON i.id = m.item_id
+                  o.total_qty AS consumed_qty, i.unit,
+                  ROUND(o.total_qty * i.unit_cost, 2) AS consumed_value
+           FROM (
+               SELECT item_id, SUM(requested_quantity) AS total_qty
+               FROM outbound_requests WHERE rolled_back = 0
+               GROUP BY item_id
+           ) o
+           JOIN items i ON i.id = o.item_id
            JOIN categories c ON c.id = i.category_id
-           WHERE m.action = '出库'
-           GROUP BY m.item_id ORDER BY consumed_qty DESC"""
+           ORDER BY o.total_qty DESC"""
     ).fetchall()
 
     return render_template(
