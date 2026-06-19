@@ -1,22 +1,22 @@
-{% extends 'base.html' %}
+{% extends "base.html" %}
 {% block content %}
-<h2>补货录入</h2>
-<p>请根据当前库存状态填写补货数量。留空表示本次不补该品项。</p>
-<form method="post" action="{{ url_for('restock_submit') }}">
+<h2>入库录入</h2>
+<p>请根据当前库存状态填写入库数量。留空表示本次不入库该品项。</p>
+<form method="post" action="{{ url_for('restock.restock_submit') }}">
   <div class="form-inline">
-    <input name="reason" placeholder="本次补货原因（可选）" />
+    <input name="reason" placeholder="本次入库原因（可选）" />
     <button type="submit">提交并入库</button>
   </div>
 
   <table>
-    <tr><th>品类</th><th>品项</th><th>当前库存</th><th>安全库存</th><th>补货数量（填写）</th></tr>
+    <tr><th>品类</th><th>品项</th><th>当前库存</th><th>安全库存</th><th>入库数量（填写）</th></tr>
     {% for i in items %}
     <tr>
       <td>{{ i.category_name }}</td>
       <td>{{ i.name }}</td>
       <td>{{ i.quantity }} {{ i.unit }}</td>
       <td>{{ i.safety_stock }}</td>
-      <td><input type="number" min="0" name="restock_{{ i.id }}" placeholder="留空=不补货" /></td>
+      <td><input type="number" min="0" name="restock_{{ i.id }}" placeholder="留空=不入库" /></td>
     </tr>
     {% endfor %}
   </table>

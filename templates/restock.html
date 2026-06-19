@@ -1,12 +1,12 @@
-{% extends 'base.html' %}
+{% extends "base.html" %}
 {% block content %}
-<h2>补货记录</h2>
-<form method="post" action="{{ url_for('restock_start') }}" class="form-inline">
+<h2>入库记录</h2>
+<form method="post" action="{{ url_for('restock.restock_start') }}" class="form-inline">
   <button type="submit">新建入库</button>
 </form>
 
 <table>
-  <tr><th>时间</th><th>品项</th><th>补货数量</th><th>原因</th><th>状态</th><th>操作</th></tr>
+  <tr><th>时间</th><th>品项</th><th>入库数量</th><th>原因</th><th>状态</th><th>操作</th></tr>
   {% for r in requests %}
   <tr>
     <td>{{ r.created_at }}</td>
@@ -15,7 +15,7 @@
     <td>{{ r.reason }}</td>
     <td>{{ r.status }}</td>
     <td>
-      <form method="post" action="{{ url_for('delete_restock', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
+      <form method="post" action="{{ url_for('restock.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
         <button type="submit">删除</button>
       </form>
     </td>

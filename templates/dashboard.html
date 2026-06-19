@@ -5,12 +5,12 @@
   <section class="card"><p>品类数</p><strong>{{ total_categories }}</strong></section>
   <section class="card"><p>库存品数</p><strong>{{ total_items }}</strong></section>
   <section class="card"><p>低库存项</p><strong>{{ low_stock }}</strong></section>
-  <section class="card"><p>提交中补货</p><strong>{{ pending_requests }}</strong></section>
+  <section class="card"><p>待入库请求</p><strong>{{ pending_requests }}</strong></section>
 </div>
 
 <div class="grid cols-2" style="margin-top:16px">
-  <a href="{{ url_for('report_outbound') }}" class="card" style="display:block;text-decoration:none"><p>当日出库报告</p><strong>{{ outbound_today }} 条记录</strong></a>
-  <a href="{{ url_for('report_inbound') }}" class="card" style="display:block;text-decoration:none"><p>当日入库报告</p><strong>{{ inbound_today }} 条记录</strong></a>
+  <a href="{{ url_for('reports.outbound') }}" class="card" style="display:block;text-decoration:none"><p>当日出库报告</p><strong>{{ outbound_today }} 条记录</strong></a>
+  <a href="{{ url_for('reports.inbound') }}" class="card" style="display:block;text-decoration:none"><p>当日入库报告</p><strong>{{ inbound_today }} 条记录</strong></a>
 </div>
 
 <h3>最近库存变动</h3>

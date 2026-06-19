@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
 {% block content %}
 <h2>库存盘点</h2>
-<form method="post" action="{{ url_for('stocktake_start') }}" class="form-inline">
+<form method="post" action="{{ url_for('stocktake.stocktake_start') }}" class="form-inline">
   <button type="submit">开始盘点</button>
 </form>
 
@@ -22,11 +22,11 @@
     <td>
       {% if b.rolled_back == 0 and b.status != 'approved' %}
       <div class="inline">
-        <a href="{{ url_for('edit_stocktake_batch', batch_id=b.id) }}" class="btn-sm btn-edit">查看</a>
-        <form method="post" action="{{ url_for('approve_stocktake_batch', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认审核通过？盘亏将计入出库，盘盈将调整为库存');">
+        <a href="{{ url_for('stocktake.edit', batch_id=b.id) }}" class="btn-sm btn-edit">查看</a>
+        <form method="post" action="{{ url_for('stocktake.approve', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认审核通过？盘亏将计入出库，盘盈将调整为库存');">
           <button type="submit" class="btn-sm" style="background:var(--success);color:#fff;border:none;padding:2px 8px;border-radius:4px;cursor:pointer">审核通过</button>
         </form>
-        <form method="post" action="{{ url_for('rollback_stocktake_batch', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认删除该批次？');">
+        <form method="post" action="{{ url_for('stocktake.rollback', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认删除该批次？');">
           <button type="submit" class="btn-sm btn-delete">删除批次</button>
         </form>
       </div>

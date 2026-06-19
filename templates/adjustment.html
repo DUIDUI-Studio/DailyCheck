@@ -2,7 +2,7 @@
 {% block content %}
 <h2>调整单</h2>
 <p>调整出库直接从库存中扣减数量，不计入消耗统计。</p>
-<form method="get" action="{{ url_for('adjustment_session') }}" class="form-inline">
+<form method="get" action="{{ url_for('adjustment.adjustment_session') }}" class="form-inline">
   <button type="submit">新建调整单</button>
 </form>
 
@@ -17,11 +17,11 @@
     <td>{% if r.rolled_back == 1 %}已回退{% else %}已执行{% endif %}</td>
     <td>
       {% if r.rolled_back == 0 %}
-      <form method="post" action="{{ url_for('rollback_adjustment', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认回退该调整单？将恢复库存。');">
+      <form method="post" action="{{ url_for('adjustment.rollback', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认回退该调整单？将恢复库存。');">
         <button type="submit" class="btn-sm btn-edit">回退</button>
       </form>
       {% endif %}
-      <form method="post" action="{{ url_for('delete_adjustment', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该调整记录？');">
+      <form method="post" action="{{ url_for('adjustment.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该调整记录？');">
         <button type="submit" class="btn-sm btn-delete">删除</button>
       </form>
     </td>

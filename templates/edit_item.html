@@ -31,7 +31,7 @@
     <span>单位</span>
     <input name="unit" value="{{ item.unit }}" placeholder="件" />
   </label>
-  <a href="{{ url_for('items') }}" class="btn-cancel">取消</a>
+  <a href="{{ url_for('items.items_list') }}" class="btn-cancel">取消</a>
   <button type="submit">保存修改</button>
 </form>
 {% endblock %}

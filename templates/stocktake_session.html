@@ -2,7 +2,7 @@
 {% block content %}
 <h2>盘点录入</h2>
 <p>所有品项均必须填写实盘数量，不能留空。</p>
-<form method="post" action="{{ url_for('stocktake_submit') }}">
+<form method="post" action="{{ url_for('stocktake.stocktake_submit') }}">
   <div class="form-inline">
     <input name="note" placeholder="本次盘点备注（可选）" />
     <button type="submit">提交本次盘点</button>

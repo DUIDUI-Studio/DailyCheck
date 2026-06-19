@@ -2,8 +2,8 @@
 {% block content %}
 <h2>入库报告</h2>
 <div class="inline" style="margin-bottom:12px">
-  <a href="{{ url_for('report_inbound', scope='today') }}" class="btn-sm {% if scope == 'today' %}btn-edit{% endif %}" style="{% if scope != 'today' %}color:var(--text);border-color:var(--border);text-decoration:none{% endif %}">当日</a>
-  <a href="{{ url_for('report_inbound', scope='all') }}" class="btn-sm {% if scope == 'all' %}btn-edit{% endif %}" style="{% if scope != 'all' %}color:var(--text);border-color:var(--border);text-decoration:none{% endif %}">总计</a>
+  <a href="{{ url_for('reports.inbound', scope='today') }}" class="btn-sm {% if scope == 'today' %}btn-edit{% endif %}" style="{% if scope != 'today' %}color:var(--text);border-color:var(--border);text-decoration:none{% endif %}">当日</a>
+  <a href="{{ url_for('reports.inbound', scope='all') }}" class="btn-sm {% if scope == 'all' %}btn-edit{% endif %}" style="{% if scope != 'all' %}color:var(--text);border-color:var(--border);text-decoration:none{% endif %}">总计</a>
 </div>
 {% if scope == 'today' %}
 <table>

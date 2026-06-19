@@ -2,7 +2,7 @@
 {% block content %}
 <h2>调整单录入</h2>
 <p>请根据当前库存状态填写调整出库数量。留空表示本次不调整该品项。<strong>调整不计入消耗统计。</strong></p>
-<form method="post" action="{{ url_for('adjustment_submit') }}">
+<form method="post" action="{{ url_for('adjustment.adjustment_submit') }}">
   <div class="form-inline">
     <input name="reason" placeholder="本次调整原因（可选）" />
     <button type="submit">提交调整</button>

@@ -2,7 +2,7 @@
 {% block content %}
 <h2>出库录入</h2>
 <p>请根据当前库存状态填写出库数量。留空表示本次不出该品项。</p>
-<form method="post" action="{{ url_for('outbound_submit') }}">
+<form method="post" action="{{ url_for('outbound.outbound_submit') }}">
   <div class="form-inline">
     <input name="reason" placeholder="本次出库原因（可选）" />
     <button type="submit">提交并出库</button>

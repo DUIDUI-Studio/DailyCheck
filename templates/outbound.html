@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
 {% block content %}
 <h2>出库记录</h2>
-<form method="post" action="{{ url_for('outbound_start') }}" class="form-inline">
+<form method="post" action="{{ url_for('outbound.outbound_start') }}" class="form-inline">
   <button type="submit">新建出库</button>
 </form>
 
@@ -16,7 +16,7 @@
     <td>{% if r.rolled_back == 1 %}已回退{% else %}{{ r.status }}{% endif %}</td>
     <td>
       {% if r.rolled_back == 0 %}
-      <form method="post" action="{{ url_for('delete_outbound', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该出库记录？');">
+      <form method="post" action="{{ url_for('outbound.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该出库记录？');">
         <button type="submit">删除</button>
       </form>
       {% else %}

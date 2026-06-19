@@ -2,7 +2,7 @@
 {% block content %}
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
   <h2 style="margin:0">汇总</h2>
-  <a href="{{ url_for('export_consumption') }}" download>导出消耗清单 CSV</a>
+  <a href="{{ url_for('reports.export_consumption') }}" download>导出消耗清单 CSV</a>
 </div>
 
 <div class="grid cols-4">
