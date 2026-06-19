@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>登录 · 库存管理</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=3" />
+</head>
+<body class="auth-page">
+  <main class="auth-card">
+    <h1>登录</h1>
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+      <ul class="flash-list">
+        {% for msg in messages %}<li>{{ msg }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+    {% endwith %}
+    <form method="post" action="{{ url_for('auth.login') }}">
+      <label>账号
+        <input name="username" required autofocus autocomplete="username" />
+      </label>
+      <label>密码
+        <input name="password" type="password" required autocomplete="current-password" />
+      </label>
+      <button type="submit" class="btn primary">登录</button>
+    </form>
+  </main>
+</body>
+</html>

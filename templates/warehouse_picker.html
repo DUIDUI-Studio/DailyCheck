@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}选择仓库{% endblock %}
+{% block sidebar %}{% endblock %}
+{% block content %}
+<h2>选择仓库</h2>
+<p class="muted">当前账号：{{ g.user['username'] }}{% if g.user['is_admin'] %} (平台管理员){% endif %}</p>
+
+{% if warehouses %}
+<ul class="warehouse-list">
+  {% for wh in warehouses %}
+  <li>
+    <form method="post" action="{{ url_for('auth.warehouse_select', warehouse_id=wh['id']) }}">
+      <button type="submit" class="btn block">
+        <strong>{{ wh['name'] }}</strong>
+        <span class="muted">{{ wh['code'] }}</span>
+      </button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p>暂无可访问的仓库，请联系管理员。</p>
+{% endif %}
+
+<p><a href="{{ url_for('auth.logout') }}">注销</a></p>
+{% endblock %}

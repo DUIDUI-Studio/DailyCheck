@@ -7,3 +7,4 @@ static/icons/icon-192.tmp
 .DS_Store
 access.log
 error.log
+.inventory.db.original.backup

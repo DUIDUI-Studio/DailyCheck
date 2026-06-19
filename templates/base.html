@@ -8,29 +8,48 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="库存管理" />
   <title>{{ title or "轻量库存管理" }}</title>
-  <link rel="manifest" href="{{ url_for('webmanifest') }}" />
+  <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=3" />
 </head>
 <body>
+  {% block sidebar %}
   <aside class="sidebar desktop-only">
     <h1>库存管理</h1>
-    <a href="{{ url_for('dashboard') }}">总览</a>
-    <a href="{{ url_for('summary') }}">汇总</a>
-    <a href="{{ url_for('categories') }}">品类管理</a>
-    <a href="{{ url_for('items') }}">库存品管理</a>
-    <a href="{{ url_for('stocktake') }}">库存盘点</a>
-    <a href="{{ url_for('inventory') }}">库存查阅</a>
-    <a href="{{ url_for('restock') }}">补货记录</a>
-    <a href="{{ url_for('adjustment') }}">调整单</a>
-    <a href="{{ url_for('outbound') }}">出库记录</a>
+    {% if g.user %}
+      {% if g.user['is_admin'] %}
+      <a href="{{ url_for('users.list_users') }}">账号管理</a>
+      {% endif %}
+      <a href="{{ url_for('items.items_list') }}">品类与品项</a>
+    {% endif %}
+    <a href="{{ url_for('core.dashboard') }}">总览</a>
+    <a href="{{ url_for('core.summary') }}">汇总</a>
+    <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
+    <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>
+    <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
+    <a href="{{ url_for('adjustment.adjustment_list') }}">调整单</a>
+    <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
   </aside>
+  {% endblock %}
 
   <div class="app-shell">
     <header class="mobile-header mobile-only">
       <p class="mobile-subtitle">项目运营</p>
       <h1>轻量库存管理</h1>
     </header>
+
+    {% if g.user %}
+    <div class="ctx-bar">
+      {% if g.warehouse %}
+      <span class="ctx-warehouse">{{ g.warehouse['name'] }} <small>({{ g.warehouse['code'] }})</small></span>
+      <a class="ctx-link" href="{{ url_for('auth.warehouse_picker') }}">切换</a>
+      {% endif %}
+      <span class="ctx-user">
+        {{ g.user['username'] }}{% if g.user['is_admin'] %} <small>[平台管理员]</small>{% elif g.role %}<small>[{{ g.role['role'] }}]</small>{% endif %}
+      </span>
+      <a class="ctx-link" href="{{ url_for('auth.logout') }}">注销</a>
+    </div>
+    {% endif %}
 
     <main>
       {% with messages = get_flashed_messages() %}
@@ -46,14 +65,14 @@
     </main>
 
     <nav class="mobile-nav mobile-only">
-      <a href="{{ url_for('dashboard') }}">总览</a>
-      <a href="{{ url_for('summary') }}">汇总</a>
-      <a href="{{ url_for('inventory') }}">库存</a>
-      <a href="{{ url_for('items') }}">品项</a>
-      <a href="{{ url_for('stocktake') }}">盘点</a>
-      <a href="{{ url_for('restock') }}">补货</a>
-      <a href="{{ url_for('adjustment') }}">调整</a>
-      <a href="{{ url_for('outbound') }}">出库</a>
+      <a href="{{ url_for('core.dashboard') }}">总览</a>
+      <a href="{{ url_for('core.summary') }}">汇总</a>
+      <a href="{{ url_for('items.inventory_view') }}">库存</a>
+      <a href="{{ url_for('items.items_list') }}">品项</a>
+      <a href="{{ url_for('stocktake.stocktake_list') }}">盘点</a>
+      <a href="{{ url_for('restock.restock_list') }}">入库</a>
+      <a href="{{ url_for('adjustment.adjustment_list') }}">调整</a>
+      <a href="{{ url_for('outbound.outbound_list') }}">出库</a>
     </nav>
   </div>
   <script>
