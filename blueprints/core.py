@@ -76,15 +76,21 @@ def summary():
            JOIN items i ON i.id = r.item_id"""
     ).fetchone()["c"]
 
-    # 口径:消耗金额 = 全部 outbound_requests(被删除/回退的不算) × 单价
-    # 同理:outbound_requests 是真理源,stock_movements 里的
-    # '出库回退' action 是流水标记,汇总不该看流水。
-    total_consumed_value = db.execute(
+    # 口径:消耗金额 = 出库(rolled_back=0) + 生产消耗(pr.rolled_back=0)
+    consumed_outbound = db.execute(
         """SELECT COALESCE(SUM(o.requested_quantity * i.unit_cost), 0) AS c
            FROM outbound_requests o
            JOIN items i ON i.id = o.item_id
            WHERE o.rolled_back = 0"""
     ).fetchone()["c"]
+    consumed_production = db.execute(
+        """SELECT COALESCE(SUM(pri.actual_qty * i.unit_cost), 0) AS c
+           FROM production_run_items pri
+           JOIN production_runs pr ON pr.id = pri.run_id
+           JOIN items i ON i.id = pri.item_id
+           WHERE pr.rolled_back = 0"""
+    ).fetchone()["c"]
+    total_consumed_value = float(consumed_outbound) + float(consumed_production)
 
     # 口径:库存金额 = 当前 quantity × unit_cost(账面)
     total_stock_value = db.execute(

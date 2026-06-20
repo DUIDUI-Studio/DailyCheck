@@ -147,7 +147,7 @@ def inventory_view():
                       COUNT(DISTINCT substr(m.created_at, 1, 10)) AS days
                FROM stock_movements m
                JOIN items i2 ON i2.id = m.item_id
-               WHERE m.action = '出库'
+               WHERE m.action IN ('出库', '生产消耗')
                  AND m.created_at >= datetime('now', '-7 days')
                GROUP BY m.item_id
            ) c7 ON c7.item_id = i.id
