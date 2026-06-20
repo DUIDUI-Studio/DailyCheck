@@ -240,18 +240,13 @@ def products_list():
 
 - [ ] **Step 4: 创建 `templates/production/products.html`（空列表占位）**
 
+> 注：暂不放 `+ 新建产品` 按钮（`production.product_new` 路由在 Task 4 才注册，放进去会在 Task 3 阶段导致 `/production` 渲染 500）。Task 4 替换为真查询时一起加回按钮。
+
 ```html
 {% extends "base.html" %}
 {% block content %}
-<div class="list-head">
-  <h2>产品</h2>
-  <a class="btn" href="{{ url_for('production.product_new') }}">+ 新建产品</a>
-</div>
-{% if products %}
-  <p>共 {{ products|length }} 个产品（待实现）</p>
-{% else %}
-  <p class="muted">暂无产品，点击右上"新建产品"开始。</p>
-{% endif %}
+<h2>产品</h2>
+<p class="muted">暂无产品，点击右上"新建产品"开始。</p>
 {% endblock %}
 ```
 
