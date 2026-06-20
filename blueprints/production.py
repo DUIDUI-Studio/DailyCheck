@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import sqlite3
 
-from flask import Blueprint, flash, redirect, request, url_for
+from decimal import Decimal
+
+from flask import Blueprint, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
@@ -187,7 +189,6 @@ def session():
 @bp.route("/production/submit", methods=["POST"])
 @require_login
 def submit():
-    from flask import g
     db = get_warehouse_db()
     product_id = request.form.get("product_id", type=int)
     output_qty = parse_qty(request.form.get("output_qty", "0"))
@@ -215,10 +216,15 @@ def submit():
         flash("该产品尚未配置配方")
         return redirect(url_for("production.session", product_id=product_id))
 
-    # Build planned & actual
+    # Build planned & actual. Use Decimal for qty_per_unit × output_qty
+    # to avoid the 0.1 + 0.2 float trap the parse_qty helper exists to
+    # prevent — see _helpers.py:50.
     plan = []
     for b in bom_rows:
-        planned = round(b["qty_per_unit"] * output_qty, 2)
+        planned = float(
+            (Decimal(str(b["qty_per_unit"])) * Decimal(str(output_qty)))
+            .quantize(Decimal("0.01"))
+        )
         raw = request.form.get(f"actual_{b['item_id']}", "").strip()
         actual = parse_qty(raw) if raw != "" else planned
         if actual < 0:
