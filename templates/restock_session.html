@@ -7,12 +7,24 @@
       <input name="reason" placeholder="本次入库原因（可选）" />
       <button type="submit">提交并入库</button>
     </div>
-    <p class="hint">留空 = 本次不入库该品项。平板/手机均可左右双指缩放。</p>
+    <p class="hint">留空 = 本次不入库该品项。点击下方品类可快速定位。</p>
+    {% set ns = namespace(cats=[]) %}
+    {% for i in items %}
+      {% if i.category_name not in ns.cats %}
+        {% set ns.cats = ns.cats + [i.category_name] %}
+      {% endif %}
+    {% endfor %}
+    <div class="cat-bar" role="tablist" aria-label="按品类筛选">
+      <button type="button" class="cat-chip is-active" data-cat="__all" role="tab" aria-selected="true">全部</button>
+      {% for c in ns.cats %}
+        <button type="button" class="cat-chip" data-cat="{{ c }}" role="tab" aria-selected="false">{{ c }}</button>
+      {% endfor %}
+    </div>
   </div>
 
-  <div class="entry-grid">
+  <div class="entry-grid" data-cat-bar>
     {% for i in items %}
-      <div class="entry-row">
+      <div class="entry-row" data-cat="{{ i.category_name }}">
         <div class="er-meta">
           <span class="er-cat">{{ i.category_name }}</span>
           <span class="er-name">{{ i.name }}</span>
@@ -37,4 +49,40 @@
     {% endfor %}
   </div>
 </form>
+
+<script>
+  // 品类 chip 筛选：保持不点也能用、点了不打断输入
+  (function () {
+    var bar = document.querySelector('[data-cat-bar]');
+    if (!bar) return;
+    var chips = document.querySelectorAll('.cat-chip');
+    var rows = bar.querySelectorAll('.entry-row');
+    var active = '__all';
+
+    function apply(cat) {
+      active = cat;
+      for (var i = 0; i < chips.length; i++) {
+        var on = chips[i].getAttribute('data-cat') === cat;
+        chips[i].classList.toggle('is-active', on);
+        chips[i].setAttribute('aria-selected', on ? 'true' : 'false');
+      }
+      var first = null;
+      for (var j = 0; j < rows.length; j++) {
+        var row = rows[j];
+        var match = (cat === '__all') || (row.getAttribute('data-cat') === cat);
+        row.classList.toggle('is-dim', !match);
+        if (match && first === null) first = row;
+      }
+      if (cat !== '__all' && first) {
+        first.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      }
+    }
+
+    for (var k = 0; k < chips.length; k++) {
+      chips[k].addEventListener('click', (function (c) {
+        return function () { apply(c); };
+      })(chips[k].getAttribute('data-cat')));
+    }
+  })();
+</script>
 {% endblock %}

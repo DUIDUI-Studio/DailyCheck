@@ -630,6 +630,36 @@ code {
   white-space: nowrap;
 }
 
+/* category quick-filter chips (restock/outbound/stocktake/adjustment) */
+.cat-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 0 0;
+  margin: 0;
+  border-bottom: 0;
+}
+.cat-chip {
+  width: auto;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  color: #334155;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cat-chip:hover { background: #e2e8f0; }
+.cat-chip.is-active {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+  font-weight: 600;
+}
+.entry-row.is-dim { opacity: 0.32; }
+
 /* pad: 768-1180, two-column card grid */
 @media (min-width: 720px) {
   .entry-grid { grid-template-columns: 1fr 1fr; }
