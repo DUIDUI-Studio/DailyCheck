@@ -2,6 +2,7 @@
 {% block content %}
 <div class="list-head">
   <h2>生产录入</h2>
+  <a class="btn" href="{{ url_for('production.runs_list') }}">历史记录 →</a>
 </div>
 
 <form method="get" action="{{ url_for('production.session') }}" class="form-inline">

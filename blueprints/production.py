@@ -269,3 +269,101 @@ def submit():
     })
     flash("生产已记录")
     return redirect(url_for("production.runs_list"))
+
+
+@bp.route("/production/runs", methods=["GET"])
+@require_login
+def runs_list():
+    db = get_warehouse_db()
+    runs = db.execute(
+        """SELECT r.*, p.name AS product_name, p.unit AS product_unit
+           FROM production_runs r JOIN products p ON p.id = r.product_id
+           ORDER BY r.id DESC LIMIT 200"""
+    ).fetchall()
+    # attach per-run items for the expanded view
+    enriched = []
+    for r in runs:
+        items = db.execute(
+            """SELECT pri.*, i.name AS item_name, i.unit
+               FROM production_run_items pri JOIN items i ON i.id = pri.item_id
+               WHERE pri.run_id = ? ORDER BY pri.id""",
+            (r["id"],),
+        ).fetchall()
+        enriched.append({**dict(r), "items": items})
+    return render("production/runs.html", runs=enriched)
+
+
+@bp.route("/production/runs/<int:run_id>/rollback", methods=["POST"])
+@require_role("manager")
+def rollback(run_id: int):
+    db = get_warehouse_db()
+    run = db.execute(
+        "SELECT id, rolled_back FROM production_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if run is None:
+        flash("生产记录不存在")
+        return redirect(url_for("production.runs_list"))
+    if int(run["rolled_back"]) == 1:
+        flash("该记录已回退")
+        return redirect(url_for("production.runs_list"))
+
+    items = db.execute(
+        "SELECT item_id, actual_qty FROM production_run_items WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    for it in items:
+        qty = parse_qty(it["actual_qty"])
+        db.execute(
+            "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+            (qty, now(), int(it["item_id"])),
+        )
+        db.execute(
+            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+               VALUES (?, '生产消耗回退', ?, ?, ?)""",
+            (int(it["item_id"]), qty, f"回退生产记录#{run_id}", now()),
+        )
+    db.execute("UPDATE production_runs SET rolled_back = 1 WHERE id = ?", (run_id,))
+    db.commit()
+    audit("production.run.rollback", "run", run_id)
+    flash("生产记录已回退")
+    return redirect(url_for("production.runs_list"))
+
+
+@bp.route("/production/runs/<int:run_id>/delete", methods=["POST"])
+@require_role("manager")
+def delete_run(run_id: int):
+    db = get_warehouse_db()
+    run = db.execute(
+        "SELECT id, rolled_back FROM production_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if run is None:
+        flash("生产记录不存在")
+        return redirect(url_for("production.runs_list"))
+
+    qty_total = 0.0
+    if int(run["rolled_back"]) == 0:
+        items = db.execute(
+            "SELECT item_id, actual_qty FROM production_run_items WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        for it in items:
+            qty = parse_qty(it["actual_qty"])
+            qty_total += qty
+            db.execute(
+                "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+                (qty, now(), int(it["item_id"])),
+            )
+            db.execute(
+                """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+                   VALUES (?, '生产消耗回退', ?, ?, ?)""",
+                (int(it["item_id"]), qty, f"删除生产记录#{run_id}回滚", now()),
+            )
+
+    db.execute("DELETE FROM production_runs WHERE id = ?", (run_id,))
+    db.commit()
+    audit("production.run.delete", "run", run_id, {
+        "rolled_back": int(run["rolled_back"]),
+        "qty_total": qty_total,
+    })
+    flash("生产记录已删除" + ("，库存已归还" if int(run["rolled_back"]) == 0 else ""))
+    return redirect(url_for("production.runs_list"))

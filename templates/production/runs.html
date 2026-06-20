@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="list-head">
+  <h2>生产记录</h2>
+  <a class="btn" href="{{ url_for('production.session') }}">+ 新建生产</a>
+</div>
+
+{% if runs %}
+<div class="card-list">
+  {% for r in runs %}
+  <div class="card">
+    <div class="card-main">
+      <h3>{{ r['product_name'] }} <small class="muted">产出 {{ r['output_qty'] | fmt_qty }} {{ r['product_unit'] }}</small></h3>
+      <p class="muted">
+        {{ r['created_at'] }}{% if r['created_by'] %} · {{ r['created_by'] }}{% endif %}
+        {% if r['note'] %} · {{ r['note'] }}{% endif %}
+        {% if r['rolled_back'] == 1 %} · <span class="status-rolled">已回退</span>{% endif %}
+      </p>
+      <ul class="bom-mini">
+        {% for it in r['items'] %}
+        <li>
+          {{ it['item_name'] }}：
+          计划 {{ it['planned_qty'] | fmt_qty }} /
+          实际 <strong>{{ it['actual_qty'] | fmt_qty }}</strong>
+          {{ it['unit'] }}
+          {% if it['planned_qty'] != it['actual_qty'] %}<span class="muted">（偏离配方）</span>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div class="card-actions">
+      {% if r['rolled_back'] == 0 %}
+      <form method="post" action="{{ url_for('production.rollback', run_id=r['id']) }}" onsubmit="return confirm('确认回退该生产记录？库存将归还。');">
+        <button class="btn-sm" type="submit">回退</button>
+      </form>
+      <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除？未回退的记录会先回滚库存。');">
+        <button class="btn-sm btn-delete" type="submit">删除</button>
+      </form>
+      {% else %}
+      <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除该记录？');">
+        <button class="btn-sm btn-delete" type="submit">删除</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+  <p class="muted">暂无生产记录。</p>
+{% endif %}
+{% endblock %}
