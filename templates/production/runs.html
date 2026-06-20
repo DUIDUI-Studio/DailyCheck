@@ -14,7 +14,7 @@
       <p class="muted">
         {{ r['created_at'] }}{% if r['created_by'] %} · {{ r['created_by'] }}{% endif %}
         {% if r['note'] %} · {{ r['note'] }}{% endif %}
-        {% if r['rolled_back'] == 1 %} · <span class="status-rolled">已回退</span>{% endif %}
+        {% if r['rolled_back'] == 1 %} · <span class="status-pill warn">已回退</span>{% endif %}
       </p>
       <ul class="bom-mini">
         {% for it in r['items'] %}

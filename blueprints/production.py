@@ -275,22 +275,46 @@ def submit():
 @require_login
 def runs_list():
     db = get_warehouse_db()
-    runs = db.execute(
-        """SELECT r.*, p.name AS product_name, p.unit AS product_unit
-           FROM production_runs r JOIN products p ON p.id = r.product_id
-           ORDER BY r.id DESC LIMIT 200"""
+    # Single query: runs + their items via LEFT JOIN, then group in Python.
+    # Avoids N+1 (was 1 + 200 queries at LIMIT 200).
+    flat = db.execute(
+        """SELECT r.id AS run_id, r.output_qty, r.note AS run_note,
+                  r.rolled_back, r.created_at, r.created_by,
+                  p.name AS product_name, p.unit AS product_unit,
+                  pri.id AS pri_id, pri.planned_qty, pri.actual_qty,
+                  i.name AS item_name, i.unit AS item_unit
+           FROM production_runs r
+           JOIN products p ON p.id = r.product_id
+           LEFT JOIN production_run_items pri ON pri.run_id = r.id
+           LEFT JOIN items i ON i.id = pri.item_id
+           ORDER BY r.id DESC, pri.id LIMIT 200"""
     ).fetchall()
-    # attach per-run items for the expanded view
-    enriched = []
-    for r in runs:
-        items = db.execute(
-            """SELECT pri.*, i.name AS item_name, i.unit
-               FROM production_run_items pri JOIN items i ON i.id = pri.item_id
-               WHERE pri.run_id = ? ORDER BY pri.id""",
-            (r["id"],),
-        ).fetchall()
-        enriched.append({**dict(r), "items": items})
-    return render("production/runs.html", runs=enriched)
+    # Group items under their parent run
+    runs_by_id: dict = {}
+    for row in flat:
+        rid = row["run_id"]
+        if rid not in runs_by_id:
+            runs_by_id[rid] = {
+                "id": rid,
+                "output_qty": row["output_qty"],
+                "note": row["run_note"],
+                "rolled_back": row["rolled_back"],
+                "created_at": row["created_at"],
+                "created_by": row["created_by"],
+                "product_name": row["product_name"],
+                "product_unit": row["product_unit"],
+                "items": [],
+            }
+        if row["pri_id"] is not None:
+            runs_by_id[rid]["items"].append({
+                "id": row["pri_id"],
+                "planned_qty": row["planned_qty"],
+                "actual_qty": row["actual_qty"],
+                "item_name": row["item_name"],
+                "unit": row["item_unit"],
+            })
+    runs = list(runs_by_id.values())
+    return render("production/runs.html", runs=runs)
 
 
 @bp.route("/production/runs/<int:run_id>/rollback", methods=["POST"])
@@ -311,8 +335,10 @@ def rollback(run_id: int):
         "SELECT item_id, actual_qty FROM production_run_items WHERE run_id = ?",
         (run_id,),
     ).fetchall()
+    qty_total = 0.0
     for it in items:
         qty = parse_qty(it["actual_qty"])
+        qty_total += qty
         db.execute(
             "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
             (qty, now(), int(it["item_id"])),
@@ -324,7 +350,7 @@ def rollback(run_id: int):
         )
     db.execute("UPDATE production_runs SET rolled_back = 1 WHERE id = ?", (run_id,))
     db.commit()
-    audit("production.run.rollback", "run", run_id)
+    audit("production.run.rollback", "run", run_id, {"qty_total": qty_total})
     flash("生产记录已回退")
     return redirect(url_for("production.runs_list"))
 
