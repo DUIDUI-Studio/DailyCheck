@@ -541,7 +541,7 @@ code {
 
 .inv-summary {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 8px;
   background: linear-gradient(135deg, #0f766e 0%, #0e7490 100%);
   color: #fff;
@@ -643,18 +643,21 @@ code {
   color: var(--muted);
 }
 .metric-value {
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
   color: var(--text);
 }
 .metric-value.small {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text);
 }
 .metric-value.highlight {
   color: var(--brand-ink);
-  font-size: 20px;
+  font-size: 18px;
+}
+.inv-metric-consume .metric-value {
+  color: #b45309;
 }
 .metric-value small {
   font-size: 11px;
@@ -673,11 +676,14 @@ code {
 /* pad landscape: 2 columns */
 @media (min-width: 720px) {
   .inv-grid { grid-template-columns: 1fr 1fr; }
-  .inv-card-body { grid-template-columns: repeat(4, 1fr); }
+  .inv-card-body { grid-template-columns: repeat(3, 1fr); }
+  .inv-summary { grid-template-columns: repeat(3, 1fr); }
 }
 /* desktop: 3 columns */
 @media (min-width: 1100px) {
   .inv-grid { grid-template-columns: 1fr 1fr 1fr; }
+  .inv-summary { grid-template-columns: repeat(6, 1fr); }
+  .inv-summary .inv-stat-value { font-size: 14px; }
 }
 
 /* === restock / outbound / adjustment / stocktake session (pad-first) === */
@@ -803,6 +809,8 @@ code {
   border-radius: 999px;
   cursor: pointer;
   white-space: nowrap;
+  text-decoration: none;
+  display: inline-block;
 }
 .cat-chip:hover { background: #e2e8f0; }
 .cat-chip.is-active {

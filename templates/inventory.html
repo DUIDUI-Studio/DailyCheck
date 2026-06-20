@@ -3,15 +3,31 @@
 <form method="get" class="inv-search">
   <input name="q" value="{{ q }}" placeholder="按品项名/品类搜索" autofocus />
   <button type="submit">查询</button>
+  {% if cat %}<input type="hidden" name="cat" value="{{ cat }}" />{% endif %}
 </form>
 
-{% set ns = namespace(total_qty=0, total_value=0) %}
+{% set ns = namespace(total_qty=0, total_value=0, consume_qty=0, consume_value=0) %}
 {% for i in items %}
   {% set qty = i.quantity | float %}
   {% set cost = i.unit_cost | float %}
+  {% set c7 = i.consume_7d_qty | float %}
   {% set ns.total_qty = ns.total_qty + qty %}
   {% set ns.total_value = ns.total_value + (qty * cost) %}
+  {% set ns.consume_qty = ns.consume_qty + c7 %}
+  {% set ns.consume_value = ns.consume_value + (i.consume_7d_value | float) %}
 {% endfor %}
+
+{% set cats = [] %}
+{% for i in items %}
+  {% if i.category_name not in cats %}{% set _ = cats.append(i.category_name) %}{% endif %}
+{% endfor %}
+
+<div class="cat-bar" role="tablist" aria-label="按品类筛选">
+  <a class="cat-chip {% if not cat %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if not cat else 'false' }}" href="{% if q %}?q={{ q }}{% else %}?{% endif %}">全部</a>
+  {% for c in cats %}
+    <a class="cat-chip {% if cat == c %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if cat == c else 'false' }}" href="?{% if q %}q={{ q }}&amp;{% endif %}cat={{ c }}">{{ c }}</a>
+  {% endfor %}
+</div>
 
 <div class="inv-summary">
   <div class="inv-stat">
@@ -26,6 +42,18 @@
     <span class="inv-stat-label">库存总金额</span>
     <span class="inv-stat-value">¥ {{ ns.total_value | fmt_money }}</span>
   </div>
+  <div class="inv-stat">
+    <span class="inv-stat-label">7日消耗</span>
+    <span class="inv-stat-value">{{ ns.consume_qty | fmt_qty }}</span>
+  </div>
+  <div class="inv-stat">
+    <span class="inv-stat-label">7日日均</span>
+    <span class="inv-stat-value">{{ (ns.consume_qty / 7) | fmt_qty }}</span>
+  </div>
+  <div class="inv-stat">
+    <span class="inv-stat-label">7日消耗金额</span>
+    <span class="inv-stat-value">¥ {{ ns.consume_value | fmt_money }}</span>
+  </div>
 </div>
 
 <div class="inv-grid">
@@ -33,6 +61,8 @@
     {% set qty = i.quantity | float %}
     {% set cost = i.unit_cost | float %}
     {% set value = qty * cost %}
+    {% set c7 = i.consume_7d_qty | float %}
+    {% set c7v = i.consume_7d_value | float %}
     <div class="inv-card {% if qty <= 0 %}is-danger{% elif qty <= i.safety_stock %}is-warn{% endif %}">
       <div class="inv-card-head">
         <div class="inv-card-name">
@@ -59,9 +89,17 @@
           <span class="metric-label">单价</span>
           <span class="metric-value small">¥ {{ cost | fmt_money }}</span>
         </div>
-        <div class="inv-metric inv-metric-value">
+        <div class="inv-metric">
           <span class="metric-label">库存金额</span>
-          <span class="metric-value highlight">¥ {{ value | fmt_money }}</span>
+          <span class="metric-value small">¥ {{ value | fmt_money }}</span>
+        </div>
+        <div class="inv-metric">
+          <span class="metric-label">7日消耗</span>
+          <span class="metric-value small">{{ c7 | fmt_qty }}<small>{{ i.unit }}</small></span>
+        </div>
+        <div class="inv-metric inv-metric-consume">
+          <span class="metric-label">日均消耗</span>
+          <span class="metric-value small">¥{{ c7v | fmt_money }}</span>
         </div>
       </div>
 

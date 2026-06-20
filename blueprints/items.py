@@ -125,12 +125,30 @@ def inventory_view():
     db = get_warehouse_db()
     placeholders, params = fixed_categories_in_clause()
     q = request.args.get("q", "").strip()
+    cat = request.args.get("cat", "").strip()
+    # 7-day consumption per item: sum of |delta| for action='出库' in the
+    # last 7 days, with stocktake loss already written as action='出库'
+    # (口径 B — see stocktake.approve). Daily avg = total / 7.
     rows = db.execute(
-        f"""SELECT i.*, c.name AS category_name
-            FROM items i JOIN categories c ON c.id = i.category_id
-            WHERE c.name IN ({placeholders})
-              AND (? = '' OR i.name LIKE '%' || ? || '%' OR i.sku LIKE '%' || ? || '%')
-            ORDER BY (i.quantity <= i.safety_stock) DESC, i.name""",
-        params + [q, q, q],
+        f"""SELECT i.*, c.name AS category_name,
+                  COALESCE(c7.qty, 0) AS consume_7d_qty,
+                  COALESCE(c7.value, 0) AS consume_7d_value
+           FROM items i
+           JOIN categories c ON c.id = i.category_id
+           LEFT JOIN (
+               SELECT m.item_id,
+                      ABS(SUM(m.delta)) AS qty,
+                      ROUND(ABS(SUM(m.delta)) * i2.unit_cost, 2) AS value
+               FROM stock_movements m
+               JOIN items i2 ON i2.id = m.item_id
+               WHERE m.action = '出库'
+                 AND m.created_at >= datetime('now', '-7 days')
+               GROUP BY m.item_id
+           ) c7 ON c7.item_id = i.id
+           WHERE c.name IN ({placeholders})
+             AND (? = '' OR i.name LIKE '%' || ? || '%' OR i.sku LIKE '%' || ? || '%')
+             AND (? = '' OR c.name = ?)
+           ORDER BY (i.quantity <= i.safety_stock) DESC, i.name""",
+        params + [q, q, q, cat, cat],
     ).fetchall()
-    return render_template("inventory.html", items=rows, q=q)
+    return render_template("inventory.html", items=rows, q=q, cat=cat)
