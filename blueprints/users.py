@@ -226,6 +226,105 @@ def toggle_admin(user_id: int):
     return redirect(url_for("users.list_users"))
 
 
+@bp.route("/users/<int:user_id>/delete", methods=["POST"])
+@require_login
+def delete_user(user_id: int):
+    """Permanently delete a user.
+
+    Guard rails:
+    - Cannot delete self (would lock out the only admin).
+    - Cannot delete the last platform admin (must keep ≥1 admin).
+    - warehouse_users bindings cascade-delete with the user.
+    """
+    _require_admin()
+    from flask import g
+    if g.user["id"] == user_id:
+        flash("不能删除自己的账号")
+        return redirect(url_for("users.list_users"))
+    db = get_master_db()
+    target = db.execute(
+        "SELECT username, is_admin FROM users WHERE id=?", (user_id,)
+    ).fetchone()
+    if target is None:
+        abort(404)
+    if target["is_admin"]:
+        admin_count = db.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE is_admin=1"
+        ).fetchone()["c"]
+        if admin_count <= 1:
+            flash("至少保留一个平台管理员,无法删除")
+            return redirect(url_for("users.list_users"))
+    db.execute("DELETE FROM warehouse_users WHERE user_id=?", (user_id,))
+    db.execute("DELETE FROM users WHERE id=?", (user_id,))
+    db.commit()
+    _log_admin_action(f"delete user #{user_id} {target['username']}")
+    flash(f"已删除账号 {target['username']}")
+    return redirect(url_for("users.list_users"))
+
+
+@bp.route("/warehouses/<int:warehouse_id>/init", methods=["POST"])
+@require_login
+def init_warehouse(warehouse_id: int):
+    """Wipe business data for one warehouse, preserving the catalog.
+
+    What gets cleared:
+      - stock_movements, stocktakes, stocktake_batches
+      - restock_requests, outbound_requests, adjustment_requests
+      - daily_revenue, audit_log
+      - items.quantity / items.safety_stock reset to 0
+
+    What gets preserved:
+      - categories (system-fixed seeds)
+      - items (the catalog: sku, name, unit, unit_cost) — only
+        quantity and safety_stock are zeroed
+
+    Two-step confirmation: the form sends a hidden confirm_token that
+    must equal the warehouse's code. Plain-text confirmation in the
+    button label.
+    """
+    _require_admin()
+    from flask import g
+    from config import BASE_DIR
+
+    db = get_master_db()
+    wh = db.execute(
+        "SELECT code, name, db_path FROM warehouses WHERE id=?", (warehouse_id,)
+    ).fetchone()
+    if wh is None:
+        abort(404)
+
+    expected = request.form.get("confirm_token", "")
+    if expected.strip() != wh["code"]:
+        flash(f"确认口令不匹配:请输入仓库编码 '{wh['code']}' 二次确认")
+        return redirect(url_for("users.list_users"))
+
+    db_path = BASE_DIR / wh["db_path"]
+    target_tables = [
+        "stock_movements",
+        "stocktakes",
+        "stocktake_batches",
+        "restock_requests",
+        "outbound_requests",
+        "adjustment_requests",
+        "daily_revenue",
+        "audit_log",
+    ]
+    with closing(sqlite3.connect(db_path)) as wh_db:
+        cur = wh_db.cursor()
+        cur.execute("PRAGMA foreign_keys = OFF")
+        for tbl in target_tables:
+            cur.execute(f"DELETE FROM {tbl}")
+        cur.execute("UPDATE items SET quantity = 0, safety_stock = 0")
+        wh_db.commit()
+
+    _log_admin_action(
+        f"init warehouse #{warehouse_id} {wh['code']} ({wh['name']}) "
+        f"cleared {len(target_tables)} tables + zeroed item quantities"
+    )
+    flash(f"已初始化仓库 {wh['name']}({wh['code']}):业务数据已清空,品类/品项保留")
+    return redirect(url_for("users.list_users"))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

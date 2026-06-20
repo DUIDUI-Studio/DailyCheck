@@ -413,3 +413,131 @@ code {
 .btn-sm:hover { background: #f9fafb; }
 .btn-edit { border-color: #0f766e; color: #0f766e; }
 .btn-delete { border-color: #dc2626; color: #dc2626; }
+
+/* /users responsive card layout ----------------------------------------- */
+
+/* role matrix inside the create-user form */
+.role-matrix { width: 100%; font-size: 14px; }
+.role-matrix th, .role-matrix td {
+  text-align: center;
+  padding: 6px 4px;
+  border-bottom: 1px solid #f0f0f0;
+}
+.role-matrix th:first-child, .role-matrix td:first-child { text-align: left; }
+
+/* each user becomes a card */
+.user-cards { display: grid; gap: 12px; margin-bottom: 24px; }
+.user-card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+.user-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.user-card-meta {
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: right;
+}
+.user-card-section {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #f3f4f6;
+  font-size: 14px;
+}
+.user-card-section > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #0f766e;
+  list-style: none;
+}
+.user-card-section > summary::-webkit-details-marker { display: none; }
+.user-card-section > summary::before {
+  content: "▸ ";
+  font-size: 11px;
+}
+.user-card-section[open] > summary::before { content: "▾ "; }
+.user-card-label {
+  font-weight: 600;
+  color: #374151;
+  display: block;
+  margin-bottom: 6px;
+}
+.user-card-actions {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid #f3f4f6;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* role-row used inside edit-permissions details */
+.role-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px dashed #f0f0f0;
+}
+.role-row:last-child { border-bottom: 0; }
+.role-row-label {
+  min-width: 110px;
+  font-size: 13px;
+}
+.role-row-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.role-row-form select {
+  width: auto;
+  padding: 4px 6px;
+  font-size: 13px;
+}
+.role-row-form input[type="password"] {
+  width: auto;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+/* warehouse cards */
+.warehouse-cards { display: grid; gap: 12px; }
+.warehouse-card {
+  background: #fff;
+  border: 1px solid #fecaca;
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.warehouse-card > header {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.warehouse-card details > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.warehouse-card details > summary::-webkit-details-marker { display: none; }
+
+/* mobile layout: stack everything vertically */
+@media (max-width: 720px) {
+  .user-card-head { flex-direction: column; }
+  .user-card-meta { text-align: left; }
+  .role-matrix { font-size: 12px; }
+  .role-matrix th, .role-matrix td { padding: 4px 2px; }
+  .role-row-label { min-width: 100%; }
+  .role-row-form { width: 100%; }
+  .role-row-form select,
+  .role-row-form input[type="password"] { flex: 1; }
+}

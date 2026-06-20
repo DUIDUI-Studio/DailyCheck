@@ -22,7 +22,7 @@
     {% if warehouses %}
     <fieldset style="margin-top:14px;border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px">
       <legend style="padding:0 6px;color:#374151">仓库权限(可选,创建时直接绑定)</legend>
-      <table style="width:100%;font-size:14px">
+      <table class="role-matrix">
         <tr>
           <th>仓库</th><th>无权限</th><th>staff</th><th>manager</th><th>admin</th>
         </tr>
@@ -43,101 +43,135 @@
   </form>
 </details>
 
-<table class="grid-table">
-  <thead>
-    <tr>
-      <th>账号</th>
-      <th>角色</th>
-      <th>仓库权限</th>
-      <th>最近登录</th>
-      <th>创建时间</th>
-      <th>操作</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for u in users %}
-    <tr>
-      <td><strong>{{ u['username'] }}</strong>{% if u['id'] == current_user_id %} (我){% endif %}</td>
-      <td>
+<h3>用户列表</h3>
+<div class="user-cards">
+  {% for u in users %}
+  <article class="user-card">
+    <header class="user-card-head">
+      <div>
+        <strong>{{ u['username'] }}</strong>
+        {% if u['id'] == current_user_id %}<span class="muted">(我)</span>{% endif %}
         {% if u['is_admin'] %}<span class="tag admin">平台管理员</span>
         {% else %}<span class="tag user">普通用户</span>{% endif %}
-      </td>
-      <td>
+      </div>
+      <div class="user-card-meta muted">
+        最近登录: {{ u['last_login_at'] or '—' }}<br>
+        创建: {{ u['created_at'] }}
+      </div>
+    </header>
+
+    <div class="user-card-section">
+      <span class="user-card-label">仓库权限</span>
+      {% set bindings = bindings_by_user.get(u['id'], {}) %}
+      {% if bindings %}
+        {% for w in warehouses %}
+          {% if bindings.get(w['id']) %}
+            <span class="tag">{{ w['name'] }}:{{ bindings[w['id']] }}</span>
+          {% endif %}
+        {% endfor %}
+      {% else %}
+        <span class="muted">— 无 —</span>
+      {% endif %}
+      {% if u['is_admin'] %}
+        <span class="muted" style="font-size:12px">(平台管理员可访问全部)</span>
+      {% endif %}
+    </div>
+
+    <details class="user-card-section">
+      <summary>编辑仓库权限</summary>
+      <div style="margin-top:8px">
         {% set bindings = bindings_by_user.get(u['id'], {}) %}
-        {% if bindings %}
-          {% for w in warehouses %}
+        {% for w in warehouses %}
+          <div class="role-row">
+            <span class="role-row-label"><strong>{{ w['name'] }}</strong></span>
             {% if bindings.get(w['id']) %}
-              <span class="tag">{{ w['name'] }}:{{ bindings[w['id']] }}</span>
-            {% endif %}
-          {% endfor %}
-        {% else %}
-          <span class="muted">— 无 —</span>
-        {% endif %}
-        {% if u['is_admin'] %}
-          <span class="muted" style="font-size:12px">(平台管理员已可访问全部)</span>
-        {% endif %}
-      </td>
-      <td>{{ u['last_login_at'] or '—' }}</td>
-      <td>{{ u['created_at'] }}</td>
-      <td>
-        <details>
-          <summary class="btn-sm btn-edit">重置密码</summary>
-          <form method="post" action="{{ url_for('users.reset_password', user_id=u['id']) }}" style="margin-top:6px">
-            <input name="password" type="password" required placeholder="新密码" autocomplete="new-password" />
-            <button type="submit" class="btn-sm btn-edit">保存</button>
-          </form>
-        </details>
-        {% if u['id'] != current_user_id %}
-        <form method="post" action="{{ url_for('users.toggle_admin', user_id=u['id']) }}" style="display:inline">
-          <button type="submit" class="btn-sm" onclick="return confirm('确认切换平台管理员状态?')">
-            {% if u['is_admin'] %}取消管理员{% else %}设为管理员{% endif %}
-          </button>
-        </form>
-        {% endif %}
-        <details>
-          <summary class="btn-sm">编辑仓库权限</summary>
-          <div style="margin-top:6px;padding:6px;background:#f9fafb;border-radius:6px">
-            {% set bindings = bindings_by_user.get(u['id'], {}) %}
-            {% for w in warehouses %}
-              <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
-                <span style="min-width:90px"><strong>{{ w['name'] }}</strong></span>
-                {% if bindings.get(w['id']) %}
-                  <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" style="display:inline-flex;gap:4px">
-                    <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                    <select name="role" class="role-select">
-                      <option value="staff" {% if bindings[w['id']] == 'staff' %}selected{% endif %}>staff</option>
-                      <option value="manager" {% if bindings[w['id']] == 'manager' %}selected{% endif %}>manager</option>
-                      <option value="admin" {% if bindings[w['id']] == 'admin' %}selected{% endif %}>admin</option>
-                    </select>
-                    <button type="submit" class="btn-sm btn-edit">保存</button>
-                  </form>
-                  <form method="post" action="{{ url_for('users.unbind_role', user_id=u['id']) }}" style="display:inline">
-                    <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                    <button type="submit" class="btn-sm btn-delete" onclick="return confirm('确认解除 {{ u['username'] }} 在 {{ w['name'] }} 的权限?')">解绑</button>
-                  </form>
-                {% else %}
-                  <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" style="display:inline-flex;gap:4px">
-                    <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                    <select name="role">
-                      <option value="staff">staff</option>
-                      <option value="manager" selected>manager</option>
-                      <option value="admin">admin</option>
-                    </select>
-                    <button type="submit" class="btn-sm btn-edit">绑定</button>
-                  </form>
-                {% endif %}
-              </div>
-            {% endfor %}
-            {% if not warehouses %}
-              <span class="muted">尚无仓库</span>
+              <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" class="role-row-form">
+                <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
+                <select name="role">
+                  <option value="staff" {% if bindings[w['id']] == 'staff' %}selected{% endif %}>staff</option>
+                  <option value="manager" {% if bindings[w['id']] == 'manager' %}selected{% endif %}>manager</option>
+                  <option value="admin" {% if bindings[w['id']] == 'admin' %}selected{% endif %}>admin</option>
+                </select>
+                <button type="submit" class="btn-sm btn-edit">保存</button>
+              </form>
+              <form method="post" action="{{ url_for('users.unbind_role', user_id=u['id']) }}" class="role-row-form">
+                <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
+                <button type="submit" class="btn-sm btn-delete"
+                        onclick="return confirm('确认解除 {{ u['username'] }} 在 {{ w['name'] }} 的权限?')">解绑</button>
+              </form>
+            {% else %}
+              <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" class="role-row-form">
+                <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
+                <select name="role">
+                  <option value="staff">staff</option>
+                  <option value="manager" selected>manager</option>
+                  <option value="admin">admin</option>
+                </select>
+                <button type="submit" class="btn-sm btn-edit">绑定</button>
+              </form>
             {% endif %}
           </div>
-        </details>
-      </td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+        {% endfor %}
+      </div>
+    </details>
+
+    <details class="user-card-section">
+      <summary>重置密码</summary>
+      <form method="post" action="{{ url_for('users.reset_password', user_id=u['id']) }}" class="role-row-form" style="margin-top:8px">
+        <input name="password" type="password" required placeholder="新密码" autocomplete="new-password" />
+        <button type="submit" class="btn-sm btn-edit">保存</button>
+      </form>
+    </details>
+
+    <div class="user-card-actions">
+      {% if u['id'] != current_user_id %}
+      <form method="post" action="{{ url_for('users.toggle_admin', user_id=u['id']) }}" style="display:inline">
+        <button type="submit" class="btn-sm" onclick="return confirm('确认切换平台管理员状态?')">
+          {% if u['is_admin'] %}取消管理员{% else %}设为管理员{% endif %}
+        </button>
+      </form>
+      <form method="post" action="{{ url_for('users.delete_user', user_id=u['id']) }}" style="display:inline">
+        <button type="submit" class="btn-sm btn-delete"
+                onclick="return confirm('确认永久删除 {{ u['username'] }}?此操作不可撤销。')">
+          删除账号
+        </button>
+      </form>
+      {% endif %}
+    </div>
+  </article>
+  {% endfor %}
+</div>
+
+<h3>仓库管理</h3>
+<div class="warehouse-cards">
+  {% for w in warehouses %}
+  <article class="warehouse-card">
+    <header>
+      <strong>{{ w['name'] }}</strong>
+      <small class="muted">({{ w['code'] }})</small>
+    </header>
+    <p class="muted" style="font-size:13px;margin:6px 0">
+      初始化将清空所有入库/出库/盘点/调整/审计流水,并把品项库存与安全库存归零。
+      品类和品项(规格/单价)保留。
+    </p>
+    <details>
+      <summary class="btn-sm btn-delete">初始化仓库</summary>
+      <form method="post" action="{{ url_for('users.init_warehouse', warehouse_id=w['id']) }}" style="margin-top:8px">
+        <label style="display:block;font-size:13px;margin-bottom:6px">
+          输入 <code>{{ w['code'] }}</code> 二次确认:
+        </label>
+        <input name="confirm_token" required placeholder="{{ w['code'] }}" autocomplete="off"
+               style="font-family:monospace;letter-spacing:1px" />
+        <button type="submit" class="btn-sm btn-delete"
+                style="margin-top:6px"
+                onclick="return confirm('确认初始化 {{ w['name'] }}?业务数据将全部清空!')">
+          确认初始化
+        </button>
+      </form>
+    </details>
+  </article>
+  {% endfor %}
+</div>
 
 <p class="muted" style="margin-top:16px;font-size:13px">
   平台管理员(is_admin=1)不受仓库级权限检查约束。<br>
