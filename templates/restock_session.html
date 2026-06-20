@@ -8,18 +8,19 @@
       <button type="submit">提交并入库</button>
     </div>
     <p class="hint">留空 = 本次不入库该品项。点击下方品类可快速定位。</p>
-    {% set ns = namespace(cats=[]) %}
-    {% for i in items %}
-      {% if i.category_name not in ns.cats %}
-        {% set ns.cats = ns.cats + [i.category_name] %}
-      {% endif %}
+  </div>
+
+  {% set ns = namespace(cats=[]) %}
+  {% for i in items %}
+    {% if i.category_name not in ns.cats %}
+      {% set ns.cats = ns.cats + [i.category_name] %}
+    {% endif %}
+  {% endfor %}
+  <div class="cat-bar" role="tablist" aria-label="按品类筛选">
+    <button type="button" class="cat-chip is-active" data-cat="__all" role="tab" aria-selected="true">全部</button>
+    {% for c in ns.cats %}
+      <button type="button" class="cat-chip" data-cat="{{ c }}" role="tab" aria-selected="false">{{ c }}</button>
     {% endfor %}
-    <div class="cat-bar" role="tablist" aria-label="按品类筛选">
-      <button type="button" class="cat-chip is-active" data-cat="__all" role="tab" aria-selected="true">全部</button>
-      {% for c in ns.cats %}
-        <button type="button" class="cat-chip" data-cat="{{ c }}" role="tab" aria-selected="false">{{ c }}</button>
-      {% endfor %}
-    </div>
   </div>
 
   <div class="entry-grid" data-cat-bar>
@@ -70,7 +71,7 @@
       for (var j = 0; j < rows.length; j++) {
         var row = rows[j];
         var match = (cat === '__all') || (row.getAttribute('data-cat') === cat);
-        row.classList.toggle('is-dim', !match);
+        row.classList.toggle('is-hidden', !match);
         if (match && first === null) first = row;
       }
       if (cat !== '__all' && first) {

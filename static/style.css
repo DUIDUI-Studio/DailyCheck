@@ -540,9 +540,7 @@ code {
   box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
 }
 .session-head {
-  position: sticky;
-  top: 0;
-  z-index: 5;
+  /* not sticky — chip bar owns the top slot */
   background: var(--panel);
   margin: -14px -16px 14px;
   padding: 14px 16px;
@@ -632,12 +630,17 @@ code {
 
 /* category quick-filter chips (restock/outbound/stocktake/adjustment) */
 .cat-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--panel);
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 8px 0 0;
-  margin: 0;
-  border-bottom: 0;
+  padding: 10px 0 12px;
+  margin: 0 0 8px;
+  border-bottom: 1px dashed var(--border);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.04);
 }
 .cat-chip {
   width: auto;
@@ -658,7 +661,7 @@ code {
   color: #fff;
   font-weight: 600;
 }
-.entry-row.is-dim { opacity: 0.32; }
+.entry-row.is-hidden { display: none; }
 
 /* pad: 768-1180, two-column card grid */
 @media (min-width: 720px) {
