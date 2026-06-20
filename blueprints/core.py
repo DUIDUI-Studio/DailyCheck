@@ -7,13 +7,13 @@ from flask import Blueprint, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import fixed_categories_in_clause
+from ._helpers import fixed_categories_in_clause, render
 
 
 bp = Blueprint("core", __name__)
 
 
-@bp.route("/")
+@bp.route("/dashboard")
 @require_login
 def dashboard():
     db = get_warehouse_db()
@@ -51,6 +51,14 @@ def dashboard():
         inbound_today=inbound_today,
         latest_movements=latest_movements,
     )
+
+
+@bp.route("/")
+@bp.route("/land")
+@require_login
+def land():
+    """Post-warehouse-pick landing page: choose between 库存管理 and 生产录入."""
+    return render("land.html")
 
 
 @bp.route("/summary")

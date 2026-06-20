@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block sidebar %}{% endblock %}
+{% block title %}选择功能{% endblock %}
+{% block content %}
+<h2>请选择功能</h2>
+{% if g.warehouse %}
+<p class="muted">当前仓库：<strong>{{ g.warehouse['name'] }}</strong></p>
+{% endif %}
+
+<div class="land-grid">
+  <a class="land-card" href="{{ url_for('items.items_list') }}">
+    <h3>库存管理</h3>
+    <p>品项 / 盘点 / 入库 / 出库 / 调整 / 库存查阅</p>
+  </a>
+  {# 生产录入 蓝图在 Task 3 才注册。先用占位 href，等蓝图就位后改成 url_for。 #}
+  <a class="land-card" href="/production/products">
+    <h3>生产录入</h3>
+    <p>产品配方 / 按产出量自动领料</p>
+  </a>
+</div>
+{% endblock %}

@@ -173,7 +173,7 @@ def warehouse_select(warehouse_id: int):
         if binding is None:
             abort(403)
     session["warehouse_id"] = warehouse_id
-    return redirect(url_for("core.dashboard"))
+    return redirect(url_for("core.land"))
 
 
 # ---------------------------------------------------------------------------
