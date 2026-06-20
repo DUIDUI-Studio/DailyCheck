@@ -15,7 +15,7 @@
         <p>配方项数：<strong>{{ p['bom_count'] }}</strong></p>
       </div>
       <div class="card-actions">
-        <span class="btn-sm btn-disabled" title="录入页在 Task 5 启用">录入</span>
+        <a class="btn-sm" href="{{ url_for('production.session') }}?product_id={{ p['id'] }}">录入</a>
         <a class="btn-sm" href="{{ url_for('production.product_edit', product_id=p['id']) }}">编辑配方</a>
         <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" onsubmit="return confirm('确认删除该产品？');">
           <button class="btn-sm btn-delete" type="submit">删除</button>

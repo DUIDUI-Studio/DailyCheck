@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="list-head">
+  <h2>生产录入</h2>
+</div>
+
+<form method="get" action="{{ url_for('production.session') }}" class="form-inline">
+  <label>产品
+    <select name="product_id" onchange="this.form.submit()">
+      <option value="">-- 请选择产品 --</option>
+      {% for p in products %}
+      <option value="{{ p['id'] }}" {% if chosen and chosen['id']==p['id'] %}selected{% endif %}>
+        {{ p['name'] }} ({{ p['unit'] }})
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+
+{% if chosen and bom %}
+<form method="post" action="{{ url_for('production.submit') }}" class="session-form" id="prod-form">
+  <input type="hidden" name="product_id" value="{{ chosen['id'] }}" />
+
+  <div class="session-head">
+    <div class="session-actions">
+      <label>产出量（{{ chosen['unit'] }}）
+        <input type="number" step="0.01" min="0" name="output_qty" id="output_qty" required />
+      </label>
+      <label>备注 <input name="note" placeholder="可选" /></label>
+      <button type="submit" id="submit-btn">提交</button>
+    </div>
+    <p class="hint">实际消耗可偏离配方；原料不足将无法提交。</p>
+  </div>
+
+  <div class="entry-grid" id="bom-grid">
+    {% for b in bom %}
+    <div class="entry-row" data-stock="{{ b['stock'] }}">
+      <div class="er-meta">
+        <span class="er-name">{{ b['item_name'] }}</span>
+        <span class="er-cat muted">当前库存 {{ b['stock'] | fmt_qty }} {{ b['unit'] }}</span>
+      </div>
+      <div class="er-stock">
+        <span>配方 / 单位 <strong>{{ b['qty_per_unit'] | fmt_qty }}</strong> {{ b['unit'] }}</span>
+        <span>本批计划 <strong class="planned" data-qpu="{{ b['qty_per_unit'] }}">0.00</strong> {{ b['unit'] }}</span>
+      </div>
+      <div class="er-input">
+        <input
+          type="number" step="0.01" min="0" inputmode="decimal"
+          name="actual_{{ b['item_id'] }}" data-stock="{{ b['stock'] }}"
+          class="actual" placeholder="0" autocomplete="off" />
+        <span class="er-unit">{{ b['unit'] }}</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</form>
+
+<script>
+(function() {
+  var out = document.getElementById('output_qty');
+  var rows = document.querySelectorAll('#bom-grid .entry-row');
+  var btn = document.getElementById('submit-btn');
+
+  function recompute() {
+    var oq = parseFloat(out.value || '0');
+    var anyShort = false;
+    rows.forEach(function(r) {
+      var qpu = parseFloat(r.querySelector('.planned').getAttribute('data-qpu'));
+      var planned = Math.round(qpu * oq * 100) / 100;
+      r.querySelector('.planned').textContent = planned.toFixed(2);
+      var act = r.querySelector('.actual');
+      var stock = parseFloat(act.getAttribute('data-stock'));
+      var actVal = parseFloat(act.value);
+      var show = (actVal > stock);
+      r.classList.toggle('is-short', show);
+      if (show) anyShort = true;
+    });
+    btn.disabled = (oq <= 0) || anyShort;
+  }
+  out.addEventListener('input', recompute);
+  rows.forEach(function(r) { r.querySelector('.actual').addEventListener('input', recompute); });
+  recompute();
+})();
+</script>
+{% elif chosen %}
+  <p class="muted">该产品还没有配方，请先 <a href="{{ url_for('production.product_edit', product_id=chosen['id']) }}">编辑配方</a>。</p>
+{% endif %}
+{% endblock %}

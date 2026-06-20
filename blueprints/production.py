@@ -152,3 +152,114 @@ def product_delete(product_id: int):
     audit("production.product.delete", "product", product_id)
     flash("产品已删除")
     return redirect(url_for("production.products_list"))
+
+
+@bp.route("/production/session", methods=["GET"])
+@require_login
+def session():
+    db = get_warehouse_db()
+    products_data = db.execute(
+        "SELECT id, name, unit FROM products ORDER BY name"
+    ).fetchall()
+    product_id = request.args.get("product_id", type=int)
+    bom = []
+    chosen = None
+    if product_id:
+        chosen = db.execute(
+            "SELECT * FROM products WHERE id = ?", (product_id,)
+        ).fetchone()
+        if chosen is not None:
+            bom = db.execute(
+                """SELECT b.id AS bom_id, b.qty_per_unit, b.item_id,
+                          i.name AS item_name, i.unit, i.quantity AS stock
+                   FROM product_bom b JOIN items i ON i.id = b.item_id
+                   WHERE b.product_id = ? ORDER BY b.id""",
+                (product_id,),
+            ).fetchall()
+    return render(
+        "production/session.html",
+        products=products_data,
+        chosen=chosen,
+        bom=bom,
+    )
+
+
+@bp.route("/production/submit", methods=["POST"])
+@require_login
+def submit():
+    from flask import g
+    db = get_warehouse_db()
+    product_id = request.form.get("product_id", type=int)
+    output_qty = parse_qty(request.form.get("output_qty", "0"))
+    note = request.form.get("note", "").strip()
+
+    if not product_id or output_qty <= 0:
+        flash("请选择产品并填写大于 0 的产出量")
+        return redirect(url_for("production.session"))
+
+    product = db.execute(
+        "SELECT id, name, unit FROM products WHERE id = ?", (product_id,)
+    ).fetchone()
+    if product is None:
+        flash("产品不存在")
+        return redirect(url_for("production.session"))
+
+    bom_rows = db.execute(
+        """SELECT b.id AS bom_id, b.item_id, b.qty_per_unit,
+                  i.name AS item_name, i.quantity AS stock
+           FROM product_bom b JOIN items i ON i.id = b.item_id
+           WHERE b.product_id = ? ORDER BY b.id""",
+        (product_id,),
+    ).fetchall()
+    if not bom_rows:
+        flash("该产品尚未配置配方")
+        return redirect(url_for("production.session", product_id=product_id))
+
+    # Build planned & actual
+    plan = []
+    for b in bom_rows:
+        planned = round(b["qty_per_unit"] * output_qty, 2)
+        raw = request.form.get(f"actual_{b['item_id']}", "").strip()
+        actual = parse_qty(raw) if raw != "" else planned
+        if actual < 0:
+            flash(f"原料 {b['item_name']} 实际消耗不能为负")
+            return redirect(url_for("production.session", product_id=product_id))
+        plan.append((int(b["item_id"]), b["item_name"], float(b["stock"]), planned, actual))
+
+    # 硬性拦截: 库存不足
+    for item_id, name, stock, planned, actual in plan:
+        if actual > stock:
+            flash(f"原料 {name} 库存不足（需 {actual}，现有 {stock}）")
+            return redirect(url_for("production.session", product_id=product_id))
+
+    created_by = g.user["username"] if g.get("user") else None
+    cur = db.execute(
+        """INSERT INTO production_runs
+           (product_id, output_qty, note, rolled_back, created_by, created_at)
+           VALUES (?, ?, ?, 0, ?, ?)""",
+        (product_id, output_qty, note, created_by, now()),
+    )
+    run_id = int(cur.lastrowid)
+
+    for item_id, name, stock, planned, actual in plan:
+        db.execute(
+            """INSERT INTO production_run_items
+               (run_id, item_id, planned_qty, actual_qty) VALUES (?, ?, ?, ?)""",
+            (run_id, item_id, planned, actual),
+        )
+        db.execute(
+            "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
+            (actual, now(), item_id),
+        )
+        db.execute(
+            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+               VALUES (?, '生产消耗', ?, ?, ?)""",
+            (item_id, -actual, f"生产记录#{run_id}领料", now()),
+        )
+
+    db.commit()
+    audit("production.run.submit", "run", run_id, {
+        "product_id": product_id, "output_qty": output_qty, "rows": len(plan),
+    })
+    flash("生产已记录")
+    return redirect(url_for("production.runs_list"))
