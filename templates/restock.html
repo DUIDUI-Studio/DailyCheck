@@ -1,25 +1,40 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>入库记录</h2>
-<form method="post" action="{{ url_for('restock.restock_start') }}" class="form-inline">
-  <button type="submit">新建入库</button>
-</form>
+<div class="list-head">
+  <h2>入库记录</h2>
+  <form method="post" action="{{ url_for('restock.restock_start') }}">
+    <button type="submit">+ 新建入库</button>
+  </form>
+</div>
 
-<table>
-  <tr><th>时间</th><th>品项</th><th>入库数量</th><th>原因</th><th>状态</th><th>操作</th></tr>
+{% set ns = namespace(prev_day='', shown_header=False) %}
+<div class="record-list">
   {% for r in requests %}
-  <tr>
-    <td>{{ r.created_at }}</td>
-    <td>{{ r.item_name }}</td>
-    <td>{{ r.requested_quantity | fmt_qty }} {{ r.unit }}</td>
-    <td>{{ r.reason }}</td>
-    <td>{{ r.status }}</td>
-    <td>
-      <form method="post" action="{{ url_for('restock.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
-        <button type="submit">删除</button>
-      </form>
-    </td>
-  </tr>
+    {% set day = r.created_at[:10] %}
+    {% if day != ns.prev_day %}
+      <div class="record-day">{{ day }}</div>
+      {% set ns.prev_day = day %}
+    {% endif %}
+    <div class="record-card">
+      <div class="rc-main">
+        <p class="rc-name">{{ r.item_name }} <small class="muted">{{ r.unit }}</small></p>
+        <div class="rc-meta">
+          <span>{{ r.created_at[11:] }}</span>
+          {% if r.reason %}<span class="sep">·</span><span>{{ r.reason }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="rc-right">
+        <div class="rc-qty">+{{ r.requested_quantity | fmt_qty }}<small>{{ r.unit }}</small></div>
+        <div class="rc-status done">{{ r.status }}</div>
+        <div class="rc-actions">
+          <form method="post" action="{{ url_for('restock.delete', req_id=r.id) }}" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
+            <button type="submit" class="btn-sm btn-delete">删除</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  {% else %}
+    <p class="muted">暂无入库记录。</p>
   {% endfor %}
-</table>
+</div>
 {% endblock %}

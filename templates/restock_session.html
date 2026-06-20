@@ -1,24 +1,40 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>入库录入</h2>
-<p>请根据当前库存状态填写入库数量。留空表示本次不入库该品项。</p>
-<form method="post" action="{{ url_for('restock.restock_submit') }}">
-  <div class="form-inline">
-    <input name="reason" placeholder="本次入库原因（可选）" />
-    <button type="submit">提交并入库</button>
+<form method="post" action="{{ url_for('restock.restock_submit') }}" class="session-form">
+  <div class="session-head">
+    <h2>入库录入</h2>
+    <div class="session-actions">
+      <input name="reason" placeholder="本次入库原因（可选）" />
+      <button type="submit">提交并入库</button>
+    </div>
+    <p class="hint">留空 = 本次不入库该品项。平板/手机均可左右双指缩放。</p>
   </div>
 
-  <table>
-    <tr><th>品类</th><th>品项</th><th>当前库存</th><th>安全库存</th><th>入库数量（填写）</th></tr>
+  <div class="entry-grid">
     {% for i in items %}
-    <tr>
-      <td>{{ i.category_name }}</td>
-      <td>{{ i.name }}</td>
-      <td>{{ i.quantity }} {{ i.unit }}</td>
-      <td>{{ i.safety_stock }}</td>
-      <td><input type="number" step="0.01" min="0" name="restock_{{ i.id }}" placeholder="留空=不入库" /></td>
-    </tr>
+      <div class="entry-row">
+        <div class="er-meta">
+          <span class="er-cat">{{ i.category_name }}</span>
+          <span class="er-name">{{ i.name }}</span>
+        </div>
+        <div class="er-stock">
+          <span>当前 <strong>{{ i.quantity | fmt_qty }}</strong> {{ i.unit }}</span>
+          <span>安全 <strong>{{ i.safety_stock | fmt_qty if i.safety_stock is not none else 0 }}</strong> {{ i.unit }}</span>
+        </div>
+        <div class="er-input">
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            inputmode="decimal"
+            name="restock_{{ i.id }}"
+            placeholder="0"
+            autocomplete="off"
+          />
+          <span class="er-unit">{{ i.unit }}</span>
+        </div>
+      </div>
     {% endfor %}
-  </table>
+  </div>
 </form>
 {% endblock %}

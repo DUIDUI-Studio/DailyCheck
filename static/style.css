@@ -530,6 +530,203 @@ code {
 }
 .warehouse-card details > summary::-webkit-details-marker { display: none; }
 
+/* === restock / outbound / adjustment / stocktake session (pad-first) === */
+
+.session-form {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 14px 16px 88px;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
+}
+.session-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--panel);
+  margin: -14px -16px 14px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px 14px;
+  align-items: center;
+}
+.session-head h2 { margin: 0; font-size: 18px; }
+.session-head .hint {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+}
+.session-head .session-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.session-head .session-actions input {
+  width: 280px;
+  max-width: 100%;
+}
+.session-head .session-actions button { width: auto; min-width: 140px; }
+
+.entry-grid {
+  display: grid;
+  gap: 10px;
+}
+.entry-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fafbfd;
+}
+.entry-row.is-warn { background: #fef9c3; border-color: #fde68a; }
+.entry-row.is-low { background: #fff7ed; border-color: #fed7aa; }
+.entry-row .er-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+}
+.entry-row .er-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.entry-row .er-cat {
+  font-size: 11px;
+  color: var(--muted);
+  background: #eef2f6;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.entry-row .er-stock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.entry-row .er-stock strong { color: var(--text); font-weight: 600; }
+.entry-row .er-stock .er-warn { color: #b45309; font-weight: 600; }
+.entry-row .er-input {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.entry-row .er-input input {
+  font-size: 16px;
+  padding: 12px 14px;
+  text-align: right;
+}
+.entry-row .er-input .er-unit {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+/* pad: 768-1180, two-column card grid */
+@media (min-width: 720px) {
+  .entry-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (min-width: 1100px) {
+  .entry-grid { grid-template-columns: 1fr 1fr 1fr; }
+}
+
+/* list cards for inbound/outbound/adjustment history */
+.record-list { display: grid; gap: 10px; margin-top: 14px; }
+.record-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 14px;
+  align-items: center;
+}
+.record-card .rc-main { min-width: 0; }
+.record-card .rc-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+.record-card .rc-meta {
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.record-card .rc-meta .sep { color: #cbd5e1; }
+.record-card .rc-right {
+  text-align: right;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.record-card .rc-qty {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--brand-ink);
+}
+.record-card .rc-qty small { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+.record-card .rc-status {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #ecfeff;
+  border: 1px solid #a5f3fc;
+  color: #0e7490;
+  font-weight: 600;
+}
+.record-card .rc-status.done { background: #ecfdf5; border-color: #6ee7b7; color: #047857; }
+.record-card .rc-status.rollback { background: #fef3c7; border-color: #fde68a; color: #92400e; }
+.record-card .rc-actions { display: flex; gap: 6px; }
+.record-card .rc-actions form { display: inline; }
+
+@media (min-width: 960px) {
+  .record-list { grid-template-columns: 1fr 1fr; }
+  .record-card { padding: 14px 18px; }
+}
+
+/* list header (date group) */
+.record-day {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 18px 4px 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.record-day::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* list-page header row (new button + title) */
+.list-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.list-head h2 { margin: 0; }
+.list-head form { margin: 0; }
+.list-head form button { width: auto; min-width: 140px; }
+
 /* mobile layout: stack everything vertically */
 @media (max-width: 720px) {
   .user-card-head { flex-direction: column; }
@@ -540,4 +737,14 @@ code {
   .role-row-form { width: 100%; }
   .role-row-form select,
   .role-row-form input[type="password"] { flex: 1; }
+  .session-head {
+    grid-template-columns: 1fr;
+  }
+  .session-head .session-actions { width: 100%; }
+  .session-head .session-actions input { width: 100%; }
+  .session-head .session-actions button { width: 100%; }
+  .session-head h2 { font-size: 17px; }
+  .record-card { grid-template-columns: 1fr; }
+  .record-card .rc-right { align-items: flex-start; text-align: left; }
+  .record-card .rc-qty { font-size: 22px; }
 }
