@@ -128,17 +128,23 @@ def inventory_view():
     cat = request.args.get("cat", "").strip()
     # 7-day consumption per item: sum of |delta| for action='出库' in the
     # last 7 days, with stocktake loss already written as action='出库'
-    # (口径 B — see stocktake.approve). Daily avg = total / 7.
+    # (口径 B — see stocktake.approve). Daily avg = total / active_days,
+    # where active_days = distinct dates with at least one outbound in
+    # the window. Items that did not move at all in 7d are excluded
+    # from the subquery, so the per-item avg is only shown when there
+    # is real activity to average over.
     rows = db.execute(
         f"""SELECT i.*, c.name AS category_name,
                   COALESCE(c7.qty, 0) AS consume_7d_qty,
-                  COALESCE(c7.value, 0) AS consume_7d_value
+                  COALESCE(c7.value, 0) AS consume_7d_value,
+                  COALESCE(c7.days, 0) AS consume_7d_days
            FROM items i
            JOIN categories c ON c.id = i.category_id
            LEFT JOIN (
                SELECT m.item_id,
                       ABS(SUM(m.delta)) AS qty,
-                      ROUND(ABS(SUM(m.delta)) * i2.unit_cost, 2) AS value
+                      ROUND(ABS(SUM(m.delta)) * i2.unit_cost, 2) AS value,
+                      COUNT(DISTINCT substr(m.created_at, 1, 10)) AS days
                FROM stock_movements m
                JOIN items i2 ON i2.id = m.item_id
                WHERE m.action = '出库'
