@@ -84,7 +84,10 @@ def product_edit(product_id: int):
             "UPDATE products SET name=?, unit=?, note=? WHERE id=?",
             (name, unit, note, product_id),
         )
-        # BOM rows: parallel arrays
+        # BOM rows: parallel arrays. bom_row_id[] identifies existing rows
+        # (empty string = new); bom_delete[]='1' removes that row. We do
+        # NOT need a separate product_bom check on delete — schema has
+        # ON DELETE CASCADE from products (see db/__init__.py).
         bom_ids = request.form.getlist("bom_row_id")
         item_ids = request.form.getlist("bom_item_id")
         qtys = request.form.getlist("bom_qty")
