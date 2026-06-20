@@ -91,8 +91,8 @@ CREATE INDEX IF NOT EXISTS idx_pruni_run ON production_run_items(run_id);
 ```
 
 ### 迁移策略
-- 全部走 `CREATE TABLE IF NOT EXISTS`，老仓库 db 文件首次连接即自动建表（`init_warehouse_db` 已经在每次启动调用）
-- 不需要 `migrate_warehouse_db_columns` 补丁
+- 新仓库 db 文件通过 `init_warehouse_db` 自动建表
+- 老仓库 db 文件通过 `migrate_warehouse_db_columns` 在每次请求时执行 `executescript(WAREHOUSE_SCHEMA)` 拾取新增表/索引（`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` 全部幂等）
 
 ## 新增/修改页面
 
