@@ -287,6 +287,7 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
     if not db_path.exists():
         return
     with closing(sqlite3.connect(db_path)) as conn:
+        conn.executescript(WAREHOUSE_SCHEMA)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(stocktake_batches)").fetchall()}
         if "status" not in cols:
             conn.execute(
