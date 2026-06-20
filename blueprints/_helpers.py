@@ -6,6 +6,7 @@ blueprints/auth.py's before_app_request hook.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, abort, flash, g, redirect, render_template, request, url_for
 from werkzeug.security import generate_password_hash
@@ -46,6 +47,52 @@ def gen_sku() -> str:
     return f"AUTO-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
 
+# Quantities are decimal with 2 dp. Float would be lossy
+# (e.g. 0.1 + 0.2 = 0.30000000000000004); Decimal preserves precision.
+def parse_qty(raw) -> float:
+    """Parse a quantity value (str | int | float | None) as float with 2 dp.
+
+    Uses Decimal internally to avoid float-string rounding traps
+    (0.1 + 0.2 = 0.30000000000000004) and emits float() so sqlite3
+    accepts the value as a parameter binding. The 2-dp quantize keeps
+    "1.55" from becoming 1.5500000000000003.
+
+    Returns 0.0 on empty / None / invalid input — callers decide
+    whether to treat 0 as a no-op (skip) or an explicit value.
+    Negative numbers are preserved — the caller is expected to
+    validate non-negativity (or not) before/after calling.
+    """
+    if raw is None:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        try:
+            return float(Decimal(str(raw)).quantize(Decimal('0.01')))
+        except InvalidOperation:
+            return 0.0
+    s = str(raw).strip()
+    if not s:
+        return 0.0
+    try:
+        v = Decimal(s).quantize(Decimal('0.01'))
+    except InvalidOperation:
+        return 0.0
+    return float(v)
+
+
+def fmt_qty(value) -> str:
+    """Format a quantity for display: trim trailing zeros but keep
+    up to 2 decimal places. Decimal('1.50') → '1.5' (but display
+    as '1.50' if we wanted). Returns '0' for None / zero."""
+    if value is None:
+        return '0'
+    d = Decimal(str(value)).quantize(Decimal('0.01'))
+    s = str(d)
+    # '1.50' -> '1.5'; '1.00' -> '1'
+    if '.' in s:
+        s = s.rstrip('0').rstrip('.')
+    return s or '0'
+
+
 def render(template: str, **context):
     """Pass common context (current warehouse / user / role) implicitly."""
     ctx = dict(context)
@@ -54,3 +101,20 @@ def render(template: str, **context):
     if "user" not in ctx and g.get("user") is not None:
         ctx["user"] = g.user
     return render_template(template, **ctx)
+
+
+def register_jinja_filters(app) -> None:
+    """Expose fmt_qty and fmt_money to Jinja templates."""
+    app.jinja_env.filters["fmt_qty"] = fmt_qty
+    app.jinja_env.filters["fmt_money"] = fmt_money
+
+
+def fmt_money(value) -> str:
+    """Render a money value with thousands separator and 2 dp."""
+    if value is None:
+        return "0.00"
+    try:
+        d = Decimal(str(value)).quantize(Decimal('0.01'))
+    except InvalidOperation:
+        return "0.00"
+    return f"{d:,.2f}"

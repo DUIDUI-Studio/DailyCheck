@@ -11,7 +11,7 @@
   <tr>
     <td>{{ r.created_at }}</td>
     <td>{{ r.item_name }}</td>
-    <td>{{ r.requested_quantity }} {{ r.unit }}</td>
+    <td>{{ r.requested_quantity | fmt_qty }} {{ r.unit }}</td>
     <td>{{ r.reason }}</td>
     <td>{% if r.rolled_back == 1 %}已回退{% else %}{{ r.status }}{% endif %}</td>
     <td>

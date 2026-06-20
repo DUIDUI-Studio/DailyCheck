@@ -30,11 +30,11 @@
   </label>
   <label>
     <span>初始库存</span>
-    <input name="quantity" type="number" min="0" />
+    <input name="quantity" type="number" min="0" step="0.01" />
   </label>
   <label>
     <span>安全库存</span>
-    <input name="safety_stock" type="number" min="0" />
+    <input name="safety_stock" type="number" min="0" step="0.01" />
   </label>
   <label>
     <span>进货单价（¥）</span>
@@ -53,7 +53,7 @@
   {% for i in items %}
   <tr>
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
-    <td>{{ i.quantity }} {{ i.unit }}</td><td>{{ i.safety_stock }}</td>
+    <td>{{ i.quantity | fmt_qty }} {{ i.unit }}</td><td>{{ i.safety_stock | fmt_qty }}</td>
     <td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>
     <td>{{ i.updated_at }}</td>
     <td class="inline">

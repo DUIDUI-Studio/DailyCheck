@@ -12,7 +12,7 @@
   <tr>
     <td>{{ r.created_at }}</td>
     <td>{{ r.item_name }}</td>
-    <td>{{ r.adjusted_quantity }} {{ r.unit }}</td>
+    <td>{{ r.adjusted_quantity | fmt_qty }} {{ r.unit }}</td>
     <td>{{ r.reason }}</td>
     <td>{% if r.rolled_back == 1 %}已回退{% else %}已执行{% endif %}</td>
     <td>

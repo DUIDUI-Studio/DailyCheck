@@ -21,7 +21,7 @@
     <td>{{ m.created_at }}</td>
     <td>{{ m.item_name }}</td>
     <td>{{ m.action }}</td>
-    <td>{{ m.delta }}</td>
+    <td>{{ m.delta | fmt_qty }}</td>
   </tr>
   {% endfor %}
 </table>

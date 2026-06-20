@@ -9,10 +9,10 @@
 <table>
   <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th><th>状态</th><th>更新时间</th></tr>
   {% for i in items %}
-  <tr class="{% if i.quantity == 0 %}danger-row{% elif i.quantity <= i.safety_stock %}warn-row{% endif %}">
+  <tr class="{% if i.quantity <= 0 %}danger-row{% elif i.quantity <= i.safety_stock %}warn-row{% endif %}">
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
-    <td>{{ i.quantity }} {{ i.unit }}</td><td>{{ i.safety_stock }}</td>
-    <td>{% if i.quantity == 0 %}<span class="danger">0库存</span>{% elif i.quantity <= i.safety_stock %}<span class="warn">需补货</span>{% else %}正常{% endif %}</td>
+    <td>{{ i.quantity | fmt_qty }} {{ i.unit }}</td><td>{{ i.safety_stock | fmt_qty }}</td>
+    <td>{% if i.quantity <= 0 %}<span class="danger">0库存</span>{% elif i.quantity <= i.safety_stock %}<span class="warn">需补货</span>{% else %}正常{% endif %}</td>
     <td>{{ i.updated_at }}</td>
   </tr>
   {% endfor %}

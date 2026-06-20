@@ -7,7 +7,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import fixed_categories_in_clause, gen_sku, now
+from ._helpers import fixed_categories_in_clause, fmt_qty, gen_sku, now, parse_qty
 from .auth import audit
 
 
@@ -22,8 +22,8 @@ def items_list():
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         category_id = request.form.get("category_id", "").strip()
-        quantity = int(request.form.get("quantity", "0") or 0)
-        safety_stock = int(request.form.get("safety_stock", "0") or 0)
+        quantity = parse_qty(request.form.get("quantity", "0"))
+        safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
 
@@ -70,7 +70,7 @@ def edit_item(item_id: int):
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         category_id = request.form.get("category_id", "").strip()
-        safety_stock = int(request.form.get("safety_stock", "0") or 0)
+        safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
         if not name or not category_id:

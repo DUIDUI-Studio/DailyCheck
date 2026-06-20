@@ -57,7 +57,7 @@
   <tr>
     <td>{{ item.item_name }}</td>
     <td>{{ item.category_name }}</td>
-    <td>{{ item.consumed_qty }} {{ item.unit }}</td>
+    <td>{{ item.consumed_qty | fmt_qty }} {{ item.unit }}</td>
     <td>¥{{ "{:,.2f}".format(item.consumed_value) }}</td>
   </tr>
   {% else %}

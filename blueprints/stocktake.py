@@ -7,7 +7,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import now
+from ._helpers import now, parse_qty
 from .auth import audit
 
 
@@ -57,8 +57,8 @@ def stocktake_submit():
         raw = request.form.get(f"actual_{item['id']}", "").strip()
         if raw == "":
             continue
-        actual_quantity = int(raw)
-        previous_quantity = int(item["quantity"])
+        actual_quantity = parse_qty(raw)
+        previous_quantity = parse_qty(item["quantity"])
         diff = actual_quantity - previous_quantity
         changed_rows.append((int(item["id"]), previous_quantity, actual_quantity, diff))
 
@@ -102,7 +102,7 @@ def rollback(batch_id: int):
         "SELECT item_id, diff FROM stocktakes WHERE batch_id = ?", (batch_id,)
     ).fetchall()
     for record in records:
-        diff = int(record["diff"])
+        diff = parse_qty(record["diff"])
         if diff == 0:
             continue
         item_id = int(record["item_id"])
@@ -187,13 +187,12 @@ def submit_edit(batch_id: int):
         raw = request.form.get(f"actual_{rec['item_id']}", "").strip()
         if raw == "":
             continue
-        try:
-            new_actual = int(raw)
-        except ValueError:
-            continue
-        current_qty = db.execute(
-            "SELECT quantity FROM items WHERE id = ?", (int(rec["item_id"]),)
-        ).fetchone()["quantity"]
+        new_actual = parse_qty(raw)
+        current_qty = parse_qty(
+            db.execute(
+                "SELECT quantity FROM items WHERE id = ?", (int(rec["item_id"]),)
+            ).fetchone()["quantity"]
+        )
         new_diff = new_actual - current_qty
         if new_diff == 0:
             continue
@@ -255,7 +254,7 @@ def approve(batch_id: int):
     ).fetchall()
     loss_items, gain_items = [], []
     for record in records:
-        diff = int(record["diff"])
+        diff = parse_qty(record["diff"])
         if diff == 0:
             continue
         item_id = int(record["item_id"])

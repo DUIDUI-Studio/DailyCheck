@@ -16,7 +16,7 @@
       <td>{{ i.name }}</td>
       <td>{{ i.quantity }} {{ i.unit }}</td>
       <td>{{ i.safety_stock }}</td>
-      <td><input type="number" min="0" name="actual_{{ i.id }}" placeholder="必填" required /></td>
+      <td><input type="number" step="0.01" min="0" name="actual_{{ i.id }}" placeholder="必填" required /></td>
     </tr>
     {% endfor %}
   </table>

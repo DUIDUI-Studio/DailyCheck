@@ -6,7 +6,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import now
+from ._helpers import now, parse_qty
 from .auth import audit
 
 
@@ -54,9 +54,10 @@ def restock_submit():
         raw = request.form.get(f"restock_{item['id']}", "").strip()
         if raw == "":
             continue
-        qty = int(raw)
-        if qty > 0:
-            rows.append((int(item["id"]), qty))
+        qty = parse_qty(raw)
+        if qty <= 0:
+            continue
+        rows.append((int(item["id"]), qty))
     if not rows:
         flash("请至少填写一个补货数量")
         return redirect(url_for("restock.restock_session"))

@@ -16,7 +16,7 @@
       <td>{{ i.name }}</td>
       <td>{{ i.quantity }} {{ i.unit }}</td>
       <td>{{ i.safety_stock }}</td>
-      <td><input type="number" min="0" name="adjustment_{{ i.id }}" placeholder="留空=不调整" /></td>
+      <td><input type="number" step="0.01" min="0" name="adjustment_{{ i.id }}" placeholder="留空=不调整" /></td>
     </tr>
     {% endfor %}
   </table>

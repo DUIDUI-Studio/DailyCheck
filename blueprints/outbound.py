@@ -1,11 +1,13 @@
 """Outbound requests: create, submit, rollback, delete."""
 from __future__ import annotations
 
+from decimal import Decimal
+
 from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import now
+from ._helpers import now, parse_qty
 from .auth import audit
 
 
@@ -53,10 +55,10 @@ def outbound_submit():
         raw = request.form.get(f"outbound_{item['id']}", "").strip()
         if raw == "":
             continue
-        qty = int(raw)
+        qty = parse_qty(raw)
         if qty <= 0:
             continue
-        if qty > int(item["quantity"]):
+        if qty > Decimal(str(item["quantity"])):
             flash("存在出库数量大于当前库存的品项，请检查后重试")
             return redirect(url_for("outbound.outbound_session"))
         rows.append((int(item["id"]), qty))
