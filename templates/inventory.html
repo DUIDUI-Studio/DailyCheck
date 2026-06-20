@@ -102,7 +102,7 @@
           <span class="metric-label">日均消耗</span>
           <span class="metric-value small">
             {% if i.consume_7d_days and i.consume_7d_days > 0 %}
-              ¥{{ c7v | fmt_money }}<small>/{{ i.consume_7d_days }}d</small>
+              {{ (c7 / i.consume_7d_days) | fmt_qty }}<small>{{ i.unit }}/{{ i.consume_7d_days }}d</small>
             {% else %}
               —
             {% endif %}
