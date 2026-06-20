@@ -1,24 +1,85 @@
-{% extends 'base.html' %}
+{% extends "base.html" %}
 {% block content %}
-<h2>盘点录入</h2>
-<p>所有品项均必须填写实盘数量，不能留空。</p>
-<form method="post" action="{{ url_for('stocktake.stocktake_submit') }}">
-  <div class="form-inline">
-    <input name="note" placeholder="本次盘点备注（可选）" />
-    <button type="submit">提交本次盘点</button>
+<form method="post" action="{{ url_for('stocktake.stocktake_submit') }}" class="session-form">
+  <div class="session-head">
+    <h2>盘点录入</h2>
+    <div class="session-actions">
+      <input name="note" placeholder="本次盘点备注（可选）" />
+      <button type="submit">提交本次盘点</button>
+    </div>
+    <p class="hint">所有品项均必须填写实盘数量。点击下方品类可快速定位。</p>
   </div>
 
-  <table>
-    <tr><th>品类</th><th>品项</th><th>当前库存</th><th>安全库存</th><th>盘点数量（必填）</th></tr>
-    {% for i in items %}
-    <tr>
-      <td>{{ i.category_name }}</td>
-      <td>{{ i.name }}</td>
-      <td>{{ i.quantity }} {{ i.unit }}</td>
-      <td>{{ i.safety_stock }}</td>
-      <td><input type="number" step="0.01" min="0" name="actual_{{ i.id }}" placeholder="必填" required /></td>
-    </tr>
+  {% set ns = namespace(cats=[]) %}
+  {% for i in items %}
+    {% if i.category_name not in ns.cats %}
+      {% set ns.cats = ns.cats + [i.category_name] %}
+    {% endif %}
+  {% endfor %}
+  <div class="cat-bar" role="tablist" aria-label="按品类筛选">
+    <button type="button" class="cat-chip is-active" data-cat="__all" role="tab" aria-selected="true">全部</button>
+    {% for c in ns.cats %}
+      <button type="button" class="cat-chip" data-cat="{{ c }}" role="tab" aria-selected="false">{{ c }}</button>
     {% endfor %}
-  </table>
+  </div>
+
+  <div class="entry-grid" data-cat-bar>
+    {% for i in items %}
+      <div class="entry-row" data-cat="{{ i.category_name }}">
+        <div class="er-meta">
+          <span class="er-cat">{{ i.category_name }}</span>
+          <span class="er-name">{{ i.name }}</span>
+        </div>
+        <div class="er-stock">
+          <span>当前 <strong>{{ i.quantity | fmt_qty }}</strong> {{ i.unit }}</span>
+          <span>安全 <strong>{{ i.safety_stock | fmt_qty if i.safety_stock is not none else 0 }}</strong> {{ i.unit }}</span>
+        </div>
+        <div class="er-input">
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            inputmode="decimal"
+            name="actual_{{ i.id }}"
+            placeholder="必填"
+            required
+            autocomplete="off"
+          />
+          <span class="er-unit">{{ i.unit }}</span>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
 </form>
+
+<script>
+  (function () {
+    var bar = document.querySelector('[data-cat-bar]');
+    if (!bar) return;
+    var chips = document.querySelectorAll('.cat-chip');
+    var rows = bar.querySelectorAll('.entry-row');
+    function apply(cat) {
+      for (var i = 0; i < chips.length; i++) {
+        var on = chips[i].getAttribute('data-cat') === cat;
+        chips[i].classList.toggle('is-active', on);
+        chips[i].setAttribute('aria-selected', on ? 'true' : 'false');
+      }
+      var first = null;
+      for (var j = 0; j < rows.length; j++) {
+        var row = rows[j];
+        var match = (cat === '__all') || (row.getAttribute('data-cat') === cat);
+        row.classList.toggle('is-hidden', !match);
+        if (match && first === null) first = row;
+      }
+      if (cat !== '__all' && first) {
+        first.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      }
+    }
+    for (var k = 0; k < chips.length; k++) {
+      chips[k].addEventListener('click', (function (c) {
+        return function () { apply(c); };
+      })(chips[k].getAttribute('data-cat')));
+    }
+  })();
+</script>
 {% endblock %}
