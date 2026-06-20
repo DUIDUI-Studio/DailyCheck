@@ -2,6 +2,29 @@
 {% block content %}
 <div class="list-head">
   <h2>产品</h2>
+  <a class="btn" href="{{ url_for('production.product_new') }}">+ 新建产品</a>
 </div>
-<p class="muted">暂无产品。</p>
+
+{% if products %}
+  <div class="card-list">
+    {% for p in products %}
+    <div class="card">
+      <div class="card-main">
+        <h3>{{ p['name'] }}</h3>
+        <p class="muted">单位：{{ p['unit'] }}{% if p['note'] %} · {{ p['note'] }}{% endif %}</p>
+        <p>配方项数：<strong>{{ p['bom_count'] }}</strong></p>
+      </div>
+      <div class="card-actions">
+        <span class="btn-sm btn-disabled" title="录入页在 Task 5 启用">录入</span>
+        <a class="btn-sm" href="{{ url_for('production.product_edit', product_id=p['id']) }}">编辑配方</a>
+        <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" onsubmit="return confirm('确认删除该产品？');">
+          <button class="btn-sm btn-delete" type="submit">删除</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="muted">暂无产品，点击右上"新建产品"开始。</p>
+{% endif %}
 {% endblock %}
