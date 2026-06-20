@@ -29,6 +29,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(create_user_cmd)
     app.cli.add_command(assign_role_cmd)
     app.cli.add_command(list_users_cmd)
+    app.cli.add_command(bootstrap_cmd)
 
 
 @click.command("init-master")
@@ -133,3 +134,77 @@ def list_users_cmd() -> None:
             ).fetchall()
             for r in roles:
                 click.echo(f"    {r['code']}: {r['role']}")
+
+
+@click.command("bootstrap")
+@click.option("--admin-username", default="admin", show_default=True)
+@click.option("--admin-password", default="admin123", show_default=True)
+@click.option(
+    "--warehouse-code", default="wh_001", show_default=True,
+    help="First warehouse code to create (only used if no warehouses exist yet)."
+)
+@click.option(
+    "--warehouse-name", default="中央仓", show_default=True,
+    help="Display name for the first warehouse."
+)
+def bootstrap_cmd(
+    admin_username: str, admin_password: str,
+    warehouse_code: str, warehouse_name: str,
+) -> None:
+    """One-shot first-run setup: master.db + admin user + first warehouse.
+
+    Run this on a fresh clone (no db files committed). Idempotent — if
+    master.db / users / warehouses already exist, those steps are
+    skipped. Always runnable; never destroys data.
+    """
+    from datetime import datetime
+    from werkzeug.security import generate_password_hash
+
+    # 1) master.db
+    init_master_db()
+    click.echo(f"  master.db schema ready at {MASTER_DB}")
+
+    # 2) admin user
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        existing_admin = conn.execute(
+            "SELECT id FROM users WHERE username=?", (admin_username,)
+        ).fetchone()
+        if existing_admin is None:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """INSERT INTO users
+                   (username, password_hash, is_admin, created_at)
+                   VALUES (?, ?, 1, ?)""",
+                (admin_username, generate_password_hash(admin_password), now),
+            )
+            conn.commit()
+            click.echo(f"  admin user '{admin_username}' created")
+        else:
+            click.echo(f"  admin user '{admin_username}' already exists, skipped")
+
+    # 3) first warehouse (only if none exist)
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        any_wh = conn.execute("SELECT 1 FROM warehouses LIMIT 1").fetchone()
+    if any_wh is None:
+        # Inline create-warehouse logic so we don't double-import.
+        from db import init_warehouse_db
+        from config import WAREHOUSE_DB_DIR
+        db_path = WAREHOUSE_DB_DIR / f"{warehouse_code}.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        init_warehouse_db(db_path)
+        rel_path = str(db_path.relative_to(BASE_DIR))
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with closing(sqlite3.connect(MASTER_DB)) as conn:
+            conn.execute(
+                """INSERT INTO warehouses (code, name, db_path, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (warehouse_code, warehouse_name, rel_path, now),
+            )
+            conn.commit()
+        click.echo(f"  warehouse '{warehouse_code}' ({warehouse_name}) created")
+    else:
+        click.echo("  warehouses already exist, skipped")
+
+    click.echo(
+        f"\nBootstrap complete. Login: {admin_username} / {admin_password}"
+    )

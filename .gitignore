@@ -8,3 +8,10 @@ static/icons/icon-192.tmp
 access.log
 error.log
 .inventory.db.original.backup
+
+# SQLite databases are runtime state, not source. They get re-created
+# by `flask init-master` + `flask create-warehouse` on a fresh clone.
+# Keep the schema (db/__init__.py) and migration / import scripts in
+# git, but the actual db files stay local.
+db/master.db
+db/warehouses/*.db
