@@ -2,6 +2,7 @@
 {% block content %}
 <div class="list-head">
   <h2>生产记录</h2>
+  <a class="btn" href="{{ url_for('production.runs_csv') }}">导出 CSV</a>
   <a class="btn" href="{{ url_for('production.session') }}">+ 新建生产</a>
 </div>
 

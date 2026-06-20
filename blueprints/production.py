@@ -1,11 +1,13 @@
 """Production: products, BOM, runs, rollback, delete, CSV export."""
 from __future__ import annotations
 
+import csv
+import io
 import sqlite3
-
+from datetime import datetime
 from decimal import Decimal
 
-from flask import Blueprint, flash, g, redirect, request, url_for
+from flask import Blueprint, current_app, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
@@ -393,3 +395,48 @@ def delete_run(run_id: int):
     })
     flash("生产记录已删除" + ("，库存已归还" if int(run["rolled_back"]) == 0 else ""))
     return redirect(url_for("production.runs_list"))
+
+
+@bp.route("/production/runs.csv", methods=["GET"])
+@require_login
+def runs_csv():
+    """CSV download: one row per production_run_item.
+
+    口径:包含 rolled_back=1 的行(审计需要),文件加 UTF-8 BOM 以兼容 Excel CN。
+    """
+    db = get_warehouse_db()
+    rows = db.execute(
+        """SELECT pr.id AS run_id, pr.created_at, pr.created_by,
+                  pr.output_qty, pr.note AS run_note, pr.rolled_back,
+                  p.name AS product_name, p.unit AS product_unit,
+                  pri.planned_qty, pri.actual_qty,
+                  i.sku AS item_sku, i.name AS item_name, i.unit AS item_unit
+           FROM production_runs pr
+           JOIN products p ON p.id = pr.product_id
+           JOIN production_run_items pri ON pri.run_id = pr.id
+           JOIN items i ON i.id = pri.item_id
+           ORDER BY pr.id DESC, pri.id"""
+    ).fetchall()
+    audit("production.runs_export", "report", None, {"rows": len(rows)})
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "run_id", "created_at", "created_by", "product_name", "output_qty",
+        "output_unit", "item_sku", "item_name", "planned_qty", "actual_qty",
+        "item_unit", "rolled_back", "run_note",
+    ])
+    for r in rows:
+        writer.writerow([
+            r["run_id"], r["created_at"], r["created_by"] or "",
+            r["product_name"], r["output_qty"], r["product_unit"],
+            r["item_sku"], r["item_name"], r["planned_qty"], r["actual_qty"],
+            r["item_unit"], r["rolled_back"], r["run_note"] or "",
+        ])
+    today = datetime.now().strftime("%Y%m%d")
+    response = current_app.response_class(
+        output.getvalue().encode("utf-8-sig"),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename=production_runs_{today}.csv"},
+    )
+    return response

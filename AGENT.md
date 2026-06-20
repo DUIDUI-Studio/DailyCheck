@@ -28,12 +28,15 @@ flask --app app run --host 0.0.0.0 --port 5001 --debug
 - `static/sw.js`：Service Worker（缓存与离线策略）
 - `static/offline.html`：离线回退页
 - `static/icons/`：PWA 图标
+- `blueprints/production.py`：生产录入（产品/BOM/生产批次/回退/CSV）
 
 ## 关键业务约束
 - 固定品类：`包材`、`原料`、`工具`
 - 品类页仅展示固定品类，不允许新增/删除
 - 库存品若存在关联业务记录（入库/盘点/补货）不可删除
 - 入库记录删除时会回滚库存
+- 产品定义独立于库存品（products 表），产品本身不入库、不产生库存
+- 生产录入时若任一原料库存不足，提交被硬性拦截
 
 ## 盘点流程（当前设计）
 1. 在 `/stocktake` 点击“开始盘点”
@@ -49,6 +52,10 @@ flask --app app run --host 0.0.0.0 --port 5001 --debug
 - `stocktakes`：盘点明细记录（支持 `batch_id`）
 - `stocktake_batches`：盘点批次（支持回滚状态）
 - `restock_requests`：补货申请
+- `products`：产品定义（独立于库存品）
+- `product_bom`：产品-原料配方
+- `production_runs`：生产批次
+- `production_run_items`：批次原料消耗
 
 ## 常见维护任务
 - 修改固定品类：调整 `app.py` 中 `FIXED_CATEGORIES`
