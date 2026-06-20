@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime
 from decimal import Decimal
 
-from flask import Blueprint, current_app, flash, g, redirect, request, url_for
+from flask import Blueprint, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
@@ -403,7 +403,10 @@ def runs_csv():
     """CSV download: one row per production_run_item.
 
     口径:包含 rolled_back=1 的行(审计需要),文件加 UTF-8 BOM 以兼容 Excel CN。
+    粒度比 /export/consumption 更细:这里每行是一条生产批次的某一种原料消耗,
+    在 Excel 里按 run_id 透视即可还原完整批次。
     """
+    from flask import current_app  # match reports.py local-import style
     db = get_warehouse_db()
     rows = db.execute(
         """SELECT pr.id AS run_id, pr.created_at, pr.created_by,
