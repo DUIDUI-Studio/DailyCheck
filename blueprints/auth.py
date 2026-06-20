@@ -71,6 +71,11 @@ def load_user_and_warehouse():
                    WHERE user_id=? AND warehouse_id=?""",
                 (user_id, warehouse_id),
             ).fetchone()
+            # Run idempotent column migrations on the warehouse db so
+            # legacy dbs created before certain columns still work.
+            # Cheap when already up-to-date (just PRAGMA lookups).
+            from db import migrate_warehouse_db_columns
+            migrate_warehouse_db_columns(Path(g.warehouse_db_path))
         else:
             session.pop("warehouse_id", None)
 

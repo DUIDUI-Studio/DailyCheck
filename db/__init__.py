@@ -39,6 +39,9 @@ def get_warehouse_db() -> sqlite3.Connection:
         path = g.get("warehouse_db_path")
         if not path:
             raise RuntimeError("No warehouse selected")
+        # Idempotent column migrations for legacy dbs. Cheap when
+        # already up-to-date (just a PRAGMA lookup).
+        migrate_warehouse_db_columns(Path(path))
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -200,13 +203,25 @@ def init_master_db() -> None:
 
 
 def init_warehouse_db(db_path: Path) -> None:
-    """Create the schema for one warehouse db if missing, and seed fixed categories."""
+    """Create the schema for one warehouse db if missing, and seed fixed categories.
+
+    Also runs idempotent column-add migrations for tables that pre-date
+    some columns (CREATE TABLE IF NOT EXISTS is a no-op for existing
+    tables, so missing columns must be added separately).
+    """
     from datetime import datetime
     from config import FIXED_CATEGORIES
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(db_path)) as conn:
         conn.executescript(WAREHOUSE_SCHEMA)
+        # Defensive column-add migrations for legacy warehouse dbs that
+        # were created before the column was introduced.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(stocktake_batches)").fetchall()}
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE stocktake_batches ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            )
         existing = {r[0] for r in conn.execute("SELECT name FROM categories").fetchall()}
         for name in FIXED_CATEGORIES:
             if name not in existing:
@@ -215,3 +230,23 @@ def init_warehouse_db(db_path: Path) -> None:
                     (name, "系统固定品类", ts),
                 )
         conn.commit()
+
+
+def migrate_warehouse_db_columns(db_path: Path) -> None:
+    """Run idempotent column-add migrations on an EXISTING warehouse db.
+
+    Safe to call on every request — every check is gated by a
+    PRAGMA table_info lookup so the ALTER only runs when needed.
+
+    Called from get_warehouse_db() so legacy dbs get patched on the
+    fly without requiring a separate init step.
+    """
+    if not db_path.exists():
+        return
+    with closing(sqlite3.connect(db_path)) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(stocktake_batches)").fetchall()}
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE stocktake_batches ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            )
+            conn.commit()
