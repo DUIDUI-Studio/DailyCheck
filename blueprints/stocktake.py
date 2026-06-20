@@ -115,6 +115,23 @@ def rollback(batch_id: int):
                VALUES (?, '盘点回滚', ?, ?, ?)""",
             (item_id, -diff, f"回滚盘点批次#{batch_id}", now()),
         )
+
+    # Reverse any synthetic outbound_requests written at approve time
+    # so /summary no longer counts the loss as consumption. We hard-
+    # delete the row rather than flipping rolled_back, because the
+    # user's intent at this point is "undo the approval entirely".
+    batch_row = db.execute(
+        "SELECT loss_req_ids FROM stocktake_batches WHERE id=?", (batch_id,)
+    ).fetchone()
+    if batch_row and batch_row["loss_req_ids"]:
+        for req_id in (
+            int(x) for x in batch_row["loss_req_ids"].split(",") if x.strip()
+        ):
+            db.execute(
+                "DELETE FROM outbound_requests WHERE id=? AND reason=?",
+                (req_id, f"盘点审核#{batch_id}盘亏"),
+            )
+
     db.execute(
         "UPDATE stocktake_batches SET rolled_back = 1, status = 'rolled_back' WHERE id = ?",
         (batch_id,),
@@ -206,8 +223,18 @@ def submit_edit(batch_id: int):
 @bp.route("/stocktake/batch/<int:batch_id>/approve", methods=["POST"])
 @require_role("manager")
 def approve(batch_id: int):
-    """Approval: loss becomes 出库 (consumption), gain becomes 库存调整,
-    no inbound. Per design decision documented in commit c6a64dd.
+    """Approval semantics (口径 B):
+    - 盘亏 (diff < 0): real consumption. We write a synthetic
+      outbound_requests row (rolled_back=0) so /summary counts it
+      in total_consumed_value, AND the matching stock_movements
+      action='出库' row for the flow / audit trail.
+    - 盘盈 (diff > 0): only inventory adjustment (账面增, NOT counted
+      as consumption). Written to stock_movements.action='库存调整'.
+      Operators can use the adjustment-order page to write off a
+      盘盈 that was actually a previous 出库-mis-entry.
+
+    Rollback reverses both: deletes the synthetic outbound_requests,
+    or flips rolled_back=1 if a later rollback is needed.
     """
     db = get_warehouse_db()
     batch = db.execute(
@@ -234,32 +261,56 @@ def approve(batch_id: int):
         item_id = int(record["item_id"])
         (loss_items if diff < 0 else gain_items).append((item_id, diff))
 
+    # Apply stock changes first.
     for item_id, diff in loss_items + gain_items:
         db.execute(
             "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
             (diff, now(), item_id),
         )
+
+    # 盘亏 → write a synthetic outbound request so summary counts it.
+    # Store the new req id in the audit so rollback can find it.
+    loss_req_ids = []
     for item_id, diff in loss_items:
+        loss_qty = abs(diff)
+        cur = db.execute(
+            """INSERT INTO outbound_requests
+               (item_id, requested_quantity, reason, status, rolled_back, created_at)
+               VALUES (?, ?, ?, '出库', 0, ?)""",
+            (
+                item_id, loss_qty,
+                f"盘点审核#{batch_id}盘亏",
+                now(),
+            ),
+        )
+        loss_req_ids.append(int(cur.lastrowid))
         db.execute(
             """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
                VALUES (?, '出库', ?, ?, ?)""",
-            (item_id, diff, f"盘点审核#{batch_id}盘亏", now()),
+            (item_id, diff, f"盘点审核#{batch_id}盘亏 (req#{loss_req_ids[-1]})", now()),
         )
+
+    # 盘盈 → inventory adjustment only (NOT a consumption).
     for item_id, diff in gain_items:
         db.execute(
             """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
                VALUES (?, '库存调整', ?, ?, ?)""",
             (item_id, diff, f"盘点审核#{batch_id}盘盈", now()),
         )
+
     db.execute(
-        "UPDATE stocktake_batches SET status = 'approved' WHERE id = ?", (batch_id,)
+        "UPDATE stocktake_batches SET status = 'approved', loss_req_ids = ? WHERE id = ?",
+        (",".join(str(i) for i in loss_req_ids), batch_id),
     )
     db.commit()
-    audit("stocktake.approve", "batch", batch_id,
-          {"losses": len(loss_items), "gains": len(gain_items)})
+    audit("stocktake.approve", "batch", batch_id, {
+        "losses": len(loss_items),
+        "gains": len(gain_items),
+        "loss_req_ids": loss_req_ids,
+    })
     msg = f"盘点批次 #{batch_id} 已审核"
     if loss_items:
-        msg += f"，{len(loss_items)}项盘亏已计入出库"
+        msg += f"，{len(loss_items)}项盘亏已计入消耗"
     if gain_items:
         msg += f"，{len(gain_items)}项盘盈已调整为库存"
     flash(msg)

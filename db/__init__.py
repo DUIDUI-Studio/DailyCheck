@@ -138,7 +138,8 @@ CREATE TABLE IF NOT EXISTS stocktake_batches (
     created_at TEXT NOT NULL,
     note TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
-    rolled_back INTEGER NOT NULL DEFAULT 0
+    rolled_back INTEGER NOT NULL DEFAULT 0,
+    loss_req_ids TEXT
 );
 
 CREATE TABLE IF NOT EXISTS restock_requests (
@@ -249,4 +250,8 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE stocktake_batches ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
             )
-            conn.commit()
+        if "loss_req_ids" not in cols:
+            conn.execute(
+                "ALTER TABLE stocktake_batches ADD COLUMN loss_req_ids TEXT"
+            )
+        conn.commit()
