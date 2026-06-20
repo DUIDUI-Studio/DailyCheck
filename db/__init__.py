@@ -192,6 +192,48 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    unit TEXT NOT NULL DEFAULT '件',
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS product_bom (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    qty_per_unit REAL NOT NULL,
+    UNIQUE(product_id, item_id),
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES items(id)
+);
+
+CREATE TABLE IF NOT EXISTS production_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    output_qty REAL NOT NULL,
+    note TEXT,
+    rolled_back INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+CREATE TABLE IF NOT EXISTS production_run_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    planned_qty REAL NOT NULL,
+    actual_qty REAL NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES production_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES items(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prun_created ON production_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_pruni_run ON production_run_items(run_id);
 """
 
 
