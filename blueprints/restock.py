@@ -103,14 +103,14 @@ def update_status(req_id: int):
     if old_status != "入库" and status == "入库":
         db.execute(
             "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-            (int(req["requested_quantity"]), now(), int(req["item_id"])),
+            (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
         )
         db.execute(
             """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
                VALUES (?, '补货入库', ?, ?, ?)""",
             (
                 int(req["item_id"]),
-                int(req["requested_quantity"]),
+                parse_qty(req["requested_quantity"]),
                 f"补货记录#{req_id}入库",
                 now(),
             ),
@@ -150,14 +150,14 @@ def delete(req_id: int):
         # which is far more work than accepting the negative balance.)
         db.execute(
             "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
-            (int(req["requested_quantity"]), now(), int(req["item_id"])),
+            (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
         )
         db.execute(
             """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
                VALUES (?, '补货删除回滚', ?, ?, ?)""",
             (
                 int(req["item_id"]),
-                -int(req["requested_quantity"]),
+                -parse_qty(req["requested_quantity"]),
                 f"删除补货记录#{req_id}回滚",
                 now(),
             ),
@@ -170,9 +170,9 @@ def delete(req_id: int):
         req_id,
         {
             "item_id": int(req["item_id"]),
-            "qty": int(req["requested_quantity"]),
+            "qty": parse_qty(req["requested_quantity"]),
             "status_at_delete": req["status"],
-            "quantity_after": int(item["quantity"]) - int(req["requested_quantity"]),
+            "quantity_after": parse_qty(item["quantity"]) - parse_qty(req["requested_quantity"]),
         },
     )
     flash("补货记录已删除")

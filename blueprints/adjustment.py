@@ -104,12 +104,12 @@ def rollback(req_id: int):
         return redirect(url_for("adjustment.adjustment_list"))
     db.execute(
         "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-        (int(req["adjusted_quantity"]), now(), int(req["item_id"])),
+        (parse_qty(req["adjusted_quantity"]), now(), int(req["item_id"])),
     )
     db.execute(
         """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
            VALUES (?, '调整出库回滚', ?, ?, ?)""",
-        (int(req["item_id"]), int(req["adjusted_quantity"]), f"回滚调整单#{req_id}", now()),
+        (int(req["item_id"]), parse_qty(req["adjusted_quantity"]), f"回滚调整单#{req_id}", now()),
     )
     db.execute("UPDATE adjustment_requests SET rolled_back = 1 WHERE id = ?", (req_id,))
     db.commit()
