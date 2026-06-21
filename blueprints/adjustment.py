@@ -89,7 +89,7 @@ def adjustment_submit():
 
 
 @bp.route("/adjustment/<int:req_id>/rollback", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def rollback(req_id: int):
     db = get_warehouse_db()
     req = db.execute(
@@ -119,7 +119,7 @@ def rollback(req_id: int):
 
 
 @bp.route("/adjustment/<int:req_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def delete(req_id: int):
     db = get_warehouse_db()
     db.execute("DELETE FROM adjustment_requests WHERE id = ?", (req_id,))

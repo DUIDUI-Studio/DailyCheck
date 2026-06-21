@@ -177,7 +177,7 @@ def categories():
 
 
 @bp.route("/categories/<int:category_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def delete_category(category_id: int):
     from flask import flash
     flash("品类为系统固定项，不支持删除")

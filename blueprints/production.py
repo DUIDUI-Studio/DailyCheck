@@ -364,7 +364,7 @@ def runs_list():
 
 
 @bp.route("/production/runs/<int:run_id>/rollback", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def rollback(run_id: int):
     db = get_warehouse_db()
     run = db.execute(
@@ -407,7 +407,7 @@ def rollback(run_id: int):
 
 
 @bp.route("/production/runs/<int:run_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def delete_run(run_id: int):
     db = get_warehouse_db()
     run = db.execute(

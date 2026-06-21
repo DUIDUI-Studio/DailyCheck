@@ -89,7 +89,7 @@ def outbound_submit():
 
 
 @bp.route("/outbound/<int:req_id>/rollback", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def rollback(req_id: int):
     db = get_warehouse_db()
     req = db.execute(
@@ -120,7 +120,7 @@ def rollback(req_id: int):
 
 
 @bp.route("/outbound/<int:req_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def delete(req_id: int):
     """Remove an outbound record and return its quantity to stock.
 

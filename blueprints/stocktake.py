@@ -85,7 +85,7 @@ def stocktake_submit():
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/rollback", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def rollback(batch_id: int):
     db = get_warehouse_db()
     batch = db.execute(
@@ -143,7 +143,7 @@ def rollback(batch_id: int):
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/edit", methods=["GET"])
-@require_role("manager")
+@require_role("staff")
 def edit(batch_id: int):
     db = get_warehouse_db()
     batch = db.execute(
@@ -166,7 +166,7 @@ def edit(batch_id: int):
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/edit", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def submit_edit(batch_id: int):
     db = get_warehouse_db()
     batch = db.execute(
@@ -220,7 +220,7 @@ def submit_edit(batch_id: int):
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/approve", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def approve(batch_id: int):
     """Approval semantics (口径 B):
     - 盘亏 (diff < 0): real consumption. We write a synthetic

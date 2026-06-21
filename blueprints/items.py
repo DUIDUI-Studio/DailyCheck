@@ -16,7 +16,7 @@ bp = Blueprint("items", __name__)
 
 @bp.route("/items", methods=["GET", "POST"])
 @require_login
-@require_role("admin")
+@require_role("staff")
 def items_list():
     db = get_warehouse_db()
     if request.method == "POST":
@@ -98,7 +98,7 @@ def edit_item(item_id: int):
 
 
 @bp.route("/items/<int:item_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def delete_item(item_id: int):
     db = get_warehouse_db()
     usage = db.execute(

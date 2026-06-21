@@ -123,7 +123,7 @@ def update_status(req_id: int):
 
 
 @bp.route("/restock/<int:req_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_role("staff")
 def delete(req_id: int):
     db = get_warehouse_db()
     req = db.execute(
