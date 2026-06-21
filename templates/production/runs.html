@@ -1,52 +1,60 @@
 {% extends "base.html" %}
+{% block sidebar %}{% endblock %}
 {% block content %}
 <div class="list-head">
   <h2>生产记录</h2>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
   <a class="btn" href="{{ url_for('production.runs_csv') }}">导出 CSV</a>
-  <a class="btn" href="{{ url_for('production.session') }}">+ 新建生产</a>
 </div>
 
+<form method="get" class="filter-bar">
+  <label class="filter-chip {% if scope == 'today' %}is-active{% endif %}">
+    <input type="radio" name="scope" value="today" {% if scope == 'today' %}checked{% endif %} onchange="this.form.submit()" />
+    当天
+  </label>
+  <label class="filter-chip {% if scope == '7d' %}is-active{% endif %}">
+    <input type="radio" name="scope" value="7d" {% if scope == '7d' %}checked{% endif %} onchange="this.form.submit()" />
+    最近 7 天
+  </label>
+  <label class="filter-chip {% if scope == 'day' %}is-active{% endif %}">
+    <input type="radio" name="scope" value="day" {% if scope == 'day' %}checked{% endif %} onchange="this.form.submit()" />
+    单日
+    <input type="date" name="date" value="{{ custom_day }}" onchange="this.form.submit()" />
+  </label>
+</form>
+
 {% if runs %}
-<div class="card-list">
+<div class="runs-table">
   {% for r in runs %}
-  <div class="card">
-    <div class="card-main">
-      <h3>{{ r['product_name'] }} <small class="muted">产出 {{ r['output_qty'] | fmt_qty }} {{ r['product_unit'] }}</small></h3>
-      <p class="muted">
-        {{ r['created_at'] }}{% if r['created_by'] %} · {{ r['created_by'] }}{% endif %}
-        {% if r['note'] %} · {{ r['note'] }}{% endif %}
-        {% if r['rolled_back'] == 1 %} · <span class="status-pill warn">已回退</span>{% endif %}
-      </p>
-      <ul class="bom-mini">
-        {% for it in r['items'] %}
-        <li>
-          {{ it['item_name'] }}：
-          计划 {{ it['planned_qty'] | fmt_qty }} /
-          实际 <strong>{{ it['actual_qty'] | fmt_qty }}</strong>
-          {{ it['unit'] }}
-          {% if it['planned_qty'] != it['actual_qty'] %}<span class="muted">（偏离配方）</span>{% endif %}
-        </li>
-        {% endfor %}
-      </ul>
+  <div class="runs-row">
+    <div class="runs-head">
+      <span class="runs-time">{{ r['created_at'] }}</span>
+      <span class="runs-product">{{ r['product_name'] }} <small class="muted">产出 {{ r['output_qty'] | fmt_qty }} {{ r['product_unit'] }}</small></span>
+      {% if r['rolled_back'] == 1 %}<span class="status-pill warn">已回退</span>{% endif %}
+      <span class="runs-actions">
+        {% if r['rolled_back'] == 0 %}
+        <form method="post" action="{{ url_for('production.rollback', run_id=r['id']) }}" onsubmit="return confirm('确认回退？库存将归还。');">
+          <button class="btn-sm" type="submit">回退</button>
+        </form>
+        {% endif %}
+        <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除该记录？');">
+          <button class="btn-sm btn-delete" type="submit">删除</button>
+        </form>
+      </span>
     </div>
-    <div class="card-actions">
-      {% if r['rolled_back'] == 0 %}
-      <form method="post" action="{{ url_for('production.rollback', run_id=r['id']) }}" onsubmit="return confirm('确认回退该生产记录？库存将归还。');">
-        <button class="btn-sm" type="submit">回退</button>
-      </form>
-      <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除？未回退的记录会先回滚库存。');">
-        <button class="btn-sm btn-delete" type="submit">删除</button>
-      </form>
-      {% else %}
-      <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除该记录？');">
-        <button class="btn-sm btn-delete" type="submit">删除</button>
-      </form>
-      {% endif %}
-    </div>
+    {% if r['note'] %}<div class="runs-note muted">{{ r['note'] }}</div>{% endif %}
+    <table class="runs-bom">
+      {% for it in r['items'] %}
+      <tr>
+        <td class="bom-name">{{ it['item_name'] }}</td>
+        <td class="bom-qty">{{ it['actual_qty'] | fmt_qty }} {{ it['unit'] }}</td>
+      </tr>
+      {% endfor %}
+    </table>
   </div>
   {% endfor %}
 </div>
 {% else %}
-  <p class="muted">暂无生产记录。</p>
+  <p class="muted">该时间范围内暂无生产记录。</p>
 {% endif %}
 {% endblock %}

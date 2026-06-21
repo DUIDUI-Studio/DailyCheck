@@ -67,6 +67,16 @@ h2, h3 {
 
 .card small { font-size: 14px; font-weight: 400; }
 
+.card-list { display: grid; gap: 12px; }
+.card-list-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 720px) { .card-list-3 { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 480px) { .card-list-3 { grid-template-columns: 1fr; } }
+
+.card[data-href]:hover { box-shadow: 0 8px 22px rgba(15, 23, 42, 0.10); transform: translateY(-2px); }
+.card[data-href]:hover h3 { color: var(--brand-ink, #0f766e); }
+.card-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.card-actions form { margin: 0; }
+
 .land-grid {
   display: grid;
   gap: 14px;
@@ -373,6 +383,12 @@ th, td {
   .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .mobile-only { display: none; }
   .desktop-only { display: block; }
+  /* Pages that override sidebar (e.g. /land, /select-warehouse) collapse
+     the grid to one full-width column so main isn't squeezed into 240px. */
+  body.no-sidebar { grid-template-columns: 1fr; }
+  body.no-sidebar .app-shell { max-width: 1200px; margin: 0 auto; width: 100%; }
+  body.no-sidebar .ctx-bar { padding: 10px 22px; }
+  body.no-sidebar .mobile-header { padding: 16px 22px; }
 }
 
 @media (max-width: 960px) {
@@ -649,6 +665,9 @@ code {
   border-radius: 999px;
   font-weight: 600;
   white-space: nowrap;
+  display: inline-block;
+  flex-shrink: 0;
+  line-height: 1.4;
 }
 .status-pill.ok { background: #ecfdf5; color: #047857; border: 1px solid #6ee7b7; }
 .status-pill.warn { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
@@ -757,58 +776,211 @@ code {
 }
 .entry-row {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 10px;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 8px 16px;
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: #fafbfd;
 }
 .entry-row.is-warn { background: #fef9c3; border-color: #fde68a; }
-.entry-row.is-low { background: #fff7ed; border-color: #fed7aa; }
-.entry-row .er-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 6px 10px;
-}
+.entry-row.is-low { background: #fee2e2; border-color: #fca5a5; }
 .entry-row .er-name {
   font-size: 15px;
   font-weight: 600;
   color: var(--text);
 }
-.entry-row .er-cat {
+.entry-row .er-cell {
+  display: grid;
+  grid-template-columns: auto auto auto;
+  align-items: baseline;
+  gap: 2px 6px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  min-width: 96px;
+}
+.entry-row .er-cell-label {
+  grid-column: 1 / -1;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.entry-row .er-cell-num {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.entry-row .er-cell-unit {
   font-size: 11px;
   color: var(--muted);
-  background: #eef2f6;
-  border-radius: 999px;
-  padding: 2px 8px;
 }
-.entry-row .er-stock {
+.entry-row .er-stock-cell { background: #eef2f6; }
+.entry-row .er-planned-cell.er-planned-pill {
+  background: #ccfbf1;
+  border: 1px solid #5eead4;
+}
+.entry-row .er-planned-cell .er-planned-num { color: #0f766e; }
+
+/* 生产录入: 左配方 / 右录入 */
+.session-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 720px) { .session-grid { grid-template-columns: 1fr; } }
+.recipe-pane {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  position: sticky;
+  top: 12px;
+  height: 500px;
+  overflow-y: auto;
+}
+.recipe-pane h3 { margin: 0 0 4px; font-size: 16px; }
+.recipe-pane .recipe-hint { margin: 0 0 12px; font-size: 12px; }
+.recipe-list { list-style: none; margin: 0; padding: 0; }
+.recipe-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.recipe-list li:last-child { border-bottom: none; }
+.recipe-list .recipe-name { font-size: 14px; color: var(--text); }
+.recipe-list .recipe-qty { font-size: 13px; color: var(--muted); }
+.recipe-list .recipe-qty strong { font-size: 15px; color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.materials-pane .session-head { margin-bottom: 14px; }
+.materials-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+/* 产出量选择: 1/2/3 预设按钮 + 自定义数字输入 */
+.qty-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.qty-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-right: 4px;
+}
+.qty-presets {
+  display: inline-flex;
+  gap: 4px;
+}
+.qty-preset {
+  min-width: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+}
+.qty-preset:hover { border-color: var(--brand-ink, #0f766e); }
+.qty-preset.is-active {
+  background: var(--brand-ink, #0f766e);
+  color: #fff;
+  border-color: var(--brand-ink, #0f766e);
+}
+
+/* 时间筛选 chips (生产记录页) */
+.filter-bar {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 12px;
-  font-size: 12px;
-  color: var(--muted);
-}
-.entry-row .er-stock strong { color: var(--text); font-weight: 600; }
-.entry-row .er-stock .er-warn { color: #b45309; font-weight: 600; }
-.entry-row .er-input {
-  display: grid;
-  grid-template-columns: 1fr auto;
   gap: 8px;
+  margin-bottom: 14px;
   align-items: center;
 }
-.entry-row .er-input input {
-  font-size: 16px;
-  padding: 12px 14px;
-  text-align: right;
-}
-.entry-row .er-input .er-unit {
-  font-size: 12px;
-  color: var(--muted);
-  padding: 0 6px;
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  font-size: 13px;
+  cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
+}
+.filter-chip input[type=radio] { margin: 0; flex-shrink: 0; }
+.filter-chip input[type=date] {
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  padding: 0;
+  min-width: 110px;
+  flex-shrink: 0;
+}
+.filter-chip.is-active {
+  background: var(--brand-ink, #0f766e);
+  color: #fff;
+  border-color: var(--brand-ink, #0f766e);
+}
+.filter-chip.is-active input { color: #fff; }
+
+/* 生产记录页紧凑表格 */
+.runs-table { display: grid; gap: 8px; }
+.runs-row {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+.runs-row.is-rolled-back { opacity: 0.7; }
+.runs-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: 13px;
+}
+.runs-time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.runs-product { font-weight: 600; }
+.runs-actions { margin-left: auto; display: flex; gap: 6px; }
+.runs-actions form { margin: 0; display: inline; }
+.runs-note {
+  font-size: 12px;
+  margin-top: 4px;
+  margin-bottom: 4px;
+}
+.runs-bom {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 6px;
+}
+.runs-bom td {
+  padding: 3px 8px;
+  font-size: 13px;
+  border-bottom: 1px dashed var(--border);
+}
+.runs-bom tr:last-child td { border-bottom: none; }
+.runs-bom .bom-name { color: var(--text); }
+.runs-bom .bom-qty {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }
 
 /* category quick-filter chips (restock/outbound/stocktake/adjustment) */

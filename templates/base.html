@@ -12,7 +12,7 @@
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=10" />
 </head>
-<body>
+<body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
   <aside class="sidebar desktop-only">
     <h1>库存管理</h1>

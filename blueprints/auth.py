@@ -153,7 +153,7 @@ def warehouse_picker():
                ORDER BY w.id""",
             (g.user["id"],),
         ).fetchall()
-    return render_template("warehouse_picker.html", warehouses=rows)
+    return render_template("warehouse_picker.html", warehouses=rows, no_sidebar=True)
 
 
 @bp.route("/select-warehouse/<int:warehouse_id>", methods=["POST"])

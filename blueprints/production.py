@@ -18,6 +18,17 @@ from .auth import audit
 bp = Blueprint("production", __name__)
 
 
+@bp.before_request
+def _set_no_sidebar():
+    """Production module has its own sidebar-free layout — users navigate
+    between 产品/录入/历史 via the top tabs and return to /land for the
+    库存管理/生产录入 choice. The view must still pass no_sidebar=True
+    in its render() call (Flask's g is not visible to Jinja by default).
+    This hook sets g for any future context_processor that wants it."""
+    from flask import g
+    g.no_sidebar = True
+
+
 @bp.route("/production", methods=["GET"])
 @require_login
 def products_list():
@@ -28,7 +39,7 @@ def products_list():
            LEFT JOIN product_bom b ON b.product_id = p.id
            GROUP BY p.id ORDER BY p.id DESC"""
     ).fetchall()
-    return render("production/products.html", products=products_data)
+    return render("production/products.html", products=products_data, no_sidebar=True)
 
 
 def _load_items_for_bom():
@@ -65,7 +76,7 @@ def product_new():
         except sqlite3.IntegrityError:
             flash("产品名称已存在")
             return redirect(url_for("production.product_new"))
-    return render("production/product_edit.html", product=None, bom_rows=[], items=_load_items_for_bom())
+    return render("production/product_edit.html", product=None, bom_rows=[], items=_load_items_for_bom(), no_sidebar=True)
 
 
 @bp.route("/production/products/<int:product_id>/edit", methods=["GET", "POST"])
@@ -137,7 +148,7 @@ def product_edit(product_id: int):
         (product_id,),
     ).fetchall()
     items = _load_items_for_bom()
-    return render("production/product_edit.html", product=product, bom_rows=bom_rows, items=items)
+    return render("production/product_edit.html", product=product, bom_rows=bom_rows, items=items, no_sidebar=True)
 
 
 @bp.route("/production/products/<int:product_id>/delete", methods=["POST"])
@@ -185,6 +196,9 @@ def session():
         products=products_data,
         chosen=chosen,
         bom=bom,
+        # 禁用产品下拉: 卡片点入 = 锁定产品;session.html 收到 chosen 后只展示该产品的配方。
+        lock_product=bool(chosen),
+        no_sidebar=True,
     )
 
 
@@ -255,6 +269,14 @@ def submit():
                (run_id, item_id, planned_qty, actual_qty) VALUES (?, ?, ?, ?)""",
             (run_id, item_id, planned, actual),
         )
+        # 双写 outbound_requests 让 /outbound 出库记录页面也能看到生产领料
+        # reason 标识生产 run id 以便回退时定位
+        db.execute(
+            """INSERT INTO outbound_requests
+               (item_id, requested_quantity, reason, status, rolled_back, created_at)
+               VALUES (?, ?, ?, '出库', 0, ?)""",
+            (item_id, actual, f"生产领料(run=#{run_id})", now()),
+        )
         db.execute(
             "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
             (actual, now(), item_id),
@@ -270,17 +292,31 @@ def submit():
         "product_id": product_id, "output_qty": output_qty, "rows": len(plan),
     })
     flash("生产已记录")
-    return redirect(url_for("production.runs_list"))
+    return redirect(url_for("production.products_list"))
 
 
 @bp.route("/production/runs", methods=["GET"])
 @require_login
 def runs_list():
     db = get_warehouse_db()
-    # Single query: runs + their items via LEFT JOIN, then group in Python.
-    # Avoids N+1 (was 1 + 200 queries at LIMIT 200).
+    # 时间筛选:
+    #   scope=today  (default) - 当天 created_at LIKE 'YYYY-MM-DD%'
+    #   scope=7d               - 最近 7 天
+    #   scope=day&date=YYYY-MM-DD - 自定义单日
+    scope = request.args.get("scope", "today")
+    custom_day = request.args.get("date", "").strip()
+    where = ""
+    params: list = []
+    if scope == "7d":
+        where = "WHERE r.created_at >= datetime('now', '-7 days')"
+    elif scope == "day" and custom_day:
+        where = "WHERE r.created_at LIKE ? || '%'"
+        params = [custom_day]
+    else:  # default 'today'
+        where = "WHERE r.created_at LIKE ? || '%'"
+        params = [datetime.now().strftime("%Y-%m-%d")]
     flat = db.execute(
-        """SELECT r.id AS run_id, r.output_qty, r.note AS run_note,
+        f"""SELECT r.id AS run_id, r.output_qty, r.note AS run_note,
                   r.rolled_back, r.created_at, r.created_by,
                   p.name AS product_name, p.unit AS product_unit,
                   pri.id AS pri_id, pri.planned_qty, pri.actual_qty,
@@ -289,7 +325,9 @@ def runs_list():
            JOIN products p ON p.id = r.product_id
            LEFT JOIN production_run_items pri ON pri.run_id = r.id
            LEFT JOIN items i ON i.id = pri.item_id
-           ORDER BY r.id DESC, pri.id LIMIT 200"""
+           {where}
+           ORDER BY r.id DESC, pri.id LIMIT 200""",
+        params,
     ).fetchall()
     # Group items under their parent run
     runs_by_id: dict = {}
@@ -316,7 +354,13 @@ def runs_list():
                 "unit": row["item_unit"],
             })
     runs = list(runs_by_id.values())
-    return render("production/runs.html", runs=runs)
+    return render(
+        "production/runs.html",
+        runs=runs,
+        scope=scope,
+        custom_day=custom_day,
+        no_sidebar=True,
+    )
 
 
 @bp.route("/production/runs/<int:run_id>/rollback", methods=["POST"])
@@ -341,6 +385,11 @@ def rollback(run_id: int):
     for it in items:
         qty = parse_qty(it["actual_qty"])
         qty_total += qty
+        # 标记该 run 对应的 outbound_requests 为已回退 — 库存和汇总口径同步
+        db.execute(
+            "UPDATE outbound_requests SET rolled_back = 1 WHERE reason = ? AND rolled_back = 0",
+            (f"生产领料(run=#{run_id})",),
+        )
         db.execute(
             "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
             (qty, now(), int(it["item_id"])),
@@ -386,6 +435,17 @@ def delete_run(run_id: int):
                    VALUES (?, '生产消耗回退', ?, ?, ?)""",
                 (int(it["item_id"]), qty, f"删除生产记录#{run_id}回滚", now()),
             )
+        # 直接删除 run 对应的 outbound_requests（语义：删除生产记录 ≡ 删除出库记录）
+        db.execute(
+            "DELETE FROM outbound_requests WHERE reason = ?",
+            (f"生产领料(run=#{run_id})",),
+        )
+    else:
+        # 已回退的 outbound_requests 已 rolled_back=1，删除 run 时把它们也清掉
+        db.execute(
+            "DELETE FROM outbound_requests WHERE reason = ?",
+            (f"生产领料(run=#{run_id})",),
+        )
 
     db.execute("DELETE FROM production_runs WHERE id = ?", (run_id,))
     db.commit()

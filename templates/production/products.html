@@ -1,30 +1,49 @@
 {% extends "base.html" %}
+{% block sidebar %}{% endblock %}
 {% block content %}
+{% set is_manager = g.user['is_admin'] or (g.role and g.role['role'] in ('manager', 'admin')) %}
+
 <div class="list-head">
   <h2>产品</h2>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
+  <a class="btn" href="{{ url_for('production.runs_list') }}">历史记录 →</a>
+  {% if is_manager %}
   <a class="btn" href="{{ url_for('production.product_new') }}">+ 新建产品</a>
+  {% endif %}
 </div>
 
 {% if products %}
-  <div class="card-list">
+  <div class="card-list card-list-3">
     {% for p in products %}
-    <div class="card">
+    <div class="card" data-href="{{ url_for('production.session') }}?product_id={{ p['id'] }}">
       <div class="card-main">
         <h3>{{ p['name'] }}</h3>
         <p class="muted">单位：{{ p['unit'] }}{% if p['note'] %} · {{ p['note'] }}{% endif %}</p>
         <p>配方项数：<strong>{{ p['bom_count'] }}</strong></p>
       </div>
+      {% if is_manager %}
       <div class="card-actions">
-        <a class="btn-sm" href="{{ url_for('production.session') }}?product_id={{ p['id'] }}">录入</a>
         <a class="btn-sm" href="{{ url_for('production.product_edit', product_id=p['id']) }}">编辑配方</a>
         <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" onsubmit="return confirm('确认删除该产品？');">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>
       </div>
+      {% endif %}
     </div>
     {% endfor %}
   </div>
+  <script>
+    // Card click → navigate. Skip clicks that originated from interactive
+    // children (button / a / form action button).
+    document.querySelectorAll('.card[data-href]').forEach(function(card) {
+      card.addEventListener('click', function(e) {
+        if (e.target.closest('a, button, form, input, select, textarea')) return;
+        location.href = card.getAttribute('data-href');
+      });
+      card.style.cursor = 'pointer';
+    });
+  </script>
 {% else %}
-  <p class="muted">暂无产品，点击右上"新建产品"开始。</p>
+  <p class="muted">暂无产品{% if is_manager %}，点击右上"新建产品"开始{% endif %}。</p>
 {% endif %}
 {% endblock %}

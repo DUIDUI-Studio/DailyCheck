@@ -58,7 +58,7 @@ def dashboard():
 @require_login
 def land():
     """Post-warehouse-pick landing page: choose between 库存管理 and 生产录入."""
-    return render("land.html")
+    return render("land.html", no_sidebar=True)
 
 
 @bp.route("/summary")
@@ -76,12 +76,15 @@ def summary():
            JOIN items i ON i.id = r.item_id"""
     ).fetchone()["c"]
 
-    # 口径:消耗金额 = 出库(rolled_back=0) + 生产消耗(pr.rolled_back=0)
+    # 口径:消耗金额 = 出库(rolled_back=0, 排除生产领料) + 生产消耗(pr.rolled_back=0)
+    # outbound_requests 已经双写了生产领料(reason='生产领料(run=#X)'),所以这里要排除,
+    # 否则会被生产消耗重复计算。
     consumed_outbound = db.execute(
         """SELECT COALESCE(SUM(o.requested_quantity * i.unit_cost), 0) AS c
            FROM outbound_requests o
            JOIN items i ON i.id = o.item_id
-           WHERE o.rolled_back = 0"""
+           WHERE o.rolled_back = 0
+             AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')"""
     ).fetchone()["c"]
     consumed_production = db.execute(
         """SELECT COALESCE(SUM(pri.actual_qty * i.unit_cost), 0) AS c

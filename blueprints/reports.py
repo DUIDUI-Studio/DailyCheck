@@ -41,7 +41,7 @@ def outbound():
         raw = db.execute(
             """SELECT i.name AS item_name, i.unit, ABS(m.delta) AS qty, m.created_at
                FROM stock_movements m JOIN items i ON i.id = m.item_id
-               WHERE m.action = '出库' ORDER BY m.created_at ASC"""
+               WHERE m.action IN ('出库', '生产消耗') ORDER BY m.created_at ASC"""
         ).fetchall()
         # 口径:每个品项 × 每个日期的出库量,缺失日补 0
         daily: dict[tuple[str, str], int] = {}
@@ -69,7 +69,7 @@ def outbound():
                   ABS(SUM(m.delta)) AS total_qty, COUNT(*) AS times,
                   MAX(m.created_at) AS last_time
            FROM stock_movements m JOIN items i ON i.id = m.item_id
-           WHERE m.action = '出库' AND m.created_at LIKE ? || '%'
+           WHERE m.action IN ('出库', '生产消耗') AND m.created_at LIKE ? || '%'
            GROUP BY m.item_id ORDER BY last_time DESC""",
         (today,),
     ).fetchall()
@@ -156,7 +156,7 @@ def export_consumption():
            FROM stock_movements m
            JOIN items i ON i.id = m.item_id
            JOIN categories c ON c.id = i.category_id
-           WHERE m.action = '出库'
+           WHERE m.action IN ('出库', '生产消耗')
            GROUP BY m.item_id ORDER BY c.name, i.name"""
     ).fetchall()
     audit("report.consumption_export", "report", None, {"rows": len(rows)})

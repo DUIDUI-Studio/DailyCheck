@@ -1,58 +1,79 @@
 {% extends "base.html" %}
+{% block sidebar %}{% endblock %}
 {% block content %}
 <div class="list-head">
   <h2>生产录入</h2>
-  <a class="btn" href="{{ url_for('production.runs_list') }}">历史记录 →</a>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
 </div>
 
-<form method="get" action="{{ url_for('production.session') }}" class="form-inline">
-  <label>产品
-    <select name="product_id" onchange="this.form.submit()">
-      <option value="">-- 请选择产品 --</option>
-      {% for p in products %}
-      <option value="{{ p['id'] }}" {% if chosen and chosen['id']==p['id'] %}selected{% endif %}>
-        {{ p['name'] }} ({{ p['unit'] }})
-      </option>
-      {% endfor %}
-    </select>
-  </label>
-</form>
+{% if chosen %}
+  <p class="muted">产品：<strong>{{ chosen['name'] }}</strong>（产出单位 {{ chosen['unit'] }}）· <a href="{{ url_for('production.products_list') }}">← 返回产品列表</a></p>
+{% else %}
+  <p class="muted">没有选择产品。<a href="{{ url_for('production.products_list') }}">返回产品列表</a></p>
+{% endif %}
 
 {% if chosen and bom %}
 <form method="post" action="{{ url_for('production.submit') }}" class="session-form" id="prod-form">
   <input type="hidden" name="product_id" value="{{ chosen['id'] }}" />
 
-  <div class="session-head">
-    <div class="session-actions">
-      <label>产出量（{{ chosen['unit'] }}）
-        <input type="number" step="0.01" min="0" name="output_qty" id="output_qty" required />
-      </label>
-      <label>备注 <input name="note" placeholder="可选" /></label>
-      <button type="submit" id="submit-btn">提交</button>
-    </div>
-    <p class="hint">实际消耗可偏离配方；原料不足将无法提交。</p>
-  </div>
+  <div class="session-grid">
+    {# 左: 配方卡 (静态, 显示每单位用量) #}
+    <aside class="recipe-pane">
+      <h3>配方</h3>
+      <p class="muted recipe-hint">每生产 1 单位产品所需</p>
+      <ul class="recipe-list">
+        {% for b in bom %}
+        <li>
+          <span class="recipe-name">{{ b['item_name'] }}</span>
+          <span class="recipe-qty"><strong>{{ b['qty_per_unit'] | fmt_qty }}</strong> {{ b['unit'] }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </aside>
 
-  <div class="entry-grid" id="bom-grid">
-    {% for b in bom %}
-    <div class="entry-row" data-stock="{{ b['stock'] }}">
-      <div class="er-meta">
-        <span class="er-name">{{ b['item_name'] }}</span>
-        <span class="er-cat muted">当前库存 {{ b['stock'] | fmt_qty }} {{ b['unit'] }}</span>
+    {# 右: 录入 + 原料卡 (动态, 显示库存 / 本批用量) #}
+    <section class="materials-pane">
+      <div class="session-head">
+        <div class="session-actions">
+          <div class="qty-picker">
+            <span class="qty-label">产出量（{{ chosen['unit'] }}）</span>
+            <div class="qty-presets" role="group" aria-label="产出量预设">
+              <button type="button" class="qty-preset" data-qty="1">1</button>
+              <button type="button" class="qty-preset" data-qty="2">2</button>
+              <button type="button" class="qty-preset" data-qty="3">3</button>
+            </div>
+            {# Hidden input carries the selected output_qty for form POST. #}
+            <input type="hidden" name="output_qty" id="output_qty" value="1" required />
+          </div>
+          <label>备注 <input name="note" placeholder="可选" /></label>
+          <button type="submit" id="submit-btn">提交</button>
+        </div>
+        <p class="hint">原料不足将无法提交。</p>
       </div>
-      <div class="er-stock">
-        <span>配方 / 单位 <strong>{{ b['qty_per_unit'] | fmt_qty }}</strong> {{ b['unit'] }}</span>
-        <span>本批计划 <strong class="planned" data-qpu="{{ b['qty_per_unit'] }}">0.00</strong> {{ b['unit'] }}</span>
-      </div>
-      <div class="er-input">
-        <input
-          type="number" step="0.01" min="0" inputmode="decimal"
-          name="actual_{{ b['item_id'] }}" data-stock="{{ b['stock'] }}"
-          class="actual" placeholder="0" autocomplete="off" />
-        <span class="er-unit">{{ b['unit'] }}</span>
-      </div>
-    </div>
-    {% endfor %}
+
+      <ul class="materials-list" id="bom-grid">
+        {% for b in bom %}
+        <li class="entry-row"
+            data-stock="{{ b['stock'] }}"
+            data-min-qty="{{ b['qty_per_unit'] }}">
+          <div class="er-name">{{ b['item_name'] }}</div>
+          <div class="er-cell er-stock-cell" title="当前库存">
+            <span class="er-cell-label">库存</span>
+            <span class="er-cell-num er-stock-num">{{ b['stock'] | fmt_qty }}</span>
+            <span class="er-cell-unit">{{ b['unit'] }}</span>
+          </div>
+          <div class="er-cell er-planned-cell er-planned-pill" title="按当前产出量本批共需" data-qpu="{{ b['qty_per_unit'] }}">
+            <span class="er-cell-label">本批用量</span>
+            <span class="er-cell-num er-planned-num planned">0.00</span>
+            <span class="er-cell-unit">{{ b['unit'] }}</span>
+          </div>
+          {# Hidden field carries actual_qty for the submit handler.
+             Since the user can't edit it, it always equals planned. #}
+          <input type="hidden" name="actual_{{ b['item_id'] }}" data-stock="{{ b['stock'] }}" value="0" class="actual" />
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
   </div>
 </form>
 
@@ -61,25 +82,51 @@
   var out = document.getElementById('output_qty');
   var rows = document.querySelectorAll('#bom-grid .entry-row');
   var btn = document.getElementById('submit-btn');
+  var presets = document.querySelectorAll('.qty-preset');
+
+  function highlightPreset() {
+    var v = parseFloat(out.value || '0');
+    presets.forEach(function(p) {
+      p.classList.toggle('is-active', parseFloat(p.getAttribute('data-qty')) === v);
+    });
+  }
+
+  presets.forEach(function(p) {
+    p.addEventListener('click', function() {
+      out.value = p.getAttribute('data-qty');
+      recompute();
+    });
+  });
 
   function recompute() {
+    highlightPreset();
     var oq = parseFloat(out.value || '0');
     var anyShort = false;
     rows.forEach(function(r) {
-      var qpu = parseFloat(r.querySelector('.planned').getAttribute('data-qpu'));
+      var qpu = parseFloat(r.querySelector('.er-planned-cell').getAttribute('data-qpu'));
       var planned = Math.round(qpu * oq * 100) / 100;
-      r.querySelector('.planned').textContent = planned.toFixed(2);
+      r.querySelector('.er-planned-cell .planned').textContent = planned.toFixed(2);
+
+      // 原料不可编辑 — 实际消耗 = 计划消耗 (同步显示)
       var act = r.querySelector('.actual');
-      var stock = parseFloat(act.getAttribute('data-stock'));
+      act.value = planned.toFixed(2);
+
+      var stock = parseFloat(r.getAttribute('data-stock'));
+      var minQty = parseFloat(r.getAttribute('data-min-qty'));
+
+      // 红底: 库存 < 生产 1 件的量 (独立于产出量)
+      r.classList.toggle('is-low', stock < minQty);
+      // 红色边框: 实际消耗 > 库存 (产出量>库存能撑的量)
       var actVal = parseFloat(act.value);
-      var show = (actVal > stock);
-      r.classList.toggle('is-short', show);
-      if (show) anyShort = true;
+      var showShort = (actVal > stock);
+      r.classList.toggle('is-short', showShort);
+      if (showShort) anyShort = true;
     });
     btn.disabled = (oq <= 0) || anyShort;
   }
   out.addEventListener('input', recompute);
-  rows.forEach(function(r) { r.querySelector('.actual').addEventListener('input', recompute); });
+
+  // 默认产出量 = 1 (与 hidden input 的 value 一致)
   recompute();
 })();
 </script>

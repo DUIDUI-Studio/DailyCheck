@@ -1,7 +1,9 @@
 {% extends "base.html" %}
+{% block sidebar %}{% endblock %}
 {% block content %}
 <div class="list-head">
   <h2>{% if product %}编辑产品{% else %}新建产品{% endif %}</h2>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
   <a class="btn" href="{{ url_for('production.products_list') }}">← 返回列表</a>
 </div>
 
