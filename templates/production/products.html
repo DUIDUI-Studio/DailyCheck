@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% block sidebar %}{% endblock %}
 {% block content %}
-{% set is_manager = g.user['is_admin'] or (g.role and g.role['role'] in ('manager', 'admin')) %}
+{% set is_platform_admin = g.user['is_admin'] %}
 
 <div class="list-head">
   <h2>产品</h2>
   <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
   <a class="btn" href="{{ url_for('production.runs_list') }}">历史记录 →</a>
-  {% if is_manager %}
+  {% if is_platform_admin %}
   <a class="btn" href="{{ url_for('production.product_new') }}">+ 新建产品</a>
   {% endif %}
 </div>
@@ -21,7 +21,7 @@
         <p class="muted">单位：{{ p['unit'] }}{% if p['note'] %} · {{ p['note'] }}{% endif %}</p>
         <p>配方项数：<strong>{{ p['bom_count'] }}</strong></p>
       </div>
-      {% if is_manager %}
+      {% if is_platform_admin %}
       <div class="card-actions">
         <a class="btn-sm" href="{{ url_for('production.product_edit', product_id=p['id']) }}">编辑配方</a>
         <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" onsubmit="return confirm('确认删除该产品？');">
@@ -44,6 +44,6 @@
     });
   </script>
 {% else %}
-  <p class="muted">暂无产品{% if is_manager %}，点击右上"新建产品"开始{% endif %}。</p>
+  <p class="muted">暂无产品{% if is_platform_admin %}，点击右上"新建产品"开始{% endif %}。</p>
 {% endif %}
 {% endblock %}

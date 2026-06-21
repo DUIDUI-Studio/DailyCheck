@@ -10,7 +10,7 @@ from decimal import Decimal
 from flask import Blueprint, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
-from permissions import require_login, require_role
+from permissions import require_login, require_platform_admin, require_role
 from ._helpers import now, parse_qty, render
 from .auth import audit
 
@@ -53,7 +53,7 @@ def _load_items_for_bom():
 
 
 @bp.route("/production/products/new", methods=["GET", "POST"])
-@require_role("manager")
+@require_platform_admin
 def product_new():
     if request.method == "POST":
         name = request.form.get("name", "").strip()
@@ -80,7 +80,7 @@ def product_new():
 
 
 @bp.route("/production/products/<int:product_id>/edit", methods=["GET", "POST"])
-@require_role("manager")
+@require_platform_admin
 def product_edit(product_id: int):
     db = get_warehouse_db()
     product = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
@@ -152,7 +152,7 @@ def product_edit(product_id: int):
 
 
 @bp.route("/production/products/<int:product_id>/delete", methods=["POST"])
-@require_role("manager")
+@require_platform_admin
 def product_delete(product_id: int):
     db = get_warehouse_db()
     used = db.execute(

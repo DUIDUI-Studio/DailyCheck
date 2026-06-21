@@ -52,6 +52,25 @@ def require_role(min_role: str) -> Callable:
     return decorator
 
 
+def require_platform_admin(view: Callable) -> Callable:
+    """Block the request unless the user is a platform admin (users.is_admin=1).
+
+    Use this for routes that ONLY platform admins should touch, regardless of
+    per-warehouse role. Unlike require_role, this does NOT bypass on the
+    is_admin flag — it requires it.
+    """
+    @functools.wraps(view)
+    def wrapped(*args, **kwargs):
+        if g.user is None:
+            return redirect(url_for("auth.login", next=request.path))
+        if not g.user["is_admin"]:
+            flash("需要平台管理员权限")
+            abort(403)
+            return None
+        return view(*args, **kwargs)
+    return wrapped
+
+
 def require_login(view: Callable) -> Callable:
     """Block the request unless the user is logged in AND has a warehouse selected.
 
