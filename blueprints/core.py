@@ -125,7 +125,10 @@ def summary():
               ) r ON r.item_id = i.id
               LEFT JOIN (
                   SELECT item_id, SUM(requested_quantity) AS total_outbound
-                  FROM outbound_requests WHERE rolled_back = 0 GROUP BY item_id
+                  FROM outbound_requests
+                  WHERE rolled_back = 0
+                    AND (reason IS NULL OR reason NOT LIKE '生产领料(run=#%')
+                  GROUP BY item_id
               ) o ON o.item_id = i.id
            ) item_vals ON item_vals.category_id = c.id
            GROUP BY c.id, c.name ORDER BY c.id"""
@@ -150,7 +153,9 @@ def summary():
                   ROUND(o.total_qty * i.unit_cost, 2) AS consumed_value
            FROM (
                SELECT item_id, SUM(requested_quantity) AS total_qty
-               FROM outbound_requests WHERE rolled_back = 0
+               FROM outbound_requests
+               WHERE rolled_back = 0
+                 AND (reason IS NULL OR reason NOT LIKE '生产领料(run=#%')
                GROUP BY item_id
            ) o
            JOIN items i ON i.id = o.item_id
