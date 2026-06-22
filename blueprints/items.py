@@ -26,6 +26,7 @@ def items_list():
         safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
+        gram_per_unit = parse_qty(request.form.get("gram_per_unit", "0"))
 
         if not name or not category_id:
             flash("名称、品类为必填")
@@ -34,9 +35,9 @@ def items_list():
         try:
             db.execute(
                 """INSERT INTO items
-                   (sku, name, category_id, quantity, safety_stock, unit_cost, unit, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (gen_sku(), name, int(category_id), quantity, safety_stock, unit_cost, unit, now()),
+                   (sku, name, category_id, quantity, safety_stock, unit_cost, unit, gram_per_unit, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (gen_sku(), name, int(category_id), quantity, safety_stock, unit_cost, unit, gram_per_unit, now()),
             )
             new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
             db.commit()
@@ -73,13 +74,14 @@ def edit_item(item_id: int):
         safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
+        gram_per_unit = parse_qty(request.form.get("gram_per_unit", "0"))
         if not name or not category_id:
             flash("名称、品类为必填")
             return redirect(url_for("items.edit_item", item_id=item_id))
         db.execute(
             """UPDATE items SET name=?, category_id=?, safety_stock=?,
-               unit_cost=?, unit=?, updated_at=? WHERE id=?""",
-            (name, int(category_id), safety_stock, unit_cost, unit, now(), item_id),
+               unit_cost=?, unit=?, gram_per_unit=?, updated_at=? WHERE id=?""",
+            (name, int(category_id), safety_stock, unit_cost, unit, gram_per_unit, now(), item_id),
         )
         db.commit()
         audit("items.update", "item", item_id, {"name": name})

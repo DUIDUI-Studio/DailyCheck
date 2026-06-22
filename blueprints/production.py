@@ -11,7 +11,7 @@ from flask import Blueprint, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
-from ._helpers import now, parse_qty, render
+from ._helpers import now, parse_qty, render, grams_to_stock
 from .auth import audit
 
 
@@ -43,10 +43,10 @@ def products_list():
 
 
 def _load_items_for_bom():
-    """Return items for the BOM item picker: id, name, unit, category_name."""
+    """Return items for the BOM item picker: id, name, unit, gram_per_unit, category_name."""
     db = get_warehouse_db()
     return db.execute(
-        """SELECT i.id, i.name, i.unit, c.name AS category_name
+        """SELECT i.id, i.name, i.unit, i.gram_per_unit, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
            ORDER BY c.name, i.name"""
     ).fetchall()
@@ -186,7 +186,8 @@ def session():
         if chosen is not None:
             bom = db.execute(
                 """SELECT b.id AS bom_id, b.qty_per_unit, b.item_id,
-                          i.name AS item_name, i.unit, i.quantity AS stock
+                          i.name AS item_name, i.unit, i.quantity AS stock,
+                          i.gram_per_unit
                    FROM product_bom b JOIN items i ON i.id = b.item_id
                    WHERE b.product_id = ? ORDER BY b.id""",
                 (product_id,),
@@ -223,7 +224,7 @@ def submit():
 
     bom_rows = db.execute(
         """SELECT b.id AS bom_id, b.item_id, b.qty_per_unit,
-                  i.name AS item_name, i.quantity AS stock
+                  i.name AS item_name, i.quantity AS stock, i.gram_per_unit
            FROM product_bom b JOIN items i ON i.id = b.item_id
            WHERE b.product_id = ? ORDER BY b.id""",
         (product_id,),
@@ -237,12 +238,16 @@ def submit():
     # prevent — see _helpers.py:50.
     plan = []
     for b in bom_rows:
-        planned = float(
+        gpu = float(b["gram_per_unit"] or 0)
+        # qty_per_unit: 启用克时是克/件，否则是库存单位/件。
+        # 先乘产出量得本批配方量，再一次性折算成库存单位（避免逐件累积误差）。
+        batch_recipe_qty = float(
             (Decimal(str(b["qty_per_unit"])) * Decimal(str(output_qty)))
             .quantize(Decimal("0.01"))
         )
+        planned = grams_to_stock(batch_recipe_qty, gpu)  # 库存单位
         raw = request.form.get(f"actual_{b['item_id']}", "").strip()
-        actual = parse_qty(raw) if raw != "" else planned
+        actual = parse_qty(raw) if raw != "" else planned  # 表单已传库存单位
         if actual < 0:
             flash(f"原料 {b['item_name']} 实际消耗不能为负")
             return redirect(url_for("production.session", product_id=product_id))
