@@ -126,13 +126,10 @@ def inventory_view():
     placeholders, params = fixed_categories_in_clause()
     q = request.args.get("q", "").strip()
     cat = request.args.get("cat", "").strip()
-    # 7-day consumption per item: sum of |delta| for action='出库' in the
-    # last 7 days, with stocktake loss already written as action='出库'
-    # (口径 B — see stocktake.approve). Daily avg = total / active_days,
-    # where active_days = distinct dates with at least one outbound in
-    # the window. Items that did not move at all in 7d are excluded
-    # from the subquery, so the per-item avg is only shown when there
-    # is real activity to average over.
+    # 7-day consumption per item.
+    # 口径:只算"实际出库/消耗"动作 — 即 stock_movements 里 delta<0 的行
+    # (action='出库' 或 '生产消耗',都把 delta 写成负数)。delta>0 的反向
+    # 动作(盘点回滚 / 生产消耗回退)自动被排除,不会双倍计入。
     rows = db.execute(
         f"""SELECT i.*, c.name AS category_name,
                   COALESCE(c7.qty, 0) AS consume_7d_qty,
@@ -142,12 +139,13 @@ def inventory_view():
            JOIN categories c ON c.id = i.category_id
            LEFT JOIN (
                SELECT m.item_id,
-                      ABS(SUM(m.delta)) AS qty,
-                      ROUND(ABS(SUM(m.delta)) * i2.unit_cost, 2) AS value,
+                      -SUM(m.delta) AS qty,
+                      ROUND(-SUM(m.delta) * i2.unit_cost, 2) AS value,
                       COUNT(DISTINCT substr(m.created_at, 1, 10)) AS days
                FROM stock_movements m
                JOIN items i2 ON i2.id = m.item_id
                WHERE m.action IN ('出库', '生产消耗')
+                 AND m.delta < 0
                  AND m.created_at >= datetime('now', '-7 days')
                GROUP BY m.item_id
            ) c7 ON c7.item_id = i.id
