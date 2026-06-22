@@ -19,7 +19,7 @@ bp = Blueprint("stocktake", __name__)
 def stocktake_list():
     db = get_warehouse_db()
     batches = db.execute(
-        """SELECT b.id, b.created_at, b.note, b.rolled_back, COUNT(s.id) AS item_count
+        """SELECT b.id, b.created_at, b.note, b.status, b.rolled_back, COUNT(s.id) AS item_count
            FROM stocktake_batches b
            LEFT JOIN stocktakes s ON s.batch_id = b.id
            GROUP BY b.id ORDER BY b.id DESC LIMIT 20"""
