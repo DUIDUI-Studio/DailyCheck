@@ -31,6 +31,10 @@
     <span>单位</span>
     <input name="unit" value="{{ item.unit }}" placeholder="件" />
   </label>
+  <label>
+    <span>每单位克重（克，0=不启用克）</span>
+    <input name="gram_per_unit" type="number" min="0" step="0.01" value="{{ item.gram_per_unit or 0 }}" />
+  </label>
   <a href="{{ url_for('items.items_list') }}" class="btn-cancel">取消</a>
   <button type="submit">保存修改</button>
 </form>
