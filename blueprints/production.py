@@ -43,10 +43,10 @@ def products_list():
 
 
 def _load_items_for_bom():
-    """Return items for the BOM item picker: id, name, unit, category_name."""
+    """Return items for the BOM item picker: id, name, unit, gram_per_unit, category_name."""
     db = get_warehouse_db()
     return db.execute(
-        """SELECT i.id, i.name, i.unit, c.name AS category_name
+        """SELECT i.id, i.name, i.unit, i.gram_per_unit, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
            ORDER BY c.name, i.name"""
     ).fetchall()

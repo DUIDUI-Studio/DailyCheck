@@ -25,21 +25,25 @@
   <input type="hidden" name="note" value="{{ product['note'] or '' }}" />
 
   <table class="bom-table">
-    <thead><tr><th>原料</th><th>每单位用量</th><th>操作</th></tr></thead>
+    <thead><tr><th>原料</th><th>每单位用量</th><th>单位</th><th>操作</th></tr></thead>
     <tbody id="bom-body">
       {% for b in bom_rows %}
       <tr>
         <td>
           <input type="hidden" name="bom_row_id" value="{{ b['id'] }}" />
-          <select name="bom_item_id">
+          <select name="bom_item_id" class="bom-item-sel">
             {% for it in items %}
-            <option value="{{ it['id'] }}" {% if it['id']==b['item_id'] %}selected{% endif %}>
+            <option value="{{ it['id'] }}"
+                    data-gram="{{ it['gram_per_unit'] or 0 }}"
+                    data-unit="{{ it['unit'] }}"
+                    {% if it['id']==b['item_id'] %}selected{% endif %}>
               {{ it['category_name'] }} / {{ it['name'] }} ({{ it['unit'] }})
             </option>
             {% endfor %}
           </select>
         </td>
         <td><input type="number" step="0.01" min="0" name="bom_qty" value="{{ b['qty_per_unit'] }}" /></td>
+        <td><span class="bom-unit-label"></span></td>
         <td>
           <label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label>
         </td>
@@ -53,20 +57,38 @@
 </form>
 
 <script>
+function refreshBomUnitLabel(sel) {
+  var opt = sel.options[sel.selectedIndex];
+  var gram = parseFloat(opt.getAttribute('data-gram') || '0');
+  var unit = opt.getAttribute('data-unit') || '';
+  var label = sel.closest('tr').querySelector('.bom-unit-label');
+  label.textContent = gram > 0 ? '克' : unit;
+}
+
 document.getElementById('bom-add').addEventListener('click', function() {
   var tbody = document.getElementById('bom-body');
   var tr = document.createElement('tr');
   tr.innerHTML = `
     <td>
       <input type="hidden" name="bom_row_id" value="" />
-      <select name="bom_item_id">
-        {% for it in items %}<option value="{{ it['id'] }}">{{ it['category_name'] }} / {{ it['name'] }} ({{ it['unit'] }})</option>{% endfor %}
+      <select name="bom_item_id" class="bom-item-sel">
+        {% for it in items %}<option value="{{ it['id'] }}" data-gram="{{ it['gram_per_unit'] or 0 }}" data-unit="{{ it['unit'] }}">{{ it['category_name'] }} / {{ it['name'] }} ({{ it['unit'] }})</option>{% endfor %}
       </select>
     </td>
     <td><input type="number" step="0.01" min="0" name="bom_qty" value="0" /></td>
+    <td><span class="bom-unit-label"></span></td>
     <td><label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label></td>
   `;
   tbody.appendChild(tr);
+  var sel = tr.querySelector('.bom-item-sel');
+  sel.addEventListener('change', function() { refreshBomUnitLabel(sel); });
+  refreshBomUnitLabel(sel);
+});
+
+// 初始化已有行
+document.querySelectorAll('.bom-item-sel').forEach(function(sel) {
+  sel.addEventListener('change', function() { refreshBomUnitLabel(sel); });
+  refreshBomUnitLabel(sel);
 });
 </script>
 {% endif %}
