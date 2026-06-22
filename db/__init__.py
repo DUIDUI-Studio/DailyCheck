@@ -107,6 +107,7 @@ CREATE TABLE IF NOT EXISTS items (
     safety_stock REAL NOT NULL DEFAULT 0,
     unit TEXT NOT NULL DEFAULT '件',
     unit_cost REAL NOT NULL DEFAULT 0,
+    gram_per_unit REAL NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (category_id) REFERENCES categories(id)
 );
@@ -296,5 +297,10 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if "loss_req_ids" not in cols:
             conn.execute(
                 "ALTER TABLE stocktake_batches ADD COLUMN loss_req_ids TEXT"
+            )
+        item_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+        if "gram_per_unit" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN gram_per_unit REAL NOT NULL DEFAULT 0"
             )
         conn.commit()
