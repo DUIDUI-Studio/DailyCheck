@@ -26,6 +26,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(init_master_cmd)
     app.cli.add_command(migrate_legacy_cmd)
     app.cli.add_command(create_warehouse_cmd)
+    app.cli.add_command(clone_warehouse_cmd)
     app.cli.add_command(create_user_cmd)
     app.cli.add_command(assign_role_cmd)
     app.cli.add_command(list_users_cmd)
@@ -70,6 +71,53 @@ def create_warehouse_cmd(code: str, name: str) -> None:
             click.echo(f"Created warehouse {code} ({name})")
         except sqlite3.IntegrityError:
             click.echo(f"Warehouse {code} already exists", err=True)
+
+
+@click.command("clone-warehouse")
+@click.argument("src_code")
+@click.argument("new_code")
+@click.argument("name")
+def clone_warehouse_cmd(src_code: str, new_code: str, name: str) -> None:
+    """Create <new_code> by cloning categories, items, products and
+    product_bom from <src_code>. Stock quantities are reset to zero.
+    """
+    from db import init_warehouse_db
+    from db.clone import clone_warehouse_catalog
+    from config import WAREHOUSE_DB_DIR
+
+    src_path = WAREHOUSE_DB_DIR / f"{src_code}.db"
+    if not src_path.exists():
+        click.echo(f"Source warehouse {src_code} not found", err=True)
+        return
+
+    dst_path = WAREHOUSE_DB_DIR / f"{new_code}.db"
+    if dst_path.exists():
+        click.echo(f"Destination {new_code} already exists", err=True)
+        return
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    init_warehouse_db(dst_path)
+    counts = clone_warehouse_catalog(src_path, dst_path)
+
+    rel_path = str(dst_path.relative_to(BASE_DIR))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO warehouses (code, name, db_path, created_at) VALUES (?, ?, ?, ?)",
+                (new_code, name, rel_path, now),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            click.echo(f"Warehouse {new_code} already registered", err=True)
+            return
+
+    click.echo(
+        f"Cloned {src_code} → {new_code} ({name}): "
+        f"{counts['categories']} categories, {counts['items']} items, "
+        f"{counts['products']} products, {counts['product_bom']} BOM rows. "
+        f"Stock reset to 0."
+    )
 
 
 @click.command("create-user")
