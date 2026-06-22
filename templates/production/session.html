@@ -25,7 +25,11 @@
         {% for b in bom %}
         <li>
           <span class="recipe-name">{{ b['item_name'] }}</span>
+          {% if b['gram_per_unit'] and b['gram_per_unit'] > 0 %}
+          <span class="recipe-qty"><strong>{{ b['qty_per_unit'] | fmt_qty }}</strong> 克</span>
+          {% else %}
           <span class="recipe-qty"><strong>{{ b['qty_per_unit'] | fmt_qty }}</strong> {{ b['unit'] }}</span>
+          {% endif %}
         </li>
         {% endfor %}
       </ul>
@@ -55,7 +59,8 @@
         {% for b in bom %}
         <li class="entry-row"
             data-stock="{{ b['stock'] }}"
-            data-min-qty="{{ b['qty_per_unit'] }}">
+            data-min-qty="{{ b['qty_per_unit'] }}"
+            data-gram-per-unit="{{ b['gram_per_unit'] or 0 }}">
           <div class="er-name">{{ b['item_name'] }}</div>
           <div class="er-cell er-stock-cell" title="当前库存">
             <span class="er-cell-label">库存</span>
@@ -65,10 +70,12 @@
           <div class="er-cell er-planned-cell er-planned-pill" title="按当前产出量本批共需" data-qpu="{{ b['qty_per_unit'] }}">
             <span class="er-cell-label">本批用量</span>
             <span class="er-cell-num er-planned-num planned">0.00</span>
+            {% if b['gram_per_unit'] and b['gram_per_unit'] > 0 %}
+            <span class="er-cell-unit">克</span>
+            {% else %}
             <span class="er-cell-unit">{{ b['unit'] }}</span>
+            {% endif %}
           </div>
-          {# Hidden field carries actual_qty for the submit handler.
-             Since the user can't edit it, it always equals planned. #}
           <input type="hidden" name="actual_{{ b['item_id'] }}" data-stock="{{ b['stock'] }}" value="0" class="actual" />
         </li>
         {% endfor %}
@@ -104,21 +111,26 @@
     var anyShort = false;
     rows.forEach(function(r) {
       var qpu = parseFloat(r.querySelector('.er-planned-cell').getAttribute('data-qpu'));
-      var planned = Math.round(qpu * oq * 100) / 100;
-      r.querySelector('.er-planned-cell .planned').textContent = planned.toFixed(2);
+      var gpu = parseFloat(r.getAttribute('data-gram-per-unit') || '0');
+      // 本批配方量：启用克时是克，否则是库存单位
+      var batchRecipe = Math.round(qpu * oq * 100) / 100;
+      // 折算成库存单位（提交给后端 / 库存比较）
+      var stockUnits = gpu > 0 ? (Math.round(batchRecipe / gpu * 100) / 100) : batchRecipe;
 
-      // 原料不可编辑 — 实际消耗 = 计划消耗 (同步显示)
+      // 显示：启用克的行展示克数，否则展示库存单位
+      r.querySelector('.er-planned-cell .planned').textContent = batchRecipe.toFixed(2);
+      // hidden actual 永远是库存单位
       var act = r.querySelector('.actual');
-      act.value = planned.toFixed(2);
+      act.value = stockUnits.toFixed(2);
 
-      var stock = parseFloat(r.getAttribute('data-stock'));
-      var minQty = parseFloat(r.getAttribute('data-min-qty'));
+      var stock = parseFloat(r.getAttribute('data-stock'));          // 库存单位
+      var minRecipe = parseFloat(r.getAttribute('data-min-qty'));    // 每件配方量(克或库存单位)
+      var minStock = gpu > 0 ? (minRecipe / gpu) : minRecipe;        // 每件折算库存单位
 
-      // 红底: 库存 < 生产 1 件的量 (独立于产出量)
-      r.classList.toggle('is-low', stock < minQty);
-      // 红色边框: 实际消耗 > 库存 (产出量>库存能撑的量)
-      var actVal = parseFloat(act.value);
-      var showShort = (actVal > stock);
+      // 红底：库存 < 生产 1 件所需（库存单位口径）
+      r.classList.toggle('is-low', stock < minStock);
+      // 红框：本批需求 > 库存（库存单位口径）
+      var showShort = (stockUnits > stock);
       r.classList.toggle('is-short', showShort);
       if (showShort) anyShort = true;
     });
