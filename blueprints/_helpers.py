@@ -79,6 +79,21 @@ def parse_qty(raw) -> float:
     return float(v)
 
 
+def grams_to_stock(grams: float, gram_per_unit: float) -> float:
+    """克 → 库存单位。
+
+    gram_per_unit<=0 表示该物品未启用克换算，原样返回入参
+    （此时调用方传入的本就是库存单位量）。否则做 grams/gram_per_unit
+    的除法并量化到 2 位小数（与系统其余数量精度一致）。
+    """
+    if gram_per_unit <= 0:
+        return float(Decimal(str(grams)).quantize(Decimal('0.01')))
+    return float(
+        (Decimal(str(grams)) / Decimal(str(gram_per_unit)))
+        .quantize(Decimal('0.01'))
+    )
+
+
 def fmt_qty(value) -> str:
     """Format a quantity for display: trim trailing zeros but keep
     up to 2 decimal places. Decimal('1.50') → '1.5' (but display
