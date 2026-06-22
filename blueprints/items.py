@@ -127,9 +127,13 @@ def inventory_view():
     q = request.args.get("q", "").strip()
     cat = request.args.get("cat", "").strip()
     # 7-day consumption per item.
-    # 口径:只算"实际出库/消耗"动作 — 即 stock_movements 里 delta<0 的行
-    # (action='出库' 或 '生产消耗',都把 delta 写成负数)。delta>0 的反向
-    # 动作(盘点回滚 / 生产消耗回退)自动被排除,不会双倍计入。
+    # 口径:业务表 + 7 日窗口,rolled_back=0 表示未被回退/删除。
+    # 数据源:
+    #   - outbound_requests (rolled_back=0, 排除生产领料 reason)
+    #   - production_run_items JOIN production_runs (rolled_back=0)
+    # 与 /summary 同源。被删除的出库记录 (outbound.delete 会 DELETE 该行)
+    # 和被回退的批次 (production.run.rollback 标记 rolled_back=1)
+    # 都自动从统计中消失。
     rows = db.execute(
         f"""SELECT i.*, c.name AS category_name,
                   COALESCE(c7.qty, 0) AS consume_7d_qty,
@@ -138,16 +142,30 @@ def inventory_view():
            FROM items i
            JOIN categories c ON c.id = i.category_id
            LEFT JOIN (
-               SELECT m.item_id,
-                      -SUM(m.delta) AS qty,
-                      ROUND(-SUM(m.delta) * i2.unit_cost, 2) AS value,
-                      COUNT(DISTINCT substr(m.created_at, 1, 10)) AS days
-               FROM stock_movements m
-               JOIN items i2 ON i2.id = m.item_id
-               WHERE m.action IN ('出库', '生产消耗')
-                 AND m.delta < 0
-                 AND m.created_at >= datetime('now', '-7 days')
-               GROUP BY m.item_id
+               SELECT item_id,
+                      SUM(qty) AS qty,
+                      ROUND(SUM(qty * unit_cost), 2) AS value,
+                      COUNT(DISTINCT substr(created_at, 1, 10)) AS days
+               FROM (
+                   -- 出库 (业务表,删除即消失)
+                   SELECT o.item_id, o.requested_quantity AS qty,
+                          i2.unit_cost, o.created_at
+                   FROM outbound_requests o
+                   JOIN items i2 ON i2.id = o.item_id
+                   WHERE o.rolled_back = 0
+                     AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
+                     AND o.created_at >= datetime('now', '-7 days')
+                   UNION ALL
+                   -- 生产消耗 (业务表,run.rolled_back=0 排除回退)
+                   SELECT pri.item_id, pri.actual_qty AS qty,
+                          i2.unit_cost, pr.created_at
+                   FROM production_run_items pri
+                   JOIN production_runs pr ON pr.id = pri.run_id
+                   JOIN items i2 ON i2.id = pri.item_id
+                   WHERE pr.rolled_back = 0
+                     AND pr.created_at >= datetime('now', '-7 days')
+               )
+               GROUP BY item_id
            ) c7 ON c7.item_id = i.id
            WHERE c.name IN ({placeholders})
              AND (? = '' OR i.name LIKE '%' || ? || '%' OR i.sku LIKE '%' || ? || '%')
