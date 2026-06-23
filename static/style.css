@@ -903,7 +903,7 @@ code {
   border-color: var(--brand-ink, #0f766e);
 }
 
-/* 时间筛选 chips (生产记录页) */
+/* 时间筛选 chips (生产记录页) — 2026-06-23 UI update C: 复刻 qty-preset 视觉 */
 .filter-bar {
   display: flex;
   flex-wrap: wrap;
@@ -915,20 +915,23 @@ code {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 36px;
   padding: 6px 12px;
   border: 1px solid var(--border);
-  border-radius: 999px;
   background: var(--panel);
-  font-size: 13px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
   flex-shrink: 0;
 }
+.filter-chip:hover { border-color: var(--brand-ink, #0f766e); }
 .filter-chip input[type=radio] { margin: 0; flex-shrink: 0; }
 .filter-chip input[type=date] {
   border: none;
   background: transparent;
-  font-size: 13px;
+  font-size: 14px;
   padding: 0;
   min-width: 110px;
   flex-shrink: 0;
