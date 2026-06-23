@@ -27,9 +27,11 @@
         <div class="rc-qty">+{{ r.requested_quantity | fmt_qty }}<small>{{ r.unit }}</small></div>
         <div class="rc-status done">{{ r.status }}</div>
         <div class="rc-actions">
+          {% if current_role != 'staff' %}
           <form method="post" action="{{ url_for('restock.delete', req_id=r.id) }}" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
             <button type="submit" class="btn-sm btn-delete">删除</button>
           </form>
+          {% endif %}
         </div>
       </div>
     </div>

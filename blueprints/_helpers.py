@@ -124,6 +124,16 @@ def register_jinja_filters(app) -> None:
     app.jinja_env.filters["fmt_money"] = fmt_money
 
 
+def register_template_context(app) -> None:
+    """Expose current_role and g.user/is_admin to every template."""
+    @app.context_processor
+    def _inject():
+        role = g.get("role")
+        return {
+            "current_role": role["role"] if role else None,
+        }
+
+
 def fmt_money(value) -> str:
     """Render a money value with thousands separator and 2 dp."""
     if value is None:

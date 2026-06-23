@@ -58,9 +58,11 @@
     <td>{{ i.updated_at }}</td>
     <td class="inline">
       <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">编辑</a>
+      {% if current_role != 'staff' %}
       <form method="post" action="{{ url_for('items.delete_item', item_id=i.id) }}" class="inline" onsubmit="return confirm('确认删除该库存品？');">
         <button type="submit" class="btn-sm btn-delete">删除</button>
       </form>
+      {% endif %}
     </td>
   </tr>
   {% endfor %}
