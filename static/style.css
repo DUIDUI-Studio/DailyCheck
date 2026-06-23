@@ -1185,3 +1185,6 @@ code {
   min-height: 84px;
   font-size: 16px;
 }
+
+/* 2026-06-23 UI update — E: inventory client-side hide */
+.inv-card.is-hidden { display: none; }

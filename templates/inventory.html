@@ -24,9 +24,9 @@
 {% endfor %}
 
 <div class="cat-bar" role="tablist" aria-label="按品类筛选">
-  <a class="cat-chip {% if not cat %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if not cat else 'false' }}" href="{% if q %}?q={{ q }}{% else %}?{% endif %}">全部</a>
+  <button type="button" class="cat-chip {% if not cat %}is-active{% endif %}" data-cat="__all" role="tab" aria-selected="{{ 'true' if not cat else 'false' }}">全部</button>
   {% for c in cats %}
-    <a class="cat-chip {% if cat == c %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if cat == c else 'false' }}" href="?{% if q %}q={{ q }}&amp;{% endif %}cat={{ c }}">{{ c }}</a>
+    <button type="button" class="cat-chip {% if cat == c %}is-active{% endif %}" data-cat="{{ c }}" role="tab" aria-selected="{{ 'true' if cat == c else 'false' }}">{{ c }}</button>
   {% endfor %}
 </div>
 
@@ -64,7 +64,7 @@
     {% set value = qty * cost %}
     {% set c7 = i.consume_7d_qty | float %}
     {% set c7v = i.consume_7d_value | float %}
-    <div class="inv-card {% if qty <= 0 %}is-danger{% elif qty <= i.safety_stock %}is-warn{% endif %}">
+    <div class="inv-card {% if qty <= 0 %}is-danger{% elif qty <= i.safety_stock %}is-warn{% endif %}" data-cat="{{ i.category_name }}">
       <div class="inv-card-head">
         <div class="inv-card-name">
           <span class="inv-cat">{{ i.category_name }}</span>
@@ -118,4 +118,30 @@
     <p class="muted">未找到匹配的品项。</p>
   {% endfor %}
 </div>
+<script>
+(function() {
+  var bar = document.querySelector('.cat-bar');
+  if (!bar) return;
+  var chips = bar.querySelectorAll('.cat-chip');
+  var cards = document.querySelectorAll('.inv-card');
+  function apply(cat) {
+    chips.forEach(function(c) {
+      var on = c.getAttribute('data-cat') === cat;
+      c.classList.toggle('is-active', on);
+      c.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    cards.forEach(function(card) {
+      var match = (cat === '__all') || (card.getAttribute('data-cat') === cat);
+      card.classList.toggle('is-hidden', !match);
+    });
+    if (cat !== '__all') {
+      var first = document.querySelector('.inv-card[data-cat="' + cat + '"]');
+      if (first) first.scrollIntoView({block:'start', behavior:'smooth'});
+    }
+  }
+  chips.forEach(function(c) {
+    c.addEventListener('click', function() { apply(c.getAttribute('data-cat')); });
+  });
+})();
+</script>
 {% endblock %}
