@@ -770,19 +770,22 @@ code {
 }
 .session-head .session-actions button { width: auto; min-width: 140px; }
 
+/* entry-grid + entry-row — 2026-06-23 UI update D: 3 排垂直堆叠 */
 .entry-grid {
   display: grid;
   gap: 10px;
 }
 .entry-row {
   display: grid;
-  grid-template-columns: 1fr auto auto;
-  align-items: center;
-  gap: 8px 16px;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto auto auto;
+  align-items: stretch;
+  gap: 8px 0;
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: 14px;
   background: #fafbfd;
+  min-height: 0;
 }
 .entry-row.is-warn { background: #fef9c3; border-color: #fde68a; }
 .entry-row.is-low { background: #fee2e2; border-color: #fca5a5; }
@@ -791,6 +794,19 @@ code {
   font-weight: 600;
   color: var(--text);
 }
+.entry-row .er-stock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.entry-row .er-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.entry-row .er-input input { max-width: 200px; }
 .entry-row .er-cell {
   display: grid;
   grid-template-columns: auto auto auto;
