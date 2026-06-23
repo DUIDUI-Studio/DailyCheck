@@ -1138,3 +1138,24 @@ code {
   .record-card .rc-right { align-items: flex-start; text-align: left; }
   .record-card .rc-qty { font-size: 22px; }
 }
+
+/* 2026-06-23 UI update — A: recipe note block */
+.recipe-note {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.recipe-note-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.recipe-note p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
