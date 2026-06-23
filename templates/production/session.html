@@ -33,6 +33,12 @@
         </li>
         {% endfor %}
       </ul>
+      {% if chosen['note'] %}
+      <div class="recipe-note">
+        <span class="recipe-note-label">备注</span>
+        <p>{{ chosen['note'] }}</p>
+      </div>
+      {% endif %}
     </aside>
 
     {# 右: 录入 + 原料卡 (动态, 显示库存 / 本批用量) #}
