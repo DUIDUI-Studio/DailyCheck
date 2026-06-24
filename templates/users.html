@@ -43,6 +43,34 @@
   </form>
 </details>
 
+<details class="card" style="margin-bottom:16px" open>
+  <summary><strong>创建门店</strong></summary>
+  <form method="post" action="{{ url_for('users.create_warehouse') }}" style="margin-top:12px">
+    <div class="grid cols-2">
+      <label>仓库编码
+        <input name="code" required pattern="wh_\w+"
+               placeholder="例如 wh_004" autocomplete="off" />
+      </label>
+      <label>门店名称
+        <input name="name" required placeholder="例如 新天地店" autocomplete="off" />
+      </label>
+    </div>
+    <label style="display:block;margin-top:8px">
+      克隆源
+      <select name="clone_from_code" style="margin-top:4px">
+        <option value="">不克隆(只建空门店)</option>
+        {% for w in warehouses %}
+        <option value="{{ w['code'] }}">{{ w['code'] }} — {{ w['name'] }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">
+      选择"克隆源"时,会从源门店复制品项目录、产品与配方(库存归零、SKU 保留)。
+    </p>
+    <button type="submit" class="btn primary" style="margin-top:12px">创建</button>
+  </form>
+</details>
+
 <h3>用户列表</h3>
 <div class="user-cards">
   {% for u in users %}
