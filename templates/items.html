@@ -10,16 +10,6 @@
   {% endfor %}
 </div>
 
-<section id="categories" class="card" style="margin-bottom:24px">
-  <h3 style="margin-top:0">固定品类</h3>
-  <p class="muted" style="font-size:13px;margin-top:0">品类为系统固定项，不可新增或删除。</p>
-  <ul style="list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:10px">
-    {% for c in categories %}
-    <li class="tag">{{ c.name }}</li>
-    {% endfor %}
-  </ul>
-</section>
-
 <h3>新增库存品</h3>
 <form method="post" class="grid cols-3">
   <label>
