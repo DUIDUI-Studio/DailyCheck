@@ -1,6 +1,7 @@
 """Dashboard, summary, and category redirect (read-only summary screens)."""
 from __future__ import annotations
 
+import datetime as _dt
 from datetime import datetime
 
 from flask import Blueprint, redirect, render_template, request, url_for
@@ -66,32 +67,67 @@ def land():
 def summary():
     db = get_warehouse_db()
 
+    # range 参数:7d(默认)/ month / all
+    range_param = request.args.get("range", "7d")
+    if range_param not in ("7d", "month", "all"):
+        range_param = "7d"
+
+    # 时间筛选 SQL 起点表达式(SQLite 字符串)
+    import calendar
+    if range_param == "7d":
+        time_clause_outbound = "o.created_at >= datetime('now','-7 days')"
+        time_clause_production = "pr.created_at >= datetime('now','-7 days')"
+        time_clause_restock = "r.created_at >= datetime('now','-7 days')"
+        window_days = 7
+    elif range_param == "month":
+        ym = _dt.datetime.now().strftime("%Y-%m")
+        time_clause_outbound = f"o.created_at LIKE '{ym}%'"
+        time_clause_production = f"pr.created_at LIKE '{ym}%'"
+        time_clause_restock = f"r.created_at LIKE '{ym}%'"
+        window_days = calendar.monthrange(_dt.datetime.now().year, _dt.datetime.now().month)[1]
+    else:  # all
+        time_clause_outbound = "1=1"
+        time_clause_production = "1=1"
+        time_clause_restock = "1=1"
+        first = db.execute(
+            "SELECT MIN(created_at) AS d FROM stock_movements"
+        ).fetchone()["d"]
+        if first:
+            window_days = max(
+                1, (_dt.datetime.now() - _dt.datetime.strptime(first[:10], "%Y-%m-%d")).days
+            )
+        else:
+            window_days = 1
+
     # 口径:进货金额 = 全部 restock_requests(被删除的不算) × 单价
     # 用 restock_requests 而不是 stock_movements,因为后者把
     # '补货删除回滚' 写为独立 action,会与 '补货入库' 抵消混乱。
     # restock_requests 是用户意图的真理源(被删除就不在表里)。
     total_inbound_value = db.execute(
-        """SELECT COALESCE(SUM(r.requested_quantity * i.unit_cost), 0) AS c
-           FROM restock_requests r
-           JOIN items i ON i.id = r.item_id"""
+        f"""SELECT COALESCE(SUM(r.requested_quantity * i.unit_cost), 0) AS c
+            FROM restock_requests r
+            JOIN items i ON i.id = r.item_id
+            WHERE {time_clause_restock}"""
     ).fetchone()["c"]
 
     # 口径:消耗金额 = 出库(rolled_back=0, 排除生产领料) + 生产消耗(pr.rolled_back=0)
     # outbound_requests 已经双写了生产领料(reason='生产领料(run=#X)'),所以这里要排除,
     # 否则会被生产消耗重复计算。
     consumed_outbound = db.execute(
-        """SELECT COALESCE(SUM(o.requested_quantity * i.unit_cost), 0) AS c
-           FROM outbound_requests o
-           JOIN items i ON i.id = o.item_id
-           WHERE o.rolled_back = 0
-             AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')"""
+        f"""SELECT COALESCE(SUM(o.requested_quantity * i.unit_cost), 0) AS c
+            FROM outbound_requests o
+            JOIN items i ON i.id = o.item_id
+            WHERE o.rolled_back = 0
+              AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
+              AND {time_clause_outbound}"""
     ).fetchone()["c"]
     consumed_production = db.execute(
-        """SELECT COALESCE(SUM(pri.actual_qty * i.unit_cost), 0) AS c
-           FROM production_run_items pri
-           JOIN production_runs pr ON pr.id = pri.run_id
-           JOIN items i ON i.id = pri.item_id
-           WHERE pr.rolled_back = 0"""
+        f"""SELECT COALESCE(SUM(pri.actual_qty * i.unit_cost), 0) AS c
+            FROM production_run_items pri
+            JOIN production_runs pr ON pr.id = pri.run_id
+            JOIN items i ON i.id = pri.item_id
+            WHERE pr.rolled_back = 0
+              AND {time_clause_production}"""
     ).fetchone()["c"]
     total_consumed_value = float(consumed_outbound) + float(consumed_production)
 
@@ -106,7 +142,7 @@ def summary():
 
     # 口径:按品类统计 — 同样基于 restock_requests / outbound_requests
     cat_data = db.execute(
-        """SELECT
+        f"""SELECT
               c.name AS category_name,
               COALESCE(SUM(item_vals.restock_value), 0) AS restock_value,
               COALESCE(SUM(item_vals.consumed_value), 0) AS consumed_value,
@@ -121,13 +157,16 @@ def summary():
               FROM items i
               LEFT JOIN (
                   SELECT item_id, SUM(requested_quantity) AS total_restock
-                  FROM restock_requests GROUP BY item_id
+                  FROM restock_requests r
+                  WHERE {time_clause_restock}
+                  GROUP BY item_id
               ) r ON r.item_id = i.id
               LEFT JOIN (
                   SELECT item_id, SUM(requested_quantity) AS total_outbound
-                  FROM outbound_requests
-                  WHERE rolled_back = 0
-                    AND (reason IS NULL OR reason NOT LIKE '生产领料(run=#%')
+                  FROM outbound_requests o
+                  WHERE o.rolled_back = 0
+                    AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
+                    AND {time_clause_outbound}
                   GROUP BY item_id
               ) o ON o.item_id = i.id
            ) item_vals ON item_vals.category_id = c.id
@@ -148,21 +187,23 @@ def summary():
         })
 
     top_consumed = db.execute(
-        """SELECT i.name AS item_name, c.name AS category_name,
+        f"""SELECT i.name AS item_name, c.name AS category_name,
                   o.total_qty AS consumed_qty, i.unit,
                   ROUND(o.total_qty * i.unit_cost, 2) AS consumed_value
            FROM (
                SELECT item_id, SUM(requested_quantity) AS total_qty
-               FROM outbound_requests
-               WHERE rolled_back = 0
-                 AND (reason IS NULL OR reason NOT LIKE '生产领料(run=#%')
-               GROUP BY item_id
+               FROM outbound_requests o
+               WHERE o.rolled_back = 0
+                 AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
+                 AND {time_clause_outbound}
+               GROUP BY o.item_id
            ) o
            JOIN items i ON i.id = o.item_id
            JOIN categories c ON c.id = i.category_id
-           ORDER BY o.total_qty DESC"""
+           ORDER BY o.total_qty DESC LIMIT 10"""
     ).fetchall()
 
+    range_label = {"7d": "7 日滚动", "month": "当月", "all": "全部"}[range_param]
     return render_template(
         "summary.html",
         total_inbound_value=round(total_inbound_value, 2),
@@ -171,6 +212,8 @@ def summary():
         total_revenue=round(total_revenue, 2),
         category_stats=enriched_stats,
         top_consumed=top_consumed,
+        range=range_param,
+        range_label=range_label,
     )
 
 
