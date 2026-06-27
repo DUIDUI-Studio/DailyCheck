@@ -2,36 +2,39 @@
 {% block content %}
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
   <h2 style="margin:0">汇总</h2>
-  <a href="{{ url_for('reports.export_consumption') }}" download>导出消耗清单 CSV</a>
+  <a class="btn" href="{{ url_for('reports.export_summary', range=range) }}">导出 CSV</a>
+</div>
+
+<div class="cat-bar summary-range" role="tablist" aria-label="时间范围">
+  <a href="{{ url_for('core.summary', range='7d') }}" class="cat-chip {% if range == '7d' %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if range == '7d' else 'false' }}">7 日</a>
+  <a href="{{ url_for('core.summary', range='month') }}" class="cat-chip {% if range == 'month' %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if range == 'month' else 'false' }}">当月</a>
+  <a href="{{ url_for('core.summary', range='all') }}" class="cat-chip {% if range == 'all' %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if range == 'all' else 'false' }}">全部</a>
 </div>
 
 <div class="grid cols-4">
   <section class="card">
-    <p>营业额</p>
-    <strong><small>¥</small>{{ "{:,.2f}".format(total_revenue) }}</strong>
-  </section>
-  <section class="card">
     <p>进货总金额</p>
     <strong><small>¥</small>{{ "{:,.2f}".format(total_inbound_value) }}</strong>
+    <small class="muted">{{ range_label }}</small>
   </section>
   <section class="card">
-    <p>总消耗金额</p>
+    <p>消耗金额</p>
     <strong><small>¥</small>{{ "{:,.2f}".format(total_consumed_value) }}</strong>
+    <small class="muted">{{ range_label }}</small>
   </section>
   <section class="card">
     <p>库存总价值</p>
     <strong><small>¥</small>{{ "{:,.2f}".format(total_stock_value) }}</strong>
+    <small class="muted">不受时间筛选</small>
   </section>
-</div>
-
-<div class="grid cols-2">
-  <section class="card">
+  <section class="card turnover-card">
     <p>库存周转率</p>
     <strong>{{ "{:.2f}".format(turnover) }}</strong>
-  </section>
-  <section class="card">
-    <p>可售天数</p>
-    <strong>{% if turnover_days is none %}—{% else %}{{ "{:.1f}".format(turnover_days) }}{% endif %}</strong>
+    {% if turnover_days is not none %}
+    <small class="muted">≈ 可售 {{ turnover_days }} 天</small>
+    {% else %}
+    <small class="muted">可售 — 天</small>
+    {% endif %}
   </section>
 </div>
 
@@ -43,6 +46,7 @@
     <th>进货金额</th>
     <th>消耗金额</th>
     <th>库存金额</th>
+    <th>周转率</th>
   </tr>
   {% for cat in category_stats %}
   <tr>
@@ -50,6 +54,9 @@
     <td>¥{{ "{:,.2f}".format(cat.inbound_value) }}</td>
     <td>¥{{ "{:,.2f}".format(cat.consumed_value) }}</td>
     <td>¥{{ "{:,.2f}".format(cat.stock_value) }}</td>
+    <td>
+      {% if cat.turnover is not none %}{{ "{:.2f}".format(cat.turnover) }}{% else %}—{% endif %}
+    </td>
   </tr>
   {% endfor %}
 </table>
