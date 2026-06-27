@@ -295,11 +295,11 @@ def export_summary():
         turnover_str = "0.00"
         days_str = "—"
 
-    # 段 2:按品类
+    # 段 2:按品类(outbound 无生产领料 + production_run_items,口径与 /summary 一致)
     cat_rows = db.execute(
         f"""SELECT c.name AS category_name,
                   COALESCE(SUM(r.total_restock * i.unit_cost), 0) AS inbound_value,
-                  COALESCE(SUM(o.total_outbound * i.unit_cost), 0) AS consumed_value,
+                  COALESCE(SUM((o.total_outbound + COALESCE(p.total_production, 0)) * i.unit_cost), 0) AS consumed_value,
                   COALESCE(SUM(i.quantity * i.unit_cost), 0) AS stock_value
            FROM categories c
            LEFT JOIN items i ON i.category_id = c.id
@@ -316,6 +316,14 @@ def export_summary():
                  AND {time_clause_outbound}
                GROUP BY item_id
            ) o ON o.item_id = i.id
+           LEFT JOIN (
+               SELECT pri.item_id, SUM(pri.actual_qty) AS total_production
+               FROM production_run_items pri
+               JOIN production_runs pr ON pr.id = pri.run_id
+               WHERE pr.rolled_back = 0
+                 AND {time_clause_production}
+               GROUP BY pri.item_id
+           ) p ON p.item_id = i.id
            GROUP BY c.id, c.name ORDER BY c.id"""
     ).fetchall()
 

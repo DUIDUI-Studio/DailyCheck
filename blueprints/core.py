@@ -192,7 +192,7 @@ def summary():
         "SELECT COALESCE(SUM(amount), 0) AS c FROM daily_revenue"
     ).fetchone()["c"]
 
-    # 口径:按品类统计 — 同样基于 restock_requests / outbound_requests
+    # 口径:按品类统计 — outbound(无生产领料) + production_run_items,口径与 total_consumed_value 一致
     cat_data = db.execute(
         f"""SELECT
               c.id AS category_id,
@@ -205,7 +205,7 @@ def summary():
               SELECT
                   i.category_id,
                   COALESCE(r.total_restock, 0) * i.unit_cost AS restock_value,
-                  COALESCE(o.total_outbound, 0) * i.unit_cost AS consumed_value,
+                  (COALESCE(o.total_outbound, 0) + COALESCE(p.total_production, 0)) * i.unit_cost AS consumed_value,
                   i.quantity * i.unit_cost AS current_stock_value
               FROM items i
               LEFT JOIN (
@@ -222,6 +222,14 @@ def summary():
                     AND {time_clause_outbound}
                   GROUP BY item_id
               ) o ON o.item_id = i.id
+              LEFT JOIN (
+                  SELECT pri.item_id, SUM(pri.actual_qty) AS total_production
+                  FROM production_run_items pri
+                  JOIN production_runs pr ON pr.id = pri.run_id
+                  WHERE pr.rolled_back = 0
+                    AND {time_clause_production}
+                  GROUP BY pri.item_id
+              ) p ON p.item_id = i.id
            ) item_vals ON item_vals.category_id = c.id
            GROUP BY c.id, c.name ORDER BY c.id"""
     ).fetchall()
