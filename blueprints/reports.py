@@ -350,6 +350,9 @@ def export_summary():
     for cat in cat_rows:
         cat_consumed = float(cat["consumed_value"])
         cat_stock = float(cat["stock_value"])
+        # 注:CSV 这里用的是 consumed / stock_value(当前库存金额),
+        # /summary 页用的是 consumed / avg(start+end 平均)。
+        # 两者口径不同(CSV 简化未反推起点),v2 统一为 avg。
         if cat_stock > 0 and cat_consumed > 0:
             cat_turnover = f"{cat_consumed / cat_stock:.2f}"
         else:
