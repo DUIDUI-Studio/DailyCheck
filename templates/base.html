@@ -10,7 +10,7 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=10" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=11" />
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
@@ -20,7 +20,9 @@
       {% if g.user['is_admin'] %}
       <a href="{{ url_for('users.list_users') }}">账号管理</a>
       {% endif %}
+      {% if current_role != 'staff' %}
       <a href="{{ url_for('items.items_list') }}">品类与品项</a>
+      {% endif %}
     {% endif %}
     <a href="{{ url_for('core.dashboard') }}">总览</a>
     <a href="{{ url_for('core.summary') }}">汇总</a>
@@ -72,7 +74,9 @@
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       <a href="{{ url_for('core.summary') }}">汇总</a>
       <a href="{{ url_for('items.inventory_view') }}">库存</a>
+      {% if current_role != 'staff' %}
       <a href="{{ url_for('items.items_list') }}">品项</a>
+      {% endif %}
       <a href="{{ url_for('stocktake.stocktake_list') }}">盘点</a>
       <a href="{{ url_for('restock.restock_list') }}">入库</a>
       <a href="{{ url_for('adjustment.adjustment_list') }}">调整</a>
