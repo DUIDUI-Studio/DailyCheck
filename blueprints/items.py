@@ -60,9 +60,11 @@ def items_list():
         params,
     ).fetchall()
     rows = db.execute(
-        """SELECT i.*, c.name AS category_name
-           FROM items i JOIN categories c ON c.id = i.category_id
-           ORDER BY i.id DESC"""
+        f"""SELECT i.*, c.name AS category_name
+            FROM items i JOIN categories c ON c.id = i.category_id
+            WHERE c.name IN ({placeholders})
+            ORDER BY i.id DESC""",
+        params,
     ).fetchall()
     return render_template(
         "items.html",
