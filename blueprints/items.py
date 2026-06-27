@@ -16,7 +16,7 @@ bp = Blueprint("items", __name__)
 
 @bp.route("/items", methods=["GET", "POST"])
 @require_login
-@require_role("staff")
+@require_role("manager")
 def items_list():
     db = get_warehouse_db()
     if request.method == "POST":
@@ -27,6 +27,13 @@ def items_list():
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
         gram_per_unit = parse_qty(request.form.get("gram_per_unit", "0"))
+
+        if gram_per_unit < 0:
+            flash("每单位克重不能为负数")
+            return redirect(url_for("items.items_list"))
+        if unit_cost < 0:
+            flash("进货单价不能为负数")
+            return redirect(url_for("items.items_list"))
 
         if not name or not category_id:
             flash("名称、品类为必填")
@@ -53,9 +60,11 @@ def items_list():
         params,
     ).fetchall()
     rows = db.execute(
-        """SELECT i.*, c.name AS category_name
-           FROM items i JOIN categories c ON c.id = i.category_id
-           ORDER BY i.id DESC"""
+        f"""SELECT i.*, c.name AS category_name
+            FROM items i JOIN categories c ON c.id = i.category_id
+            WHERE c.name IN ({placeholders})
+            ORDER BY i.id DESC""",
+        params,
     ).fetchall()
     return render_template(
         "items.html",
@@ -66,6 +75,7 @@ def items_list():
 
 @bp.route("/items/<int:item_id>/edit", methods=["GET", "POST"])
 @require_login
+@require_role("manager")
 def edit_item(item_id: int):
     db = get_warehouse_db()
     if request.method == "POST":
@@ -75,6 +85,12 @@ def edit_item(item_id: int):
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
         gram_per_unit = parse_qty(request.form.get("gram_per_unit", "0"))
+        if gram_per_unit < 0:
+            flash("每单位克重不能为负数")
+            return redirect(url_for("items.edit_item", item_id=item_id))
+        if unit_cost < 0:
+            flash("进货单价不能为负数")
+            return redirect(url_for("items.edit_item", item_id=item_id))
         if not name or not category_id:
             flash("名称、品类为必填")
             return redirect(url_for("items.edit_item", item_id=item_id))

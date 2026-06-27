@@ -1200,3 +1200,11 @@ code {
 
 /* 2026-06-23 UI update — E: inventory client-side hide */
 .inv-card.is-hidden { display: none; }
+tr.is-hidden { display: none; }
+
+/* Summary time-range + turnover card */
+.summary-range { margin: 8px 0 14px; }
+.turnover-card { background: #ecfdf5; border-color: #0f766e; }
+.turnover-card p { color: #0f766e; }
+.turnover-card strong { color: #0f766e; }
+.turnover-card .muted { color: #047857; }

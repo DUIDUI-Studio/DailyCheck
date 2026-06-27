@@ -3,15 +3,12 @@
 {% block content %}
 <h2>品类与品项</h2>
 
-<section id="categories" class="card" style="margin-bottom:24px">
-  <h3 style="margin-top:0">固定品类</h3>
-  <p class="muted" style="font-size:13px;margin-top:0">品类为系统固定项，不可新增或删除。</p>
-  <ul style="list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:10px">
-    {% for c in categories %}
-    <li class="tag">{{ c.name }}</li>
-    {% endfor %}
-  </ul>
-</section>
+<div class="cat-bar" role="tablist" aria-label="按品类筛选">
+  <button type="button" class="cat-chip is-active" data-cat="__all" role="tab" aria-selected="true">全部</button>
+  {% for c in categories %}
+  <button type="button" class="cat-chip" data-cat="{{ c.name }}" role="tab" aria-selected="false">{{ c.name }}</button>
+  {% endfor %}
+</div>
 
 <h3>新增库存品</h3>
 <form method="post" class="grid cols-3">
@@ -44,17 +41,22 @@
     <span>单位</span>
     <input name="unit" placeholder="件" />
   </label>
+  <label>
+    <span>每单位克重（克，0=不启用）</span>
+    <input name="gram_per_unit" type="number" min="0" step="0.01" placeholder="0" />
+  </label>
   <button type="submit">新增库存品</button>
 </form>
 
 <h3>品项列表</h3>
 <table>
-  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th><th>单价（¥）</th><th>更新时间</th><th>操作</th></tr>
+  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th><th>单价（¥）</th><th>克重</th><th>更新时间</th><th>操作</th></tr>
   {% for i in items %}
-  <tr>
+  <tr data-cat="{{ i.category_name }}">
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
     <td>{{ i.quantity | fmt_qty }} {{ i.unit }}</td><td>{{ i.safety_stock | fmt_qty }}</td>
     <td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>
+    <td>{% if i.gram_per_unit and i.gram_per_unit > 0 %}{{ i.gram_per_unit | fmt_qty }} g/件{% else %}—{% endif %}</td>
     <td>{{ i.updated_at }}</td>
     <td class="inline">
       <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">编辑</a>
@@ -67,4 +69,27 @@
   </tr>
   {% endfor %}
 </table>
+
+<script>
+(function() {
+  var bar = document.querySelector('.cat-bar');
+  if (!bar) return;
+  var chips = bar.querySelectorAll('.cat-chip');
+  var rows = document.querySelectorAll('table tbody tr[data-cat]');
+  function apply(cat) {
+    chips.forEach(function(c) {
+      var on = c.getAttribute('data-cat') === cat;
+      c.classList.toggle('is-active', on);
+      c.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    rows.forEach(function(row) {
+      var match = (cat === '__all') || (row.getAttribute('data-cat') === cat);
+      row.classList.toggle('is-hidden', !match);
+    });
+  }
+  chips.forEach(function(c) {
+    c.addEventListener('click', function() { apply(c.getAttribute('data-cat')); });
+  });
+})();
+</script>
 {% endblock %}
