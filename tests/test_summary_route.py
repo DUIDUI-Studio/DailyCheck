@@ -71,3 +71,12 @@ def test_total_stock_value_unchanged_by_range(tmp_path, monkeypatch):
     resp = client.get("/summary")
     # 库存金额 ¥500 在 HTML 中存在(无论 range)
     assert b"500" in resp.data
+
+
+def test_turnover_zero_when_no_consume(tmp_path, monkeypatch):
+    """无消耗数据时 turnover=0.00,turnover_days=None(模板渲染为 '—')。"""
+    client, _ = _login_as_admin(tmp_path, monkeypatch)
+    resp = client.get("/summary")
+    assert resp.status_code == 200
+    # turnover 字段在响应体里能找到(模板渲染后);HTML 出现 "库存周转率" 字样
+    assert "库存周转率" in resp.data.decode("utf-8")

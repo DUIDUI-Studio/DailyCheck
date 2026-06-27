@@ -24,6 +24,17 @@
   </section>
 </div>
 
+<div class="grid cols-2">
+  <section class="card">
+    <p>库存周转率</p>
+    <strong>{{ "{:.2f}".format(turnover) }}</strong>
+  </section>
+  <section class="card">
+    <p>可售天数</p>
+    <strong>{% if turnover_days is none %}—{% else %}{{ "{:.1f}".format(turnover_days) }}{% endif %}</strong>
+  </section>
+</div>
+
 <h3>按品类统计</h3>
 <div class="table-scroll">
 <table>

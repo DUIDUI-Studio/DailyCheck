@@ -136,6 +136,58 @@ def summary():
         "SELECT COALESCE(SUM(quantity * unit_cost), 0) AS c FROM items"
     ).fetchone()["c"]
 
+    # 平均库存金额(起止两点平均)
+    end_value = float(db.execute(
+        "SELECT COALESCE(SUM(quantity * unit_cost), 0) AS c FROM items"
+    ).fetchone()["c"])
+
+    # 反推窗口起始库存金额
+    if range_param == "7d":
+        start_filter = "m.created_at >= datetime('now','-7 days')"
+    elif range_param == "month":
+        ym = _dt.datetime.now().strftime("%Y-%m")
+        start_filter = f"m.created_at LIKE '{ym}%'"
+    else:  # all:反推到第一条 stock_movements
+        first = db.execute(
+            "SELECT MIN(created_at) AS d FROM stock_movements"
+        ).fetchone()["d"]
+        if first:
+            start_filter = f"m.created_at >= '{first}'"
+        else:
+            start_filter = None
+
+    if start_filter is None:
+        start_value = end_value  # 无 stock_movements 历史,起点=当前
+    else:
+        rows = db.execute(
+            f"""SELECT i.id, i.quantity, i.unit_cost,
+                       COALESCE(SUM(m.delta), 0) AS d
+                FROM items i
+                LEFT JOIN stock_movements m
+                  ON m.item_id = i.id AND {start_filter}
+                GROUP BY i.id"""
+        ).fetchall()
+        start_value = 0.0
+        for r in rows:
+            qty_start = float(r["quantity"]) - float(r["d"])
+            if qty_start < 0:
+                qty_start = 0  # 防御:反推得负数视为 0
+            start_value += qty_start * float(r["unit_cost"])
+
+    avg_stock_value = (start_value + end_value) / 2
+
+    # 周转率 + 可售天数
+    if avg_stock_value > 0 and window_days > 0:
+        turnover = round(float(total_consumed_value) / avg_stock_value, 2)
+        daily_consume = float(total_consumed_value) / window_days
+        if daily_consume > 0:
+            turnover_days = round(avg_stock_value / daily_consume, 1)
+        else:
+            turnover_days = None  # 消耗为 0,无意义
+    else:
+        turnover = 0.0
+        turnover_days = None
+
     total_revenue = db.execute(
         "SELECT COALESCE(SUM(amount), 0) AS c FROM daily_revenue"
     ).fetchone()["c"]
@@ -143,6 +195,7 @@ def summary():
     # 口径:按品类统计 — 同样基于 restock_requests / outbound_requests
     cat_data = db.execute(
         f"""SELECT
+              c.id AS category_id,
               c.name AS category_name,
               COALESCE(SUM(item_vals.restock_value), 0) AS restock_value,
               COALESCE(SUM(item_vals.consumed_value), 0) AS consumed_value,
@@ -173,17 +226,53 @@ def summary():
            GROUP BY c.id, c.name ORDER BY c.id"""
     ).fetchall()
 
+    # 品类级反推起点库存金额
+    if range_param == "7d":
+        cat_start_filter = "sm.created_at >= datetime('now','-7 days')"
+    elif range_param == "month":
+        ym = _dt.datetime.now().strftime("%Y-%m")
+        cat_start_filter = f"sm.created_at LIKE '{ym}%'"
+    else:
+        first = db.execute(
+            "SELECT MIN(created_at) AS d FROM stock_movements"
+        ).fetchone()["d"]
+        if first:
+            cat_start_filter = f"sm.created_at >= '{first}'"
+        else:
+            cat_start_filter = None
+
+    if cat_start_filter:
+        cat_start_rows = db.execute(
+            f"""SELECT i.category_id AS cid,
+                       COALESCE(SUM((i.quantity - sm.delta) * i.unit_cost), 0) AS start_value
+                FROM items i
+                LEFT JOIN stock_movements sm
+                  ON sm.item_id = i.id AND {cat_start_filter}
+                GROUP BY i.category_id"""
+        ).fetchall()
+        cat_start_map = {r["cid"]: float(r["start_value"]) for r in cat_start_rows}
+    else:
+        cat_start_map = {}
+
     enriched_stats = []
     for row in cat_data:
+        consumed_v = round(float(row["consumed_value"]), 2)
+        stock_v = round(float(row["stock_value"]), 2)
+        cid = row["category_id"]
+        start_v = cat_start_map.get(cid, stock_v)
+        if start_v < 0:
+            start_v = 0
+        avg = (start_v + stock_v) / 2
+        if avg > 0 and consumed_v > 0:
+            cat_turnover = round(consumed_v / avg, 2)
+        else:
+            cat_turnover = None
         enriched_stats.append({
             "category_name": row["category_name"],
-            # backward-compat: old code returned a single "inbound_value"
-            # combining init_value + restock_value. init_value is 0
-            # since the column was dropped (commit 940cc22), so the sum
-            # equals restock_value. Keep the same key.
-            "inbound_value": round(row["restock_value"], 2),
-            "consumed_value": round(row["consumed_value"], 2),
-            "stock_value": round(row["stock_value"], 2),
+            "inbound_value": round(float(row["restock_value"]), 2),
+            "consumed_value": consumed_v,
+            "stock_value": stock_v,
+            "turnover": cat_turnover,
         })
 
     top_consumed = db.execute(
@@ -214,6 +303,8 @@ def summary():
         top_consumed=top_consumed,
         range=range_param,
         range_label=range_label,
+        turnover=turnover,
+        turnover_days=turnover_days,
     )
 
 
