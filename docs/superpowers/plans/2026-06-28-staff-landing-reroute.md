@@ -82,11 +82,13 @@ git diff --stat templates/land.html
 Expected output:
 
 ```
- templates/land.html | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ templates/land.html | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
 ```
 
-If the diff shows any other file or more than 2 lines changed, stop and inspect with `git diff templates/land.html` — do not proceed.
+(Git counts each modified line in both directions; two single-line edits → 2 `-` + 2 `+` lines.)
+
+If the diff shows any other file or more than 4 changed lines, stop and inspect with `git diff templates/land.html` — do not proceed.
 
 - [ ] **Step 4: Manually verify in browser**
 
