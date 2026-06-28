@@ -5,7 +5,7 @@
   <button type="submit">查询</button>
   {% if cat %}<input type="hidden" name="cat" value="{{ cat }}" />{% endif %}
 </form>
-<p class="muted" style="margin: 0 0 8px; font-size: 11px;">卡片内的「日均消耗」分母为该品项 7 日窗口内实际有消耗的天数（不是固定 7 天）。</p>
+<p class="muted" style="margin: 0 0 8px; font-size: 11px;">日均消耗 = 7 日消耗 ÷ 7（固定 7 天，与汇总页一致）。</p>
 
 {% set ns = namespace(total_qty=0, total_value=0, consume_qty=0, consume_value=0) %}
 {% for i in items %}
@@ -96,17 +96,11 @@
         </div>
         <div class="inv-metric">
           <span class="metric-label">7日消耗</span>
-          <span class="metric-value small">{{ c7 | fmt_qty }}<small>{{ i.unit }}{% if i.consume_7d_days %} / {{ i.consume_7d_days }}d{% endif %}</small></span>
+          <span class="metric-value small">{{ c7 | fmt_qty }}<small>{{ i.unit }}/7d</small></span>
         </div>
         <div class="inv-metric inv-metric-consume">
           <span class="metric-label">日均消耗</span>
-          <span class="metric-value small">
-            {% if i.consume_7d_days and i.consume_7d_days > 0 %}
-              {{ (c7 / i.consume_7d_days) | fmt_qty }}<small>{{ i.unit }}/{{ i.consume_7d_days }}d</small>
-            {% else %}
-              —
-            {% endif %}
-          </span>
+          <span class="metric-value small">{{ (c7 / 7) | fmt_qty }}<small>{{ i.unit }}/7d</small></span>
         </div>
       </div>
 

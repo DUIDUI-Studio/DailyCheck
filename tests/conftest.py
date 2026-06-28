@@ -57,3 +57,49 @@ def _wh(wh_path):
     conn = sqlite3.connect(wh_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _seed_item(wh_path, name, qty, unit_cost, gram_per_unit=0):
+    """插入一个测试品项,返回 (item_id, category_id)。"""
+    conn = _wh(wh_path)
+    cat_id = conn.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, safety_stock, unit_cost, unit, gram_per_unit, updated_at) "
+        "VALUES (?, ?, ?, ?, 0, ?, '件', ?, ?)",
+        (f"T-{name}", name, cat_id, qty, unit_cost, gram_per_unit, ts))
+    item_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return item_id, cat_id
+
+
+def _seed_outbound(wh_path, item_id, qty, reason=None):
+    """插入一条出库请求。"""
+    conn = _wh(wh_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO outbound_requests (item_id, requested_quantity, reason, rolled_back, created_at) "
+        "VALUES (?, ?, ?, 0, ?)",
+        (item_id, qty, reason, ts))
+    conn.commit()
+    conn.close()
+
+
+def _seed_production_consumption(wh_path, item_id, qty):
+    """插入一条生产消耗(自动建 product + production_run)。"""
+    conn = _wh(wh_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        "INSERT INTO products (name, unit, note, created_at) VALUES ('test-product', '件', '', ?)",
+        (ts,))
+    product_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO production_runs (product_id, output_qty, note, rolled_back, created_at) "
+        "VALUES (?, 1, 'test', 0, ?)", (product_id, ts))
+    run_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO production_run_items (run_id, item_id, planned_qty, actual_qty) VALUES (?, ?, ?, ?)",
+        (run_id, item_id, qty, qty))
+    conn.commit()
+    conn.close()
