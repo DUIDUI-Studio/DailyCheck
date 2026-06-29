@@ -50,6 +50,10 @@
       {% endif %}
     </a>
     {% endif %}
+    {# Agent MPC: platform admins only (subproject 6) #}
+    {% if g.user and g.user['is_admin'] %}
+    <a href="{{ url_for('agent_mpc.admin_mpc_usage') }}">MPC 用量</a>
+    {% endif %}
   </aside>
   {% endblock %}
 
