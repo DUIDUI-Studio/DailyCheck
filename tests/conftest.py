@@ -23,6 +23,13 @@ def logged_client(tmp_path, monkeypatch):
     # 让 db 模块用临时路径
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    # Also patch config directly — several blueprints (forecast,
+    # procurement, notifications) import MASTER_DB from config at call
+    # time to bypass flask 'g', so without this patch the test would
+    # write to the real on-disk master.db and pollute it.
+    import config as config_module
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
 
     init_master_db()
     init_warehouse_db(wh_path)
