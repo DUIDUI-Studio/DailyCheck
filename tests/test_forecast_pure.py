@@ -69,7 +69,8 @@ def test_compute_daily_avg_recent_spike_dominates():
     today = datetime(2026, 6, 29, 12, 0, 0)
     rows = [(today - timedelta(days=i), 1.0) for i in range(1, 7)]
     rows.insert(0, (today, 100.0))
-    assert compute_daily_avg(rows) == pytest.approx(3159 / 189)
+    # 2dp quantize rounds 16.714... → 16.71
+    assert compute_daily_avg(rows) == pytest.approx(16.71)
 
 
 def test_compute_daily_avg_old_data_weighs_less_than_recent():
@@ -87,9 +88,10 @@ def test_compute_daily_avg_old_data_weighs_less_than_recent():
     """
     today = datetime(2026, 6, 29, 12, 0, 0)
     rows = [(today, 1.0), (today - timedelta(days=29), 100.0)]
+    # 2dp quantize rounds 4.1935... → 4.19
     # Expected ≈ 4.19, NOT anywhere near 50.5 (which would be naive mean).
     result = compute_daily_avg(rows)
-    assert result == pytest.approx(130 / 31)
+    assert result == pytest.approx(4.19)
     assert result < 10  # well below naive (1+100)/2 = 50.5
 
 
