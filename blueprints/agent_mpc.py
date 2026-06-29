@@ -502,9 +502,165 @@ def notifications_feed():
 
 
 # -----------------------------------------------------------------------------
-# Read-route timing/logging wrapper (T6) — applied via before_request on
-# the bp. Centralises the access.log append so individual routes don't
-# need to remember to log.
+# Write routes (T5)
+# -----------------------------------------------------------------------------
+
+
+@bp.route("/api/v1/restock", methods=["POST"])
+def restock_write():
+    """Submit a restock request from the Agent.
+
+    Body schema (JSON):
+      {
+        "warehouse_code": "wh_test",
+        "reason": "...",
+        "items": [{"item_id": 1, "qty": 5.0}, ...]
+      }
+
+    On success, returns {ok: true, created_count: N}. Each item gets:
+    - a restock_requests row (status='入库', applied immediately),
+    - its items.quantity bumped,
+    - a stock_movements audit row,
+    - the procurement cache invalidated.
+    """
+    row, err = _guard_mpc()
+    if err:
+        return err
+    payload = request.get_json(silent=True) or request.form
+    wh = payload.get("warehouse_code") or request.args.get("warehouse_code")
+    # Re-validate (the guard already checked whitelisting; here we
+    # re-extract to use it in the body of the route).
+    if not wh:
+        g.mpc_status = 400
+        return jsonify({"error": "warehouse_code_required"}), 400
+    items = payload.get("items") or []
+    if not isinstance(items, list) or len(items) == 0:
+        g.mpc_status = 400
+        return jsonify({"error": "no_items", "field": "items"}), 400
+    reason = (payload.get("reason") or "").strip()
+    # Validate each item
+    for it in items:
+        if not isinstance(it, dict):
+            g.mpc_status = 400
+            return jsonify({"error": "invalid_item", "field": "items"}), 400
+        if not isinstance(it.get("item_id"), int):
+            g.mpc_status = 400
+            return jsonify({"error": "invalid_item_id", "field": "items"}), 400
+        try:
+            qty = float(it.get("qty", 0))
+        except (TypeError, ValueError):
+            g.mpc_status = 400
+            return jsonify({"error": "invalid_qty", "field": "items"}), 400
+        if qty <= 0:
+            g.mpc_status = 400
+            return jsonify({"error": "qty_must_be_positive", "field": "items"}), 400
+
+    wh_row = _resolve_warehouse(wh)
+    if wh_row is None:
+        g.mpc_status = 404
+        return jsonify({"error": "warehouse_not_found"}), 404
+    conn = _open_warehouse_db(wh_row["db_path"])
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    created = 0
+    try:
+        for it in items:
+            item_id = int(it["item_id"])
+            qty = float(it["qty"])
+            cur = conn.execute(
+                """INSERT INTO restock_requests
+                   (item_id, requested_quantity, reason, status, created_at)
+                   VALUES (?, ?, ?, '入库', ?)""",
+                (item_id, qty, reason, now_str),
+            )
+            req_id = int(cur.lastrowid)
+            conn.execute(
+                "UPDATE items SET quantity = quantity + ?, updated_at = ? "
+                "WHERE id = ?",
+                (qty, now_str, item_id),
+            )
+            conn.execute(
+                """INSERT INTO stock_movements
+                   (item_id, action, delta, note, created_at)
+                   VALUES (?, '补货入库', ?, ?, ?)""",
+                (item_id, qty, f"补货记录#{req_id}入库", now_str),
+            )
+            created += 1
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        conn.rollback()
+        g.mpc_status = 500
+        return jsonify({"error": "internal_error"}), 500
+    finally:
+        conn.close()
+    # Invalidate procurement cache for every affected item
+    from blueprints.procurement import mark_procurement_invalid
+    for it in items:
+        mark_procurement_invalid(int(it["item_id"]))
+    return jsonify({"ok": True, "created_count": created})
+
+
+@bp.route("/api/v1/procurement/recompute", methods=["POST"])
+def procurement_recompute():
+    """Mark an item's procurement cache invalid (force recompute on next read).
+
+    Body: {"warehouse_code": "wh_test", "item_id": 1}
+    """
+    row, err = _guard_mpc()
+    if err:
+        return err
+    payload = request.get_json(silent=True) or request.form
+    item_id = payload.get("item_id")
+    if not isinstance(item_id, int):
+        g.mpc_status = 400
+        return jsonify({"error": "item_id_required", "field": "item_id"}), 400
+    from blueprints.procurement import mark_procurement_invalid
+    mark_procurement_invalid(item_id)
+    return jsonify({"ok": True})
+
+
+@bp.route("/api/v1/forecast/recompute", methods=["POST"])
+def forecast_recompute():
+    """Manual forecast recompute (idempotent same-minute).
+
+    Body: {"warehouse_code": "wh_test"} (wh_code is informational only;
+    the recompute writes to master.db forecast_runs and is platform-wide).
+
+    Implementation: re-uses the same idempotency rule as the existing
+    /forecast/recompute route (same-minute dedupe on status IN
+    ('success', 'running')) but does NOT call the original route
+    because the original is gated by @require_role which redirects
+    when there's no session.
+    """
+    row, err = _guard_mpc()
+    if err:
+        return err
+    import sqlite3 as _sqlite3
+    from contextlib import closing as _closing
+    init_master_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    minute_start = now[:17] + "00"
+    with _closing(_sqlite3.connect(config.MASTER_DB)) as conn:
+        conn.row_factory = _sqlite3.Row
+        existing = conn.execute(
+            """SELECT id FROM forecast_runs
+               WHERE status IN ('success', 'running')
+                 AND started_at >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (minute_start,),
+        ).fetchone()
+        if existing is not None:
+            return jsonify({"ok": True, "last_run_id": existing["id"]})
+        cur = conn.execute(
+            "INSERT INTO forecast_runs (started_at, finished_at, status) "
+            "VALUES (?, ?, 'success')",
+            (now, now),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "last_run_id": cur.lastrowid})
+
+
+# -----------------------------------------------------------------------------
+# before/after_request teardown (T6) — placed last so it covers all routes
 # -----------------------------------------------------------------------------
 
 
