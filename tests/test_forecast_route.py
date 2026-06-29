@@ -169,3 +169,38 @@ def test_forecast_item_response_shape_stable(logged_client):
     assert body["data_status"] in ("ok", "cold_start")
     # computed_at must be ISO 8601 ending in Z
     assert body["computed_at"].endswith("Z")
+
+
+# ---------------------------------------------------------------------------
+# TASK 6 — POST /forecast/recompute
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_recompute_returns_ok_and_run_id(logged_client):
+    client, _ = logged_client
+    resp = client.post("/forecast/recompute")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert isinstance(body["last_run_id"], int)
+    assert body["last_run_id"] > 0
+
+
+def test_forecast_recompute_idempotent(logged_client):
+    """Two consecutive POSTs return the same last_run_id (no duplicate runs)."""
+    client, _ = logged_client
+    r1 = client.post("/forecast/recompute").get_json()
+    r2 = client.post("/forecast/recompute").get_json()
+    assert r1["last_run_id"] == r2["last_run_id"]
+
+
+def test_forecast_recompute_creates_exactly_one_run(logged_client):
+    """Idempotency: 3 POSTs create exactly 1 run row in forecast_runs."""
+    client, _ = logged_client
+    with client.application.app_context():
+        for _ in range(3):
+            client.post("/forecast/recompute")
+        from db import get_master_db
+        db = get_master_db()
+        n = db.execute("SELECT COUNT(*) AS c FROM forecast_runs").fetchone()["c"]
+    assert n == 1
