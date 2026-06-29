@@ -453,18 +453,16 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN gram_per_unit REAL NOT NULL DEFAULT 0"
             )
-<<<<<<< HEAD
         if "created_by_publish_event_id" not in item_cols:
             # Subproject 4 (item publish) — reverse link from items to the
             # publish_events row that materialised this item. Nullable.
             conn.execute(
                 "ALTER TABLE items ADD COLUMN created_by_publish_event_id INTEGER"
-=======
+            )
         # Subproject 5: products.current_version_id migration (spec §2.2).
         product_cols = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
         if "current_version_id" not in product_cols:
             conn.execute(
                 "ALTER TABLE products ADD COLUMN current_version_id INTEGER"
->>>>>>> feat/recipe-publish
             )
         conn.commit()
