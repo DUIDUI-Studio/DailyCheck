@@ -66,14 +66,16 @@ def create_app() -> Flask:
 
     @app.route("/health")
     def health() -> tuple[dict, int]:
-        """JSON health probe with forecast last-success timestamp.
+        """JSON health probe with forecast last-success timestamp + lock counter.
 
         Returns the most recent forecast_runs.finished_at for any
         status='success' row, or null if none. Surfaces PRD §3.6
         (must-automate observability) without a separate /admin/health
-        page in this subproject.
+        page in this subproject. Lock-failure counter is read from a
+        file maintained by blueprints.forecast._bump_lock_counter.
         """
         from db import get_master_db
+        from blueprints.forecast import _read_lock_counter
         last_success = None
         try:
             db = get_master_db()
@@ -87,7 +89,11 @@ def create_app() -> Flask:
                 last_success = row["finished_at"].replace(" ", "T") + "Z"
         except Exception:  # noqa: BLE001 — health must never 500
             pass
-        return {"status": "ok", "forecast_last_success_at": last_success}, 200
+        return {
+            "status": "ok",
+            "forecast_last_success_at": last_success,
+            "forecast_lock_failures": _read_lock_counter(),
+        }, 200
 
     return app
 

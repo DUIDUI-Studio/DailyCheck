@@ -258,6 +258,34 @@ _scheduler_lock = threading.Lock()
 _scheduler_started = False
 _STOP = threading.Event()
 
+# Counter file path for /health observability. The path is module-level
+# so tests can monkeypatch it. In production it lives under the project
+# base dir next to access.log so operators can find it.
+_LOCK_COUNTER_PATH = Path(__file__).resolve().parent.parent / "forecast_lock_failures.txt"
+
+
+def _bump_lock_counter() -> None:
+    """Increment the lock-failure counter (best-effort; never raises)."""
+    try:
+        n = 0
+        if _LOCK_COUNTER_PATH.exists():
+            try:
+                n = int(_LOCK_COUNTER_PATH.read_text().strip() or "0")
+            except ValueError:
+                n = 0
+        _LOCK_COUNTER_PATH.write_text(str(n + 1))
+    except Exception:  # noqa: BLE001
+        _logger.exception("forecast_lock: counter write failed")
+
+
+def _read_lock_counter() -> int:
+    try:
+        if not _LOCK_COUNTER_PATH.exists():
+            return 0
+        return int(_LOCK_COUNTER_PATH.read_text().strip() or "0")
+    except (ValueError, OSError):
+        return 0
+
 
 def _recover_orphaned_runs() -> None:
     """Mark any 'running' rows left behind by a previous crash as 'failed'.
@@ -310,24 +338,45 @@ def _run_daily_forecast() -> int:
             return existing["id"]
 
         items_processed = 0
+        last_error: str | None = None
         if WAREHOUSE_DB_DIR.exists():
             for wh_path in WAREHOUSE_DB_DIR.glob("*.db"):
-                try:
-                    with closing(sqlite3.connect(wh_path)) as w:
-                        items_processed += w.execute(
-                            "SELECT COUNT(*) FROM items"
-                        ).fetchone()[0]
-                        items_processed += w.execute(
-                            "SELECT COUNT(*) FROM products"
-                        ).fetchone()[0]
-                except sqlite3.Error as exc:  # noqa: BLE001
-                    _logger.warning("forecast_lock: %s (%s)", exc, wh_path)
+                attempt = 0
+                while attempt < 3:
+                    try:
+                        with closing(sqlite3.connect(wh_path)) as w:
+                            items_processed += w.execute(
+                                "SELECT COUNT(*) FROM items"
+                            ).fetchone()[0]
+                            items_processed += w.execute(
+                                "SELECT COUNT(*) FROM products"
+                            ).fetchone()[0]
+                        break
+                    except sqlite3.OperationalError as exc:
+                        attempt += 1
+                        if attempt >= 3:
+                            last_error = f"{wh_path.name}: {exc}"
+                            _logger.warning("forecast_lock: %s", last_error)
+                            _bump_lock_counter()
+                        else:
+                            time.sleep(0.05 * (2 ** (attempt - 1)))
+                    except sqlite3.Error as exc:  # noqa: BLE001
+                        last_error = f"{wh_path.name}: {exc}"
+                        _logger.warning("forecast_lock: %s", last_error)
+                        break
 
-        cur = m.execute(
-            "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed) "
-            "VALUES (?, ?, 'success', ?)",
-            (now_str, now_str, items_processed),
-        )
+        if last_error is not None:
+            cur = m.execute(
+                "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed, error_message) "
+                "VALUES (?, ?, 'failed', ?, ?)",
+                (now_str, now_str, items_processed, last_error),
+            )
+        else:
+            cur = m.execute(
+                "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed) "
+                "VALUES (?, ?, 'success', ?)",
+                (now_str, now_str, items_processed),
+            )
         m.commit()
         return cur.lastrowid
 
