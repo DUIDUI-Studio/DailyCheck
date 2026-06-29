@@ -41,6 +41,10 @@
     {% if g.user %}
     <a href="{{ url_for('procurement.procurement_store') }}">采购建议</a>
     {% endif %}
+    {# /admin/publish/recipe: admin only (subproject 5) #}
+    {% if g.user and g.user['is_admin'] %}
+    <a href="{{ url_for('publish_recipe.publish_recipe') }}">配方发布</a>
+    {% endif %}
     {# /notifications: everyone logged in, with unread badge (PRD §1.1 A6) #}
     {% if g.user %}
     <a href="{{ url_for('notifications.notifications_feed') }}">

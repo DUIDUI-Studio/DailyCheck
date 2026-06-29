@@ -26,6 +26,12 @@
     <p>加权日均 + 未来 14 天预测量，可手动重算</p>
   </a>
   {% endif %}
+  {% if g.user and g.user['is_admin'] %}
+  <a class="land-card" href="{{ url_for('publish_recipe.publish_recipe') }}">
+    <h3>配方发布</h3>
+    <p>版本化新配方 + 全站通知</p>
+  </a>
+  {% endif %}
   <a class="land-card" href="{{ url_for('notifications.notifications_feed') }}">
     <h3>通知中心
       {% if unread_notifications_count and unread_notifications_count > 0 %}

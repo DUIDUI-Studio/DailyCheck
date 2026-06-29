@@ -10,6 +10,9 @@ def _login_as_admin(tmp_path, monkeypatch):
     wh_path = tmp_path / "wh.db"
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    import config as config_module
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
     init_master_db()
     init_warehouse_db(wh_path)
 
