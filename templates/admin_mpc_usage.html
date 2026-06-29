@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Agent MPC 用量{% endblock %}
+{% block content %}
+<h2>Agent MPC 用量</h2>
+<p class="muted">每个 token 的累计调用次数、错误率、最近一次调用时间。数据来源：<code>access.log</code>（与 web 访问日志共用文件，JSON 行由 MPC 路由追加）。</p>
+
+{% if not tokens %}
+<p class="muted">尚未创建任何 Agent Token。请使用 CLI 创建：<code>flask --app app create-mpc-token &lt;name&gt;</code>。</p>
+{% else %}
+<table class="role-matrix" style="width:100%;margin-top:14px">
+  <thead>
+    <tr>
+      <th style="text-align:left">Token</th>
+      <th>调用次数</th>
+      <th>错误率</th>
+      <th>最近一次</th>
+      <th>状态</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in tokens %}
+    <tr>
+      <td style="text-align:left">
+        <strong>{{ t.name }}</strong>
+        <small class="muted">#{{ t.id }}</small>
+      </td>
+      <td>{{ t.call_count }}</td>
+      <td>
+        {% if t.error_rate > 0.5 %}
+        <span class="badge badge-error">{{ '%.0f%%' % (t.error_rate * 100) }}</span>
+        {% else %}
+        {{ '%.0f%%' % (t.error_rate * 100) }}
+        {% endif %}
+      </td>
+      <td>
+        {% if t.last_call_at %}
+        <span title="{{ t.last_call_at }}">{{ t.last_call_at }}</span>
+        {% else %}
+        <span class="muted">—</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if t.revoked_at %}
+        <span class="badge badge-error">已撤销</span>
+        {% else %}
+        <span class="badge badge-ok">正常</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

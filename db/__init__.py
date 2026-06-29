@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS notification_prefs (
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+<<<<<<< HEAD
 CREATE TABLE IF NOT EXISTS publish_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -203,6 +204,18 @@ CREATE TABLE IF NOT EXISTS recipe_publish_event_warehouses (
     status TEXT NOT NULL,
     error_message TEXT,
     FOREIGN KEY (publish_event_id) REFERENCES recipe_publish_events(id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    allowed_read_paths_json TEXT NOT NULL DEFAULT '[]',
+    allowed_write_paths_json TEXT NOT NULL DEFAULT '[]',
+    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]'
 );
 """
 
