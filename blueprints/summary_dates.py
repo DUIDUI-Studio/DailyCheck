@@ -53,8 +53,9 @@ def _parse_date(raw: Any) -> Optional[_dt.date]:
 def parse_summary_dates(args: Any) -> tuple[Optional[_dt.date], Optional[_dt.date], Optional[str]]:
     """Return (start, end, error) for a summary view.
 
-    `args` must expose .start, .end, .range attributes (Flask
-    request.args compatible). .range is read but ignored per spec §0.1.
+    `args` must be dict-like with `start`, `end`, `range` keys
+    (Flask request.args compatible). `range` is read but ignored
+    per spec §0.1.
 
     Rules (PRD §2.6.3):
       - missing start → today - 7 days
@@ -67,14 +68,23 @@ def parse_summary_dates(args: Any) -> tuple[Optional[_dt.date], Optional[_dt.dat
     today = _today()
     default_start = today - _dt.timedelta(days=7)
 
-    start = _parse_date(getattr(args, "start", None))
-    end = _parse_date(getattr(args, "end", None))
+    def _get(name: str) -> Optional[str]:
+        """Dict-like access that works for both Flask request.args
+        and plain objects (test convenience)."""
+        if hasattr(args, "get"):
+            v = args.get(name)
+            if v is not None:
+                return v
+        return getattr(args, name, None)
 
-    # Both are "absent" if the raw value was None or empty. _parse_date
-    # already collapses both to None, so a present-but-malformed value
-    # (e.g. start="bogus") still trips the format check below.
-    start_raw = getattr(args, "start", None)
-    end_raw = getattr(args, "end", None)
+    start_raw = _get("start")
+    end_raw = _get("end")
+    start = _parse_date(start_raw)
+    end = _parse_date(end_raw)
+
+    # `_parse_date` collapses missing AND malformed to None. Distinguish
+    # the two by re-checking the raw string. A present-but-bad value
+    # trips the format check below.
     start_provided = bool(start_raw) and str(start_raw).strip() != ""
     end_provided = bool(end_raw) and str(end_raw).strip() != ""
 
@@ -100,6 +110,6 @@ def parse_summary_dates(args: Any) -> tuple[Optional[_dt.date], Optional[_dt.dat
     # `range=` param is intentionally ignored (spec §0.1). Read it so
     # the unused-arg linter doesn't complain; the caller documents this
     # in the view.
-    _ = getattr(args, "range", None)
+    _ = _get("range")
 
     return start, end, None
