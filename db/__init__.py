@@ -98,6 +98,27 @@ CREATE TABLE IF NOT EXISTS forecast_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_status ON forecast_runs(status, started_at);
+
+CREATE TABLE IF NOT EXISTS procurement_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cover_days INTEGER NOT NULL DEFAULT 14,
+    min_absolute REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS procurement_cache (
+    item_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    daily_avg REAL NOT NULL,
+    current_qty REAL NOT NULL,
+    in_transit_qty REAL NOT NULL,
+    safety_stock REAL NOT NULL,
+    suggested_qty INTEGER NOT NULL,
+    invalid INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (item_id, warehouse_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_procurement_cache_invalid ON procurement_cache(invalid);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
@@ -254,6 +275,12 @@ def init_master_db() -> None:
     WAREHOUSE_DB_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         conn.executescript(MASTER_SCHEMA)
+        # Seed single-row procurement_config if missing (id=1 is the only row).
+        row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO procurement_config (id, cover_days, min_absolute) VALUES (1, 14, 0)"
+            )
         conn.commit()
 
 
