@@ -142,6 +142,18 @@ CREATE TABLE IF NOT EXISTS notification_prefs (
     PRIMARY KEY (user_id, event_type, channel),
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    allowed_read_paths_json TEXT NOT NULL DEFAULT '[]',
+    allowed_write_paths_json TEXT NOT NULL DEFAULT '[]',
+    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
