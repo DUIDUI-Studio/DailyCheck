@@ -15,13 +15,36 @@ from ._helpers import fixed_categories_in_clause, render
 bp = Blueprint("core", __name__)
 
 
-def _time_clauses(range_param):
+def _time_clauses(range_param, start=None, end=None):
     """根据 range 参数生成 SQL 时间子句 + window_days。
 
     子句不带表别名(只写 `created_at`),由调用方拼前缀(如 `o.created_at` /
     `created_at`)以适配不同查询上下文。
     返回 (time_clause_outbound, time_clause_production, time_clause_restock, window_days)。
+
+    自定义日期范围 (PRD §2.6.4):当 start/end 都给出时,改用基于日期的子句。
+    自定义窗口的 window_days 用 (end - start).days + 1。
     """
+    if start is not None and end is not None:
+        # 自定义日期范围:clause 写成 `created_at BETWEEN 'YYYY-MM-DD 00:00:00'
+        # AND 'YYYY-MM-DD 23:59:59' OR ...`(按天 OR 链)。这样 _where 拼上
+        # `<alias>.` 前缀后,`created_at` 变成 `<alias>.created_at`,仍是合法 SQL。
+        # 同理 stock_movements 的反推窗口也用同一格式。
+        # OR 链由 _where 负责,这里只给出占位符。
+        # 实际 SQL 是按天的 OR 链,我们直接展开成 BETWEEN 形式(单天),
+        # 多天用 OR 拼接(最多 366 天,不会爆炸)。
+        s = start.strftime("%Y-%m-%d")
+        e = end.strftime("%Y-%m-%d")
+        window_days = (end - start).days + 1
+        # 拆成单日 OR 链:date(created_at) = 'YYYY-MM-DD' 形式
+        # 出于安全和简洁,生成 "date(created_at) BETWEEN 'X' AND 'Y'"
+        # 但 date() 是 SQLite 函数,column reference 仍需前缀。
+        # 改用:  "<col> >= 'YYYY-MM-DD' AND <col> < 'YYYY-MM-DD+1'"
+        # 其中 <col> = created_at,_where 会把第一段改成 <alias>.created_at
+        next_day = (end + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        clause = f"created_at >= '{s}' AND created_at < '{next_day}'"
+        return (clause, clause, clause, window_days)
+
     if range_param == "7d":
         return (
             "created_at >= datetime('now','-7 days')",
@@ -53,13 +76,13 @@ def _where(clause, alias):
         return clause
     return f"{alias}.{clause}"
 
-def _compute_summary_metrics(db, range_param):
+def _compute_summary_metrics(db, range_param, start=None, end=None):
     """总体段:进货 / 消耗 / 库存金额 + 反推起点 + 周转率 + 可售天数。
 
     返回 dict,字段含义见 plan doc。
     与 /summary 共享;被 reports.py 的 CSV 导出复用。
     """
-    tco, tcp, tcr, window_days = _time_clauses(range_param)
+    tco, tcp, tcr, window_days = _time_clauses(range_param, start, end)
 
     total_inbound_value = float(db.execute(
         f"""SELECT COALESCE(SUM(r.requested_quantity * i.unit_cost), 0) AS c
@@ -91,7 +114,11 @@ def _compute_summary_metrics(db, range_param):
     ).fetchone()["c"])
 
     # 反推窗口起始库存金额
-    if range_param == "7d":
+    if start is not None and end is not None:
+        s = start.strftime("%Y-%m-%d")
+        next_day = (end + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        start_filter = f"m.created_at >= '{s}' AND m.created_at < '{next_day}'"
+    elif range_param == "7d":
         start_filter = "m.created_at >= datetime('now','-7 days')"
     elif range_param == "month":
         ym = _dt.datetime.now().strftime("%Y-%m")
@@ -143,9 +170,9 @@ def _compute_summary_metrics(db, range_param):
     }
 
 
-def _compute_category_stats(db, range_param):
+def _compute_category_stats(db, range_param, start=None, end=None):
     """品类段:进货 / 消耗 / 库存金额 + 反推起点 + 周转率(与 /summary 共享)。"""
-    tco, tcp, tcr, window_days = _time_clauses(range_param)
+    tco, tcp, tcr, window_days = _time_clauses(range_param, start, end)
 
     cat_data = db.execute(
         f"""SELECT
@@ -189,7 +216,11 @@ def _compute_category_stats(db, range_param):
     ).fetchall()
 
     # 反推品类起点库存金额
-    if range_param == "7d":
+    if start is not None and end is not None:
+        s = start.strftime("%Y-%m-%d")
+        next_day = (end + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        cat_start_filter = f"sm.created_at >= '{s}' AND sm.created_at < '{next_day}'"
+    elif range_param == "7d":
         cat_start_filter = "sm.created_at >= datetime('now','-7 days')"
     elif range_param == "month":
         ym = _dt.datetime.now().strftime("%Y-%m")
@@ -236,9 +267,9 @@ def _compute_category_stats(db, range_param):
     return enriched
 
 
-def _compute_top_consumed(db, range_param):
+def _compute_top_consumed(db, range_param, start=None, end=None):
     """消耗 Top 10(只取 outbound,与原 /summary 同口径;production 暂不参与 Top)。"""
-    tco, _, _, _ = _time_clauses(range_param)
+    tco, _, _, _ = _time_clauses(range_param, start, end)
     return db.execute(
         f"""SELECT i.name AS item_name, c.name AS category_name,
                   o.total_qty AS consumed_qty, i.unit,
@@ -308,22 +339,62 @@ def land():
 @bp.route("/summary")
 @require_login
 def summary():
+    """汇总仪表盘 (PRD §2.6)。
+
+    URL 契约:
+      - ?start=YYYY-MM-DD&end=YYYY-MM-DD  自定义范围
+      - ?start=...                         end 缺省 = 今天
+      - ?end=...                           start 缺省 = today - 7d
+      - 不传                              缺省 = past 7 days
+      - ?range=7d|month|all               旧参数,被忽略(spec §0.1)
+    """
+    from flask import flash
+    from .summary_dates import parse_summary_dates
+
     db = get_warehouse_db()
 
-    # range 参数:7d(默认)/ month / all
+    # 自定义日期范围(PRD §2.6.3):优先于 range 参数。
+    parsed = parse_summary_dates(request.args)
+    start_date, end_date, err = parsed
+    if err is not None:
+        # 校验失败:返回 400 + flash (PRD §2.6.3)。仍渲染 summary 模板,
+        # 让用户看到现有页面 + flash 错误,可修正后重试。
+        flash(err)
+        return render_template(
+            "summary.html",
+            total_inbound_value=0,
+            total_consumed_value=0,
+            total_stock_value=0,
+            total_revenue=0,
+            category_stats=[],
+            top_consumed=[],
+            range="7d",
+            range_label="7 日滚动",
+            start_date=None,
+            end_date=None,
+            turnover=0.0,
+            turnover_days=None,
+        ), 400
+
+    # 兼容旧的 ?range= 标签(模板上仍显示 range chip),不影响计算。
     range_param = request.args.get("range", "7d")
     if range_param not in ("7d", "month", "all"):
         range_param = "7d"
 
-    metrics = _compute_summary_metrics(db, range_param)
-    cat_stats = _compute_category_stats(db, range_param)
-    top = _compute_top_consumed(db, range_param)
+    metrics = _compute_summary_metrics(db, range_param, start_date, end_date)
+    cat_stats = _compute_category_stats(db, range_param, start_date, end_date)
+    top = _compute_top_consumed(db, range_param, start_date, end_date)
 
     total_revenue = float(db.execute(
         "SELECT COALESCE(SUM(amount), 0) AS c FROM daily_revenue"
     ).fetchone()["c"])
 
     range_label = {"7d": "7 日滚动", "month": "当月", "all": "全部"}[range_param]
+    # 自定义范围时,把标签换成起止日期(让用户清楚当前在哪个窗口)
+    if start_date is not None and end_date is not None and (
+        request.args.get("start") or request.args.get("end")
+    ):
+        range_label = f"{start_date.isoformat()} ~ {end_date.isoformat()}"
     return render_template(
         "summary.html",
         total_inbound_value=round(metrics["total_inbound_value"], 2),
@@ -334,6 +405,8 @@ def summary():
         top_consumed=top,
         range=range_param,
         range_label=range_label,
+        start_date=start_date.isoformat() if start_date else None,
+        end_date=end_date.isoformat() if end_date else None,
         turnover=metrics["turnover"],
         turnover_days=metrics["turnover_days"],
     )

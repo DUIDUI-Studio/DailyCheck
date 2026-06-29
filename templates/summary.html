@@ -11,6 +11,15 @@
   <a href="{{ url_for('core.summary', range='all') }}" class="cat-chip {% if range == 'all' %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if range == 'all' else 'false' }}">全部</a>
 </div>
 
+<div class="cat-bar summary-quick" role="tablist" aria-label="快捷范围">
+  <button type="button" class="cat-chip" data-quick="this-week">本周</button>
+  <button type="button" class="cat-chip" data-quick="last-week">上周</button>
+  <button type="button" class="cat-chip" data-quick="this-month">本月</button>
+  <button type="button" class="cat-chip" data-quick="last-month">上月</button>
+  <button type="button" class="cat-chip" data-quick="this-quarter">本季</button>
+  <button type="button" class="cat-chip" data-quick="this-year">本年</button>
+</div>
+
 <div class="grid cols-4">
   <section class="card">
     <p>进货总金额</p>
@@ -83,4 +92,5 @@
   {% endfor %}
 </table>
 </div>
+<script src="{{ url_for('static', filename='summary_dates.js') }}"></script>
 {% endblock %}

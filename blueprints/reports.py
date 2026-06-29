@@ -226,18 +226,32 @@ def export_summary():
     """CSV 三段导出:总体 / 按品类 / 消耗 Top。
 
     与 /summary 共享 range 参数(7d|month|all,默认 7d)。
+    新增 start/end 自定义日期范围(PRD §2.6.5):当两者给出时,
+    过滤窗口按 start..end,文件名改为 summary_<start>_to_<end>.csv。
     输出 UTF-8 BOM 兼容 Excel 中文。
     """
     import datetime as _dt
+    from flask import abort, flash
 
     db = get_warehouse_db()
+
+    # 自定义日期范围(PRD §2.6.3)。校验失败时返回 400 + flash。
+    from .summary_dates import parse_summary_dates
+    start_date, end_date, err = parse_summary_dates(request.args)
+    if err is not None:
+        flash(err)
+        abort(400)
+
     range_param = request.args.get("range", "7d")
     if range_param not in ("7d", "month", "all"):
         range_param = "7d"
-    range_label = {"7d": "7 日", "month": "当月", "all": "全部"}[range_param]
+    if start_date is not None and end_date is not None:
+        range_label = f"{start_date.isoformat()} ~ {end_date.isoformat()}"
+    else:
+        range_label = {"7d": "7 日", "month": "当月", "all": "全部"}[range_param]
 
     # 总体段:复用 /summary 的同源函数,周转率与可售天数口径完全一致。
-    metrics = _compute_summary_metrics(db, range_param)
+    metrics = _compute_summary_metrics(db, range_param, start_date, end_date)
     total_inbound = metrics["total_inbound_value"]
     total_consumed = metrics["total_consumed_value"]
     total_stock = metrics["total_stock_value"]
@@ -246,11 +260,11 @@ def export_summary():
 
     # 品类段:复用 /summary 的同源函数,周转率口径 = consumed / avg(start+end),
     # 与页面完全一致。
-    cat_stats = _compute_category_stats(db, range_param)
+    cat_stats = _compute_category_stats(db, range_param, start_date, end_date)
 
     # 段 3:消耗 Top 10(历史口径:只取 outbound,与 /summary 同源;production 暂不参与 Top)
     from .core import _time_clauses, _where
-    tco, _, _, _ = _time_clauses(range_param)
+    tco, _, _, _ = _time_clauses(range_param, start_date, end_date)
     top_rows = db.execute(
         f"""SELECT i.name AS item_name, c.name AS category_name,
                   o.total_qty AS consumed_qty, i.unit,
@@ -300,7 +314,14 @@ def export_summary():
             f"{float(r['consumed_value']):.2f}",
         ])
 
-    filename = f"summary-{_dt.datetime.now().strftime('%Y-%m-%d')}-{range_param}.csv"
+    # 文件名:自定义范围 → summary_<start>_to_<end>.csv;
+    # 否则保留旧式 summary-<date>-<range>.csv(向后兼容)。
+    if start_date is not None and end_date is not None and (
+        request.args.get("start") or request.args.get("end")
+    ):
+        filename = f"summary_{start_date.isoformat()}_to_{end_date.isoformat()}.csv"
+    else:
+        filename = f"summary-{_dt.datetime.now().strftime('%Y-%m-%d')}-{range_param}.csv"
     from flask import current_app
     return current_app.response_class(
         output.getvalue().encode("utf-8-sig"),
