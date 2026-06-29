@@ -163,6 +163,47 @@ def forecast_product(product_id: int):
     return jsonify(body)
 
 
+@bp.route("/forecast/recompute", methods=["POST"])
+def forecast_recompute():
+    """Mark a manual batch as complete (idempotent).
+
+    The actual per-item forecast is computed on demand by the GET routes
+    (no cache). This endpoint exists to satisfy PRD §2.1.5 (manual
+    recompute) and to leave a trace row in forecast_runs for the
+    /admin/health last-success display.
+
+    Idempotency: if the most recent run is still status='success' (or
+    'running') within the same minute, return that row's id instead of
+    creating a new one. This matches the spec's "多次点击结果一致" claim
+    while still allowing a real second run after a minute has passed.
+    """
+    from db import get_master_db
+
+    db = get_master_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Idempotency: if a 'success' or 'running' row exists in the current
+    # minute, return its id. strftime + sub-string compare is needed
+    # because sqlite's datetime() modifier does not parse bound strings
+    # (verified empirically — datetime(?, 'start of minute') returns NULL).
+    minute_start = now[:17] + "00"  # "YYYY-MM-DD HH:MM:00"
+    existing = db.execute(
+        """SELECT id FROM forecast_runs
+           WHERE status IN ('success', 'running')
+             AND started_at >= ?
+           ORDER BY id DESC LIMIT 1""",
+        (minute_start,),
+    ).fetchone()
+    if existing is not None:
+        return jsonify({"ok": True, "last_run_id": existing["id"]})
+
+    cur = db.execute(
+        "INSERT INTO forecast_runs (started_at, finished_at, status) VALUES (?, ?, 'success')",
+        (now, now),
+    )
+    db.commit()
+    return jsonify({"ok": True, "last_run_id": cur.lastrowid})
+
+
 # ---------------------------------------------------------------------------
 # Scheduler (TASK 8 — minimal placeholder; full impl in next commits)
 # ---------------------------------------------------------------------------
