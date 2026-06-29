@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}预测看板{% endblock %}
+{% block content %}
+<h1>预测看板</h1>
+<p>未来 {{ horizon }} 天预测，基于过去 30 天加权日均消耗。</p>
+
+<form method="post" action="{{ url_for('forecast.forecast_recompute') }}" style="margin: 12px 0;">
+  <button type="submit">手动重算</button>
+</form>
+
+<table class="forecast-table">
+  <thead>
+    <tr>
+      <th>品项</th>
+      <th>当前库存</th>
+      <th>日均</th>
+      <th>{{ horizon }}天预测</th>
+      <th>状态</th>
+      <th>详情</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ '%.2f'|format(item.current_qty) }}</td>
+      <td>{{ '%.2f'|format(item.daily_avg) }}</td>
+      <td>{{ '%.2f'|format(item.forecast_total) }}</td>
+      <td>
+        {% if item.data_status == 'cold_start' %}
+          <span class="badge cold">数据积累中</span>
+        {% else %}
+          <span class="badge ok">OK</span>
+        {% endif %}
+      </td>
+      <td><a href="{{ url_for('forecast.forecast_item', item_id=item.id) }}?horizon_days={{ horizon }}">JSON</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<style>
+  .forecast-table { width: 100%; border-collapse: collapse; }
+  .forecast-table th, .forecast-table td { padding: 6px 10px; border-bottom: 1px solid #ddd; text-align: left; }
+  .badge { padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge.cold { background: #fef3c7; color: #92400e; }
+  .badge.ok { background: #d1fae5; color: #065f46; }
+</style>
+{% endblock %}

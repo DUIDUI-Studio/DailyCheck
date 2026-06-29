@@ -21,7 +21,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from flask import Blueprint, abort, g, jsonify, request
+from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_role
@@ -165,6 +165,40 @@ def forecast_product(product_id: int):
     # Spec §1: the field is "item_id" for both shapes (stability for Agent).
     # We keep the same key, just changing its semantic to the product id.
     return jsonify(body)
+
+
+@bp.route("/forecast", methods=["GET"])
+@require_role("manager")
+def forecast_index():
+    """Render the forecast dashboard for the current warehouse.
+
+    Lists up to 50 items with their computed daily_avg + forecast_total.
+    Manager+ can click 'recompute' to insert a fresh forecast_runs row.
+    """
+    db = get_warehouse_db()
+    rows = db.execute(
+        "SELECT id, name, quantity FROM items ORDER BY id LIMIT 50"
+    ).fetchall()
+    items = []
+    horizon = 14
+    for r in rows:
+        movements = _fetch_outbound_rows(r["id"])
+        n = len(movements)
+        if classify_confidence(n) == "cold_start":
+            avg, total, status = 0.0, 0.0, "cold_start"
+        else:
+            avg = compute_daily_avg(movements)
+            total = compute_forecast_total(avg, horizon)
+            status = "ok"
+        items.append({
+            "id": r["id"],
+            "name": r["name"],
+            "current_qty": r["quantity"],
+            "daily_avg": avg,
+            "forecast_total": total,
+            "data_status": status,
+        })
+    return render_template("forecast.html", items=items, horizon=horizon)
 
 
 @bp.route("/forecast/recompute", methods=["POST"])
