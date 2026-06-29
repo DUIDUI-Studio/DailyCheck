@@ -78,6 +78,9 @@ def restock_submit():
                VALUES (?, '补货入库', ?, ?, ?)""",
             (item_id, qty, f"补货记录#{req_id}入库", now()),
         )
+    from blueprints.procurement import mark_procurement_invalid
+    for item_id, _ in rows:
+        mark_procurement_invalid(item_id)
     db.commit()
     audit("restock.submit", "request", None, {"rows": rows})
     flash("入库已执行")

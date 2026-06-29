@@ -65,6 +65,7 @@ def outbound_submit():
     if not rows:
         flash("请至少填写一个出库数量")
         return redirect(url_for("outbound.outbound_session"))
+    from blueprints.procurement import mark_procurement_invalid
     for item_id, qty in rows:
         cur = db.execute(
             """INSERT INTO outbound_requests
@@ -82,6 +83,7 @@ def outbound_submit():
                VALUES (?, '出库', ?, ?, ?)""",
             (item_id, -qty, f"出库记录#{req_id}出库", now()),
         )
+        mark_procurement_invalid(item_id)
     db.commit()
     audit("outbound.submit", "request", None, {"rows": rows})
     flash("出库已执行")
