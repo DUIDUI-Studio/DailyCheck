@@ -267,10 +267,12 @@ def approve(batch_id: int):
     # are skipped: the edit path already wrote actual_quantity + diff on
     # the stocktakes row, and approve must not apply diff twice.
     #
-    # Scope by exact equality on the movement note's batch reference
-    # (not LIKE substring match: '#9' would also match '#99', '#90'…).
-    # The note format `修正盘点批次#X` is set by submit_edit, so we pin
-    # it exactly to `修正盘点批次#{batch_id}`.
+    # Scope rule: exact equality (note = ?) on the movement's note string.
+    # The note format `修正盘点批次#{batch_id}` is set by submit_edit at
+    # the matching line below — if submit_edit ever changes that format,
+    # this query must change too. LIKE is NOT acceptable (a substring
+    # match like `LIKE '%#X%'` would also catch `#X0`, `#X1`, ..., `#XY`
+    # for sibling batch IDs containing `#X`).
     edited_item_ids = {
         r["item_id"] for r in db.execute(
             """SELECT DISTINCT item_id FROM stock_movements

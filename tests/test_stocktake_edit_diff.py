@@ -105,21 +105,19 @@ def test_edit_then_approve_deducts_once(logged_client):
 
 def test_approve_idempotency_guards_exact_batch_only(logged_client):
     """Regression: approve's `edited_item_ids` guard must scope to the
-    EXACT batch_id being approved, not by substring matching the
-    movement note.
+    exact batch_id being approved.
 
     Bug: the old guard queried `note LIKE '%修正盘点批次#X%'`. SQLite
-    LIKE wildcards on both sides mean `#X` substring matches `#X`,
-    `#X0`, `#X1`, ... `#XY`. So approving batch X also incorrectly
-    tags items as "edited" when those items were edited by a
-    different batch whose ID contains #X as a substring (e.g.
-    approving batch 9 would falsely skip items edited by batch 99).
-    The skipped item then never receives batch 9's diff, silently
-    corrupting items.quantity.
+    LIKE wildcards on both sides mean `#X` substring matches `#X0`,
+    `#X1`, ..., `#XY`. So approving batch 9 also incorrectly tags
+    items as "edited" when those items were edited by a different
+    batch whose ID contains `#X` as a substring (e.g. approving
+    batch 9 would falsely skip items edited by batch 99). The
+    skipped item then never receives batch 9's diff.
 
-    Fix: join stocktakes (exact batch_id + item_id) instead of
-    matching the note. Now approving batch 9 only skips items
-    actually edited by batch 9; items edited by batch 99 still
+    Fix: exact equality on the note string (`note = ?`). Approving
+    batch 9 now only skips items where the movement note is
+    literally `修正盘点批次#9`; items edited by batch 99 still
     receive batch 9's apply normally.
     """
     from tests.conftest import _seed_item, _wh
@@ -128,27 +126,14 @@ def test_approve_idempotency_guards_exact_batch_only(logged_client):
 
     item_id, _ = _seed_item(wh_path, "collision-item", qty=100.0, unit_cost=1.0)
 
-    # Force-insert two stocktake batches with IDs 9 and 99 via raw SQL
-    # so the LIKE `#9` substring collision is real on both notes.
+    # Force-insert two stocktake batches with explicit IDs 9 and 99.
+    # SQLite INTEGER PRIMARY KEY auto-increment accepts explicit id values,
+    # so no auto-increment padding is needed.
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = _wh(wh_path)
-    # Pad auto-increment by inserting 8 throwaway batches first, so the
-    # next one is ID 9. Then 89 more pads, so the next is ID 99.
-    for i in range(8):
-        conn.execute(
-            "INSERT INTO stocktake_batches (created_at, note, status, rolled_back) "
-            "VALUES (?, ?, 'pending', 0)",
-            (ts, f"pad-{i}"),
-        )
     conn.execute(
         "INSERT INTO stocktake_batches (id, created_at, note, status, rolled_back) "
         "VALUES (9, ?, 'batch-9', 'pending', 0)", (ts,))
-    for i in range(89):
-        conn.execute(
-            "INSERT INTO stocktake_batches (created_at, note, status, rolled_back) "
-            "VALUES (?, ?, 'pending', 0)",
-            (ts, f"pad-after-9-{i}"),
-        )
     conn.execute(
         "INSERT INTO stocktake_batches (id, created_at, note, status, rolled_back) "
         "VALUES (99, ?, 'batch-99', 'pending', 0)", (ts,))
@@ -172,22 +157,21 @@ def test_approve_idempotency_guards_exact_batch_only(logged_client):
 
     # ONLY edit batch 99 (not batch 9). This means:
     #   - batch 9's stocktakes.diff stays at -20 (untouched by edit).
-    #   - batch 99's stocktakes.diff was already -30 at submit.
-    #   - the 盘点修正 movement was written for batch 99 (note contains '#99'
-    #     which is also '#9' substring).
+    #   - batch 99's stocktakes.actual changes → submit_edit writes
+    #     a 盘点修正 movement with note `修正盘点批次#99`.
     client.post("/stocktake/batch/99/edit", data={
-        f"actual_{item_id}": "75.0",  # actual changes → triggers movement
+        f"actual_{item_id}": "75.0",
     }, follow_redirects=True)
 
     # Approve batch 9 (which was NOT edited).
-    # With the OLD LIKE-based guard: scan looks for note LIKE
-    # '%修正盘点批次#9%', which matches BOTH the batch-9 note AND the
-    # batch-99 note (since '#99' contains '#9'). Result: the item
-    # is wrongly tagged as edited for batch 9, batch 9's diff -20
-    # is NOT applied, items.quantity stays at 100.0 instead of 80.0.
-    # With the NEW join-based guard: scan only finds items where
-    # stocktakes.batch_id = 9. Batch 99's note doesn't matter.
-    # Result: batch 9's diff -20 IS applied, items.quantity becomes 80.0.
+    # With the OLD LIKE-based guard: `LIKE '%#9%'` would match
+    # BOTH `#9` and `#99`, the item gets wrongly tagged as edited
+    # for batch 9, batch 9's diff -20 is NOT applied, items.quantity
+    # stays at 100.0 instead of 80.0.
+    # With the NEW exact-equality guard: scan looks for
+    # `note = '修正盘点批次#9'`. Only batch 99's note is `...#99`,
+    # so the item is NOT tagged as edited for batch 9; batch 9's
+    # diff -20 IS applied, items.quantity becomes 80.0.
     client.post("/stocktake/batch/9/approve", follow_redirects=True)
 
     conn = _wh(wh_path)
