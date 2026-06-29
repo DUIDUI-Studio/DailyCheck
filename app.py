@@ -41,6 +41,7 @@ def create_app() -> Flask:
     from blueprints.users import bp as users_bp
     from blueprints.forecast import bp as forecast_bp, _start_scheduler
     from blueprints.procurement import bp as procurement_bp
+    from blueprints.notifications import bp as notifications_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -54,6 +55,7 @@ def create_app() -> Flask:
     app.register_blueprint(users_bp)
     app.register_blueprint(forecast_bp)
     app.register_blueprint(procurement_bp)
+    app.register_blueprint(notifications_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp

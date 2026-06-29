@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}通知中心{% endblock %}
+{% block content %}
+<h1>通知中心</h1>
+
+{% if not events %}
+<p style="color:#666;">暂无通知。</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>类型</th>
+      <th>摘要</th>
+      <th>时间</th>
+      <th>状态</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in events %}
+    <tr class="{{ 'unread' if not e.read else 'read' }}">
+      <td>{{ e.event_type }}</td>
+      <td>
+        {% if e.target_url %}
+          <a href="{{ e.target_url }}">{{ e.summary }}</a>
+        {% else %}
+          {{ e.summary }}
+        {% endif %}
+      </td>
+      <td>{{ e.created_at }}</td>
+      <td>
+        {% if e.read %}<span class="badge read">已读</span>{% else %}<span class="badge unread">未读</span>{% endif %}
+      </td>
+      <td>
+        {% if not e.read %}
+        <form method="post" action="{{ url_for('notifications.mark_notification_read', event_id=e.event_id) }}" style="display:inline;">
+          <button type="submit">标记已读</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+<style>
+  .badge.unread { background: #fee2e2; color: #991b1b; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .badge.read   { background: #e5e7eb; color: #4b5563; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  tr.unread { font-weight: 600; }
+</style>
+{% endblock %}
