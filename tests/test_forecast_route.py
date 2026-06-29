@@ -176,10 +176,10 @@ def test_forecast_item_response_shape_stable(logged_client):
 # ---------------------------------------------------------------------------
 
 
-def test_forecast_item_rejects_staff_role(staff_client, wh_path):
+def test_forecast_item_rejects_staff_role(staff_client):
     """Staff cannot read /forecast/item; expect 403."""
-    client, _wh = staff_client
-    item_id, _ = _seed_item(_wh, "forbid", qty=10, unit_cost=5)
+    client, wh_path = staff_client
+    item_id, _ = _seed_item(wh_path, "forbid", qty=10, unit_cost=5)
     resp = client.get(f"/forecast/item/{item_id}")
     assert resp.status_code == 403
 

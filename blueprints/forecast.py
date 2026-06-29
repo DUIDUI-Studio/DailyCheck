@@ -24,6 +24,7 @@ from pathlib import Path
 from flask import Blueprint, abort, g, jsonify, request
 
 from db import get_warehouse_db
+from permissions import require_role
 from .forecast_pure import (
     classify_confidence,
     compute_daily_avg,
@@ -134,6 +135,7 @@ def _build_response(
 
 
 @bp.route("/forecast/item/<int:item_id>", methods=["GET"])
+@require_role("manager")
 def forecast_item(item_id: int):
     horizon = _parse_horizon(request.args.get("horizon_days"))
     if horizon is None:
@@ -148,6 +150,7 @@ def forecast_item(item_id: int):
 
 
 @bp.route("/forecast/product/<int:product_id>", methods=["GET"])
+@require_role("manager")
 def forecast_product(product_id: int):
     horizon = _parse_horizon(request.args.get("horizon_days"))
     if horizon is None:
@@ -165,6 +168,7 @@ def forecast_product(product_id: int):
 
 
 @bp.route("/forecast/recompute", methods=["POST"])
+@require_role("manager")
 def forecast_recompute():
     """Mark a manual batch as complete (idempotent).
 
