@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}采购建议 — {{ warehouse_code }}{% endblock %}
+{% block content %}
+<h1>采购建议 — {{ warehouse_code }}</h1>
+<p>基于过去 30 天加权日均消耗 + 14 天安全库存。</p>
+
+<form method="post" action="{{ url_for('procurement.procurement_accept') }}" style="margin: 12px 0;">
+  <input type="hidden" name="warehouse_code" value="{{ warehouse_code }}">
+  <button type="submit">采纳 → 导出 CSV</button>
+</form>
+
+<table>
+  <thead>
+    <tr>
+      <th>品项</th>
+      <th>当前库存</th>
+      <th>在途</th>
+      <th>日均</th>
+      <th>14天预测</th>
+      <th>安全库存</th>
+      <th>建议补货</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for it in items %}
+    <tr>
+      <td>{{ it.item_name }}</td>
+      <td>{{ '%.2f'|format(it.current_qty) }}</td>
+      <td>{{ '%.2f'|format(it.in_transit_qty) }}</td>
+      <td>{{ '%.2f'|format(it.daily_avg) }}</td>
+      <td>{{ '%.2f'|format(it.forecast_total_horizon) }}</td>
+      <td>{{ '%.2f'|format(it.safety_stock) }}</td>
+      <td><strong>{{ it.suggested_qty }}</strong></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" style="text-align:center;color:#666;">暂无补货建议（数据积累中或库存充足）</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
