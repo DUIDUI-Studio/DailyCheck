@@ -39,6 +39,7 @@ def create_app() -> Flask:
     from blueprints.reports import bp as reports_bp
     from blueprints.production import bp as production_bp
     from blueprints.users import bp as users_bp
+    from blueprints.forecast import bp as forecast_bp, _start_scheduler
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -50,10 +51,13 @@ def create_app() -> Flask:
     app.register_blueprint(reports_bp)
     app.register_blueprint(production_bp)
     app.register_blueprint(users_bp)
+    app.register_blueprint(forecast_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp
     app.register_blueprint(pwa_bp)
+
+    _start_scheduler()
 
     register_cli(app)
     from blueprints._helpers import register_jinja_filters, register_template_context
