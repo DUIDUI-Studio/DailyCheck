@@ -82,6 +82,9 @@ def adjustment_submit():
                VALUES (?, '调整出库', ?, ?, ?)""",
             (item_id, -qty, f"调整单#{req_id}", now()),
         )
+    from blueprints.procurement import mark_procurement_invalid
+    for item_id, _ in rows:
+        mark_procurement_invalid(item_id)
     db.commit()
     audit("adjustment.submit", "request", None, {"rows": rows})
     flash("调整单已执行")
