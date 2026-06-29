@@ -182,8 +182,16 @@ def test_list_for_user_limit_100(db):
 def test_list_for_user_only_returns_user_own(db):
     emit_event(db, "recipe_published", "a", "/a", [1, 2, 3])
     out = list_for_user(db, user_id=1, unread_only=False)
-    assert all(o["user_id"] == 1 for o in out)
+    # Only 1 row (the one for user 1). The user_id field is not in
+    # the response shape (spec §1.1) — implicit from the filter.
     assert len(out) == 1
+    # And user 2 sees only their own
+    out2 = list_for_user(db, user_id=2, unread_only=False)
+    assert len(out2) == 1
+    # And user 1 does NOT see user 2's event
+    out1_ids = [o["event_id"] for o in out]
+    out2_ids = [o["event_id"] for o in out2]
+    assert out1_ids != out2_ids
 
 
 def test_list_for_user_shape_stable(db):
