@@ -87,6 +87,29 @@ CREATE TABLE IF NOT EXISTS warehouse_users (
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
 );
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    target_url TEXT,
+    created_at TEXT NOT NULL,
+    read_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_user_created ON notifications(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notif_user_unread ON notifications(user_id, read_at);
+
+CREATE TABLE IF NOT EXISTS notification_prefs (
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    muted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, event_type, channel),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
