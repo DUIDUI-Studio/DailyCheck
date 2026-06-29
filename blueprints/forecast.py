@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -205,19 +206,129 @@ def forecast_recompute():
 
 
 # ---------------------------------------------------------------------------
-# Scheduler (TASK 8 — minimal placeholder; full impl in next commits)
+# Scheduler (TASK 8)
 # ---------------------------------------------------------------------------
+
+import logging
+import time
+
+from db import init_master_db
+
+_logger = logging.getLogger(__name__)
 
 _scheduler_lock = threading.Lock()
 _scheduler_started = False
+_STOP = threading.Event()
+
+
+def _recover_orphaned_runs() -> None:
+    """Mark any 'running' rows left behind by a previous crash as 'failed'.
+
+    Called once at app startup (TASK 8). Sets finished_at to now and
+    error_message to 'scheduler_restart'. Idempotent and safe to call
+    multiple times. Uses a direct sqlite3 connection (not get_master_db)
+    because this runs before/outside the Flask app context, where 'g'
+    is unbound. Calls init_master_db() first so a fresh db is a no-op.
+    """
+    from config import MASTER_DB
+    from datetime import datetime as _dt
+    now = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    init_master_db()  # no-op if already initialized
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        conn.execute(
+            """UPDATE forecast_runs
+               SET status='failed', finished_at=?, error_message='scheduler_restart'
+               WHERE status='running' AND finished_at IS NULL""",
+            (now,),
+        )
+        conn.commit()
+
+
+def _run_daily_forecast() -> int:
+    """Run a single batch forecast pass over all warehouses.
+
+    Returns the forecast_runs.id of the run (existing reused via
+    same-minute idempotency, or newly inserted). 'items_processed'
+    counts (items + products) touched across all warehouses — the
+    values are computed on demand by GET routes, so this count is
+    best-effort metadata for /admin/health operators.
+    """
+    from config import MASTER_DB, WAREHOUSE_DB_DIR
+    from datetime import datetime as _dt
+    now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    minute_start = now_str[:17] + "00"
+
+    init_master_db()
+    with closing(sqlite3.connect(MASTER_DB)) as m:
+        m.row_factory = sqlite3.Row
+        existing = m.execute(
+            """SELECT id FROM forecast_runs
+               WHERE status IN ('success', 'running')
+                 AND started_at >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (minute_start,),
+        ).fetchone()
+        if existing is not None:
+            return existing["id"]
+
+        items_processed = 0
+        if WAREHOUSE_DB_DIR.exists():
+            for wh_path in WAREHOUSE_DB_DIR.glob("*.db"):
+                try:
+                    with closing(sqlite3.connect(wh_path)) as w:
+                        items_processed += w.execute(
+                            "SELECT COUNT(*) FROM items"
+                        ).fetchone()[0]
+                        items_processed += w.execute(
+                            "SELECT COUNT(*) FROM products"
+                        ).fetchone()[0]
+                except sqlite3.Error as exc:  # noqa: BLE001
+                    _logger.warning("forecast_lock: %s (%s)", exc, wh_path)
+
+        cur = m.execute(
+            "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed) "
+            "VALUES (?, ?, 'success', ?)",
+            (now_str, now_str, items_processed),
+        )
+        m.commit()
+        return cur.lastrowid
+
+
+def _scheduler_loop() -> None:
+    """Daemon thread loop: trigger _run_daily_forecast at 03:00 local.
+
+    Polls every 30 seconds — sufficient for a once-a-day cron-style
+    trigger. The 30s granularity means the actual run may fire up to
+    30s after 03:00, which is acceptable per spec §4 (no precise time
+    contract was promised). Uses local time (datetime.now()).
+    """
+    while not _STOP.is_set():
+        now = datetime.now()
+        if now.hour == 3 and now.minute == 0:
+            try:
+                _run_daily_forecast()
+            except Exception:  # noqa: BLE001
+                _logger.exception("forecast scheduler tick failed")
+        # 30s poll — _STOP.wait returns True if stopped, breaking the loop
+        if _STOP.wait(30):
+            return
 
 
 def _start_scheduler() -> None:
-    """Idempotent — safe to call from create_app() multiple times."""
+    """Idempotent: safe to call from create_app() multiple times.
+
+    Recovers orphaned runs first, then starts the daemon thread. Thread
+    is daemon=True so it does not block process exit. NOTE: under
+    gunicorn multi-worker, each worker will run its own thread, so
+    the same /admin/health minute-bucket can absorb N inserts (the
+    idempotency key prevents that — only the first wins). Multi-worker
+    is acknowledged in spec §4 as a known limitation.
+    """
     global _scheduler_started
     with _scheduler_lock:
         if _scheduler_started:
             return
         _scheduler_started = True
-    # Full scheduler body is in TASK 8; placeholder keeps the symbol
-    # import-safe for tests that import this module.
+    _recover_orphaned_runs()
+    t = threading.Thread(target=_scheduler_loop, name="forecast-scheduler", daemon=True)
+    t.start()
