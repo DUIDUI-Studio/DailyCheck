@@ -48,6 +48,7 @@ from werkzeug.security import check_password_hash
 
 import config
 from db import init_master_db
+from permissions import require_platform_admin
 from .agent_mpc_pure import path_matches
 
 # -----------------------------------------------------------------------------
@@ -657,6 +658,77 @@ def forecast_recompute():
         )
         conn.commit()
         return jsonify({"ok": True, "last_run_id": cur.lastrowid})
+
+
+# -----------------------------------------------------------------------------
+# Admin page: /admin/mpc-usage (T7)
+# -----------------------------------------------------------------------------
+
+
+def _aggregate_usage() -> list[dict]:
+    """Read access.log + agent_tokens, return per-token usage stats.
+
+    Each row: {id, name, call_count, error_count, error_rate,
+               last_call_at, revoked_at}. Uses the access.log written
+    by _write_mpc_access_log(); a missing or empty log is OK (counts=0).
+    """
+    init_master_db()
+    with closing(sqlite3.connect(config.MASTER_DB)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, name, revoked_at FROM agent_tokens ORDER BY id"
+        ).fetchall()
+    by_id: dict[int, dict] = {
+        int(r["id"]): {
+            "id": int(r["id"]),
+            "name": r["name"],
+            "revoked_at": r["revoked_at"],
+            "call_count": 0,
+            "error_count": 0,
+            "last_call_at": None,
+        }
+        for r in rows
+    }
+    # Walk the log. Corrupt lines are skipped silently.
+    try:
+        with open(_ACCESS_LOG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                tid = rec.get("agent_token_id")
+                if tid is None:
+                    continue
+                bucket = by_id.get(int(tid))
+                if bucket is None:
+                    continue
+                bucket["call_count"] += 1
+                if int(rec.get("status", 0)) >= 400:
+                    bucket["error_count"] += 1
+                ts = rec.get("ts")
+                if ts and (bucket["last_call_at"] is None or ts > bucket["last_call_at"]):
+                    bucket["last_call_at"] = ts
+    except OSError:
+        pass
+    # Derive error rate
+    out: list[dict] = []
+    for b in by_id.values():
+        n = b["call_count"]
+        b["error_rate"] = (b["error_count"] / n) if n else 0.0
+        out.append(b)
+    return out
+
+
+@bp.route("/admin/mpc-usage", methods=["GET"])
+@require_platform_admin
+def admin_mpc_usage():
+    """Operator page: per-token call stats from access.log."""
+    tokens = _aggregate_usage()
+    return render_template("admin_mpc_usage.html", tokens=tokens)
 
 
 # -----------------------------------------------------------------------------
