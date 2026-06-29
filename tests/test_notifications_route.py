@@ -101,12 +101,20 @@ def test_mark_own_notification_read(logged_client):
 def test_mark_other_users_notification_returns_404(logged_client):
     """Notification belongs to user 2; user 1 (logged in) cannot mark it."""
     client, _ = logged_client
+    # Seed a second user so FK holds.
+    import sqlite3 as _sq
+    from config import MASTER_DB
+    with _sq.connect(MASTER_DB) as m:
+        ts = "2026-06-29 12:00:00"
+        m.execute(
+            "INSERT OR IGNORE INTO users (id, username, password_hash, is_admin, created_at) "
+            "VALUES (2, 'other_user', 'x', 0, ?)", (ts,),
+        )
+        m.commit()
     client.post(
         "/admin/notifications/test-emit",
         json={"event_type": "recipe_published", "summary": "x", "target_url": "/x", "user_ids": [2]},
     )
-    # Find the event id from master.db directly (we can't fetch via /notifications
-    # because user 1 doesn't see user 2's notifications)
     with client.application.app_context():
         from db import get_master_db
         db = get_master_db()
@@ -183,3 +191,29 @@ def test_test_emit_rejects_oversized_summary(logged_client):
         json={"event_type": "recipe_published", "summary": "a" * 201, "target_url": "/x", "user_ids": [1]},
     )
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# HTML page
+# ---------------------------------------------------------------------------
+
+
+def test_notifications_html_renders(logged_client):
+    client, _ = logged_client
+    client.post(
+        "/admin/notifications/test-emit",
+        json={"event_type": "recipe_published", "summary": "经典柠檬茶 v3", "target_url": "/p/12", "user_ids": [1]},
+    )
+    resp = client.get("/notifications", headers={"Accept": "text/html"})
+    assert resp.status_code == 200
+    body = resp.data.decode("utf-8")
+    assert "经典柠檬茶 v3" in body
+    assert "标记已读" in body
+
+
+def test_notifications_html_empty_state(logged_client):
+    client, _ = logged_client
+    resp = client.get("/notifications", headers={"Accept": "text/html"})
+    assert resp.status_code == 200
+    body = resp.data.decode("utf-8")
+    assert "暂无通知" in body
