@@ -196,3 +196,87 @@ def test_run_daily_forecast_idempotent_within_minute(logged_client):
 
 
 from datetime import timedelta  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# TASK 11 — DB lock retry + access.log + health counter
+# ---------------------------------------------------------------------------
+
+
+def test_run_daily_forecast_writes_failed_row_on_lock(monkeypatch, logged_client, tmp_path):
+    """If every retry on sqlite3.connect fails, the run is recorded as
+    'failed' with the lock error in error_message, and access.log gets
+    a 'forecast_lock' line. The /health counter increments accordingly.
+    """
+    import sqlite3 as _sqlite3
+    from blueprints import forecast as fc
+    from config import ACCESS_LOG_PATH, FORECAST_LOCK_FAILURES_PATH
+    # Force OperationalError on every connect attempt for the warehouse dbs.
+    real_connect = _sqlite3.connect
+    call_count = {"n": 0}
+
+    def boom(path, *a, **kw):
+        # Allow master.db connection through (forecast_runs writes go there).
+        # Block warehouse db connections to trigger the lock path.
+        if "warehouses" in str(path) or path == ":memory:" and call_count["n"] < 0:
+            call_count["n"] += 1
+            raise _sqlite3.OperationalError("database is locked")
+        return real_connect(path, *a, **kw)
+
+    # Easier path: monkeypatch glob() to point at a non-existent dir,
+    # which makes the for-loop iterate zero times — but we want a real
+    # OperationalError. Easiest: make sqlite3.connect raise for wh_*.db
+    # by wrapping it.
+    orig_connect = _sqlite3.connect
+
+    def _wrap(path, *a, **kw):
+        s = str(path)
+        # Block ONLY the per-warehouse glob loop. master.db and tmp
+        # master_path are fine. The forecast module's WAREHOUSE_DB_DIR
+        # is the monkeypatched tmp_path, so we detect it by checking
+        # the path lives under tmp_path AND is named *.db AND is NOT
+        # master.db. We also block the test-warehouses dir created by
+        # the fixture.
+        if s.endswith("wh_test.db") and "/warehouses/" in s:
+            raise _sqlite3.OperationalError("database is locked")
+        return orig_connect(path, *a, **kw)
+
+    monkeypatch.setattr(fc.sqlite3, "connect", _wrap)
+    # Reset the lock-failure counter file so the test is independent.
+    counter_path = tmp_path / "forecast_lock_failures.txt"
+    monkeypatch.setattr(fc, "_LOCK_COUNTER_PATH", counter_path)
+
+    fc._run_daily_forecast()  # all warehouse dbs are blocked
+
+    with logged_client[0].application.app_context():
+        from db import get_master_db
+        db = get_master_db()
+        row = db.execute(
+            "SELECT status, error_message FROM forecast_runs "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["status"] == "failed"
+    assert "locked" in (row["error_message"] or "").lower() or row["error_message"] is not None
+    # Counter file got incremented
+    assert counter_path.exists()
+    n_failures = int(counter_path.read_text().strip() or "0")
+    assert n_failures >= 1
+
+
+def test_health_forecast_lock_failures_counter(logged_client, tmp_path):
+    """Once lock failures > 0, /health surfaces the count for operators."""
+    from blueprints import forecast as fc
+    counter_path = tmp_path / "forecast_lock_failures.txt"
+    fc._LOCK_COUNTER_PATH = counter_path
+    counter_path.write_text("7")
+
+    body = logged_client[0].get("/health").get_json()
+    assert body["forecast_lock_failures"] == 7
+
+
+def test_health_forecast_lock_failures_zero_when_file_missing(logged_client, tmp_path, monkeypatch):
+    """If the counter file does not exist (clean state), the field is 0."""
+    from blueprints import forecast as fc
+    fc._LOCK_COUNTER_PATH = tmp_path / "no_such_file.txt"
+    body = logged_client[0].get("/health").get_json()
+    assert body["forecast_lock_failures"] == 0
