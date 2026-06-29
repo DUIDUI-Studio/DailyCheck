@@ -16,6 +16,7 @@ from flask import Blueprint, render_template, request
 from db import get_warehouse_db
 from permissions import require_login
 from .auth import audit
+from .core import _compute_summary_metrics, _compute_category_stats
 
 
 bp = Blueprint("reports", __name__)
@@ -213,3 +214,106 @@ def api_upload_revenue():
     )
     db.commit()
     return f"OK {date_str}={amount}"
+
+
+# ---------------------------------------------------------------------------
+# Summary export (CSV with three sections)
+# ---------------------------------------------------------------------------
+
+@bp.route("/summary/export")
+@require_login
+def export_summary():
+    """CSV 三段导出:总体 / 按品类 / 消耗 Top。
+
+    与 /summary 共享 range 参数(7d|month|all,默认 7d)。
+    输出 UTF-8 BOM 兼容 Excel 中文。
+    """
+    import datetime as _dt
+
+    db = get_warehouse_db()
+    range_param = request.args.get("range", "7d")
+    if range_param not in ("7d", "month", "all"):
+        range_param = "7d"
+    range_label = {"7d": "7 日", "month": "当月", "all": "全部"}[range_param]
+
+    # 总体段:复用 /summary 的同源函数,周转率与可售天数口径完全一致。
+    metrics = _compute_summary_metrics(db, range_param)
+    total_inbound = metrics["total_inbound_value"]
+    total_consumed = metrics["total_consumed_value"]
+    total_stock = metrics["total_stock_value"]
+    turnover_str = f"{metrics['turnover']:.2f}" if metrics["turnover"] else "0.00"
+    days_str = f"{metrics['turnover_days']}" if metrics["turnover_days"] is not None else "—"
+
+    # 品类段:复用 /summary 的同源函数,周转率口径 = consumed / avg(start+end),
+    # 与页面完全一致。
+    cat_stats = _compute_category_stats(db, range_param)
+
+    # 段 3:消耗 Top 10(历史口径:只取 outbound,与 /summary 同源;production 暂不参与 Top)
+    from .core import _time_clauses, _where
+    tco, _, _, _ = _time_clauses(range_param)
+    top_rows = db.execute(
+        f"""SELECT i.name AS item_name, c.name AS category_name,
+                  o.total_qty AS consumed_qty, i.unit,
+                  ROUND(o.total_qty * i.unit_cost, 2) AS consumed_value
+           FROM (
+               SELECT item_id, SUM(requested_quantity) AS total_qty
+               FROM outbound_requests o
+               WHERE o.rolled_back = 0
+                 AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
+                 AND {_where(tco, 'o')}
+               GROUP BY o.item_id
+           ) o
+           JOIN items i ON i.id = o.item_id
+           JOIN categories c ON c.id = i.category_id
+           ORDER BY o.total_qty DESC LIMIT 10"""
+    ).fetchall()
+
+    # 写 CSV(三段以空行分隔)
+    output = io.StringIO()
+    w = csv.writer(output)
+
+    w.writerow(["范围", "进货金额", "消耗金额", "当前库存金额", "周转率", "可售天数"])
+    w.writerow([range_label, f"{total_inbound:.2f}", f"{total_consumed:.2f}",
+                f"{total_stock:.2f}", turnover_str, days_str])
+    w.writerow([])
+
+    # 品类段:周转率与 /summary 同源(avg(start+end) 反推),
+    # 增加「平均库存金额」列让消费者看到分母本身。
+    w.writerow(["品类", "进货金额", "消耗金额", "库存金额", "平均库存金额", "周转率"])
+    for cat in cat_stats:
+        cat_turnover = f"{cat['turnover']:.2f}" if cat["turnover"] is not None else "—"
+        w.writerow([
+            cat["category_name"],
+            f"{cat['inbound_value']:.2f}",
+            f"{cat['consumed_value']:.2f}",
+            f"{cat['stock_value']:.2f}",
+            f"{cat['avg_stock_value']:.2f}",
+            cat_turnover,
+        ])
+    w.writerow([])
+
+    w.writerow(["品类", "品项", "消耗数量", "单位", "消耗金额"])
+    for r in top_rows:
+        w.writerow([
+            r["category_name"], r["item_name"],
+            fmt_qty(r["consumed_qty"]), r["unit"],
+            f"{float(r['consumed_value']):.2f}",
+        ])
+
+    filename = f"summary-{_dt.datetime.now().strftime('%Y-%m-%d')}-{range_param}.csv"
+    from flask import current_app
+    return current_app.response_class(
+        output.getvalue().encode("utf-8-sig"),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={filename}"},
+    )
+
+
+def fmt_qty(value):
+    """简化版 fmt_qty,避免循环导入。"""
+    if value is None:
+        return "0"
+    s = f"{float(value):.2f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"

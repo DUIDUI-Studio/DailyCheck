@@ -17,13 +17,17 @@
     <td>{% if r.rolled_back == 1 %}已回退{% else %}已执行{% endif %}</td>
     <td>
       {% if r.rolled_back == 0 %}
+      {% if current_role != 'staff' %}
       <form method="post" action="{{ url_for('adjustment.rollback', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认回退该调整单？将恢复库存。');">
         <button type="submit" class="btn-sm btn-edit">回退</button>
       </form>
       {% endif %}
+      {% endif %}
+      {% if current_role != 'staff' %}
       <form method="post" action="{{ url_for('adjustment.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该调整记录？');">
         <button type="submit" class="btn-sm btn-delete">删除</button>
       </form>
+      {% endif %}
     </td>
   </tr>
   {% endfor %}

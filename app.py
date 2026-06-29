@@ -56,8 +56,9 @@ def create_app() -> Flask:
     app.register_blueprint(pwa_bp)
 
     register_cli(app)
-    from blueprints._helpers import register_jinja_filters
+    from blueprints._helpers import register_jinja_filters, register_template_context
     register_jinja_filters(app)
+    register_template_context(app)
 
     @app.route("/health")
     def health() -> tuple[str, int]:

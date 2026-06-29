@@ -24,9 +24,11 @@
         {% if r.reason and r.reason.startswith('生产领料(run=#') %}
           <span class="muted">生产领料</span>
         {% else %}
+          {% if current_role != 'staff' %}
           <form method="post" action="{{ url_for('outbound.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该出库记录？');">
             <button type="submit">删除</button>
           </form>
+          {% endif %}
         {% endif %}
       {% else %}
         已回退

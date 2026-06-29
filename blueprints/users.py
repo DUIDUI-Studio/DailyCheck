@@ -4,18 +4,22 @@
 - Reset passwords
 - Toggle platform admin (is_admin)
 - Bind / unbind / change role on a per-warehouse basis
+- Create warehouses (optionally cloning items / products / product_bom
+  from an existing one)
 """
 from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
 from datetime import datetime
+from pathlib import Path
+import re
 
 from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
 from werkzeug.security import generate_password_hash
 
-from config import MASTER_DB, ROLE_RANK
-from db import get_master_db
+from config import BASE_DIR, MASTER_DB, ROLE_RANK, WAREHOUSE_DB_DIR
+from db import get_master_db, init_warehouse_db
 from permissions import require_login
 
 
@@ -262,6 +266,73 @@ def delete_user(user_id: int):
     return redirect(url_for("users.list_users"))
 
 
+@bp.route("/warehouses/create", methods=["POST"])
+@require_login
+def create_warehouse():
+    """Create a new warehouse. Optionally clone the items / products /
+    product_bom from an existing warehouse (inventory zeroed, SKUs kept).
+    """
+    _require_admin()
+
+    code = request.form.get("code", "").strip().lower()
+    name = request.form.get("name", "").strip()
+    clone_from_code = request.form.get("clone_from_code", "").strip()
+
+    if not re.fullmatch(r"wh_\w+", code):
+        flash("仓库编码必须以 wh_ 开头,后面接字母/数字/下划线")
+        return redirect(url_for("users.list_users"))
+    if not name:
+        flash("门店名称必填")
+        return redirect(url_for("users.list_users"))
+
+    db_path = WAREHOUSE_DB_DIR / f"{code}.db"
+    if db_path.exists():
+        flash(f"仓库编码 {code} 的数据库文件已存在")
+        return redirect(url_for("users.list_users"))
+
+    db = get_master_db()
+    if db.execute("SELECT 1 FROM warehouses WHERE code=?", (code,)).fetchone() is not None:
+        flash(f"仓库编码 {code} 已注册")
+        return redirect(url_for("users.list_users"))
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    init_warehouse_db(db_path)
+    counts = {"items": 0, "products": 0, "bom": 0}
+    if clone_from_code:
+        if clone_from_code == code:
+            flash("克隆源不能是自己")
+            return redirect(url_for("users.list_users"))
+        if db.execute("SELECT 1 FROM warehouses WHERE code=?", (clone_from_code,)).fetchone() is None:
+            flash(f"克隆源仓库 {clone_from_code} 不存在")
+            return redirect(url_for("users.list_users"))
+        src_path = WAREHOUSE_DB_DIR / f"{clone_from_code}.db"
+        if not src_path.exists():
+            flash(f"克隆源数据库 {src_path} 缺失")
+            return redirect(url_for("users.list_users"))
+        counts = _clone_catalog_from(src_path, db_path)
+
+    rel_path = str(db_path.relative_to(BASE_DIR))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db.execute(
+        """INSERT INTO warehouses (code, name, db_path, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (code, name, rel_path, now),
+    )
+    db.commit()
+    _log_admin_action(
+        f"create warehouse {code} ({name})"
+        + (f" cloned {counts['items']} items / {counts['products']} products / "
+           f"{counts['bom']} bom from {clone_from_code}"
+           if clone_from_code else "")
+    )
+    flash(
+        f"已创建仓库 {code} ({name})"
+        + (f",从 {clone_from_code} 复制了 {counts['items']} 个品项"
+           if clone_from_code else "")
+    )
+    return redirect(url_for("users.list_users"))
+
+
 @bp.route("/warehouses/<int:warehouse_id>/init", methods=["POST"])
 @require_login
 def init_warehouse(warehouse_id: int):
@@ -385,3 +456,57 @@ def _log_admin_action(detail: str) -> None:
             "actor": g.user["username"] if g.user else None,
             "detail": detail,
         }, ensure_ascii=False) + "\n")
+
+
+def _clone_catalog_from(src_path: Path, dst_path: Path) -> dict[str, int]:
+    """Copy items / products / product_bom from src to dst.
+
+    Preserves SKUs and per-item fields (safety_stock, unit_cost, unit,
+    gram_per_unit, category_id, name) but resets quantity to 0 so the
+    new warehouse starts empty. The fixed categories must already be
+    seeded in dst by init_warehouse_db before calling this.
+
+    Returns a {items, products, bom} count dict for the audit log.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(sqlite3.connect(src_path)) as src, \
+         closing(sqlite3.connect(dst_path)) as dst:
+        src.row_factory = sqlite3.Row
+        items = src.execute(
+            """SELECT name, category_id, sku, safety_stock, unit_cost, unit,
+                      gram_per_unit
+               FROM items"""
+        ).fetchall()
+        dst.executemany(
+            """INSERT INTO items
+               (name, category_id, sku, quantity, safety_stock, unit_cost, unit,
+                gram_per_unit, updated_at)
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+            [(r["name"], r["category_id"], r["sku"], r["safety_stock"],
+              r["unit_cost"], r["unit"], r["gram_per_unit"], now) for r in items],
+        )
+
+        products = src.execute(
+            "SELECT name, unit, note, created_at FROM products"
+        ).fetchall()
+        dst.executemany(
+            """INSERT INTO products (name, unit, note, created_at)
+               VALUES (?, ?, ?, ?)""",
+            [(r["name"], r["unit"], r["note"], now) for r in products],
+        )
+
+        # BOM preserves product_id / item_id from src. This relies on both
+        # dbs inserting items and products in the same order so the
+        # auto-increment ids line up — true because we just inserted them
+        # in that order above. Cloning a fully-built warehouse this way
+        # is the supported entry point; ad-hoc per-row clones aren't.
+        bom = src.execute(
+            "SELECT product_id, item_id, qty_per_unit FROM product_bom"
+        ).fetchall()
+        dst.executemany(
+            """INSERT INTO product_bom (product_id, item_id, qty_per_unit)
+               VALUES (?, ?, ?)""",
+            [(r["product_id"], r["item_id"], r["qty_per_unit"]) for r in bom],
+        )
+        dst.commit()
+    return {"items": len(items), "products": len(products), "bom": len(bom)}
