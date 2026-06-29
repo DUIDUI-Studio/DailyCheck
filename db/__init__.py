@@ -143,7 +143,6 @@ CREATE TABLE IF NOT EXISTS notification_prefs (
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
-<<<<<<< HEAD
 CREATE TABLE IF NOT EXISTS publish_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
