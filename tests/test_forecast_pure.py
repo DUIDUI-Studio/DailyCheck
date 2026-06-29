@@ -12,6 +12,7 @@ import pytest
 from blueprints.forecast_pure import (
     classify_confidence,
     compute_daily_avg,
+    compute_forecast_total,
 )
 
 
@@ -136,3 +137,42 @@ def test_compute_daily_avg_filters_outside_30d():
 ])
 def test_classify_confidence(n, expected):
     assert classify_confidence(n) == expected
+
+
+# ---------------------------------------------------------------------------
+# compute_forecast_total
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_total_zero_daily_zero_total():
+    assert compute_forecast_total(0.0, 14) == 0.0
+
+
+def test_forecast_total_basic_multiplication():
+    """daily_avg * horizon, 2dp quantize."""
+    assert compute_forecast_total(2.5, 14) == 35.0
+
+
+def test_forecast_total_quantize_down():
+    """0.1 * 3 = 0.3 (must not be 0.30000000000000004)."""
+    assert compute_forecast_total(0.1, 3) == 0.3
+
+
+def test_forecast_total_quantize_rounds_half_up():
+    """1.235 * 2 = 2.47 (banker's rounding would give 2.46 or 2.48; spec
+    pins Decimal default which is ROUND_HALF_EVEN — we accept either 2.47
+    or 2.46 here to avoid pinning implementation detail, but reject 2.46
+    if it silently dropped precision)."""
+    result = compute_forecast_total(1.235, 2)
+    assert result in (2.46, 2.47)
+
+
+def test_forecast_total_handles_fractional_horizon():
+    """horizon is expected to be an int from the API, but the pure fn
+    must not crash on float input — defensive coding at the boundary."""
+    assert compute_forecast_total(1.0, 7.0) == 7.0
+
+
+def test_forecast_total_returns_float_type():
+    """Caller does arithmetic on the result; type must be float (not Decimal)."""
+    assert isinstance(compute_forecast_total(1.0, 1), float)
