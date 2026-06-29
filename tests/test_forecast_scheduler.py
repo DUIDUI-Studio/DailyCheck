@@ -108,3 +108,91 @@ def test_health_forecast_last_success_at_ignores_failed_runs(logged_client):
         db.commit()
     body = client.get("/health").get_json()
     assert body["forecast_last_success_at"] is None  # failed doesn't count
+
+
+# ---------------------------------------------------------------------------
+# TASK 8 — scheduler + orphaned run recovery
+# ---------------------------------------------------------------------------
+
+
+def test_recover_orphaned_runs_marks_running_as_failed(logged_client):
+    """An orphaned 'running' row (no finished_at) at startup is marked failed."""
+    client, _ = logged_client
+    ts = (datetime.now() - timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+    with client.application.app_context():
+        from db import get_master_db
+        db = get_master_db()
+        cur = db.execute(
+            "INSERT INTO forecast_runs (started_at, status) VALUES (?, 'running')",
+            (ts,),
+        )
+        db.commit()
+        orphan_id = cur.lastrowid
+        # Recovery runs in the same app context
+        from blueprints.forecast import _recover_orphaned_runs
+        _recover_orphaned_runs()
+        row = db.execute(
+            "SELECT status, finished_at FROM forecast_runs WHERE id=?",
+            (orphan_id,),
+        ).fetchone()
+    assert row["status"] == "failed"
+    assert row["finished_at"] is not None
+
+
+def test_recover_orphaned_runs_leaves_success_alone(logged_client):
+    """A completed success row must not be touched by recovery."""
+    client, _ = logged_client
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with client.application.app_context():
+        from db import get_master_db
+        db = get_master_db()
+        cur = db.execute(
+            "INSERT INTO forecast_runs (started_at, finished_at, status) "
+            "VALUES (?, ?, 'success')",
+            (ts, ts),
+        )
+        db.commit()
+        keep_id = cur.lastrowid
+        from blueprints.forecast import _recover_orphaned_runs
+        _recover_orphaned_runs()
+        row = db.execute(
+            "SELECT status, finished_at FROM forecast_runs WHERE id=?",
+            (keep_id,),
+        ).fetchone()
+    assert row["status"] == "success"
+    assert row["finished_at"] == ts
+
+
+def test_run_daily_forecast_creates_success_run(logged_client):
+    """One full run produces a single 'success' row with items_processed=0
+    when no data is seeded. The row exists, is success, has finished_at."""
+    client, wh_path = logged_client
+    from blueprints.forecast import _run_daily_forecast
+    _run_daily_forecast()
+    with client.application.app_context():
+        from db import get_master_db
+        db = get_master_db()
+        row = db.execute(
+            "SELECT status, items_processed, finished_at FROM forecast_runs "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["status"] == "success"
+    assert row["items_processed"] == 0
+    assert row["finished_at"] is not None
+
+
+def test_run_daily_forecast_idempotent_within_minute(logged_client):
+    """Two back-to-back _run_daily_forecast calls in the same minute produce
+    only one row (idempotency mirrors POST /forecast/recompute)."""
+    client, _ = logged_client
+    from blueprints.forecast import _run_daily_forecast
+    _run_daily_forecast()
+    _run_daily_forecast()
+    with client.application.app_context():
+        from db import get_master_db
+        db = get_master_db()
+        n = db.execute("SELECT COUNT(*) AS c FROM forecast_runs").fetchone()["c"]
+    assert n == 1
+
+
+from datetime import timedelta  # noqa: E402
