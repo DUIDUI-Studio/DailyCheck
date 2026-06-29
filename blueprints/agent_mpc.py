@@ -61,6 +61,44 @@ bp = Blueprint("agent_mpc", __name__)
 # below. The set is exposed publicly so the auth blueprint can adopt
 # it without coupling (see app.py / blueprints/auth.py note).
 
+# Access-log path. Spec §4.1 says append to the existing access.log
+# at the project root (same file the request logger writes to). Tests
+# monkeypatch this constant.
+from config import BASE_DIR as _BASE_DIR
+_ACCESS_LOG_PATH: Path = _BASE_DIR / "access.log"
+
+
+def _write_mpc_access_log(
+    token_id: int | None,
+    method: str,
+    path: str,
+    status: int,
+    duration_ms: int,
+) -> None:
+    """Append one JSON line to the access.log (spec §4.1).
+
+    The JSON shape is fixed:
+        {ts, agent_token_id, path, method, status, duration_ms}
+
+    The helper must never raise — observability failures must not break
+    the user-facing route. Errors are swallowed silently (operators can
+    detect them via the per-request access.log gap, not via 500s).
+    """
+    try:
+        rec = {
+            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "agent_token_id": token_id,
+            "path": path,
+            "method": method,
+            "status": int(status),
+            "duration_ms": int(duration_ms),
+        }
+        line = json.dumps(rec, ensure_ascii=False)
+        with open(_ACCESS_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:  # noqa: BLE001 — see docstring
+        return
+
 
 # -----------------------------------------------------------------------------
 # Auth helpers (T3)
