@@ -192,6 +192,36 @@ def test_forecast_recompute_rejects_staff_role(staff_client):
 
 
 # ---------------------------------------------------------------------------
+# TASK 10 — /forecast HTML page
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_page_renders_200_for_manager(logged_client):
+    """Manager sees a 200 HTML page with at least one item row."""
+    client, wh_path = logged_client
+    _seed_item(wh_path, "pageItem", qty=10, unit_cost=5)
+    resp = client.get("/forecast")
+    assert resp.status_code == 200
+    body = resp.data.decode("utf-8")
+    assert "pageItem" in body
+
+
+def test_forecast_page_has_manual_recompute_button(logged_client):
+    """Admin/manager sees a button to trigger manual recompute."""
+    client, _ = logged_client
+    body = client.get("/forecast").data.decode("utf-8")
+    # The button posts to /forecast/recompute
+    assert "/forecast/recompute" in body
+
+
+def test_forecast_page_rejects_staff(staff_client):
+    """Staff must not see the page (role gate applies to HTML view too)."""
+    client, _ = staff_client
+    resp = client.get("/forecast")
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
 # TASK 6 — POST /forecast/recompute
 # ---------------------------------------------------------------------------
 
