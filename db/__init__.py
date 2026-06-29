@@ -87,6 +87,17 @@ CREATE TABLE IF NOT EXISTS warehouse_users (
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
 );
+
+CREATE TABLE IF NOT EXISTS forecast_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    items_processed INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_runs_status ON forecast_runs(status, started_at);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
