@@ -9,7 +9,6 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
-
 BUTTON_LABELS = ["本周", "上周", "本月", "上月", "本季", "本年"]
 
 

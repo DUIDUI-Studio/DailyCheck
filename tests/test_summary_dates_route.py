@@ -10,8 +10,6 @@ import datetime as _dt
 import sqlite3
 from datetime import datetime
 
-import pytest
-
 
 def _login_as_admin(tmp_path, monkeypatch):
     import db as db_module

@@ -13,15 +13,14 @@ import pytest
 
 from blueprints.summary_dates import parse_summary_dates
 
-
 TODAY = _dt.date(2026, 6, 29)
 
 
 @pytest.fixture(autouse=True)
 def _freeze_today(monkeypatch):
-    """The fn uses datetime.date.today(); freeze it to TODAY for deterministic tests."""
+    """Freeze the fn's `_today()` helper so tests are deterministic."""
     import blueprints.summary_dates as mod
-    monkeypatch.setattr(mod._dt.date, "today", staticmethod(lambda: TODAY))
+    monkeypatch.setattr(mod, "_today", lambda: TODAY)
 
 
 # ---------------------------------------------------------------------------

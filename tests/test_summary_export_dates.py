@@ -7,7 +7,6 @@ contain data within that range.
 from __future__ import annotations
 
 import csv as _csv
-import datetime as _dt
 import io
 import sqlite3
 from datetime import datetime

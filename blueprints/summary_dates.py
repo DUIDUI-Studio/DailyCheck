@@ -8,8 +8,7 @@ callers convert the error message into a flash + 400.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Any, Optional
-
+from typing import Any
 
 # --- flash messages locked by PRD §2.6.3 -----------------------------
 ERR_START_AFTER_END = "开始日期不能晚于结束日期"
@@ -29,7 +28,7 @@ def _today() -> _dt.date:
     return _dt.date.today()
 
 
-def _parse_date(raw: Any) -> Optional[_dt.date]:
+def _parse_date(raw: Any) -> _dt.date | None:
     """Parse a YYYY-MM-DD string into date. Returns None on missing/empty/invalid.
 
     Strict format: 10 chars, exactly 4 dashes, calendar-valid. A bare
@@ -50,7 +49,7 @@ def _parse_date(raw: Any) -> Optional[_dt.date]:
         return None
 
 
-def parse_summary_dates(args: Any) -> tuple[Optional[_dt.date], Optional[_dt.date], Optional[str]]:
+def parse_summary_dates(args: Any) -> tuple[_dt.date | None, _dt.date | None, str | None]:
     """Return (start, end, error) for a summary view.
 
     `args` must be dict-like with `start`, `end`, `range` keys
@@ -68,7 +67,7 @@ def parse_summary_dates(args: Any) -> tuple[Optional[_dt.date], Optional[_dt.dat
     today = _today()
     default_start = today - _dt.timedelta(days=7)
 
-    def _get(name: str) -> Optional[str]:
+    def _get(name: str) -> str | None:
         """Dict-like access that works for both Flask request.args
         and plain objects (test convenience)."""
         if hasattr(args, "get"):
