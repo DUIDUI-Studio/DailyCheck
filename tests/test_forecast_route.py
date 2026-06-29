@@ -172,6 +172,26 @@ def test_forecast_item_response_shape_stable(logged_client):
 
 
 # ---------------------------------------------------------------------------
+# TASK 9 — role gate: only admin / manager can call /forecast
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_item_rejects_staff_role(staff_client, wh_path):
+    """Staff cannot read /forecast/item; expect 403."""
+    client, _wh = staff_client
+    item_id, _ = _seed_item(_wh, "forbid", qty=10, unit_cost=5)
+    resp = client.get(f"/forecast/item/{item_id}")
+    assert resp.status_code == 403
+
+
+def test_forecast_recompute_rejects_staff_role(staff_client):
+    """Staff cannot trigger manual recompute."""
+    client, _ = staff_client
+    resp = client.post("/forecast/recompute")
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
 # TASK 6 — POST /forecast/recompute
 # ---------------------------------------------------------------------------
 
