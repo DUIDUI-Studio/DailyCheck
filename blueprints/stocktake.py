@@ -224,6 +224,16 @@ def approve(batch_id: int):
       Operators can use the adjustment-order page to write off a
       盘盈 that was actually a previous 出库-mis-entry.
 
+    Idempotency: if the batch went through submit_edit first, every
+    edited item carries a 盘点修正 movement whose note exactly reads
+    `修正盘点批次#{batch_id}`. For those items we skip BOTH the items
+    UPDATE AND the synthetic outbound_request / 库存调整 insertion —
+    the edit path already recorded the corrected diff, so approving
+    must not apply it again (double-deduction) nor emit a phantom
+    consumption for /summary. The note is matched with `=` (not LIKE)
+    so substring collisions across batch IDs (e.g. approving #9 vs
+    a note referring to #99) don't cross-pollute the skip set.
+
     Rollback reverses both: deletes the synthetic outbound_requests,
     or flips rolled_back=1 if a later rollback is needed.
     """
@@ -256,11 +266,16 @@ def approve(batch_id: int):
     # movement for THIS batch (i.e. submitted via /edit before approval)
     # are skipped: the edit path already wrote actual_quantity + diff on
     # the stocktakes row, and approve must not apply diff twice.
+    #
+    # Scope by exact equality on the movement note's batch reference
+    # (not LIKE substring match: '#9' would also match '#99', '#90'…).
+    # The note format `修正盘点批次#X` is set by submit_edit, so we pin
+    # it exactly to `修正盘点批次#{batch_id}`.
     edited_item_ids = {
         r["item_id"] for r in db.execute(
             """SELECT DISTINCT item_id FROM stock_movements
-               WHERE action = '盘点修正' AND note LIKE ?""",
-            (f"%修正盘点批次#{batch_id}%",),
+               WHERE action = '盘点修正' AND note = ?""",
+            (f"修正盘点批次#{batch_id}",),
         ).fetchall()
     }
     for item_id, diff in loss_items + gain_items:
@@ -273,8 +288,13 @@ def approve(batch_id: int):
 
     # 盘亏 → write a synthetic outbound request so summary counts it.
     # Store the new req id in the audit so rollback can find it.
+    # Skip items that were already touched by 盘点修正 for this batch:
+    # items.quantity is unchanged for those, and a phantom outbound
+    # would inflate /summary consumption counts.
     loss_req_ids = []
     for item_id, diff in loss_items:
+        if item_id in edited_item_ids:
+            continue
         loss_qty = abs(diff)
         cur = db.execute(
             """INSERT INTO outbound_requests
@@ -294,7 +314,11 @@ def approve(batch_id: int):
         )
 
     # 盘盈 → inventory adjustment only (NOT a consumption).
+    # Same idempotency guard: edited items already had a 盘点修正
+    # movement; a phantom 库存调整 would double-count the gain.
     for item_id, diff in gain_items:
+        if item_id in edited_item_ids:
+            continue
         db.execute(
             """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
                VALUES (?, '库存调整', ?, ?, ?)""",
