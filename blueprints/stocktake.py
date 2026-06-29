@@ -193,10 +193,6 @@ def submit_edit(batch_id: int):
         if new_diff == 0:
             continue
         db.execute(
-            "UPDATE items SET quantity = ?, updated_at = ? WHERE id = ?",
-            (new_actual, now(), int(rec["item_id"])),
-        )
-        db.execute(
             "UPDATE stocktakes SET actual_quantity = ?, diff = ? WHERE id = ?",
             (new_actual, new_diff, int(rec["id"])),
         )
@@ -256,8 +252,20 @@ def approve(batch_id: int):
         item_id = int(record["item_id"])
         (loss_items if diff < 0 else gain_items).append((item_id, diff))
 
-    # Apply stock changes first.
+    # Apply stock changes first. Items already touched by a 盘点修正
+    # movement for THIS batch (i.e. submitted via /edit before approval)
+    # are skipped: the edit path already wrote actual_quantity + diff on
+    # the stocktakes row, and approve must not apply diff twice.
+    edited_item_ids = {
+        r["item_id"] for r in db.execute(
+            """SELECT DISTINCT item_id FROM stock_movements
+               WHERE action = '盘点修正' AND note LIKE ?""",
+            (f"%修正盘点批次#{batch_id}%",),
+        ).fetchall()
+    }
     for item_id, diff in loss_items + gain_items:
+        if item_id in edited_item_ids:
+            continue
         db.execute(
             "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
             (diff, now(), item_id),
