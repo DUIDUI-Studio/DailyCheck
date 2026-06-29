@@ -183,6 +183,27 @@ CREATE TABLE IF NOT EXISTS publish_event_items (
     error_message TEXT,
     FOREIGN KEY (publish_event_id) REFERENCES publish_events(id)
 );
+
+-- Subproject 5: recipe publish event log + per-warehouse status (PRD §2.5).
+CREATE TABLE IF NOT EXISTS recipe_publish_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    bom_version_id INTEGER NOT NULL,
+    started_by INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    summary TEXT,
+    warehouse_codes_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recipe_publish_event_warehouses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    FOREIGN KEY (publish_event_id) REFERENCES recipe_publish_events(id)
+);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
@@ -295,7 +316,8 @@ CREATE TABLE IF NOT EXISTS products (
     name TEXT NOT NULL UNIQUE,
     unit TEXT NOT NULL DEFAULT '件',
     note TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    current_version_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS product_bom (
@@ -331,6 +353,26 @@ CREATE TABLE IF NOT EXISTS production_run_items (
 
 CREATE INDEX IF NOT EXISTS idx_prun_created ON production_runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_pruni_run ON production_run_items(run_id);
+
+-- Subproject 5: recipe version snapshot + per-store effective version (PRD §2.5).
+CREATE TABLE IF NOT EXISTS product_bom_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    bom_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(product_id, version),
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+
+CREATE TABLE IF NOT EXISTS product_bom_store_versions (
+    product_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    bom_version_id INTEGER NOT NULL,
+    effective_at TEXT NOT NULL,
+    PRIMARY KEY (product_id, warehouse_code),
+    FOREIGN KEY (bom_version_id) REFERENCES product_bom_versions(id)
+);
 """
 
 
@@ -411,10 +453,18 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN gram_per_unit REAL NOT NULL DEFAULT 0"
             )
+<<<<<<< HEAD
         if "created_by_publish_event_id" not in item_cols:
             # Subproject 4 (item publish) — reverse link from items to the
             # publish_events row that materialised this item. Nullable.
             conn.execute(
                 "ALTER TABLE items ADD COLUMN created_by_publish_event_id INTEGER"
+=======
+        # Subproject 5: products.current_version_id migration (spec §2.2).
+        product_cols = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
+        if "current_version_id" not in product_cols:
+            conn.execute(
+                "ALTER TABLE products ADD COLUMN current_version_id INTEGER"
+>>>>>>> feat/recipe-publish
             )
         conn.commit()
