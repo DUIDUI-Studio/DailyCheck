@@ -114,10 +114,6 @@ def test_notifications_badge_shows_unread_count_for_admin(logged_client):
         json={"event_type": "recipe_published", "summary": "测试", "target_url": "/x", "user_ids": [1]},
     )
     body = client.get("/land").data.decode("utf-8")
-    # ctx-bar (or nav) should show a count > 0 next to /notifications
-    assert "通知" in body
-    # The unread count '1' should appear next to the notifications link
-    # (loose check — we just want a digit near "通知")
+    # The badge uses class="nav-badge">N</span>. Look for that exact pattern.
     import re
-    # find "通知" then a digit within ~30 chars
-    assert re.search(r"通知[^0-9]{0,30}[1-9]", body), "expected unread count badge near 通知 link"
+    assert re.search(r'class="nav-badge"[^>]*>(\d+)</span>', body), "expected unread count badge on /land"

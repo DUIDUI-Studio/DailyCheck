@@ -34,6 +34,9 @@ pwa_bp = Blueprint("pwa", __name__)
 PUBLIC_ENDPOINTS = {
     "auth.login", "auth.logout", "static",
     "pwa.service_worker", "pwa.webmanifest",
+    # /health is an operator probe (subproject 1 §3.6) — must be
+    # reachable without auth, so monitoring tools can hit it.
+    "health",
 }
 
 

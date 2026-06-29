@@ -16,5 +16,23 @@
     <h3>生产录入</h3>
     <p>产品配方 / 按产出量自动领料</p>
   </a>
+  <a class="land-card" href="{{ url_for('procurement.procurement_store') }}">
+    <h3>采购建议</h3>
+    <p>基于预测 + 安全库存 + 在途，缺什么补什么</p>
+  </a>
+  {% if g.user and (g.user['is_admin'] or current_role in ('manager', 'admin')) %}
+  <a class="land-card" href="{{ url_for('forecast.forecast_index') }}">
+    <h3>预测看板</h3>
+    <p>加权日均 + 未来 14 天预测量，可手动重算</p>
+  </a>
+  {% endif %}
+  <a class="land-card" href="{{ url_for('notifications.notifications_feed') }}">
+    <h3>通知中心
+      {% if unread_notifications_count and unread_notifications_count > 0 %}
+      <span class="nav-badge">{{ unread_notifications_count }}</span>
+      {% endif %}
+    </h3>
+    <p>查看全站通知，标记已读</p>
+  </a>
 </div>
 {% endblock %}

@@ -125,12 +125,38 @@ def register_jinja_filters(app) -> None:
 
 
 def register_template_context(app) -> None:
-    """Expose current_role and g.user/is_admin to every template."""
+    """Expose current_role and g.user/is_admin to every template.
+
+    Also injects `unread_notifications_count` for the currently logged-in
+    user, so the sidebar / ctx-bar can render a notification badge
+    (PRD §1.1 A6). Computed lazily — only one COUNT query per request.
+    """
     @app.context_processor
     def _inject():
         role = g.get("role")
+        unread = 0
+        if g.get("user") is not None:
+            try:
+                # Use a direct sqlite3 connection (not get_master_db) to
+                # avoid pulling g.state into a context that may not be
+                # available (e.g. CLI / error handlers). The read is
+                # idempotent; no row mutation.
+                import sqlite3 as _sq
+                from config import MASTER_DB
+                with _sq.connect(MASTER_DB) as m:
+                    row = m.execute(
+                        "SELECT COUNT(*) AS c FROM notifications "
+                        "WHERE user_id=? AND read_at IS NULL",
+                        (g.user["id"],),
+                    ).fetchone()
+                unread = int(row[0]) if row else 0
+            except Exception:  # noqa: BLE001
+                # Never break template rendering over a notification count
+                # failure — fall back to 0 (no badge).
+                unread = 0
         return {
             "current_role": role["role"] if role else None,
+            "unread_notifications_count": unread,
         }
 
 

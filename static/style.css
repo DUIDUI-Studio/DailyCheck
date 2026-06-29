@@ -364,6 +364,22 @@ th, td {
 }
 .sidebar a:hover { background: #1e293b; color: #fff; }
 
+/* Nav badge — small red dot with count, used by the 通知 link */
+.nav-badge {
+  display: inline-block;
+  min-width: 18px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  background: #dc2626;
+  color: #fff;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  vertical-align: middle;
+}
+
 .mobile-only { display: block; }
 .desktop-only { display: none; }
 
