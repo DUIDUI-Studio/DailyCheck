@@ -142,6 +142,47 @@ CREATE TABLE IF NOT EXISTS notification_prefs (
     PRIMARY KEY (user_id, event_type, channel),
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS publish_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    created_by INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS template_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    items_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(template_id, version),
+    FOREIGN KEY (template_id) REFERENCES publish_templates(id)
+);
+
+CREATE TABLE IF NOT EXISTS publish_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL,
+    template_version INTEGER NOT NULL,
+    started_by INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    warehouse_codes_json TEXT NOT NULL,
+    resolutions_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publish_event_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    template_item_idx INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    item_id INTEGER,
+    action TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    FOREIGN KEY (publish_event_id) REFERENCES publish_events(id)
+);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
@@ -334,6 +375,12 @@ def init_warehouse_db(db_path: Path) -> None:
                     "INSERT INTO categories (name, description, created_at) VALUES (?, ?, ?)",
                     (name, "系统固定品类", ts),
                 )
+        # Subproject 4: items.created_by_publish_event_id column on fresh dbs.
+        item_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+        if "created_by_publish_event_id" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN created_by_publish_event_id INTEGER"
+            )
         conn.commit()
 
 
@@ -363,5 +410,11 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if "gram_per_unit" not in item_cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN gram_per_unit REAL NOT NULL DEFAULT 0"
+            )
+        if "created_by_publish_event_id" not in item_cols:
+            # Subproject 4 (item publish) — reverse link from items to the
+            # publish_events row that materialised this item. Nullable.
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN created_by_publish_event_id INTEGER"
             )
         conn.commit()
