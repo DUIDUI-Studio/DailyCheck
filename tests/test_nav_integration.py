@@ -117,3 +117,39 @@ def test_notifications_badge_shows_unread_count_for_admin(logged_client):
     # The badge uses class="nav-badge">N</span>. Look for that exact pattern.
     import re
     assert re.search(r'class="nav-badge"[^>]*>(\d+)</span>', body), "expected unread count badge on /land"
+
+
+# ---------------------------------------------------------------------------
+# Recipe publish (subproject 5) — admin nav + land card
+# ---------------------------------------------------------------------------
+
+
+def test_sidebar_includes_recipe_publish_for_admin(logged_client):
+    """Admin sees /admin/publish/recipe link in the sidebar."""
+    client, _ = logged_client
+    body = client.get("/land").data.decode("utf-8")
+    assert "/admin/publish/recipe" in body
+    # Must be labeled 配方发布
+    assert "配方发布" in body
+
+
+def test_land_page_has_recipe_publish_card(logged_client):
+    """Admin sees a 配方发布 land card on /land."""
+    client, _ = logged_client
+    body = client.get("/land").data.decode("utf-8")
+    assert "配方发布" in body
+    assert "/admin/publish/recipe" in body
+
+
+def test_sidebar_recipe_publish_hidden_for_staff(staff_client):
+    """Staff must NOT see /admin/publish/recipe link (platform-admin only)."""
+    client, _ = staff_client
+    body = client.get("/land").data.decode("utf-8")
+    # Check the specific admin route is absent (other 配方 mentions in
+    # admin nav / land card don't exist for staff).
+    import re
+    # The recipe-publish card should not be rendered for staff — search for
+    # the admin route in the rendered HTML.
+    assert "/admin/publish/recipe" not in body, (
+        "staff should not see /admin/publish/recipe, found in /land HTML"
+    )
