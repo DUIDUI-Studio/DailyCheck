@@ -68,3 +68,14 @@ def classify_confidence(n_records: int) -> str:
     if n_records <= MEDIUM_MAX:
         return "medium"
     return "high"
+
+
+def compute_forecast_total(daily_avg: float, horizon: float) -> float:
+    """Project daily_avg forward over horizon days, 2dp quantize.
+
+    Uses Decimal internally to avoid the 0.1+0.2 = 0.30000000000000004
+    trap when daily_avg or horizon have fractional parts. Accepts float
+    horizon defensively even though the API contract is int (1..90).
+    """
+    raw = Decimal(str(daily_avg)) * Decimal(str(horizon))
+    return float(raw.quantize(Decimal('0.01')))
