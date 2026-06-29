@@ -34,5 +34,11 @@
     </h3>
     <p>查看全站通知，标记已读</p>
   </a>
+  {% if g.user and g.user['is_admin'] %}
+  <a class="land-card" href="{{ url_for('publish_items.preview_items') }}">
+    <h3>品项发布</h3>
+    <p>模板 → 多门店差异分析 → 冲突解决 → 一键发布</p>
+  </a>
+  {% endif %}
 </div>
 {% endblock %}
