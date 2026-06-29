@@ -180,7 +180,8 @@ def submit_edit(batch_id: int):
         return redirect(url_for("stocktake.stocktake_list"))
 
     records = db.execute(
-        "SELECT id, item_id FROM stocktakes WHERE batch_id = ?", (batch_id,)
+        "SELECT id, item_id, previous_quantity FROM stocktakes WHERE batch_id = ?",
+        (batch_id,),
     ).fetchall()
     changed = 0
     for rec in records:
@@ -188,12 +189,7 @@ def submit_edit(batch_id: int):
         if raw == "":
             continue
         new_actual = parse_qty(raw)
-        current_qty = parse_qty(
-            db.execute(
-                "SELECT quantity FROM items WHERE id = ?", (int(rec["item_id"]),)
-            ).fetchone()["quantity"]
-        )
-        new_diff = new_actual - current_qty
+        new_diff = new_actual - parse_qty(rec["previous_quantity"])
         if new_diff == 0:
             continue
         db.execute(
