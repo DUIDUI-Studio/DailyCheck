@@ -65,8 +65,29 @@ def create_app() -> Flask:
     register_template_context(app)
 
     @app.route("/health")
-    def health() -> tuple[str, int]:
-        return "ok", 200
+    def health() -> tuple[dict, int]:
+        """JSON health probe with forecast last-success timestamp.
+
+        Returns the most recent forecast_runs.finished_at for any
+        status='success' row, or null if none. Surfaces PRD §3.6
+        (must-automate observability) without a separate /admin/health
+        page in this subproject.
+        """
+        from db import get_master_db
+        last_success = None
+        try:
+            db = get_master_db()
+            row = db.execute(
+                """SELECT finished_at FROM forecast_runs
+                   WHERE status='success' AND finished_at IS NOT NULL
+                   ORDER BY finished_at DESC LIMIT 1"""
+            ).fetchone()
+            if row is not None and row["finished_at"]:
+                # Convert "YYYY-MM-DD HH:MM:SS" → ISO Z
+                last_success = row["finished_at"].replace(" ", "T") + "Z"
+        except Exception:  # noqa: BLE001 — health must never 500
+            pass
+        return {"status": "ok", "forecast_last_success_at": last_success}, 200
 
     return app
 
