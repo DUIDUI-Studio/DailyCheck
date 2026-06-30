@@ -262,7 +262,11 @@ def export_summary():
     # 与页面完全一致。
     cat_stats = _compute_category_stats(db, range_param, start_date, end_date)
 
-    # 段 3:消耗 Top 10(历史口径:只取 outbound,与 /summary 同源;production 暂不参与 Top)
+    # 段 3:消耗 Top 10 (口径与 /inventory c7 一致: outbound_requests +
+    # production_run_items union). 之前只取 outbound — 与 /inventory、
+    # /forecast、/procurement 口径不一致. 改后 4 个页面数字对同一物项
+    # 应一致.
+    from .consumption import raw_30d_sum
     from .core import _time_clauses, _where
     tco, _, _, _ = _time_clauses(range_param, start_date, end_date)
     top_rows = db.execute(
@@ -270,12 +274,20 @@ def export_summary():
                   o.total_qty AS consumed_qty, i.unit,
                   ROUND(o.total_qty * i.unit_cost, 2) AS consumed_value
            FROM (
-               SELECT item_id, SUM(requested_quantity) AS total_qty
-               FROM outbound_requests o
-               WHERE o.rolled_back = 0
-                 AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
-                 AND {_where(tco, 'o')}
-               GROUP BY o.item_id
+               SELECT item_id, SUM(qty) AS total_qty FROM (
+                   SELECT o.item_id, o.requested_quantity AS qty
+                   FROM outbound_requests o
+                   WHERE o.rolled_back = 0
+                     AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%')
+                     AND {_where(tco, 'o')}
+                   UNION ALL
+                   SELECT pri.item_id, pri.actual_qty AS qty
+                   FROM production_run_items pri
+                   JOIN production_runs pr ON pr.id = pri.run_id
+                   WHERE pr.rolled_back = 0
+                     AND {_where(tco, 'pr')}
+               )
+               GROUP BY item_id
            ) o
            JOIN items i ON i.id = o.item_id
            JOIN categories c ON c.id = i.category_id
