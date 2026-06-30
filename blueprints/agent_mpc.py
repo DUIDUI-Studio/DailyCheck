@@ -348,7 +348,8 @@ def forecast_item(item_id: int):
         return jsonify({"error": "warehouse_not_found"}), 404
     # Re-use subproject 1's helpers directly (no need to re-implement).
     # We import inside the route to avoid a hard dep at module load.
-    from blueprints.forecast import _fetch_outbound_rows, _build_response
+    from blueprints.forecast import _build_response
+    from blueprints.consumption import fetch_item_movements_30d
     conn = _open_warehouse_db(wh_row["db_path"])
     with closing(conn) as c:
         if c.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone() is None:
@@ -358,25 +359,10 @@ def forecast_item(item_id: int):
     horizon = _parse_horizon(request.args.get("horizon_days"))
     if horizon is None:
         return jsonify({"error": "invalid_horizon"}), 400
-    # _fetch_outbound_rows uses get_warehouse_db() (flask 'g'). Open a
-    # fresh connection on the target db and reuse the same query.
-    from datetime import datetime
+    # Use the shared consumption helper (outbound + production union,
+    # same source as /inventory + /forecast + /procurement).
     conn = _open_warehouse_db(wh_row["db_path"])
-    with closing(conn) as c:
-        rows = c.execute(
-            """SELECT requested_quantity, created_at
-               FROM outbound_requests
-               WHERE item_id=? AND rolled_back=0
-                 AND created_at >= datetime('now', '-30 days')""",
-            (item_id,),
-        ).fetchall()
-    parsed: list[tuple[datetime, float]] = []
-    for r in rows:
-        try:
-            ts = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
-        except (TypeError, ValueError):
-            continue
-        parsed.append((ts, float(r["requested_quantity"])))
+    parsed = fetch_item_movements_30d(conn, item_id)
     # Build response with a custom warehouse_code (the helper uses g).
     body = _build_response(item_id, horizon, parsed)
     body["warehouse_code"] = wh
