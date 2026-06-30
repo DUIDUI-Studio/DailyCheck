@@ -25,6 +25,7 @@ from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template
 
 from db import get_warehouse_db
 from permissions import require_role
+from .consumption import fetch_item_movements_30d
 from .forecast_pure import (
     classify_confidence,
     compute_daily_avg,
@@ -61,24 +62,18 @@ def _warehouse_code() -> str:
     return g.warehouse["code"] if g.warehouse else "unknown"
 
 
-def _fetch_outbound_rows(item_id: int) -> list[tuple[datetime, float]]:
-    """Return [(datetime, qty), ...] for non-rolled-back outbounds in last 30d."""
-    db = get_warehouse_db()
-    rows = db.execute(
-        """SELECT requested_quantity, created_at
-           FROM outbound_requests
-           WHERE item_id = ? AND rolled_back = 0
-             AND created_at >= datetime('now', '-30 days')""",
-        (item_id,),
-    ).fetchall()
-    parsed: list[tuple[datetime, float]] = []
-    for r in rows:
-        try:
-            ts = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
-        except (TypeError, ValueError):
-            continue
-        parsed.append((ts, float(r["requested_quantity"])))
-    return parsed
+def _fetch_item_movements(item_id: int) -> list[tuple[datetime, float]]:
+    """Wrapper for blueprints.consumption.fetch_item_movements_30d.
+
+    Source: outbound_requests.rolled_back=0 UNION production_run_items
+    (filtered to non-rolled-back runs). Matches the /inventory page's
+    '7-day consumption' definition (see blueprints/items.py c7 CTE) so
+    /forecast and /inventory report the same daily consumption number.
+    The /forecast route quantizes to a 30-day weighted average; /inventory
+    sums the raw 7-day number. Both pages now agree on the underlying
+    "what counts as consumption" definition.
+    """
+    return fetch_item_movements_30d(get_warehouse_db(), item_id)
 
 
 def _fetch_production_rows(product_id: int) -> list[tuple[datetime, float]]:
@@ -145,7 +140,7 @@ def forecast_item(item_id: int):
     if db.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone() is None:
         return jsonify({"error": "not_found"}), 404
 
-    movements = _fetch_outbound_rows(item_id)
+    movements = _fetch_item_movements(item_id)
     return jsonify(_build_response(item_id, horizon, movements))
 
 
@@ -182,7 +177,7 @@ def forecast_index():
     items = []
     horizon = 14
     for r in rows:
-        movements = _fetch_outbound_rows(r["id"])
+        movements = _fetch_item_movements(r["id"])
         n = len(movements)
         if classify_confidence(n) == "cold_start":
             avg, total, status = 0.0, 0.0, "cold_start"
