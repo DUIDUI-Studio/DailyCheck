@@ -119,3 +119,30 @@ def raw_30d_sum(db: sqlite3.Connection, item_id: int) -> float:
     else:
         val = row[0]
     return float(val or 0)
+
+
+def count_30d_records(db: sqlite3.Connection, item_id: int) -> int:
+    """Count of consumption records in last 30 days (outbound + production).
+
+    Used for cold-start threshold (PRD §2.1.3: < 7 → cold_start).
+    """
+    row = db.execute(
+        """SELECT COUNT(*) AS c FROM (
+              SELECT o.id
+              FROM outbound_requests o
+              WHERE o.item_id = ? AND o.rolled_back = 0
+                AND created_at >= datetime('now', '-30 days')
+              UNION ALL
+              SELECT pri.id
+              FROM production_run_items pri
+              JOIN production_runs pr ON pr.id = pri.run_id
+              WHERE pri.item_id = ? AND pr.rolled_back = 0
+                AND pr.created_at >= datetime('now', '-30 days')
+           )""",
+        (item_id, item_id),
+    ).fetchone()
+    if isinstance(row, sqlite3.Row):
+        val = row["c"]
+    else:
+        val = row[0]
+    return int(val or 0)

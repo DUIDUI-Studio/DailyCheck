@@ -153,6 +153,11 @@ def _fetch_item_movements_30d(db: sqlite3.Connection, item_id: int) -> float:
     return raw_30d_sum(db, item_id)
 
 
+def _count_consumption_30d(db: sqlite3.Connection, item_id: int) -> int:
+    from .consumption import count_30d_records
+    return count_30d_records(db, item_id)
+
+
 def _weighted_daily_avg(wh_path: str, item_id: int) -> float:
     """Linear-decay weighted average of consumption qty over last 30d.
 
@@ -200,16 +205,11 @@ def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
             "SELECT id, name, quantity, unit FROM items ORDER BY id"
         ).fetchall()
     for it in items:
-        # Replicate forecast's cold-start threshold: n<7 records.
-        n = 0
+        # Replicate forecast's cold-start threshold: n<7 records in the
+        # last 30 days (outbound + production consumption, same source
+        # as the weighted_avg below).
         with closing(sqlite3.connect(wh_path)) as w:
-            w.row_factory = sqlite3.Row
-            n = w.execute(
-                """SELECT COUNT(*) AS c FROM outbound_requests
-                   WHERE item_id=? AND rolled_back=0
-                     AND created_at >= datetime('now', '-30 days')""",
-                (it["id"],),
-            ).fetchone()["c"]
+            n = _count_consumption_30d(w, it["id"])
         if n < 7:
             continue
         avg = _weighted_daily_avg(wh_path, it["id"])
