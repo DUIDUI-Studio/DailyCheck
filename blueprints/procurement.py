@@ -139,56 +139,38 @@ def _write_cache(wh_code: str, item_id: int, payload: dict) -> None:
 
 
 def _outbound_30d_sum(wh_path: str, item_id: int) -> float:
-    """Sum of non-rolled-back outbound in last 30d for an item, by qty."""
+    """Sum of 30-day consumption (outbound + production) for an item.
+
+    Delegates to blueprints.consumption.raw_30d_sum so /procurement and
+    /forecast agree on what "consumption" means (PRD §1.1 A2).
+    """
     with closing(sqlite3.connect(wh_path)) as w:
-        w.row_factory = sqlite3.Row
-        row = w.execute(
-            """SELECT COALESCE(SUM(requested_quantity), 0) AS total
-               FROM outbound_requests
-               WHERE item_id=? AND rolled_back=0
-                 AND created_at >= datetime('now', '-30 days')""",
-            (item_id,),
-        ).fetchone()
-    return float(row["total"] or 0)
+        return _fetch_item_movements_30d(w, item_id)  # type: ignore[return-value]
+
+
+def _fetch_item_movements_30d(db: sqlite3.Connection, item_id: int) -> float:
+    from .consumption import raw_30d_sum
+    return raw_30d_sum(db, item_id)
+
+
+def _count_consumption_30d(db: sqlite3.Connection, item_id: int) -> int:
+    from .consumption import count_30d_records
+    return count_30d_records(db, item_id)
 
 
 def _weighted_daily_avg(wh_path: str, item_id: int) -> float:
-    """Linear-decay weighted average of outbound qty over last 30d.
+    """Linear-decay weighted average of consumption qty over last 30d.
 
-    Mirrors blueprints.forecast_pure.compute_daily_avg exactly so the
-    two endpoints agree (subproject 6 Agent MPC will see consistent
-    numbers). Returns 0.0 if no recent outbounds.
+    Source = outbound_requests UNION production_run_items (matches
+    /inventory and /forecast). Mirrors
+    blueprints.consumption.compute_weighted_daily_avg exactly so the
+    procurement safety stock + the forecast daily_avg come from the
+    same number. Returns 0.0 if no recent movements.
     """
-    from decimal import Decimal
+    from .consumption import compute_weighted_daily_avg, fetch_item_movements_30d
     with closing(sqlite3.connect(wh_path)) as w:
-        w.row_factory = sqlite3.Row
-        rows = w.execute(
-            """SELECT requested_quantity, created_at
-               FROM outbound_requests
-               WHERE item_id=? AND rolled_back=0
-                 AND created_at >= datetime('now', '-30 days')""",
-            (item_id,),
-        ).fetchall()
-    if not rows:
-        return 0.0
-    today = datetime.now()
-    weighted_sum = 0.0
-    weight_sum = 0
-    for r in rows:
-        try:
-            ts = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
-        except (TypeError, ValueError):
-            continue
-        days_ago = (today - ts).days
-        if days_ago < 0 or days_ago >= 30:
-            continue
-        w_ = 30 - days_ago
-        weighted_sum += w_ * float(r["requested_quantity"])
-        weight_sum += w_
-    if weight_sum == 0:
-        return 0.0
-    raw = weighted_sum / weight_sum
-    return float(Decimal(str(raw)).quantize(Decimal('0.01')))
+        movements = fetch_item_movements_30d(w, item_id)
+    return compute_weighted_daily_avg(movements)
 
 
 def _in_transit_qty(wh_path: str, item_id: int) -> float:
@@ -223,16 +205,11 @@ def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
             "SELECT id, name, quantity, unit FROM items ORDER BY id"
         ).fetchall()
     for it in items:
-        # Replicate forecast's cold-start threshold: n<7 records.
-        n = 0
+        # Replicate forecast's cold-start threshold: n<7 records in the
+        # last 30 days (outbound + production consumption, same source
+        # as the weighted_avg below).
         with closing(sqlite3.connect(wh_path)) as w:
-            w.row_factory = sqlite3.Row
-            n = w.execute(
-                """SELECT COUNT(*) AS c FROM outbound_requests
-                   WHERE item_id=? AND rolled_back=0
-                     AND created_at >= datetime('now', '-30 days')""",
-                (it["id"],),
-            ).fetchone()["c"]
+            n = _count_consumption_30d(w, it["id"])
         if n < 7:
             continue
         avg = _weighted_daily_avg(wh_path, it["id"])
