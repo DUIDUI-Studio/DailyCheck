@@ -135,3 +135,22 @@ Subproject 3 (notifications event bus) is the next branch off `main`
 (it doesn't depend on subproject 2's procurement code; only on the
 shared `g.warehouse`/session model that already exists). The runbook
 is unchanged.
+
+---
+
+## Post-merge cherry-pick
+
+After this PR was opened, subproject 2's `/procurement/store` was
+updated to use the same "consumption" source as `/inventory` and
+`/forecast` (preview-phase1 commits 1e7f2ba + 3fbb1dd):
+
+1. `_weighted_daily_avg` and `_outbound_30d_sum` switched from
+   outbound-only to outbound + production union.
+2. The cold-start counter (used to filter items with n<7 records in
+   30 days) was also switched to the union source, so it no longer
+   hides items that have plenty of production-side consumption.
+
+The updated branch includes these fixes as a follow-up commit:
+`fix(procurement): align consumption source with /inventory
+(cherry-pick from preview-phase1)`. The shared `blueprints/consumption.py`
+module is the source of truth for this SQL.
