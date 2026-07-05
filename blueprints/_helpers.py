@@ -32,22 +32,11 @@ def fixed_category_ids() -> list[int]:
     return [r["id"] for r in rows]
 
 
-def fixed_categories_in_clause() -> tuple[str, list[str]]:
-    """Build a parameterized IN clause over the four fixed categories.
-
-    Returns (placeholder_sql, params). Use in SELECTs that should only
-    surface the seeded categories (e.g. items list, category picker).
-    """
-    from config import FIXED_CATEGORIES
-    placeholders = ",".join("?" for _ in FIXED_CATEGORIES)
-    return placeholders, list(FIXED_CATEGORIES)
-
-
-def warehouse_categories_in_clause() -> tuple[str, list]:
+def warehouse_categories_in_clause() -> tuple[str, list[str]]:
     """按当前仓库自身的 categories 表生成 IN 子句。
 
-    替代旧的 fixed_categories_in_clause(),让每家店用自己的品类集合。
-    极端情况(仓库无 categories)返回 (1, [0]) 防御性 0 行。
+    让每家店用自己的品类集合。极端情况(仓库无 categories)
+    返回 ("1", [0]) 防御性 0 行。
     """
     db = get_warehouse_db()
     names = [r["name"] for r in db.execute(
@@ -58,7 +47,8 @@ def warehouse_categories_in_clause() -> tuple[str, list]:
     return ",".join("?" for _ in names), names
 
 
-# 向后兼容别名
+# 向后兼容别名:旧 fixed_categories_in_clause 已废弃,统一改读仓库自身 categories。
+# Deprecated: use warehouse_categories_in_clause directly.
 fixed_categories_in_clause = warehouse_categories_in_clause
 
 

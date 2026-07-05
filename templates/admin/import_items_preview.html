@@ -2,6 +2,8 @@
 {% block title %}导入预览 — {{ target_wh_name }}{% endblock %}
 {% block content %}
 <h2>导入预览 — {{ target_wh_name }} ({{ warehouse_code }})</h2>
+<p class="muted">文件:{{ filename }}</p>
+
 <p class="muted">
   共 {{ total_rows }} 行 · {{ groups_order|length }} 个分组
   {% if problems %} · <span class="warn">{{ problems|length }} 个数据问题</span>{% endif %}
@@ -36,7 +38,7 @@
   <div class="form-actions">
     <a href="{{ url_for('items.items_list') }}" class="btn-sm">取消</a>
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">返回修改</a>
-    <button type="submit" class="btn-danger">确认导入</button>
+    <button type="submit" class="btn-danger">⚠️ 确认导入</button>
   </div>
 </form>
 {% endblock %}

@@ -1,16 +1,16 @@
 """Web 端品项批量导入:上传 → 预览 → 确认写入。"""
 from __future__ import annotations
 
-import io
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import IO
 
 from flask import (
-    Blueprint, abort, flash, redirect, render_template, request, session, url_for,
+    Blueprint, abort, current_app, flash, redirect, render_template, request, session, url_for,
 )
 
+from db import get_master_db
 from permissions import require_login, require_role
 from werkzeug.datastructures import FileStorage
 
@@ -65,10 +65,11 @@ def parse_xlsx(file_stream: IO[bytes]) -> dict:
         unit = str(unit_raw).strip() if unit_raw is not None else ""
         if not unit:
             unit = "件"
+        spec_raw = ws.cell(r, 4).value
         groups_rows[cat].append({
             "row": r,
             "name": str(name).strip(),
-            "spec": ws.cell(r, 4).value,
+            "spec": str(spec_raw) if spec_raw is not None else None,
             "unit_cost": unit_cost,
             "unit": unit,
         })
@@ -88,8 +89,7 @@ bp = Blueprint("import_items", __name__, url_prefix="/admin/import-items")
 @require_role("admin")
 def upload_form():
     """渲染上传表单。"""
-    import db as db_module
-    master = db_module.get_master_db()
+    master = get_master_db()
     warehouses = master.execute(
         "SELECT code, name FROM warehouses ORDER BY id"
     ).fetchall()
@@ -113,8 +113,7 @@ def upload_parse():
         return redirect(url_for("import_items.upload_form"))
 
     # 校验仓库存在
-    import db as db_module
-    master = db_module.get_master_db()
+    master = get_master_db()
     row = master.execute(
         "SELECT 1 FROM warehouses WHERE code = ?", (warehouse_code,)
     ).fetchone()
@@ -124,8 +123,9 @@ def upload_parse():
 
     try:
         preview = parse_xlsx(file.stream)
-    except Exception as e:  # openpyxl 各种解析异常
-        flash(f"Excel 解析失败:{e}")
+    except Exception:
+        current_app.logger.exception("Excel 解析失败")
+        flash("Excel 解析失败,请检查文件格式")
         return redirect(url_for("import_items.upload_form"))
 
     if not preview["groups_order"]:
@@ -150,8 +150,7 @@ def preview():
         flash("预览已过期,请重新上传")
         return redirect(url_for("import_items.upload_form"))
 
-    import db as db_module
-    master = db_module.get_master_db()
+    master = get_master_db()
     wh = master.execute(
         "SELECT name FROM warehouses WHERE code = ?", (pv["warehouse_code"],)
     ).fetchone()
@@ -171,10 +170,8 @@ def preview():
 @require_role("admin")
 def commit():
     """事务化:DELETE 预览分组下 items + INSERT 预览数据,缺品类则拒绝。"""
-    from datetime import datetime
-
-    import db as db_module
     from blueprints._helpers import gen_sku, now
+    from config import BASE_DIR
 
     pv = session.pop("import_preview", None)
     if not pv:
@@ -185,7 +182,7 @@ def commit():
     groups_order = pv["groups_order"]
 
     # 1. 校验仓库存在
-    master = db_module.get_master_db()
+    master = get_master_db()
     wh_row = master.execute(
         "SELECT db_path, name FROM warehouses WHERE code = ?", (warehouse_code,)
     ).fetchone()
@@ -193,7 +190,6 @@ def commit():
         flash(f"仓库 {warehouse_code} 不存在")
         return redirect(url_for("import_items.upload_form"))
 
-    from config import BASE_DIR
     db_path = Path(BASE_DIR) / wh_row["db_path"]
 
     # 2. 校验所有分组均存在于目标仓库的 categories 表
@@ -213,6 +209,23 @@ def commit():
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             placeholders = ",".join("?" for _ in groups_order)
+            # 子查询:本次导入分组下的所有 item_id
+            items_subq = (
+                f"item_id IN (SELECT id FROM items WHERE category_id IN "
+                f"(SELECT id FROM categories WHERE name IN ({placeholders})))"
+            )
+            # 先清掉引用这些 item 的子行,避免 FK 约束阻止 DELETE items
+            for table in [
+                "stock_movements",
+                "stocktakes",
+                "restock_requests",
+                "outbound_requests",
+                "adjustment_requests",
+                "product_bom",
+                "production_run_items",
+            ]:
+                conn.execute(f"DELETE FROM {table} WHERE {items_subq}", groups_order)
+            # 现在可以安全删 items
             conn.execute(
                 f"DELETE FROM items WHERE category_id IN "
                 f"(SELECT id FROM categories WHERE name IN ({placeholders}))",
