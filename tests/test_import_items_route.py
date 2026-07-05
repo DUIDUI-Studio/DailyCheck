@@ -60,19 +60,19 @@ def test_upload_rejects_non_xlsx(logged_client):
         "warehouse_code": "wh_test",
     }
     resp = client.post("/admin/import-items", data=data,
-                       content_type="multipart/form-data", follow_redirects=True)
-    # 拒绝: 跳回 form 或 flash 提示
-    assert b"\xe4\xbb\x85\xe6\x94\xaf\xe6\x8c\x81 .xlsx" in resp.data or \
-           resp.status_code in (200, 302)
+                       content_type="multipart/form-data", follow_redirects=False)
+    # 拒绝: 重定向回 form
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/admin/import-items"
 
 
 def test_preview_without_session_redirects(logged_client):
     client, _ = logged_client
     _login_admin(client)
-    resp = client.get("/admin/import-items/preview", follow_redirects=True)
-    # 没有 session 缓存 → 重定向回 form 或显示提示
-    assert b"\xe9\xa2\x84\xe8\xa7\x88\xe5\xb7\xb2\xe8\xbf\x87\xe6\x9c\x9f" in resp.data or \
-           resp.status_code == 200
+    resp = client.get("/admin/import-items/preview", follow_redirects=False)
+    # 没有 session 缓存 → 重定向回 form
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "/admin/import-items"
 
 
 def test_non_admin_cannot_access(logged_client):
