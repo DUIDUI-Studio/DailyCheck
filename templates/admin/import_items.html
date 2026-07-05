@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}品项批量导入{% endblock %}
+{% block content %}
+<h2>品项批量导入</h2>
+<p class="muted">仅管理员可操作;目标仓库的分类必须已存在。</p>
+
+<form method="post" enctype="multipart/form-data" class="grid cols-2">
+  <label>
+    <span>目标仓库</span>
+    <select name="warehouse_code" required>
+      {% for wh in warehouses %}
+        <option value="{{ wh.code }}">{{ wh.name }} ({{ wh.code }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>Excel 文件(.xlsx)</span>
+    <input type="file" name="file" accept=".xlsx" required>
+  </label>
+  <div class="form-actions">
+    <a href="{{ url_for('items.items_list') }}" class="btn-sm">取消</a>
+    <button type="submit" class="btn-primary">解析预览</button>
+  </div>
+</form>
+{% endblock %}

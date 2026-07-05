@@ -4,6 +4,13 @@ from __future__ import annotations
 import io
 from typing import IO
 
+from flask import (
+    Blueprint, abort, flash, redirect, render_template, request, session, url_for,
+)
+
+from permissions import require_login, require_role
+from werkzeug.datastructures import FileStorage
+
 
 def parse_xlsx(file_stream: IO[bytes]) -> dict:
     """解析 xlsx 文件为分组预览数据。
@@ -68,3 +75,99 @@ def parse_xlsx(file_stream: IO[bytes]) -> dict:
         "groups_rows": groups_rows,
         "problems": problems,
     }
+
+
+bp = Blueprint("import_items", __name__, url_prefix="/admin/import-items")
+
+
+@bp.route("", methods=["GET"])
+@require_login
+@require_role("admin")
+def upload_form():
+    """渲染上传表单。"""
+    import db as db_module
+    master = db_module.get_master_db()
+    warehouses = master.execute(
+        "SELECT code, name FROM warehouses ORDER BY id"
+    ).fetchall()
+    return render_template("admin/import_items.html", warehouses=warehouses)
+
+
+@bp.route("", methods=["POST"])
+@require_login
+@require_role("admin")
+def upload_parse():
+    """解析上传的 xlsx → 缓存到 session → 重定向预览。"""
+    file = request.files.get("file")
+    warehouse_code = request.form.get("warehouse_code", "").strip()
+
+    if not isinstance(file, FileStorage) or not file.filename:
+        flash("请选择文件")
+        return redirect(url_for("import_items.upload_form"))
+
+    if not file.filename.lower().endswith(".xlsx"):
+        flash("仅支持 .xlsx 文件")
+        return redirect(url_for("import_items.upload_form"))
+
+    # 校验仓库存在
+    import db as db_module
+    master = db_module.get_master_db()
+    row = master.execute(
+        "SELECT 1 FROM warehouses WHERE code = ?", (warehouse_code,)
+    ).fetchone()
+    if row is None:
+        flash(f"仓库 {warehouse_code} 不存在")
+        return redirect(url_for("import_items.upload_form"))
+
+    try:
+        preview = parse_xlsx(file.stream)
+    except Exception as e:  # openpyxl 各种解析异常
+        flash(f"Excel 解析失败:{e}")
+        return redirect(url_for("import_items.upload_form"))
+
+    if not preview["groups_order"]:
+        flash("Excel 中无数据行")
+        return redirect(url_for("import_items.upload_form"))
+
+    session["import_preview"] = {
+        "warehouse_code": warehouse_code,
+        "filename": file.filename,
+        **preview,
+    }
+    return redirect(url_for("import_items.preview"))
+
+
+@bp.route("/preview", methods=["GET"])
+@require_login
+@require_role("admin")
+def preview():
+    """渲染预览页。"""
+    pv = session.get("import_preview")
+    if not pv:
+        flash("预览已过期,请重新上传")
+        return redirect(url_for("import_items.upload_form"))
+
+    import db as db_module
+    master = db_module.get_master_db()
+    wh = master.execute(
+        "SELECT name FROM warehouses WHERE code = ?", (pv["warehouse_code"],)
+    ).fetchone()
+    target_wh_name = wh["name"] if wh else pv["warehouse_code"]
+
+    total_rows = sum(len(v) for v in pv["groups_rows"].values())
+    return render_template(
+        "admin/import_items_preview.html",
+        target_wh_name=target_wh_name,
+        total_rows=total_rows,
+        **pv,
+    )
+
+
+@bp.route("/commit", methods=["POST"])
+@require_login
+@require_role("admin")
+def commit():
+    """占位:Task 4 将实现真正的写入逻辑。"""
+    session.pop("import_preview", None)
+    flash("提交路由尚未实现(Task 4)")
+    return redirect(url_for("import_items.upload_form"))
