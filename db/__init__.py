@@ -246,15 +246,20 @@ def init_master_db() -> None:
         conn.commit()
 
 
-def init_warehouse_db(db_path: Path) -> None:
+def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
     """Create the schema for one warehouse db if missing, and seed fixed categories.
+
+    seed_categories=None 时退回 config.FIXED_CATEGORIES(默认行为不变)。
+    传入自定义 tuple 可让新建仓库用别的品类集合(本次 spec 不调用,留作未来)。
 
     Also runs idempotent column-add migrations for tables that pre-date
     some columns (CREATE TABLE IF NOT EXISTS is a no-op for existing
     tables, so missing columns must be added separately).
     """
     from datetime import datetime
-    from config import FIXED_CATEGORIES
+    if seed_categories is None:
+        from config import FIXED_CATEGORIES
+        seed_categories = FIXED_CATEGORIES
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(db_path)) as conn:
@@ -267,7 +272,7 @@ def init_warehouse_db(db_path: Path) -> None:
                 "ALTER TABLE stocktake_batches ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
             )
         existing = {r[0] for r in conn.execute("SELECT name FROM categories").fetchall()}
-        for name in FIXED_CATEGORIES:
+        for name in seed_categories:
             if name not in existing:
                 conn.execute(
                     "INSERT INTO categories (name, description, created_at) VALUES (?, ?, ?)",

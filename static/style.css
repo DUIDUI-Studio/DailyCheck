@@ -1208,3 +1208,12 @@ tr.is-hidden { display: none; }
 .turnover-card p { color: #0f766e; }
 .turnover-card strong { color: #0f766e; }
 .turnover-card .muted { color: #047857; }
+
+/* Page-header: layout row with title + action button */
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}

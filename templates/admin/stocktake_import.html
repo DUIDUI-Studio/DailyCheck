@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}盘点 CSV 导入{% endblock %}
+{% block content %}
+<h2>盘点批量导入(xlsx)</h2>
+<p class="muted">仅管理员可操作。需先在 <a href="{{ url_for('stocktake.stocktake_list') }}">盘点页面</a> 点击「开始盘点」创建批次。</p>
+
+{% if not pending_batch_id %}
+<div class="warn">
+  当前仓库<strong>没有进行中的盘点批次</strong>。请先到盘点页面点「开始盘点」。
+</div>
+{% else %}
+<p>目标批次:<strong>#{{ pending_batch_id }}</strong>(pending 状态)</p>
+{% endif %}
+
+<form method="post" enctype="multipart/form-data" class="grid cols-2">
+  <label>
+    <span>Excel 文件(.xlsx)</span>
+    <input type="file" name="file" accept=".xlsx" required>
+  </label>
+  <div></div>
+  <div class="form-actions">
+    <a href="{{ url_for('stocktake.stocktake_list') }}" class="btn-sm">取消</a>
+    <button type="submit" class="btn-primary" {% if not pending_batch_id %}disabled{% endif %}>解析预览</button>
+  </div>
+</form>
+
+<p class="muted" style="margin-top:1rem">
+  期望格式(泰柯盘点表):列 2 = 物料名称,列 6 = 实际盘点数量。其他列忽略。
+</p>
+{% endblock %}

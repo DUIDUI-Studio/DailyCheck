@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}导入预览 — {{ target_wh_name }}{% endblock %}
+{% block content %}
+<h2>导入预览 — {{ target_wh_name }} ({{ warehouse_code }})</h2>
+<p class="muted">文件:{{ filename }}</p>
+
+<p class="muted">
+  共 {{ total_rows }} 行 · {{ groups_order|length }} 个分组
+  {% if problems %} · <span class="warn">{{ problems|length }} 个数据问题</span>{% endif %}
+</p>
+
+{% for cat_name in groups_order %}
+<details {% if loop.first %}open{% endif %}>
+  <summary>{{ cat_name }} ({{ groups_rows[cat_name]|length }} 行)</summary>
+  <table>
+    <tr><th>物料名称</th><th>规格</th><th>单位</th><th>单价(¥)</th></tr>
+    {% for item in groups_rows[cat_name] %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ item.spec or '—' }}</td>
+      <td>{{ item.unit }}</td>
+      <td>{{ "%.3f"|format(item.unit_cost) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
+{% endfor %}
+
+{% if problems %}
+<details>
+  <summary>数据问题({{ problems|length }} 个,导入时跳过)</summary>
+  <ul>{% for p in problems %}<li>{{ p }}</li>{% endfor %}</ul>
+</details>
+{% endif %}
+
+<form method="post" action="{{ url_for('import_items.commit') }}"
+      onsubmit="return confirm('确认导入 {{ total_rows }} 条品项到 {{ target_wh_name }}?\n该仓库以上分类下的现有品项将被全部删除。');">
+  <div class="form-actions">
+    <a href="{{ url_for('items.items_list') }}" class="btn-sm">取消</a>
+    <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">返回修改</a>
+    <button type="submit" class="btn-danger">⚠️ 确认导入</button>
+  </div>
+</form>
+{% endblock %}
