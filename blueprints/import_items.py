@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import io
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from typing import IO
 
 from flask import (
@@ -167,7 +170,82 @@ def preview():
 @require_login
 @require_role("admin")
 def commit():
-    """占位:Task 4 将实现真正的写入逻辑。"""
-    session.pop("import_preview", None)
-    flash("提交路由尚未实现(Task 4)")
-    return redirect(url_for("import_items.upload_form"))
+    """事务化:DELETE 预览分组下 items + INSERT 预览数据,缺品类则拒绝。"""
+    from datetime import datetime
+
+    import db as db_module
+    from blueprints._helpers import gen_sku, now
+
+    pv = session.pop("import_preview", None)
+    if not pv:
+        flash("预览已过期,请重新上传")
+        return redirect(url_for("import_items.upload_form"))
+
+    warehouse_code = pv["warehouse_code"]
+    groups_order = pv["groups_order"]
+
+    # 1. 校验仓库存在
+    master = db_module.get_master_db()
+    wh_row = master.execute(
+        "SELECT db_path, name FROM warehouses WHERE code = ?", (warehouse_code,)
+    ).fetchone()
+    if wh_row is None:
+        flash(f"仓库 {warehouse_code} 不存在")
+        return redirect(url_for("import_items.upload_form"))
+
+    from config import BASE_DIR
+    db_path = Path(BASE_DIR) / wh_row["db_path"]
+
+    # 2. 校验所有分组均存在于目标仓库的 categories 表
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        existing_cats = {
+            r["name"] for r in conn.execute("SELECT name FROM categories").fetchall()
+        }
+    missing = [c for c in groups_order if c not in existing_cats]
+    if missing:
+        flash(f"目标仓库缺少分类:{', '.join(missing)}")
+        return redirect(url_for("items.items_list"))
+
+    # 3. 事务化 DELETE + INSERT
+    try:
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            placeholders = ",".join("?" for _ in groups_order)
+            conn.execute(
+                f"DELETE FROM items WHERE category_id IN "
+                f"(SELECT id FROM categories WHERE name IN ({placeholders}))",
+                groups_order,
+            )
+            cat_by_name = {
+                r["name"]: r["id"]
+                for r in conn.execute("SELECT id, name FROM categories").fetchall()
+            }
+            ts = now()
+            inserted = 0
+            for cat_name in groups_order:
+                cid = cat_by_name[cat_name]
+                for item in pv["groups_rows"][cat_name]:
+                    conn.execute(
+                        """INSERT INTO items
+                           (sku, name, category_id, quantity, safety_stock,
+                            unit_cost, unit, gram_per_unit, updated_at)
+                           VALUES (?, ?, ?, 0, 0, ?, ?, 0, ?)""",
+                        (gen_sku(), item["name"], cid,
+                         item["unit_cost"], item["unit"], ts),
+                    )
+                    inserted += 1
+            conn.commit()
+    except sqlite3.IntegrityError:
+        flash("导入失败,请重试")
+        return redirect(url_for("import_items.upload_form"))
+
+    # 4. audit
+    from blueprints.auth import audit
+    audit("import_items.import", "warehouse", warehouse_code, {
+        "count": inserted,
+        "filename": pv.get("filename"),
+    })
+    flash(f"导入成功:{inserted} 条品项")
+    return redirect(url_for("items.items_list"))

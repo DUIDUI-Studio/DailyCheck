@@ -1,5 +1,7 @@
-"""上传 + 预览路由测试。"""
+"""上传 + 预览 + commit 路由测试。"""
 import io
+import sqlite3
+from datetime import datetime
 
 from openpyxl import Workbook
 
@@ -82,3 +84,114 @@ def test_non_admin_cannot_access(logged_client):
     client2 = client.application.test_client()
     resp = client2.get("/admin/import-items")
     assert resp.status_code in (302, 403)
+
+
+# ---------------------------------------------------------------------------
+# commit 路由测试 (Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_commit_requires_session(logged_client):
+    """无 session 缓存 → commit 拒绝,items 表不应有新增。"""
+    client, wh_path = logged_client
+    _login_admin(client)
+    resp = client.post("/admin/import-items/commit", follow_redirects=True)
+    assert resp.status_code in (200, 400)
+    wh = sqlite3.connect(wh_path)
+    wh.row_factory = sqlite3.Row
+    n = wh.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+    assert n == 0
+    wh.close()
+
+
+def test_commit_rejects_when_category_missing(logged_client):
+    """目标仓库 categories 缺 xlsx 的某个分组 → commit 拒绝,不写 items。"""
+    client, wh_path = logged_client
+    _login_admin(client)
+    xlsx_bytes = _make_xlsx_bytes([
+        ("不存在的分类", "A", None, "s", 100, 5, "箱", 10, 50),
+    ])
+    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
+            "warehouse_code": "wh_test"}
+    client.post("/admin/import-items", data=data,
+                content_type="multipart/form-data", follow_redirects=False)
+    resp = client.post("/admin/import-items/commit", follow_redirects=True)
+    assert resp.status_code == 200
+    wh = sqlite3.connect(wh_path)
+    wh.row_factory = sqlite3.Row
+    n = wh.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+    assert n == 0
+    wh.close()
+
+
+def test_commit_inserts_items_when_categories_match(logged_client):
+    """仓库已有"X"分类 + 上传"X"分类 → commit 后 items 行数 = 2。"""
+    client, wh_path = logged_client
+    _login_admin(client)
+    # 注入一个 "X" 分类
+    wh = sqlite3.connect(wh_path)
+    wh.row_factory = sqlite3.Row
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    wh.execute(
+        "INSERT INTO categories (name, description, created_at) VALUES ('X', '', ?)",
+        (ts,))
+    wh.commit()
+    wh.close()
+    xlsx_bytes = _make_xlsx_bytes([
+        ("X", "AAA", None, "spec1", 100, 5, "箱", 10, 50),
+        (None, "BBB", None, "spec2", 200, 3, "包", 20, 60),
+    ])
+    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
+            "warehouse_code": "wh_test"}
+    client.post("/admin/import-items", data=data,
+                content_type="multipart/form-data", follow_redirects=False)
+    resp = client.post("/admin/import-items/commit", follow_redirects=False)
+    assert resp.status_code == 302
+    wh = sqlite3.connect(wh_path)
+    wh.row_factory = sqlite3.Row
+    rows = wh.execute(
+        "SELECT name, unit, unit_cost FROM items ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["name"] == "AAA"
+    assert rows[0]["unit"] == "箱"
+    assert rows[0]["unit_cost"] == 10.0
+    assert rows[1]["unit"] == "包"
+    wh.close()
+
+
+def test_commit_is_idempotent(logged_client):
+    """二次 commit → 行数仍为 1(覆盖无残留)。"""
+    client, wh_path = logged_client
+    _login_admin(client)
+    wh = sqlite3.connect(wh_path)
+    wh.row_factory = sqlite3.Row
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    wh.execute(
+        "INSERT INTO categories (name, description, created_at) VALUES ('X', '', ?)",
+        (ts,))
+    wh.commit()
+    wh.close()
+    xlsx_bytes = _make_xlsx_bytes([
+        ("X", "AAA", None, "s", 100, 5, "箱", 10, 50),
+    ])
+
+    def _post_upload():
+        return client.post(
+            "/admin/import-items",
+            data={"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
+                  "warehouse_code": "wh_test"},
+            content_type="multipart/form-data",
+            follow_redirects=False,
+        )
+
+    _post_upload()
+    client.post("/admin/import-items/commit", follow_redirects=False)
+    # 再来一遍(用全新 BytesIO,因为上次的已被消费)
+    _post_upload()
+    client.post("/admin/import-items/commit", follow_redirects=False)
+    wh = sqlite3.connect(wh_path)
+    wh.row_factory = sqlite3.Row
+    n = wh.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+    assert n == 1
+    wh.close()
