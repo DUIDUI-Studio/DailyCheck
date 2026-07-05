@@ -320,7 +320,14 @@ return redirect(url_for("items.items_list"))
 </div>
 ```
 
-`.page-header` 复用现有 `.flex-between` 样式(若存在),否则新增简单一行布局。
+实现时查 `static/style.css`;若已有 `.flex-between`(或等效工具类)则复用,否则新增
+最小一行布局样式:
+
+```css
+.page-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+```
+
+(CSS 走现有 v-bump 策略:修改 `templates/base.html` 中 `style.css?v=N` 改为 `?v=N+1`)
 
 ### 3.2 `templates/admin/import_items.html` 上传页
 
