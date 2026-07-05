@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import IO
 
 from flask import (
-    Blueprint, abort, current_app, flash, redirect, render_template, request, session, url_for,
+    Blueprint, abort, current_app, flash, g, redirect, render_template, request, session, url_for,
 )
 
 from db import get_master_db
@@ -88,21 +88,20 @@ bp = Blueprint("import_items", __name__, url_prefix="/admin/import-items")
 @require_login
 @require_role("admin")
 def upload_form():
-    """渲染上传表单。"""
-    master = get_master_db()
-    warehouses = master.execute(
-        "SELECT code, name FROM warehouses ORDER BY id"
-    ).fetchall()
-    return render_template("admin/import_items.html", warehouses=warehouses)
+    """渲染上传表单。目标仓库 = 当前登录用户的 g.warehouse。"""
+    return render_template(
+        "admin/import_items.html",
+        target_wh_code=g.warehouse["code"],
+        target_wh_name=g.warehouse["name"],
+    )
 
 
 @bp.route("", methods=["POST"])
 @require_login
 @require_role("admin")
 def upload_parse():
-    """解析上传的 xlsx → 缓存到 session → 重定向预览。"""
+    """解析上传的 xlsx → 缓存到 session → 重定向预览。目标仓库 = g.warehouse。"""
     file = request.files.get("file")
-    warehouse_code = request.form.get("warehouse_code", "").strip()
 
     if not isinstance(file, FileStorage) or not file.filename:
         flash("请选择文件")
@@ -110,15 +109,6 @@ def upload_parse():
 
     if not file.filename.lower().endswith(".xlsx"):
         flash("仅支持 .xlsx 文件")
-        return redirect(url_for("import_items.upload_form"))
-
-    # 校验仓库存在
-    master = get_master_db()
-    row = master.execute(
-        "SELECT 1 FROM warehouses WHERE code = ?", (warehouse_code,)
-    ).fetchone()
-    if row is None:
-        flash(f"仓库 {warehouse_code} 不存在")
         return redirect(url_for("import_items.upload_form"))
 
     try:
@@ -133,7 +123,7 @@ def upload_parse():
         return redirect(url_for("import_items.upload_form"))
 
     session["import_preview"] = {
-        "warehouse_code": warehouse_code,
+        "warehouse_code": g.warehouse["code"],
         "filename": file.filename,
         **preview,
     }
@@ -178,7 +168,8 @@ def commit():
         flash("预览已过期,请重新上传")
         return redirect(url_for("import_items.upload_form"))
 
-    warehouse_code = pv["warehouse_code"]
+    # 目标仓库始终是当前 g.warehouse(防 session 写入其他 code 的退化场景)
+    warehouse_code = g.warehouse["code"]
     groups_order = pv["groups_order"]
 
     # 1. 校验仓库存在

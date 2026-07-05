@@ -46,7 +46,6 @@ def test_upload_parse_redirects_to_preview(logged_client):
     ])
     data = {
         "file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
-        "warehouse_code": "wh_test",
     }
     resp = client.post("/admin/import-items", data=data,
                        content_type="multipart/form-data", follow_redirects=False)
@@ -59,7 +58,6 @@ def test_upload_rejects_non_xlsx(logged_client):
     _login_admin(client)
     data = {
         "file": (io.BytesIO(b"not an xlsx"), "test.txt"),
-        "warehouse_code": "wh_test",
     }
     resp = client.post("/admin/import-items", data=data,
                        content_type="multipart/form-data", follow_redirects=False)
@@ -111,8 +109,7 @@ def test_commit_creates_missing_categories(logged_client):
     xlsx_bytes = _make_xlsx_bytes([
         ("不存在的分类", "A", None, "s", 100, 5, "箱", 10, 50),
     ])
-    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
-            "warehouse_code": "wh_test"}
+    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx")}
     client.post("/admin/import-items", data=data,
                 content_type="multipart/form-data", follow_redirects=False)
     resp = client.post("/admin/import-items/commit", follow_redirects=False)
@@ -149,8 +146,7 @@ def test_commit_inserts_items_when_categories_match(logged_client):
         ("X", "AAA", None, "spec1", 100, 5, "箱", 10, 50),
         (None, "BBB", None, "spec2", 200, 3, "包", 20, 60),
     ])
-    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
-            "warehouse_code": "wh_test"}
+    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx")}
     client.post("/admin/import-items", data=data,
                 content_type="multipart/form-data", follow_redirects=False)
     resp = client.post("/admin/import-items/commit", follow_redirects=False)
@@ -187,8 +183,7 @@ def test_commit_is_idempotent(logged_client):
     def _post_upload():
         return client.post(
             "/admin/import-items",
-            data={"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
-                  "warehouse_code": "wh_test"},
+            data={"file": (io.BytesIO(xlsx_bytes), "test.xlsx")},
             content_type="multipart/form-data",
             follow_redirects=False,
         )
@@ -229,8 +224,7 @@ def test_commit_purges_child_rows_when_deleting_items(logged_client):
     wh.commit()
     wh.close()
     xlsx_bytes = _make_xlsx_bytes([("X", "NewItem", None, "s", 100, 5, "箱", 10, 50)])
-    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx"),
-            "warehouse_code": "wh_test"}
+    data = {"file": (io.BytesIO(xlsx_bytes), "test.xlsx")}
     client.post("/admin/import-items", data=data,
                 content_type="multipart/form-data", follow_redirects=False)
     resp = client.post("/admin/import-items/commit", follow_redirects=False)

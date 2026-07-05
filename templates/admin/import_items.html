@@ -7,11 +7,7 @@
 <form method="post" enctype="multipart/form-data" class="grid cols-2">
   <label>
     <span>目标仓库</span>
-    <select name="warehouse_code" required>
-      {% for wh in warehouses %}
-        <option value="{{ wh.code }}">{{ wh.name }} ({{ wh.code }})</option>
-      {% endfor %}
-    </select>
+    <div><strong>{{ target_wh_name }}</strong> ({{ target_wh_code }})</div>
   </label>
   <label>
     <span>Excel 文件(.xlsx)</span>
