@@ -43,6 +43,25 @@ def fixed_categories_in_clause() -> tuple[str, list[str]]:
     return placeholders, list(FIXED_CATEGORIES)
 
 
+def warehouse_categories_in_clause() -> tuple[str, list]:
+    """按当前仓库自身的 categories 表生成 IN 子句。
+
+    替代旧的 fixed_categories_in_clause(),让每家店用自己的品类集合。
+    极端情况(仓库无 categories)返回 (1, [0]) 防御性 0 行。
+    """
+    db = get_warehouse_db()
+    names = [r["name"] for r in db.execute(
+        "SELECT name FROM categories ORDER BY id"
+    ).fetchall()]
+    if not names:
+        return "1", [0]
+    return ",".join("?" for _ in names), names
+
+
+# 向后兼容别名
+fixed_categories_in_clause = warehouse_categories_in_clause
+
+
 def gen_sku() -> str:
     return f"AUTO-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 

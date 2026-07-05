@@ -7,7 +7,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import fixed_categories_in_clause, fmt_qty, gen_sku, now, parse_qty
+from ._helpers import warehouse_categories_in_clause, fmt_qty, gen_sku, now, parse_qty
 from .auth import audit
 
 
@@ -54,7 +54,7 @@ def items_list():
             flash("库存品创建失败，请重试")
         return redirect(url_for("items.items_list"))
 
-    placeholders, params = fixed_categories_in_clause()
+    placeholders, params = warehouse_categories_in_clause()
     categories_data = db.execute(
         f"SELECT id, name, description FROM categories WHERE name IN ({placeholders}) ORDER BY name",
         params,
@@ -104,7 +104,7 @@ def edit_item(item_id: int):
         flash("已更新")
         return redirect(url_for("items.items_list"))
 
-    placeholders, params = fixed_categories_in_clause()
+    placeholders, params = warehouse_categories_in_clause()
     categories_data = db.execute(
         f"SELECT id, name FROM categories WHERE name IN ({placeholders}) ORDER BY name",
         params,
@@ -141,7 +141,7 @@ def delete_item(item_id: int):
 @require_login
 def inventory_view():
     db = get_warehouse_db()
-    placeholders, params = fixed_categories_in_clause()
+    placeholders, params = warehouse_categories_in_clause()
     q = request.args.get("q", "").strip()
     cat = request.args.get("cat", "").strip()
     # 7-day consumption per item.

@@ -18,7 +18,7 @@ from flask import (
 )
 from werkzeug.security import check_password_hash
 
-from config import BASE_DIR, FIXED_CATEGORIES, MASTER_DB, SECRET_KEY
+from config import BASE_DIR, MASTER_DB, SECRET_KEY
 from db import get_master_db, init_warehouse_db
 from permissions import require_login
 
