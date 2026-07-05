@@ -1,9 +1,16 @@
 """Stocktake workflows: start a batch, fill in actuals, submit, rollback,
-edit, approve. Approval requires manager role.
+edit, approve, CSV import. Approval requires manager role.
 """
 from __future__ import annotations
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+import io
+from typing import IO
+
+from flask import (
+    Blueprint, current_app, flash, g, redirect, render_template, request,
+    session, url_for,
+)
+from werkzeug.datastructures import FileStorage
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
@@ -12,6 +19,200 @@ from .auth import audit
 
 
 bp = Blueprint("stocktake", __name__)
+
+
+# ---------------------------------------------------------------------------
+# xlsx 解析(纯函数):泰柯盘点表格式 → 物料盘点清单
+# ---------------------------------------------------------------------------
+
+def parse_stocktake_xlsx(file_stream: IO[bytes]) -> dict:
+    """解析 xlsx 为盘点预览数据。
+
+    期望格式(泰柯盘点表):
+      Sheet1, 跳过前 2 行(标题 + 表头), 第 3 行起为数据。
+      列 2 = 物料名称(必填)
+      列 6 = 现有库存(实际盘点数量, None → 0)
+      其他列忽略(分类/SKU/规格/单价/单位/盘点单价/库存金额)。
+
+    Returns:
+        {
+            "rows": [{"row": int, "name": str, "quantity": float}, ...],
+            "problems": ["行 N: ..."],
+        }
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(file_stream, data_only=True)
+    ws = wb["Sheet1"]
+    rows: list[dict] = []
+    problems: list[str] = []
+    for r in range(3, ws.max_row + 1):
+        name_raw = ws.cell(r, 2).value
+        if not name_raw:
+            continue  # 合计行 / 空行
+        name = str(name_raw).strip()
+        qty_raw = ws.cell(r, 6).value
+        try:
+            quantity = float(qty_raw) if qty_raw is not None else 0.0
+        except (TypeError, ValueError):
+            quantity = 0.0
+            problems.append(f"行 {r}: {name} 盘点数量无法解析 → 记为 0")
+        rows.append({"row": r, "name": name, "quantity": quantity})
+    return {"rows": rows, "problems": problems}
+
+
+# ---------------------------------------------------------------------------
+# CSV 导入流程:上传 → 预览 → commit 写入最近 pending batch
+# ---------------------------------------------------------------------------
+
+@bp.route("/admin/stocktake-import", methods=["GET"])
+@require_login
+@require_role("admin")
+def stocktake_csv_form():
+    """渲染上传表单。目标仓库 = g.warehouse,目标 batch = 最近 pending batch。"""
+    db = get_warehouse_db()
+    pending = db.execute(
+        "SELECT id FROM stocktake_batches WHERE status='pending' AND rolled_back=0 "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return render_template(
+        "admin/stocktake_import.html",
+        pending_batch_id=pending["id"] if pending else None,
+    )
+
+
+@bp.route("/admin/stocktake-import", methods=["POST"])
+@require_login
+@require_role("admin")
+def stocktake_csv_parse():
+    """解析 xlsx → 与 pending batch 匹配 → 缓存预览。"""
+    file = request.files.get("file")
+
+    if not isinstance(file, FileStorage) or not file.filename:
+        flash("请选择文件")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+
+    if not file.filename.lower().endswith(".xlsx"):
+        flash("仅支持 .xlsx 文件")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+
+    try:
+        preview = parse_stocktake_xlsx(file.stream)
+    except Exception:
+        current_app.logger.exception("盘点 xlsx 解析失败")
+        flash("Excel 解析失败,请检查文件格式")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+
+    if not preview["rows"]:
+        flash("Excel 中无数据行")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+
+    # 必须有 pending batch
+    db = get_warehouse_db()
+    pending = db.execute(
+        "SELECT id FROM stocktake_batches WHERE status='pending' AND rolled_back=0 "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if pending is None:
+        flash("请先在盘点页面点击「开始盘点」创建批次")
+        return redirect(url_for("stocktake.stocktake_list"))
+
+    # 匹配品项:按 name 查 items
+    items_rows = db.execute(
+        "SELECT id, name, quantity FROM items"
+    ).fetchall()
+    by_name: dict[str, list] = {}
+    for it in items_rows:
+        by_name.setdefault(it["name"], []).append(it)
+
+    matched: list[dict] = []
+    not_found: list[dict] = []
+    for row in preview["rows"]:
+        candidates = by_name.get(row["name"])
+        if not candidates:
+            not_found.append({"row": row["row"], "name": row["name"], "quantity": row["quantity"]})
+            continue
+        if len(candidates) > 1:
+            preview["problems"].append(
+                f"行 {row['row']}: {row['name']} 在系统中有 {len(candidates)} 个同名品项,取第一个"
+            )
+        cand = candidates[0]
+        matched.append({
+            "row": row["row"],
+            "item_id": cand["id"],
+            "name": cand["name"],
+            "previous_quantity": cand["quantity"],
+            "actual_quantity": row["quantity"],
+            "diff": round(row["quantity"] - cand["quantity"], 2),
+        })
+
+    session["stocktake_csv_preview"] = {
+        "filename": file.filename,
+        "batch_id": pending["id"],
+        "matched": matched,
+        "not_found": not_found,
+        "problems": preview["problems"],
+    }
+    return redirect(url_for("stocktake.stocktake_csv_preview_view"))
+
+
+@bp.route("/admin/stocktake-import/preview", methods=["GET"])
+@require_login
+@require_role("admin")
+def stocktake_csv_preview_view():
+    pv = session.get("stocktake_csv_preview")
+    if not pv:
+        flash("预览已过期,请重新上传")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+    return render_template("admin/stocktake_import_preview.html", **pv)
+
+
+@bp.route("/admin/stocktake-import/commit", methods=["POST"])
+@require_login
+@require_role("admin")
+def stocktake_csv_commit():
+    pv = session.pop("stocktake_csv_preview", None)
+    if not pv:
+        flash("预览已过期,请重新上传")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+
+    batch_id = pv["batch_id"]
+    matched = pv["matched"]
+    if not matched:
+        flash("无可写入的行(全部未匹配)")
+        return redirect(url_for("stocktake.stocktake_csv_form"))
+
+    db = get_warehouse_db()
+    # 校验 batch 仍存在且 pending
+    batch = db.execute(
+        "SELECT id, status FROM stocktake_batches WHERE id=? AND rolled_back=0",
+        (batch_id,),
+    ).fetchone()
+    if batch is None or batch["status"] != "pending":
+        flash(f"批次 #{batch_id} 已不存在或非 pending 状态")
+        return redirect(url_for("stocktake.stocktake_list"))
+
+    ts = now()
+    inserted = 0
+    for m in matched:
+        db.execute(
+            """INSERT INTO stocktakes
+               (item_id, previous_quantity, actual_quantity, diff, batch_id, created_at, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (m["item_id"], m["previous_quantity"], m["actual_quantity"],
+             m["diff"], batch_id, ts, "CSV 导入"),
+        )
+        inserted += 1
+    db.commit()
+    audit("stocktake.csv_import", "batch", batch_id, {
+        "count": inserted,
+        "filename": pv["filename"],
+        "not_found_count": len(pv["not_found"]),
+    })
+    msg = f"盘点导入成功:{inserted} 条已写入批次 #{batch_id}"
+    if pv["not_found"]:
+        msg += f"({len(pv['not_found'])} 条未匹配,见预览页)"
+    flash(msg)
+    return redirect(url_for("stocktake.stocktake_list"))
 
 
 @bp.route("/stocktake", methods=["GET"])
@@ -30,6 +231,22 @@ def stocktake_list():
 @bp.route("/stocktake/start", methods=["POST"])
 @require_login
 def stocktake_start():
+    """开始盘点 = 创建一个空 batch(status=pending, 无 stocktakes 行)。
+    后续可通过 CSV 导入或 /stocktake/session 手动填写。
+    已有 pending batch 时直接跳 session 页(避免重复创建空 batch)。"""
+    db = get_warehouse_db()
+    existing = db.execute(
+        "SELECT id FROM stocktake_batches WHERE status='pending' AND rolled_back=0 "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if existing is None:
+        cur = db.execute(
+            "INSERT INTO stocktake_batches (created_at, note, status, rolled_back) "
+            "VALUES (?, '', 'pending', 0)",
+            (now(),),
+        )
+        db.commit()
+        audit("stocktake.start", "batch", cur.lastrowid, {})
     return redirect(url_for("stocktake.stocktake_session"))
 
 
