@@ -192,29 +192,33 @@ def commit():
 
     db_path = Path(BASE_DIR) / wh_row["db_path"]
 
-    # 2. 校验所有分组均存在于目标仓库的 categories 表
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        existing_cats = {
-            r["name"] for r in conn.execute("SELECT name FROM categories").fetchall()
-        }
-    missing = [c for c in groups_order if c not in existing_cats]
-    if missing:
-        flash(f"目标仓库缺少分类:{', '.join(missing)}")
-        return redirect(url_for("items.items_list"))
-
-    # 3. 事务化 DELETE + INSERT
+    # 3. 事务化:创建缺失分类 + DELETE 子表 + DELETE items + INSERT
+    inserted = 0
+    created_cats: list[str] = []
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
+            ts = now()
+            # 3a. 自动创建缺失的分组分类(同事务,保证原子性)
+            existing_cats = {
+                r["name"] for r in conn.execute("SELECT name FROM categories").fetchall()
+            }
+            for cat_name in groups_order:
+                if cat_name not in existing_cats:
+                    conn.execute(
+                        "INSERT INTO categories (name, description, created_at) "
+                        "VALUES (?, ?, ?)",
+                        (cat_name, "导入自动创建", ts),
+                    )
+                    created_cats.append(cat_name)
             placeholders = ",".join("?" for _ in groups_order)
             # 子查询:本次导入分组下的所有 item_id
             items_subq = (
                 f"item_id IN (SELECT id FROM items WHERE category_id IN "
                 f"(SELECT id FROM categories WHERE name IN ({placeholders})))"
             )
-            # 先清掉引用这些 item 的子行,避免 FK 约束阻止 DELETE items
+            # 3b. 先清掉引用这些 item 的子行,避免 FK 约束阻止 DELETE items
             for table in [
                 "stock_movements",
                 "stocktakes",
@@ -225,7 +229,7 @@ def commit():
                 "production_run_items",
             ]:
                 conn.execute(f"DELETE FROM {table} WHERE {items_subq}", groups_order)
-            # 现在可以安全删 items
+            # 3c. 现在可以安全删 items
             conn.execute(
                 f"DELETE FROM items WHERE category_id IN "
                 f"(SELECT id FROM categories WHERE name IN ({placeholders}))",
@@ -235,8 +239,6 @@ def commit():
                 r["name"]: r["id"]
                 for r in conn.execute("SELECT id, name FROM categories").fetchall()
             }
-            ts = now()
-            inserted = 0
             for cat_name in groups_order:
                 cid = cat_by_name[cat_name]
                 for item in pv["groups_rows"][cat_name]:
@@ -259,6 +261,10 @@ def commit():
     audit("import_items.import", "warehouse", warehouse_code, {
         "count": inserted,
         "filename": pv.get("filename"),
+        "created_categories": created_cats,
     })
-    flash(f"导入成功:{inserted} 条品项")
+    msg = f"导入成功:{inserted} 条品项"
+    if created_cats:
+        msg += f"(自动创建分类:{', '.join(created_cats)})"
+    flash(msg)
     return redirect(url_for("items.items_list"))

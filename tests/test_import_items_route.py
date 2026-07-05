@@ -104,8 +104,8 @@ def test_commit_requires_session(logged_client):
     wh.close()
 
 
-def test_commit_rejects_when_category_missing(logged_client):
-    """目标仓库 categories 缺 xlsx 的某个分组 → commit 拒绝,不写 items。"""
+def test_commit_creates_missing_categories(logged_client):
+    """目标仓库缺 xlsx 的某个分组 → commit 自动创建分类,不拒绝。"""
     client, wh_path = logged_client
     _login_admin(client)
     xlsx_bytes = _make_xlsx_bytes([
@@ -115,12 +115,20 @@ def test_commit_rejects_when_category_missing(logged_client):
             "warehouse_code": "wh_test"}
     client.post("/admin/import-items", data=data,
                 content_type="multipart/form-data", follow_redirects=False)
-    resp = client.post("/admin/import-items/commit", follow_redirects=True)
-    assert resp.status_code == 200
+    resp = client.post("/admin/import-items/commit", follow_redirects=False)
+    assert resp.status_code == 302  # 重定向到 /items
     wh = sqlite3.connect(wh_path)
     wh.row_factory = sqlite3.Row
+    # 验证:新分类被自动创建
+    cat = wh.execute(
+        "SELECT name, description FROM categories WHERE name=?",
+        ("不存在的分类",),
+    ).fetchone()
+    assert cat is not None
+    assert cat["description"] == "导入自动创建"
+    # 验证:item 被插入
     n = wh.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
-    assert n == 0
+    assert n == 1
     wh.close()
 
 
