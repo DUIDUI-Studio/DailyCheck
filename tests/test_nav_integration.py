@@ -124,30 +124,3 @@ def test_notifications_badge_shows_unread_count_for_admin(logged_client):
 # ---------------------------------------------------------------------------
 
 
-def test_sidebar_includes_mpc_usage_for_admin(logged_client):
-    """Admin sees the /admin/mpc-usage link in the sidebar."""
-    client, _ = logged_client
-    body = client.get("/land").data.decode("utf-8")
-    assert "/admin/mpc-usage" in body
-
-
-def test_sidebar_mpc_usage_hidden_for_staff(staff_client):
-    """Staff must NOT see the MPC usage link (platform-admin only)."""
-    client, _ = staff_client
-    body = client.get("/land").data.decode("utf-8")
-    assert "/admin/mpc-usage" not in body
-
-
-def test_land_page_has_mpc_card_for_admin(logged_client):
-    """Admin sees an Agent MPC card on /land."""
-    client, _ = logged_client
-    body = client.get("/land").data.decode("utf-8")
-    assert "Agent MPC" in body or "MPC 用量" in body
-    assert "/admin/mpc-usage" in body
-
-
-def test_land_page_mpc_card_hidden_for_staff(staff_client):
-    """Staff must NOT see the Agent MPC card on /land."""
-    client, _ = staff_client
-    body = client.get("/land").data.decode("utf-8")
-    assert "/admin/mpc-usage" not in body

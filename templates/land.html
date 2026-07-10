@@ -34,11 +34,5 @@
     </h3>
     <p>查看全站通知，标记已读</p>
   </a>
-  {% if g.user and g.user['is_admin'] %}
-  <a class="land-card" href="{{ url_for('agent_mpc.admin_mpc_usage') }}">
-    <h3>Agent MPC 用量</h3>
-    <p>外部 Agent 调用 /api/v1/* 的统计与错误率</p>
-  </a>
-  {% endif %}
 </div>
 {% endblock %}

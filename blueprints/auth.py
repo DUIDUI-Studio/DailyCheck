@@ -50,9 +50,6 @@ def load_user_and_warehouse():
     user_id = session.get("user_id")
     warehouse_id = session.get("warehouse_id")
 
-    # Agent MPC routes (/api/v1/*) authenticate via Bearer tokens, not
-    # the session cookie. Skip the session-based redirect for them.
-    # (subproject 6 — PRD §2.3.3)
     if request.path.startswith("/api/v1/"):
         return None
 
