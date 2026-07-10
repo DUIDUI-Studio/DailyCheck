@@ -31,6 +31,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(assign_role_cmd)
     app.cli.add_command(list_users_cmd)
     app.cli.add_command(bootstrap_cmd)
+    app.cli.add_command(mcp_cmd)
 
 
 @click.command("init-master")
@@ -256,3 +257,19 @@ def bootstrap_cmd(
     click.echo(
         f"\nBootstrap complete. Login: {admin_username} / {admin_password}"
     )
+
+
+@click.command("mcp")
+@click.option("--port", default=5100, help="MCP server port (stdio mode only binds to stdio)")
+def mcp_cmd(port: int) -> None:
+    """Start the MCP server (stdio transport)."""
+    import asyncio
+    from mcp_server.protocol.server import build_server
+    from mcp.server.stdio import stdio_server
+
+    async def run_server():
+        server = build_server()
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+
+    asyncio.run(run_server())
