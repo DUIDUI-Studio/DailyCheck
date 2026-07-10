@@ -1,6 +1,11 @@
 {% extends 'base.html' %}
 {% block content %}
-<h2>库存盘点</h2>
+<div class="page-header">
+  <h2>库存盘点</h2>
+  {% if g.user.is_admin %}
+    <a href="{{ url_for('stocktake.stocktake_csv_form') }}" class="btn-sm">📥 CSV 导入</a>
+  {% endif %}
+</div>
 <form method="post" action="{{ url_for('stocktake.stocktake_start') }}" class="form-inline">
   <button type="submit">开始盘点</button>
 </form>
