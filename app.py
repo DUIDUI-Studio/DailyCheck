@@ -45,6 +45,7 @@ def create_app() -> Flask:
     from blueprints.publish_items import bp as publish_items_bp
     from blueprints.publish_recipe import bp as publish_recipe_bp
     from blueprints.agent_mpc import bp as agent_mpc_bp
+    from blueprints.import_items import bp as import_items_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -62,6 +63,7 @@ def create_app() -> Flask:
     app.register_blueprint(publish_items_bp)
     app.register_blueprint(publish_recipe_bp)
     app.register_blueprint(agent_mpc_bp)
+    app.register_blueprint(import_items_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp

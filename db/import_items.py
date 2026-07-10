@@ -22,7 +22,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from config import BASE_DIR, FIXED_CATEGORIES
+from config import BASE_DIR
 
 
 def now() -> str:
@@ -83,7 +83,7 @@ def import_items(xlsx_path: str, warehouse_code: str) -> None:
 
         if unknown:
             sys.exit(
-                "Unknown categories in xlsx (not in FIXED_CATEGORIES, "
+                "Unknown categories in xlsx (not in target warehouse's categories, "
                 "refusing to insert): " + ", ".join(sorted(unknown))
             )
 

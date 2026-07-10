@@ -1,7 +1,14 @@
 {% extends "base.html" %}
 {% block title %}品类与品项{% endblock %}
 {% block content %}
-<h2>品类与品项</h2>
+<div class="page-header">
+  <h2>品类与品项</h2>
+  {% if g.user and g.user['is_admin'] %}
+    <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">
+      📥 批量导入
+    </a>
+  {% endif %}
+</div>
 
 <div class="cat-bar" role="tablist" aria-label="按品类筛选">
   <button type="button" class="cat-chip is-active" data-cat="__all" role="tab" aria-selected="true">全部</button>
