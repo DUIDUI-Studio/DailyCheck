@@ -39,6 +39,8 @@ def create_app() -> Flask:
     from blueprints.reports import bp as reports_bp
     from blueprints.production import bp as production_bp
     from blueprints.users import bp as users_bp
+<<<<<<< HEAD
+    from blueprints.import_items import bp as import_items_bp
     from blueprints.forecast import bp as forecast_bp, _start_scheduler
     from blueprints.procurement import bp as procurement_bp
     from blueprints.notifications import bp as notifications_bp
@@ -54,6 +56,7 @@ def create_app() -> Flask:
     app.register_blueprint(reports_bp)
     app.register_blueprint(production_bp)
     app.register_blueprint(users_bp)
+    app.register_blueprint(import_items_bp)
     app.register_blueprint(forecast_bp)
     app.register_blueprint(procurement_bp)
     app.register_blueprint(notifications_bp)
