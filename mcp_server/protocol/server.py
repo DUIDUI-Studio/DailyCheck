@@ -12,6 +12,15 @@ from mcp_server.protocol.tools.inventory import (
     items_detail_impl,
     movements_list_impl,
 )
+from mcp_server.protocol.tools.inbound import (
+    restock_create_impl,
+    restock_list_impl,
+)
+from mcp_server.protocol.tools.forecast import item_forecast_impl
+from mcp_server.protocol.tools.procurement import (
+    procurement_store_impl,
+    procurement_hub_impl,
+)
 from mcp_server.infra.errors import McpError
 
 logger = logging.getLogger(__name__)
@@ -20,6 +29,11 @@ _tool_map = {
     "items_list": items_list_impl,
     "items_detail": items_detail_impl,
     "movements_list": movements_list_impl,
+    "restock_create": restock_create_impl,
+    "restock_list": restock_list_impl,
+    "item_forecast": item_forecast_impl,
+    "procurement_store": procurement_store_impl,
+    "procurement_hub": procurement_hub_impl,
 }
 
 
