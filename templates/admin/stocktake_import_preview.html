@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}盘点导入预览 — 批次 #{{ batch_id }}{% endblock %}
+{% block content %}
+<h2>盘点导入预览 — 批次 #{{ batch_id }}</h2>
+<p class="muted">
+  共匹配 <strong>{{ matched|length }}</strong> 行,
+  未匹配 <strong>{{ not_found|length }}</strong> 行
+  {% if problems %}· <span class="warn">{{ problems|length }} 个数据问题</span>{% endif %}
+</p>
+
+{% if matched %}
+<details open>
+  <summary>匹配成功 ({{ matched|length }} 行,点击「确认导入」将写入批次)</summary>
+  <table>
+    <tr><th>物料名称</th><th>系统库存</th><th>盘点数量</th><th>差异</th></tr>
+    {% for m in matched %}
+    <tr>
+      <td>{{ m.name }}</td>
+      <td>{{ m.previous_quantity | fmt_qty }}</td>
+      <td>{{ m.actual_quantity | fmt_qty }}</td>
+      <td>
+        {% if m.diff > 0 %}<span style="color:var(--success)">+{{ m.diff | fmt_qty }}</span>
+        {% elif m.diff < 0 %}<span style="color:var(--danger)">{{ m.diff | fmt_qty }}</span>
+        {% else %}0{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+
+{% if not_found %}
+<details>
+  <summary>未匹配 ({{ not_found|length }} 行,导入时跳过 — 系统无此品项)</summary>
+  <table>
+    <tr><th>行号</th><th>物料名称</th><th>盘点数量</th></tr>
+    {% for r in not_found %}
+    <tr><td>{{ r.row }}</td><td>{{ r.name }}</td><td>{{ r.quantity | fmt_qty }}</td></tr>
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+
+{% if problems %}
+<details>
+  <summary>数据问题 ({{ problems|length }} 个)</summary>
+  <ul>{% for p in problems %}<li>{{ p }}</li>{% endfor %}</ul>
+</details>
+{% endif %}
+
+<form method="post" action="{{ url_for('stocktake.stocktake_csv_commit') }}"
+      onsubmit="return confirm('确认将 {{ matched|length }} 条盘点数据写入批次 #{{ batch_id }}?');">
+  <div class="form-actions">
+    <a href="{{ url_for('stocktake.stocktake_list') }}" class="btn-sm">取消</a>
+    <a href="{{ url_for('stocktake.stocktake_csv_form') }}" class="btn-sm">返回修改</a>
+    <button type="submit" class="btn-danger" {% if not matched %}disabled{% endif %}>⚠️ 确认导入</button>
+  </div>
+</form>
+{% endblock %}
