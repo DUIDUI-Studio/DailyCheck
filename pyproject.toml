@@ -1,3 +1,9 @@
+[project]
+dependencies = [
+    "mcp>=1.0.0",
+    "click",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
