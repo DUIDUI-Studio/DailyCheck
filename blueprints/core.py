@@ -9,7 +9,7 @@ from flask import Blueprint, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import fixed_categories_in_clause, render
+from ._helpers import render
 
 
 bp = Blueprint("core", __name__)
