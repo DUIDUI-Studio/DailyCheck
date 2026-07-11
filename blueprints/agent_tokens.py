@@ -35,13 +35,14 @@ def _decrypt_token(encrypted: str) -> str:
     return _fernet().decrypt(encrypted.encode()).decode()
 
 
-def _ensure_encrypted_token_col():
+def _ensure_encrypted_token_col(db):
     """Add encrypted_token column if it doesn't exist (zero-cost on repeated runs)."""
-    db = get_master_db()
     cols = [r[1] for r in db.execute("PRAGMA table_info(agent_tokens)")]
     if "encrypted_token" not in cols:
         db.execute("ALTER TABLE agent_tokens ADD COLUMN encrypted_token TEXT")
         db.commit()
+        # Reload schema cache so subsequent SELECT in the same request sees the new column
+        db.execute("PRAGMA schema_reload")
 
 
 bp = Blueprint("agent_tokens", __name__)
@@ -72,8 +73,8 @@ def _parse_warehouses(s: str) -> str:
 @require_login
 def list_tokens():
     _require_admin()
-    _ensure_encrypted_token_col()
     db = get_master_db()
+    _ensure_encrypted_token_col(db)
     rows = db.execute(
         """SELECT id, name, created_by, created_at, revoked_at,
                   allowed_read_paths_json, allowed_write_paths_json,
