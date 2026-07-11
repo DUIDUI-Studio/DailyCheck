@@ -16,9 +16,13 @@
     <input id="token-display" type="text" readonly value="{{ new_token }}"
            style="flex:1;font-family:monospace;padding:6px 10px;border:1px solid #86efac;border-radius:6px;background:#fff;font-size:14px" />
     <button type="button" class="btn primary" onclick="
-      navigator.clipboard.writeText(document.getElementById('token-display').value);
-      this.textContent='已复制!';
-      setTimeout(()=>this.textContent='复制',2000);
+      (async()=>{
+        const el=document.getElementById('token-display');
+        try{await navigator.clipboard.writeText(el.value)}
+        catch{el.select();el.setSelectionRange(0,99999);document.execCommand('copy')}
+        this.textContent='已复制!';
+        setTimeout(()=>this.textContent='复制',2000);
+      })();
     ">复制</button>
   </div>
 </div>
