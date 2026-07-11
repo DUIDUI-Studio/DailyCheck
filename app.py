@@ -35,11 +35,14 @@ def create_app() -> Flask:
     from blueprints.stocktake import bp as stocktake_bp
     from blueprints.restock import bp as restock_bp
     from blueprints.outbound import bp as outbound_bp
-    from blueprints.adjustment import bp as adjustment_bp
     from blueprints.reports import bp as reports_bp
     from blueprints.production import bp as production_bp
     from blueprints.users import bp as users_bp
     from blueprints.import_items import bp as import_items_bp
+    from blueprints.forecast import bp as forecast_bp, _start_scheduler
+    from blueprints.procurement import bp as procurement_bp
+    from blueprints.notifications import bp as notifications_bp
+    from blueprints.agent_tokens import bp as agent_tokens_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -47,15 +50,20 @@ def create_app() -> Flask:
     app.register_blueprint(stocktake_bp)
     app.register_blueprint(restock_bp)
     app.register_blueprint(outbound_bp)
-    app.register_blueprint(adjustment_bp)
     app.register_blueprint(reports_bp)
     app.register_blueprint(production_bp)
     app.register_blueprint(users_bp)
     app.register_blueprint(import_items_bp)
+    app.register_blueprint(forecast_bp)
+    app.register_blueprint(procurement_bp)
+    app.register_blueprint(notifications_bp)
+    app.register_blueprint(agent_tokens_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp
     app.register_blueprint(pwa_bp)
+
+    _start_scheduler()
 
     register_cli(app)
     from blueprints._helpers import register_jinja_filters, register_template_context
@@ -63,8 +71,35 @@ def create_app() -> Flask:
     register_template_context(app)
 
     @app.route("/health")
-    def health() -> tuple[str, int]:
-        return "ok", 200
+    def health() -> tuple[dict, int]:
+        """JSON health probe with forecast last-success timestamp + lock counter.
+
+        Returns the most recent forecast_runs.finished_at for any
+        status='success' row, or null if none. Surfaces PRD §3.6
+        (must-automate observability) without a separate /admin/health
+        page in this subproject. Lock-failure counter is read from a
+        file maintained by blueprints.forecast._bump_lock_counter.
+        """
+        from db import get_master_db
+        from blueprints.forecast import _read_lock_counter
+        last_success = None
+        try:
+            db = get_master_db()
+            row = db.execute(
+                """SELECT finished_at FROM forecast_runs
+                   WHERE status='success' AND finished_at IS NOT NULL
+                   ORDER BY finished_at DESC LIMIT 1"""
+            ).fetchone()
+            if row is not None and row["finished_at"]:
+                # Convert "YYYY-MM-DD HH:MM:SS" → ISO Z
+                last_success = row["finished_at"].replace(" ", "T") + "Z"
+        except Exception:  # noqa: BLE001 — health must never 500
+            pass
+        return {
+            "status": "ok",
+            "forecast_last_success_at": last_success,
+            "forecast_lock_failures": _read_lock_counter(),
+        }, 200
 
     return app
 

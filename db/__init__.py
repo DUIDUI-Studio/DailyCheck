@@ -87,6 +87,73 @@ CREATE TABLE IF NOT EXISTS warehouse_users (
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (warehouse_id) REFERENCES warehouses(id)
 );
+
+CREATE TABLE IF NOT EXISTS forecast_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    items_processed INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_runs_status ON forecast_runs(status, started_at);
+
+CREATE TABLE IF NOT EXISTS procurement_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cover_days INTEGER NOT NULL DEFAULT 14,
+    min_absolute REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS procurement_cache (
+    item_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    daily_avg REAL NOT NULL,
+    current_qty REAL NOT NULL,
+    in_transit_qty REAL NOT NULL,
+    safety_stock REAL NOT NULL,
+    suggested_qty INTEGER NOT NULL,
+    invalid INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (item_id, warehouse_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_procurement_cache_invalid ON procurement_cache(invalid);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    target_url TEXT,
+    created_at TEXT NOT NULL,
+    read_at TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_user_created ON notifications(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notif_user_unread ON notifications(user_id, read_at);
+
+CREATE TABLE IF NOT EXISTS notification_prefs (
+    user_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    muted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, event_type, channel),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    allowed_read_paths_json TEXT NOT NULL DEFAULT '[]',
+    allowed_write_paths_json TEXT NOT NULL DEFAULT '[]',
+    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
@@ -243,6 +310,12 @@ def init_master_db() -> None:
     WAREHOUSE_DB_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         conn.executescript(MASTER_SCHEMA)
+        # Seed single-row procurement_config if missing (id=1 is the only row).
+        row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO procurement_config (id, cover_days, min_absolute) VALUES (1, 14, 0)"
+            )
         conn.commit()
 
 

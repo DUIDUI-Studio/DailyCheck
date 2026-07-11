@@ -6,7 +6,7 @@ import sqlite3
 from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
-from permissions import require_login, require_role
+from permissions import require_login, require_platform_admin, require_role
 from ._helpers import warehouse_categories_in_clause, fmt_qty, gen_sku, now, parse_qty
 from .auth import audit
 
@@ -15,7 +15,7 @@ bp = Blueprint("items", __name__)
 
 
 @bp.route("/items", methods=["GET", "POST"])
-@require_login
+@require_platform_admin
 @require_role("manager")
 def items_list():
     db = get_warehouse_db()
@@ -74,7 +74,7 @@ def items_list():
 
 
 @bp.route("/items/<int:item_id>/edit", methods=["GET", "POST"])
-@require_login
+@require_platform_admin
 @require_role("manager")
 def edit_item(item_id: int):
     db = get_warehouse_db()

@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "DailyCheck",
+      "runtimeExecutable": "/usr/bin/python3",
+      "runtimeArgs": ["-c", "import os; os.chdir('/Users/ericmr/Documents/GitHub/DailyCheck'); exec(open('app.py').read())"],
+      "autoPort": true,
+      "env": {
+        "DAILYCHECK_SECRET_KEY": "dev-key-change-me",
+        "RUNAPP": "1"
+      }
+    }
+  ]
+}

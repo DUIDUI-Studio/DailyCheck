@@ -34,6 +34,9 @@ pwa_bp = Blueprint("pwa", __name__)
 PUBLIC_ENDPOINTS = {
     "auth.login", "auth.logout", "static",
     "pwa.service_worker", "pwa.webmanifest",
+    # /health is an operator probe (subproject 1 §3.6) — must be
+    # reachable without auth, so monitoring tools can hit it.
+    "health",
 }
 
 
@@ -46,6 +49,10 @@ def load_user_and_warehouse():
 
     user_id = session.get("user_id")
     warehouse_id = session.get("warehouse_id")
+
+    if request.path.startswith("/api/v1/"):
+        return None
+
     if user_id is None:
         if request.endpoint not in PUBLIC_ENDPOINTS:
             return redirect(url_for("auth.login", next=request.path))

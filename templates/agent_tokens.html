@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}Agent Token 管理{% endblock %}
+{% block content %}
+<h2>Agent Token 管理</h2>
+
+<!-- Token just created — show prominently -->
+{% if new_token %}
+<div style="background:#f0fdf4;border:1px solid #22c55e;border-radius:10px;padding:16px 20px;margin-bottom:20px">
+  <p style="margin:0 0 8px;font-weight:bold;color:#166534">
+    ✅ Token 「{{ new_token_name }}」创建成功
+  </p>
+  <p style="margin:0 0 8px;font-size:13px;color:#166534">
+    ⚠️ 此 Token 只能看到这一次，请立即复制并妥善保存。
+  </p>
+  <div style="display:flex;gap:8px;align-items:center">
+    <input id="token-display" type="text" readonly value="{{ new_token }}"
+           style="flex:1;font-family:monospace;padding:6px 10px;border:1px solid #86efac;border-radius:6px;background:#fff;font-size:14px" />
+    <button type="button" class="btn primary" onclick="
+      navigator.clipboard.writeText(document.getElementById('token-display').value);
+      this.textContent='已复制!';
+      setTimeout(()=>this.textContent='复制',2000);
+    ">复制</button>
+  </div>
+</div>
+{% endif %}
+
+<!-- Create form -->
+<details class="card" style="margin-bottom:16px" open>
+  <summary><strong>创建新 Token</strong></summary>
+  <form method="post" action="{{ url_for('agent_tokens.create_token') }}" style="margin-top:12px">
+    <label>Token 名称
+      <input name="name" placeholder="例如: claude-code-prod" required autocomplete="off" />
+    </label>
+
+    <label style="margin-top:10px">允许仓库</label>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px">
+      <label style="display:flex;align-items:center;gap:4px;font-weight:normal;cursor:pointer">
+        <input type="checkbox" name="warehouses" value="" id="wh_all" onclick="
+          document.querySelectorAll('[name=warehouses]').forEach(el=>{if(el!==document.getElementById('wh_all')) el.checked=this.checked});
+        " />
+        全部仓库
+      </label>
+      {% for w in warehouses %}
+      <label style="display:flex;align-items:center;gap:4px;font-weight:normal;cursor:pointer;background:#f3f4f6;border:1px solid #d1d5db;border-radius:6px;padding:4px 10px;font-size:13px">
+        <input type="checkbox" name="warehouses" value="{{ w.code }}" onclick="
+          const all = document.getElementById('wh_all');
+          const checked = [...document.querySelectorAll('[name=warehouses]')].filter(el=>el.value&&el.checked).length;
+          all.checked = checked == {{ warehouses|length }};
+        " />
+        {{ w.name }} ({{ w.code }})
+      </label>
+      {% endfor %}
+    </div>
+    <small class="muted">留空 = 所有仓库</small>
+
+    <div style="background:#fef9c3;border:1px solid #eab308;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:13px;color:#854d0e">
+      <strong>安全提示：</strong>Token 创建后只能看到一次，无法再次查看，请立即复制并妥善保管。
+    </div>
+
+    <button type="submit" class="btn primary" style="margin-top:12px">创建 Token</button>
+  </form>
+</details>
+
+<!-- Token list -->
+{% if tokens %}
+<table class="role-matrix" style="width:100%">
+  <thead>
+    <tr>
+      <th style="text-align:left">名称</th>
+      <th style="text-align:left">仓库权限</th>
+      <th style="text-align:left">创建时间</th>
+      <th>状态</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for t in tokens %}
+    <tr>
+      <td>
+        <strong>{{ t.name }}</strong>
+        <small class="muted">#{{ t.id }}</small>
+      </td>
+      <td>
+        {% set whs = t.allowed_warehouse_codes_json %}
+        {% if whs == 'null' %}
+        <span class="muted">全部仓库</span>
+        {% else %}
+        <small>{{ whs }}</small>
+        {% endif %}
+      </td>
+      <td>
+        <small>{{ t.created_at }}</small>
+      </td>
+      <td>
+        {% if t.revoked_at %}
+        <span class="badge badge-error">已撤销</span>
+        {% else %}
+        <span class="badge badge-ok">正常</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if not t.revoked_at %}
+        <form method="post" action="{{ url_for('agent_tokens.revoke_token', token_id=t.id) }}"
+              onsubmit="return confirm('撤销后使用此 Token 的 Agent 将无法连接。确认撤销 {{ t.name }} 吗？')"
+              style="display:inline">
+          <button type="submit" class="btn btn-sm btn-danger">撤销</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted" style="margin-top:12px">暂无 Token，请先创建一个。</p>
+{% endif %}
+{% endblock %}

@@ -548,6 +548,9 @@ def approve(batch_id: int):
         "UPDATE stocktake_batches SET status = 'approved', loss_req_ids = ? WHERE id = ?",
         (",".join(str(i) for i in loss_req_ids), batch_id),
     )
+    from blueprints.procurement import mark_procurement_invalid
+    for item_id, _ in loss_items + gain_items:
+        mark_procurement_invalid(item_id)
     db.commit()
     audit("stocktake.approve", "batch", batch_id, {
         "losses": len(loss_items),

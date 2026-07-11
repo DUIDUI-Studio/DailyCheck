@@ -6,6 +6,7 @@ Run via:
     flask --app app create-warehouse <code> <name>
     flask --app app create-user <username> <password> [--admin]
     flask --app app assign-role <username> <warehouse_code> <role>
+    flask --app app create-agent-token <name> [--read-paths *] [--warehouses wh_001]
 """
 from __future__ import annotations
 
@@ -31,6 +32,8 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(assign_role_cmd)
     app.cli.add_command(list_users_cmd)
     app.cli.add_command(bootstrap_cmd)
+    app.cli.add_command(mcp_cmd)
+    app.cli.add_command(create_agent_token_cmd)
 
 
 @click.command("init-master")
@@ -256,3 +259,77 @@ def bootstrap_cmd(
     click.echo(
         f"\nBootstrap complete. Login: {admin_username} / {admin_password}"
     )
+
+
+@click.command("mcp")
+@click.option("--port", default=5100, help="MCP server port (stdio mode only binds to stdio)")
+def mcp_cmd(port: int) -> None:
+    """Start the MCP server (stdio transport)."""
+    import asyncio
+    from mcp_server.protocol.server import build_server
+    from mcp.server.stdio import stdio_server
+
+    async def run_server():
+        server = build_server()
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+
+    asyncio.run(run_server())
+
+
+@click.command("create-agent-token")
+@click.argument("name")
+@click.option("--read-paths", default="*", help="Allowed read paths (comma-separated, * = all)")
+@click.option("--write-paths", default="", help="Allowed write paths (comma-separated, * = all)")
+@click.option("--warehouses", default="", help="Allowed warehouse codes (comma-separated, empty = all)")
+def create_agent_token_cmd(name: str, read_paths: str, write_paths: str, warehouses: str) -> None:
+    """Create an agent token and print the raw secret.
+
+    Store the printed secret as DAILYCHECK_MCP_TOKEN in your environment.
+    Example: flask --app app create-agent-token my-agent --read-paths "*"
+    """
+    import secrets
+    from werkzeug.security import generate_password_hash
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = generate_password_hash(raw_token, method="pbkdf2:sha256")
+
+    import json
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _parse_paths(s: str) -> str:
+        if s == "*":
+            return json.dumps(["*"])
+        return json.dumps([p.strip() for p in s.split(",") if p.strip()])
+
+    def _parse_warehouses(s: str) -> str:
+        if not s.strip():
+            return "null"
+        return json.dumps([w.strip() for w in s.split(",") if w.strip()])
+
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id FROM users WHERE is_admin = 1 LIMIT 1"
+        ).fetchone()
+        created_by = row["id"] if row else 1
+
+        conn.execute(
+            """INSERT INTO agent_tokens
+               (name, token_hash, created_by, created_at,
+                allowed_read_paths_json, allowed_write_paths_json, allowed_warehouse_codes_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                name,
+                token_hash,
+                created_by,
+                now,
+                _parse_paths(read_paths),
+                _parse_paths(write_paths),
+                _parse_warehouses(warehouses),
+            ),
+        )
+        conn.commit()
+
+    click.echo(f"Token '{name}' created.")
+    click.echo(f"  DAILYCHECK_MCP_TOKEN={raw_token}")

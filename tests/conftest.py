@@ -23,6 +23,13 @@ def logged_client(tmp_path, monkeypatch):
     # 让 db 模块用临时路径
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    # Also patch config directly — several blueprints (forecast,
+    # procurement, notifications) import MASTER_DB from config at call
+    # time to bypass flask 'g', so without this patch the test would
+    # write to the real on-disk master.db and pollute it.
+    import config as config_module
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
 
     init_master_db()
     init_warehouse_db(wh_path)
@@ -48,6 +55,62 @@ def logged_client(tmp_path, monkeypatch):
     client = app.test_client()
     with client.session_transaction() as s:
         s["user_id"] = 1
+        s["warehouse_id"] = 1
+
+    return client, wh_path
+
+
+@pytest.fixture
+def staff_client(tmp_path, monkeypatch):
+    """Same temp-db layout as logged_client but the bound user has role=staff.
+
+    Adds a second user (id=2) bound to the same warehouse with role='staff'
+    and sets the session to that user. Used by forecast role-gate tests
+    (TASK 9).
+    """
+    import db as db_module
+    from db import init_master_db, init_warehouse_db
+
+    master_path = tmp_path / "master.db"
+    wh_dir = tmp_path / "warehouses"
+    wh_dir.mkdir()
+    wh_path = wh_dir / "wh_test.db"
+
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    import config as config_module
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
+
+    init_master_db()
+    init_warehouse_db(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (2, 'staff1', 'x', 0, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, created_at) "
+        "VALUES (1, 'wh_test', '测试仓', ?, ?)", (str(wh_path), ts))
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) "
+        "VALUES (1, 1, 'admin')")
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) "
+        "VALUES (2, 1, 'staff')")
+    m.commit()
+    m.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 2
         s["warehouse_id"] = 1
 
     return client, wh_path
