@@ -71,6 +71,7 @@
   <thead>
     <tr>
       <th style="text-align:left">名称</th>
+      <th style="text-align:left">Token</th>
       <th style="text-align:left">仓库权限</th>
       <th style="text-align:left">创建时间</th>
       <th>状态</th>
@@ -83,6 +84,25 @@
       <td>
         <strong>{{ t.name }}</strong>
         <small class="muted">#{{ t.id }}</small>
+      </td>
+      <td>
+        {% if t.token_value and not t.revoked_at %}
+        <div style="display:flex;gap:6px;align-items:center">
+          <input id="tk-{{ t.id }}" type="text" readonly value="{{ t.token_value }}"
+                 style="font-family:monospace;font-size:12px;padding:2px 6px;border:1px solid #86efac;border-radius:4px;background:#f0fdf4;width:320px" />
+          <button type="button" class="btn btn-sm" onclick="
+            (async()=>{
+              const el=document.getElementById('tk-{{ t.id }}');
+              try{await navigator.clipboard.writeText(el.value)}
+              catch{el.select();el.setSelectionRange(0,99999);document.execCommand('copy')}
+              this.textContent='已复制';
+              setTimeout(()=>this.textContent='复制',2000);
+            })();
+          ">复制</button>
+        </div>
+        {% else %}
+        <span class="muted">—</span>
+        {% endif %}
       </td>
       <td>
         {% set whs = t.allowed_warehouse_codes_json %}

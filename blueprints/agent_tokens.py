@@ -14,9 +14,34 @@ from datetime import datetime
 from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
 from werkzeug.security import generate_password_hash
 
-from config import MASTER_DB
+from config import MASTER_DB, SECRET_KEY
 from db import get_master_db
 from permissions import require_login
+
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    import hashlib, base64
+    # Derive a stable Fernet key from the app SECRET_KEY
+    key = base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest())
+    return Fernet(key)
+
+
+def _encrypt_token(raw: str) -> str:
+    return _fernet().encrypt(raw.encode()).decode()
+
+
+def _decrypt_token(encrypted: str) -> str:
+    return _fernet().decrypt(encrypted.encode()).decode()
+
+
+def _ensure_encrypted_token_col():
+    """Add encrypted_token column if it doesn't exist (zero-cost on repeated runs)."""
+    db = get_master_db()
+    cols = [r[1] for r in db.execute("PRAGMA table_info(agent_tokens)")]
+    if "encrypted_token" not in cols:
+        db.execute("ALTER TABLE agent_tokens ADD COLUMN encrypted_token TEXT")
+        db.commit()
 
 
 bp = Blueprint("agent_tokens", __name__)
@@ -47,14 +72,24 @@ def _parse_warehouses(s: str) -> str:
 @require_login
 def list_tokens():
     _require_admin()
+    _ensure_encrypted_token_col()
     db = get_master_db()
-    tokens = db.execute(
+    rows = db.execute(
         """SELECT id, name, created_by, created_at, revoked_at,
                   allowed_read_paths_json, allowed_write_paths_json,
-                  allowed_warehouse_codes_json
+                  allowed_warehouse_codes_json, encrypted_token
            FROM agent_tokens
            ORDER BY created_at DESC"""
     ).fetchall()
+    tokens = []
+    for row in rows:
+        token_value = None
+        if row["encrypted_token"] and not row["revoked_at"]:
+            try:
+                token_value = _decrypt_token(row["encrypted_token"])
+            except Exception:
+                token_value = None
+        tokens.append({**row, "token_value": token_value})
     warehouses = db.execute(
         "SELECT id, code, name FROM warehouses ORDER BY id"
     ).fetchall()
@@ -85,19 +120,21 @@ def create_token():
 
     raw_token = secrets.token_urlsafe(32)
     token_hash = generate_password_hash(raw_token, method="pbkdf2:sha256")
+    encrypted = _encrypt_token(raw_token)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = get_master_db()
     try:
         db.execute(
             """INSERT INTO agent_tokens
-               (name, token_hash, created_by, created_at,
+               (name, token_hash, encrypted_token, created_by, created_at,
                 allowed_read_paths_json, allowed_write_paths_json,
                 allowed_warehouse_codes_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 token_hash,
+                encrypted,
                 g.user["id"],
                 now,
                 _parse_paths(read_paths),
