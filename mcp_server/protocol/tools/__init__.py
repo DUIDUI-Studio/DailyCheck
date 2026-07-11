@@ -45,7 +45,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="movements_list",
             title="List Stock Movements",
-            description="List recent stock movements (outbound requests and stock adjustments) for a warehouse.",
+            description="List recent stock movements (outbound requests and stocktake adjustments) for a warehouse.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -153,6 +153,115 @@ def get_tools() -> list[Tool]:
                     },
                 },
                 "required": [],
+            },
+        ),
+        # Outbound tools
+        Tool(
+            name="outbound_create",
+            title="Create Outbound",
+            description="Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "Item ID",
+                    },
+                    "quantity": {
+                        "type": "number",
+                        "description": "Quantity to outbound (must be <= current stock)",
+                    },
+                    "warehouse_code": {
+                        "type": "string",
+                        "description": "Warehouse code (e.g. WH001)",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for outbound (optional)",
+                    },
+                },
+                "required": ["item_id", "quantity", "warehouse_code"],
+            },
+        ),
+        Tool(
+            name="outbound_list",
+            title="List Outbounds",
+            description="List outbound requests for a warehouse",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "warehouse_code": {
+                        "type": "string",
+                        "description": "Warehouse code (e.g. WH001)",
+                    }
+                },
+                "required": ["warehouse_code"],
+            },
+        ),
+        Tool(
+            name="outbound_rollback",
+            title="Rollback Outbound",
+            description="Roll back an outbound request: return stock to warehouse",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "integer",
+                        "description": "Outbound request ID to roll back",
+                    },
+                    "warehouse_code": {
+                        "type": "string",
+                        "description": "Warehouse code (e.g. WH001)",
+                    },
+                },
+                "required": ["request_id", "warehouse_code"],
+            },
+        ),
+        # Consumption tools
+        Tool(
+            name="warehouse_consumption",
+            title="Warehouse Consumption Summary",
+            description="Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "warehouse_code": {
+                        "type": "string",
+                        "description": "Warehouse code (e.g. WH001)",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Time window: 7 or 30 days (default 7)",
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Sort by: qty (default), value, turnover, name",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max items to return (default 100, max 200)",
+                    },
+                },
+                "required": ["warehouse_code"],
+            },
+        ),
+        Tool(
+            name="item_consumption",
+            title="Item Consumption Detail",
+            description="Return consumption stats for a single item: 7d / 30d / monthly totals, weekly breakdown, and daily avg.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "Item ID",
+                    },
+                    "warehouse_code": {
+                        "type": "string",
+                        "description": "Warehouse code (e.g. WH001)",
+                    },
+                },
+                "required": ["item_id", "warehouse_code"],
             },
         ),
     ]

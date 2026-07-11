@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 
 from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import BASE_DIR, MASTER_DB, ROLE_RANK, WAREHOUSE_DB_DIR
 from db import get_master_db, init_warehouse_db
@@ -89,7 +89,7 @@ def create_user():
         db.execute(
             """INSERT INTO users (username, password_hash, is_admin, created_at)
                VALUES (?, ?, ?, ?)""",
-            (username, generate_password_hash(password), 1 if is_admin else 0, now),
+            (username, generate_password_hash(password, method="pbkdf2:sha256"), 1 if is_admin else 0, now),
         )
         new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         db.commit()
@@ -196,7 +196,7 @@ def reset_password(user_id: int):
         abort(404)
     db.execute(
         "UPDATE users SET password_hash=? WHERE id=?",
-        (generate_password_hash(password), user_id),
+        (generate_password_hash(password, method="pbkdf2:sha256"), user_id),
     )
     db.commit()
     _log_admin_action(f"reset password for user #{user_id} {target['username']}")

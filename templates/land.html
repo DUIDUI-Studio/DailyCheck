@@ -9,18 +9,18 @@
 
 <div class="land-grid">
   <a class="land-card" href="{{ url_for('items.inventory_view') }}">
-    <h3>库存管理</h3>
-    <p>盘点 / 入库 / 出库 / 调整 / 库存查阅</p>
+    <h3>库存查阅</h3>
+    <p>盘点 / 入库 / 出库 / 库存查阅</p>
   </a>
   <a class="land-card" href="{{ url_for('production.products_list') }}">
     <h3>生产录入</h3>
     <p>产品配方 / 按产出量自动领料</p>
   </a>
+  {% if g.user and g.user['is_admin'] %}
   <a class="land-card" href="{{ url_for('procurement.procurement_store') }}">
     <h3>采购建议</h3>
     <p>基于预测 + 安全库存 + 在途，缺什么补什么</p>
   </a>
-  {% if g.user and (g.user['is_admin'] or current_role in ('manager', 'admin')) %}
   <a class="land-card" href="{{ url_for('forecast.forecast_index') }}">
     <h3>预测看板</h3>
     <p>加权日均 + 未来 14 天预测量，可手动重算</p>

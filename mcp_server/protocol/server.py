@@ -21,6 +21,15 @@ from mcp_server.protocol.tools.procurement import (
     procurement_store_impl,
     procurement_hub_impl,
 )
+from mcp_server.protocol.tools.outbound import (
+    outbound_create_impl,
+    outbound_list_impl,
+    outbound_rollback_impl,
+)
+from mcp_server.protocol.tools.consumption import (
+    warehouse_consumption_impl,
+    item_consumption_impl,
+)
 from mcp_server.infra.errors import McpError
 
 logger = logging.getLogger(__name__)
@@ -34,6 +43,11 @@ _tool_map = {
     "item_forecast": item_forecast_impl,
     "procurement_store": procurement_store_impl,
     "procurement_hub": procurement_hub_impl,
+    "outbound_create": outbound_create_impl,
+    "outbound_list": outbound_list_impl,
+    "outbound_rollback": outbound_rollback_impl,
+    "warehouse_consumption": warehouse_consumption_impl,
+    "item_consumption": item_consumption_impl,
 }
 
 

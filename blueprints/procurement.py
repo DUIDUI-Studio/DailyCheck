@@ -21,7 +21,7 @@ from flask import (
 
 import config  # use config.MASTER_DB at call time so monkeypatch works
 from db import get_master_db, get_warehouse_db, init_master_db
-from permissions import require_role
+from permissions import require_platform_admin, require_role
 from .procurement_pure import (
     aggregate_hub,
     compute_safety_stock,
@@ -331,6 +331,7 @@ def _store_procurement_json(wh_code: str) -> dict:
 
 
 @bp.route("/procurement/store", methods=["GET"])
+@require_platform_admin
 @require_role("staff")
 def procurement_store():
     wh_code = request.args.get("warehouse_code") or (

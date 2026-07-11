@@ -19,8 +19,7 @@
     {% if g.user %}
       {% if g.user['is_admin'] %}
       <a href="{{ url_for('users.list_users') }}">账号管理</a>
-      {% endif %}
-      {% if current_role != 'staff' %}
+      <a href="{{ url_for('agent_tokens.list_tokens') }}">Agent Token</a>
       <a href="{{ url_for('items.items_list') }}">品类与品项</a>
       {% endif %}
     {% endif %}
@@ -29,16 +28,14 @@
     <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
     <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>
     <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
-    <a href="{{ url_for('adjustment.adjustment_list') }}">调整单</a>
     <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
     <a href="{{ url_for('production.products_list') }}">生产录入</a>
-    {# Phase 1 nav entries — visibility per PRD §1.3 #}
-    {# /forecast: manager+ only (subproject 1) #}
-    {% if g.user and (g.user['is_admin'] or current_role in ('manager', 'admin')) %}
+    {# /forecast: admin only #}
+    {% if g.user and g.user['is_admin'] %}
     <a href="{{ url_for('forecast.forecast_index') }}">预测</a>
     {% endif %}
-    {# /procurement/store: staff+ (everyone logged in) #}
-    {% if g.user %}
+    {# /procurement/store: admin only #}
+    {% if g.user and g.user['is_admin'] %}
     <a href="{{ url_for('procurement.procurement_store') }}">采购建议</a>
     {% endif %}
     {# /notifications: everyone logged in, with unread badge (PRD §1.1 A6) #}
@@ -88,16 +85,13 @@
     <nav class="mobile-nav mobile-only">
       {% if g.user and g.user['is_admin'] %}
       <a href="{{ url_for('users.list_users') }}">账号</a>
+      <a href="{{ url_for('items.items_list') }}">品项</a>
       {% endif %}
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       <a href="{{ url_for('core.summary') }}">汇总</a>
       <a href="{{ url_for('items.inventory_view') }}">库存</a>
-      {% if current_role != 'staff' %}
-      <a href="{{ url_for('items.items_list') }}">品项</a>
-      {% endif %}
       <a href="{{ url_for('stocktake.stocktake_list') }}">盘点</a>
       <a href="{{ url_for('restock.restock_list') }}">入库</a>
-      <a href="{{ url_for('adjustment.adjustment_list') }}">调整</a>
       <a href="{{ url_for('outbound.outbound_list') }}">出库</a>
       <a href="{{ url_for('production.products_list') }}">生产</a>
     </nav>

@@ -26,7 +26,7 @@ def authenticate(authorization_header: str) -> AuthContext | None:
         return None
     with master_connection() as conn:
         rows = conn.execute(
-            "SELECT id, token_hash, allowed_read_paths_json, "
+            "SELECT id, token_hash, revoked_at, allowed_read_paths_json, "
             "allowed_write_paths_json, allowed_warehouse_codes_json "
             "FROM agent_tokens WHERE token_hash IS NOT NULL"
         ).fetchall()

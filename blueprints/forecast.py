@@ -24,7 +24,7 @@ from pathlib import Path
 from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
-from permissions import require_role
+from permissions import require_platform_admin, require_role
 from .forecast_pure import (
     classify_confidence,
     compute_daily_avg,
@@ -168,6 +168,7 @@ def forecast_product(product_id: int):
 
 
 @bp.route("/forecast", methods=["GET"])
+@require_platform_admin
 @require_role("manager")
 def forecast_index():
     """Render the forecast dashboard for the current warehouse.
