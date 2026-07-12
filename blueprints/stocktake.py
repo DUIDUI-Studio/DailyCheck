@@ -255,7 +255,8 @@ def stocktake_start():
 def stocktake_session():
     db = get_warehouse_db()
     items_data = db.execute(
-        """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock, c.name AS category_name
+        """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock,
+                  i.aux_unit, i.aux_rate, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
            ORDER BY c.name, i.name"""
     ).fetchall()
@@ -267,14 +268,24 @@ def stocktake_session():
 def stocktake_submit():
     db = get_warehouse_db()
     note = request.form.get("note", "").strip()
-    items_data = db.execute("SELECT id, quantity FROM items").fetchall()
+    items_data = db.execute("SELECT id, quantity, aux_unit, aux_rate FROM items").fetchall()
+    from ._helpers import aux_to_base
 
     changed_rows = []
     for item in items_data:
         raw = request.form.get(f"actual_{item['id']}", "").strip()
         if raw == "":
             continue
-        actual_quantity = parse_qty(raw)
+        qty_raw = parse_qty(raw)
+        unit_choice = request.form.get(f"actual_{item['id']}_unit", "base")
+        if unit_choice == "aux":
+            aux_rate = float(item["aux_rate"] or 0)
+            if aux_rate <= 0:
+                flash("存在品项未启用辅单位，请用基础单位录入")
+                return redirect(url_for("stocktake.stocktake_session"))
+            actual_quantity = aux_to_base(qty_raw, aux_rate)
+        else:
+            actual_quantity = qty_raw
         previous_quantity = parse_qty(item["quantity"])
         diff = actual_quantity - previous_quantity
         changed_rows.append((int(item["id"]), previous_quantity, actual_quantity, diff))

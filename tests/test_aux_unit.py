@@ -359,3 +359,32 @@ def test_restock_submit_with_aux_unit(logged_client):
         (item_id,)).fetchone()
     assert req["requested_quantity"] == pytest.approx(2.0)
     conn.close()
+
+
+# --- 盘点 submit 使用辅单位 ---
+
+def test_stocktake_submit_with_aux_unit(logged_client):
+    """盘 18 个 (aux_unit='个', aux_rate=12, previous=10 箱) → 实盘 1.5 箱，diff=-8.5 箱。"""
+    client, wh_path = logged_client
+    from tests.conftest import _seed_item, _wh
+
+    item_id, _ = _seed_item(wh_path, "test-milk2", qty=10, unit_cost=5)
+    conn = _wh(wh_path)
+    conn.execute("UPDATE items SET aux_unit='个', aux_rate=12 WHERE id=?", (item_id,))
+    conn.commit()
+    conn.close()
+
+    client.post("/stocktake/submit", data={
+        f"actual_{item_id}": "18",
+        f"actual_{item_id}_unit": "aux",
+        "note": "test",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute(
+        "SELECT previous_quantity, actual_quantity, diff FROM stocktakes WHERE item_id=? ORDER BY id DESC LIMIT 1",
+        (item_id,)).fetchone()
+    assert r["actual_quantity"] == pytest.approx(1.5)
+    assert r["previous_quantity"] == pytest.approx(10.0)
+    assert r["diff"] == pytest.approx(-8.5)
+    conn.close()
