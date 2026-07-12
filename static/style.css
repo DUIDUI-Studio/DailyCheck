@@ -802,6 +802,7 @@ code {
   border-radius: 14px;
   background: #fafbfd;
   min-height: 0;
+  cursor: pointer;
 }
 .entry-row.is-warn { background: #fef9c3; border-color: #fde68a; }
 .entry-row.is-low { background: #fee2e2; border-color: #fca5a5; }
@@ -1270,6 +1271,7 @@ tr.is-hidden { display: none; }
   background: rgba(0,0,0,0.35);
   display: flex; align-items: center; justify-content: center;
 }
+.modal-overlay[hidden] { display: none !important; }
 .modal {
   background: #fff; border-radius: 16px;
   width: 360px; max-width: 90vw;

@@ -49,7 +49,32 @@
   </div>
 </form>
 
+<!-- Modal (must be before script that references it) -->
+<div id="modal-overlay" class="modal-overlay" hidden onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <h3 id="modal-name"></h3>
+    <p class="modal-stock" id="modal-stock"></p>
+
+    <div class="pill-group" id="modal-pills">
+      <button class="pill pill--active" data-u="base" id="pill-base"></button>
+      <button class="pill" data-u="aux" id="pill-aux"></button>
+    </div>
+
+    <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">数量</label>
+    <input id="modal-qty" type="number" step="0.01" min="0" inputmode="decimal"
+           style="width:100%;padding:10px 12px;font-size:16px;border:1.5px solid var(--border);border-radius:10px;box-sizing:border-box" />
+    <div id="modal-hint" class="calc-hint" hidden style="margin:8px 0 0"></div>
+
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="btn-cancel" style="flex:1" onclick="closeModal()">取消</button>
+      <button class="btn" style="flex:1" onclick="confirmModal()">确认</button>
+    </div>
+  </div>
+</div>
+
 <script>
+  document.addEventListener('DOMContentLoaded', function () {
   /* ---- category filter (unchanged) ---- */
   (function () {
     var bar = document.querySelector('[data-cat-bar]');
@@ -88,7 +113,7 @@
 
   var _currentId = null, _currentUnit = null, _currentAuxUnit = null, _currentAuxRate = 0;
 
-  function openModal(el) {
+  window.openModal = function(el) {
     _currentId = el.getAttribute('data-id');
     var name = el.getAttribute('data-name');
     var unit = el.getAttribute('data-unit');
@@ -121,12 +146,12 @@
     updateModalHint();
 
     modalOverlay.removeAttribute('hidden');
-  }
+  };
 
-  function closeModal(e) {
+  window.closeModal = function(e) {
     if (e && e.target !== modalOverlay) return;
     modalOverlay.setAttribute('hidden', '');
-  }
+  };
 
   function setActivePill(u) {
     var btns = document.querySelectorAll('#modal-pills .pill');
@@ -161,7 +186,7 @@
     }
   }
 
-  function confirmModal() {
+  window.confirmModal = function() {
     var v = modalQty.value.trim();
     var activePill = document.querySelector('#modal-pills .pill--active');
     if (!activePill) return;
@@ -209,30 +234,7 @@
     }
 
     closeModal();
-  }
+  };
+  });
 </script>
-
-<!-- Modal -->
-<div id="modal-overlay" class="modal-overlay" hidden onclick="closeModal(event)">
-  <div class="modal" onclick="event.stopPropagation()">
-    <button class="modal-close" onclick="closeModal()">&times;</button>
-    <h3 id="modal-name"></h3>
-    <p class="modal-stock" id="modal-stock"></p>
-
-    <div class="pill-group" id="modal-pills">
-      <button class="pill pill--active" data-u="base" id="pill-base"></button>
-      <button class="pill" data-u="aux" id="pill-aux"></button>
-    </div>
-
-    <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">数量</label>
-    <input id="modal-qty" type="number" step="0.01" min="0" inputmode="decimal"
-           style="width:100%;padding:10px 12px;font-size:16px;border:1.5px solid var(--border);border-radius:10px;box-sizing:border-box" />
-    <div id="modal-hint" class="calc-hint" hidden style="margin:8px 0 0"></div>
-
-    <div style="display:flex;gap:10px;margin-top:16px">
-      <button class="btn-cancel" style="flex:1" onclick="closeModal()">取消</button>
-      <button class="btn" style="flex:1" onclick="confirmModal()">确认</button>
-    </div>
-  </div>
-</div>
 {% endblock %}
