@@ -15,3 +15,6 @@ error.log
 # git, but the actual db files stay local.
 db/master.db
 db/warehouses/*.db
+
+# Superpowers brainstorming sessions (mockups, scratch)
+.superpowers/
