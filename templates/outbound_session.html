@@ -35,16 +35,26 @@
           <span>安全 <strong>{{ i.safety_stock | fmt_qty if i.safety_stock is not none else 0 }}</strong> {{ i.unit }}</span>
         </div>
         <div class="er-input">
+          {% if i.aux_unit and i.aux_rate > 0 %}
+          <div class="seg" data-rate="{{ i.aux_rate }}">
+            <button type="button" class="active" data-u="base">{{ i.unit }}</button>
+            <button type="button" data-u="aux">{{ i.aux_unit }}</button>
+          </div>
+          {% endif %}
           <input
             type="number"
             step="0.01"
             min="0"
             inputmode="decimal"
             name="outbound_{{ i.id }}"
+            data-base-unit="{{ i.unit }}"
+            data-aux-unit="{{ i.aux_unit or '' }}"
             placeholder="0"
             autocomplete="off"
           />
+          <input type="hidden" name="outbound_{{ i.id }}_unit" value="base" />
           <span class="er-unit">{{ i.unit }}</span>
+          <span class="calc-hint" hidden></span>
         </div>
       </div>
     {% endfor %}
@@ -78,6 +88,56 @@
       chips[k].addEventListener('click', (function (c) {
         return function () { apply(c); };
       })(chips[k].getAttribute('data-cat')));
+    }
+  })();
+
+  // 单位 segment 切换 + 实时换算
+  (function () {
+    var rows = document.querySelectorAll('.entry-row');
+    for (var i = 0; i < rows.length; i++) {
+      (function (row) {
+        var seg = row.querySelector('.seg');
+        if (!seg) return;
+        var rate = parseFloat(seg.getAttribute('data-rate') || '0');
+        var baseUnit = row.querySelector('input[data-base-unit]');
+        var baseName = baseUnit ? baseUnit.getAttribute('data-base-unit') : '';
+        var auxName = baseUnit ? baseUnit.getAttribute('data-aux-unit') : '';
+        var input = row.querySelector('input[type=number]');
+        var hidden = row.querySelector('input[type=hidden]');
+        var label = row.querySelector('.er-unit');
+        var hint = row.querySelector('.calc-hint');
+        var btns = seg.querySelectorAll('button');
+        for (var j = 0; j < btns.length; j++) {
+          btns[j].addEventListener('click', function () {
+            for (var k = 0; k < btns.length; k++) btns[k].classList.remove('active');
+            this.classList.add('active');
+            var u = this.getAttribute('data-u');
+            hidden.value = u;
+            if (u === 'aux') {
+              label.textContent = auxName;
+              input.setAttribute('placeholder', '0 ' + auxName);
+            } else {
+              label.textContent = baseName;
+              input.setAttribute('placeholder', '0');
+            }
+            updateHint();
+          });
+        }
+        function updateHint() {
+          var v = parseFloat(input.value || '0');
+          if (isNaN(v) || v === 0) { if (hint) hint.setAttribute('hidden', ''); return; }
+          if (hidden.value === 'aux' && rate > 0) {
+            var base = Math.round((v / rate) * 100) / 100;
+            if (hint) {
+              hint.textContent = v + ' ' + auxName + ' ≈ ' + base + ' ' + baseName;
+              hint.removeAttribute('hidden');
+            }
+          } else {
+            if (hint) hint.setAttribute('hidden', '');
+          }
+        }
+        input.addEventListener('input', updateHint);
+      })(rows[i]);
     }
   })();
 </script>

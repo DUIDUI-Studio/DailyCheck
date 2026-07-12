@@ -2,6 +2,8 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from blueprints._helpers import aux_to_base, base_to_aux, grams_to_stock
 
 # --- 纯函数单元测试 ---
@@ -279,4 +281,51 @@ def test_create_item_negative_aux_rate_rejected(logged_client):
     conn = _wh(wh_path)
     r = conn.execute("SELECT id FROM items WHERE name='负品项'").fetchone()
     assert r is None
+    conn.close()
+
+
+# --- 出库 submit 使用辅单位 ---
+
+def test_outbound_submit_with_aux_unit(logged_client):
+    """24 个 (aux_unit='个', aux_rate=12) 出库 = 2 箱扣减。"""
+    client, wh_path = logged_client
+    from tests.conftest import _seed_item, _wh
+
+    item_id, _ = _seed_item(wh_path, "test-shoyu", qty=10, unit_cost=10)
+    conn = _wh(wh_path)
+    conn.execute("UPDATE items SET aux_unit='个', aux_rate=12 WHERE id=?", (item_id,))
+    conn.commit()
+    conn.close()
+
+    client.post("/outbound/submit", data={
+        f"outbound_{item_id}": "24",
+        f"outbound_{item_id}_unit": "aux",
+        "reason": "test",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT quantity FROM items WHERE id=?", (item_id,)).fetchone()
+    # 10 箱 - 2 箱 = 8 箱
+    assert r["quantity"] == pytest.approx(8.0)
+    req = conn.execute(
+        "SELECT requested_quantity FROM outbound_requests WHERE item_id=? ORDER BY id DESC LIMIT 1",
+        (item_id,)).fetchone()
+    assert req["requested_quantity"] == pytest.approx(2.0)
+    conn.close()
+
+
+def test_outbound_submit_with_base_unit_default(logged_client):
+    """不传 _unit 字段，默认 base（基础单位），保持向后兼容。"""
+    client, wh_path = logged_client
+    from tests.conftest import _seed_item, _wh
+
+    item_id, _ = _seed_item(wh_path, "test-plain", qty=5, unit_cost=10)
+    client.post("/outbound/submit", data={
+        f"outbound_{item_id}": "1",
+        "reason": "test",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT quantity FROM items WHERE id=?", (item_id,)).fetchone()
+    assert r["quantity"] == pytest.approx(4.0)
     conn.close()
