@@ -175,6 +175,8 @@ CREATE TABLE IF NOT EXISTS items (
     unit TEXT NOT NULL DEFAULT '件',
     unit_cost REAL NOT NULL DEFAULT 0,
     gram_per_unit REAL NOT NULL DEFAULT 0,
+    aux_unit TEXT,
+    aux_rate REAL NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (category_id) REFERENCES categories(id)
 );
@@ -381,4 +383,18 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN gram_per_unit REAL NOT NULL DEFAULT 0"
             )
+        if "aux_unit" not in item_cols:
+            conn.execute("ALTER TABLE items ADD COLUMN aux_unit TEXT")
+        if "aux_rate" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN aux_rate REAL NOT NULL DEFAULT 0"
+            )
+        # 一次性把旧启用克的行同步到 aux_unit/aux_rate（幂等：仅当 aux_rate=0
+        # 且 gram_per_unit>0 且 aux_unit IS NULL 时执行）
+        conn.execute(
+            """UPDATE items SET aux_rate = gram_per_unit, aux_unit = '克'
+               WHERE aux_rate = 0
+                 AND gram_per_unit > 0
+                 AND aux_unit IS NULL"""
+        )
         conn.commit()
