@@ -49,21 +49,32 @@
     <input name="unit" placeholder="件" />
   </label>
   <label>
-    <span>每单位克重（克，0=不启用）</span>
-    <input name="gram_per_unit" type="number" min="0" step="0.01" placeholder="0" />
+    <span>辅单位</span>
+    <select name="aux_unit">
+      <option value="">无</option>
+      <option value="克">克</option>
+      <option value="个">个</option>
+      <option value="条">条</option>
+      <option value="袋">袋</option>
+      <option value="瓶">瓶</option>
+    </select>
+  </label>
+  <label>
+    <span>1 基础单位 = N 辅单位</span>
+    <input name="aux_rate" type="number" min="0" step="0.01" placeholder="0" />
   </label>
   <button type="submit">新增库存品</button>
 </form>
 
 <h3>品项列表</h3>
 <table>
-  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th><th>单价（¥）</th><th>克重</th><th>更新时间</th><th>操作</th></tr>
+  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th><th>单价（¥）</th><th>辅单位</th><th>更新时间</th><th>操作</th></tr>
   {% for i in items %}
   <tr data-cat="{{ i.category_name }}">
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
     <td>{{ i.quantity | fmt_qty }} {{ i.unit }}</td><td>{{ i.safety_stock | fmt_qty }}</td>
     <td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>
-    <td>{% if i.gram_per_unit and i.gram_per_unit > 0 %}{{ i.gram_per_unit | fmt_qty }} g/件{% else %}—{% endif %}</td>
+    <td>{% if i.aux_unit and i.aux_rate > 0 %}{{ i.aux_rate | fmt_qty }} {{ i.aux_unit }}/{{ i.unit }}{% else %}—{% endif %}</td>
     <td>{{ i.updated_at }}</td>
     <td class="inline">
       <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">编辑</a>
