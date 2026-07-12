@@ -1263,3 +1263,43 @@ tr.is-hidden { display: none; }
   display: inline-block;
 }
 .calc-hint[hidden] { display: none; }
+
+/* Modal overlay + dialog */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 999;
+  background: rgba(0,0,0,0.35);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: #fff; border-radius: 16px;
+  width: 360px; max-width: 90vw;
+  padding: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+  position: relative;
+}
+.modal h3 { margin: 0 0 4px; font-size: 16px; }
+.modal .modal-stock { font-size: 13px; color: var(--muted); margin-bottom: 14px; }
+.modal-close {
+  position: absolute; top: 12px; right: 16px;
+  background: none; border: none; font-size: 18px;
+  color: var(--muted); cursor: pointer; padding: 4px;
+}
+
+/* Pill group — separate rounded pills */
+.pill-group {
+  display: flex; gap: 12px; margin-bottom: 14px;
+}
+.pill {
+  border: 1.5px solid var(--border); border-radius: 999px;
+  background: transparent; color: var(--muted);
+  font-size: 13px; padding: 6px 18px; cursor: pointer;
+}
+.pill--active {
+  border-color: var(--brand); background: var(--brand); color: #fff;
+}
+
+/* Filled card state */
+.card--filled { background: #ecfdf5 !important; }
+.card-summary {
+  font-size: 11px; color: #0f766e; text-align: right;
+  margin-top: 4px;
+}
