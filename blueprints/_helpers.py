@@ -103,6 +103,30 @@ def grams_to_stock(grams: float, gram_per_unit: float) -> float:
     )
 
 
+def aux_to_base(aux_qty: float, aux_rate: float) -> float:
+    """辅单位 → 基础单位。aux_rate<=0 表示无辅单位，原样返回（防御）。"""
+    if aux_rate <= 0:
+        return float(Decimal(str(aux_qty)).quantize(Decimal('0.01')))
+    return float(
+        (Decimal(str(aux_qty)) / Decimal(str(aux_rate)))
+        .quantize(Decimal('0.01'))
+    )
+
+
+def base_to_aux(base_qty: float, aux_rate: float) -> float:
+    """基础单位 → 辅单位（仅用于显示换算预览）。aux_rate<=0 返回原值。"""
+    if aux_rate <= 0:
+        return float(Decimal(str(base_qty)).quantize(Decimal('0.01')))
+    return float(
+        (Decimal(str(base_qty)) * Decimal(str(aux_rate)))
+        .quantize(Decimal('0.01'))
+    )
+
+
+# 向后兼容：grams_to_stock 是 aux_to_base 的特例
+# （但生产代码目前直接定义 grams_to_stock，这里保留兼容别名给测试与未来使用）
+
+
 def fmt_qty(value) -> str:
     """Format a quantity for display: trim trailing zeros but keep
     up to 2 decimal places. Decimal('1.50') → '1.5' (but display
