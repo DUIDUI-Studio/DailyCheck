@@ -36,7 +36,8 @@ def restock_start():
 def restock_session():
     db = get_warehouse_db()
     items_data = db.execute(
-        """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock, c.name AS category_name
+        """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock,
+                  i.aux_unit, i.aux_rate, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
            ORDER BY c.name, i.name"""
     ).fetchall()
@@ -48,15 +49,25 @@ def restock_session():
 def restock_submit():
     db = get_warehouse_db()
     reason = request.form.get("reason", "").strip()
-    items_data = db.execute("SELECT id FROM items").fetchall()
+    items_data = db.execute("SELECT id, aux_unit, aux_rate FROM items").fetchall()
+    from ._helpers import aux_to_base
     rows = []
     for item in items_data:
         raw = request.form.get(f"restock_{item['id']}", "").strip()
         if raw == "":
             continue
-        qty = parse_qty(raw)
-        if qty <= 0:
+        qty_raw = parse_qty(raw)
+        if qty_raw <= 0:
             continue
+        unit_choice = request.form.get(f"restock_{item['id']}_unit", "base")
+        if unit_choice == "aux":
+            aux_rate = float(item["aux_rate"] or 0)
+            if aux_rate <= 0:
+                flash("存在品项未启用辅单位，请用基础单位录入")
+                return redirect(url_for("restock.restock_session"))
+            qty = aux_to_base(qty_raw, aux_rate)
+        else:
+            qty = qty_raw
         rows.append((int(item["id"]), qty))
     if not rows:
         flash("请至少填写一个补货数量")
