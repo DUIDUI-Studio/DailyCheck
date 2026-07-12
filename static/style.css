@@ -1233,3 +1233,33 @@ tr.is-hidden { display: none; }
   gap: 1rem;
   margin-bottom: 1rem;
 }
+
+/* 出入库/盘点单位选择 segment + 换算提示 */
+.seg {
+  display: inline-flex;
+  background: #eef2f6;
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+.seg button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.seg button.active { background: var(--brand); color: #fff; }
+.calc-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--brand-ink);
+  background: #d9f5ef;
+  padding: 4px 8px;
+  border-radius: 8px;
+  display: inline-block;
+}
+.calc-hint[hidden] { display: none; }
