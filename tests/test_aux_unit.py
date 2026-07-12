@@ -163,3 +163,120 @@ def test_migrate_idempotent(tmp_path):
     assert r[0] == "个"
     assert r[1] == 999
     conn.close()
+
+
+# --- 品项编辑保存测试 ---
+
+
+def test_edit_item_switches_from_gram_to_piece_blocked_if_bom(logged_client):
+    """被 product_bom 引用且原启用克时禁止切走克。"""
+    client, wh_path = logged_client
+    # seed item 启用克
+    from tests.conftest import _seed_item, _wh
+    item_id, _ = _seed_item(wh_path, "test-milk", qty=10, unit_cost=2.0, gram_per_unit=1000)
+    conn = _wh(wh_path)
+    # 同步写入 aux_unit（旧 _seed_item 不带这俩列；手动补）
+    conn.execute("UPDATE items SET aux_unit='克', aux_rate=1000 WHERE id=?", (item_id,))
+    # 建 product + product_bom 引用该 item
+    from datetime import datetime
+    ts2 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute("INSERT INTO products (name, unit, note, created_at) VALUES ('p1','件','',?)", (ts2,))
+    pid = cur.lastrowid
+    conn.execute("INSERT INTO product_bom (product_id, item_id, qty_per_unit) VALUES (?, ?, 100)", (pid, item_id))
+    conn.commit()
+    conn.close()
+
+    # 尝试切到 '个' → 应被拒绝
+    client.post(f"/items/{item_id}/edit", data={
+        "name": "test-milk", "category_id": "1",
+        "aux_unit": "个", "aux_rate": "12",
+        "safety_stock": "0", "unit_cost": "2", "unit": "箱",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT aux_unit, aux_rate, gram_per_unit FROM items WHERE id=?", (item_id,)).fetchone()
+    # 应保留为克
+    assert r["aux_unit"] == "克"
+    assert r["aux_rate"] == 1000
+    assert r["gram_per_unit"] == 1000
+    conn.close()
+
+
+def test_edit_item_switches_from_gram_ok_if_no_bom(logged_client):
+    """无 product_bom 引用时允许切走克，gram_per_unit 落为 0。"""
+    client, wh_path = logged_client
+    from tests.conftest import _seed_item, _wh
+
+    item_id, _ = _seed_item(wh_path, "test-shake", qty=5, unit_cost=2.0, gram_per_unit=1000)
+    conn = _wh(wh_path)
+    conn.execute("UPDATE items SET aux_unit='克', aux_rate=1000 WHERE id=?", (item_id,))
+    conn.commit()
+    conn.close()
+
+    client.post(f"/items/{item_id}/edit", data={
+        "name": "test-shake", "category_id": "1",
+        "aux_unit": "个", "aux_rate": "12",
+        "safety_stock": "0", "unit_cost": "2", "unit": "箱",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT aux_unit, aux_rate, gram_per_unit FROM items WHERE id=?", (item_id,)).fetchone()
+    assert r["aux_unit"] == "个"
+    assert r["aux_rate"] == 12
+    assert r["gram_per_unit"] == 0
+    conn.close()
+
+
+def test_create_item_with_game_syncs_gram_per_unit(logged_client):
+    """新建 item aux_unit='克' 同步写 gram_per_unit。"""
+    client, wh_path = logged_client
+    from tests.conftest import _wh
+
+    client.post("/items", data={
+        "name": "牛乳1L", "category_id": "1",
+        "quantity": "10", "safety_stock": "2", "unit_cost": "100",
+        "unit": "箱", "aux_unit": "克", "aux_rate": "1000",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT aux_unit, aux_rate, gram_per_unit FROM items WHERE name='牛乳1L'").fetchone()
+    assert r["aux_unit"] == "克"
+    assert r["aux_rate"] == 1000
+    assert r["gram_per_unit"] == 1000
+    conn.close()
+
+
+def test_create_item_no_aux_unit(logged_client):
+    """新建 item 不填 aux_unit → aux_unit=NULL, aux_rate=0。"""
+    client, wh_path = logged_client
+    from tests.conftest import _wh
+
+    client.post("/items", data={
+        "name": "无辅品项", "category_id": "1",
+        "quantity": "5", "safety_stock": "0", "unit_cost": "50",
+        "unit": "包", "aux_unit": "", "aux_rate": "0",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT aux_unit, aux_rate, gram_per_unit FROM items WHERE name='无辅品项'").fetchone()
+    assert r["aux_unit"] is None
+    assert r["aux_rate"] == 0
+    assert r["gram_per_unit"] == 0
+    conn.close()
+
+
+def test_create_item_negative_aux_rate_rejected(logged_client):
+    """负 aux_rate 应被 flash 报错，不写入。"""
+    client, wh_path = logged_client
+    from tests.conftest import _wh
+
+    client.post("/items", data={
+        "name": "负品项", "category_id": "1",
+        "quantity": "5", "safety_stock": "0", "unit_cost": "50",
+        "unit": "包", "aux_unit": "个", "aux_rate": "-3",
+    }, follow_redirects=True)
+
+    conn = _wh(wh_path)
+    r = conn.execute("SELECT id FROM items WHERE name='负品项'").fetchone()
+    assert r is None
+    conn.close()

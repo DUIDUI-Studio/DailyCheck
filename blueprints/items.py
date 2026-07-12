@@ -26,25 +26,30 @@ def items_list():
         safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
-        gram_per_unit = parse_qty(request.form.get("gram_per_unit", "0"))
+        aux_unit = request.form.get("aux_unit", "").strip() or None
+        aux_rate = parse_qty(request.form.get("aux_rate", "0"))
 
-        if gram_per_unit < 0:
-            flash("每单位克重不能为负数")
+        if aux_rate < 0:
+            flash("辅单位换算率不能为负数")
             return redirect(url_for("items.items_list"))
         if unit_cost < 0:
             flash("进货单价不能为负数")
             return redirect(url_for("items.items_list"))
-
         if not name or not category_id:
             flash("名称、品类为必填")
             return redirect(url_for("items.items_list"))
 
+        # gram_per_unit 同步：仅当 aux_unit=='克'
+        gram_per_unit = aux_rate if aux_unit == "克" else 0.0
+
         try:
             db.execute(
                 """INSERT INTO items
-                   (sku, name, category_id, quantity, safety_stock, unit_cost, unit, gram_per_unit, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (gen_sku(), name, int(category_id), quantity, safety_stock, unit_cost, unit, gram_per_unit, now()),
+                   (sku, name, category_id, quantity, safety_stock, unit_cost,
+                    unit, gram_per_unit, aux_unit, aux_rate, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (gen_sku(), name, int(category_id), quantity, safety_stock,
+                 unit_cost, unit, gram_per_unit, aux_unit, aux_rate, now()),
             )
             new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
             db.commit()
@@ -84,9 +89,10 @@ def edit_item(item_id: int):
         safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
-        gram_per_unit = parse_qty(request.form.get("gram_per_unit", "0"))
-        if gram_per_unit < 0:
-            flash("每单位克重不能为负数")
+        aux_unit = request.form.get("aux_unit", "").strip() or None
+        aux_rate = parse_qty(request.form.get("aux_rate", "0"))
+        if aux_rate < 0:
+            flash("辅单位换算率不能为负数")
             return redirect(url_for("items.edit_item", item_id=item_id))
         if unit_cost < 0:
             flash("进货单价不能为负数")
@@ -94,10 +100,27 @@ def edit_item(item_id: int):
         if not name or not category_id:
             flash("名称、品类为必填")
             return redirect(url_for("items.edit_item", item_id=item_id))
+
+        # 生产配方锁：被 product_bom 引用且原启用克禁止切走克
+        old = db.execute(
+            "SELECT aux_unit, aux_rate, gram_per_unit FROM items WHERE id=?", (item_id,)
+        ).fetchone()
+        if (old["aux_unit"] == "克" and old["gram_per_unit"] > 0
+                and aux_unit != "克"):
+            bom_ref = db.execute(
+                "SELECT COUNT(*) AS c FROM product_bom WHERE item_id=?", (item_id,)
+            ).fetchone()["c"]
+            if bom_ref > 0:
+                flash("该品项已被生产配方引用且启用克，不能切到非克辅单位；请先清空相关配方")
+                return redirect(url_for("items.edit_item", item_id=item_id))
+
+        gram_per_unit = aux_rate if aux_unit == "克" else 0.0
         db.execute(
             """UPDATE items SET name=?, category_id=?, safety_stock=?,
-               unit_cost=?, unit=?, gram_per_unit=?, updated_at=? WHERE id=?""",
-            (name, int(category_id), safety_stock, unit_cost, unit, gram_per_unit, now(), item_id),
+               unit_cost=?, unit=?, gram_per_unit=?,
+               aux_unit=?, aux_rate=?, updated_at=? WHERE id=?""",
+            (name, int(category_id), safety_stock, unit_cost, unit,
+             gram_per_unit, aux_unit, aux_rate, now(), item_id),
         )
         db.commit()
         audit("items.update", "item", item_id, {"name": name})
