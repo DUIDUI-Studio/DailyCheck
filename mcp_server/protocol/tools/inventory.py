@@ -7,6 +7,7 @@ from mcp_server.service.inventory import (
     list_items as svc_list_items,
     get_item as svc_get_item,
     list_movements as svc_list_movements,
+    list_warehouses_for_token as svc_list_warehouses,
 )
 from mcp_server.infra.errors import UnauthorizedError, ForbiddenError
 
@@ -53,3 +54,8 @@ def movements_list_impl(args: dict) -> list[dict]:
     if warehouse_code and not check_warehouse(ctx, warehouse_code):
         raise ForbiddenError("forbidden_warehouse")
     return svc_list_movements(warehouse_code, ctx)
+
+
+def warehouse_list_impl(_args: dict) -> list[dict]:
+    ctx = _get_ctx()
+    return svc_list_warehouses(ctx)

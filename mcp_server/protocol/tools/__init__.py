@@ -7,6 +7,17 @@ from mcp.types import Tool
 def get_tools() -> list[Tool]:
     """Return the list of Tool definitions for the list_tools callback."""
     tools = [
+        # Warehouse meta
+        Tool(
+            name="warehouse_list",
+            title="List Warehouses",
+            description="List all warehouses accessible to this token, returning code and display name.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
         # Inventory tools
         Tool(
             name="items_list",
@@ -231,10 +242,12 @@ def get_tools() -> list[Tool]:
                     },
                     "days": {
                         "type": "integer",
+                        "enum": [7, 30],
                         "description": "Time window: 7 or 30 days (default 7)",
                     },
                     "sort_by": {
                         "type": "string",
+                        "enum": ["qty", "value", "turnover", "name"],
                         "description": "Sort by: qty (default), value, turnover, name",
                     },
                     "limit": {

@@ -11,6 +11,7 @@ from mcp_server.protocol.tools.inventory import (
     items_list_impl,
     items_detail_impl,
     movements_list_impl,
+    warehouse_list_impl,
 )
 from mcp_server.protocol.tools.inbound import (
     restock_create_impl,
@@ -35,6 +36,7 @@ from mcp_server.infra.errors import McpError
 logger = logging.getLogger(__name__)
 
 _tool_map = {
+    "warehouse_list": warehouse_list_impl,
     "items_list": items_list_impl,
     "items_detail": items_detail_impl,
     "movements_list": movements_list_impl,
