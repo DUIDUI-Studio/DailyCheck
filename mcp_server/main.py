@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_server.protocol.server import build_server
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 MESSAGES_PATH = "/messages/"
 SSE_PATH = "/sse"
 HEALTH_PATH = "/health"
+STREAMABLE_HTTP_PATH = "/api/mcp/"
 
 
 # ---------------------------------------------------------------------------
@@ -40,9 +42,11 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     transport = SseServerTransport(MESSAGES_PATH)
     app.state.sse_transport = transport
     app.state.mcp_server = build_server()
+    app.state.streamable_manager = StreamableHTTPSessionManager(app.state.mcp_server, json_response=True, stateless=True)
     logger.info("MCP server initialized")
     try:
-        yield
+        async with app.state.streamable_manager.run():
+            yield
     finally:
         logger.info("MCP server shutting down")
 
@@ -100,6 +104,14 @@ async def post_message(request: Request) -> Response:
     return Response()
 
 
+async def streamable_http_asgi(scope, receive, send) -> None:
+    """ASGI entrypoint for streamableHttp transport — delegates to manager which
+    sends its own ASGI messages. Must NOT be wrapped in a starlette typed endpoint
+    (Request→Response), since that would trigger an extra http.response.start."""
+    manager: StreamableHTTPSessionManager = scope["app"].state.streamable_manager
+    await manager.handle_request(scope, receive, send)
+
+
 # ---------------------------------------------------------------------------
 # Health check — more thorough than just "ok"
 # ---------------------------------------------------------------------------
@@ -112,6 +124,7 @@ def _build_app() -> Starlette:
         routes=[
             Route(SSE_PATH, endpoint=sse_endpoint, methods=["GET"]),
             Mount(MESSAGES_PATH, app=post_message),
+            Mount(STREAMABLE_HTTP_PATH, app=streamable_http_asgi),
             Route(HEALTH_PATH, endpoint=health, methods=["GET"]),
         ],
     )
