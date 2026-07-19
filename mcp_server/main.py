@@ -96,12 +96,10 @@ async def sse_endpoint(request: Request) -> Response:
     return Response()
 
 
-async def post_message(request: Request) -> Response:
-    transport: SseServerTransport = request.app.state.sse_transport
-    await transport.handle_post_message(
-        request.scope, request.receive, request._send
-    )
-    return Response()
+async def post_message(scope, receive, send) -> None:
+    # Mount passes an ASGI 3-callable, not a Request — use scope["app"] to reach state.
+    transport: SseServerTransport = scope["app"].state.sse_transport
+    await transport.handle_post_message(scope, receive, send)
 
 
 async def streamable_http_asgi(scope, receive, send) -> None:
@@ -131,7 +129,7 @@ def _build_app() -> Starlette:
     return app
 
 
-def health(**_) -> JSONResponse:
+def health(request) -> JSONResponse:
     """Return health status including MCP server and DB connectivity."""
     checks = {
         "mcp_server": "ok",
