@@ -542,3 +542,128 @@ def test_update_selling_price_rejects_negative(tmp_path, monkeypatch):
     ).fetchone()
     check.close()
     assert float(row["selling_price"]) == 10.0
+
+
+def test_api_cost_returns_json(tmp_path, monkeypatch):
+    """GET /recipe-cost/api/cost/<kind>/<id> 返回成本 JSON。"""
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db
+    master_path = tmp_path / "master.db"
+    wh_path = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    import sqlite3
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, created_at) "
+        "VALUES (1, 'wh_t', 'T', ?, ?)", (str(wh_path), ts))
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) "
+        "VALUES (1, 1, 'admin')")
+    m.commit()
+    m.close()
+
+    conn = sqlite3.connect(wh_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('香草冰淇淋', 'g', 100, 25, ?, ?)",
+        (ts, ts))
+    ic_id = conn.execute("SELECT id FROM ic_recipes WHERE name='香草冰淇淋'").fetchone()["id"]
+    conn.commit()
+    conn.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 1
+        s["warehouse_id"] = 1
+
+    resp = client.get(f"/recipe-cost/api/cost/ic_recipe/{ic_id}")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["cost_purchase"] == 0.0
+    assert data["cost_selling"] == 0.0
+    assert data["sale_price"] == 25.0
+    assert data["margin_purchase"] == 1.0  # (25-0)/25 = 100%
+
+
+def test_items_delete_blocked_when_referenced_by_recipe(tmp_path, monkeypatch):
+    """品项被 ic_recipe_items 引用时禁止删除。"""
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    master_path = tmp_path / "master.db"
+    wh_path = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(wh_path)
+    migrate_warehouse_db_columns(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    import sqlite3
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, created_at) "
+        "VALUES (1, 'wh_t', 'T', ?, ?)", (str(wh_path), ts))
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) "
+        "VALUES (1, 1, 'admin')")
+    m.commit()
+    m.close()
+
+    conn = sqlite3.connect(wh_path)
+    conn.row_factory = sqlite3.Row
+    cat_id = conn.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit_cost, "
+        "selling_price, unit, gram_per_unit, aux_rate, aux_unit, updated_at) "
+        "VALUES ('X-1', '糖', ?, 10, 5, 10, '件', 0, 0, NULL, ?)",
+        (cat_id, ts))
+    item_id = conn.execute("SELECT id FROM items WHERE name='糖'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('香草冰淇淋', 'g', 100, 25, ?, ?)",
+        (ts, ts))
+    ic_id = conn.execute("SELECT id FROM ic_recipes WHERE name='香草冰淇淋'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+        "VALUES (?, ?, 50)", (ic_id, item_id))
+    conn.commit()
+    conn.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 1
+        s["warehouse_id"] = 1
+
+    resp = client.post(f"/items/{item_id}/delete", follow_redirects=True)
+    assert resp.status_code == 200
+    check = sqlite3.connect(wh_path)
+    check.row_factory = sqlite3.Row
+    cnt = check.execute(
+        "SELECT COUNT(*) AS c FROM items WHERE id=?", (item_id,)
+    ).fetchone()["c"]
+    check.close()
+    assert cnt == 1

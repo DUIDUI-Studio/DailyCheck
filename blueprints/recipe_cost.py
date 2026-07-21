@@ -452,3 +452,25 @@ def update_selling_price(item_id: int):
     })
     flash(f"已保存新售价 ¥{new_sp:.2f}")
     return redirect(request.referrer or url_for("core.land"))
+
+
+@bp.route("/recipe-cost/api/cost/<kind>/<int:rid>", methods=["GET"])
+@require_login
+def api_cost(kind: str, rid: int):
+    """只读 JSON：当前 ic_recipe / recipe 的成本与毛利率（前端 sanity check 用）。"""
+    db = get_warehouse_db()
+    from blueprints.recipe_cost_pure import ic_recipe_cost, recipe_cost
+    if kind == "ic_recipe":
+        c = ic_recipe_cost(db, rid)
+    elif kind == "recipe":
+        c = recipe_cost(db, rid)
+    else:
+        return {"error": "unknown_kind"}, 400
+    if c is None:
+        return {"error": "not_found"}, 404
+    return {
+        "cost_purchase": float(c["cost_purchase"]),
+        "cost_selling": float(c["cost_selling"]),
+        "sale_price": float(c["sale_price"]),
+        "margin_purchase": c["margin_purchase"],
+    }

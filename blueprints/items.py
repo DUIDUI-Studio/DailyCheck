@@ -161,8 +161,10 @@ def delete_item(item_id: int):
               (SELECT COUNT(*) FROM stock_movements WHERE item_id=?) +
               (SELECT COUNT(*) FROM restock_requests WHERE item_id=?) +
               (SELECT COUNT(*) FROM outbound_requests WHERE item_id=?) +
-              (SELECT COUNT(*) FROM stocktakes WHERE item_id=?) AS c""",
-        (item_id, item_id, item_id, item_id),
+              (SELECT COUNT(*) FROM stocktakes WHERE item_id=?) +
+              (SELECT COUNT(*) FROM ic_recipe_items WHERE item_id=?) +
+              (SELECT COUNT(*) FROM recipe_items WHERE item_id=? AND source_type='item') AS c""",
+        (item_id, item_id, item_id, item_id, item_id, item_id),
     ).fetchone()["c"]
     if usage > 0:
         flash("该品项存在关联业务记录，无法删除")
