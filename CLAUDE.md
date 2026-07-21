@@ -1,5 +1,7 @@
 # DailyCheck — 轻量库存管理系统
 
+> **每次 session 启动先读 [`docs/DEV_ENV.md`](docs/DEV_ENV.md)**,里面记录了当前 dev 环境的部署方式(wdg-systemd 容器)、入口、调试命令和已知坑。错误的部署模型会导致走错方向(例如以为有独立 Dockerfile)。
+
 ## 技术栈
 - **后端**: Flask 3.1.1 + Python 3.10+
 - **数据库**: SQLite（`master.db` 全局 + `db/warehouses/*.db` 每个仓库独立文件）
@@ -10,19 +12,43 @@
 - **Lint**: Ruff（target Python 3.10, line_length=100, 规则 E/F/W/I/B/UP）
 - **部署**: GitHub Actions（push to main 触发，通过 SSH 推送至 VPS）
 
-## 启动方式
+## Dev 环境（在 wdg-systemd 容器里）
+
+dev 跟生产路径不同 — 本地不跑独立 Docker 容器,而是部署到 `wdg-data-foundation` 项目里的
+`wdg-systemd` 容器,跟 WDG UI / Portal / Agent 一起在同一个 docker network 上,方便联调。
+
+| 项 | host 路径 | 容器内路径 |
+|---|---|---|
+| 源码 | `~/Documents/GitHub/DailyCheck/` | `/opt/dailycheck/` (bind mount) |
+| DB | `./db/master.db` + `./db/warehouses/*` | 同上 (bind mount, 同一份 SQLite 文件) |
+| Flask | http://localhost:8080 | systemd `dailycheck-app.service` |
+| MCP   | http://localhost:5100 | systemd `dailycheck-mcp.service` (Bearer `dev-mcp-token-for-testing`) |
+
+**启动 / 重建**:
 ```bash
-# 开发
+# 容器外 — 启动 wdg-systemd 容器 (首次或改了 docker-compose.yml)
+cd /Users/ericmr/Documents/GitHub/wdg-data-foundation
+docker compose up -d systemd-stack
+
+# 容器内 — install DailyCheck 的 unit (容器重建后会丢, 跑一次恢复)
+docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
+```
+
+**日常调试**:
+```bash
+docker exec wdg-systemd bash -c 'systemctl status dailycheck-app dailycheck-mcp'
+docker exec wdg-systemd bash -c 'systemctl restart dailycheck-app'   # 改 unit 后用
+docker exec wdg-systemd bash -c 'journalctl -u dailycheck-app -f'
+```
+
+**live reload**: Flask 用 `--debug` 模式,改 `app.py` / blueprint 自动 reload,不需要 systemctl restart。
+
+**standalone 启动**(仅当不想用 wdg-systemd 时,例如 lint/checkout 自检):
+```bash
 flask --app app run --host 0.0.0.0 --port 5001 --debug
-
-# 或
-RUNAPP=1 python3 app.py
-
-# MCP 服务器（stdio 模式，供 Claude Code 使用）
-flask mcp
-
-# MCP 服务器（HTTP 模式，供远程 agent 使用）
-python3 -m mcp_server
+RUNAPP=1 python3 app.py                                                # 等价
+flask mcp                                                              # MCP stdio 模式
+python3 -m mcp_server                                                  # MCP HTTP 模式
 ```
 
 ## 目录结构

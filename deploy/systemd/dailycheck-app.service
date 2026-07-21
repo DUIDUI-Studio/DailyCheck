@@ -1,0 +1,30 @@
+# deploy/systemd/dailycheck-app.service
+# DailyCheck Flask dev server (port 8080, --debug for live reload)
+# 安装到 wdg-systemd 容器内 /etc/systemd/system/ 用 scripts/install-in-wdg-systemd.sh
+[Unit]
+Description=DailyCheck Flask App (dev mode on :8080)
+Documentation=file:/opt/dailycheck/CLAUDE.md
+After=network.target
+PartOf=wdg.target
+Wants=wdg.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/dailycheck
+Environment=DAILYCHECK_SECRET_KEY=dev-secret-key-not-for-prod
+Environment=DAILYCHECK_MCP_TOKEN=dev-mcp-token-for-testing
+Environment=FLASK_DEBUG=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 -m flask --app app run --host 0.0.0.0 --port 8080 --debug
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=wdg.target multi-user.target

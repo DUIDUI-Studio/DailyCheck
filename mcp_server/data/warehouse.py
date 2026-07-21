@@ -207,11 +207,11 @@ def _window_sum(
     item_id: int,
     days: int,
 ) -> dict:
-    """Return {qty, days} for an item's consumption over <days> window."""
+    """Return {qty, active_days, window_days} for an item's consumption over <days> window."""
     row = conn.execute(f"""
         SELECT
             COALESCE(SUM(qty), 0) AS qty,
-            COUNT(DISTINCT substr(created_at, 1, 10)) AS days
+            COUNT(DISTINCT substr(created_at, 1, 10)) AS active_days
         FROM (
             SELECT o.requested_quantity AS qty, o.created_at
             FROM outbound_requests o
@@ -225,7 +225,7 @@ def _window_sum(
             WHERE pri.item_id = ? AND pr.rolled_back = 0
               AND pr.created_at >= datetime('now', '-{days} days')
         )""", (item_id, item_id)).fetchone()
-    return dict(row) if row else {"qty": 0, "days": 0}
+    return {**(dict(row) if row else {"qty": 0, "active_days": 0}), "window_days": days}
 
 
 def _weekly_breakdown(
@@ -287,10 +287,7 @@ def list_consumption_summary(
             i.unit, i.unit_cost,
             c.name AS category_name,
             COALESCE(c7.qty, 0) AS consume_qty,
-            COALESCE(c7.days, 0) AS consume_days,
-            CASE WHEN c7.days > 0
-                 THEN ROUND(COALESCE(c7.qty, 0) * 1.0 / c7.days, 2)
-                 ELSE 0 END AS daily_avg,
+            COALESCE(c7.days, 0) AS active_days,
             CASE WHEN i.quantity > 0
                  THEN ROUND(COALESCE(c7.qty, 0) / i.quantity, 2)
                  ELSE 0 END AS turnover_rate,
@@ -356,8 +353,8 @@ def list_consumption_summary(
             "current_stock": r["quantity"],
             "safety_stock": r["safety_stock"],
             "consume_qty": qty,
-            "consume_days": r["consume_days"],
-            "daily_avg": r["daily_avg"],
+            "active_days": r["active_days"],
+            "daily_avg": round(qty / days, 2) if days > 0 else 0.0,
             "turnover_rate": r["turnover_rate"],
             "consume_pct": round(qty / total_qty * 100, 1),
             "first_date": r["first_date"],
@@ -381,11 +378,13 @@ def get_item_consumption(
 
     def _fmt(win: dict) -> dict:
         qty = float(win.get("qty", 0) or 0)
-        dys = int(win.get("days", 0) or 0)
+        window_days = int(win.get("window_days", 0) or 0)
+        active_days = int(win.get("active_days", 0) or 0)
         return {
             "qty": qty,
-            "days_active": dys,
-            "daily_avg": round(qty / dys, 2) if dys > 0 else 0.0,
+            "active_days": active_days,
+            "window_days": window_days,
+            "daily_avg": round(qty / window_days, 2) if window_days > 0 else 0.0,
         }
 
     return {

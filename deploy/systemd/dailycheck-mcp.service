@@ -1,0 +1,29 @@
+# deploy/systemd/dailycheck-mcp.service
+# DailyCheck MCP HTTP/SSE server (port 5100)
+# 安装到 wdg-systemd 容器内 /etc/systemd/system/ 用 scripts/install-in-wdg-systemd.sh
+[Unit]
+Description=DailyCheck MCP HTTP Server (port 5100)
+Documentation=file:/opt/dailycheck/CLAUDE.md
+After=network.target dailycheck-app.service
+PartOf=wdg.target
+Wants=wdg.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/dailycheck
+Environment=DAILYCHECK_SECRET_KEY=dev-secret-key-not-for-prod
+Environment=DAILYCHECK_MCP_TOKEN=dev-mcp-token-for-testing
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 -m mcp_server --transport http --host 0.0.0.0 --port 5100
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=wdg.target multi-user.target
