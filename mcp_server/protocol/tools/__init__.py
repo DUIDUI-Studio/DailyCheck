@@ -11,7 +11,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="warehouse_list",
             title="List Warehouses",
-            description="List all warehouses accessible to this token, returning code and display name.",
+            description="List all warehouses accessible to this token, returning code and display name. Returns: array of {code, name}.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -22,7 +22,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="items_list",
             title="List Warehouse Items",
-            description="List all items in a warehouse, including quantity and safety stock.",
+            description="List all items in a warehouse. Returns: array of {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -37,7 +37,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="items_detail",
             title="Get Item Detail",
-            description="Get full details for a single inventory item by ID.",
+            description="Get full details for a single inventory item by ID. Returns: {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -56,7 +56,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="movements_list",
             title="List Stock Movements",
-            description="List recent stock movements (outbound requests and stocktake adjustments) for a warehouse.",
+            description="List recent stock movements (outbound requests and stocktake adjustments) for a warehouse. Returns: array of {id, type, item_id, item_name, qty, reason, created_at}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -72,7 +72,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="restock_create",
             title="Create Restock",
-            description="Create a restock (inbound) record",
+            description="Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -99,7 +99,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="restock_list",
             title="List Restocks",
-            description="List restock records for a warehouse",
+            description="List restock records for a warehouse. Returns: array of {id, item_id, item_name, qty, reason, created_at}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -115,7 +115,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="item_forecast",
             title="Get Item Forecast",
-            description="Get consumption forecast for an item",
+            description="Get consumption forecast for an item. Returns: {item_id, warehouse_code, horizon_days, daily_avg, forecast_total, confidence, computed_at, data_status}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -139,7 +139,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="procurement_store",
             title="Get Store Procurement",
-            description="Get procurement recommendations for a store",
+            description="Get procurement recommendations for a store. Returns: {warehouse_code, computed_at, items: [{item_id, item_name, current_qty, in_transit_qty, daily_avg, forecast_total_horizon, safety_stock, suggested_qty}]}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -154,7 +154,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="procurement_hub",
             title="Get Hub Procurement",
-            description="Get procurement recommendations aggregated across all warehouses",
+            description="Get procurement recommendations aggregated across all warehouses. Returns: {computed_at, items: [{item_id, item_name, total_suggested_qty, stores_needing, stores_detail}]}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -170,7 +170,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="outbound_create",
             title="Create Outbound",
-            description="Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint.",
+            description="Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint. Returns: {id, item_id, quantity, warehouse_code}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -197,7 +197,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="outbound_list",
             title="List Outbounds",
-            description="List outbound requests for a warehouse",
+            description="List outbound requests for a warehouse. Returns: array of {id, item_id, item_name, quantity, reason, status, rolled_back, created_at}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -212,7 +212,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="outbound_rollback",
             title="Rollback Outbound",
-            description="Roll back an outbound request: return stock to warehouse",
+            description="Roll back an outbound request: return stock to warehouse. Returns: {id, item_id, quantity}.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -232,7 +232,13 @@ def get_tools() -> list[Tool]:
         Tool(
             name="warehouse_consumption",
             title="Warehouse Consumption Summary",
-            description="Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage.",
+            description=(
+                "Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage. "
+                "Returns: {items: [{rank, item_id, sku, name, category_name, unit, current_stock, safety_stock, "
+                "consume_qty, active_days, daily_avg, turnover_rate, consume_pct, first_date, last_date}], "
+                "warehouse_turnover: {window_days, warehouse_cogs_value, warehouse_avg_inventory_value, "
+                "turnover_value, items_with_turnover, items_total, data_quality, method}}."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -261,7 +267,13 @@ def get_tools() -> list[Tool]:
         Tool(
             name="item_consumption",
             title="Item Consumption Detail",
-            description="Return consumption stats for a single item: 7d / 30d / monthly totals, weekly breakdown, and daily avg. Opt-in: include_turnover adds a stocktake-anchored inventory turnover estimate.",
+            description=(
+                "Return consumption stats for a single item: 7d / 14d / 30d / monthly totals, weekly breakdown, "
+                "and daily avg. Opt-in include_turnover adds a stocktake-anchored inventory turnover estimate. "
+                "Returns: {item_id, sku, name, category_name, unit, current_stock, safety_stock, "
+                "consume_7d, consume_14d, consume_30d, consume_monthly, weekly, "
+                "[opt-in when include_turnover=true: inventory_turnover]}."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
