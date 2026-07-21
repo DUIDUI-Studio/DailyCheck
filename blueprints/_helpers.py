@@ -123,6 +123,20 @@ def base_to_aux(base_qty: float, aux_rate: float) -> float:
     )
 
 
+def qty_to_stock_units(qty, item: dict):
+    """配方用量 (克 或 库存单位) → 库存单位（Decimal, 2dp）。
+
+    item 必须含 gram_per_unit / aux_rate / unit。复用 grams_to_stock 的口径：
+    gram_per_unit > 0 → qty 视为克，除以 gram_per_unit；否则 qty 即库存单位。
+    返回 Decimal（不转 float，保持下游 cost 计算精度）。
+    """
+    qty_d = Decimal(str(qty)).quantize(Decimal("0.01"))
+    gpu = float(item.get("gram_per_unit") or 0)
+    if gpu > 0:
+        return (qty_d / Decimal(str(gpu))).quantize(Decimal("0.01"))
+    return qty_d
+
+
 # 向后兼容：grams_to_stock 是 aux_to_base 的特例
 # （但生产代码目前直接定义 grams_to_stock，这里保留兼容别名给测试与未来使用）
 
