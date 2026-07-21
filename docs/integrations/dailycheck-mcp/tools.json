@@ -1,11 +1,11 @@
 {
-  "": "https://json-schema.org/draft/2020-12/schema",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "DailyCheck MCP server tool registry",
   "server": null,
   "tools": [
     {
       "name": "warehouse_list",
-      "description": "List all warehouses accessible to this token, returning code and display name.",
+      "description": "List all warehouses accessible to this token, returning code and display name. Returns: array of {code, name}.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -14,7 +14,7 @@
     },
     {
       "name": "items_list",
-      "description": "List all items in a warehouse, including quantity and safety stock.",
+      "description": "List all items in a warehouse. Returns: array of {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -30,7 +30,7 @@
     },
     {
       "name": "items_detail",
-      "description": "Get full details for a single inventory item by ID.",
+      "description": "Get full details for a single inventory item by ID. Returns: {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -51,7 +51,7 @@
     },
     {
       "name": "movements_list",
-      "description": "List recent stock movements (outbound requests and stocktake adjustments) for a warehouse.",
+      "description": "List recent stock movements (outbound requests and stocktake adjustments) for a warehouse. Returns: array of {id, type, item_id, item_name, qty, reason, created_at}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -67,7 +67,7 @@
     },
     {
       "name": "restock_create",
-      "description": "Create a restock (inbound) record",
+      "description": "Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -97,7 +97,7 @@
     },
     {
       "name": "restock_list",
-      "description": "List restock records for a warehouse",
+      "description": "List restock records for a warehouse. Returns: array of {id, item_id, item_name, qty, reason, created_at}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -113,7 +113,7 @@
     },
     {
       "name": "item_forecast",
-      "description": "Get consumption forecast for an item",
+      "description": "Get consumption forecast for an item. Returns: {item_id, warehouse_code, horizon_days, daily_avg, forecast_total, confidence, computed_at, data_status}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -138,7 +138,7 @@
     },
     {
       "name": "procurement_store",
-      "description": "Get procurement recommendations for a store",
+      "description": "Get procurement recommendations for a store. Returns: {warehouse_code, computed_at, items: [{item_id, item_name, current_qty, in_transit_qty, daily_avg, forecast_total_horizon, safety_stock, suggested_qty}]}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -154,7 +154,7 @@
     },
     {
       "name": "procurement_hub",
-      "description": "Get procurement recommendations aggregated across all warehouses",
+      "description": "Get procurement recommendations aggregated across all warehouses. Returns: {computed_at, items: [{item_id, item_name, total_suggested_qty, stores_needing, stores_detail}]}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -168,7 +168,7 @@
     },
     {
       "name": "outbound_create",
-      "description": "Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint.",
+      "description": "Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint. Returns: {id, item_id, quantity, warehouse_code}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -198,7 +198,7 @@
     },
     {
       "name": "outbound_list",
-      "description": "List outbound requests for a warehouse",
+      "description": "List outbound requests for a warehouse. Returns: array of {id, item_id, item_name, quantity, reason, status, rolled_back, created_at}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -214,7 +214,7 @@
     },
     {
       "name": "outbound_rollback",
-      "description": "Roll back an outbound request: return stock to warehouse",
+      "description": "Roll back an outbound request: return stock to warehouse. Returns: {id, item_id, quantity}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -235,7 +235,7 @@
     },
     {
       "name": "warehouse_consumption",
-      "description": "Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage.",
+      "description": "Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage. Returns: {items: [{rank, item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_qty, active_days, daily_avg, turnover_rate, consume_pct, first_date, last_date}], warehouse_turnover: {window_days, warehouse_cogs_value, warehouse_avg_inventory_value, turnover_value, items_with_turnover, items_total, data_quality, method}}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -274,7 +274,7 @@
     },
     {
       "name": "item_consumption",
-      "description": "Return consumption stats for a single item: 7d / 30d / monthly totals, weekly breakdown, and daily avg. Opt-in: include_turnover adds a stocktake-anchored inventory turnover estimate.",
+      "description": "Return consumption stats for a single item: 7d / 14d / 30d / monthly totals, weekly breakdown, and daily avg. Opt-in include_turnover adds a stocktake-anchored inventory turnover estimate. Returns: {item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_7d, consume_14d, consume_30d, consume_monthly, weekly, [opt-in when include_turnover=true: inventory_turnover]}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -293,7 +293,11 @@
           },
           "turnover_days": {
             "type": "integer",
-            "enum": [7, 14, 30],
+            "enum": [
+              7,
+              14,
+              30
+            ],
             "description": "Window for the inventory_turnover calculation (default 30).",
             "default": 30
           }
