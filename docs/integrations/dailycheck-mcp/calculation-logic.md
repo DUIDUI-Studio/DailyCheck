@@ -80,7 +80,7 @@
 |------|------|
 | 原始表 | `items`, `categories`, `outbound_requests`, `production_run_items`, `production_runs` |
 | 消耗来源 | `outbound_requests.requested_quantity`（非生产原料、非回退）<br>+ `production_run_items.actual_qty`（非回退）|
-| **daily_avg** | `consume_qty / window_days`（窗口总天数：7 或 30） |
+| **daily_avg** | `consume_qty / window_days`（窗口总天数:7、14 或 30） |
 | **turnover_rate** | `consume_qty / current_quantity`（消耗量占当前库存比例，2 位小数） |
 | **consume_pct** | `(consume_qty / 仓库窗口总消耗) × 100`（该品占全库总消耗百分比） |
 | 支持参数 | `days`（默认 30）、`sort_by`（qty/value/turnover/name） |
@@ -90,11 +90,11 @@
 | 项目 | 说明 |
 |------|------|
 | 原始表 | 同 `warehouse_consumption` |
-| 窗口 | 三个独立窗口：`7天`、`30天`、`月度`（28天近似） |
-| **daily_avg** | `qty / window_days`（7天窗口=7，30天窗口=30，月度=28） |
+| 窗口 | 四个独立窗口：`7天`、`14天`、`30天`、`月度`（28天近似） |
+| **daily_avg** | `qty / window_days`（7天窗口=7，14天窗口=14，30天窗口=30，月度=28） |
 | 周度分解 | 近 4 周分别统计出库 + 生产消耗量 |
 | 冷启动规则 | 7 天窗口内无记录 → 返回 `{qty:0, days_active:0, daily_avg:0}` |
-| 输出字段 | `item_id, sku, name, unit, current_stock, safety_stock, consume_7d{qty,active_days,window_days,daily_avg}, consume_30d{...}, consume_monthly{...}, weekly[{week_label,qty},...]` |
+| 输出字段 | `item_id, sku, name, unit, current_stock, safety_stock, consume_7d{qty,active_days,window_days,daily_avg}, consume_14d{...}, consume_30d{...}, consume_monthly{...}, weekly[{week_label,qty},...]` |
 
 ---
 
@@ -149,7 +149,7 @@
 | `outbound_create` | `items` + `outbound_requests` + `stock_movements` | `quantity -= qty`，失效采购缓存 |
 | `outbound_list` | `outbound_requests` | 无计算，直接返回 |
 | `outbound_rollback` | `items` + `outbound_requests` + `stock_movements` | `quantity += qty`，标记 `rolled_back=1` |
-| `warehouse_consumption` | `items` + `outbound_requests` + `production_run_items` | `daily_avg = consume_qty / window_days`（7 或 30），`active_days`（有消耗天数），`turnover_rate`、`consume_pct` |
+| `warehouse_consumption` | `items` + `outbound_requests` + `production_run_items` | `daily_avg = consume_qty / window_days`（7、14 或 30），`active_days`（有消耗天数），`turnover_rate`、`consume_pct` |
 | `item_consumption` | 同上 | 三窗口（7d/30d/月度）`daily_avg = qty / window_days`（7/30/28）+ `active_days` + 周度分解 |
 | `item_forecast` | 同上 | 加权平均 `daily_avg`（线性衰减）+ 置信度分类 |
 | `procurement_store` | `items` + `outbound_requests` + `restock_requests` | `safety_stock`、`in_transit_qty`、`suggested_qty` |

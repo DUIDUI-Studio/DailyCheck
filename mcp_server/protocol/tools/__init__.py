@@ -242,8 +242,8 @@ def get_tools() -> list[Tool]:
                     },
                     "days": {
                         "type": "integer",
-                        "enum": [7, 30],
-                        "description": "Time window: 7 or 30 days (default 7)",
+                        "enum": [7, 14, 30],
+                        "description": "Time window: 7, 14, or 30 days (default 7)",
                     },
                     "sort_by": {
                         "type": "string",

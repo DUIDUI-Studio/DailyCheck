@@ -28,8 +28,8 @@ def warehouse_consumption(
         raise ValidationError("warehouse_code required")
     if not check_warehouse(ctx, warehouse_code):
         raise ForbiddenError("forbidden_warehouse")
-    if days not in (7, 30):
-        raise ValidationError("days must be 7 or 30")
+    if days not in (7, 14, 30):
+        raise ValidationError("days must be 7, 14, or 30")
     if sort_by not in ("qty", "value", "turnover", "name"):
         raise ValidationError("sort_by must be one of: qty, value, turnover, name")
     wh = resolve_warehouse(warehouse_code)
@@ -44,7 +44,7 @@ def item_consumption(
     warehouse_code: str,
     ctx: AuthContext,
 ) -> dict:
-    """Return consumption stats for a single item: 7d / 30d / monthly / weekly breakdown."""
+    """Return consumption stats for a single item: 7d / 14d / 30d / monthly / weekly breakdown."""
     if not warehouse_code:
         raise ValidationError("warehouse_code required")
     if not check_warehouse(ctx, warehouse_code):

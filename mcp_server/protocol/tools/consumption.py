@@ -43,7 +43,7 @@ def warehouse_consumption_impl(args: dict) -> list[dict]:
 def item_consumption_impl(args: dict) -> dict:
     """Return consumption stats for a single item.
 
-    Includes: 7d, 30d, monthly totals + weekly breakdown + daily avg.
+    Includes: 7d, 14d, 30d, monthly totals + weekly breakdown + daily avg.
     """
     item_id: int = args["item_id"]
     warehouse_code: str = args["warehouse_code"]

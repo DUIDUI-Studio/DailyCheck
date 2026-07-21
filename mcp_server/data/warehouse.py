@@ -367,8 +367,9 @@ def get_item_consumption(
     conn: sqlite3.Connection,
     item_id: int,
 ) -> dict:
-    """Return consumption stats for a single item: 7d/30d/monthly + weekly breakdown."""
+    """Return consumption stats for a single item: 7d/14d/30d/monthly + weekly breakdown."""
     win_7d = _window_sum(conn, item_id, 7)
+    win_14d = _window_sum(conn, item_id, 14)
     win_30d = _window_sum(conn, item_id, 30)
     # Monthly: 28 days approximation
     win_monthly = _window_sum(conn, item_id, 28)
@@ -395,6 +396,7 @@ def get_item_consumption(
         "current_stock": item["quantity"] if item else None,
         "safety_stock": item["safety_stock"] if item else None,
         "consume_7d": _fmt(win_7d),
+        "consume_14d": _fmt(win_14d),
         "consume_30d": _fmt(win_30d),
         "consume_monthly": _fmt(win_monthly),
         "weekly": weekly,
