@@ -1,0 +1,8 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>出品配方</h2>
+  <a class="btn" href="{{ url_for('recipe_cost.ic_recipes_list') }}">← 冰激凌配方</a>
+</div>
+<p class="muted">暂无出品配方。</p>
+{% endblock %}

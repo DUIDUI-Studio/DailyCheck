@@ -1,0 +1,41 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>冰激凌配方</h2>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
+  <a class="btn" href="{{ url_for('recipe_cost.recipes_list') }}">出品配方 →</a>
+  {% if g.user['is_admin'] %}
+  <a class="btn btn-primary" href="{{ url_for('recipe_cost.ic_recipe_new') }}">+ 新建冰激凌配方</a>
+  {% endif %}
+</div>
+
+{% if ic_recipes %}
+  <div class="card-list card-list-3">
+    {% for r in ic_recipes %}
+    <div class="card">
+      <div class="card-main">
+        <h3>{{ r['name'] }}</h3>
+        <p class="muted">{{ r['output_qty'] | fmt_qty }} {{ r['output_unit'] }} / 份 · 配方项数 {{ r['item_count'] }}</p>
+        <p>采购成本：<strong>{{ r['cost_purchase'] | fmt_money }}</strong></p>
+        <p>销售价值：<strong>{{ r['cost_selling'] | fmt_money }}</strong></p>
+        <p>售价 {{ r['sale_price'] | fmt_money }} · 毛利率
+          {% if r['margin_purchase'] is not none %}
+            <strong>{{ '%.1f' | format(r['margin_purchase'] * 100) }}%</strong>
+          {% else %}—{% endif %}
+        </p>
+      </div>
+      {% if g.user['is_admin'] %}
+      <div class="card-actions">
+        <a class="btn-sm" href="{{ url_for('recipe_cost.ic_recipe_edit', ic_recipe_id=r['id']) }}">编辑</a>
+        <form method="post" action="{{ url_for('recipe_cost.ic_recipe_delete', ic_recipe_id=r['id']) }}" onsubmit="return confirm('确认删除该冰激凌配方？');">
+          <button class="btn-sm btn-delete" type="submit">删除</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="muted">暂无冰激凌配方{% if g.user['is_admin'] %}，点击右上"新建冰激凌配方"开始{% endif %}。</p>
+{% endif %}
+{% endblock %}
