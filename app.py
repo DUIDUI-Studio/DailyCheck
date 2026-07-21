@@ -43,6 +43,7 @@ def create_app() -> Flask:
     from blueprints.procurement import bp as procurement_bp
     from blueprints.notifications import bp as notifications_bp
     from blueprints.agent_tokens import bp as agent_tokens_bp
+    from blueprints.recipe_cost import bp as recipe_cost_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -52,6 +53,7 @@ def create_app() -> Flask:
     app.register_blueprint(outbound_bp)
     app.register_blueprint(reports_bp)
     app.register_blueprint(production_bp)
+    app.register_blueprint(recipe_cost_bp)
     app.register_blueprint(users_bp)
     app.register_blueprint(import_items_bp)
     app.register_blueprint(forecast_bp)

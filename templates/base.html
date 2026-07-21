@@ -30,6 +30,7 @@
     <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
     <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
     <a href="{{ url_for('production.products_list') }}">生产录入</a>
+    <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
     {# /forecast: admin only #}
     {% if g.user and g.user['is_admin'] %}
     <a href="{{ url_for('forecast.forecast_index') }}">预测</a>
@@ -94,6 +95,7 @@
       <a href="{{ url_for('restock.restock_list') }}">入库</a>
       <a href="{{ url_for('outbound.outbound_list') }}">出库</a>
       <a href="{{ url_for('production.products_list') }}">生产</a>
+      <a href="{{ url_for('recipe_cost.landing') }}">配方</a>
     </nav>
   </div>
   <script>
