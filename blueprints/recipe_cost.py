@@ -208,11 +208,200 @@ def _save_ic_recipe(ic_recipe_id: Optional[int]):
 
 
 # ---------------------------------------------------------------------------
-# 出品配方 (recipes) — 占位, Task 7 实现
+# 出品配方 (recipes)
 # ---------------------------------------------------------------------------
 
 @bp.route("/recipe-cost/recipes", methods=["GET"])
 @require_login
 def recipes_list():
-    """占位：出品配方列表。"""
-    return render_template("recipe_cost/recipes.html", recipes=[])
+    db = get_warehouse_db()
+    from blueprints.recipe_cost_pure import recipe_cost
+    rows = db.execute(
+        "SELECT id, name, output_unit, output_qty, sale_price, created_at "
+        "FROM recipes ORDER BY id DESC"
+    ).fetchall()
+    enriched = []
+    for r in rows:
+        c = recipe_cost(db, int(r["id"]))
+        enriched.append({
+            **dict(r),
+            "cost_purchase": float(c["cost_purchase"]),
+            "cost_selling": float(c["cost_selling"]),
+            "margin_purchase": c["margin_purchase"],
+            "item_count": len(c["lines"]),
+        })
+    return render_template("recipe_cost/recipes.html", recipes=enriched)
+
+
+def _load_ic_recipes_for_picker() -> list:
+    db = get_warehouse_db()
+    return db.execute(
+        "SELECT id, name, sale_price, output_unit, output_qty FROM ic_recipes ORDER BY name"
+    ).fetchall()
+
+
+@bp.route("/recipe-cost/recipes/new", methods=["GET", "POST"])
+@require_platform_admin
+def recipe_new():
+    if request.method == "POST":
+        return _save_recipe(None)
+    return render_template(
+        "recipe_cost/recipe_edit.html",
+        recipe=None,
+        bom_rows=[],
+        items=_load_items_for_bom(),
+        ic_recipes=_load_ic_recipes_for_picker(),
+    )
+
+
+@bp.route("/recipe-cost/recipes/<int:recipe_id>/edit", methods=["GET", "POST"])
+@require_platform_admin
+def recipe_edit(recipe_id: int):
+    if request.method == "POST":
+        return _save_recipe(recipe_id)
+    db = get_warehouse_db()
+    recipe = db.execute("SELECT * FROM recipes WHERE id = ?", (recipe_id,)).fetchone()
+    if recipe is None:
+        flash("出品配方不存在")
+        return redirect(url_for("recipe_cost.recipes_list"))
+    bom_rows = db.execute(
+        """SELECT ri.*, i.name AS item_name, i.unit AS item_unit,
+                  i.gram_per_unit, i.aux_rate, i.aux_unit,
+                  i.unit_cost, i.selling_price,
+                  ic.name AS ic_recipe_name
+           FROM recipe_items ri
+           LEFT JOIN items i ON i.id = ri.item_id
+           LEFT JOIN ic_recipes ic ON ic.id = ri.ic_recipe_id
+           WHERE ri.recipe_id = ? ORDER BY ri.id""",
+        (recipe_id,),
+    ).fetchall()
+    return render_template(
+        "recipe_cost/recipe_edit.html",
+        recipe=recipe,
+        bom_rows=bom_rows,
+        items=_load_items_for_bom(),
+        ic_recipes=_load_ic_recipes_for_picker(),
+    )
+
+
+@bp.route("/recipe-cost/recipes/<int:recipe_id>/delete", methods=["POST"])
+@require_platform_admin
+def recipe_delete(recipe_id: int):
+    db = get_warehouse_db()
+    db.execute("DELETE FROM recipes WHERE id = ?", (recipe_id,))
+    db.commit()
+    audit("recipe_cost.recipe.delete", "recipe", recipe_id)
+    flash("出品配方已删除")
+    return redirect(url_for("recipe_cost.recipes_list"))
+
+
+def _save_recipe(recipe_id):
+    name = request.form.get("name", "").strip()
+    note = request.form.get("note", "").strip()
+    output_unit = request.form.get("output_unit", "件").strip() or "件"
+    output_qty = parse_qty(request.form.get("output_qty", "1"))
+    sale_price = float(request.form.get("sale_price", "0") or 0)
+
+    if not name:
+        flash("配方名称为必填")
+        if recipe_id:
+            return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
+        return redirect(url_for("recipe_cost.recipe_new"))
+    if sale_price < 0:
+        flash("售价不能为负")
+
+    db = get_warehouse_db()
+    if recipe_id is None:
+        try:
+            db.execute(
+                """INSERT INTO recipes
+                   (name, note, output_unit, output_qty, sale_price,
+                    sale_price_updated_at, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, note, output_unit, output_qty, sale_price, now(), now(), now()),
+            )
+            new_id = int(db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            db.commit()
+            audit("recipe_cost.recipe.create", "recipe", new_id, {"name": name})
+            return redirect(url_for("recipe_cost.recipe_edit", recipe_id=new_id))
+        except sqlite3.IntegrityError:
+            flash("配方名称已存在")
+            return redirect(url_for("recipe_cost.recipe_new"))
+    else:
+        old = db.execute(
+            "SELECT sale_price FROM recipes WHERE id=?", (recipe_id,)
+        ).fetchone()
+        old_sp = float(old["sale_price"] or 0) if old else 0
+        sp_updated_at = now() if sale_price != old_sp else None
+        db.execute(
+            """UPDATE recipes SET name=?, note=?, output_unit=?,
+               output_qty=?, sale_price=?, sale_price_updated_at=?,
+               updated_at=? WHERE id=?""",
+            (name, note, output_unit, output_qty, sale_price, sp_updated_at,
+             now(), recipe_id),
+        )
+
+    # BOM rows (多态)
+    bom_ids = request.form.getlist("bom_row_id")
+    source_types = request.form.getlist("bom_source_type")
+    item_ids = request.form.getlist("bom_item_id")
+    ic_ids = request.form.getlist("bom_ic_recipe_id")
+    qtys = request.form.getlist("bom_qty")
+    deletes = request.form.getlist("bom_delete")
+    added = removed = updated = 0
+    for i in range(len(bom_ids)):
+        row_id = bom_ids[i].strip()
+        if i < len(deletes) and deletes[i] == "1":
+            if row_id:
+                db.execute("DELETE FROM recipe_items WHERE id = ?", (int(row_id),))
+                removed += 1
+            continue
+        st = source_types[i].strip() if i < len(source_types) else "item"
+        qty = parse_qty(qtys[i]) if i < len(qtys) else 0.0
+        if qty <= 0:
+            continue
+        item_id = item_ids[i].strip() if i < len(item_ids) else ""
+        ic_id = ic_ids[i].strip() if i < len(ic_ids) else ""
+        if st == "item":
+            if not item_id:
+                continue
+            if row_id:
+                db.execute(
+                    """UPDATE recipe_items SET source_type='item',
+                       item_id=?, ic_recipe_id=NULL, qty_per_unit=? WHERE id=?""",
+                    (int(item_id), qty, int(row_id)),
+                )
+                updated += 1
+            else:
+                db.execute(
+                    """INSERT INTO recipe_items
+                       (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
+                       VALUES (?, 'item', ?, NULL, ?)""",
+                    (recipe_id, int(item_id), qty),
+                )
+                added += 1
+        elif st == "ic_recipe":
+            if not ic_id:
+                continue
+            if row_id:
+                db.execute(
+                    """UPDATE recipe_items SET source_type='ic_recipe',
+                       item_id=NULL, ic_recipe_id=?, qty_per_unit=? WHERE id=?""",
+                    (int(ic_id), qty, int(row_id)),
+                )
+                updated += 1
+            else:
+                db.execute(
+                    """INSERT INTO recipe_items
+                       (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
+                       VALUES (?, 'ic_recipe', NULL, ?, ?)""",
+                    (recipe_id, int(ic_id), qty),
+                )
+                added += 1
+
+    db.commit()
+    audit("recipe_cost.recipe.update", "recipe", recipe_id, {
+        "added": added, "removed": removed, "updated": updated,
+    })
+    flash("出品配方已保存")
+    return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))

@@ -1,0 +1,127 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>{% if recipe %}编辑出品配方{% else %}新建出品配方{% endif %}</h2>
+  <a class="btn" href="{{ url_for('recipe_cost.recipes_list') }}">← 返回列表</a>
+</div>
+
+<form method="post" class="form-block">
+  <div class="grid cols-3">
+    <label>配方名称 <input name="name" required value="{{ recipe['name'] if recipe else '' }}" /></label>
+    <label>输出单位 <input name="output_unit" value="{{ recipe['output_unit'] if recipe else '件' }}" /></label>
+    <label>每份输出量 <input name="output_qty" type="number" min="0" step="0.01"
+      value="{{ recipe['output_qty'] if recipe else 1 }}" /></label>
+    <label>售价（¥） <input name="sale_price" id="sale-price" type="number" min="0" step="0.01"
+      value="{{ recipe['sale_price'] if recipe else 0 }}" /></label>
+    <label>备注 <input name="note" value="{{ recipe['note'] or '' if recipe else '' }}" /></label>
+  </div>
+  <button type="submit" class="btn-primary">保存配方</button>
+</form>
+
+<hr/>
+<h3>原料配方</h3>
+<p class="muted">可引用 品项（item）或 冰激凌配方（ic_recipe）。</p>
+
+<form method="post" id="bom-form">
+  <input type="hidden" name="name" value="{{ recipe['name'] if recipe else '' }}" />
+  <input type="hidden" name="note" value="{{ recipe['note'] or '' if recipe else '' }}" />
+  <input type="hidden" name="output_unit" value="{{ recipe['output_unit'] if recipe else '件' }}" />
+  <input type="hidden" name="output_qty" value="{{ recipe['output_qty'] if recipe else 1 }}" />
+  <input type="hidden" name="sale_price" id="bom-sale-price"
+         value="{{ recipe['sale_price'] if recipe else 0 }}" />
+
+  <div class="form-block" style="margin: 0.5em 0;">
+    <label>
+      <input type="checkbox" id="use-temp-prices" />
+      使用临时售价（用于探索毛利率）
+    </label>
+  </div>
+
+  <table class="bom-table">
+    <thead>
+      <tr>
+        <th>类型</th><th>成分</th><th>每份用量</th><th>单位</th>
+        <th>采购小计</th><th>销售小计</th>
+        <th>临时售价</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="bom-body">
+      {% for b in bom_rows %}
+      <tr class="bom-row"
+          data-source-type="{{ b['source_type'] }}"
+          {% if b['source_type']=='item' %}data-item-id="{{ b['item_id'] }}"
+          data-unit-cost="{{ b['unit_cost'] or 0 }}"
+          data-selling-price="{{ b['selling_price'] or 0 }}"
+          data-gram-per-unit="{{ b['gram_per_unit'] or 0 }}"{% endif %}>
+        <td>
+          <input type="hidden" name="bom_row_id" value="{{ b['id'] }}" />
+          <select name="bom_source_type" class="bom-source-type">
+            <option value="item" {% if b['source_type']=='item' %}selected{% endif %}>品项</option>
+            <option value="ic_recipe" {% if b['source_type']=='ic_recipe' %}selected{% endif %}>冰激凌配方</option>
+          </select>
+        </td>
+        <td class="bom-target-cell">
+          {% if b['source_type']=='item' %}
+            <select name="bom_item_id" class="bom-item-sel">
+              {% for it in items %}
+              <option value="{{ it['id'] }}"
+                      data-gram="{{ it['gram_per_unit'] or 0 }}"
+                      data-uc="{{ it['unit_cost'] or 0 }}"
+                      data-sp="{{ it['selling_price'] or 0 }}"
+                      {% if it['id']==b['item_id'] %}selected{% endif %}>
+                {{ it['category_name'] }} / {{ it['name'] }}
+              </option>
+              {% endfor %}
+            </select>
+          {% else %}
+            <select name="bom_ic_recipe_id" class="bom-ic-sel">
+              {% for ic in ic_recipes %}
+              <option value="{{ ic['id'] }}"
+                      data-sp="{{ ic['sale_price'] or 0 }}"
+                      data-output-qty="{{ ic['output_qty'] or 1 }}"
+                      {% if ic['id']==b['ic_recipe_id'] %}selected{% endif %}>
+                {{ ic['name'] }}
+              </option>
+              {% endfor %}
+            </select>
+          {% endif %}
+        </td>
+        <td><input type="number" step="0.01" min="0" name="bom_qty" class="bom-qty"
+                   value="{{ b['qty_per_unit'] }}" /></td>
+        <td><span class="bom-unit-label">—</span></td>
+        <td><span class="bom-cost-purchase">0.00</span></td>
+        <td><span class="bom-cost-selling">0.00</span></td>
+        <td>
+          <input type="range" class="bom-temp-slider" min="0" step="0.01"
+                 value="0" disabled />
+          <span class="bom-temp-display">0.00</span>
+          <button type="button" class="btn-sm bom-save-temp"
+                  data-item-id="" disabled>保存为新价</button>
+        </td>
+        <td>
+          <label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <th colspan="4" style="text-align:right;">合计</th>
+        <th id="total-purchase">0.00</th>
+        <th id="total-selling">0.00</th>
+        <th colspan="2"></th>
+      </tr>
+      <tr>
+        <th colspan="4" style="text-align:right;">售价</th>
+        <th colspan="2" id="footer-sale-price">0.00</th>
+        <th colspan="2">毛利率：<strong id="footer-margin">—</strong></th>
+      </tr>
+    </tfoot>
+  </table>
+
+  <button type="button" id="bom-add" class="btn-sm">+ 新增一行</button>
+  <button type="submit" class="btn-primary">保存配方</button>
+</form>
+
+<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=1"></script>
+{% endblock %}

@@ -306,3 +306,109 @@ def test_ic_recipe_delete_blocked_when_referenced(tmp_path, monkeypatch):
     ).fetchone()["c"]
     check.close()
     assert cnt == 1
+
+
+def test_recipe_crud_with_mixed_sources(tmp_path, monkeypatch):
+    """出品配方 CRUD：含 item + ic_recipe 引用。"""
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    master_path = tmp_path / "master.db"
+    wh_path = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(wh_path)
+    migrate_warehouse_db_columns(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    import sqlite3
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, created_at) "
+        "VALUES (1, 'wh_t', 'T', ?, ?)", (str(wh_path), ts))
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) "
+        "VALUES (1, 1, 'admin')")
+    m.commit()
+    m.close()
+
+    conn = sqlite3.connect(wh_path)
+    conn.row_factory = sqlite3.Row
+    cat_id = conn.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit_cost, "
+        "selling_price, unit, gram_per_unit, aux_rate, aux_unit, updated_at) "
+        "VALUES ('X-1', '糖', ?, 10, 5, 10, '件', 50, 50, '克', ?)",
+        (cat_id, ts))
+    item_id = conn.execute("SELECT id FROM items WHERE name='糖'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('香草冰淇淋', 'g', 100, 25, ?, ?)",
+        (ts, ts))
+    ic_id = conn.execute("SELECT id FROM ic_recipes WHERE name='香草冰淇淋'").fetchone()["id"]
+    conn.commit()
+    conn.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 1
+        s["warehouse_id"] = 1
+
+    resp = client.post("/recipe-cost/recipes/new", data={
+        "name": "柠檬茶",
+        "note": "test",
+        "output_unit": "杯",
+        "output_qty": "1",
+        "sale_price": "15",
+    }, follow_redirects=True)
+    assert resp.status_code == 200
+    check = sqlite3.connect(wh_path)
+    check.row_factory = sqlite3.Row
+    rid = check.execute(
+        "SELECT id FROM recipes WHERE name='柠檬茶'"
+    ).fetchone()["id"]
+
+    resp = client.post(f"/recipe-cost/recipes/{rid}/edit", data={
+        "name": "柠檬茶",
+        "note": "test",
+        "output_unit": "杯",
+        "output_qty": "1",
+        "sale_price": "15",
+        "bom_row_id": ["", ""],
+        "bom_source_type": ["item", "ic_recipe"],
+        "bom_item_id": [str(item_id), ""],
+        "bom_ic_recipe_id": ["", str(ic_id)],
+        "bom_qty": ["60", "50"],
+        "bom_delete": ["", ""],
+    }, follow_redirects=True)
+    assert resp.status_code == 200
+
+    rows = check.execute(
+        "SELECT source_type, item_id, ic_recipe_id, qty_per_unit FROM recipe_items "
+        "WHERE recipe_id=? ORDER BY id",
+        (rid,),
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["source_type"] == "item"
+    assert rows[0]["item_id"] == item_id
+    assert float(rows[0]["qty_per_unit"]) == 60.0
+    assert rows[1]["source_type"] == "ic_recipe"
+    assert rows[1]["ic_recipe_id"] == ic_id
+    assert float(rows[1]["qty_per_unit"]) == 50.0
+
+    resp = client.post(f"/recipe-cost/recipes/{rid}/delete", follow_redirects=True)
+    assert resp.status_code == 200
+    cnt = check.execute(
+        "SELECT COUNT(*) AS c FROM recipes WHERE id=?", (rid,)
+    ).fetchone()["c"]
+    check.close()
+    assert cnt == 0

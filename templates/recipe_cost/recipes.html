@@ -3,6 +3,38 @@
 <div class="list-head">
   <h2>出品配方</h2>
   <a class="btn" href="{{ url_for('recipe_cost.ic_recipes_list') }}">← 冰激凌配方</a>
+  {% if g.user['is_admin'] %}
+  <a class="btn btn-primary" href="{{ url_for('recipe_cost.recipe_new') }}">+ 新建出品配方</a>
+  {% endif %}
 </div>
-<p class="muted">暂无出品配方。</p>
+
+{% if recipes %}
+  <div class="card-list card-list-3">
+    {% for r in recipes %}
+    <div class="card">
+      <div class="card-main">
+        <h3>{{ r['name'] }}</h3>
+        <p class="muted">{{ r['output_qty'] | fmt_qty }} {{ r['output_unit'] }} / 份 · 配方项数 {{ r['item_count'] }}</p>
+        <p>采购成本：<strong>{{ r['cost_purchase'] | fmt_money }}</strong></p>
+        <p>销售价值：<strong>{{ r['cost_selling'] | fmt_money }}</strong></p>
+        <p>售价 {{ r['sale_price'] | fmt_money }} · 毛利率
+          {% if r['margin_purchase'] is not none %}
+            <strong>{{ '%.1f' | format(r['margin_purchase'] * 100) }}%</strong>
+          {% else %}—{% endif %}
+        </p>
+      </div>
+      {% if g.user['is_admin'] %}
+      <div class="card-actions">
+        <a class="btn-sm" href="{{ url_for('recipe_cost.recipe_edit', recipe_id=r['id']) }}">编辑</a>
+        <form method="post" action="{{ url_for('recipe_cost.recipe_delete', recipe_id=r['id']) }}" onsubmit="return confirm('确认删除该出品配方？');">
+          <button class="btn-sm btn-delete" type="submit">删除</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="muted">暂无出品配方{% if g.user['is_admin'] %}，点击右上"新建出品配方"开始{% endif %}。</p>
+{% endif %}
 {% endblock %}
