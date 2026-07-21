@@ -18,3 +18,10 @@ db/warehouses/*.db
 
 # Superpowers brainstorming sessions (mockups, scratch)
 .superpowers/
+
+# Runtime / scratch artifacts
+admin_audit.log
+graphify-out/
+
+# Frontend toolchain deps (not part of source — install per-machine)
+node_modules/
