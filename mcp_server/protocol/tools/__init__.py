@@ -261,7 +261,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="item_consumption",
             title="Item Consumption Detail",
-            description="Return consumption stats for a single item: 7d / 30d / monthly totals, weekly breakdown, and daily avg.",
+            description="Return consumption stats for a single item: 7d / 30d / monthly totals, weekly breakdown, and daily avg. Opt-in: include_turnover adds a stocktake-anchored inventory turnover estimate.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -272,6 +272,17 @@ def get_tools() -> list[Tool]:
                     "warehouse_code": {
                         "type": "string",
                         "description": "Warehouse code (e.g. WH001)",
+                    },
+                    "include_turnover": {
+                        "type": "boolean",
+                        "description": "If true, also return inventory_turnover (stocktake-anchored average-inventory estimate). Default false.",
+                        "default": False,
+                    },
+                    "turnover_days": {
+                        "type": "integer",
+                        "enum": [7, 14, 30],
+                        "description": "Window for the inventory_turnover calculation (default 30).",
+                        "default": 30,
                     },
                 },
                 "required": ["item_id", "warehouse_code"],

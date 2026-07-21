@@ -34,8 +34,9 @@ class TestListItems:
         mock_context.__exit__ = MagicMock(return_value=False)
         mock_context.execute.return_value.fetchall.return_value = [
             {"id": 1, "sku": "SKU001", "name": "Item 1", "category_id": 1,
-             "quantity": 10, "safety_stock": 5, "unit": "pcs",
-             "unit_cost": 100, "gram_per_unit": 0, "updated_at": "2024-01-01"}
+             "current_stock": 10, "safety_stock": 5, "unit": "pcs",
+             "unit_cost": 100, "gram_per_unit": 0, "updated_at": "2024-01-01",
+             "category_name": "调味酱"}
         ]
         mock_conn.return_value = mock_context
 
@@ -44,6 +45,7 @@ class TestListItems:
 
         assert len(result) == 1
         assert result[0]["sku"] == "SKU001"
+        assert result[0]["category_name"] == "调味酱"
 
 
 class TestGetItem:
