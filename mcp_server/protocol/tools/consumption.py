@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import os
+
+from mcp_server.infra.errors import UnauthorizedError
 from mcp_server.service.auth import authenticate
 from mcp_server.service.consumption import (
-    warehouse_consumption as svc_warehouse_consumption,
     item_consumption as svc_item_consumption,
 )
-from mcp_server.infra.errors import UnauthorizedError
+from mcp_server.service.consumption import (
+    warehouse_consumption as svc_warehouse_consumption,
+)
 
 
 def _get_ctx():
@@ -44,12 +47,17 @@ def item_consumption_impl(args: dict) -> dict:
     """Return consumption stats for a single item.
 
     Includes: 7d, 14d, 30d, monthly totals + weekly breakdown + daily avg.
+    Optional: inventory_turnover (stocktake-anchored, opt-in via include_turnover).
     """
     item_id: int = args["item_id"]
     warehouse_code: str = args["warehouse_code"]
+    include_turnover: bool = bool(args.get("include_turnover", False))
+    turnover_days: int = args.get("turnover_days", 30)
     ctx = _get_ctx()
     return svc_item_consumption(
         item_id=item_id,
         warehouse_code=warehouse_code,
         ctx=ctx,
+        include_turnover=include_turnover,
+        turnover_days=turnover_days,
     )

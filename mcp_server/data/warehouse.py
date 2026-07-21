@@ -1,22 +1,29 @@
 """warehouse DB 数据访问：items, movements, restock 等。"""
 from __future__ import annotations
 
+import datetime
 import sqlite3
 
 
 def list_items(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
-        "SELECT id, sku, name, category_id, quantity, safety_stock, "
-        "unit, unit_cost, gram_per_unit, updated_at "
-        "FROM items ORDER BY id"
+        "SELECT i.id, i.sku, i.name, i.category_id, "
+        "i.quantity AS current_stock, i.safety_stock, "
+        "i.unit, i.unit_cost, i.gram_per_unit, i.updated_at, "
+        "c.name AS category_name "
+        "FROM items i "
+        "LEFT JOIN categories c ON c.id = i.category_id "
+        "ORDER BY i.id"
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_item(conn: sqlite3.Connection, item_id: int) -> dict | None:
     r = conn.execute(
-        "SELECT id, sku, name, category_id, quantity, safety_stock, "
-        "unit, unit_cost, gram_per_unit, updated_at "
+        "SELECT id, sku, name, category_id, "
+        "quantity AS current_stock, safety_stock, "
+        "unit, unit_cost, gram_per_unit, updated_at, "
+        "(SELECT name FROM categories WHERE id = items.category_id) AS category_name "
         "FROM items WHERE id = ?",
         (item_id,),
     ).fetchone()
@@ -199,6 +206,273 @@ def rollback_outbound(conn: sqlite3.Connection, req_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 库存周转率 (inventory turnover) — stocktake-anchored
+# ---------------------------------------------------------------------------
+
+def get_inventory_turnover(
+    conn: sqlite3.Connection,
+    item_id: int,
+    days: int = 30,
+    _now: datetime.datetime | None = None,
+) -> dict:
+    """Estimate avg inventory and COGS-based turnover from stocktake anchors.
+
+    Anchors are taken from `stocktakes.previous_quantity` joined to
+    `stocktake_batches.created_at` (the snapshot timestamp). Batches with
+    `rolled_back = 1` are excluded.
+
+    Method: weighted-by-gap average — between two adjacent anchors, the
+    earlier anchor's quantity is assumed to hold for the whole gap. This is
+    a simplified "step" approximation; with only 1 anchor inside the
+    window, we can't average, so we return `avg_inventory = None`.
+
+    COGS uses the item's current `unit_cost` as a proxy for historical
+    cost (the schema doesn't snapshot cost per movement).
+
+    Returns:
+        {
+            "window_days": int,
+            "avg_inventory": float | None,    # None if <2 anchors
+            "current_inventory": float,
+            "cogs_value": float,             # window consume_qty × unit_cost
+            "turnover_value": float | None,  # None if avg_inventory is None
+            "anchors_in_window": int,
+            "anchors_total": int,            # all-time, for context
+            "data_quality": "high" | "medium" | "low" | "none",
+            "method": "stocktake_weighted_avg",
+        }
+    """
+
+    item = conn.execute(
+        "SELECT quantity, COALESCE(unit_cost, 0) AS unit_cost "
+        "FROM items WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+    if item is None:
+        return None  # caller is expected to validate item exists
+
+    current_qty = float(item["quantity"])
+    unit_cost = float(item["unit_cost"])
+
+    # 1) Fetch all non-rolled-back stocktake anchors for this item, oldest first.
+    anchor_rows = conn.execute(
+        """
+        SELECT b.created_at AS ts, s.previous_quantity AS qty
+        FROM stocktakes s
+        JOIN stocktake_batches b ON b.id = s.batch_id
+        WHERE b.rolled_back = 0
+          AND s.item_id = ?
+        ORDER BY b.created_at
+        """,
+        (item_id,),
+    ).fetchall()
+
+    anchors_total = len(anchor_rows)
+    if anchors_total == 0:
+        return {
+            "window_days": days,
+            "avg_inventory": None,
+            "current_inventory": current_qty,
+            "cogs_value": 0.0,
+            "turnover_value": None,
+            "anchors_in_window": 0,
+            "anchors_total": 0,
+            "data_quality": "none",
+            "method": "stocktake_weighted_avg",
+        }
+
+    # 2) Window bounds (use UTC-naive arithmetic matching stored format).
+    end_ts = _now if _now is not None else datetime.datetime.now()
+    start_ts = end_ts - datetime.timedelta(days=days)
+
+    # Add boundary anchors: window start (qty interpolated) and window end
+    # (current qty). Each boundary anchor helps clip gaps at the window edge.
+    def _parse(ts_str: str) -> datetime.datetime:
+        return datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+
+    pts: list[tuple[datetime.datetime, float]] = []
+    for r in anchor_rows:
+        pts.append((_parse(r["ts"]), float(r["qty"])))
+
+    # 3) Compute cogs = window consume_qty × unit_cost (same source as
+    # _window_sum, but cheaper: we already know it from get_item_consumption
+    # path; here we sum directly). The window cutoff is parameterized so
+    # tests can pin time deterministically.
+    cutoff = (end_ts - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    consume_row = conn.execute("""
+        SELECT COALESCE(SUM(qty), 0) AS qty
+        FROM (
+            SELECT o.requested_quantity AS qty, o.created_at
+            FROM outbound_requests o
+            WHERE o.item_id = ? AND o.rolled_back = 0
+              AND (o.reason IS NULL OR o.reason NOT LIKE '生产领料(run=#%%')
+              AND o.created_at >= ?
+            UNION ALL
+            SELECT pri.actual_qty AS qty, pr.created_at
+            FROM production_run_items pri
+            JOIN production_runs pr ON pr.id = pri.run_id
+            WHERE pri.item_id = ? AND pr.rolled_back = 0
+              AND pr.created_at >= ?
+        )
+    """, (item_id, cutoff, item_id, cutoff)).fetchone()
+    cogs_qty = float(dict(consume_row)["qty"])
+    cogs_value = cogs_qty * unit_cost
+
+    # 4) Clip anchors to window: if first anchor is after window start, prepend
+    # a synthetic boundary anchor using current qty (back-projected). If last
+    # anchor is before window end, append current qty at window end.
+    in_window = [(ts, q) for ts, q in pts if start_ts <= ts <= end_ts]
+    anchors_in_window = len(in_window)
+
+    if anchors_in_window < 2:
+        # Need at least 2 anchors in the window to compute a meaningful
+        # weighted average. With 0 anchors (or only 1 outside the window)
+        # we have no signal — fall back to None for avg/turnover.
+        quality = "none" if anchors_in_window == 0 else "medium"
+        return {
+            "window_days": days,
+            "avg_inventory": None,
+            "current_inventory": current_qty,
+            "cogs_value": round(cogs_value, 2),
+            "turnover_value": None,
+            "anchors_in_window": anchors_in_window,
+            "anchors_total": anchors_total,
+            "data_quality": quality,
+            "method": "stocktake_weighted_avg",
+        }
+
+    # Build the segment list. Sort + dedupe timestamps.
+    segments: list[tuple[datetime.datetime, float]] = sorted(in_window, key=lambda x: x[0])
+
+    # Prepend window-start boundary: use earliest in-window anchor's qty
+    # (conservative — assumes that level held back to window start).
+    if segments[0][0] > start_ts:
+        segments.insert(0, (start_ts, segments[0][1]))
+
+    # Append window-end boundary: current quantity.
+    if segments[-1][0] < end_ts:
+        segments.append((end_ts, current_qty))
+    else:
+        # Last in-window anchor coincides with end — still need an end point
+        # for the last segment to have a length; reuse current_qty at end_ts.
+        segments.append((end_ts, current_qty))
+
+    # 5) Weighted average: each anchor's qty covers until the next anchor.
+    #    weight_i = gap_days_i (julianday of next - julianday of current)
+    #    weighted_avg = Σ(qty_i * gap_i) / Σ(gap_i)
+    weighted_sum = 0.0
+    gap_sum = 0.0
+    for i in range(len(segments) - 1):
+        ts_i, qty_i = segments[i]
+        ts_next = segments[i + 1][0]
+        gap_days = (ts_next - ts_i).total_seconds() / 86400.0
+        if gap_days <= 0:
+            continue
+        weighted_sum += qty_i * gap_days
+        gap_sum += gap_days
+
+    if gap_sum <= 0:
+        avg_inventory: float | None = None
+    else:
+        avg_inventory = round(weighted_sum / gap_sum, 2)
+
+    if avg_inventory is None or avg_inventory <= 0:
+        turnover_value: float | None = None
+    else:
+        turnover_value = round(cogs_value / avg_inventory, 2)
+
+    if anchors_in_window >= 2:
+        data_quality = "high"
+    else:
+        data_quality = "medium"
+
+    return {
+        "window_days": days,
+        "avg_inventory": avg_inventory,
+        "current_inventory": current_qty,
+        "cogs_value": round(cogs_value, 2),
+        "turnover_value": turnover_value,
+        "anchors_in_window": anchors_in_window,
+        "anchors_total": anchors_total,
+        "data_quality": data_quality,
+        "method": "stocktake_weighted_avg",
+    }
+
+
+def get_warehouse_inventory_turnover(
+    conn: sqlite3.Connection,
+    days: int = 30,
+    _now: datetime.datetime | None = None,
+) -> dict:
+    """Aggregate per-item turnover into a single warehouse-level figure.
+
+    For each item with non-null avg_inventory:
+        avg_inventory_value = avg_inventory × current unit_cost
+        cogs_value          = window consumption × current unit_cost
+    Then:
+        warehouse_avg_inventory_value = Σ per-item avg_inventory_value
+        warehouse_cogs                = Σ per-item cogs_value
+        warehouse_turnover_value      = warehouse_cogs / warehouse_avg_inventory_value
+
+    Caveats (inherited from get_inventory_turnover, applies per item):
+      - unit_cost is current, not historical → COGS distortion on price changes
+      - items with <2 anchors in window contribute nothing to the weighted sum
+      - items with no anchors contribute nothing (data_quality='none')
+
+    `_now` is a test-injection hook so unit tests can pin wall-clock time.
+    """
+    item_rows = conn.execute(
+        "SELECT id FROM items"
+    ).fetchall()
+
+    warehouse_cogs = 0.0
+    warehouse_avg_inventory_value = 0.0
+    items_with_turnover = 0
+    items_total = len(item_rows)
+
+    for r in item_rows:
+        t = get_inventory_turnover(conn, int(r["id"]), days=days, _now=_now)
+        # Items with avg_inventory=None contribute nothing.
+        if t["avg_inventory"] is None:
+            continue
+        # Get the item's unit_cost to convert avg_inventory (units → value).
+        cost_row = conn.execute(
+            "SELECT COALESCE(unit_cost, 0) AS unit_cost FROM items WHERE id = ?",
+            (int(r["id"]),),
+        ).fetchone()
+        unit_cost = float(cost_row["unit_cost"])
+        if unit_cost <= 0:
+            # Can't convert units to value → skip (would be misleading to mix).
+            continue
+        warehouse_cogs += float(t["cogs_value"])
+        warehouse_avg_inventory_value += float(t["avg_inventory"]) * unit_cost
+        items_with_turnover += 1
+
+    if warehouse_avg_inventory_value <= 0:
+        turnover_value: float | None = None
+    else:
+        turnover_value = round(warehouse_cogs / warehouse_avg_inventory_value, 2)
+
+    if items_with_turnover == 0:
+        quality = "none"
+    elif items_with_turnover < items_total:
+        quality = "medium"
+    else:
+        quality = "high"
+
+    return {
+        "window_days": days,
+        "warehouse_cogs_value": round(warehouse_cogs, 2),
+        "warehouse_avg_inventory_value": round(warehouse_avg_inventory_value, 2),
+        "turnover_value": turnover_value,
+        "items_with_turnover": items_with_turnover,
+        "items_total": items_total,
+        "data_quality": quality,
+        "method": "stocktake_weighted_sum",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 消耗统计 (consumption)
 # ---------------------------------------------------------------------------
 
@@ -267,11 +541,26 @@ def list_consumption_summary(
     days: int = 7,
     sort_by: str = "qty",
     limit: int = 100,
-) -> list[dict]:
-    """Return per-item consumption summary for the warehouse.
+) -> dict:
+    """Return per-item consumption summary for the warehouse + warehouse-level turnover.
 
     Mirrors blueprints/items.py inventory_view() exactly.
     Includes: 7d/30d consumption, daily_avg, turnover_rate, ranking.
+
+    Return shape (changed in this version — was list[dict]):
+        {
+            "items": [ {... per-item ...}, ... ],
+            "warehouse_turnover": {
+                "window_days": int,
+                "warehouse_cogs_value": float,
+                "warehouse_avg_inventory_value": float,
+                "turnover_value": float | None,
+                "items_with_turnover": int,
+                "items_total": int,
+                "data_quality": "high" | "medium" | "none",
+                "method": "stocktake_weighted_sum",
+            },
+        }
     """
     order_map = {
         "qty": "consume_qty DESC",
@@ -348,7 +637,7 @@ def list_consumption_summary(
             "item_id": r["id"],
             "sku": r["sku"],
             "name": r["name"],
-            "category": r["category_name"],
+            "category_name": r["category_name"],
             "unit": r["unit"],
             "current_stock": r["quantity"],
             "safety_stock": r["safety_stock"],
@@ -360,7 +649,14 @@ def list_consumption_summary(
             "first_date": r["first_date"],
             "last_date": r["last_date"],
         })
-    return result
+
+    # Warehouse-level turnover — always 30-day window per current spec.
+    warehouse_turnover = get_warehouse_inventory_turnover(conn, days=30)
+
+    return {
+        "items": result,
+        "warehouse_turnover": warehouse_turnover,
+    }
 
 
 def get_item_consumption(
@@ -392,8 +688,9 @@ def get_item_consumption(
         "item_id": item_id,
         "sku": item["sku"] if item else None,
         "name": item["name"] if item else None,
+        "category_name": item["category_name"] if item else None,
         "unit": item["unit"] if item else None,
-        "current_stock": item["quantity"] if item else None,
+        "current_stock": item["current_stock"] if item else None,
         "safety_stock": item["safety_stock"] if item else None,
         "consume_7d": _fmt(win_7d),
         "consume_14d": _fmt(win_14d),
