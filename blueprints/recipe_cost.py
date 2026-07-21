@@ -235,9 +235,20 @@ def recipes_list():
 
 def _load_ic_recipes_for_picker() -> list:
     db = get_warehouse_db()
-    return db.execute(
+    from blueprints.recipe_cost_pure import ic_recipe_cost
+    rows = db.execute(
         "SELECT id, name, sale_price, output_unit, output_qty FROM ic_recipes ORDER BY name"
     ).fetchall()
+    enriched = []
+    for r in rows:
+        c = ic_recipe_cost(db, int(r["id"]))
+        out_qty = float(r["output_qty"] or 1)
+        enriched.append({
+            **dict(r),
+            "cost_purchase_per_unit": float(c["cost_purchase"]) / out_qty if out_qty > 0 else 0.0,
+            "cost_selling_per_unit": float(c["cost_selling"]) / out_qty if out_qty > 0 else 0.0,
+        })
+    return enriched
 
 
 @bp.route("/recipe-cost/recipes/new", methods=["GET", "POST"])
@@ -405,3 +416,39 @@ def _save_recipe(recipe_id):
     })
     flash("出品配方已保存")
     return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
+
+
+@bp.route("/recipe-cost/items/<int:item_id>/update-selling-price", methods=["POST"])
+@require_platform_admin
+def update_selling_price(item_id: int):
+    """滑块"保存为新价"按钮：POST 写回 items.selling_price。"""
+    db = get_warehouse_db()
+    new_sp_raw = request.form.get("selling_price", "0") or "0"
+    try:
+        new_sp = float(new_sp_raw)
+    except ValueError:
+        flash("销售单价格式错误")
+        return redirect(request.referrer or url_for("core.land"))
+    if new_sp < 0:
+        flash("销售单价不能为负")
+        return redirect(request.referrer or url_for("core.land"))
+
+    old_row = db.execute(
+        "SELECT selling_price FROM items WHERE id=?", (item_id,)
+    ).fetchone()
+    if old_row is None:
+        flash("品项不存在")
+        return redirect(request.referrer or url_for("core.land"))
+    old_sp = float(old_row["selling_price"] or 0)
+
+    db.execute(
+        "UPDATE items SET selling_price=?, selling_price_updated_at=?, "
+        "updated_at=? WHERE id=?",
+        (new_sp, now(), now(), item_id),
+    )
+    db.commit()
+    audit("recipe_cost.items.update_selling_price", "item", item_id, {
+        "old": old_sp, "new": new_sp,
+    })
+    flash(f"已保存新售价 ¥{new_sp:.2f}")
+    return redirect(request.referrer or url_for("core.land"))

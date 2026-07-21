@@ -115,5 +115,15 @@
   <button type="submit" class="btn-primary">保存配方</button>
 </form>
 
+<script>
+  window.__items = [
+    {% for it in items %}
+    {"id": {{ it['id'] }}, "label": "{{ it['category_name'] }} / {{ it['name'] }}",
+     "gram_per_unit": {{ it['gram_per_unit'] or 0 }},
+     "unit_cost": {{ it['unit_cost'] or 0 }},
+     "selling_price": {{ it['selling_price'] or 0 }}}{% if not loop.last %},{% endif %}
+    {% endfor %}
+  ];
+</script>
 <script src="{{ url_for('static', filename='recipe_cost.js') }}?v=1"></script>
 {% endblock %}
