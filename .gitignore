@@ -15,6 +15,7 @@ error.log
 # git, but the actual db files stay local.
 db/master.db
 db/warehouses/*.db
+master.db
 
 # Superpowers brainstorming sessions (mockups, scratch)
 .superpowers/
@@ -22,6 +23,12 @@ db/warehouses/*.db
 # Runtime / scratch artifacts
 admin_audit.log
 graphify-out/
+
+# Playwright MCP debug artifacts
+.playwright-mcp/
+
+# Dev screenshots
+*.png
 
 # Frontend toolchain deps (not part of source — install per-machine)
 node_modules/
