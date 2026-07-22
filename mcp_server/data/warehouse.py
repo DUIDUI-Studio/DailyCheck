@@ -687,9 +687,6 @@ def list_consumption_summary(
         else:
             turnover_rate = None
 
-        days_active = int(r["active_days"] or 0)
-        daily_avg = round(qty / days_active, 2) if days_active > 0 else 0.0
-
         item = {
             "item_id": r["id"],
             "sku": r["sku"],
@@ -700,8 +697,6 @@ def list_consumption_summary(
             "safety_stock": r["safety_stock"],
             "consume_qty": qty,
             "consume_value": consume_value,
-            "active_days": days_active,
-            "daily_avg": daily_avg,
             "avg_stock_value": avg_stock_value,
             "turnover_rate": turnover_rate,
             "consume_pct": round(qty / total_qty * 100, 1),

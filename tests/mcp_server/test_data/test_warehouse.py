@@ -662,7 +662,7 @@ def test_list_consumption_summary_returns_dict_with_items_and_warehouse_turnover
     first = result["items"][0]
     for key in ("rank", "item_id", "sku", "name", "category_name", "unit",
                 "current_stock", "safety_stock", "consume_qty",
-                "active_days", "daily_avg", "turnover_rate",
+                "turnover_rate",
                 "consume_pct", "first_date", "last_date"):
         assert key in first, f"missing key {key} in item"
     wt = result["warehouse_turnover"]
