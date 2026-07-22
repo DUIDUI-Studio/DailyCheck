@@ -115,7 +115,7 @@
 | 窗口 | 四个独立窗口：`7天`、`14天`、`30天`、`月度`（28天近似） |
 | **daily_avg** | `qty / window_days`（7天窗口=7，14天窗口=14，30天窗口=30，月度=28） |
 | 周度分解 | 近 4 周分别统计出库 + 生产消耗量 |
-| 冷启动规则 | 7 天窗口内无记录 → 返回 `{qty:0, days_active:0, daily_avg:0}` |
+| 冷启动规则 | 7 天窗口内无记录 → 返回 `{qty:0, daily_avg:0}` |
 | **可选: `inventory_turnover`** | 盘点加权平均库存 + COGS 周转率。计算见下表。`include_turnover=false` 默认不返回 |
 | 输出字段 | `item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_7d{...}, consume_14d{...}, consume_30d{...}, consume_monthly{...}, weekly[{...}], inventory_turnover?{...}` |
 
@@ -197,7 +197,7 @@
 | `outbound_list` | `outbound_requests` | 无计算，直接返回 |
 | `outbound_rollback` | `items` + `outbound_requests` + `stock_movements` | `quantity += qty`，标记 `rolled_back=1` |
 | `warehouse_consumption` | `items` + `outbound_requests` + `production_run_items` + `stocktakes`/`stocktake_batches` | `daily_avg = consume_qty / window_days`（7、14 或 30），`active_days`、`turnover_rate`、`consume_pct`；`warehouse_turnover = Σ cogs / Σ avg_inventory_value`（30 天，固定） |
-| `item_consumption` | 同上 + 可选 `stocktakes`/`stocktake_batches` | 三窗口（7d/30d/月度）`daily_avg = qty / window_days`（7/30/28）+ `active_days` + 周度分解；opt-in `include_turnover=true` 加 `inventory_turnover`（盘点加权平均 + COGS 周转） |
+| `item_consumption` | 同上 + 可选 `stocktakes`/`stocktake_batches` | 三窗口（7d/30d/月度）`daily_avg = qty / window_days`（7/30/28）+ 周度分解；opt-in `include_turnover=true` 加 `inventory_turnover`（盘点加权平均 + COGS 周转） |
 | `item_forecast` | 同上 | 加权平均 `daily_avg`（线性衰减）+ 置信度分类 |
 | `procurement_store` | `items` + `outbound_requests` + `restock_requests` | `safety_stock`、`in_transit_qty`、`suggested_qty` |
 | `procurement_hub` | 所有仓库 `procurement_store` | 跨仓汇总 `total_suggested_qty`、`stores_needing` |

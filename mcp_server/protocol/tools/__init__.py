@@ -268,10 +268,11 @@ def get_tools() -> list[Tool]:
             name="item_consumption",
             title="Item Consumption Detail",
             description=(
-                "Return consumption stats for a single item: 7d / 14d / 30d / monthly totals, weekly breakdown, "
-                "and daily avg. Opt-in include_turnover adds a stocktake-anchored inventory turnover estimate. "
+                "Return consumption stats for a single item: 7d / 14d / 30d / monthly totals, weekly breakdown. "
+                "Opt-in include_turnover adds a stocktake-anchored inventory turnover estimate. "
                 "Returns: {item_id, sku, name, category_name, unit, current_stock, safety_stock, "
-                "consume_7d, consume_14d, consume_30d, consume_monthly, weekly, "
+                "consume_7d{qty,window_days,daily_avg}, consume_14d{...}, consume_30d{...}, consume_monthly{...}, "
+                "weekly[{...}], "
                 "[opt-in when include_turnover=true: inventory_turnover]}."
             ),
             inputSchema={

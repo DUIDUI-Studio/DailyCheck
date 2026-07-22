@@ -506,11 +506,9 @@ def _window_sum(
     item_id: int,
     days: int,
 ) -> dict:
-    """Return {qty, active_days, window_days} for an item's consumption over <days> window."""
+    """Return {qty, window_days} for an item's consumption over <days> window."""
     row = conn.execute(f"""
-        SELECT
-            COALESCE(SUM(qty), 0) AS qty,
-            COUNT(DISTINCT substr(created_at, 1, 10)) AS active_days
+        SELECT COALESCE(SUM(qty), 0) AS qty
         FROM (
             SELECT o.requested_quantity AS qty, o.created_at
             FROM outbound_requests o
@@ -524,7 +522,7 @@ def _window_sum(
             WHERE pri.item_id = ? AND pr.rolled_back = 0
               AND pr.created_at >= datetime('now', '-{days} days')
         )""", (item_id, item_id)).fetchone()
-    return {**(dict(row) if row else {"qty": 0, "active_days": 0}), "window_days": days}
+    return {**(dict(row) if row else {"qty": 0}), "window_days": days}
 
 
 def _weekly_breakdown(
@@ -584,7 +582,6 @@ def list_consumption_summary(
             i.unit, i.unit_cost,
             c.name AS category_name,
             COALESCE(c7.qty, 0) AS consume_qty,
-            COALESCE(c7.days, 0) AS active_days,
             COALESCE(r7.qty, 0) AS inbound_qty,
             st.avg_stocktake_qty,
             rr.last_restock_at,
@@ -747,10 +744,8 @@ def get_item_consumption(
     def _fmt(win: dict) -> dict:
         qty = float(win.get("qty", 0) or 0)
         window_days = int(win.get("window_days", 0) or 0)
-        active_days = int(win.get("active_days", 0) or 0)
         return {
             "qty": qty,
-            "active_days": active_days,
             "window_days": window_days,
             "daily_avg": round(qty / window_days, 2) if window_days > 0 else 0.0,
         }
