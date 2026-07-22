@@ -3,22 +3,54 @@ edit, approve, CSV import. Approval requires manager role.
 """
 from __future__ import annotations
 
-import io
 from typing import IO
 
 from flask import (
-    Blueprint, current_app, flash, g, redirect, render_template, request,
-    session, url_for,
+    Blueprint,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
 )
 from werkzeug.datastructures import FileStorage
 
 from db import get_warehouse_db
-from permissions import require_login, require_role
+from permissions import (
+    require_login,
+    require_role,
+)
+
 from ._helpers import now, parse_qty
 from .auth import audit
 
-
 bp = Blueprint("stocktake", __name__)
+
+
+@bp.before_request
+def _require_storefront():
+    """Stocktake is a storefront-only feature;研发中心 has no physical inventory.
+
+    Implemented as a per-blueprint before_request hook so EVERY route under
+    this blueprint is gated without annotating each one.
+    """
+    from permissions import WAREHOUSE_EXEMPT
+    if request.endpoint in WAREHOUSE_EXEMPT or request.endpoint is None:
+        return None
+    if g.user is not None and g.user["is_admin"]:
+        return None  # platform admins bypass for testing
+    wh = g.get("warehouse")
+    if wh is None:
+        return None  # require_login will redirect to picker
+    if wh["warehouse_type"] != "storefront":
+        flash("研发中心无库存盘点功能")
+        from flask import abort
+        abort(403)
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------

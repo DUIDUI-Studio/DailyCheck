@@ -3,15 +3,35 @@ from __future__ import annotations
 
 import sqlite3
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
-from ._helpers import warehouse_categories_in_clause, fmt_qty, gen_sku, now, parse_qty
+
+from ._helpers import gen_sku, now, parse_qty, warehouse_categories_in_clause
 from .auth import audit
 
-
 bp = Blueprint("items", __name__)
+
+
+@bp.before_request
+def _require_storefront():
+    """Items CRUD + inventory view are storefront-only;研发中心 has no stock."""
+    from flask import abort
+
+    from permissions import WAREHOUSE_EXEMPT
+    if request.endpoint in WAREHOUSE_EXEMPT or request.endpoint is None:
+        return None
+    if g.user is not None and g.user["is_admin"]:
+        return None
+    wh = g.get("warehouse")
+    if wh is None:
+        return None
+    if wh["warehouse_type"] != "storefront":
+        flash("研发中心无库存管理功能")
+        abort(403)
+        return None
+    return None
 
 
 @bp.route("/items", methods=["GET", "POST"])

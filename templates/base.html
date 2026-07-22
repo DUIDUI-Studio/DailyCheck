@@ -14,23 +14,34 @@
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
+  {% set wh_type = g.warehouse.warehouse_type if g.warehouse else None %}
+  {% set is_rd = (wh_type == 'rd') %}
+  {% set is_storefront = (wh_type == 'storefront') %}
   <aside class="sidebar desktop-only">
     <h1>库存管理</h1>
     {% if g.user %}
       {% if g.user['is_admin'] %}
       <a href="{{ url_for('users.list_users') }}">账号管理</a>
       <a href="{{ url_for('agent_tokens.list_tokens') }}">Agent Token</a>
+      {# 品类与品项仅门店可见;研发中心没有实体库存。管理员 (is_admin) 不受仓库类型限制。 #}
+      {% if is_admin or is_storefront %}
       <a href="{{ url_for('items.items_list') }}">品类与品项</a>
       {% endif %}
+      {% endif %}
     {% endif %}
+    {# 总览 / 汇总 / 通知: 所有仓库类型可见。 #}
     <a href="{{ url_for('core.dashboard') }}">总览</a>
     <a href="{{ url_for('core.summary') }}">汇总</a>
+    {% if is_admin or is_storefront %}
     <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
     <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>
     <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
     <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
     <a href="{{ url_for('production.products_list') }}">生产录入</a>
+    {% endif %}
+    {% if is_admin or is_rd %}
     <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
+    {% endif %}
     {# /forecast: admin only #}
     {% if g.user and g.user['is_admin'] %}
     <a href="{{ url_for('forecast.forecast_index') }}">预测</a>
@@ -86,16 +97,22 @@
     <nav class="mobile-nav mobile-only">
       {% if g.user and g.user['is_admin'] %}
       <a href="{{ url_for('users.list_users') }}">账号</a>
+      {% if is_admin or is_storefront %}
       <a href="{{ url_for('items.items_list') }}">品项</a>
+      {% endif %}
       {% endif %}
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       <a href="{{ url_for('core.summary') }}">汇总</a>
+      {% if is_admin or is_storefront %}
       <a href="{{ url_for('items.inventory_view') }}">库存</a>
       <a href="{{ url_for('stocktake.stocktake_list') }}">盘点</a>
       <a href="{{ url_for('restock.restock_list') }}">入库</a>
       <a href="{{ url_for('outbound.outbound_list') }}">出库</a>
       <a href="{{ url_for('production.products_list') }}">生产</a>
+      {% endif %}
+      {% if is_admin or is_rd %}
       <a href="{{ url_for('recipe_cost.landing') }}">配方</a>
+      {% endif %}
     </nav>
   </div>
   <script>

@@ -53,10 +53,17 @@ def migrate_legacy_cmd() -> None:
 @click.command("create-warehouse")
 @click.argument("code")
 @click.argument("name")
-def create_warehouse_cmd(code: str, name: str) -> None:
+@click.option(
+    "--type",
+    "warehouse_type",
+    type=click.Choice(["storefront", "rd"], case_sensitive=False),
+    default="storefront",
+    help="Warehouse type: storefront (default, has inventory ops) or rd (研发中心, recipe-only).",
+)
+def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
     """Register a new warehouse. The db file is created if missing."""
-    from db import init_warehouse_db
     from config import WAREHOUSE_DB_DIR
+    from db import init_warehouse_db
 
     db_path = WAREHOUSE_DB_DIR / f"{code}.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,11 +74,14 @@ def create_warehouse_cmd(code: str, name: str) -> None:
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         try:
             conn.execute(
-                "INSERT INTO warehouses (code, name, db_path, created_at) VALUES (?, ?, ?, ?)",
-                (code, name, rel_path, now),
+                "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (code, name, rel_path, warehouse_type, now),
             )
             conn.commit()
-            click.echo(f"Created warehouse {code} ({name})")
+            click.echo(
+                f"Created warehouse {code} ({name}) type={warehouse_type}"
+            )
         except sqlite3.IntegrityError:
             click.echo(f"Warehouse {code} already exists", err=True)
 
@@ -84,9 +94,9 @@ def clone_warehouse_cmd(src_code: str, new_code: str, name: str) -> None:
     """Create <new_code> by cloning categories, items, products and
     product_bom from <src_code>. Stock quantities are reset to zero.
     """
+    from config import WAREHOUSE_DB_DIR
     from db import init_warehouse_db
     from db.clone import clone_warehouse_catalog
-    from config import WAREHOUSE_DB_DIR
 
     src_path = WAREHOUSE_DB_DIR / f"{src_code}.db"
     if not src_path.exists():
@@ -209,6 +219,7 @@ def bootstrap_cmd(
     skipped. Always runnable; never destroys data.
     """
     from datetime import datetime
+
     from werkzeug.security import generate_password_hash
 
     # 1) master.db
@@ -238,8 +249,8 @@ def bootstrap_cmd(
         any_wh = conn.execute("SELECT 1 FROM warehouses LIMIT 1").fetchone()
     if any_wh is None:
         # Inline create-warehouse logic so we don't double-import.
-        from db import init_warehouse_db
         from config import WAREHOUSE_DB_DIR
+        from db import init_warehouse_db
         db_path = WAREHOUSE_DB_DIR / f"{warehouse_code}.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         init_warehouse_db(db_path)
@@ -266,8 +277,10 @@ def bootstrap_cmd(
 def mcp_cmd(port: int) -> None:
     """Start the MCP server (stdio transport)."""
     import asyncio
-    from mcp_server.protocol.server import build_server
+
     from mcp.server.stdio import stdio_server
+
+    from mcp_server.protocol.server import build_server
 
     async def run_server():
         server = build_server()
@@ -289,6 +302,7 @@ def create_agent_token_cmd(name: str, read_paths: str, write_paths: str, warehou
     Example: flask --app app create-agent-token my-agent --read-paths "*"
     """
     import secrets
+
     from werkzeug.security import generate_password_hash
 
     raw_token = secrets.token_urlsafe(32)

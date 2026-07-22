@@ -11,22 +11,42 @@ from flask import Blueprint, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
-from ._helpers import now, parse_qty, render, grams_to_stock
-from .auth import audit
 
+from ._helpers import grams_to_stock, now, parse_qty, render
+from .auth import audit
 
 bp = Blueprint("production", __name__)
 
 
 @bp.before_request
-def _set_no_sidebar():
-    """Production module has its own sidebar-free layout — users navigate
-    between 产品/录入/历史 via the top tabs and return to /land for the
-    库存管理/生产录入 choice. The view must still pass no_sidebar=True
-    in its render() call (Flask's g is not visible to Jinja by default).
-    This hook sets g for any future context_processor that wants it."""
-    from flask import g
+def _set_no_sidebar_and_guard():
+    """Production module:
+
+    1. Has its own sidebar-free layout — users navigate between 产品/录入/历史
+       via the top tabs and return to /land for the 库存管理/生产录入 choice.
+       The view must still pass no_sidebar=True in its render() call (Flask's
+       g is not visible to Jinja by default). This hook sets g for any future
+       context_processor that wants it.
+
+    2. Is gated to storefronts only — production consumes physical inventory,
+       so it doesn't apply to 研发中心.
+    """
+    from flask import abort
+
+    from permissions import WAREHOUSE_EXEMPT
     g.no_sidebar = True
+    if request.endpoint in WAREHOUSE_EXEMPT or request.endpoint is None:
+        return None
+    if g.user is not None and g.user["is_admin"]:
+        return None
+    wh = g.get("warehouse")
+    if wh is None:
+        return None
+    if wh["warehouse_type"] != "storefront":
+        flash("研发中心无生产录入功能")
+        abort(403)
+        return None
+    return None
 
 
 @bp.route("/production", methods=["GET"])

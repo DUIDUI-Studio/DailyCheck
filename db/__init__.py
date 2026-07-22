@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS warehouses (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     db_path TEXT NOT NULL,
+    warehouse_type TEXT NOT NULL DEFAULT 'storefront',
     created_at TEXT NOT NULL
 );
 
