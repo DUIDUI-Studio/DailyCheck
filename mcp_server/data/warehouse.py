@@ -254,6 +254,32 @@ def get_inventory_turnover(
     current_qty = float(item["quantity"])
     unit_cost = float(item["unit_cost"])
 
+    # Precondition: only compute turnover if last restock > 30 days ago.
+    end_ts = _now if _now is not None else datetime.datetime.now()
+    last_restock = conn.execute(
+        "SELECT MAX(created_at) AS last_at FROM restock_requests WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+    if last_restock and last_restock["last_at"]:
+        try:
+            last_dt = datetime.datetime.strptime(
+                last_restock["last_at"], "%Y-%m-%d %H:%M:%S"
+            )
+            if (end_ts - last_dt).days < 30:
+                return {
+                    "window_days": days,
+                    "avg_inventory": None,
+                    "current_inventory": current_qty,
+                    "cogs_value": 0.0,
+                    "turnover_value": None,
+                    "anchors_in_window": 0,
+                    "anchors_total": 0,
+                    "data_quality": "too_new",
+                    "method": "stocktake_weighted_avg",
+                }
+        except ValueError:
+            pass
+
     # 1) Fetch all non-rolled-back stocktake anchors for this item, oldest first.
     anchor_rows = conn.execute(
         """
@@ -281,8 +307,7 @@ def get_inventory_turnover(
             "method": "stocktake_weighted_avg",
         }
 
-    # 2) Window bounds (use UTC-naive arithmetic matching stored format).
-    end_ts = _now if _now is not None else datetime.datetime.now()
+    # 2) Window bounds.
     start_ts = end_ts - datetime.timedelta(days=days)
 
     # Add boundary anchors: window start (qty interpolated) and window end
@@ -562,6 +587,7 @@ def list_consumption_summary(
             COALESCE(c7.days, 0) AS active_days,
             COALESCE(r7.qty, 0) AS inbound_qty,
             st.avg_stocktake_qty,
+            rr.last_restock_at,
             c7.first_date,
             c7.last_date
         FROM items i
@@ -600,6 +626,11 @@ def list_consumption_summary(
             WHERE created_at >= datetime('now', '-{days} days')
             GROUP BY item_id
         ) st ON st.item_id = i.id
+        LEFT JOIN (
+            SELECT item_id, MAX(created_at) AS last_restock_at
+            FROM restock_requests
+            GROUP BY item_id
+        ) rr ON rr.item_id = i.id
     """).fetchall()
 
     # Total for percentage calculation
@@ -639,15 +670,27 @@ def list_consumption_summary(
             avg_qty = (start_qty + current_stock) / 2
         avg_stock_value = round(avg_qty * unit_cost, 2)
 
-        turnover_rate = (
-            round(consume_value / avg_stock_value, 2)
-            if avg_stock_value > 0 else 0.0
-        )
+        # Precondition: only compute turnover if last restock > 30 days ago
+        now = datetime.datetime.now()
+        last_restock_str = r["last_restock_at"]
+        stock_age_ok = True
+        if last_restock_str is not None:
+            try:
+                last_dt = datetime.datetime.strptime(last_restock_str, "%Y-%m-%d %H:%M:%S")
+                if (now - last_dt).days < 30:
+                    stock_age_ok = False
+            except ValueError:
+                pass
+
+        if stock_age_ok and avg_stock_value > 0:
+            turnover_rate = round(consume_value / avg_stock_value, 2)
+        else:
+            turnover_rate = None
 
         days_active = int(r["active_days"] or 0)
         daily_avg = round(qty / days_active, 2) if days_active > 0 else 0.0
 
-        result.append({
+        item = {
             "item_id": r["id"],
             "sku": r["sku"],
             "name": r["name"],
@@ -664,13 +707,16 @@ def list_consumption_summary(
             "consume_pct": round(qty / total_qty * 100, 1),
             "first_date": r["first_date"],
             "last_date": r["last_date"],
-        })
+        }
+        if turnover_rate is None:
+            item["turnover_note"] = "库存未满30天"
+        result.append(item)
 
     # Sort per-item results
     sort_key = {
         "qty": lambda x: x["consume_qty"],
         "value": lambda x: x["consume_value"],
-        "turnover": lambda x: x["turnover_rate"],
+        "turnover": lambda x: x["turnover_rate"] if x["turnover_rate"] is not None else -1,
         "name": lambda x: x["name"],
     }.get(sort_by, lambda x: x["consume_qty"])
     reverse = sort_by != "name"

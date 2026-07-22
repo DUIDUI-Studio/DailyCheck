@@ -124,6 +124,7 @@ def test_create_restock_increases_quantity():
     conn.row_factory = sqlite3.Row
     create_items_table(conn)
     create_stock_movements_table(conn)
+    create_restock_requests_table(conn)
 
     # Insert item with initial quantity
     conn.execute(
@@ -290,6 +291,7 @@ def _setup_turnover_env(
     create_stocktake_batches_table(conn)
     create_stocktakes_table(conn)
     create_outbound_requests_table(conn)
+    create_restock_requests_table(conn)
     create_production_runs_table(conn)
     create_production_run_items_table(conn)
     conn.execute(
