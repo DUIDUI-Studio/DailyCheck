@@ -2,17 +2,36 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Optional
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
-from db import get_warehouse_db
-from permissions import require_login, require_platform_admin
 from blueprints._helpers import now, parse_qty
 from blueprints.auth import audit
-
+from db import get_warehouse_db
+from permissions import require_login, require_platform_admin
 
 bp = Blueprint("recipe_cost", __name__)
+
+
+@bp.before_request
+def _require_rd():
+    """Recipe-cost module is RD-only; storefronts don't need it (their inventory
+    lives in their own DB, not in recipes). Platform admins bypass for testing."""
+    from flask import abort
+
+    from permissions import WAREHOUSE_EXEMPT
+    if request.endpoint in WAREHOUSE_EXEMPT or request.endpoint is None:
+        return None
+    if g.user is not None and g.user["is_admin"]:
+        return None
+    wh = g.get("warehouse")
+    if wh is None:
+        return None  # require_login redirects to picker
+    if wh["warehouse_type"] != "rd":
+        flash("配方功能仅在研发中心可用")
+        abort(403)
+        return None
+    return None
 
 
 @bp.route("/recipe-cost/")
@@ -54,6 +73,8 @@ def ic_recipes_list():
             "cost_purchase": float(c["cost_purchase"]),
             "cost_selling": float(c["cost_selling"]),
             "margin_purchase": c["margin_purchase"],
+            "margin_selling": c.get("margin_selling"),
+            "profit": c.get("profit", 0.0),
             "item_count": len(c["lines"]),
         })
     return render_template(
@@ -122,16 +143,18 @@ def ic_recipe_delete(ic_recipe_id: int):
     return redirect(url_for("recipe_cost.ic_recipes_list"))
 
 
-def _save_ic_recipe(ic_recipe_id: Optional[int]):
+def _save_ic_recipe(ic_recipe_id: int | None):
     """Create or update an ic_recipe + its BOM rows.
 
     Form fields: name / note / output_unit / output_qty / sale_price /
                  bom_row_id[] / bom_item_id[] / bom_qty[] / bom_delete[]
+
+    `output_qty` is auto-computed as Σ(bom.qty_per_unit) of surviving rows
+    (grams in RD world). The user-supplied value is overwritten.
     """
     name = request.form.get("name", "").strip()
     note = request.form.get("note", "").strip()
-    output_unit = request.form.get("output_unit", "g").strip() or "g"
-    output_qty = parse_qty(request.form.get("output_qty", "100"))
+    output_unit = "g"  # hard-coded: 冰激凌配方 always grams
     sale_price = float(request.form.get("sale_price", "0") or 0)
 
     if not name:
@@ -145,32 +168,33 @@ def _save_ic_recipe(ic_recipe_id: Optional[int]):
     db = get_warehouse_db()
     if ic_recipe_id is None:
         try:
+            # Insert with placeholder output_qty=0; we'll update after BOM.
             db.execute(
                 """INSERT INTO ic_recipes
                    (name, note, output_unit, output_qty, sale_price,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (name, note, output_unit, output_qty, sale_price, now(), now()),
+                   VALUES (?, ?, ?, 0, ?, ?, ?)""",
+                (name, note, output_unit, sale_price, now(), now()),
             )
             new_id = int(db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
             db.commit()
             audit("recipe_cost.ic_recipe.create", "ic_recipe", new_id, {"name": name})
-            return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=new_id))
         except sqlite3.IntegrityError:
             flash("配方名称已存在")
             return redirect(url_for("recipe_cost.ic_recipe_new"))
     else:
-        db.execute(
-            """UPDATE ic_recipes SET name=?, note=?, output_unit=?,
-               output_qty=?, sale_price=?, updated_at=? WHERE id=?""",
-            (name, note, output_unit, output_qty, sale_price, now(), ic_recipe_id),
-        )
+        # output_qty updated after BOM processing
+        pass
 
+    # Process BOM rows (works for both new + existing)
     bom_ids = request.form.getlist("bom_row_id")
     item_ids = request.form.getlist("bom_item_id")
     qtys = request.form.getlist("bom_qty")
     deletes = request.form.getlist("bom_delete")
     added = removed = updated = 0
+    total_grams = 0.0
+    target_id = ic_recipe_id if ic_recipe_id is not None else new_id
+
     for i in range(len(bom_ids)):
         row_id = bom_ids[i].strip()
         if i < len(deletes) and deletes[i] == "1":
@@ -193,18 +217,27 @@ def _save_ic_recipe(ic_recipe_id: Optional[int]):
                 db.execute(
                     """INSERT INTO ic_recipe_items
                        (ic_recipe_id, item_id, qty_per_unit) VALUES (?, ?, ?)""",
-                    (ic_recipe_id, int(item_id), qty),
+                    (target_id, int(item_id), qty),
                 )
                 added += 1
             except sqlite3.IntegrityError:
                 flash(f"第 {i+1} 行原料重复")
+        total_grams += qty
+
+    # Now update output_qty + sale_price + name/note for the recipe
+    db.execute(
+        """UPDATE ic_recipes SET name=?, note=?, output_unit=?,
+           output_qty=?, sale_price=?, updated_at=? WHERE id=?""",
+        (name, note, output_unit, round(total_grams, 2), sale_price, now(), target_id),
+    )
 
     db.commit()
-    audit("recipe_cost.ic_recipe.update", "ic_recipe", ic_recipe_id, {
+    audit("recipe_cost.ic_recipe.update", "ic_recipe", target_id, {
         "added": added, "removed": removed, "updated": updated,
+        "output_qty": round(total_grams, 2),
     })
     flash("冰激凌配方已保存")
-    return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=ic_recipe_id))
+    return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=target_id))
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +261,8 @@ def recipes_list():
             "cost_purchase": float(c["cost_purchase"]),
             "cost_selling": float(c["cost_selling"]),
             "margin_purchase": c["margin_purchase"],
+            "margin_selling": c.get("margin_selling"),
+            "profit": c.get("profit", 0.0),
             "item_count": len(c["lines"]),
         })
     return render_template("recipe_cost/recipes.html", recipes=enriched)
@@ -309,8 +344,7 @@ def recipe_delete(recipe_id: int):
 def _save_recipe(recipe_id):
     name = request.form.get("name", "").strip()
     note = request.form.get("note", "").strip()
-    output_unit = request.form.get("output_unit", "件").strip() or "件"
-    output_qty = parse_qty(request.form.get("output_qty", "1"))
+    output_unit = "g"  # RD world: output always grams
     sale_price = float(request.form.get("sale_price", "0") or 0)
 
     if not name:
@@ -328,13 +362,12 @@ def _save_recipe(recipe_id):
                 """INSERT INTO recipes
                    (name, note, output_unit, output_qty, sale_price,
                     sale_price_updated_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (name, note, output_unit, output_qty, sale_price, now(), now(), now()),
+                   VALUES (?, ?, ?, 0, ?, ?, ?, ?)""",
+                (name, note, output_unit, sale_price, now(), now(), now()),
             )
             new_id = int(db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
             db.commit()
             audit("recipe_cost.recipe.create", "recipe", new_id, {"name": name})
-            return redirect(url_for("recipe_cost.recipe_edit", recipe_id=new_id))
         except sqlite3.IntegrityError:
             flash("配方名称已存在")
             return redirect(url_for("recipe_cost.recipe_new"))
@@ -346,9 +379,9 @@ def _save_recipe(recipe_id):
         sp_updated_at = now() if sale_price != old_sp else None
         db.execute(
             """UPDATE recipes SET name=?, note=?, output_unit=?,
-               output_qty=?, sale_price=?, sale_price_updated_at=?,
+               sale_price=?, sale_price_updated_at=?,
                updated_at=? WHERE id=?""",
-            (name, note, output_unit, output_qty, sale_price, sp_updated_at,
+            (name, note, output_unit, sale_price, sp_updated_at,
              now(), recipe_id),
         )
 
@@ -360,6 +393,9 @@ def _save_recipe(recipe_id):
     qtys = request.form.getlist("bom_qty")
     deletes = request.form.getlist("bom_delete")
     added = removed = updated = 0
+    total_grams = 0.0
+    target_id = recipe_id if recipe_id is not None else new_id
+
     for i in range(len(bom_ids)):
         row_id = bom_ids[i].strip()
         if i < len(deletes) and deletes[i] == "1":
@@ -388,9 +424,11 @@ def _save_recipe(recipe_id):
                     """INSERT INTO recipe_items
                        (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
                        VALUES (?, 'item', ?, NULL, ?)""",
-                    (recipe_id, int(item_id), qty),
+                    (target_id, int(item_id), qty),
                 )
                 added += 1
+            # For items: each qty is in grams (input form is grams per serving).
+            total_grams += qty
         elif st == "ic_recipe":
             if not ic_id:
                 continue
@@ -406,16 +444,31 @@ def _save_recipe(recipe_id):
                     """INSERT INTO recipe_items
                        (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
                        VALUES (?, 'ic_recipe', NULL, ?, ?)""",
-                    (recipe_id, int(ic_id), qty),
+                    (target_id, int(ic_id), qty),
                 )
                 added += 1
+            # For ic_recipe rows: qty is "servings" of that ic recipe,
+            # and each ic recipe is output_qty grams. So total_grams = qty * ic.output_qty.
+            ic_row = db.execute(
+                "SELECT output_qty FROM ic_recipes WHERE id=?", (int(ic_id),)
+            ).fetchone()
+            if ic_row:
+                ic_grams = float(ic_row["output_qty"] or 0)
+                total_grams += qty * ic_grams
+
+    # Update output_qty (auto = total grams)
+    db.execute(
+        """UPDATE recipes SET output_qty=?, updated_at=? WHERE id=?""",
+        (round(total_grams, 2), now(), target_id),
+    )
 
     db.commit()
-    audit("recipe_cost.recipe.update", "recipe", recipe_id, {
+    audit("recipe_cost.recipe.update", "recipe", target_id, {
         "added": added, "removed": removed, "updated": updated,
+        "output_qty": round(total_grams, 2),
     })
     flash("出品配方已保存")
-    return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
+    return redirect(url_for("recipe_cost.recipe_edit", recipe_id=target_id))
 
 
 @bp.route("/recipe-cost/items/<int:item_id>/update-selling-price", methods=["POST"])
@@ -473,4 +526,6 @@ def api_cost(kind: str, rid: int):
         "cost_selling": float(c["cost_selling"]),
         "sale_price": float(c["sale_price"]),
         "margin_purchase": c["margin_purchase"],
+        "margin_selling": c.get("margin_selling"),
+        "profit": float(c.get("profit", 0.0)),
     }

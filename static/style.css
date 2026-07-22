@@ -1305,3 +1305,46 @@ tr.is-hidden { display: none; }
   font-size: 11px; color: #0f766e; text-align: right;
   margin-top: 4px;
 }
+
+/* --- recipe-cost module ----------------------------------------------- */
+
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;     /* vertical-center checkbox with text */
+  gap: 0.4rem;
+  cursor: pointer;
+}
+.checkbox-label input[type="checkbox"] {
+  width: auto;             /* override global 100% width */
+  margin: 0;
+  vertical-align: middle;
+}
+.checkbox-label span { line-height: 1; }
+
+/* BOM table: fixed layout so the row width matches the table, and
+   columns don't squish on mobile. Numeric columns stay narrow. */
+table.bom-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+table.bom-table th,
+table.bom-table td {
+  padding: 8px;
+  vertical-align: middle;
+  overflow-wrap: anywhere; /* long item names wrap instead of overflowing */
+}
+table.bom-table td .bom-qty,
+table.bom-table td .bom-temp-price {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Compact del-flag label so delete checkbox + word don't overflow */
+.del-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+.del-flag input[type="checkbox"] { width: auto; margin: 0; }

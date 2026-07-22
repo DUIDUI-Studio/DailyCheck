@@ -9,14 +9,13 @@
   <div class="grid cols-3">
     <label>配方名称 <input name="name" required value="{{ recipe['name'] if recipe else '' }}" /></label>
     <label>输出单位
-      <select name="output_unit">
-        <option value="g" {% if recipe and recipe['output_unit']=='g' %}selected{% endif %}>g（克）</option>
-        <option value="ml" {% if recipe and recipe['output_unit']=='ml' %}selected{% endif %}>ml（毫升）</option>
-        <option value="件" {% if recipe and recipe['output_unit']=='件' %}selected{% endif %}>件</option>
-      </select>
+      <input name="output_unit_display" value="g（克）" disabled />
+      <input type="hidden" name="output_unit" value="g" />
     </label>
-    <label>每份输出量 <input name="output_qty" type="number" min="0" step="0.01"
-      value="{{ recipe['output_qty'] if recipe else 100 }}" /></label>
+    <label>每份输出量 <input name="output_qty" id="output-qty" type="number" min="0" step="0.01"
+      value="{{ recipe['output_qty'] if recipe else 100 }}" />
+      <small class="muted">自动 = 原料总克数</small>
+    </label>
     <label>售价（¥） <input name="sale_price" id="sale-price" type="number" min="0" step="0.01"
       value="{{ recipe['sale_price'] if recipe else 0 }}" /></label>
     <label>备注 <input name="note" value="{{ recipe['note'] or '' if recipe else '' }}" /></label>
@@ -37,9 +36,9 @@
          value="{{ recipe['sale_price'] if recipe else 0 }}" />
 
   <div class="form-block" style="margin: 0.5em 0;">
-    <label>
+    <label class="checkbox-label">
       <input type="checkbox" id="use-temp-prices" />
-      使用临时售价（用于探索毛利率）
+      <span>使用临时售价（用于探索毛利率）</span>
     </label>
   </div>
 
@@ -83,11 +82,8 @@
         <td><span class="bom-sp">{{ '%.3f' | format(b['selling_price'] or 0) }}</span></td>
         <td><span class="bom-cost-selling">0.00</span></td>
         <td>
-          <input type="range" class="bom-temp-slider" min="0" step="0.01"
+          <input type="number" class="bom-temp-price" min="0" step="0.01"
                  value="{{ b['selling_price'] or 0 }}" disabled />
-          <span class="bom-temp-display">{{ '%.2f' | format(b['selling_price'] or 0) }}</span>
-          <button type="button" class="btn-sm bom-save-temp"
-                  data-item-id="{{ b['item_id'] }}" disabled>保存为新价</button>
         </td>
         <td>
           <label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label>
@@ -106,7 +102,22 @@
       <tr>
         <th colspan="4" style="text-align:right;">售价</th>
         <th colspan="2" id="footer-sale-price">0.00</th>
-        <th colspan="3">毛利率：<strong id="footer-margin">—</strong></th>
+        <th colspan="3"></th>
+      </tr>
+      <tr>
+        <th colspan="4" style="text-align:right;">采购毛利（基于售价）</th>
+        <th colspan="2" id="footer-margin-purchase">—</th>
+        <th colspan="3"></th>
+      </tr>
+      <tr>
+        <th colspan="4" style="text-align:right;">销售毛利（基于销售小计）</th>
+        <th colspan="2" id="footer-margin-selling">—</th>
+        <th colspan="3"></th>
+      </tr>
+      <tr>
+        <th colspan="4" style="text-align:right;">利润（销售小计−采购小计）</th>
+        <th colspan="2" id="footer-profit">0.00</th>
+        <th colspan="3">利润率：<strong id="footer-profit-margin">—</strong></th>
       </tr>
     </tfoot>
   </table>

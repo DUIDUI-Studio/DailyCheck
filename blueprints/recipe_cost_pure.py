@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import sqlite3
 from decimal import Decimal
-from typing import Optional
 
 
 def _safe_decimal(value) -> Decimal:
@@ -34,7 +33,7 @@ def qty_to_stock_units(qty, item: dict) -> Decimal:
 def line_cost(
     qty,
     item: dict,
-    temp_selling_price: Optional[Decimal] = None,
+    temp_selling_price: Decimal | None = None,
 ) -> dict:
     """单条原料行：含克重换算的采购/销售成本。
 
@@ -54,12 +53,37 @@ def line_cost(
     }
 
 
-def _margin(sale_price, cost_purchase) -> Optional[float]:
+def _margin(sale_price, cost_purchase) -> float | None:
+    """Gross margin based on PURCHASE cost (the conservative KPI).
+
+    formula: (sale_price - cost_purchase) / sale_price
+    """
     if sale_price is None or float(sale_price) <= 0:
         return None
     sp = float(sale_price)
     cp = float(cost_purchase)
     return round((sp - cp) / sp, 4)
+
+
+def _margin_selling(cost_selling, cost_purchase) -> float | None:
+    """Gross margin based on SELLING cost (the optimistic KPI).
+
+    formula: (cost_selling - cost_purchase) / cost_selling
+    Use this to compare to the customer's actual revenue potential — when
+    customers buy at the full selling price vs at the negotiated/promo price.
+    Returns None if cost_selling <= 0.
+    """
+    cs = float(cost_selling)
+    cp = float(cost_purchase)
+    if cs <= 0:
+        return None
+    return round((cs - cp) / cs, 4)
+
+
+def _profit(cost_selling, cost_purchase) -> float:
+    """Profit = cost_selling - cost_purchase. Always non-negative when not using
+    temp prices (cost_selling ≥ cost_purchase since selling price ≥ cost)."""
+    return float(cost_selling) - float(cost_purchase)
 
 
 def _lines_for_recipe(conn, table: str, recipe_id: int, recipe_id_col: str):
@@ -83,7 +107,7 @@ def _lines_for_recipe(conn, table: str, recipe_id: int, recipe_id_col: str):
 def ic_recipe_cost(
     conn,
     ic_recipe_id: int,
-    temp_prices: Optional[dict] = None,
+    temp_prices: dict | None = None,
 ) -> dict:
     """冰激凌配方总成本（采购 + 销售价值）+ 毛利率 + 每行小计。
 
@@ -126,6 +150,8 @@ def ic_recipe_cost(
         "cost_selling": cost_selling,
         "sale_price": sale_price,
         "margin_purchase": _margin(sale_price, cost_purchase),
+        "margin_selling": _margin_selling(cost_selling, cost_purchase),
+        "profit": _profit(cost_selling, cost_purchase),
         "lines": lines,
     }
 
@@ -133,7 +159,7 @@ def ic_recipe_cost(
 def recipe_cost(
     conn,
     recipe_id: int,
-    temp_prices: Optional[dict] = None,
+    temp_prices: dict | None = None,
 ) -> dict:
     """出品配方总成本 + 毛利率。多态原料：
     - source_type='item' → line_cost（克重换算）
@@ -224,5 +250,7 @@ def recipe_cost(
         "cost_selling": cost_selling,
         "sale_price": sale_price,
         "margin_purchase": _margin(sale_price, cost_purchase),
+        "margin_selling": _margin_selling(cost_selling, cost_purchase),
+        "profit": _profit(cost_selling, cost_purchase),
         "lines": lines,
     }

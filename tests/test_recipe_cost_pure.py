@@ -285,3 +285,119 @@ def test_recipe_cost_with_temp_prices_in_mixed_lines():
     # cost_selling: ic_recipe 50 * (20/100) = 10；item 2*3 = 6；合计 16
     assert r["cost_selling"] == Decimal("16.00")
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 二毛利 + 利润 (margin_selling, profit) — RD 模块新增
+# ---------------------------------------------------------------------------
+
+def test_ic_recipe_cost_margin_selling_positive():
+    """cost_selling > cost_purchase → margin_selling > 0。
+
+    Setup: cost_purchase=10, cost_selling=20 → margin_selling = (20-10)/20 = 0.5
+    """
+    import sqlite3
+    from decimal import Decimal
+    from blueprints.recipe_cost_pure import ic_recipe_cost
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE ic_recipes (id INTEGER PRIMARY KEY, sale_price REAL, output_qty REAL);
+        CREATE TABLE ic_recipe_items (
+            id INTEGER PRIMARY KEY, ic_recipe_id INTEGER, item_id INTEGER, qty_per_unit REAL);
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY, unit_cost REAL, selling_price REAL,
+            gram_per_unit REAL, aux_rate REAL, unit TEXT);
+        INSERT INTO ic_recipes VALUES (1, 0, 100.0);
+        INSERT INTO items VALUES (1, 10.0, 20.0, 0.0, 0.0, '件');
+        INSERT INTO ic_recipe_items VALUES (1, 1, 1, 1.0);
+        """
+    )
+    conn.commit()
+    r = ic_recipe_cost(conn, 1)
+    assert r["cost_purchase"] == Decimal("10.00")
+    assert r["cost_selling"] == Decimal("20.00")
+    assert abs(r["margin_selling"] - 0.5) < 0.001
+    assert r["profit"] == 10.0  # 20-10
+    conn.close()
+
+
+def test_ic_recipe_cost_margin_selling_none_when_no_revenue():
+    """cost_selling=0 (空 BOM) → margin_selling=None 而非除零错误。"""
+    import sqlite3
+    from blueprints.recipe_cost_pure import ic_recipe_cost
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE ic_recipes (id INTEGER PRIMARY KEY, sale_price REAL, output_qty REAL);
+        CREATE TABLE ic_recipe_items (
+            id INTEGER PRIMARY KEY, ic_recipe_id INTEGER, item_id INTEGER, qty_per_unit REAL);
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY, unit_cost REAL, selling_price REAL,
+            gram_per_unit REAL, aux_rate REAL, unit TEXT);
+        INSERT INTO ic_recipes VALUES (1, 30.0, 100.0);
+        """
+    )
+    conn.commit()
+    r = ic_recipe_cost(conn, 1)
+    assert r["cost_selling"] == 0
+    assert r["margin_selling"] is None
+    conn.close()
+
+
+def test_recipe_cost_margin_selling_and_profit():
+    """出品配方同样暴露 margin_selling 与 profit。"""
+    import sqlite3
+    from decimal import Decimal
+    from blueprints.recipe_cost_pure import recipe_cost
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE recipes (id INTEGER PRIMARY KEY, sale_price REAL, output_qty REAL);
+        CREATE TABLE recipe_items (
+            id INTEGER PRIMARY KEY, recipe_id INTEGER, source_type TEXT,
+            item_id INTEGER, ic_recipe_id INTEGER, qty_per_unit REAL);
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY, unit_cost REAL, selling_price REAL,
+            gram_per_unit REAL, aux_rate REAL, unit TEXT);
+        INSERT INTO recipes VALUES (1, 20.0, 1.0);
+        INSERT INTO items VALUES (1, 4.0, 8.0, 0.0, 0.0, '件');
+        INSERT INTO recipe_items VALUES (1, 1, 'item', 1, NULL, 3.0);
+        """
+    )
+    conn.commit()
+    r = recipe_cost(conn, 1)
+    assert r["cost_purchase"] == Decimal("12.00")  # 3 * 4
+    assert r["cost_selling"] == Decimal("24.00")    # 3 * 8
+    assert abs(r["margin_purchase"] - 0.4) < 0.001  # (20-12)/20
+    assert abs(r["margin_selling"] - 0.5) < 0.001  # (24-12)/24
+    assert r["profit"] == 12.0                     # 24-12
+    conn.close()
+
+
+def test_recipe_cost_profit_negative_when_selling_below_purchase():
+    """销售单价=0 但 BOM 有采购成本 → profit 为负,margin_selling 安全返回 None。"""
+    import sqlite3
+    from blueprints.recipe_cost_pure import recipe_cost
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE recipes (id INTEGER PRIMARY KEY, sale_price REAL, output_qty REAL);
+        CREATE TABLE recipe_items (
+            id INTEGER PRIMARY KEY, recipe_id INTEGER, source_type TEXT,
+            item_id INTEGER, ic_recipe_id INTEGER, qty_per_unit REAL);
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY, unit_cost REAL, selling_price REAL,
+            gram_per_unit REAL, aux_rate REAL, unit TEXT);
+        INSERT INTO recipes VALUES (1, 10.0, 1.0);
+        INSERT INTO items VALUES (1, 5.0, 0.0, 0.0, 0.0, '件');
+        INSERT INTO recipe_items VALUES (1, 1, 'item', 1, NULL, 1.0);
+        """
+    )
+    conn.commit()
+    r = recipe_cost(conn, 1)
+    assert r["cost_purchase"] == 5.0
+    assert r["cost_selling"] == 0.0
+    assert r["margin_selling"] is None
+    assert r["profit"] == -5.0
+    conn.close()
