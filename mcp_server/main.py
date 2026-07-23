@@ -53,10 +53,21 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 
 # ---------------------------------------------------------------------------
 # Auth middleware — validates Bearer token via DAILYCHECK_MCP_TOKEN env var
+# OR queries agent_tokens table (production main path).
+# Fallback chain: env → agent_tokens table
 # ---------------------------------------------------------------------------
 
 class AuthMiddleware:
-    """ASGI middleware that requires DAILYCHECK_MCP_TOKEN if set."""
+    """ASGI middleware that authenticates Bearer tokens.
+
+    Fallback chain:
+      1. env DAILYCHECK_MCP_TOKEN (legacy dev/test; backward-compat)
+      2. agent_tokens table (production main path) — checked via werkzeug
+         pbkdf2:sha256 hash, supports per-token revocation + future ACL.
+
+    Both branches verify the same header shape; either success short-circuits
+    to next middleware. 401 if neither matches.
+    """
 
     def __init__(self, app) -> None:
         self.app = app
@@ -66,19 +77,36 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        expected = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
-        if expected:
-            headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
-            auth = headers.get("authorization", "")
-            if not (auth.startswith("Bearer ") and auth[7:].strip() == expected):
-                resp = JSONResponse(
-                    {"error": "unauthorized", "message": "Invalid or missing token"},
-                    status_code=401,
-                )
-                await resp(scope, receive, send)
-                return
+        headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+        auth = headers.get("authorization", "")
 
-        await self.app(scope, receive, send)
+        # Branch 1: legacy env-based shared secret (dev only, but kept for
+        # zero-friction local testing without provisioning a token).
+        expected = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
+        if expected and auth.startswith("Bearer ") and auth[7:].strip() == expected:
+            await self.app(scope, receive, send)
+            return
+
+        # Branch 2: agent_tokens table lookup (production).
+        # Lazy import to avoid loading SQLite connection machinery for the
+        # env-only dev path (and to keep cold-start minimal).
+        try:
+            from mcp_server.service.auth import authenticate
+            ctx = authenticate(auth) if auth.startswith("Bearer ") else None
+            if ctx is not None:
+                # Stash AuthContext in scope for downstream tool handlers.
+                scope.setdefault("state", {})["auth"] = ctx
+                await self.app(scope, receive, send)
+                return
+        except Exception as e:
+            logger.warning("agent_tokens lookup failed: %s", e)
+
+        resp = JSONResponse(
+            {"error": "unauthorized", "message": "Invalid or missing token"},
+            status_code=401,
+        )
+        await resp(scope, receive, send)
+        return
 
 
 # ---------------------------------------------------------------------------
