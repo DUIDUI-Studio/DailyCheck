@@ -254,6 +254,32 @@ def get_inventory_turnover(
     current_qty = float(item["quantity"])
     unit_cost = float(item["unit_cost"])
 
+    # Precondition: only compute turnover if last restock > 30 days ago.
+    end_ts = _now if _now is not None else datetime.datetime.now()
+    last_restock = conn.execute(
+        "SELECT MAX(created_at) AS last_at FROM restock_requests WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+    if last_restock and last_restock["last_at"]:
+        try:
+            last_dt = datetime.datetime.strptime(
+                last_restock["last_at"], "%Y-%m-%d %H:%M:%S"
+            )
+            if (end_ts - last_dt).days < 30:
+                return {
+                    "window_days": days,
+                    "avg_inventory": None,
+                    "current_inventory": current_qty,
+                    "cogs_value": 0.0,
+                    "turnover_value": None,
+                    "anchors_in_window": 0,
+                    "anchors_total": 0,
+                    "data_quality": "too_new",
+                    "method": "stocktake_weighted_avg",
+                }
+        except ValueError:
+            pass
+
     # 1) Fetch all non-rolled-back stocktake anchors for this item, oldest first.
     anchor_rows = conn.execute(
         """
@@ -281,8 +307,7 @@ def get_inventory_turnover(
             "method": "stocktake_weighted_avg",
         }
 
-    # 2) Window bounds (use UTC-naive arithmetic matching stored format).
-    end_ts = _now if _now is not None else datetime.datetime.now()
+    # 2) Window bounds.
     start_ts = end_ts - datetime.timedelta(days=days)
 
     # Add boundary anchors: window start (qty interpolated) and window end
@@ -481,11 +506,9 @@ def _window_sum(
     item_id: int,
     days: int,
 ) -> dict:
-    """Return {qty, active_days, window_days} for an item's consumption over <days> window."""
+    """Return {qty, window_days} for an item's consumption over <days> window."""
     row = conn.execute(f"""
-        SELECT
-            COALESCE(SUM(qty), 0) AS qty,
-            COUNT(DISTINCT substr(created_at, 1, 10)) AS active_days
+        SELECT COALESCE(SUM(qty), 0) AS qty
         FROM (
             SELECT o.requested_quantity AS qty, o.created_at
             FROM outbound_requests o
@@ -499,7 +522,7 @@ def _window_sum(
             WHERE pri.item_id = ? AND pr.rolled_back = 0
               AND pr.created_at >= datetime('now', '-{days} days')
         )""", (item_id, item_id)).fetchone()
-    return {**(dict(row) if row else {"qty": 0, "active_days": 0}), "window_days": days}
+    return {**(dict(row) if row else {"qty": 0}), "window_days": days}
 
 
 def _weekly_breakdown(
@@ -544,42 +567,24 @@ def list_consumption_summary(
 ) -> dict:
     """Return per-item consumption summary for the warehouse + warehouse-level turnover.
 
-    Mirrors blueprints/items.py inventory_view() exactly.
-    Includes: 7d/30d consumption, daily_avg, turnover_rate, ranking.
+    Value-based turnover per item (consumed_value / avg_stock_value),
+    plus warehouse-level turnover via stocktake-weighted-sum.
 
-    Return shape (changed in this version — was list[dict]):
+    Return shape:
         {
             "items": [ {... per-item ...}, ... ],
-            "warehouse_turnover": {
-                "window_days": int,
-                "warehouse_cogs_value": float,
-                "warehouse_avg_inventory_value": float,
-                "turnover_value": float | None,
-                "items_with_turnover": int,
-                "items_total": int,
-                "data_quality": "high" | "medium" | "none",
-                "method": "stocktake_weighted_sum",
-            },
+            "warehouse_turnover": { ... },
         }
     """
-    order_map = {
-        "qty": "consume_qty DESC",
-        "value": "consume_value DESC",
-        "turnover": "turnover_rate DESC",
-        "name": "name ASC",
-    }
-    order_col = order_map.get(sort_by, "consume_qty DESC")
-
     rows = conn.execute(f"""
         SELECT
             i.id, i.sku, i.name, i.quantity, i.safety_stock,
             i.unit, i.unit_cost,
             c.name AS category_name,
             COALESCE(c7.qty, 0) AS consume_qty,
-            COALESCE(c7.days, 0) AS active_days,
-            CASE WHEN i.quantity > 0
-                 THEN ROUND(COALESCE(c7.qty, 0) / i.quantity, 2)
-                 ELSE 0 END AS turnover_rate,
+            COALESCE(r7.qty, 0) AS inbound_qty,
+            st.avg_stocktake_qty,
+            rr.last_restock_at,
             c7.first_date,
             c7.last_date
         FROM items i
@@ -606,9 +611,24 @@ def list_consumption_summary(
             )
             GROUP BY item_id
         ) c7 ON c7.item_id = i.id
-        ORDER BY {order_col}
-        LIMIT ?
-    """, (limit,)).fetchall()
+        LEFT JOIN (
+            SELECT item_id, SUM(requested_quantity) AS qty
+            FROM restock_requests
+            WHERE created_at >= datetime('now', '-{days} days')
+            GROUP BY item_id
+        ) r7 ON r7.item_id = i.id
+        LEFT JOIN (
+            SELECT item_id, AVG(actual_quantity) AS avg_stocktake_qty
+            FROM stocktakes
+            WHERE created_at >= datetime('now', '-{days} days')
+            GROUP BY item_id
+        ) st ON st.item_id = i.id
+        LEFT JOIN (
+            SELECT item_id, MAX(created_at) AS last_restock_at
+            FROM restock_requests
+            GROUP BY item_id
+        ) rr ON rr.item_id = i.id
+    """).fetchall()
 
     # Total for percentage calculation
     total_row = conn.execute(f"""
@@ -629,32 +649,80 @@ def list_consumption_summary(
     total_qty = float(dict(total_row)["total"]) or 1.0
 
     result = []
-    for rank, r in enumerate(rows, 1):
+    for r in rows:
         r = dict(r)
-        qty = float(r["consume_qty"])
-        result.append({
-            "rank": rank,
+        qty = float(r["consume_qty"] or 0)
+        unit_cost = float(r["unit_cost"] or 0)
+        consume_value = round(qty * unit_cost, 2)
+
+        current_stock = float(r["quantity"] or 0)
+        avg_stocktake_qty = r["avg_stocktake_qty"]
+        if avg_stocktake_qty is not None:
+            avg_qty = float(avg_stocktake_qty)
+        else:
+            inbound_qty = float(r["inbound_qty"] or 0)
+            start_qty = current_stock + qty - inbound_qty
+            if start_qty < 0:
+                start_qty = 0
+            avg_qty = (start_qty + current_stock) / 2
+        avg_stock_value = round(avg_qty * unit_cost, 2)
+
+        # Precondition: only compute turnover if last restock > 30 days ago
+        now = datetime.datetime.now()
+        last_restock_str = r["last_restock_at"]
+        stock_age_ok = True
+        if last_restock_str is not None:
+            try:
+                last_dt = datetime.datetime.strptime(last_restock_str, "%Y-%m-%d %H:%M:%S")
+                if (now - last_dt).days < 30:
+                    stock_age_ok = False
+            except ValueError:
+                pass
+
+        if stock_age_ok and avg_stock_value > 0:
+            turnover_rate = round(consume_value / avg_stock_value, 2)
+        else:
+            turnover_rate = None
+
+        item = {
             "item_id": r["id"],
             "sku": r["sku"],
             "name": r["name"],
             "category_name": r["category_name"],
             "unit": r["unit"],
-            "current_stock": r["quantity"],
+            "current_stock": current_stock,
             "safety_stock": r["safety_stock"],
             "consume_qty": qty,
-            "active_days": r["active_days"],
-            "daily_avg": round(qty / days, 2) if days > 0 else 0.0,
-            "turnover_rate": r["turnover_rate"],
+            "consume_value": consume_value,
+            "avg_stock_value": avg_stock_value,
+            "turnover_rate": turnover_rate,
             "consume_pct": round(qty / total_qty * 100, 1),
             "first_date": r["first_date"],
             "last_date": r["last_date"],
-        })
+        }
+        if turnover_rate is None:
+            item["turnover_note"] = "库存未满30天"
+        result.append(item)
+
+    # Sort per-item results
+    sort_key = {
+        "qty": lambda x: x["consume_qty"],
+        "value": lambda x: x["consume_value"],
+        "turnover": lambda x: x["turnover_rate"] if x["turnover_rate"] is not None else -1,
+        "name": lambda x: x["name"],
+    }.get(sort_by, lambda x: x["consume_qty"])
+    reverse = sort_by != "name"
+    result.sort(key=sort_key, reverse=reverse)
+
+    for rank, item in enumerate(result[:limit], 1):
+        item["rank"] = rank
+    items = result[:limit]
 
     # Warehouse-level turnover — always 30-day window per current spec.
     warehouse_turnover = get_warehouse_inventory_turnover(conn, days=30)
 
     return {
-        "items": result,
+        "items": items,
         "warehouse_turnover": warehouse_turnover,
     }
 
@@ -676,10 +744,8 @@ def get_item_consumption(
     def _fmt(win: dict) -> dict:
         qty = float(win.get("qty", 0) or 0)
         window_days = int(win.get("window_days", 0) or 0)
-        active_days = int(win.get("active_days", 0) or 0)
         return {
             "qty": qty,
-            "active_days": active_days,
             "window_days": window_days,
             "daily_avg": round(qty / window_days, 2) if window_days > 0 else 0.0,
         }

@@ -7,6 +7,7 @@ static/icons/icon-192.tmp
 .DS_Store
 access.log
 error.log
+health_check.log
 .inventory.db.original.backup
 
 # SQLite databases are runtime state, not source. They get re-created
@@ -15,13 +16,26 @@ error.log
 # git, but the actual db files stay local.
 db/master.db
 db/warehouses/*.db
+master.db
+wh_*.db
 
 # Superpowers brainstorming sessions (mockups, scratch)
 .superpowers/
 
+# WorkBuddy agent memory / runtime notes (local only, never commit)
+.workbuddy/
+
 # Runtime / scratch artifacts
 admin_audit.log
 graphify-out/
+
+# Playwright MCP debug artifacts
+.playwright-mcp/
+
+# Dev screenshots
+*.png
+# PWA icons are source assets — keep them tracked despite the *.png rule above
+!static/icons/*.png
 
 # Frontend toolchain deps (not part of source — install per-machine)
 node_modules/

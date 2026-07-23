@@ -124,6 +124,7 @@ def test_create_restock_increases_quantity():
     conn.row_factory = sqlite3.Row
     create_items_table(conn)
     create_stock_movements_table(conn)
+    create_restock_requests_table(conn)
 
     # Insert item with initial quantity
     conn.execute(
@@ -254,6 +255,14 @@ def create_stocktakes_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def create_restock_requests_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE restock_requests ("
+        "id INTEGER PRIMARY KEY, item_id INTEGER, requested_quantity INTEGER, "
+        "reason TEXT, status TEXT, created_at TEXT)"
+    )
+
+
 def create_production_runs_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE production_runs ("
@@ -282,6 +291,7 @@ def _setup_turnover_env(
     create_stocktake_batches_table(conn)
     create_stocktakes_table(conn)
     create_outbound_requests_table(conn)
+    create_restock_requests_table(conn)
     create_production_runs_table(conn)
     create_production_run_items_table(conn)
     conn.execute(
@@ -622,9 +632,9 @@ def _setup_consumption_summary_env() -> sqlite3.Connection:
     create_categories_table(conn)
     create_items_table(conn)
     create_outbound_requests_table(conn)
+    create_restock_requests_table(conn)
     create_production_runs_table(conn)
     create_production_run_items_table(conn)
-    # warehouse_turnover aggregates per-item turnover; needs stocktake tables.
     create_stocktake_batches_table(conn)
     create_stocktakes_table(conn)
     conn.execute("INSERT INTO categories (id, name) VALUES (1, '调味酱')")
@@ -652,7 +662,7 @@ def test_list_consumption_summary_returns_dict_with_items_and_warehouse_turnover
     first = result["items"][0]
     for key in ("rank", "item_id", "sku", "name", "category_name", "unit",
                 "current_stock", "safety_stock", "consume_qty",
-                "active_days", "daily_avg", "turnover_rate",
+                "turnover_rate",
                 "consume_pct", "first_date", "last_date"):
         assert key in first, f"missing key {key} in item"
     wt = result["warehouse_turnover"]
