@@ -134,7 +134,7 @@ def ic_recipe_cost(
             "aux_rate": r["aux_rate"],
             "unit": r["unit"],
         }
-        tmp = temp_prices.get(int(r["item_id"]))
+        tmp = temp_prices.get(int(r["item_id"])) if temp_prices else None
         lc = line_cost(r["qty_per_unit"], item, temp_selling_price=tmp)
         cost_purchase += lc["cost_purchase"]
         cost_selling += lc["cost_selling"]

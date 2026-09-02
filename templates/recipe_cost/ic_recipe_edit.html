@@ -13,19 +13,19 @@
       <input type="hidden" name="output_unit" value="g" />
     </label>
     <label>每份输出量 <input name="output_qty" id="output-qty" type="number" min="0" step="0.01"
-      value="{{ recipe['output_qty'] if recipe else 100 }}" />
-      <small class="muted">自动 = 原料总克数</small>
+      value="{{ recipe['output_qty'] if recipe else 0 }}" disabled readonly />
+      <small class="muted">自动 = 原料总克数（不可手动修改）</small>
     </label>
-    <label>售价（¥） <input name="sale_price" id="sale-price" type="number" min="0" step="0.01"
+    <label>配方售价（¥） <input name="sale_price" id="sale-price" type="number" min="0" step="0.01"
       value="{{ recipe['sale_price'] if recipe else 0 }}" /></label>
     <label>备注 <input name="note" value="{{ recipe['note'] or '' if recipe else '' }}" /></label>
   </div>
-  <button type="submit" class="btn-primary">保存配方</button>
+  <button type="submit" class="btn-primary">保存配方信息</button>
 </form>
 
 <hr/>
-<h3>原料配方</h3>
-<p class="muted">每份冰激凌的原料用量（单位与品项一致：克或库存单位）。</p>
+<h3>原料配方·销售单价试算</h3>
+<p class="muted">可修改每行原料的<b>销售单价</b>来评估对整体毛利和利润的影响（仅影响销售价值和相关毛利项，不影响采购成本及采购毛利）。</p>
 
 <form method="post" id="bom-form">
   <input type="hidden" name="name" value="{{ recipe['name'] if recipe else '' }}" />
@@ -35,20 +35,15 @@
   <input type="hidden" name="sale_price" id="bom-sale-price"
          value="{{ recipe['sale_price'] if recipe else 0 }}" />
 
-  <div class="form-block" style="margin: 0.5em 0;">
-    <label class="checkbox-label">
-      <input type="checkbox" id="use-temp-prices" />
-      <span>使用临时售价（用于探索毛利率）</span>
-    </label>
-  </div>
-
-  <table class="bom-table">
+  <table class="bom-table" data-bom-variant="ic">
     <thead>
       <tr>
         <th>原料</th><th>每份用量</th><th>单位</th>
         <th>采购单价</th><th>采购小计</th>
-        <th>销售单价</th><th>销售小计</th>
-        <th>临时售价</th><th>操作</th>
+        <th>销售单价</th>
+        <th class="sp-adj-col">调整售价</th>
+        <th>销售小计</th>
+        <th>操作</th>
       </tr>
     </thead>
     <tbody id="bom-body">
@@ -79,12 +74,15 @@
         <td><span class="bom-unit-label">{% if b['gram_per_unit'] %}克{% else %}{{ b['item_unit'] }}{% endif %}</span></td>
         <td><span class="bom-uc">{{ '%.3f' | format(b['unit_cost']) }}</span></td>
         <td><span class="bom-cost-purchase">0.00</span></td>
-        <td><span class="bom-sp">{{ '%.3f' | format(b['selling_price'] or 0) }}</span></td>
-        <td><span class="bom-cost-selling">0.00</span></td>
         <td>
-          <input type="number" class="bom-temp-price" min="0" step="0.01"
-                 value="{{ b['selling_price'] or 0 }}" disabled />
+          <span class="bom-sp">{{ '%.3f' | format(b['selling_price'] or 0) }}</span>
         </td>
+        <td class="sp-adj-col">
+          <input type="number" class="bom-sp-adj" name="bom_sp_adj" min="0" step="0.01"
+                 value="{{ b['selling_price'] or 0 }}"
+                 data-original-sp="{{ b['selling_price'] or 0 }}" />
+        </td>
+        <td><span class="bom-cost-selling">0.00</span></td>
         <td>
           <label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label>
         </td>
@@ -96,31 +94,40 @@
         <th colspan="4" style="text-align:right;">合计</th>
         <th id="total-purchase">0.00</th>
         <th></th>
+        <th class="sp-adj-col"></th>
         <th id="total-selling">0.00</th>
+        <th></th>
+      </tr>
+      <tr>
+        <th colspan="4" style="text-align:right;">配方售价</th>
+        <th colspan="3" id="footer-sale-price">0.00</th>
         <th colspan="2"></th>
       </tr>
       <tr>
-        <th colspan="4" style="text-align:right;">售价</th>
-        <th colspan="2" id="footer-sale-price">0.00</th>
-        <th colspan="3"></th>
+        <th colspan="4" style="text-align:right;">采购毛利（售价−采购小计）</th>
+        <th colspan="2" id="footer-margin-purchase-amt">0.00</th>
+        <th class="sp-adj-col"></th>
+        <th colspan="2" id="footer-margin-purchase-pct">毛利率：—</th>
       </tr>
       <tr>
-        <th colspan="4" style="text-align:right;">采购毛利（基于售价）</th>
-        <th colspan="2" id="footer-margin-purchase">—</th>
-        <th colspan="3"></th>
+        <th colspan="4" style="text-align:right;">销售毛利  原</th>
+        <th colspan="2" id="footer-margin-selling-amt">0.00</th>
+        <th class="sp-adj-col"></th>
+        <th colspan="2" id="footer-margin-selling-pct">毛利率：—</th>
       </tr>
       <tr>
-        <th colspan="4" style="text-align:right;">销售毛利（基于销售小计）</th>
-        <th colspan="2" id="footer-margin-selling">—</th>
-        <th colspan="3"></th>
-      </tr>
-      <tr>
-        <th colspan="4" style="text-align:right;">利润（销售小计−采购小计）</th>
+        <th colspan="4" style="text-align:right;">净利润  原</th>
         <th colspan="2" id="footer-profit">0.00</th>
-        <th colspan="3">利润率：<strong id="footer-profit-margin">—</strong></th>
+        <th class="sp-adj-col"></th>
+        <th colspan="2">净利率：<strong id="footer-profit-margin">—</strong></th>
       </tr>
     </tfoot>
   </table>
+
+  <div class="margin-warning" id="margin-warning" hidden>
+    <span class="mw-icon">⚠</span>
+    <span>当前净利润为负（亏损），建议上调原料销售单价或配方售价。</span>
+  </div>
 
   <button type="button" id="bom-add" class="btn-sm">+ 新增一行</button>
   <button type="submit" class="btn-primary">保存配方</button>
@@ -131,10 +138,11 @@
     {% for it in items %}
     {"id": {{ it['id'] }}, "label": "{{ it['category_name'] }} / {{ it['name'] }}",
      "gram_per_unit": {{ it['gram_per_unit'] or 0 }},
+     "unit": "{{ it['unit'] }}",
      "unit_cost": {{ it['unit_cost'] or 0 }},
      "selling_price": {{ it['selling_price'] or 0 }}}{% if not loop.last %},{% endif %}
     {% endfor %}
   ];
 </script>
-<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=2"></script>
+<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=9"></script>
 {% endblock %}

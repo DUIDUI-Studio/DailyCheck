@@ -39,7 +39,7 @@
     <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
     <a href="{{ url_for('production.products_list') }}">生产录入</a>
     {% endif %}
-    {% if is_admin or is_rd %}
+    {% if is_rd %}
     <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
     {% endif %}
     {# /forecast: admin only #}

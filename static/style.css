@@ -1348,3 +1348,174 @@ table.bom-table td .bom-temp-price {
   white-space: nowrap;
 }
 .del-flag input[type="checkbox"] { width: auto; margin: 0; }
+
+/* Recipe card (ic_recipes) — full recipe + cost + margin, redesigned for clarity.
+   2-col grid; BOM table stays readable. Sale price is the hero of each card. */
+.recipe-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+@media (max-width: 760px) { .recipe-cards { grid-template-columns: 1fr; } }
+
+.recipe-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--panel);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+  overflow: hidden;
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+.recipe-card::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 4px;
+  background: linear-gradient(90deg, #0f766e, #0e7490);
+}
+.recipe-card:hover { box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12); transform: translateY(-2px); }
+
+.recipe-card__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.recipe-card__title { min-width: 0; }
+.recipe-card__title h3 { margin: 0; font-size: 18px; font-weight: 700; color: var(--brand-ink); letter-spacing: 0.3px; }
+.recipe-card__title p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+
+.recipe-card__price {
+  flex-shrink: 0;
+  text-align: right;
+  background: linear-gradient(135deg, #0f766e, #0e7490);
+  color: #fff;
+  border-radius: 12px;
+  padding: 8px 14px;
+  min-width: 96px;
+}
+.rc-price-label { display: block; font-size: 11px; opacity: 0.88; letter-spacing: 1px; }
+.rc-price-val { display: block; font-size: 21px; font-weight: 800; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+.recipe-card__actions { display: flex; gap: 6px; }
+.recipe-card__actions form { margin: 0; }
+
+.recipe-card__section { display: flex; flex-direction: column; gap: 8px; }
+.rc-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 1px;
+  padding-left: 9px;
+  border-left: 3px solid var(--brand);
+}
+
+.recipe-card__bom {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.rc-bom-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  align-items: center;
+  border-bottom: 1px solid #eef2f6;
+}
+.rc-bom-row:last-child { border-bottom: none; }
+.rc-bom-row:nth-child(even) { background: #f8fafc; }
+.rc-bom-head {
+  background: linear-gradient(90deg, #f1f5f9, #eef2f6);
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 11.5px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.rc-bom-row:hover:not(.rc-bom-head) { background: #f0f9f6; }
+.rc-bom-name { overflow-wrap: anywhere; font-weight: 500; color: var(--text); }
+.rc-bom-empty { color: var(--muted); padding: 14px 12px; }
+.rc-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); }
+
+.recipe-card__summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.rc-sum {
+  background: linear-gradient(180deg, #f8fafc, #f1f5f9);
+  border: 1px solid #eef2f6;
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.rc-sum-label { display: block; font-size: 11px; color: var(--muted); }
+.rc-sum-val { display: block; font-size: 17px; font-weight: 800; color: var(--brand-ink); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+.recipe-card__margin { display: flex; flex-direction: column; gap: 11px; }
+.rc-margin { display: flex; flex-direction: column; gap: 5px; }
+.rc-margin--purchase { --c: #10b981; --ct: #047857; }
+.rc-margin--selling  { --c: #3b82f6; --ct: #1d4ed8; }
+.rc-margin--profit   { --c: #f59e0b; --ct: #b45309; }
+.rc-margin-top { display: flex; align-items: baseline; gap: 8px; }
+.rc-margin-label { font-size: 12.5px; color: var(--text); font-weight: 500; }
+.rc-margin-val { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--ct); }
+.rc-margin-pct { margin-left: auto; font-size: 13px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--ct); }
+.rc-margin-pct.is-neg { color: #dc2626; }
+.rc-bar { height: 7px; border-radius: 99px; background: #eef2f6; overflow: hidden; }
+.rc-bar-fill { height: 100%; border-radius: 99px; background: var(--c); transition: width 0.2s ease; }
+
+/* 编辑页：售价「原价 vs 调整价」对比 + 负利润醒目提示（与现有风格一致） */
+/* ===== 原料销售单价试算 ===== */
+/* 调整列——编辑页中原料销售单价的覆写输入 */
+.sp-adj-col { width: 100px; }
+.bom-sp-adj {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
+  text-align: right;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  background: #fafbfd;
+  transition: border-color 0.15s, background 0.15s;
+}
+.bom-sp-adj:focus {
+  outline: none;
+  border-color: var(--brand);
+  background: #fff;
+}
+/* 调整值与品项原价不同时，高亮背景提示 */
+.bom-sp-adj.is-adjusted {
+  border-color: var(--brand);
+  background: #f0fdf9;
+}
+
+/* 表后浮动影响汇总 */
+.bom-delta-note {
+  margin: 10px 0 4px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1d4ed8;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 负利润警告：紧贴影响汇总下方 */
+.margin-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  font-size: 13px;
+  font-weight: 600;
+}
+.margin-warning .mw-icon { font-size: 16px; line-height: 1; }
+
+/* footer 净利润为负标红 */
+#footer-profit.is-neg { color: #dc2626; font-weight: 800; }

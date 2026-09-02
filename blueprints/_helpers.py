@@ -201,9 +201,24 @@ def register_template_context(app) -> None:
                 # Never break template rendering over a notification count
                 # failure — fall back to 0 (no badge).
                 unread = 0
+        wh_type = g.warehouse["warehouse_type"] if g.get("warehouse") is not None else None
         return {
             "current_role": role["role"] if role else None,
             "unread_notifications_count": unread,
+            # Mirror g.user["is_admin"] into the template namespace. base.html
+            # gates several nav links on `is_admin or is_storefront`, but the
+            # bare `is_admin` name was never injected — so admins lost those
+            # links in non-storefront warehouses (e.g. the R&D center). This
+            # restores the documented "admin not limited by warehouse type"
+            # behaviour. See base.html lines 27/35.
+            "is_admin": bool(g.user["is_admin"]) if g.get("user") is not None else False,
+            # Warehouse type flags. Hoisted here from `{% set %}` in base.html's
+            # sidebar block — Jinja2 block scope doesn't propagate to child
+            # template blocks, so items.html / edit_item.html couldn't see
+            # `is_rd` and silently hid the 进货单价 (unit_cost) field in the
+            # R&D center. Inject globally so all templates can use them.
+            "is_rd": wh_type == "rd",
+            "is_storefront": wh_type == "storefront",
         }
 
 

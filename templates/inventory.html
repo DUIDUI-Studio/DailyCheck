@@ -10,7 +10,7 @@
 {% set ns = namespace(total_qty=0, total_value=0, consume_qty=0, consume_value=0) %}
 {% for i in items %}
   {% set qty = i.quantity | float %}
-  {% set cost = i.unit_cost | float %}
+  {% set cost = (i.unit_cost | float) if is_rd else 0 %}
   {% set c7 = i.consume_7d_qty | float %}
   {% set ns.total_qty = ns.total_qty + qty %}
   {% set ns.total_value = ns.total_value + (qty * cost) %}
@@ -60,7 +60,7 @@
 <div class="inv-grid">
   {% for i in items %}
     {% set qty = i.quantity | float %}
-    {% set cost = i.unit_cost | float %}
+    {% set cost = (i.unit_cost | float) if is_rd else 0 %}
     {% set value = qty * cost %}
     {% set c7 = i.consume_7d_qty | float %}
     {% set c7v = i.consume_7d_value | float %}

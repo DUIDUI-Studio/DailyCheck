@@ -225,11 +225,64 @@ def test_ic_recipe_crud(tmp_path, monkeypatch):
     }, follow_redirects=True)
     assert resp.status_code == 200
 
+    # 编辑页应渲染原料销售单价试算功能 + 负利润警告容器
+    assert b'id="margin-warning"' in resp.data, "编辑页应含负利润警告容器"
+    assert '净利润' in resp.data.decode('utf-8'), "页脚利润应改标为净利润"
+
     row = check.execute(
-        "SELECT qty_per_unit FROM ic_recipe_items WHERE ic_recipe_id=?",
+        "SELECT id, qty_per_unit FROM ic_recipe_items WHERE ic_recipe_id=?",
         (ic_id,),
     ).fetchone()
     assert float(row["qty_per_unit"]) == 60.0
+
+    # 列表页应渲染完整配方（品项名）+ 成本 + 毛利信息
+    resp = client.get("/recipe-cost/ic-recipes")
+    assert resp.status_code == 200
+    html = resp.data.decode("utf-8")
+    assert "糖" in html, "配方卡片应展示完整原料行（品项名）"
+    assert "采购毛利" in html, "卡片应展示采购毛利"
+    assert "销售毛利" in html, "卡片应展示销售毛利"
+    assert "利润" in html, "卡片应展示利润"
+
+    # 验证原料销售单价保存到品项表 items.selling_price
+    resp = client.post(f"/recipe-cost/ic-recipes/{ic_id}/edit", data={
+        "name": "香草冰淇淋",
+        "note": "测试",
+        "output_unit": "g",
+        "output_qty": "100",
+        "sale_price": "25",
+        "bom_row_id": [str(row["id"])],
+        "bom_item_id": [str(item_id)],
+        "bom_qty": ["60"],
+        "bom_delete": [""],
+        "bom_sp_adj": ["12"],      # 品项默认销售单价为 10，此处覆写为 12
+    }, follow_redirects=True)
+    assert resp.status_code == 200
+    # 验证 items 表的 selling_price 被更新
+    new_sp = check.execute(
+        "SELECT selling_price FROM items WHERE id=?", (item_id,)
+    ).fetchone()
+    assert float(new_sp["selling_price"]) == 12.0
+
+    # 编辑页 GET — 调整售价输入框应回填新价格 12
+    resp = client.get(f"/recipe-cost/ic-recipes/{ic_id}/edit")
+    assert resp.status_code == 200
+    assert b'value="12.0"' in resp.data or b'value="12"' in resp.data
+
+    # 恢复原价
+    client.post(f"/recipe-cost/ic-recipes/{ic_id}/edit", data={
+        "name": "香草冰淇淋",
+        "sale_price": "25",
+        "bom_row_id": [str(row["id"])],
+        "bom_item_id": [str(item_id)],
+        "bom_qty": ["60"],
+        "bom_delete": [""],
+        "bom_sp_adj": ["10"],
+    }, follow_redirects=True)
+    sp2 = check.execute(
+        "SELECT selling_price FROM items WHERE id=?", (item_id,)
+    ).fetchone()
+    assert float(sp2["selling_price"]) == 10.0
 
     resp = client.post(f"/recipe-cost/ic-recipes/{ic_id}/delete", follow_redirects=True)
     assert resp.status_code == 200

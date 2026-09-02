@@ -16,16 +16,16 @@
       value="{{ recipe['output_qty'] if recipe else 1 }}" />
       <small class="muted">自动 = 原料总克数</small>
     </label>
-    <label>售价（¥） <input name="sale_price" id="sale-price" type="number" min="0" step="0.01"
+    <label>配方售价（¥） <input name="sale_price" id="sale-price" type="number" min="0" step="0.01"
       value="{{ recipe['sale_price'] if recipe else 0 }}" /></label>
     <label>备注 <input name="note" value="{{ recipe['note'] or '' if recipe else '' }}" /></label>
   </div>
-  <button type="submit" class="btn-primary">保存配方</button>
+  <button type="submit" class="btn-primary">保存配方信息</button>
 </form>
 
 <hr/>
 <h3>原料配方</h3>
-<p class="muted">可引用 品项（item）或 冰激凌配方（ic_recipe）。</p>
+<p class="muted">可引用 品项（item）或 冰激凌配方（ic_recipe）。启用「临时售价」可针对每行覆盖原料销售单价来评估影响。</p>
 
 <form method="post" id="bom-form">
   <input type="hidden" name="name" value="{{ recipe['name'] if recipe else '' }}" />
@@ -38,7 +38,7 @@
   <div class="form-block" style="margin: 0.5em 0;">
     <label class="checkbox-label">
       <input type="checkbox" id="use-temp-prices" />
-      <span>使用临时售价（用于探索毛利率）</span>
+      <span>使用临时售价（调整原料销售单价以评估毛利影响）</span>
     </label>
   </div>
 
@@ -114,27 +114,32 @@
         <th colspan="2"></th>
       </tr>
       <tr>
-        <th colspan="4" style="text-align:right;">售价</th>
+        <th colspan="4" style="text-align:right;">配方售价</th>
         <th colspan="2" id="footer-sale-price">0.00</th>
         <th colspan="2"></th>
       </tr>
       <tr>
         <th colspan="4" style="text-align:right;">采购毛利（基于售价）</th>
-        <th colspan="2" id="footer-margin-purchase">—</th>
-        <th colspan="2"></th>
+        <th colspan="2" id="footer-margin-purchase-amt">0.00</th>
+        <th colspan="2" id="footer-margin-purchase-pct">毛利率：—</th>
       </tr>
       <tr>
-        <th colspan="4" style="text-align:right;">销售毛利（基于销售小计）</th>
-        <th colspan="2" id="footer-margin-selling">—</th>
-        <th colspan="2"></th>
+        <th colspan="4" style="text-align:right;">销售毛利（售价−销售小计）</th>
+        <th colspan="2" id="footer-margin-selling-amt">0.00</th>
+        <th colspan="2" id="footer-margin-selling-pct">毛利率：—</th>
       </tr>
       <tr>
-        <th colspan="4" style="text-align:right;">利润（销售小计−采购小计）</th>
+        <th colspan="4" style="text-align:right;">净利润（销售小计−采购小计）</th>
         <th colspan="2" id="footer-profit">0.00</th>
-        <th colspan="2">利润率：<strong id="footer-profit-margin">—</strong></th>
+        <th colspan="2">净利率：<strong id="footer-profit-margin">—</strong></th>
       </tr>
     </tfoot>
   </table>
+
+  <div class="margin-warning" id="margin-warning" hidden>
+    <span class="mw-icon">⚠</span>
+    <span>当前净利润为负（亏损），建议上调原料销售单价或配方售价。</span>
+  </div>
 
   <button type="button" id="bom-add" class="btn-sm">+ 新增一行</button>
   <button type="submit" class="btn-primary">保存配方</button>
@@ -161,5 +166,5 @@
     {% endfor %}
   };
 </script>
-<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=2"></script>
+<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=9"></script>
 {% endblock %}

@@ -16,7 +16,7 @@ bp = Blueprint("items", __name__)
 
 @bp.before_request
 def _require_storefront():
-    """Items CRUD + inventory view are storefront-only;研发中心 has no stock."""
+    """Items CRUD are storefront-only;研发中心 can see items but not unit_cost."""
     from flask import abort
 
     from permissions import WAREHOUSE_EXEMPT
@@ -27,8 +27,10 @@ def _require_storefront():
     wh = g.get("warehouse")
     if wh is None:
         return None
+    if wh["warehouse_type"] == "rd":
+        return None  # rd 可以看 items，只是模板里不显示 unit_cost
     if wh["warehouse_type"] != "storefront":
-        flash("研发中心无库存管理功能")
+        flash("该仓库类型不支持库存管理功能")
         abort(403)
         return None
     return None

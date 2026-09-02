@@ -56,6 +56,77 @@ def _load_items_for_bom() -> list:
     ).fetchall()
 
 
+def _build_ic_card_lines(db, lines):
+    """把 ic_recipe_cost 返回的纯成本行补全为卡片展示行（带品项名 + 单位）。
+
+    pure 函数的 lines 只有 item_id / 用量 / 成本，没有可读名称；这里一次性
+    JOIN items+categories 取名称与单位标签（克 / 库存单位），避免逐行查询。
+    """
+    meta = {}
+    for r in db.execute(
+        "SELECT i.id, i.name AS item_name, i.unit AS item_unit, "
+        "i.gram_per_unit, c.name AS category_name "
+        "FROM items i JOIN categories c ON c.id = i.category_id"
+    ).fetchall():
+        gpu = float(r["gram_per_unit"] or 0)
+        meta[r["id"]] = {
+            "name": f"{r['category_name']} / {r['item_name']}",
+            "unit": "克" if gpu > 0 else (r["item_unit"] or ""),
+        }
+    out = []
+    for ln in lines:
+        m = meta.get(ln["item_id"], {"name": f"原料#{ln['item_id']}", "unit": ""})
+        out.append({
+            "name": m["name"],
+            "qty": float(ln["qty_per_unit"]),
+            "unit": m["unit"],
+            "cost_purchase": float(ln["cost_purchase"]),
+            "cost_selling": float(ln["cost_selling"]),
+        })
+    return out
+
+
+def _build_recipe_card_lines(db, lines):
+    """把 recipe_cost 返回的 lines（含 item / ic_recipe 两种类型）补全为卡片展示行。"""
+    # 品项元数据
+    item_meta = {}
+    for r in db.execute(
+        "SELECT i.id, i.name AS item_name, i.unit AS item_unit, "
+        "i.gram_per_unit, c.name AS category_name "
+        "FROM items i JOIN categories c ON c.id = i.category_id"
+    ).fetchall():
+        gpu = float(r["gram_per_unit"] or 0)
+        item_meta[r["id"]] = {
+            "name": f"{r['category_name']} / {r['item_name']}",
+            "unit": "克" if gpu > 0 else (r["item_unit"] or ""),
+        }
+    # 冰激凌配方元数据
+    ic_meta = {}
+    for r in db.execute("SELECT id, name FROM ic_recipes").fetchall():
+        ic_meta[r["id"]] = r["name"]
+    out = []
+    for ln in lines:
+        if ln.get("line_type") == "ic_recipe":
+            name = ic_meta.get(ln.get("ic_recipe_id"), f"冰激凌配方#{ln.get('ic_recipe_id')}")
+            out.append({
+                "name": name,
+                "qty": float(ln.get("qty_per_unit", 0)),
+                "unit": "份",
+                "cost_purchase": float(ln["cost_purchase"]),
+                "cost_selling": float(ln["cost_selling"]),
+            })
+        else:
+            m = item_meta.get(ln.get("item_id"), {"name": f"原料#{ln.get('item_id')}", "unit": ""})
+            out.append({
+                "name": m["name"],
+                "qty": float(ln.get("qty_per_unit", 0)),
+                "unit": m["unit"],
+                "cost_purchase": float(ln["cost_purchase"]),
+                "cost_selling": float(ln["cost_selling"]),
+            })
+    return out
+
+
 @bp.route("/recipe-cost/ic-recipes", methods=["GET"])
 @require_login
 def ic_recipes_list():
@@ -68,14 +139,28 @@ def ic_recipes_list():
     enriched = []
     for r in rows:
         c = ic_recipe_cost(db, int(r["id"]))
+        sale_price = float(r["sale_price"] or 0)
+        cp = float(c["cost_purchase"])
+        cs = float(c["cost_selling"])
+        # 三套口径（与编辑页 footer 对齐）：
+        #   采购毛利 = 售价 − 采购成本；销售毛利 = 售价 − 销售小计；利润 = 销售小计 − 采购成本
+        margin_purchase_amt = round(sale_price - cp, 2)
+        margin_selling_amt = round(sale_price - cs, 2)
+        profit = round(cs - cp, 2)
         enriched.append({
             **dict(r),
-            "cost_purchase": float(c["cost_purchase"]),
-            "cost_selling": float(c["cost_selling"]),
+            "cost_purchase": cp,
+            "cost_selling": cs,
             "margin_purchase": c["margin_purchase"],
             "margin_selling": c.get("margin_selling"),
-            "profit": c.get("profit", 0.0),
+            "margin_purchase_amt": margin_purchase_amt,
+            "margin_selling_amt": margin_selling_amt,
+            "margin_selling_pct": (
+                round((sale_price - cs) / sale_price, 4) if sale_price > 0 else None
+            ),
+            "profit": profit,
             "item_count": len(c["lines"]),
+            "lines": _build_ic_card_lines(db, c["lines"]),
         })
     return render_template(
         "recipe_cost/ic_recipes.html",
@@ -191,9 +276,12 @@ def _save_ic_recipe(ic_recipe_id: int | None):
     item_ids = request.form.getlist("bom_item_id")
     qtys = request.form.getlist("bom_qty")
     deletes = request.form.getlist("bom_delete")
+    sp_adjs = request.form.getlist("bom_sp_adj")
+    has_sp_adj = "bom_sp_adj" in request.form  # 仅当字段存在时才更新
     added = removed = updated = 0
     total_grams = 0.0
     target_id = ic_recipe_id if ic_recipe_id is not None else new_id
+    item_price_updates = {}  # {int(item_id): float(sp_adj)} → 写回 items 表
 
     for i in range(len(bom_ids)):
         row_id = bom_ids[i].strip()
@@ -206,6 +294,12 @@ def _save_ic_recipe(ic_recipe_id: int | None):
         qty = parse_qty(qtys[i]) if i < len(qtys) else 0.0
         if not item_id or qty <= 0:
             continue
+        # 收集需要更新到品项表的销售单价
+        if has_sp_adj:
+            sp_adj_raw = sp_adjs[i].strip() if i < len(sp_adjs) else ""
+            sp_adj = parse_qty(sp_adj_raw) if sp_adj_raw else None
+            if sp_adj is not None and sp_adj > 0:
+                item_price_updates[int(item_id)] = sp_adj
         if row_id:
             db.execute(
                 "UPDATE ic_recipe_items SET item_id=?, qty_per_unit=? WHERE id=?",
@@ -215,8 +309,8 @@ def _save_ic_recipe(ic_recipe_id: int | None):
         else:
             try:
                 db.execute(
-                    """INSERT INTO ic_recipe_items
-                       (ic_recipe_id, item_id, qty_per_unit) VALUES (?, ?, ?)""",
+                    "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit)"
+                    " VALUES (?, ?, ?)",
                     (target_id, int(item_id), qty),
                 )
                 added += 1
@@ -224,17 +318,37 @@ def _save_ic_recipe(ic_recipe_id: int | None):
                 flash(f"第 {i+1} 行原料重复")
         total_grams += qty
 
+    # 将调整后的原料销售单价持久化到品项表（items.selling_price）
+    if item_price_updates:
+        _ts = now()
+        for iid, sp in item_price_updates.items():
+            db.execute(
+                "UPDATE items SET selling_price=?, selling_price_updated_at=?"
+                " WHERE id=?",
+                (sp, _ts, iid),
+            )
+
+    # output_qty is ALWAYS derived from the surviving BOM rows in DB
+    # (grams in the RD world). This makes it non-editable-by-nature and also
+    # prevents the metadata-only form submit from zeroing it out.
+    _sum = db.execute(
+        "SELECT COALESCE(SUM(qty_per_unit), 0) AS g "
+        "FROM ic_recipe_items WHERE ic_recipe_id=?",
+        (target_id,),
+    ).fetchone()
+    output_qty_final = round(float(_sum["g"]), 2)
+
     # Now update output_qty + sale_price + name/note for the recipe
     db.execute(
         """UPDATE ic_recipes SET name=?, note=?, output_unit=?,
            output_qty=?, sale_price=?, updated_at=? WHERE id=?""",
-        (name, note, output_unit, round(total_grams, 2), sale_price, now(), target_id),
+        (name, note, output_unit, output_qty_final, sale_price, now(), target_id),
     )
 
     db.commit()
     audit("recipe_cost.ic_recipe.update", "ic_recipe", target_id, {
         "added": added, "removed": removed, "updated": updated,
-        "output_qty": round(total_grams, 2),
+        "output_qty": output_qty_final,
     })
     flash("冰激凌配方已保存")
     return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=target_id))
@@ -256,14 +370,26 @@ def recipes_list():
     enriched = []
     for r in rows:
         c = recipe_cost(db, int(r["id"]))
+        sale_price = float(r["sale_price"] or 0)
+        cp = float(c["cost_purchase"])
+        cs = float(c["cost_selling"])
+        margin_purchase_amt = round(sale_price - cp, 2)
+        margin_selling_amt = round(sale_price - cs, 2)
+        profit = round(cs - cp, 2)
         enriched.append({
             **dict(r),
-            "cost_purchase": float(c["cost_purchase"]),
-            "cost_selling": float(c["cost_selling"]),
+            "cost_purchase": cp,
+            "cost_selling": cs,
             "margin_purchase": c["margin_purchase"],
             "margin_selling": c.get("margin_selling"),
-            "profit": c.get("profit", 0.0),
+            "margin_purchase_amt": margin_purchase_amt,
+            "margin_selling_amt": margin_selling_amt,
+            "margin_selling_pct": (
+                round((sale_price - cs) / sale_price, 4) if sale_price > 0 else None
+            ),
+            "profit": profit,
             "item_count": len(c["lines"]),
+            "lines": _build_recipe_card_lines(db, c["lines"]),
         })
     return render_template("recipe_cost/recipes.html", recipes=enriched)
 
