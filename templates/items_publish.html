@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}批量同步品项{% endblock %}
+{% block content %}
+<h2>批量同步品项到门店</h2>
+<p class="muted">
+  从当前仓库（{{ g.warehouse['name'] if g.warehouse else '?' }}）选择品项，
+  同步到指定的门店。品项不存在时按 <code>sku</code> 自动插入；已存在时按
+  <strong>默认动作</strong> 处理冲突（overwrite 覆盖 / keep 保留 / merge 留空补齐）。
+  类别不存在会在目标门店自动创建。
+</p>
+
+<form method="post" action="{{ url_for('items.items_publish') }}">
+  <h3>1. 选择品项</h3>
+  <table>
+    <tr>
+      <th><input type="checkbox" id="select-all-items" /></th>
+      <th>品项</th><th>SKU</th><th>单位</th><th>进货价</th><th>销售价</th>
+    </tr>
+    {% for i in items %}
+    <tr>
+      <td><input type="checkbox" class="item-cb" name="item_ids" value="{{ i['id'] }}" /></td>
+      <td>{{ i['name'] }}</td>
+      <td><small>{{ i['sku'] or '—' }}</small></td>
+      <td>{{ i['unit'] }}</td>
+      <td>¥{{ '%g' | format(i['unit_cost'] or 0) }}</td>
+      <td>¥{{ '%g' | format(i['selling_price'] or 0) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6"><em>当前仓库还没有品项。先在 <a href="{{ url_for('items.items_list') }}">品类与品项</a> 创建。</em></td></tr>
+    {% endfor %}
+  </table>
+
+  <h3>2. 选择目标门店</h3>
+  <fieldset style="border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px;margin-bottom:10px">
+    {% for w in available_warehouses %}
+    <label style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">
+      <input type="checkbox" name="warehouse_codes" value="{{ w.code }}" />
+      {{ w.code }} · {{ w.name }}
+    </label>
+    {% endfor %}
+  </fieldset>
+
+  <h3>3. 冲突处理</h3>
+  <label>默认动作
+    <select name="default_action">
+      <option value="overwrite" selected>overwrite（覆盖）</option>
+      <option value="keep">keep（保留）</option>
+      <option value="merge">merge（仅补缺）</option>
+    </select>
+  </label>
+  <label>发布说明（可选）
+    <input name="summary" placeholder="例如：首批原料 / 月度同步" />
+  </label>
+
+  <button type="submit" class="btn primary" style="margin-top:16px">执行同步</button>
+</form>
+
+<script>
+document.getElementById('select-all-items')?.addEventListener('change', function(e) {
+  document.querySelectorAll('.item-cb').forEach(function(cb) {
+    cb.checked = e.target.checked;
+  });
+});
+</script>
+{% endblock %}

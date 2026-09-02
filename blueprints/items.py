@@ -253,3 +253,108 @@ def inventory_view():
         params + [q, q, q, cat, cat],
     ).fetchall()
     return render_template("inventory.html", items=rows, q=q, cat=cat)
+
+
+# ---------------------------------------------------------------------------
+# Item / category cross-warehouse publishing
+# ---------------------------------------------------------------------------
+
+@bp.route("/items/publish", methods=["GET", "POST"])
+@require_platform_admin
+def items_publish():
+    """Per-storefront publish of selected items from current (rd) warehouse.
+
+    GET: show picker (all items in current warehouse + storefront checkbox list).
+    POST: do the publish via publish_items(), redirect to history.
+    """
+    if request.method == "POST":
+        from contextlib import closing
+        from config import MASTER_DB
+        import sqlite3 as _sq
+        from blueprints.publish_recipe_pure import (
+            publish_items, list_item_publish_events,
+        )
+
+        item_ids = [int(x) for x in request.form.getlist("item_ids") if x]
+        target_codes = request.form.getlist("warehouse_codes")
+        default_action = request.form.get("default_action", "overwrite")
+        summary = request.form.get("summary", "").strip() or None
+
+        if not item_ids:
+            flash("请至少选择一个品项")
+            return redirect(url_for("items.items_publish"))
+        if not target_codes:
+            flash("请至少选择一个目标门店")
+            return redirect(url_for("items.items_publish"))
+
+        wh_db = get_warehouse_db()
+        with closing(_sq.connect(MASTER_DB)) as master_conn:
+            master_conn.execute("PRAGMA foreign_keys = ON")
+            wh_code = g.warehouse["code"] if g.get("warehouse") else "rd_001"
+            result = publish_items(
+                master_conn, wh_db, wh_code, item_ids, target_codes,
+                user_id=g.user["id"] if g.user else None,
+                summary=summary, default_action=default_action,
+            )
+            master_conn.commit()
+        audit(
+            "items.publish", "items_publish", result["event_id"],
+            {"item_count": result["item_count"],
+             "warehouses": target_codes,
+             "status": result["status"]},
+        )
+        flash(f"批量同步完成：{result['status']}，共 {result['item_count']} 个品项")
+        return redirect(url_for("items.items_publish_history",
+                                event_id=result["event_id"]))
+
+    # GET: show picker.
+    db = get_warehouse_db()
+    items = db.execute(
+        "SELECT id, sku, name, unit, gram_per_unit, unit_cost, selling_price "
+        "FROM items ORDER BY name"
+    ).fetchall()
+    return render_template(
+        "items_publish.html",
+        items=items,
+        available_warehouses=_list_storefront_warehouses(),
+    )
+
+
+@bp.route("/items/publish/history", methods=["GET"])
+@bp.route("/items/publish/history/<int:event_id>", methods=["GET"])
+@require_login
+def items_publish_history(event_id: int | None = None):
+    """List recent item publish events + drill-down detail."""
+    from contextlib import closing
+    from config import MASTER_DB
+    import sqlite3 as _sq
+    from blueprints.publish_recipe_pure import (
+        list_item_publish_events, get_item_event_details,
+    )
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        events = list_item_publish_events(master_conn)
+        detail = get_item_event_details(master_conn, event_id) if event_id else None
+    return render_template(
+        "items_publish_history.html",
+        events=events,
+        detail=detail,
+        event_id=event_id,
+    )
+
+
+def _list_storefront_warehouses():
+    """All storefront warehouses (excludes rd_*) — for publish UI picker.
+
+    Mirrors recipe_cost._list_storefront_warehouses; could be DRY'd later.
+    """
+    from contextlib import closing
+    from config import MASTER_DB
+    import sqlite3 as _sq
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        rows = master_conn.execute(
+            "SELECT code, name FROM warehouses "
+            "WHERE warehouse_type = 'storefront' ORDER BY code"
+        ).fetchall()
+    return [dict(r) for r in rows]

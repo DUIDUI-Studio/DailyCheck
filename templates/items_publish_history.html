@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}品项同步历史{% endblock %}
+{% block content %}
+<h2>品项同步历史</h2>
+
+{% if detail %}
+<h3>事件 #{{ detail.event.id }} 详情</h3>
+<p>
+  <strong>{{ detail.event.summary or '(无说明)' }}</strong> ·
+  <span class="muted">开始 {{ detail.event.started_at }} / 完成 {{ detail.event.completed_at or '—' }}</span>
+</p>
+<p>
+  目标门店：<code>{{ detail.event.target_warehouse_codes_json }}</code> ·
+  品项数：{{ detail.event.item_count }} ·
+  状态：
+  {% if detail.event.status == 'complete' %}<span class="tag success">全部成功</span>
+  {% elif detail.event.status == 'partial' %}<span class="tag warn">部分成功</span>
+  {% else %}<span class="tag muted">{{ detail.event.status }}</span>{% endif %}
+</p>
+
+<h4>按门店</h4>
+<table>
+  <tr><th>门店</th><th>状态</th><th>错误</th></tr>
+  {% for w in detail.warehouses %}
+  <tr>
+    <td>{{ w.warehouse_code }}</td>
+    <td>
+      {% if w.status == 'success' %}<span class="tag success">成功</span>
+      {% else %}<span class="tag danger">失败</span>{% endif %}
+    </td>
+    <td>{{ w.error_message or '' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h4>按品项</h4>
+<table>
+  <tr><th>item_id</th><th>目标门店</th><th>动作</th><th>状态</th><th>错误</th></tr>
+  {% for it in detail.items %}
+  <tr>
+    <td>{{ it.item_id }}</td>
+    <td>{{ it.target_warehouse_code }}</td>
+    <td>{{ it.action }}</td>
+    <td>
+      {% if it.status == 'success' %}<span class="tag success">成功</span>
+      {% else %}<span class="tag danger">失败</span>{% endif %}
+    </td>
+    <td><small>{{ it.error_message or '' }}</small></td>
+  </tr>
+  {% endfor %}
+</table>
+
+<hr/>
+{% endif %}
+
+<h3>最近同步事件</h3>
+{% if not events %}
+<p class="muted">还没有同步事件。</p>
+{% else %}
+<table>
+  <tr><th>ID</th><th>说明</th><th>品项数</th><th>状态</th><th>目标门店</th><th>时间</th></tr>
+  {% for ev in events %}
+  <tr>
+    <td><a href="{{ url_for('items.items_publish_history', event_id=ev.id) }}">#{{ ev.id }}</a></td>
+    <td>{{ ev.summary or '' }}</td>
+    <td>{{ ev.item_count }}</td>
+    <td>
+      {% if ev.status == 'complete' %}<span class="tag success">全部成功</span>
+      {% elif ev.status == 'partial' %}<span class="tag warn">部分成功</span>
+      {% else %}<span class="tag muted">{{ ev.status }}</span>{% endif %}
+    </td>
+    <td><small>{{ ev.target_warehouse_codes_json }}</small></td>
+    <td><small>{{ ev.started_at }}<br>{{ ev.completed_at or '—' }}</small></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

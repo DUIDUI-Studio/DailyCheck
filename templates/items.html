@@ -7,6 +7,14 @@
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">
       📥 批量导入
     </a>
+    {% if is_rd %}
+    <a href="{{ url_for('items.items_publish') }}" class="btn-sm">
+      📤 同步到门店
+    </a>
+    <a href="{{ url_for('items.items_publish_history') }}" class="btn-sm">
+      🕘 同步历史
+    </a>
+    {% endif %}
   {% endif %}
 </div>
 
