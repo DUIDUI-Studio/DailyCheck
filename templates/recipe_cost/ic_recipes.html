@@ -1,0 +1,109 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% macro pct_width(pct) %}
+  {%- if pct is not none -%}
+    {%- set v = pct * 100 -%}
+    {%- if v < 0 %}0{%- elif v > 100 %}100{%- else %}{{ v | round(1) }}{%- endif -%}
+  {%- else %}0{%- endif -%}
+{%- endmacro %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>冰激凌配方</h2>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
+  <a class="btn" href="{{ url_for('recipe_cost.recipes_list') }}">出品配方 →</a>
+  {% if g.user['is_admin'] %}
+  <a class="btn btn-primary" href="{{ url_for('recipe_cost.ic_recipe_new') }}">+ 新建冰激凌配方</a>
+  {% endif %}
+</div>
+
+{% if ic_recipes %}
+  <div class="card-list recipe-cards">
+    {% for r in ic_recipes %}
+    <div class="card recipe-card">
+      <div class="recipe-card__head">
+        <div class="recipe-card__title">
+          <h3>{{ r['name'] }}</h3>
+          <p class="muted">{{ r['output_qty'] | fmt_qty }} {{ r['output_unit'] }} / 批 · {{ r['item_count'] }} 项原料</p>
+        </div>
+        <div class="recipe-card__price">
+          <span class="rc-price-label">售价</span>
+          <span class="rc-price-val">¥{{ r['sale_price'] | fmt_money }}</span>
+        </div>
+      </div>
+      {% if g.user['is_admin'] %}
+      <div class="recipe-card__actions">
+        <a class="btn-sm" href="{{ url_for('recipe_cost.ic_recipe_edit', ic_recipe_id=r['id']) }}">编辑</a>
+        <form method="post" action="{{ url_for('recipe_cost.ic_recipe_delete', ic_recipe_id=r['id']) }}" onsubmit="return confirm('确认删除该冰激凌配方？');">
+          <button class="btn-sm btn-delete" type="submit">删除</button>
+        </form>
+      </div>
+      {% endif %}
+
+      <div class="recipe-card__section">
+        <div class="rc-section-title">配方明细</div>
+        <div class="recipe-card__bom">
+          <div class="rc-bom-row rc-bom-head">
+            <span>原料</span>
+            <span class="rc-num">用量</span>
+            <span class="rc-num">采购</span>
+            <span class="rc-num">销售</span>
+          </div>
+          {% for line in r['lines'] %}
+          <div class="rc-bom-row">
+            <span class="rc-bom-name">{{ line['name'] }}</span>
+            <span class="rc-num">{{ line['qty'] | fmt_qty }} {{ line['unit'] }}</span>
+            <span class="rc-num">¥{{ line['cost_purchase'] | fmt_money }}</span>
+            <span class="rc-num">¥{{ line['cost_selling'] | fmt_money }}</span>
+          </div>
+          {% else %}
+          <div class="rc-bom-row rc-bom-empty"><span class="muted">（暂无原料）</span></div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="recipe-card__summary">
+        <div class="rc-sum">
+          <span class="rc-sum-label">采购成本</span>
+          <span class="rc-sum-val">¥{{ r['cost_purchase'] | fmt_money }}</span>
+        </div>
+        <div class="rc-sum">
+          <span class="rc-sum-label">销售价值</span>
+          <span class="rc-sum-val">¥{{ r['cost_selling'] | fmt_money }}</span>
+        </div>
+      </div>
+
+      <div class="recipe-card__section">
+        <div class="rc-section-title">毛利分析</div>
+        <div class="recipe-card__margin">
+          <div class="rc-margin rc-margin--purchase">
+            <div class="rc-margin-top">
+              <span class="rc-margin-label">采购毛利</span>
+              <span class="rc-margin-val">¥{{ r['margin_purchase_amt'] | fmt_money }}</span>
+              <span class="rc-margin-pct{% if r['margin_purchase'] is not none and r['margin_purchase'] < 0 %} is-neg{% endif %}">{% if r['margin_purchase'] is not none %}{{ '%.1f' | format(r['margin_purchase'] * 100) }}%{% else %}—{% endif %}</span>
+            </div>
+            <div class="rc-bar"><div class="rc-bar-fill" style="width: {{ pct_width(r['margin_purchase']) }}%;"></div></div>
+          </div>
+          <div class="rc-margin rc-margin--selling">
+            <div class="rc-margin-top">
+              <span class="rc-margin-label">销售毛利</span>
+              <span class="rc-margin-val">¥{{ r['margin_selling_amt'] | fmt_money }}</span>
+              <span class="rc-margin-pct{% if r['margin_selling_pct'] is not none and r['margin_selling_pct'] < 0 %} is-neg{% endif %}">{% if r['margin_selling_pct'] is not none %}{{ '%.1f' | format(r['margin_selling_pct'] * 100) }}%{% else %}—{% endif %}</span>
+            </div>
+            <div class="rc-bar"><div class="rc-bar-fill" style="width: {{ pct_width(r['margin_selling_pct']) }}%;"></div></div>
+          </div>
+          <div class="rc-margin rc-margin--profit">
+            <div class="rc-margin-top">
+              <span class="rc-margin-label">利润（销售小计−采购）</span>
+              <span class="rc-margin-val">¥{{ r['profit'] | fmt_money }}</span>
+              <span class="rc-margin-pct{% if r['sale_price'] and r['profit'] / r['sale_price'] < 0 %} is-neg{% endif %}">{% if r['sale_price'] %}+{{ '%.1f' | format(r['profit'] / r['sale_price'] * 100) }}%{% else %}—{% endif %}</span>
+            </div>
+            <div class="rc-bar"><div class="rc-bar-fill" style="width: {{ pct_width(r['profit'] / r['sale_price'] if r['sale_price'] else none) }}%;"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="muted">暂无冰激凌配方{% if g.user['is_admin'] %}，点击右上"新建冰激凌配方"开始{% endif %}。</p>
+{% endif %}
+{% endblock %}

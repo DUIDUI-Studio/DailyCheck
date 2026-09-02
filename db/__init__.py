@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS warehouses (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     db_path TEXT NOT NULL,
+    warehouse_type TEXT NOT NULL DEFAULT 'storefront',
     created_at TEXT NOT NULL
 );
 
@@ -304,6 +305,57 @@ CREATE TABLE IF NOT EXISTS production_run_items (
 
 CREATE INDEX IF NOT EXISTS idx_prun_created ON production_runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_pruni_run ON production_run_items(run_id);
+
+CREATE TABLE IF NOT EXISTS ic_recipes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    note TEXT,
+    output_unit TEXT NOT NULL DEFAULT 'g',
+    output_qty REAL NOT NULL DEFAULT 100,
+    sale_price REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ic_recipe_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ic_recipe_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    qty_per_unit REAL NOT NULL,
+    UNIQUE(ic_recipe_id, item_id),
+    FOREIGN KEY (ic_recipe_id) REFERENCES ic_recipes(id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES items(id)
+);
+
+CREATE TABLE IF NOT EXISTS recipes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    note TEXT,
+    output_unit TEXT NOT NULL DEFAULT '件',
+    output_qty REAL NOT NULL DEFAULT 1,
+    sale_price REAL NOT NULL DEFAULT 0,
+    sale_price_updated_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recipe_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_id INTEGER NOT NULL,
+    source_type TEXT NOT NULL,
+    item_id INTEGER,
+    ic_recipe_id INTEGER,
+    qty_per_unit REAL NOT NULL,
+    CHECK (source_type IN ('item', 'ic_recipe')),
+    CHECK (
+        (source_type = 'item' AND item_id IS NOT NULL AND ic_recipe_id IS NULL)
+     OR (source_type = 'ic_recipe' AND ic_recipe_id IS NOT NULL AND item_id IS NULL)
+    ),
+    FOREIGN KEY (recipe_id) REFERENCES recipes(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_recipe_items_recipe ON recipe_items(recipe_id);
+CREATE INDEX IF NOT EXISTS idx_ic_recipe_items_ic_recipe ON ic_recipe_items(ic_recipe_id);
 """
 
 
@@ -397,4 +449,12 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
                  AND gram_per_unit > 0
                  AND aux_unit IS NULL"""
         )
+        if "selling_price" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN selling_price REAL NOT NULL DEFAULT 0"
+            )
+        if "selling_price_updated_at" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN selling_price_updated_at TEXT"
+            )
         conn.commit()

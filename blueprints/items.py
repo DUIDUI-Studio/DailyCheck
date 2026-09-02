@@ -3,15 +3,37 @@ from __future__ import annotations
 
 import sqlite3
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
-from ._helpers import warehouse_categories_in_clause, fmt_qty, gen_sku, now, parse_qty
+
+from ._helpers import gen_sku, now, parse_qty, warehouse_categories_in_clause
 from .auth import audit
 
-
 bp = Blueprint("items", __name__)
+
+
+@bp.before_request
+def _require_storefront():
+    """Items CRUD are storefront-only;研发中心 can see items but not unit_cost."""
+    from flask import abort
+
+    from permissions import WAREHOUSE_EXEMPT
+    if request.endpoint in WAREHOUSE_EXEMPT or request.endpoint is None:
+        return None
+    if g.user is not None and g.user["is_admin"]:
+        return None
+    wh = g.get("warehouse")
+    if wh is None:
+        return None
+    if wh["warehouse_type"] == "rd":
+        return None  # rd 可以看 items，只是模板里不显示 unit_cost
+    if wh["warehouse_type"] != "storefront":
+        flash("该仓库类型不支持库存管理功能")
+        abort(403)
+        return None
+    return None
 
 
 @bp.route("/items", methods=["GET", "POST"])
@@ -25,6 +47,7 @@ def items_list():
         quantity = parse_qty(request.form.get("quantity", "0"))
         safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
+        selling_price = float(request.form.get("selling_price", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
         aux_unit = request.form.get("aux_unit", "").strip() or None
         aux_rate = parse_qty(request.form.get("aux_rate", "0"))
@@ -34,6 +57,9 @@ def items_list():
             return redirect(url_for("items.items_list"))
         if unit_cost < 0:
             flash("进货单价不能为负数")
+            return redirect(url_for("items.items_list"))
+        if selling_price < 0:
+            flash("销售单价不能为负数")
             return redirect(url_for("items.items_list"))
         if not name or not category_id:
             flash("名称、品类为必填")
@@ -46,10 +72,12 @@ def items_list():
             db.execute(
                 """INSERT INTO items
                    (sku, name, category_id, quantity, safety_stock, unit_cost,
+                    selling_price, selling_price_updated_at,
                     unit, gram_per_unit, aux_unit, aux_rate, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (gen_sku(), name, int(category_id), quantity, safety_stock,
-                 unit_cost, unit, gram_per_unit, aux_unit, aux_rate, now()),
+                 unit_cost, selling_price, now() if selling_price > 0 else None,
+                 unit, gram_per_unit, aux_unit, aux_rate, now()),
             )
             new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
             db.commit()
@@ -88,6 +116,7 @@ def edit_item(item_id: int):
         category_id = request.form.get("category_id", "").strip()
         safety_stock = parse_qty(request.form.get("safety_stock", "0"))
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
+        selling_price = float(request.form.get("selling_price", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
         aux_unit = request.form.get("aux_unit", "").strip() or None
         aux_rate = parse_qty(request.form.get("aux_rate", "0"))
@@ -97,13 +126,16 @@ def edit_item(item_id: int):
         if unit_cost < 0:
             flash("进货单价不能为负数")
             return redirect(url_for("items.edit_item", item_id=item_id))
+        if selling_price < 0:
+            flash("销售单价不能为负数")
+            return redirect(url_for("items.edit_item", item_id=item_id))
         if not name or not category_id:
             flash("名称、品类为必填")
             return redirect(url_for("items.edit_item", item_id=item_id))
 
         # 生产配方锁：被 product_bom 引用且原启用克禁止切走克
         old = db.execute(
-            "SELECT aux_unit, aux_rate, gram_per_unit FROM items WHERE id=?", (item_id,)
+            "SELECT aux_unit, aux_rate, gram_per_unit, selling_price FROM items WHERE id=?", (item_id,)
         ).fetchone()
         if (old["aux_unit"] == "克" and old["gram_per_unit"] > 0
                 and aux_unit != "克"):
@@ -114,13 +146,17 @@ def edit_item(item_id: int):
                 flash("该品项已被生产配方引用且启用克，不能切到非克辅单位；请先清空相关配方")
                 return redirect(url_for("items.edit_item", item_id=item_id))
 
+        sp_updated_at = now() if selling_price != float(old["selling_price"] or 0) else None
         gram_per_unit = aux_rate if aux_unit == "克" else 0.0
         db.execute(
             """UPDATE items SET name=?, category_id=?, safety_stock=?,
-               unit_cost=?, unit=?, gram_per_unit=?,
-               aux_unit=?, aux_rate=?, updated_at=? WHERE id=?""",
-            (name, int(category_id), safety_stock, unit_cost, unit,
-             gram_per_unit, aux_unit, aux_rate, now(), item_id),
+               unit_cost=?, selling_price=?, selling_price_updated_at=?,
+               unit=?, gram_per_unit=?, aux_unit=?, aux_rate=?,
+               updated_at=? WHERE id=?""",
+            (name, int(category_id), safety_stock, unit_cost,
+             selling_price, sp_updated_at,
+             unit, gram_per_unit, aux_unit, aux_rate,
+             now(), item_id),
         )
         db.commit()
         audit("items.update", "item", item_id, {"name": name})
@@ -147,8 +183,10 @@ def delete_item(item_id: int):
               (SELECT COUNT(*) FROM stock_movements WHERE item_id=?) +
               (SELECT COUNT(*) FROM restock_requests WHERE item_id=?) +
               (SELECT COUNT(*) FROM outbound_requests WHERE item_id=?) +
-              (SELECT COUNT(*) FROM stocktakes WHERE item_id=?) AS c""",
-        (item_id, item_id, item_id, item_id),
+              (SELECT COUNT(*) FROM stocktakes WHERE item_id=?) +
+              (SELECT COUNT(*) FROM ic_recipe_items WHERE item_id=?) +
+              (SELECT COUNT(*) FROM recipe_items WHERE item_id=? AND source_type='item') AS c""",
+        (item_id, item_id, item_id, item_id, item_id, item_id),
     ).fetchone()["c"]
     if usage > 0:
         flash("该品项存在关联业务记录，无法删除")

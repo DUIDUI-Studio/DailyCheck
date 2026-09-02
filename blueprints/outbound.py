@@ -3,15 +3,35 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from flask import Blueprint, flash, redirect, render_template, request, url_for
+from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
+
 from ._helpers import now, parse_qty
 from .auth import audit
 
-
 bp = Blueprint("outbound", __name__)
+
+
+@bp.before_request
+def _require_storefront():
+    """Outbound (出库) is a storefront-only feature;研发中心 has no physical inventory."""
+    from flask import abort
+
+    from permissions import WAREHOUSE_EXEMPT
+    if request.endpoint in WAREHOUSE_EXEMPT or request.endpoint is None:
+        return None
+    if g.user is not None and g.user["is_admin"]:
+        return None
+    wh = g.get("warehouse")
+    if wh is None:
+        return None
+    if wh["warehouse_type"] != "storefront":
+        flash("研发中心无出库功能")
+        abort(403)
+        return None
+    return None
 
 
 @bp.route("/outbound", methods=["GET"])

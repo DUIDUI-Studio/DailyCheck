@@ -40,9 +40,17 @@
     <span>安全库存</span>
     <input name="safety_stock" type="number" min="0" step="0.01" />
   </label>
+  {% if is_rd %}
   <label>
     <span>进货单价（¥）</span>
     <input name="unit_cost" type="number" min="0" step="0.001" />
+  </label>
+  {% else %}
+  <input type="hidden" name="unit_cost" value="0" />
+  {% endif %}
+  <label>
+    <span>销售单价（¥）</span>
+    <input name="selling_price" type="number" min="0" step="0.001" value="0" />
   </label>
   <label>
     <span>单位</span>
@@ -68,12 +76,13 @@
 
 <h3>品项列表</h3>
 <table>
-  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th><th>单价（¥）</th><th>辅单位</th><th>更新时间</th><th>操作</th></tr>
+  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th>{% if is_rd %}<th>进货单价（¥）</th>{% endif %}<th>销售单价（¥）</th><th>辅单位</th><th>更新时间</th><th>操作</th></tr>
   {% for i in items %}
   <tr data-cat="{{ i.category_name }}">
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
     <td>{{ i.quantity | fmt_qty }} {{ i.unit }}</td><td>{{ i.safety_stock | fmt_qty }}</td>
-    <td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>
+    {% if is_rd %}<td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>{% endif %}
+    <td>{{ "%.3f"|format(i.selling_price) if i.selling_price else "-" }}</td>
     <td>{% if i.aux_unit and i.aux_rate > 0 %}{{ i.aux_rate | fmt_qty }} {{ i.aux_unit }}/{{ i.unit }}{% else %}—{% endif %}</td>
     <td>{{ i.updated_at }}</td>
     <td class="inline">

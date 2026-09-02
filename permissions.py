@@ -6,12 +6,11 @@ Platform admins (users.is_admin=1) bypass warehouse checks.
 from __future__ import annotations
 
 import functools
-from typing import Callable
+from collections.abc import Callable
 
-from flask import abort, g, redirect, request, url_for, flash
+from flask import abort, flash, g, redirect, request, url_for
 
 from config import ROLE_RANK
-
 
 # View function names that are allowed to run without a warehouse selected.
 # All others are redirected to the picker.
@@ -84,4 +83,47 @@ def require_login(view: Callable) -> Callable:
             return redirect(url_for("auth.warehouse_picker"))
         return view(*args, **kwargs)
     return wrapped
+
+
+def require_warehouse_type(*allowed: str) -> Callable:
+    """Block the request unless the current warehouse's type is in `allowed`.
+
+    Example:
+        @require_warehouse_type("rd")
+        def ic_recipes_list(): ...
+
+    Platform admins (`g.user['is_admin']`) bypass the check — useful for testing
+    in dev. Otherwise an RD-only or storefront-only route 403s when the user is
+    on the wrong kind of warehouse.
+    """
+    def decorator(view: Callable) -> Callable:
+        @functools.wraps(view)
+        def wrapped(*args, **kwargs):
+            if g.user is None:
+                return redirect(url_for("auth.login", next=request.path))
+            wh = g.get("warehouse")
+            if wh is None:
+                return redirect(url_for("auth.warehouse_picker"))
+            if g.user["is_admin"]:
+                return view(*args, **kwargs)
+            wh_type = wh["warehouse_type"] if hasattr(wh, "keys") else wh["warehouse_type"]
+            if wh_type not in allowed:
+                flash(f"当前仓库类型为 {wh_type}，无权访问该功能")
+                abort(403)
+                return None
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def storefront_only(view: Callable) -> Callable:
+    """Decorator: 403 unless the current warehouse is a storefront (has inventory ops).
+
+    Used by stocktake / restock / outbound / items / production modules to hide
+    them in 研发中心 (RD), where there is no physical inventory to move.
+
+    Equivalent to `@require_warehouse_type("storefront")` but expressed as the
+    domain concept rather than a type enum value, so call sites read cleaner.
+    """
+    return require_warehouse_type("storefront")(view)
 

@@ -28,6 +28,8 @@ wh_*.db
 # Runtime / scratch artifacts
 admin_audit.log
 graphify-out/
+# Daily automated issue/PR check reports (regenerated each run, never source)
+issue-reports/
 
 # Playwright MCP debug artifacts
 .playwright-mcp/

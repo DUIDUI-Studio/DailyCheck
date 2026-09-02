@@ -23,9 +23,17 @@
     <span>安全库存</span>
     <input name="safety_stock" type="number" min="0" step="0.01" value="{{ item.safety_stock }}" />
   </label>
+  {% if is_rd %}
   <label>
     <span>进货单价（¥）</span>
     <input name="unit_cost" type="number" min="0" step="0.001" value="{{ item.unit_cost or 0 }}" />
+  </label>
+  {% else %}
+  <input type="hidden" name="unit_cost" value="{{ item.unit_cost or 0 }}" />
+  {% endif %}
+  <label>
+    <span>销售单价（¥）</span>
+    <input name="selling_price" type="number" min="0" step="0.001" value="{{ "%.3f"|format(item.selling_price) if item.selling_price else '0' }}" />
   </label>
   <label>
     <span>单位</span>
