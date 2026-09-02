@@ -1,0 +1,47 @@
+#!/bin/bash
+# DailyCheck — pre-push hook.
+#
+# Blocks every `git push` until Eric has explicitly OK'd it in the
+# current agent conversation. The intent is to prevent the agent
+# from autonomously pushing to origin (where the action is externally
+# visible and not easily reversed) without human sign-off.
+#
+# Bypass (only after Eric explicitly says so):
+#     git push --no-verify
+# Agent MUST NOT use --no-verify on its own initiative — see
+# ~/.workbuddy/MEMORY.md "Git push 必须先确认" rule.
+
+REMOTE="$1"
+URL="$2"
+
+# Collect the refs being pushed from stdin (one per line:
+# <local_ref> <local_sha> <remote_ref> <remote_sha>).
+TARGETS=""
+while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+  [ -z "$LOCAL_REF" ] && continue
+  TARGETS="${TARGETS}    ${LOCAL_REF##*/} → ${REMOTE_REF##*/}\n"
+done
+
+cat <<EOF
+
+═══════════════════════════════════════════════════════
+  PRE-PUSH HOOK: blocked — needs Eric's explicit OK first.
+═══════════════════════════════════════════════════════
+
+  remote:  ${REMOTE}
+  url:     ${URL}
+  targets:
+$(printf "$TARGETS")
+
+  → The agent must ASK Eric: "可以推 ${REMOTE} 上的目标分支吗？"
+  → Only after Eric says yes, run again with:
+        git push --no-verify
+  → NEVER use --no-verify without first asking. This rule
+    persists across sessions and projects.
+
+═══════════════════════════════════════════════════════
+
+EOF
+
+# Always block (exit 1) — never auto-allow.
+exit 1
