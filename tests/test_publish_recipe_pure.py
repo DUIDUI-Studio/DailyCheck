@@ -1,0 +1,339 @@
+"""Tests for blueprints.publish_recipe_pure — the cross-warehouse
+recipe + item publishing logic. Runs without Flask, using only
+sqlite3, so the file fixtures are minimal.
+"""
+from datetime import datetime
+from pathlib import Path
+
+
+def _bootstrap_two_warehouses(tmp_path: Path):
+    """Build a master.db + rd_001.db (source) + wh_001.db (target).
+
+    rd_001 has an ic_recipe + 2 items. wh_001 has its own (different)
+    ic_recipe + 1 item with overlapping sku.
+    """
+    import sqlite3
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+
+    master = tmp_path / "master.db"
+    rd_db = tmp_path / "rd_001.db"
+    wh_db = tmp_path / "wh_001.db"
+
+    import db as db_mod, config as cfg
+    db_mod.MASTER_DB = master
+    db_mod.WAREHOUSE_DB_DIR = tmp_path
+    cfg.MASTER_DB = master
+    cfg.WAREHOUSE_DB_DIR = tmp_path
+    cfg.BASE_DIR = tmp_path
+
+    init_master_db()
+    init_warehouse_db(rd_db)
+    migrate_warehouse_db_columns(rd_db)
+    init_warehouse_db(wh_db)
+    migrate_warehouse_db_columns(wh_db)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Register warehouses in master.db
+    m = sqlite3.connect(master)
+    m.execute(
+        "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+        "VALUES ('rd_001', 'R&D', ?, 'rd', ?)",
+        (str(rd_db.relative_to(tmp_path)), ts))
+    m.execute(
+        "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+        "VALUES ('wh_001', '中央仓', ?, 'storefront', ?)",
+        (str(wh_db.relative_to(tmp_path)), ts))
+    m.commit()
+    m.close()
+
+    # rd_001: 1 ic_recipe "开心果1号" with 2 items
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    cat = rd.execute("SELECT id FROM categories WHERE name='乳制品'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO items (sku, name, category_id, unit, gram_per_unit, unit_cost, "
+        "selling_price, updated_at) VALUES ('SKU-MILK', '牛奶', ?, '件', 1000, 6.0, 10.0, ?)",
+        (cat, ts))
+    milk = rd.execute("SELECT id FROM items WHERE sku='SKU-MILK'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO items (sku, name, category_id, unit, gram_per_unit, unit_cost, "
+        "selling_price, updated_at) VALUES ('SKU-SUGAR', '糖', ?, '件', 500, 1.0, 2.0, ?)",
+        (cat, ts))
+    sugar = rd.execute("SELECT id FROM items WHERE sku='SKU-SUGAR'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('开心果1号', 'g', 740, 250, ?, ?)",
+        (ts, ts))
+    ic = rd.execute("SELECT id FROM ic_recipes WHERE name='开心果1号'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+        "VALUES (?, ?, 500), (?, ?, 50)",
+        (ic, milk, ic, sugar))
+    rd.commit()
+    rd.close()
+
+    # wh_001: a placeholder item with overlapping sku (different price).
+    wh = sqlite3.connect(wh_db)
+    wh.execute(
+        "INSERT INTO items (sku, name, category_id, unit, gram_per_unit, unit_cost, "
+        "selling_price, updated_at) VALUES ('SKU-MILK', 'milk-store', ?, '件', 1000, 4.0, 7.0, ?)",
+        (cat, ts))
+    wh.commit()
+    wh.close()
+
+    return master, rd_db, wh_db, milk, sugar, ic
+
+
+# ---------------------------------------------------------------------------
+# Recipe version lifecycle
+# ---------------------------------------------------------------------------
+
+def test_snapshot_recipe_captures_head_and_lines(tmp_path):
+    from blueprints.publish_recipe_pure import snapshot_recipe
+    import sqlite3
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    snap = snapshot_recipe(rd, "ic_recipe", ic)
+    rd.close()
+
+    assert snap is not None
+    assert snap["recipe_type"] == "ic_recipe"
+    assert snap["head"]["name"] == "开心果1号"
+    assert snap["head"]["sale_price"] == 250.0
+    assert len(snap["lines"]) == 2
+    # item names captured for cross-warehouse replay.
+    assert {ln["sku"] for ln in snap["lines"]} == {"SKU-MILK", "SKU-SUGAR"}
+
+
+def test_upsert_draft_version_creates_then_updates(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import (
+        snapshot_recipe, upsert_draft_version, list_versions,
+    )
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+
+    snap1 = snapshot_recipe(rd, "ic_recipe", ic)
+    m = sqlite3.connect(master)
+    v1 = upsert_draft_version(m, "ic_recipe", ic, "rd_001", snap1, user_id=1)
+    assert v1 > 0
+
+    versions = list_versions(m, "ic_recipe", ic)
+    assert len(versions) == 1
+    assert versions[0]["version"] == 1
+    assert versions[0]["status"] == "draft"
+
+    # Edit snapshot (change sale_price), upsert again → same version id, updated snapshot.
+    snap2 = dict(snap1)
+    snap2["head"] = dict(snap1["head"])
+    snap2["head"]["sale_price"] = 280.0
+    v1b = upsert_draft_version(m, "ic_recipe", ic, "rd_001", snap2, user_id=1)
+    assert v1b == v1, "draft should be updated in place"
+    versions = list_versions(m, "ic_recipe", ic)
+    assert versions[0]["version"] == 1
+    assert versions[0]["status"] == "draft"
+    import json
+    stored_snap = json.loads(versions[0]["snapshot_json"])
+    assert stored_snap["head"]["sale_price"] == 280.0
+
+    m.close(); rd.close()
+
+
+def test_publish_then_new_draft_increments_version(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import (
+        snapshot_recipe, upsert_draft_version, publish_version,
+        list_versions,
+    )
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    snap = snapshot_recipe(rd, "ic_recipe", ic)
+    rd.close()
+
+    m = sqlite3.connect(master)
+    v1 = upsert_draft_version(m, "ic_recipe", ic, "rd_001", snap, user_id=1)
+
+    def apply(master_conn, code, snap):
+        # Open target warehouse, insert recipe + items.
+        row = master_conn.execute(
+            "SELECT db_path FROM warehouses WHERE code=?", (code,)
+        ).fetchone()
+        target_path = tmp_path / row["db_path"]
+        import sqlite3 as sq
+        tc = sq.connect(target_path)
+        tc.row_factory = sq.Row
+        cat_name = snap["lines"][0]["category_name"]
+        rc = tc.execute("SELECT id FROM categories WHERE name=?", (cat_name,)).fetchone()
+        if rc is None:
+            tc.execute("INSERT INTO categories (name, description, created_at) VALUES (?, '', ?)",
+                       (cat_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            cat_id = tc.execute("SELECT id FROM categories WHERE name=?", (cat_name,)).fetchone()["id"]
+        else:
+            cat_id = rc["id"]
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Insert items if missing.
+        for ln in snap["lines"]:
+            existing = tc.execute("SELECT id FROM items WHERE sku=?", (ln["sku"],)).fetchone()
+            if existing is None:
+                tc.execute(
+                    "INSERT INTO items (sku, name, category_id, unit, gram_per_unit, "
+                    "unit_cost, selling_price, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ln["sku"], ln["item_name"], cat_id, ln["item_unit"],
+                     ln["gram_per_unit"], ln["unit_cost"], ln["selling_price"], ts))
+        # Insert recipe + bom (use new id).
+        cur = tc.execute(
+            "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (snap["head"]["name"], snap["head"]["output_unit"],
+             snap["head"]["output_qty"], snap["head"]["sale_price"], ts, ts))
+        new_id = cur.lastrowid
+        for ln in snap["lines"]:
+            item_id = tc.execute("SELECT id FROM items WHERE sku=?", (ln["sku"],)).fetchone()["id"]
+            tc.execute(
+                "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+                "VALUES (?, ?, ?)", (new_id, item_id, ln["qty_per_unit"]))
+        tc.commit()
+        tc.close()
+
+    result = publish_version(m, v1, ["wh_001"], user_id=1, summary="首发", apply_func=apply)
+    assert result["status"] == "complete"
+    assert result["per_warehouse"][0]["status"] == "success"
+
+    # After publish, v1 is 'published'. Saving again creates a new draft.
+    snap2 = dict(snap)
+    snap2["head"] = dict(snap["head"])
+    snap2["head"]["sale_price"] = 300.0
+    v2 = upsert_draft_version(m, "ic_recipe", ic, "rd_001", snap2, user_id=1)
+    assert v2 != v1
+    versions = list_versions(m, "ic_recipe", ic)
+    assert versions[0]["version"] == 2
+    assert versions[0]["status"] == "draft"
+    # v1 still 'published' until v2 itself is published.
+    assert versions[1]["version"] == 1
+    assert versions[1]["status"] == "published"
+
+    # Publishing v2 flips v1 → superseded.
+    publish_version(m, v2, ["wh_001"], user_id=1, summary="v2", apply_func=apply)
+    versions = list_versions(m, "ic_recipe", ic)
+    assert versions[0]["status"] == "published"
+    assert versions[1]["status"] == "superseded"
+    m.close()
+
+
+def test_publish_to_invalid_warehouse_returns_partial(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import (
+        snapshot_recipe, upsert_draft_version, publish_version,
+    )
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    snap = snapshot_recipe(rd, "ic_recipe", ic)
+    rd.close()
+    m = sqlite3.connect(master)
+    v = upsert_draft_version(m, "ic_recipe", ic, "rd_001", snap, user_id=1)
+
+    def bad_apply(master_conn, code, snap):
+        raise RuntimeError(f"simulated failure for {code}")
+
+    result = publish_version(m, v, ["nonexistent"], user_id=1, summary=None,
+                              apply_func=bad_apply)
+    assert result["status"] in ("partial", "failed")
+    assert result["per_warehouse"][0]["status"] == "failed"
+    assert "simulated failure" in result["per_warehouse"][0]["error_message"]
+    m.close()
+
+
+# ---------------------------------------------------------------------------
+# Item publish / cross-warehouse sync
+# ---------------------------------------------------------------------------
+
+def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    snap = snapshot_item(rd, sugar)
+    rd.close()
+
+    # wh_001 has no sugar item.
+    wh = sqlite3.connect(wh_db)
+    wh.row_factory = sqlite3.Row
+    before = wh.execute("SELECT COUNT(*) AS c FROM items WHERE sku='SKU-SUGAR'").fetchone()["c"]
+    assert before == 0
+    action = apply_item_to_warehouse(wh, snap, action="overwrite")
+    assert action == "inserted"
+    after = wh.execute("SELECT COUNT(*) AS c FROM items WHERE sku='SKU-SUGAR'").fetchone()["c"]
+    assert after == 1
+    row = wh.execute("SELECT * FROM items WHERE sku='SKU-SUGAR'").fetchone()
+    assert float(row["unit_cost"]) == 1.0
+    wh.commit(); wh.close()
+
+
+def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    snap = snapshot_item(rd, milk)  # rd milk: cost=6.0, sp=10.0
+    rd.close()
+    # wh_001 already has SKU-MILK with cost=4.0, sp=7.0
+    wh = sqlite3.connect(wh_db)
+    wh.row_factory = sqlite3.Row
+    action = apply_item_to_warehouse(wh, snap, action="overwrite")
+    assert action == "overwritten"
+    row = wh.execute("SELECT * FROM items WHERE sku='SKU-MILK'").fetchone()
+    assert float(row["unit_cost"]) == 6.0  # overwritten from rd
+    assert float(row["selling_price"]) == 10.0
+    wh.close()
+
+
+def test_apply_item_to_warehouse_keep_doesnt_touch_existing(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    snap = snapshot_item(rd, milk)
+    rd.close()
+    wh = sqlite3.connect(wh_db)
+    wh.row_factory = sqlite3.Row
+    action = apply_item_to_warehouse(wh, snap, action="keep")
+    assert action == "kept"
+    row = wh.execute("SELECT * FROM items WHERE sku='SKU-MILK'").fetchone()
+    # unchanged
+    assert float(row["unit_cost"]) == 4.0
+    assert float(row["selling_price"]) == 7.0
+    wh.close()
+
+
+def test_publish_items_partial_when_one_warehouse_missing(tmp_path):
+    import sqlite3
+    from blueprints.publish_recipe_pure import publish_items, snapshot_item
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    m = sqlite3.connect(master)
+    result = publish_items(m, rd, "rd_001", [sugar],
+                           ["wh_001", "nonexistent"], user_id=1,
+                           summary=None, default_action="overwrite")
+    rd.close()
+    assert result["status"] == "partial"
+    # wh_001 succeeded for sugar; nonexistent failed.
+    from blueprints.publish_recipe_pure import get_item_event_details
+    details = get_item_event_details(m, result["event_id"])
+    codes = {w["warehouse_code"]: w["status"] for w in details["warehouses"]}
+    assert codes == {"wh_001": "success", "nonexistent": "failed"}
+    # sugar should now exist in wh_001.
+    wh = sqlite3.connect(wh_db)
+    row = wh.execute("SELECT * FROM items WHERE sku='SKU-SUGAR'").fetchone()
+    assert row is not None
+    wh.close()
+    m.close()

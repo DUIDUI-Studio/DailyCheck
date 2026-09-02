@@ -155,6 +155,82 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
     allowed_write_paths_json TEXT NOT NULL DEFAULT '[]',
     allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]'
 );
+
+-- Cross-warehouse recipe publishing (R&D → storefronts).
+-- Versioned with draft → published lifecycle.
+CREATE TABLE IF NOT EXISTS recipe_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_type TEXT NOT NULL,            -- 'ic_recipe' | 'recipe'
+    recipe_id INTEGER NOT NULL,           -- id in source warehouse
+    source_warehouse_code TEXT NOT NULL,
+    version INTEGER NOT NULL,             -- 1, 2, 3...
+    status TEXT NOT NULL DEFAULT 'draft', -- 'draft' | 'published' | 'superseded'
+    snapshot_json TEXT NOT NULL,           -- frozen copy of recipe + BOM + items
+    notes TEXT,
+    created_by INTEGER,
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    UNIQUE(recipe_type, source_warehouse_code, version)
+);
+CREATE INDEX IF NOT EXISTS idx_recipe_versions_lookup
+    ON recipe_versions(recipe_type, recipe_id, status);
+
+CREATE TABLE IF NOT EXISTS recipe_publish_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipe_version_id INTEGER NOT NULL,
+    summary TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending'|'partial'|'complete'|'failed'
+    started_by INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    target_warehouse_codes_json TEXT NOT NULL,
+    FOREIGN KEY (recipe_version_id) REFERENCES recipe_versions(id)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_publish_event_warehouses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL,                  -- 'success'|'failed'
+    error_message TEXT,
+    applied_at TEXT,
+    FOREIGN KEY (publish_event_id) REFERENCES recipe_publish_events(id),
+    UNIQUE(publish_event_id, warehouse_code)
+);
+
+-- Cross-warehouse item / category publishing (R&D → storefronts).
+CREATE TABLE IF NOT EXISTS item_publish_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_by INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    target_warehouse_codes_json TEXT NOT NULL,
+    item_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS item_publish_event_warehouses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    applied_at TEXT,
+    FOREIGN KEY (publish_event_id) REFERENCES item_publish_events(id)
+);
+
+CREATE TABLE IF NOT EXISTS item_publish_event_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    source_warehouse_code TEXT NOT NULL,
+    target_warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL,                  -- 'success'|'failed'|'skipped'
+    error_message TEXT,
+    action TEXT NOT NULL DEFAULT 'overwrite',  -- 'overwrite'|'keep'|'merge'
+    FOREIGN KEY (publish_event_id) REFERENCES item_publish_events(id)
+);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
