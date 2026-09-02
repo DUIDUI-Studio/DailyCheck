@@ -44,31 +44,69 @@
 </details>
 
 <details class="card" style="margin-bottom:16px" open>
-  <summary><strong>创建门店</strong></summary>
+  <summary><strong>创建仓库</strong></summary>
   <form method="post" action="{{ url_for('users.create_warehouse') }}" style="margin-top:12px">
+    <fieldset style="border:1px solid #e5e7eb;border-radius:8px;padding:8px 14px;margin-bottom:10px">
+      <legend style="padding:0 6px;color:#374151">仓库类型</legend>
+      <label style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">
+        <input type="radio" name="warehouse_type" value="storefront" checked
+               data-code-prefix="wh_" data-code-pattern="wh_\w+"
+               data-code-placeholder="例如 wh_004"
+               data-name-placeholder="例如 新天地店" />
+        门店(storefront,有实体库存)
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:4px">
+        <input type="radio" name="warehouse_type" value="rd"
+               data-code-prefix="rd_" data-code-pattern="rd_\w+"
+               data-code-placeholder="例如 rd_001"
+               data-name-placeholder="例如 研发中心" />
+        研发中心(rd,仅配方与成本)
+      </label>
+    </fieldset>
+
     <div class="grid cols-2">
       <label>仓库编码
-        <input name="code" required pattern="wh_\w+"
+        <input name="code" id="wh-code-input" required pattern="wh_\w+"
                placeholder="例如 wh_004" autocomplete="off" />
       </label>
-      <label>门店名称
-        <input name="name" required placeholder="例如 新天地店" autocomplete="off" />
+      <label>仓库名称
+        <input name="name" id="wh-name-input" required placeholder="例如 新天地店" autocomplete="off" />
       </label>
     </div>
-    <label style="display:block;margin-top:8px">
-      克隆源
-      <select name="clone_from_code" style="margin-top:4px">
-        <option value="">不克隆(只建空门店)</option>
-        {% for w in warehouses %}
-        <option value="{{ w['code'] }}">{{ w['code'] }} — {{ w['name'] }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <p class="muted" style="font-size:12px;margin:6px 0 0">
-      选择"克隆源"时,会从源门店复制品项目录、产品与配方(库存归零、SKU 保留)。
-    </p>
+    <div id="clone-from-block" style="margin-top:8px">
+      <label style="display:block">
+        克隆源
+        <select name="clone_from_code" style="margin-top:4px">
+          <option value="">不克隆(只建空仓库)</option>
+          {% for w in warehouses %}
+          <option value="{{ w['code'] }}">{{ w['code'] }} — {{ w['name'] }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">
+        选择"克隆源"时,会从源仓库复制品项目录、产品与配方(库存归零、SKU 保留)。仅门店类型可用。
+      </p>
+    </div>
     <button type="submit" class="btn primary" style="margin-top:12px">创建</button>
   </form>
+  <script>
+  (function() {
+    var radios = document.querySelectorAll('input[name="warehouse_type"]');
+    var code = document.getElementById('wh-code-input');
+    var name = document.getElementById('wh-name-input');
+    var cloneBlock = document.getElementById('clone-from-block');
+    function sync() {
+      var checked = document.querySelector('input[name="warehouse_type"]:checked');
+      if (!checked) return;
+      code.setAttribute('pattern', checked.getAttribute('data-code-pattern'));
+      code.setAttribute('placeholder', checked.getAttribute('data-code-placeholder'));
+      name.setAttribute('placeholder', checked.getAttribute('data-name-placeholder'));
+      cloneBlock.style.display = (checked.value === 'rd') ? 'none' : '';
+    }
+    radios.forEach(function(r) { r.addEventListener('change', sync); });
+    sync();
+  })();
+  </script>
 </details>
 
 <h3>用户列表</h3>

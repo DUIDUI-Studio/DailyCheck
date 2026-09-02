@@ -269,20 +269,38 @@ def delete_user(user_id: int):
 @bp.route("/warehouses/create", methods=["POST"])
 @require_login
 def create_warehouse():
-    """Create a new warehouse. Optionally clone the items / products /
-    product_bom from an existing warehouse (inventory zeroed, SKUs kept).
+    """Create a new warehouse. Supports two types:
+
+    * storefront (门店): code must start with 'wh_'; may clone catalog
+      (items / products / BOM) from an existing warehouse.
+    * rd (研发中心): code must start with 'rd_'; no cloning — the R&D
+      warehouse starts empty and gets recipes/items populated manually
+      (or via the rd seed script).
     """
     _require_admin()
 
     code = request.form.get("code", "").strip().lower()
     name = request.form.get("name", "").strip()
     clone_from_code = request.form.get("clone_from_code", "").strip()
+    warehouse_type = request.form.get("warehouse_type", "storefront").strip().lower()
 
-    if not re.fullmatch(r"wh_\w+", code):
-        flash("仓库编码必须以 wh_ 开头,后面接字母/数字/下划线")
+    if warehouse_type not in ("storefront", "rd"):
+        flash("仓库类型必须是 storefront 或 rd")
         return redirect(url_for("users.list_users"))
+
+    if warehouse_type == "storefront":
+        if not re.fullmatch(r"wh_\w+", code):
+            flash("门店仓库编码必须以 wh_ 开头,后面接字母/数字/下划线")
+            return redirect(url_for("users.list_users"))
+    else:  # rd
+        if not re.fullmatch(r"rd_\w+", code):
+            flash("研发中心仓库编码必须以 rd_ 开头,后面接字母/数字/下划线")
+            return redirect(url_for("users.list_users"))
+        # rd warehouses start empty — clone_from makes no sense.
+        clone_from_code = ""
+
     if not name:
-        flash("门店名称必填")
+        flash("仓库名称必填")
         return redirect(url_for("users.list_users"))
 
     db_path = WAREHOUSE_DB_DIR / f"{code}.db"
@@ -314,19 +332,19 @@ def create_warehouse():
     rel_path = str(db_path.relative_to(BASE_DIR))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute(
-        """INSERT INTO warehouses (code, name, db_path, created_at)
-           VALUES (?, ?, ?, ?)""",
-        (code, name, rel_path, now),
+        """INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (code, name, rel_path, warehouse_type, now),
     )
     db.commit()
     _log_admin_action(
-        f"create warehouse {code} ({name})"
+        f"create warehouse {code} ({name}, type={warehouse_type})"
         + (f" cloned {counts['items']} items / {counts['products']} products / "
            f"{counts['bom']} bom from {clone_from_code}"
            if clone_from_code else "")
     )
     flash(
-        f"已创建仓库 {code} ({name})"
+        f"已创建 {('研发中心' if warehouse_type == 'rd' else '门店')}仓库 {code} ({name})"
         + (f",从 {clone_from_code} 复制了 {counts['items']} 个品项"
            if clone_from_code else "")
     )

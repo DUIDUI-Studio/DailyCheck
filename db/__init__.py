@@ -360,10 +360,24 @@ CREATE INDEX IF NOT EXISTS idx_ic_recipe_items_ic_recipe ON ic_recipe_items(ic_r
 
 
 def init_master_db() -> None:
-    """Create the master.db schema if it does not exist yet."""
+    """Create the master.db schema if it does not exist yet.
+
+    Also runs idempotent column-add migrations on pre-existing tables
+    (CREATE TABLE IF NOT EXISTS is a no-op for an existing table, so
+    any columns added in newer releases must be ALTERed here).
+    Safe to call on every app startup — every check is gated by a
+    PRAGMA table_info lookup so the ALTER only runs when needed.
+    """
     WAREHOUSE_DB_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         conn.executescript(MASTER_SCHEMA)
+        # Idempotent column migrations for tables that pre-date these columns.
+        wh_cols = {r[1] for r in conn.execute("PRAGMA table_info(warehouses)").fetchall()}
+        if "warehouse_type" not in wh_cols:
+            conn.execute(
+                "ALTER TABLE warehouses ADD COLUMN warehouse_type TEXT "
+                "NOT NULL DEFAULT 'storefront'"
+            )
         # Seed single-row procurement_config if missing (id=1 is the only row).
         row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
         if row is None:
