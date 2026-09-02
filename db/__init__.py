@@ -9,7 +9,9 @@ is set by the before_request hook in auth.py based on session.
 """
 from __future__ import annotations
 
+import fcntl
 import sqlite3
+import tempfile
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -443,24 +445,39 @@ def init_master_db() -> None:
     any columns added in newer releases must be ALTERed here).
     Safe to call on every app startup — every check is gated by a
     PRAGMA table_info lookup so the ALTER only runs when needed.
+
+    The whole body is serialized behind an advisory file lock (fcntl
+    flock). gunicorn boots multiple workers concurrently, each of which
+    calls this from create_app(); without the lock, two workers can both
+    pass the PRAGMA table_info check and then both issue the same
+    ALTER TABLE ADD COLUMN, crashing the loser with
+    "duplicate column name" (issue #9). The lock is held only for the
+    milliseconds it takes to run the migration, so it has no impact on
+    steady-state runtime.
     """
     WAREHOUSE_DB_DIR.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(MASTER_DB)) as conn:
-        conn.executescript(MASTER_SCHEMA)
-        # Idempotent column migrations for tables that pre-date these columns.
-        wh_cols = {r[1] for r in conn.execute("PRAGMA table_info(warehouses)").fetchall()}
-        if "warehouse_type" not in wh_cols:
-            conn.execute(
-                "ALTER TABLE warehouses ADD COLUMN warehouse_type TEXT "
-                "NOT NULL DEFAULT 'storefront'"
-            )
-        # Seed single-row procurement_config if missing (id=1 is the only row).
-        row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO procurement_config (id, cover_days, min_absolute) VALUES (1, 14, 0)"
-            )
-        conn.commit()
+    lock_path = Path(tempfile.gettempdir()) / "dailycheck-init-master.lock"
+    with lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            with closing(sqlite3.connect(MASTER_DB)) as conn:
+                conn.executescript(MASTER_SCHEMA)
+                # Idempotent column migrations for tables that pre-date these columns.
+                wh_cols = {r[1] for r in conn.execute("PRAGMA table_info(warehouses)").fetchall()}
+                if "warehouse_type" not in wh_cols:
+                    conn.execute(
+                        "ALTER TABLE warehouses ADD COLUMN warehouse_type TEXT "
+                        "NOT NULL DEFAULT 'storefront'"
+                    )
+                # Seed single-row procurement_config if missing (id=1 is the only row).
+                row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO procurement_config (id, cover_days, min_absolute) VALUES (1, 14, 0)"
+                    )
+                conn.commit()
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
