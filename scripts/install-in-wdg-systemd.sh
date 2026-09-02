@@ -8,6 +8,7 @@
 #   - 容器内 install 两个 systemd unit (dailycheck-app.service + dailycheck-mcp.service)
 #   - daemon-reload + enable + restart
 #   - 验证端口 + 进程
+#   - 跑 R&D 仓库迁移 (idempotent, 见下)
 #
 # 何时需要跑:
 #   - wdg-systemd 容器重建后 (unit 文件在 /etc/systemd/system/ 里, 不持久)
@@ -17,6 +18,12 @@
 #   - pip install (镜像已含 python3, 容器重建后如缺依赖手动 pip install -r requirements.txt)
 #   - 数据库初始化 (master.db 是 bind mount, 容器外已有)
 #   - docker-compose.yml 配置 (那是 wdg-data-foundation 仓库的事)
+#
+# R&D 仓库迁移:
+#   调用 scripts/migrate_add_warehouse_type.py,会:
+#     - 若 warehouses.warehouse_type 列不存在 → ALTER TABLE (幂等)
+#     - 若 rd_001 仓库不存在 → 创建 db/warehouses/rd_001.db 并写入 warehouses 表
+#   脚本本身 idempotent,已存在的列/仓库会跳过。失败不影响服务启动 (仅打 warning)。
 #
 # 依赖:
 #   - docker-compose.yml 里加了 ../DailyCheck:/opt/dailycheck bind mount
@@ -56,6 +63,18 @@ if ! "$VENV_PYTHON" -c "import flask, mcp_server" 2>/dev/null; then
     -r "$DAILYCHECK_DIR/requirements.txt"
 else
   echo "    flask + mcp_server 已装"
+fi
+
+# R&D 仓库迁移 (idempotent). 仅在 master.db 已 bind mount 进来时跑;
+# 新 dev 环境 master.db 还没建, 跳过 (用户后续跑 `flask bootstrap` 即可).
+if [ -f "$DAILYCHECK_DIR/db/master.db" ]; then
+  echo "==> 迁移 R&D 仓库 (rd_001)..."
+  if "$VENV_PYTHON" "$DAILYCHECK_DIR/scripts/migrate_add_warehouse_type.py"; then
+    :
+  else
+    echo "    !! migrate 失败, 服务仍会启动; 手动跑:"
+    echo "       $VENV_PYTHON $DAILYCHECK_DIR/scripts/migrate_add_warehouse_type.py"
+  fi
 fi
 
 # 写 systemd unit (模板从本仓库 deploy/systemd/ 拷到 /etc/systemd/system/)
