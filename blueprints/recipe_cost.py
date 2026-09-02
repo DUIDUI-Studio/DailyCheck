@@ -5,8 +5,9 @@ import csv
 import io
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
-from flask import Blueprint, Response, flash, g, redirect, render_template, request, url_for
+from flask import Blueprint, Response, abort, flash, g, redirect, render_template, request, url_for
 
 from blueprints._helpers import now, parse_qty
 from blueprints.auth import audit
@@ -394,8 +395,41 @@ def _save_ic_recipe(ic_recipe_id: int | None):
         "added": added, "removed": removed, "updated": updated,
         "output_qty": output_qty_final,
     })
+    _upsert_recipe_draft("ic_recipe", target_id, user_id=g.user["id"] if g.user else None)
     flash("冰激凌配方已保存")
     return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=target_id))
+
+
+def _upsert_recipe_draft(recipe_type: str, recipe_id: int, user_id: int | None) -> int:
+    """Snapshot the recipe in its current warehouse db and upsert a draft
+    version row in master.db. Returns version_id. No-op on failure (so
+    save flow isn't blocked by cross-db issues).
+    """
+    from contextlib import closing
+    from config import MASTER_DB
+    import sqlite3 as _sq
+    import json as _json
+    try:
+        from blueprints.publish_recipe_pure import (
+            snapshot_recipe, upsert_draft_version,
+        )
+        wh_conn = get_warehouse_db()
+        snap = snapshot_recipe(wh_conn, recipe_type, recipe_id)
+        if snap is None:
+            return None
+        wh_code = g.warehouse["code"] if g.get("warehouse") else "rd_001"
+        with closing(_sq.connect(MASTER_DB)) as master_conn:
+            master_conn.execute("PRAGMA foreign_keys = ON")
+            version_id = upsert_draft_version(
+                master_conn, recipe_type, recipe_id, wh_code, snap,
+                user_id=user_id,
+            )
+            master_conn.commit()
+        return version_id
+    except Exception as exc:  # noqa: BLE001
+        audit("recipe_cost.draft.upsert_failed", recipe_type, recipe_id,
+              {"error": str(exc)})
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +671,7 @@ def _save_recipe(recipe_id):
         "added": added, "removed": removed, "updated": updated,
         "output_qty": round(total_grams, 2),
     })
+    _upsert_recipe_draft("recipe", target_id, user_id=g.user["id"] if g.user else None)
     flash("出品配方已保存")
     return redirect(url_for("recipe_cost.recipe_edit", recipe_id=target_id))
 
@@ -913,3 +948,295 @@ def recipe_bom_export_csv(recipe_id: int):
             })
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in recipe["name"])
     return _csv_response(out, f"recipe_{recipe['id']}_{safe_name}_{_stamp()}.csv")
+
+
+# ---------------------------------------------------------------------------
+# Publish recipes to storefronts (cross-warehouse)
+# ---------------------------------------------------------------------------
+
+def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot: dict) -> None:
+    """Open target warehouse db and replay the snapshot in.
+
+    Steps:
+      1. Ensure source category exists in target (idempotent INSERT).
+      2. Upsert each item in the BOM by sku (overwrite semantics).
+      3. Insert a NEW ic_recipe / recipe row + BOM lines.
+
+    Each insert is in its own transaction; the whole apply is wrapped
+    in `with sqlite3.connect(...)` so it's atomic per warehouse.
+    """
+    from contextlib import closing
+    import sqlite3 as _sq
+    from blueprints.publish_recipe_pure import apply_item_to_warehouse
+
+    master_conn.row_factory = _sq.Row
+    row = master_conn.execute(
+        "SELECT db_path, warehouse_type FROM warehouses WHERE code = ?",
+        (target_code,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"warehouse {target_code} not registered in master.db")
+    # Don't try to publish into an R&D warehouse (would create circular).
+    if row["warehouse_type"] == "rd":
+        raise ValueError(
+            f"{target_code} is an R&D warehouse; cannot publish into it"
+        )
+
+    target_path = Path(row["db_path"])
+    if not target_path.is_absolute():
+        from config import BASE_DIR as _BASE_DIR
+        target_path = Path(_BASE_DIR) / target_path
+    if not target_path.exists():
+        raise FileNotFoundError(f"warehouse db not found: {target_path}")
+
+    recipe_type = snapshot["recipe_type"]
+    head = snapshot["head"]
+    lines = snapshot["lines"]
+
+    table = "ic_recipes" if recipe_type == "ic_recipe" else "recipes"
+    bom_table = "ic_recipe_items" if recipe_type == "ic_recipe" else "recipe_items"
+    bom_id_col = "ic_recipe_id" if recipe_type == "ic_recipe" else "recipe_id"
+
+    with closing(_sq.connect(target_path)) as tc:
+        tc.row_factory = _sq.Row
+        tc.execute("PRAGMA foreign_keys = ON")
+        ts = now()
+
+        # Upsert items first so the BOM can reference them.
+        sku_to_new_id: dict[str, int] = {}
+        for ln in lines:
+            snap_item = {
+                "sku": ln["sku"],
+                "name": ln["item_name"],
+                "category_name": ln["category_name"],
+                "unit": ln["item_unit"],
+                "gram_per_unit": ln["gram_per_unit"],
+                "unit_cost": ln["unit_cost"],
+                "selling_price": ln["selling_price"],
+                "aux_unit": None,
+                "aux_rate": 0,
+                "safety_stock": 0,
+            }
+            apply_item_to_warehouse(tc, snap_item, action="overwrite")
+            sku_to_new_id[ln["sku"]] = int(tc.execute(
+                "SELECT id FROM items WHERE sku = ?", (ln["sku"],)
+            ).fetchone()["id"])
+
+        # Insert the recipe. output_unit is hard-coded 'g' in the
+        # source (CostReview convention). We DO overwrite on publish —
+        # a storefront never has an "existing" recipe from R&D.
+        tc.execute(
+            f"""INSERT INTO {table}
+               (name, note, output_unit, output_qty, sale_price,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (head["name"], head["note"] or "",
+             head["output_unit"] or "g",
+             float(head["output_qty"] or 0),
+             float(head["sale_price"] or 0), ts, ts),
+        )
+        new_recipe_id = int(tc.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # BOM lines.
+        for ln in lines:
+            if recipe_type == "ic_recipe":
+                tc.execute(
+                    f"""INSERT INTO {bom_table} ({bom_id_col}, item_id, qty_per_unit)
+                       VALUES (?, ?, ?)""",
+                    (new_recipe_id, sku_to_new_id[ln["sku"]],
+                     float(ln["qty_per_unit"])),
+                )
+            else:
+                # polymorphic recipe — respect the source's source_type
+                st = ln.get("source_type") or "item"
+                if st == "ic_recipe":
+                    # Need to also publish the referenced ic_recipe
+                    # recursively. Defer to a follow-up TODO; for now
+                    # skip polymorphic ic_recipe lines.
+                    continue
+                tc.execute(
+                    f"""INSERT INTO {bom_table} ({bom_id_col}, source_type,
+                       item_id, ic_recipe_id, qty_per_unit)
+                       VALUES (?, 'item', ?, NULL, ?)""",
+                    (new_recipe_id, sku_to_new_id[ln["sku"]],
+                     float(ln["qty_per_unit"])),
+                )
+        tc.commit()
+
+
+def _handle_recipe_publish(recipe_type: str, recipe_id: int):
+    """POST handler shared by ic_recipe and recipe publish endpoints."""
+    from contextlib import closing
+    from config import MASTER_DB
+    import sqlite3 as _sq
+    from blueprints.publish_recipe_pure import (
+        publish_version, list_versions, get_published_version_for_recipe,
+    )
+
+    # 1. Confirm source recipe still exists in current warehouse.
+    wh_db = get_warehouse_db()
+    head = wh_db.execute(
+        "SELECT id, name FROM {} WHERE id = ?".format(
+            "ic_recipes" if recipe_type == "ic_recipe" else "recipes"
+        ),
+        (recipe_id,),
+    ).fetchone()
+    if head is None:
+        flash("配方不存在")
+        return redirect(url_for(
+            "recipe_cost.ic_recipes_list" if recipe_type == "ic_recipe"
+            else "recipe_cost.recipes_list"
+        ))
+
+    # 2. Parse + validate target warehouse_codes.
+    target_codes = request.form.getlist("warehouse_codes")
+    summary = request.form.get("summary", "").strip() or None
+    if not target_codes:
+        flash("请至少选择一个目标门店")
+        return redirect(request.referrer or url_for(
+            "recipe_cost.ic_recipes_list" if recipe_type == "ic_recipe"
+            else "recipe_cost.recipes_list"
+        ))
+
+    # 3. Find the current draft version (or warn).
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.execute("PRAGMA foreign_keys = ON")
+        draft = master_conn.execute(
+            """SELECT * FROM recipe_versions
+               WHERE recipe_type = ? AND recipe_id = ? AND status = 'draft'
+               ORDER BY version DESC LIMIT 1""",
+            (recipe_type, recipe_id),
+        ).fetchone()
+
+    if draft is None:
+        # No draft yet — make one from current state.
+        version_id = _upsert_recipe_draft(
+            recipe_type, recipe_id,
+            user_id=g.user["id"] if g.user else None,
+        )
+        if version_id is None:
+            flash("无法创建草稿版本（数据库异常）")
+            return redirect(request.referrer)
+    else:
+        version_id = int(draft["id"])
+
+    # 4. Publish.
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.execute("PRAGMA foreign_keys = ON")
+        result = publish_version(
+            master_conn, version_id, target_codes,
+            user_id=g.user["id"] if g.user else None,
+            summary=summary,
+            apply_func=_apply_recipe_snapshot_to_warehouse,
+        )
+        master_conn.commit()
+
+    audit(
+        "recipe_cost.recipe_publish",
+        recipe_type, recipe_id,
+        {"event_id": result["event_id"], "status": result["status"],
+         "targets": target_codes},
+    )
+
+    # 5. Fan-out: emit_event 'recipe_published' for each user (PRD §2.5.4).
+    try:
+        from blueprints.notifications_pure import emit_event
+        target_url = (
+            url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=recipe_id)
+            if recipe_type == "ic_recipe"
+            else url_for("recipe_cost.recipe_edit", recipe_id=recipe_id)
+        )
+        with closing(_sq.connect(MASTER_DB)) as master_conn:
+            master_conn.row_factory = _sq.Row  # dict-style access on rows
+            user_ids = [r["id"] for r in master_conn.execute(
+                "SELECT id FROM users WHERE is_admin = 1"
+            ).fetchall()]
+            summary_text = summary or f"{head['name']} 已发布到 {len(target_codes)} 个门店"
+            emit_event(master_conn, "recipe_published", summary_text,
+                       target_url=target_url, user_ids=user_ids)
+            master_conn.commit()
+    except Exception as exc:  # noqa: BLE001 — don't fail publish on notification error
+        audit("recipe_cost.recipe_publish.notify_failed", recipe_type, recipe_id,
+              {"error": str(exc)})
+
+    flash(f"发布完成（{result['status']}）："
+          f"{sum(1 for w in result['per_warehouse'] if w['status'] == 'success')}/"
+          f"{len(result['per_warehouse'])} 个门店成功")
+    return redirect(url_for(
+        "recipe_cost.recipe_versions_history",
+        recipe_type=recipe_type, recipe_id=recipe_id,
+    ))
+
+
+@bp.route("/recipe-cost/ic-recipes/<int:ic_recipe_id>/publish", methods=["POST"])
+@require_platform_admin
+def ic_recipe_publish(ic_recipe_id: int):
+    return _handle_recipe_publish("ic_recipe", ic_recipe_id)
+
+
+@bp.route("/recipe-cost/recipes/<int:recipe_id>/publish", methods=["POST"])
+@require_platform_admin
+def recipe_publish(recipe_id: int):
+    return _handle_recipe_publish("recipe", recipe_id)
+
+
+@bp.route("/recipe-cost/<recipe_type>/<int:recipe_id>/versions", methods=["GET"])
+@require_login
+def recipe_versions_history(recipe_type: str, recipe_id: int):
+    """Show version history + publish events for a recipe."""
+    from contextlib import closing
+    from config import MASTER_DB
+    import sqlite3 as _sq
+    from blueprints.publish_recipe_pure import (
+        list_versions, list_publish_events_for_recipe, get_event_warehouses,
+    )
+
+    if recipe_type not in ("ic_recipe", "recipe"):
+        abort(404)
+
+    # Resolve human-readable source name from current warehouse db.
+    wh_db = get_warehouse_db()
+    table = "ic_recipes" if recipe_type == "ic_recipe" else "recipes"
+    head = wh_db.execute(
+        f"SELECT id, name FROM {table} WHERE id = ?", (recipe_id,)
+    ).fetchone()
+    if head is None:
+        flash("配方不存在")
+        return redirect(url_for(
+            "recipe_cost.ic_recipes_list" if recipe_type == "ic_recipe"
+            else "recipe_cost.recipes_list"
+        ))
+
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        versions = list_versions(master_conn, recipe_type, recipe_id)
+        events = list_publish_events_for_recipe(
+            master_conn, recipe_type, recipe_id
+        )
+        # Attach per-event warehouse rows.
+        for ev in events:
+            ev["warehouses"] = get_event_warehouses(master_conn, int(ev["id"]))
+
+    target_codes = request.args.getlist("warehouse_codes")
+    return render_template(
+        "recipe_cost/recipe_versions.html",
+        recipe_type=recipe_type,
+        recipe=head,
+        versions=versions,
+        events=events,
+        available_warehouses=_list_storefront_warehouses(),
+    )
+
+
+def _list_storefront_warehouses() -> list[dict]:
+    """All storefront warehouses (excludes rd_*) — for the publish UI picker."""
+    from contextlib import closing
+    from config import MASTER_DB
+    import sqlite3 as _sq
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        rows = master_conn.execute(
+            "SELECT code, name FROM warehouses "
+            "WHERE warehouse_type = 'storefront' ORDER BY code"
+        ).fetchall()
+    return [dict(r) for r in rows]

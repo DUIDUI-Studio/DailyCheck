@@ -131,6 +131,9 @@
 
   <button type="button" id="bom-add" class="btn-sm">+ 新增一行</button>
   <button type="submit" class="btn-primary">保存配方</button>
+  {% if recipe and g.user and g.user.is_admin %}
+  <a class="btn-sm" href="{{ url_for('recipe_cost.recipe_versions_history', recipe_type='ic_recipe', recipe_id=recipe.id) }}" style="margin-left:8px">📜 版本 / 发布历史</a>
+  {% endif %}
 </form>
 
 <script>

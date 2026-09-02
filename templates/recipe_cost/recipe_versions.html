@@ -1,0 +1,83 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block title %}版本历史 · {{ recipe.name }}{% endblock %}
+{% block recipe_content %}
+{% set back_endpoint = 'recipe_cost.ic_recipe_edit' if recipe_type == 'ic_recipe' else 'recipe_cost.recipe_edit' %}
+{% set back_arg = {'ic_recipe_id': recipe.id} if recipe_type == 'ic_recipe' else {'recipe_id': recipe.id} %}
+{% set publish_endpoint = 'recipe_cost.ic_recipe_publish' if recipe_type == 'ic_recipe' else 'recipe_cost.recipe_publish' %}
+{% set publish_arg = {'ic_recipe_id': recipe.id} if recipe_type == 'ic_recipe' else {'recipe_id': recipe.id} %}
+<div class="list-head">
+  <h2>版本历史 · {{ recipe.name }}</h2>
+  <a class="btn" href="{{ url_for(back_endpoint, **back_arg) }}">← 返回配方</a>
+</div>
+
+{% if not versions %}
+<p class="muted">暂无历史版本。保存一次配方会自动创建草稿。</p>
+{% else %}
+<h3>版本</h3>
+<table>
+  <tr><th>版本</th><th>状态</th><th>创建时间</th><th>发布时间</th><th>备注</th></tr>
+  {% for v in versions %}
+  <tr>
+    <td>v{{ v.version }}</td>
+    <td>
+      {% if v.status == 'draft' %}<span class="tag draft">草稿</span>
+      {% elif v.status == 'published' %}<span class="tag success">已发布</span>
+      {% elif v.status == 'superseded' %}<span class="tag muted">已被取代</span>
+      {% else %}{{ v.status }}{% endif %}
+    </td>
+    <td>{{ v.created_at }}</td>
+    <td>{{ v.published_at or '—' }}</td>
+    <td>{{ v.notes or '' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if g.user and g.user.is_admin %}
+<h3>发布到门店</h3>
+<form method="post" action="{{ url_for(publish_endpoint, **publish_arg) }}">
+  <p class="muted">选择要发布到的门店（多选）。当前草稿会被发布并应用到每个门店的数据库。</p>
+  <fieldset style="border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px;margin-bottom:10px">
+    {% for w in available_warehouses %}
+    <label style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">
+      <input type="checkbox" name="warehouse_codes" value="{{ w.code }}" />
+      {{ w.code }} · {{ w.name }}
+    </label>
+    {% endfor %}
+  </fieldset>
+  <label>发布说明（可选）
+    <input name="summary" placeholder="例如：首发 / 更新 v2" />
+  </label>
+  <button type="submit" class="btn primary" style="margin-top:12px">发布</button>
+</form>
+{% endif %}
+
+{% if events %}
+<h3>发布历史</h3>
+<table>
+  <tr><th>事件 ID</th><th>版本</th><th>状态</th><th>目标门店</th><th>结果</th><th>开始 / 完成</th></tr>
+  {% for ev in events %}
+  <tr>
+    <td>#{{ ev.id }}</td>
+    <td>v{{ ev.recipe_version_id }}</td>
+    <td>
+      {% if ev.status == 'complete' %}<span class="tag success">全部成功</span>
+      {% elif ev.status == 'partial' %}<span class="tag warn">部分成功</span>
+      {% else %}<span class="tag muted">{{ ev.status }}</span>
+      {% endif %}
+    </td>
+    <td><small>{{ ev.target_warehouse_codes_json }}</small></td>
+    <td>
+      {% for wh in ev.warehouses %}
+        {% if wh.status == 'success' %}<span class="tag success">{{ wh.warehouse_code }}</span>
+        {% else %}<span class="tag danger" title="{{ wh.error_message }}">{{ wh.warehouse_code }} ✗</span>
+        {% endif %}
+      {% endfor %}
+    </td>
+    <td><small>{{ ev.started_at }}<br>{{ ev.completed_at or '—' }}</small></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% endblock %}
