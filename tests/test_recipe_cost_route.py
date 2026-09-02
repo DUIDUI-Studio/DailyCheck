@@ -720,3 +720,244 @@ def test_items_delete_blocked_when_referenced_by_recipe(tmp_path, monkeypatch):
     ).fetchone()["c"]
     check.close()
     assert cnt == 1
+
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+def _setup_csv_fixture(tmp_path, monkeypatch):
+    """Common setup for CSV export tests: master + wh + admin + 1 ic_recipe."""
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    master_path = tmp_path / "master.db"
+    wh_path = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(wh_path)
+    migrate_warehouse_db_columns(wh_path)  # ensure items.selling_price exists
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    import sqlite3
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+        "VALUES (1, 'rd_t', 'R', ?, 'rd', ?)", (str(wh_path), ts))
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1, 1, 'admin')")
+    m.commit()
+    m.close()
+
+    conn = sqlite3.connect(wh_path)
+    conn.row_factory = sqlite3.Row
+    cat_id = conn.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO items (sku, name, category_id, unit, gram_per_unit, "
+        "unit_cost, selling_price, updated_at) "
+        "VALUES ('SKU-T', '牛奶', ?, '件', 1000, 6.0, 10.0, ?)",
+        (cat_id, ts))
+    item_id = conn.execute("SELECT id FROM items WHERE name='牛奶'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('测试ic', 'g', 500, 30, ?, ?)",
+        (ts, ts))
+    ic_id = conn.execute("SELECT id FROM ic_recipes WHERE name='测试ic'").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+        "VALUES (?, ?, 500.0)", (ic_id, item_id))
+    conn.commit()
+    conn.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 1
+        s["warehouse_id"] = 1
+    return client, ic_id, item_id
+
+
+def test_ic_recipes_export_csv_returns_csv(tmp_path, monkeypatch):
+    """GET /recipe-cost/ic-recipes/export.csv 200 + UTF-8 BOM + csv body."""
+    import csv as _csv
+    import io as _io
+    client, ic_id, _ = _setup_csv_fixture(tmp_path, monkeypatch)
+
+    resp = client.get("/recipe-cost/ic-recipes/export.csv")
+    assert resp.status_code == 200
+    assert resp.mimetype.startswith("text/csv")
+    assert resp.headers["Content-Disposition"].startswith("attachment; filename=")
+    # BOM byte at start.
+    assert resp.data.startswith(b"\xef\xbb\xbf"), "expected UTF-8 BOM"
+
+    # Parse CSV (skip BOM).
+    rows = list(_csv.DictReader(_io.StringIO(
+        resp.data.decode("utf-8-sig"))))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["name"] == "测试ic"
+    assert float(r["output_qty"]) == 500.0
+    assert float(r["sale_price"]) == 30.0
+    # 500g 牛奶, gpu=1000, unit_cost=6.0 → cost_purchase = 0.5 * 6 = 3.0
+    assert float(r["cost_purchase"]) == 3.0
+    assert int(r["item_count"]) == 1
+
+
+def test_recipes_export_csv_polymorphic(tmp_path, monkeypatch):
+    """GET /recipe-cost/recipes/export.csv includes polymorphic recipes."""
+    import csv as _csv
+    import io as _io
+    import sqlite3 as _sq
+    client, ic_id, item_id = _setup_csv_fixture(tmp_path, monkeypatch)
+
+    # Add a serving recipe that references the ic_recipe.
+    wh_path = tmp_path / "wh.db"
+    conn = _sq.connect(wh_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('小杯', 'g', 1000, 15, ?, ?)",
+        (ts, ts))
+    rec_id = conn.execute("SELECT id FROM recipes WHERE name='小杯'").fetchone()[0]
+    conn.execute(
+        "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+        "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)",
+        (rec_id, ic_id))
+    conn.commit()
+    conn.close()
+
+    resp = client.get("/recipe-cost/recipes/export.csv")
+    assert resp.status_code == 200
+    rows = list(_csv.DictReader(_io.StringIO(resp.data.decode("utf-8-sig"))))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["name"] == "小杯"
+    # NOTE: polymorphic cost math has a pre-existing inconsistency between
+    # blueprint (qty = "servings") and recipe_cost_pure (qty = "grams of ic"),
+    # so we don't pin the cost_purchase value here — see issue flagged in
+    # memory. We only assert shape + that the row exists.
+    assert int(r["item_count"]) == 1
+
+
+def test_ic_recipe_bom_export_csv(tmp_path, monkeypatch):
+    """GET /recipe-cost/ic-recipes/<id>/export.csv exports BOM rows."""
+    import csv as _csv
+    import io as _io
+    client, ic_id, _ = _setup_csv_fixture(tmp_path, monkeypatch)
+
+    resp = client.get(f"/recipe-cost/ic-recipes/{ic_id}/export.csv")
+    assert resp.status_code == 200
+    assert resp.mimetype.startswith("text/csv")
+
+    rows = list(_csv.DictReader(_io.StringIO(resp.data.decode("utf-8-sig"))))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["recipe_id"] == str(ic_id)
+    assert r["item_name"] == "牛奶"
+    assert float(r["qty_per_unit"]) == 500.0
+    assert r["unit"] == "克"  # gpu=1000 → "克" label
+    # 500g / 1000g-per-unit = 0.5 件; × unit_cost 6.0 = 3.0
+    assert float(r["qty_stock_units"]) == 0.5
+    assert float(r["cost_purchase"]) == 3.0
+
+
+def test_recipe_bom_export_csv_includes_ic_recipe_lines(tmp_path, monkeypatch):
+    """Polymorphic BOM export includes source_type=ic_recipe rows."""
+    import csv as _csv
+    import io as _io
+    import sqlite3 as _sq
+    client, ic_id, item_id = _setup_csv_fixture(tmp_path, monkeypatch)
+
+    wh_path = tmp_path / "wh.db"
+    conn = _sq.connect(wh_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('小杯', 'g', 1000, 15, ?, ?)",
+        (ts, ts))
+    rec_id = conn.execute("SELECT id FROM recipes WHERE name='小杯'").fetchone()[0]
+    conn.execute(
+        "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+        "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)",
+        (rec_id, ic_id))
+    conn.execute(
+        "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+        "qty_per_unit) VALUES (?, 'item', ?, NULL, 50.0)",
+        (rec_id, item_id))
+    conn.commit()
+    conn.close()
+
+    resp = client.get(f"/recipe-cost/recipes/{rec_id}/export.csv")
+    assert resp.status_code == 200
+    rows = list(_csv.DictReader(_io.StringIO(resp.data.decode("utf-8-sig"))))
+    assert len(rows) == 2
+    types = [r["source_type"] for r in rows]
+    assert "ic_recipe" in types and "item" in types
+
+
+def test_csv_export_empty_recipes(tmp_path, monkeypatch):
+    """Empty recipe list still returns header-only CSV (downloadable file)."""
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db
+    master_path = tmp_path / "master.db"
+    wh_path = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    import sqlite3
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+        "VALUES (1, 'rd_t', 'R', ?, 'rd', ?)", (str(wh_path), ts))
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1, 1, 'admin')")
+    m.commit()
+    m.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 1
+        s["warehouse_id"] = 1
+
+    resp = client.get("/recipe-cost/recipes/export.csv")
+    assert resp.status_code == 200
+    # Body = BOM only, no rows / no header line.
+    assert resp.data == b"\xef\xbb\xbf"
+
+
+def test_csv_export_redirects_on_missing_recipe(tmp_path, monkeypatch):
+    """BOM CSV for a non-existent recipe id → flash + redirect."""
+    client, ic_id, _ = _setup_csv_fixture(tmp_path, monkeypatch)
+    resp = client.get("/recipe-cost/ic-recipes/99999/export.csv")
+    # redirects to list (302)
+    assert resp.status_code == 302
+    assert "/recipe-cost/ic-recipes" in resp.headers["Location"]
+
+
+def test_list_pages_have_export_link(tmp_path, monkeypatch):
+    """Both list pages render the CSV export link."""
+    client, _, _ = _setup_csv_fixture(tmp_path, monkeypatch)
+    r1 = client.get("/recipe-cost/ic-recipes")
+    assert b"export.csv" in r1.data
+    assert b"\xe5\xaf\xbc\xe5\x87\xba CSV" in r1.data  # "导出 CSV"
+    r2 = client.get("/recipe-cost/recipes")
+    assert b"export.csv" in r2.data
+    assert b"\xe5\xaf\xbc\xe5\x87\xba CSV" in r2.data

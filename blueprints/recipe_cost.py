@@ -1,9 +1,12 @@
 """Recipe cost: ice-cream recipes + serving recipes with cost/margin."""
 from __future__ import annotations
 
+import csv
+import io
 import sqlite3
+from datetime import datetime
 
-from flask import Blueprint, flash, g, redirect, render_template, request, url_for
+from flask import Blueprint, Response, flash, g, redirect, render_template, request, url_for
 
 from blueprints._helpers import now, parse_qty
 from blueprints.auth import audit
@@ -11,6 +14,47 @@ from db import get_warehouse_db
 from permissions import require_login, require_platform_admin
 
 bp = Blueprint("recipe_cost", __name__)
+
+
+# ---------------------------------------------------------------------------
+# CSV export helpers
+# ---------------------------------------------------------------------------
+
+def _csv_response(rows: list[dict], filename: str) -> Response:
+    """Build a CSV response with a UTF-8 BOM so Excel opens Chinese correctly.
+
+    `rows` is an iterable of dicts; column order = first row's key order.
+    Use `csv.DictWriter` so missing keys yield empty cells (vs KeyError).
+    """
+    if not rows:
+        # Header-only file when there's no data — still gives a valid download.
+        body = ""
+        keys: list[str] = []
+    else:
+        keys = list(rows[0].keys())
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=keys, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        body = buf.getvalue()
+
+    # BOM + content. Filename wrapped in quotes for clients that don't
+    # RFC 5987 encode (Excel on Windows reads the plain filename).
+    return Response(
+        "\ufeff" + body,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"; '
+                                   f"filename*=UTF-8''{filename}",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _stamp() -> str:
+    """Filename-safe timestamp, e.g. '20260903-001530'."""
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 @bp.before_request
@@ -655,3 +699,217 @@ def api_cost(kind: str, rid: int):
         "margin_selling": c.get("margin_selling"),
         "profit": float(c.get("profit", 0.0)),
     }
+
+
+# ---------------------------------------------------------------------------
+# CSV export
+# ---------------------------------------------------------------------------
+
+@bp.route("/recipe-cost/ic-recipes/export.csv", methods=["GET"])
+@require_login
+def ic_recipes_export_csv():
+    """Flat list of every ic_recipe with computed cost / margin columns."""
+    db = get_warehouse_db()
+    from blueprints.recipe_cost_pure import ic_recipe_cost
+    rows = db.execute(
+        "SELECT id, name, output_unit, output_qty, sale_price, "
+        "       created_at, updated_at "
+        "FROM ic_recipes ORDER BY id"
+    ).fetchall()
+    out = []
+    for r in rows:
+        c = ic_recipe_cost(db, int(r["id"]))
+        cp = float(c["cost_purchase"])
+        cs = float(c["cost_selling"])
+        sp = float(r["sale_price"] or 0)
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "output_qty": float(r["output_qty"] or 0),
+            "output_unit": r["output_unit"],
+            "sale_price": sp,
+            "cost_purchase": cp,
+            "cost_selling": cs,
+            "margin_purchase_pct": (
+                round((sp - cp) / sp * 100, 2) if sp > 0 else None
+            ),
+            "margin_selling_pct": (
+                round((cs - cp) / cs * 100, 2) if cs > 0 else None
+            ),
+            "profit": round(cs - cp, 2),
+            "item_count": len(c["lines"]),
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        })
+    return _csv_response(out, f"ic_recipes_{_stamp()}.csv")
+
+
+@bp.route("/recipe-cost/recipes/export.csv", methods=["GET"])
+@require_login
+def recipes_export_csv():
+    """Flat list of every serving recipe (出品配方) with computed columns."""
+    db = get_warehouse_db()
+    from blueprints.recipe_cost_pure import recipe_cost
+    rows = db.execute(
+        "SELECT id, name, output_unit, output_qty, sale_price, "
+        "       created_at, updated_at "
+        "FROM recipes ORDER BY id"
+    ).fetchall()
+    out = []
+    for r in rows:
+        c = recipe_cost(db, int(r["id"]))
+        cp = float(c["cost_purchase"])
+        cs = float(c["cost_selling"])
+        sp = float(r["sale_price"] or 0)
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "output_qty": float(r["output_qty"] or 0),
+            "output_unit": r["output_unit"],
+            "sale_price": sp,
+            "cost_purchase": cp,
+            "cost_selling": cs,
+            "margin_purchase_pct": (
+                round((sp - cp) / sp * 100, 2) if sp > 0 else None
+            ),
+            "margin_selling_pct": (
+                round((cs - cp) / cs * 100, 2) if cs > 0 else None
+            ),
+            "profit": round(cs - cp, 2),
+            "item_count": len(c["lines"]),
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        })
+    return _csv_response(out, f"recipes_{_stamp()}.csv")
+
+
+@bp.route("/recipe-cost/ic-recipes/<int:ic_recipe_id>/export.csv", methods=["GET"])
+@require_login
+def ic_recipe_bom_export_csv(ic_recipe_id: int):
+    """BOM rows (one per ingredient line) for a single ic_recipe."""
+    db = get_warehouse_db()
+    recipe = db.execute(
+        "SELECT id, name, output_unit, output_qty, sale_price "
+        "FROM ic_recipes WHERE id=?", (ic_recipe_id,),
+    ).fetchone()
+    if recipe is None:
+        flash("冰激凌配方不存在")
+        return redirect(url_for("recipe_cost.ic_recipes_list"))
+    rows = db.execute(
+        """SELECT ri.item_id, ri.qty_per_unit,
+                  i.name AS item_name, c.name AS category_name,
+                  i.unit, i.gram_per_unit, i.unit_cost, i.selling_price
+           FROM ic_recipe_items ri
+           JOIN items i ON i.id = ri.item_id
+           JOIN categories c ON c.id = i.category_id
+           WHERE ri.ic_recipe_id = ?
+           ORDER BY ri.id""",
+        (ic_recipe_id,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        gpu = float(r["gram_per_unit"] or 0)
+        unit_label = "克" if gpu > 0 else (r["unit"] or "")
+        qty = float(r["qty_per_unit"])
+        if gpu > 0:
+            qty_stock = round(qty / gpu, 4)
+        else:
+            qty_stock = qty
+        unit_cost = float(r["unit_cost"] or 0)
+        selling = float(r["selling_price"] or 0)
+        out.append({
+            "recipe_id": recipe["id"],
+            "recipe_name": recipe["name"],
+            "line_no": len(out) + 1,
+            "category": r["category_name"],
+            "item_id": r["item_id"],
+            "item_name": r["item_name"],
+            "qty_per_unit": qty,
+            "unit": unit_label,
+            "qty_stock_units": qty_stock,
+            "unit_cost": unit_cost,
+            "selling_price": selling,
+            "cost_purchase": round(qty_stock * unit_cost, 4),
+            "cost_selling": round(qty_stock * selling, 4),
+        })
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in recipe["name"])
+    return _csv_response(out, f"ic_recipe_{recipe['id']}_{safe_name}_{_stamp()}.csv")
+
+
+@bp.route("/recipe-cost/recipes/<int:recipe_id>/export.csv", methods=["GET"])
+@require_login
+def recipe_bom_export_csv(recipe_id: int):
+    """BOM rows for a single recipe (出品配方), polymorphic (item or ic_recipe)."""
+    db = get_warehouse_db()
+    recipe = db.execute(
+        "SELECT id, name, output_unit, output_qty, sale_price "
+        "FROM recipes WHERE id=?", (recipe_id,),
+    ).fetchone()
+    if recipe is None:
+        flash("出品配方不存在")
+        return redirect(url_for("recipe_cost.recipes_list"))
+    rows = db.execute(
+        """SELECT ri.id AS line_id, ri.source_type, ri.qty_per_unit,
+                  ri.item_id, ri.ic_recipe_id,
+                  i.name AS item_name, i.unit AS item_unit,
+                  i.gram_per_unit, i.unit_cost, i.selling_price,
+                  c.name AS category_name,
+                  ic.name AS ic_recipe_name, ic.output_qty AS ic_output_qty
+           FROM recipe_items ri
+           LEFT JOIN items i ON i.id = ri.item_id
+           LEFT JOIN categories c ON c.id = i.category_id
+           LEFT JOIN ic_recipes ic ON ic.id = ri.ic_recipe_id
+           WHERE ri.recipe_id = ?
+           ORDER BY ri.id""",
+        (recipe_id,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        qty = float(r["qty_per_unit"])
+        if r["source_type"] == "item":
+            gpu = float(r["gram_per_unit"] or 0)
+            unit_label = "克" if gpu > 0 else (r["item_unit"] or "")
+            qty_stock = round(qty / gpu, 4) if gpu > 0 else qty
+            unit_cost = float(r["unit_cost"] or 0)
+            selling = float(r["selling_price"] or 0)
+            out.append({
+                "recipe_id": recipe["id"],
+                "recipe_name": recipe["name"],
+                "line_no": len(out) + 1,
+                "source_type": "item",
+                "ingredient": f"{r['category_name']} / {r['item_name']}",
+                "qty_per_unit": qty,
+                "unit": unit_label,
+                "qty_stock_units": qty_stock,
+                "unit_cost": unit_cost,
+                "selling_price": selling,
+                "cost_purchase": round(qty_stock * unit_cost, 4),
+                "cost_selling": round(qty_stock * selling, 4),
+            })
+        elif r["source_type"] == "ic_recipe":
+            ic_grams = float(r["ic_output_qty"] or 0)
+            qty_stock = round(qty * ic_grams, 4) if ic_grams > 0 else 0.0
+            # Cost basis: pull ic_recipe totals and divide by ic.output_qty.
+            from blueprints.recipe_cost_pure import ic_recipe_cost
+            ic_cost = ic_recipe_cost(db, int(r["ic_recipe_id"]))
+            if ic_cost and ic_grams > 0:
+                per_unit_cp = float(ic_cost["cost_purchase"]) / ic_grams
+                per_unit_cs = float(ic_cost["cost_selling"]) / ic_grams
+            else:
+                per_unit_cp = per_unit_cs = 0.0
+            out.append({
+                "recipe_id": recipe["id"],
+                "recipe_name": recipe["name"],
+                "line_no": len(out) + 1,
+                "source_type": "ic_recipe",
+                "ingredient": r["ic_recipe_name"],
+                "qty_per_unit": qty,
+                "unit": "份",
+                "qty_stock_units": qty_stock,
+                "unit_cost": round(per_unit_cp, 4),
+                "selling_price": round(per_unit_cs, 4),
+                "cost_purchase": round(per_unit_cp * qty, 4),
+                "cost_selling": round(per_unit_cs * qty, 4),
+            })
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in recipe["name"])
+    return _csv_response(out, f"recipe_{recipe['id']}_{safe_name}_{_stamp()}.csv")

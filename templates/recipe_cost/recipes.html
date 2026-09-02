@@ -3,6 +3,7 @@
 <div class="list-head">
   <h2>出品配方</h2>
   <a class="btn" href="{{ url_for('recipe_cost.ic_recipes_list') }}">← 冰激凌配方</a>
+  <a class="btn" href="{{ url_for('recipe_cost.recipes_export_csv') }}">📥 导出 CSV</a>
   {% if g.user['is_admin'] %}
   <a class="btn btn-primary" href="{{ url_for('recipe_cost.recipe_new') }}">+ 新建出品配方</a>
   {% endif %}
@@ -25,6 +26,7 @@
       {% if g.user['is_admin'] %}
       <div class="recipe-card__actions">
         <a class="btn-sm" href="{{ url_for('recipe_cost.recipe_edit', recipe_id=r['id']) }}">编辑</a>
+        <a class="btn-sm" href="{{ url_for('recipe_cost.recipe_bom_export_csv', recipe_id=r['id']) }}">📥 BOM</a>
         <form method="post" action="{{ url_for('recipe_cost.recipe_delete', recipe_id=r['id']) }}" onsubmit="return confirm('确认删除该出品配方？');">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>
