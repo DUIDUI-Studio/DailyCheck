@@ -19,9 +19,8 @@ Environment=DAILYCHECK_SECRET_KEY=dev-secret-key-not-for-prod
 # table via AuthMiddleware (mcp_server/main.py).  See
 # docs/superpowers/specs/2026-07-23-mcp-token-secure-storage.md.
 Environment=DAILYCHECK_MCP_TOKEN=dev-mcp-token-for-testing
-Environment=PYTHONUNBUFFERED=1
-Environment=PATH=/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/bin/python3 -m mcp_server --transport http --host 0.0.0.0 --port 5100
+Environment=PATH=/opt/dailycheck/.venv/bin:/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/dailycheck/.venv/bin/python -m mcp_server --transport http --host 0.0.0.0 --port 5100
 Restart=always
 RestartSec=5
 StandardOutput=journal

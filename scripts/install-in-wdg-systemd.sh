@@ -31,8 +31,7 @@ echo "==> 前置检查..."
 [ -f "$DAILYCHECK_DIR/app.py" ] || { echo "!! 找不到 app.py, bind mount 没生效?" >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "!! 需要 systemd 容器" >&2; exit 1; }
 
-# 容器镜像默认 PATH 没把 /var/www/.local/bin 包进来, pip 装的 mcp flask 等命令找不到
-export PATH="/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/opt/dailycheck/.venv/bin:/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # www-data 是 systemd unit 跑进程用的用户,容器重建后没了
 id www-data >/dev/null 2>&1 || useradd -m -s /bin/bash www-data
@@ -44,10 +43,16 @@ chown -R www-data:www-data "$DAILYCHECK_DIR" 2>/dev/null || true
 mkdir -p /var/www && chown www-data:www-data /var/www
 
 # 确保 python deps 已装 (idempotent: 跳过已存在的)
+# 注意: service 用 /opt/dailycheck/.venv/bin/python 跑, 依赖必须装进 venv
 echo "==> 检查 Python 依赖..."
-if ! sudo -u www-data python3 -c "import flask, mcp_server" 2>/dev/null; then
-  echo "==> pip install -r requirements.txt (容器内首次或缺包)..."
-  sudo -u www-data pip3 install --break-system-packages --no-cache-dir \
+VENV_PYTHON="$DAILYCHECK_DIR/.venv/bin/python"
+if [ ! -f "$VENV_PYTHON" ]; then
+  echo "==> 创建 venv..."
+  sudo -u www-data python3 -m venv "$DAILYCHECK_DIR/.venv"
+fi
+if ! "$VENV_PYTHON" -c "import flask, mcp_server" 2>/dev/null; then
+  echo "==> pip install -r requirements.txt (安装到 venv)..."
+  "$VENV_PYTHON" -m pip install --break-system-packages --no-cache-dir \
     -r "$DAILYCHECK_DIR/requirements.txt"
 else
   echo "    flask + mcp_server 已装"
