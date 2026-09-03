@@ -28,10 +28,10 @@ def _setup_rd_with_warehouse(tmp_path, monkeypatch):
               "VALUES ('admin', 'x', 1, ?)", (ts,))
     m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
               "VALUES ('rd_001', 'R&D', ?, 'rd', ?)",
-              (str(rd_db.relative_to(tmp_path)), ts))
+              (str(rd_db), ts))
     m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
               "VALUES ('wh_001', '中央仓', ?, 'storefront', ?)",
-              (str(wh_db.relative_to(tmp_path)), ts))
+              (str(wh_db), ts))
     m.commit()
     m.close()
 
