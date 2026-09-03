@@ -96,3 +96,71 @@ def test_init_master_db_is_idempotent(tmp_path, monkeypatch):
     # warehouse_type column appears exactly once.
     assert sum(1 for c in wh_cols if c == "warehouse_type") == 1
     conn.close()
+
+
+def test_recipe_versions_unique_includes_recipe_id(tmp_path, monkeypatch):
+    """recipe_versions UNIQUE must include recipe_id, not source_warehouse_code.
+
+    Regression: the original schema had UNIQUE(recipe_type,
+    source_warehouse_code, version) which blocked creating a draft for
+    any second recipe in the same source warehouse. The fix replaces it
+    with UNIQUE(recipe_type, recipe_id, version) via init_master_db's
+    rebuild branch.
+    """
+    import db as db_module
+    import config as config_module
+    master = tmp_path / "master.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+
+    # Seed a "legacy" master with the wrong unique constraint.
+    import sqlite3
+    conn = sqlite3.connect(master)
+    conn.executescript("""
+        CREATE TABLE recipe_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipe_type TEXT NOT NULL,
+            recipe_id INTEGER NOT NULL,
+            source_warehouse_code TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            snapshot_json TEXT NOT NULL,
+            notes TEXT,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            published_at TEXT,
+            UNIQUE(recipe_type, source_warehouse_code, version)
+        );
+        INSERT INTO recipe_versions (recipe_type, recipe_id, source_warehouse_code, version,
+                                      status, snapshot_json, created_at)
+        VALUES ('ic_recipe', 3, 'rd_001', 1, 'published', '{}', '2026-09-03 10:00:00');
+    """)
+    conn.commit()
+    conn.close()
+
+    from db import init_master_db
+    init_master_db()
+
+    conn = sqlite3.connect(master)
+    # After rebuild, recipe_versions should have the correct unique index.
+    idx_cols = [r[2] for r in conn.execute(
+        "PRAGMA index_info('sqlite_autoindex_recipe_versions_1')"
+    ).fetchall()]
+    assert idx_cols == ["recipe_type", "recipe_id", "version"], \
+        f"unique index must be on (recipe_type, recipe_id, version), got {idx_cols}"
+
+    # Legacy row should still be present (rebuild preserves data).
+    cnt = conn.execute("SELECT COUNT(*) FROM recipe_versions").fetchone()[0]
+    assert cnt == 1
+
+    # Now two recipes in the same source warehouse can share version 1.
+    conn.execute("""INSERT INTO recipe_versions
+        (recipe_type, recipe_id, source_warehouse_code, version,
+         status, snapshot_json, created_at)
+        VALUES ('ic_recipe', 4, 'rd_001', 1, 'draft', '{}', '2026-09-03 11:00:00')""")
+    conn.commit()
+    cnt = conn.execute("SELECT COUNT(*) FROM recipe_versions").fetchone()[0]
+    assert cnt == 2
+    conn.close()

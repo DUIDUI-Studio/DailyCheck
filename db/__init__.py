@@ -172,7 +172,10 @@ CREATE TABLE IF NOT EXISTS recipe_versions (
     created_by INTEGER,
     created_at TEXT NOT NULL,
     published_at TEXT,
-    UNIQUE(recipe_type, source_warehouse_code, version)
+    -- One version number per recipe (within a source warehouse). Without
+    -- recipe_id this constraint blocks every other recipe from reaching
+    -- the same version number, even though they live in different rows.
+    UNIQUE(recipe_type, recipe_id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_recipe_versions_lookup
     ON recipe_versions(recipe_type, recipe_id, status);
@@ -469,6 +472,62 @@ def init_master_db() -> None:
                         "ALTER TABLE warehouses ADD COLUMN warehouse_type TEXT "
                         "NOT NULL DEFAULT 'storefront'"
                     )
+
+                # recipe_versions UNIQUE constraint fix.
+                # The original schema had UNIQUE(recipe_type,
+                # source_warehouse_code, version) — missing recipe_id — so
+                # two recipes in the same source warehouse could never share a
+                # version number, which blocked creating a draft for any
+                # recipe after the first. The correct constraint is
+                # (recipe_type, recipe_id, version). SQLite can't DROP a
+                # UNIQUE in-place, so we rebuild the table when the wrong
+                # auto-index exists.
+                rv_indexes = [
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='index' AND tbl_name='recipe_versions'"
+                    ).fetchall()
+                ]
+                if "sqlite_autoindex_recipe_versions_1" in rv_indexes:
+                    # Find which columns the auto-index covers.
+                    auto_idx_info = conn.execute(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type='index' AND name='sqlite_autoindex_recipe_versions_1'"
+                    ).fetchone()
+                    # sql is None for auto-indexes (defined by UNIQUE clause);
+                    # query the columns directly via pragma_index_info.
+                    auto_cols = [
+                        r[2] for r in conn.execute(
+                            "PRAGMA index_info('sqlite_autoindex_recipe_versions_1')"
+                        ).fetchall()
+                    ]
+                    needs_rebuild = auto_cols != ["recipe_type", "recipe_id", "version"]
+                    if needs_rebuild:
+                        # Backup → rebuild → swap. Safe because the new
+                        # table is the same shape; we just change the UNIQUE.
+                        conn.executescript("""
+                            CREATE TABLE IF NOT EXISTS recipe_versions_new (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                recipe_type TEXT NOT NULL,
+                                recipe_id INTEGER NOT NULL,
+                                source_warehouse_code TEXT NOT NULL,
+                                version INTEGER NOT NULL,
+                                status TEXT NOT NULL DEFAULT 'draft',
+                                snapshot_json TEXT NOT NULL,
+                                notes TEXT,
+                                created_by INTEGER,
+                                created_at TEXT NOT NULL,
+                                published_at TEXT,
+                                UNIQUE(recipe_type, recipe_id, version)
+                            );
+                            INSERT INTO recipe_versions_new
+                                SELECT * FROM recipe_versions;
+                            DROP TABLE recipe_versions;
+                            ALTER TABLE recipe_versions_new RENAME TO recipe_versions;
+                            CREATE INDEX IF NOT EXISTS idx_recipe_versions_lookup
+                                ON recipe_versions(recipe_type, recipe_id, status);
+                        """)
+
                 # Seed single-row procurement_config if missing (id=1 is the only row).
                 row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
                 if row is None:
