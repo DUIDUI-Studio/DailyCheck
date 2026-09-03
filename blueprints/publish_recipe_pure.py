@@ -592,7 +592,13 @@ def list_item_publish_events(master_conn, limit: int = 50) -> list[dict]:
 
 
 def get_item_event_details(master_conn, event_id: int) -> dict:
-    """Combined view of an item_publish_event + per-warehouse + per-item rows."""
+    """Combined view of an item_publish_event + per-warehouse + per-item rows.
+
+    Each event_item row is enriched with the source item's name + sku by
+    looking up `(source_warehouse_code, item_id)` against the source
+    warehouse's items table. Misses (item deleted/renamed since publish)
+    fall back to '—' so the page still renders.
+    """
     master_conn.row_factory = sqlite3.Row
     event = master_conn.execute(
         "SELECT * FROM item_publish_events WHERE id = ?", (event_id,)
@@ -607,10 +613,57 @@ def get_item_event_details(master_conn, event_id: int) -> dict:
         "SELECT * FROM item_publish_event_items WHERE publish_event_id = ?",
         (event_id,),
     ).fetchall()
+
+    # Resolve item names by source warehouse. Group lookups so each
+    # source warehouse is opened at most once even if it has 100 items.
+    name_by_src: dict[str, dict[int, dict]] = {}
+    for r in items:
+        src = r["source_warehouse_code"]
+        if not src or src in name_by_src:
+            continue
+        name_by_src[src] = _load_item_names_for(master_conn, src)
+
+    enriched = []
+    for r in items:
+        row = dict(r)
+        src = r["source_warehouse_code"]
+        item_id = r["item_id"]
+        if src and name_by_src.get(src):
+            item = name_by_src[src].get(item_id)
+            if item:
+                row["item_name"] = item["name"]
+                row["item_sku"] = item["sku"]
+            else:
+                row.setdefault("item_name", "—")
+                row.setdefault("item_sku", "—")
+        else:
+            row.setdefault("item_name", "—")
+            row.setdefault("item_sku", "—")
+        enriched.append(row)
+
     return {
         "event": dict(event),
         "warehouses": [dict(r) for r in warehouses],
         # Avoid the key name 'items' — dict.items is a builtin method and
         # Jinja's attribute lookup would shadow the data on `detail.items`.
-        "event_items": [dict(r) for r in items],
+        "event_items": enriched,
     }
+
+
+def _load_item_names_for(master_conn, source_warehouse_code: str) -> dict[int, dict]:
+    """Open the source warehouse db and return {item_id: {name, sku}}.
+
+    Returns {} if the source warehouse can't be opened (deleted, missing
+    file, etc.) — callers fall back to "—".
+    """
+    from contextlib import closing
+    target_path = _resolve_warehouse_db_path(master_conn, source_warehouse_code)
+    if target_path is None or not __import__("pathlib").Path(target_path).exists():
+        return {}
+    try:
+        with closing(sqlite3.connect(target_path)) as src_conn:
+            src_conn.row_factory = sqlite3.Row
+            rows = src_conn.execute("SELECT id, sku, name FROM items").fetchall()
+            return {r["id"]: {"name": r["name"], "sku": r["sku"]} for r in rows}
+    except sqlite3.Error:
+        return {}

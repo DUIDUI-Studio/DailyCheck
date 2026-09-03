@@ -35,10 +35,10 @@
 
 <h4>按品项</h4>
 <table>
-  <tr><th>item_id</th><th>目标门店</th><th>动作</th><th>状态</th><th>错误</th></tr>
+  <tr><th>品项</th><th>目标门店</th><th>动作</th><th>状态</th><th>错误</th></tr>
   {% for it in detail.event_items %}
   <tr>
-    <td>{{ it.item_id }}</td>
+    <td><strong>{{ it.item_name }}</strong> <small class="muted">(SKU {{ it.item_sku }}, #{{ it.item_id }})</small></td>
     <td>{{ it.target_warehouse_code }}</td>
     <td>{{ it.action }}</td>
     <td>

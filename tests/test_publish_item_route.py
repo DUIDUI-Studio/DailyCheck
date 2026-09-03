@@ -231,3 +231,37 @@ def test_history_detail_renders_event_items(tmp_path, monkeypatch):
     assert "按品项" in body
     assert str(x) in body  # item_id column rendered
     assert "history detail test" in body  # summary rendered
+
+
+def test_history_detail_shows_item_name(tmp_path, monkeypatch):
+    """Detail table must show item name + sku, not just the integer id.
+
+    Regression: item_publish_event_items only stores item_id (master.db has
+    no item name) so the template showed the raw integer. Now the helper
+    looks up `(source_warehouse_code, item_id)` against the source
+    warehouse's items table and enriches each row with name + sku.
+    """
+    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
+
+    r = client.post("/items/publish", data={
+        "item_ids": [str(x), str(y)],  # both items
+        "warehouse_codes": ["wh_001"],
+        "default_action": "overwrite",
+        "summary": "names test",
+    }, follow_redirects=False)
+    assert r.status_code == 302
+
+    import sqlite3
+    m = sqlite3.connect(master)
+    m.row_factory = sqlite3.Row
+    event_id = m.execute(
+        "SELECT id FROM item_publish_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    m.close()
+
+    r = client.get(f"/items/publish/history/{event_id}")
+    assert r.status_code == 200
+    body = r.data.decode("utf-8")
+    # SKU prefix 'SKU-X' + 'SKU-Y' comes from the fixture (see _setup).
+    assert "SKU-X" in body, "item name 'SKU-X' should appear in detail table"
+    assert "SKU-Y" in body, "item name 'SKU-Y' should appear in detail table"
