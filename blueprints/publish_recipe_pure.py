@@ -610,5 +610,7 @@ def get_item_event_details(master_conn, event_id: int) -> dict:
     return {
         "event": dict(event),
         "warehouses": [dict(r) for r in warehouses],
-        "items": [dict(r) for r in items],
+        # Avoid the key name 'items' — dict.items is a builtin method and
+        # Jinja's attribute lookup would shadow the data on `detail.items`.
+        "event_items": [dict(r) for r in items],
     }

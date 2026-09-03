@@ -36,7 +36,7 @@
 <h4>按品项</h4>
 <table>
   <tr><th>item_id</th><th>目标门店</th><th>动作</th><th>状态</th><th>错误</th></tr>
-  {% for it in detail.items %}
+  {% for it in detail.event_items %}
   <tr>
     <td>{{ it.item_id }}</td>
     <td>{{ it.target_warehouse_code }}</td>

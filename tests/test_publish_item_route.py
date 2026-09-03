@@ -195,3 +195,39 @@ def test_items_publish_history_page_lists_events(tmp_path, monkeypatch):
     body = r.data.decode("utf-8")
     assert "品项同步历史" in body
     assert "SKU-X" in body or "1" in body  # event count
+
+
+def test_history_detail_renders_event_items(tmp_path, monkeypatch):
+    """GET /items/publish/history/<event_id> must render the per-item table.
+
+    Regression: the dict returned by get_item_event_details used the key
+    'items', which Jinja's attribute lookup interprets as dict.items (the
+    builtin method) → TypeError → HTTP 500. Renamed the key to
+    'event_items' in the pure helper; template uses detail.event_items.
+    """
+    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
+
+    r = client.post("/items/publish", data={
+        "item_ids": [str(x)],
+        "warehouse_codes": ["wh_001"],
+        "default_action": "overwrite",
+        "summary": "history detail test",
+    }, follow_redirects=False)
+    assert r.status_code == 302
+
+    # Look up the new event_id from the master.
+    import sqlite3
+    m = sqlite3.connect(master)
+    m.row_factory = sqlite3.Row
+    event_id = m.execute(
+        "SELECT id FROM item_publish_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    m.close()
+
+    r = client.get(f"/items/publish/history/{event_id}")
+    assert r.status_code == 200, "history detail must not 500"
+    body = r.data.decode("utf-8")
+    assert "事件 #" in body
+    assert "按品项" in body
+    assert str(x) in body  # item_id column rendered
+    assert "history detail test" in body  # summary rendered
