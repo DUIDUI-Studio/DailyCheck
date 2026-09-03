@@ -1003,8 +1003,12 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
         ts = now()
 
         # Upsert items first so the BOM can reference them.
+        # Skip polymorphic ic_recipe lines — they reference another ic_recipe,
+        # not an item, so there's nothing to insert into the items table.
         sku_to_new_id: dict[str, int] = {}
         for ln in lines:
+            if recipe_type == "recipe" and ln.get("source_type") == "ic_recipe":
+                continue
             snap_item = {
                 "sku": ln["sku"],
                 "name": ln["item_name"],
@@ -1074,7 +1078,11 @@ def _handle_recipe_publish(recipe_type: str, recipe_id: int):
     )
 
     # 1. Confirm source recipe still exists in current warehouse.
-    wh_db = get_warehouse_db()
+    try:
+        wh_db = get_warehouse_db()
+    except RuntimeError:
+        flash("请先选择一个仓库")
+        return redirect(url_for("auth.warehouse_picker"))
     head = wh_db.execute(
         "SELECT id, name FROM {} WHERE id = ?".format(
             "ic_recipes" if recipe_type == "ic_recipe" else "recipes"
@@ -1101,6 +1109,7 @@ def _handle_recipe_publish(recipe_type: str, recipe_id: int):
     # 3. Find the current draft version (or warn).
     with closing(_sq.connect(MASTER_DB)) as master_conn:
         master_conn.execute("PRAGMA foreign_keys = ON")
+        master_conn.row_factory = _sq.Row
         draft = master_conn.execute(
             """SELECT * FROM recipe_versions
                WHERE recipe_type = ? AND recipe_id = ? AND status = 'draft'

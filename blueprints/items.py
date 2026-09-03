@@ -287,7 +287,11 @@ def items_publish():
             flash("请至少选择一个目标门店")
             return redirect(url_for("items.items_publish"))
 
-        wh_db = get_warehouse_db()
+        try:
+            wh_db = get_warehouse_db()
+        except RuntimeError:
+            flash("请先选择一个仓库")
+            return redirect(url_for("auth.warehouse_picker"))
         with closing(_sq.connect(MASTER_DB)) as master_conn:
             master_conn.execute("PRAGMA foreign_keys = ON")
             wh_code = g.warehouse["code"] if g.get("warehouse") else "rd_001"

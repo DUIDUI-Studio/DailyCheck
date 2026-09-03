@@ -216,4 +216,89 @@ def test_publish_emits_recipe_published_notification(tmp_path, monkeypatch):
     ).fetchall()
     assert len(notifs) == 1
     assert notifs[0]["summary"] == "notify test"
+
+
+def test_publish_without_warehouse_selected_redirects(tmp_path, monkeypatch):
+    """POST publish with no warehouse in session → flash + 302, not 500.
+
+    Regression: the route used to call get_warehouse_db() unguarded and
+    crashed with RuntimeError → HTTP 500. Now it catches RuntimeError,
+    flashes '请先选择一个仓库', redirects to the warehouse picker.
+    """
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    master = tmp_path / "master.db"
+    rd_db = tmp_path / "rd.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(rd_db)
+    migrate_warehouse_db_columns(rd_db)
+
+    import sqlite3
+    ts = "2026-09-03 12:00:00"
+    m = sqlite3.connect(master)
+    m.execute("INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+              "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.commit()
+    m.close()
+    rd = sqlite3.connect(rd_db)
+    rd.execute("INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+               "created_at, updated_at) VALUES ('foo', 'g', 100, 50, ?, ?)", (ts, ts))
+    rd.commit()
+    rd.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    c = app.test_client()
+    with c.session_transaction() as s:
+        s["user_id"] = 1
+        # NO warehouse_id in session
+
+    r = c.post("/recipe-cost/ic-recipes/1/publish", data={
+        "warehouse_codes": ["wh_001"],
+        "summary": "test",
+    }, follow_redirects=False)
+    assert r.status_code == 302
+    assert "select-warehouse" in r.headers["Location"]
+
+
+def test_publish_draft_lookup_uses_row_factory(tmp_path, monkeypatch):
+    """The 'find current draft' lookup must set row_factory, else draft['id'] crashes.
+
+    Regression: master_conn had no row_factory set, so SELECT returned a tuple,
+    and `draft["id"]` raised TypeError → HTTP 500.
+    """
+    client, master, rd_db, wh_db, ic = _setup_rd_with_warehouse(tmp_path, monkeypatch)
+
+    # Force the route to look up an existing draft by saving first.
+    c = client.post(f"/recipe-cost/ic-recipes/{ic}/edit", data={
+        "name": "test-ic",
+        "output_unit": "g",
+        "output_qty": "600",
+        "sale_price": "100",
+        "notes": "",
+    }, follow_redirects=False)
+    assert c.status_code == 302
+
+    # Now publish — this hits the draft lookup path.
+    r = client.post(f"/recipe-cost/ic-recipes/{ic}/publish", data={
+        "warehouse_codes": ["wh_001"],
+        "summary": "draft lookup test",
+    }, follow_redirects=False)
+    assert r.status_code == 302  # not 500
+
+    m = __import__("sqlite3").connect(master)
+    m.row_factory = __import__("sqlite3").Row
+    ev = m.execute(
+        "SELECT status FROM recipe_publish_events "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert ev["status"] in ("complete", "partial")
+    m.close()
     m.close()

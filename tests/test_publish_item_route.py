@@ -27,13 +27,13 @@ def _setup_rd_with_two_storefronts(tmp_path, monkeypatch):
     m.execute("INSERT INTO users (username, password_hash, is_admin, created_at) "
               "VALUES ('admin', 'x', 1, ?)", (ts,))
     m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
-              "VALUES ('rd_001', 'R', ?, 'rd', ?)", (str(rd.relative_to(tmp_path)), ts))
+              "VALUES ('rd_001', 'R', ?, 'rd', ?)", (str(rd), ts))
     m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
               "VALUES ('wh_001', 'W1', ?, 'storefront', ?)",
-              (str(wh1.relative_to(tmp_path)), ts))
+              (str(wh1), ts))
     m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
               "VALUES ('wh_002', 'W2', ?, 'storefront', ?)",
-              (str(wh2.relative_to(tmp_path)), ts))
+              (str(wh2), ts))
     m.commit()
     rd_id = m.execute("SELECT id FROM warehouses WHERE code='rd_001'").fetchone()[0]
     m.close()

@@ -337,3 +337,131 @@ def test_publish_items_partial_when_one_warehouse_missing(tmp_path):
     assert row is not None
     wh.close()
     m.close()
+
+
+def test_snapshot_recipe_picks_up_source_type_for_polymorphic(tmp_path, monkeypatch):
+    """snapshot_recipe must SELECT source_type from recipe_items so the
+    apply step can skip ic_recipe lines. Regression: the snapshot dict
+    used to be missing source_type, so polymorphic lines went through
+    apply_item_to_warehouse with all-NULL fields and crashed on
+    INSERT INTO categories (NOT NULL constraint on name).
+    """
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    master = tmp_path / "master.db"
+    rd = tmp_path / "rd.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(rd)
+    migrate_warehouse_db_columns(rd)
+
+    ts = "2026-09-03 12:00:00"
+    import sqlite3
+    conn = sqlite3.connect(rd)
+    conn.row_factory = sqlite3.Row
+    cat = conn.execute("SELECT id FROM categories WHERE name='乳制品'").fetchone()["id"]
+    conn.execute("INSERT INTO items (sku, name, category_id, unit, gram_per_unit, "
+                 "unit_cost, selling_price, updated_at) "
+                 "VALUES ('SKU-A', 'A', ?, '件', 1000, 1.0, 2.0, ?)", (cat, ts))
+    a = conn.execute("SELECT id FROM items WHERE sku='SKU-A'").fetchone()["id"]
+    conn.execute("INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+                 "created_at, updated_at) VALUES ('inner', 'g', 100, 50, ?, ?)", (ts, ts))
+    inner = conn.execute("SELECT id FROM ic_recipes WHERE name='inner'").fetchone()["id"]
+    conn.execute("INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+                 "VALUES (?, ?, 100)", (inner, a))
+    conn.execute("INSERT INTO recipes (name, output_unit, output_qty, sale_price, "
+                 "created_at, updated_at) VALUES ('polymorphic', 'g', 500, 30, ?, ?)",
+                 (ts, ts))
+    outer = conn.execute("SELECT id FROM recipes WHERE name='polymorphic'").fetchone()["id"]
+    conn.execute("INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+                 "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)", (outer, inner))
+    conn.commit()
+
+    from blueprints.publish_recipe_pure import snapshot_recipe
+    snap = snapshot_recipe(conn, "recipe", outer)
+    assert snap is not None
+    assert snap["lines"][0]["source_type"] == "ic_recipe"
+    assert snap["lines"][0]["ic_recipe_id"] == inner
+    conn.close()
+
+
+def test_apply_polymorphic_skips_ic_recipe_lines(tmp_path, monkeypatch):
+    """_apply_recipe_snapshot_to_warehouse must skip polymorphic ic_recipe
+    lines in the items loop (the recipe head still gets inserted).
+
+    Regression: previously, polymorphic lines crashed with
+    'NOT NULL constraint failed: categories.name' because the
+    all-NULL item snapshot was passed to apply_item_to_warehouse.
+    """
+    import db as db_module
+    import config as config_module
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    from blueprints.recipe_cost import _apply_recipe_snapshot_to_warehouse
+    master = tmp_path / "master.db"
+    rd = tmp_path / "rd.db"
+    wh = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    init_master_db()
+    init_warehouse_db(rd)
+    init_warehouse_db(wh)
+    migrate_warehouse_db_columns(rd)
+    migrate_warehouse_db_columns(wh)
+
+    ts = "2026-09-03 12:00:00"
+    import sqlite3
+    m = sqlite3.connect(master)
+    m.row_factory = sqlite3.Row
+    m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+              "VALUES ('rd_001', 'R', ?, 'rd', ?)",
+              (str(rd), ts))
+    m.execute("INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+              "VALUES ('wh_001', 'W1', ?, 'storefront', ?)",
+              (str(wh), ts))
+    m.commit()
+    rd_conn = sqlite3.connect(rd)
+    rd_conn.row_factory = sqlite3.Row
+    cat = rd_conn.execute("SELECT id FROM categories WHERE name='乳制品'").fetchone()["id"]
+    rd_conn.execute("INSERT INTO items (sku, name, category_id, unit, gram_per_unit, "
+                    "unit_cost, selling_price, updated_at) "
+                    "VALUES ('SKU-A', 'A', ?, '件', 1000, 1.0, 2.0, ?)", (cat, ts))
+    a = rd_conn.execute("SELECT id FROM items WHERE sku='SKU-A'").fetchone()["id"]
+    rd_conn.execute("INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+                    "created_at, updated_at) VALUES ('inner', 'g', 100, 50, ?, ?)",
+                    (ts, ts))
+    inner = rd_conn.execute("SELECT id FROM ic_recipes WHERE name='inner'").fetchone()["id"]
+    rd_conn.execute("INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+                    "VALUES (?, ?, 100)", (inner, a))
+    rd_conn.execute("INSERT INTO recipes (name, output_unit, output_qty, sale_price, "
+                    "created_at, updated_at) VALUES ('polymorphic', 'g', 500, 30, ?, ?)",
+                    (ts, ts))
+    outer = rd_conn.execute("SELECT id FROM recipes WHERE name='polymorphic'").fetchone()["id"]
+    rd_conn.execute("INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+                    "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)", (outer, inner))
+    rd_conn.commit()
+
+    from blueprints.publish_recipe_pure import snapshot_recipe
+    snap = snapshot_recipe(rd_conn, "recipe", outer)
+    rd_conn.close()
+
+    # Apply should not raise (would have raised NOT NULL constraint failed
+    # before the fix). Recipe head inserts, BOM insert skipped for ic_recipe.
+    _apply_recipe_snapshot_to_warehouse(m, "wh_001", snap)
+
+    wh_conn = sqlite3.connect(wh)
+    wh_conn.row_factory = sqlite3.Row
+    head = wh_conn.execute("SELECT name FROM recipes WHERE name='polymorphic'").fetchone()
+    assert head is not None, "recipe head should be inserted"
+    # BOM row should NOT be inserted (polymorphic line skipped).
+    lines = wh_conn.execute("SELECT * FROM recipe_items").fetchall()
+    assert len(lines) == 0, f"expected 0 recipe_items, got {len(lines)}"
+    wh_conn.close()
+    m.close()

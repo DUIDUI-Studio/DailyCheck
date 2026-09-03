@@ -68,10 +68,17 @@ def snapshot_recipe(conn, recipe_type: str, recipe_id: int) -> dict:
     if head is None:
         return None
 
+    # recipe_items has source_type ('item' | 'ic_recipe') for polymorphism;
+    # ic_recipe_items does not — it always references a raw item. Skip the
+    # source_type column for ic_recipe so the SQL is valid against either
+    # table schema.
+    if recipe_type == "recipe":
+        select_cols = "t.id AS line_id, t.qty_per_unit, t.source_type, t.item_id, t.ic_recipe_id"
+    else:
+        select_cols = "t.id AS line_id, t.qty_per_unit, t.item_id"
     lines = conn.execute(
         f"""
-        SELECT t.id AS line_id, t.qty_per_unit,
-               t.item_id, t.ic_recipe_id,
+        SELECT {select_cols},
                i.sku, i.name AS item_name, i.unit AS item_unit,
                i.gram_per_unit, i.unit_cost, i.selling_price,
                i.category_id, c.name AS category_name
