@@ -28,6 +28,10 @@ wh_*.db
 # Runtime / scratch artifacts
 admin_audit.log
 graphify-out/
+
+# Local backups (created by `backups/warehouses/{code}-{tag}.db`,
+# see Q7 §7.7.1). Bulk SQLite copies that should never be committed.
+backups/
 # Daily automated issue/PR check reports (regenerated each run, never source)
 issue-reports/
 
