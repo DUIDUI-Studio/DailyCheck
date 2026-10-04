@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}订单详情 {{ order.order_no }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>订单 {{ order.order_no }}</h2>
+  <span class="status-pill {{ order.status }}">{{ order.status }}</span>
+</div>
+
+<div class="grid cols-3" style="margin-bottom:16px;">
+  <div><strong>门店：</strong>{{ order.store_warehouse_code }}</div>
+  <div><strong>配送中心：</strong>{{ order.dc_warehouse_code }}</div>
+  <div><strong>下单人：</strong>{{ order.requested_by_username or order.requested_by }}</div>
+  <div><strong>创建时间：</strong>{{ order.created_at }}</div>
+  <div><strong>期望到货：</strong>{{ order.expected_delivery_date or '—' }}</div>
+  <div><strong>备注：</strong>{{ order.note or '—' }}</div>
+</div>
+
+<h3>订单明细</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>品项</th><th>单位</th><th>订货数量</th><th>已出库</th><th>状态</th></tr>
+  </thead>
+  <tbody>
+    {% for item in order.order_items %}
+    <tr>
+      <td>{{ item.canonical_name }}</td>
+      <td>{{ item.unit }}</td>
+      <td>{{ item.quantity | fmt_qty }}</td>
+      <td>{{ item.fulfilled_quantity | fmt_qty }}</td>
+      <td>{{ item.status }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>状态历史</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>时间</th><th>从</th><th>到</th><th>操作人</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    {% for h in order.status_history %}
+    <tr>
+      <td>{{ h.created_at }}</td>
+      <td>{{ h.from_status or '—' }}</td>
+      <td>{{ h.to_status }}</td>
+      <td>{{ h.actor_username or h.actor_id or '—' }}</td>
+      <td>{{ h.note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if order.deliveries %}
+<h3>配送记录</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>配送单号</th><th>出库人</th><th>出库时间</th><th>送达时间</th><th>物流备注</th></tr>
+  </thead>
+  <tbody>
+    {% for d in order.deliveries %}
+    <tr>
+      <td>{{ d.delivery_no }}</td>
+      <td>{{ d.shipped_by_username or d.shipped_by }}</td>
+      <td>{{ d.shipped_at }}</td>
+      <td>{{ d.delivered_at or '—' }}</td>
+      <td>{{ d.tracking_note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<div class="actions" style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;">
+  {% if can_review and order.status == 'pending' %}
+  <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form">
+    <input type="hidden" name="decision" value="approved" />
+    <button type="submit" class="btn-sm ok">通过</button>
+  </form>
+  <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form">
+    <input type="hidden" name="decision" value="rejected" />
+    <input name="note" placeholder="拒绝原因" required />
+    <button type="submit" class="btn-sm danger">拒绝</button>
+  </form>
+  {% endif %}
+
+  {% if can_ship and order.status == 'approved' %}
+  <form method="post" action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}" class="inline-form">
+    <input name="tracking_note" placeholder="物流备注" />
+    <button type="submit" class="btn-sm ok">确认出库</button>
+  </form>
+  {% endif %}
+
+  {% if can_deliver and order.status == 'shipped' %}
+  <form method="post" action="{{ url_for('store_ordering.deliver_order_route', order_id=order.id) }}" class="inline-form">
+    <button type="submit" class="btn-sm ok">确认收货</button>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

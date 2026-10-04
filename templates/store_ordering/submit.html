@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}提交订单{% endblock %}
+{% block content %}
+<div class="page-header"><h2>提交订单</h2></div>
+
+{% if errors.shortages or errors.unbound %}
+<div class="alert danger">
+  <p><strong>无法提交：</strong></p>
+  {% if errors.shortages %}
+  <ul>
+    {% for s in errors.shortages %}
+    <li>{{ s.name }} 库存不足：需 {{ s.requested | fmt_qty }}，可用 {{ s.available | fmt_qty }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if errors.unbound %}
+  <ul>
+    {% for u in errors.unbound %}
+    <li>{{ u.name }} 尚未在门店绑定主数据</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% endif %}
+
+<table class="data-table">
+  <thead>
+    <tr><th>品项</th><th>单位</th><th>数量</th><th>可订库存</th><th>门店绑定</th></tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ item.cart_unit }}</td>
+      <td>{{ item.quantity | fmt_qty }}</td>
+      <td>{{ item.dc_available | fmt_qty }}</td>
+      <td>{% if item.store_bound %}<span class="status-pill ok">已绑定</span>{% else %}<span class="status-pill danger">未绑定</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<form method="post" class="grid cols-1" style="margin-top:16px;max-width:480px;">
+  <label>
+    <span>期望到货日期</span>
+    <input type="date" name="expected_delivery_date" value="{{ expected_date }}" min="{{ today }}" required />
+  </label>
+  <label>
+    <span>备注</span>
+    <textarea name="note" rows="3">{{ note }}</textarea>
+  </label>
+  <button type="submit" class="btn" {% if errors.shortages or errors.unbound %}disabled{% endif %}>确认提交</button>
+</form>
+{% endblock %}

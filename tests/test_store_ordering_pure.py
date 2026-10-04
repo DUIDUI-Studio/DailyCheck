@@ -266,8 +266,8 @@ def test_submit_order(ordering_env):
     assert order["status"] == sop.ORDER_STATUS_PENDING
     assert order["store_warehouse_code"] == "store_test"
     assert order["dc_warehouse_code"] == "dc_test"
-    assert len(order["items"]) == 1
-    assert order["items"][0]["quantity"] == 10.0
+    assert len(order["order_items"]) == 1
+    assert order["order_items"][0]["quantity"] == 10.0
     # cart cleared
     assert sop.list_cart_items(conn, cart["id"]) == []
 

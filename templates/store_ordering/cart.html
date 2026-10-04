@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}购物车{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>购物车</h2>
+  <span class="muted">配送中心：{{ dc_code }}</span>
+</div>
+
+{% if items %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>品项</th>
+      <th>单位</th>
+      <th>可订库存</th>
+      <th>门店绑定</th>
+      <th>数量</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ item.cart_unit }}</td>
+      <td>{{ item.dc_available | fmt_qty }}</td>
+      <td>{% if item.store_bound %}<span class="status-pill ok">已绑定</span>{% else %}<span class="status-pill danger">未绑定</span>{% endif %}</td>
+      <td>
+        <form method="post" action="{{ url_for('store_ordering.update_cart_item', cart_item_id=item.cart_item_id) }}" class="inline-form">
+          <input name="quantity" type="number" min="0" step="0.01" value="{{ item.quantity | fmt_qty }}" required />
+          <button type="submit" class="btn-sm">更新</button>
+        </form>
+      </td>
+      <td>
+        <form method="post" action="{{ url_for('store_ordering.remove_cart_item_route', cart_item_id=item.cart_item_id) }}" class="inline-form">
+          <button type="submit" class="btn-sm danger">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="actions" style="margin-top:16px;display:flex;gap:8px;">
+  <form method="post" action="{{ url_for('store_ordering.clear_cart_route') }}">
+    <button type="submit" class="btn-sm">清空购物车</button>
+  </form>
+  <a class="btn-sm" href="{{ url_for('store_ordering.submit_order_route') }}">去提交订单</a>
+</div>
+{% else %}
+<p class="empty">购物车为空</p>
+{% endif %}
+{% endblock %}

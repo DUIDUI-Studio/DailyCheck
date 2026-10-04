@@ -543,7 +543,7 @@ def get_order_detail(
     if row is None:
         return None
     order = dict(row)
-    order["items"] = [
+    order["order_items"] = [
         dict(r) for r in master_conn.execute(
             """SELECT soi.*, ci.name AS canonical_name, ci.category_code
                FROM store_order_items soi
@@ -635,7 +635,7 @@ def ship_order(
     try:
         dc_conn.row_factory = sqlite3.Row
         # Validate stock first.
-        for item in order["items"]:
+        for item in order["order_items"]:
             canonical_id = item["canonical_id"]
             dc_item = dc_conn.execute(
                 "SELECT id, quantity FROM items WHERE canonical_id=?", (canonical_id,)
@@ -653,7 +653,7 @@ def ship_order(
         ts = now()
         delivery_no = _generate_delivery_no(master_conn)
         dc_item_id_map: dict[int, int] = {}
-        for item in order["items"]:
+        for item in order["order_items"]:
             canonical_id = item["canonical_id"]
             requested = parse_qty(item["quantity"])
             dc_item = dc_conn.execute(
@@ -689,7 +689,7 @@ def ship_order(
                WHERE id=?""",
             (ORDER_STATUS_SHIPPED, shipped_by, ts, ts, order_id),
         )
-        for item in order["items"]:
+        for item in order["order_items"]:
             requested = parse_qty(item["quantity"])
             master_conn.execute(
                 """UPDATE store_order_items

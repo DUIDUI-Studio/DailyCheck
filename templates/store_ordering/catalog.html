@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}门店订货{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>门店订货</h2>
+  {% if cart_summary %}
+  <a class="btn-sm" href="{{ url_for('store_ordering.cart_view') }}">
+    购物车 {{ cart_summary.count }} 项 / {{ cart_summary.total_qty | fmt_qty }}
+  </a>
+  {% endif %}
+</div>
+
+{% if not selected_dc %}
+  <p class="muted">请先选择配送中心：</p>
+  <div class="inv-grid">
+    {% for dc in dcs %}
+    <a class="inv-card" href="{{ url_for('store_ordering.catalog', dc=dc.code) }}">
+      <div class="inv-card-head">
+        <div class="inv-card-name">
+          <span class="inv-cat">配送中心</span>
+          <span class="inv-name">{{ dc.name }}</span>
+        </div>
+      </div>
+      <div class="inv-card-body">
+        <span class="muted">{{ dc.code }}</span>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="muted">
+    当前配送中心：<strong>{{ selected_dc }}</strong>
+    <a href="{{ url_for('store_ordering.catalog') }}">切换</a>
+  </p>
+
+  <form method="get" class="inv-search">
+    <input type="hidden" name="dc" value="{{ selected_dc }}" />
+    <input name="q" value="{{ keyword }}" placeholder="搜索品项" />
+    <button type="submit">查询</button>
+  </form>
+
+  {% if categories %}
+  <div class="cat-bar" role="tablist" aria-label="按品类筛选">
+    <a class="cat-chip {% if not current_cat %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, q=keyword) }}" role="tab">全部</a>
+    {% for c in categories %}
+    <a class="cat-chip {% if current_cat == c %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, cat=c, q=keyword) }}" role="tab">{{ c }}</a>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if items %}
+  <div class="inv-grid">
+    {% for item in items %}
+    <div class="inv-card">
+      <div class="inv-card-head">
+        <div class="inv-card-name">
+          <span class="inv-cat">{{ item.category_code or '—' }}</span>
+          <span class="inv-name">{{ item.name }}</span>
+        </div>
+        <div class="inv-card-status">
+          {% if item.quantity <= 0 %}<span class="status-pill danger">0 库存</span>
+          {% else %}<span class="status-pill ok">库存 {{ item.quantity | fmt_qty }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="inv-card-body">
+        <form method="post" action="{{ url_for('store_ordering.add_to_cart') }}" class="grid cols-3">
+          <input type="hidden" name="dc" value="{{ selected_dc }}" />
+          <input type="hidden" name="canonical_id" value="{{ item.canonical_id }}" />
+          <input type="hidden" name="unit" value="{{ item.canonical_unit or item.unit }}" />
+          <label>
+            <span>数量</span>
+            <input name="quantity" type="number" min="0.01" step="0.01" value="1" required />
+          </label>
+          <label>
+            <span>单位</span>
+            <input value="{{ item.canonical_unit or item.unit }}" disabled />
+          </label>
+          <button type="submit" class="btn-sm" style="align-self:flex-end">加入购物车</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">该配送中心暂无可订商品</p>
+  {% endif %}
+{% endif %}
+{% endblock %}
