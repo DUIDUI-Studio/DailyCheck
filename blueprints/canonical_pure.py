@@ -1594,19 +1594,17 @@ def apply_canonical_to_warehouse(
             target_col = "canonical_status"
 
         local = existing[target_col]
-        last = (last_snapshot or {}).get(field)
+        last = (last_snapshot or {}).get(field) if last_snapshot else None
         cval = canonical[field]
-        # None normalization
+
+        # Spec §3.5: last_synced_value 为 None(从未下发过,例如刚认领的门店行)
+        # → 视为"门店没动过" → 正常下发,不算冲突
         if last is None:
-            last_for_cmp = object()  # 用哨兵对象
-        else:
-            last_for_cmp = last
+            written[field] = cval
+            continue
 
         # 判定
-        verdict = resolve_conflict_policy(
-            local, last_for_cmp if last_for_cmp is not object() else None,
-            cval, force=force,
-        )
+        verdict = resolve_conflict_policy(local, last, cval, force=force)
         if verdict == "frozen":
             frozen[field] = {
                 "canonical": cval, "local": local, "last": last,
@@ -1772,6 +1770,12 @@ def fanout_canonical_items(
                 # 写冲突行
                 if not dry_run and result["frozen"]:
                     for field, vals in result["frozen"].items():
+                        # 查 local_item_id
+                        local_id_row = conn.execute(
+                            "SELECT id FROM items WHERE canonical_id=?",
+                            (cid,),
+                        ).fetchone()
+                        local_id = int(local_id_row["id"]) if local_id_row else 0
                         master_conn.execute(
                             """INSERT INTO canonical_conflicts
                                (canonical_id, warehouse_code, local_item_id,
@@ -1781,16 +1785,7 @@ def fanout_canonical_items(
                                VALUES (?, ?, ?, ?, ?, 'value',
                                        ?, ?, ?, 'open', ?)""",
                             (
-                                cid, wh_code,
-                                int(conn.execute(
-                                    "SELECT id FROM items WHERE canonical_id=?",
-                                    (cid,)
-                                ).fetchone()["id"]) if conn.execute(
-                                    "SELECT id FROM items WHERE canonical_id=?",
-                                    (cid,)
-                                ).fetchone() else 0,
-                                event_id,
-                                field,
+                                cid, wh_code, local_id, event_id, field,
                                 str(vals["canonical"]),
                                 str(vals["local"]),
                                 str(vals["last"]) if vals["last"] is not None else None,

@@ -277,6 +277,10 @@ def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
 
 
 def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
+    """Canonical Item M2 (T12) — overwrite now updates name/unit/unit_family
+    but no longer touches unit_cost / selling_price / safety_stock (§7.2).
+    Q6=storefront_autonomous (default) keeps pricing fields as storefront-
+    owned; this test verifies the new behaviour."""
     import sqlite3
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
@@ -290,8 +294,9 @@ def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
     action = apply_item_to_warehouse(wh, snap, action="overwrite")
     assert action == "overwritten"
     row = wh.execute("SELECT * FROM items WHERE sku='SKU-MILK'").fetchone()
-    assert float(row["unit_cost"]) == 6.0  # overwritten from rd
-    assert float(row["selling_price"]) == 10.0
+    # Behaviour change (§7.2): unit_cost / selling_price no longer overwritten
+    assert float(row["unit_cost"]) == 4.0  # preserved (was 6.0 in pre-T12)
+    assert float(row["selling_price"]) == 7.0
     wh.close()
 
 
