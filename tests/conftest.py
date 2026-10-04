@@ -149,6 +149,83 @@ def _seed_outbound(wh_path, item_id, qty, reason=None):
     conn.close()
 
 
+def _seed_store_ordering_env(
+    tmp_path,
+    monkeypatch,
+    *,
+    warehouse_type="storefront",
+    dc_code="dc_test",
+    store_code="store_test",
+):
+    """Create a temporary master + two warehouse dbs (store + DC) for store-ordering tests.
+
+    Returns (app, client, master_path, dc_path, store_path).
+    """
+    import db as db_module
+    from db import init_master_db, init_warehouse_db
+
+    master_path = tmp_path / "master.db"
+    wh_dir = tmp_path / "warehouses"
+    wh_dir.mkdir()
+    dc_path = wh_dir / f"{dc_code}.db"
+    store_path = wh_dir / f"{store_code}.db"
+
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    import config as config_module
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
+
+    init_master_db()
+    init_warehouse_db(dc_path)
+    init_warehouse_db(store_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(master_path)
+    m.row_factory = sqlite3.Row
+    # Users: admin(1), store staff(2), store manager(3), DC staff(4), DC manager(5)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (1, 'admin', 'x', 1, ?)",
+        (ts,),
+    )
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (2, 'store_staff', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (3, 'store_mgr', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (4, 'dc_staff', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (5, 'dc_mgr', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (1, ?, '测试配送中心', ?, 'distribution_center', ?)",
+        (dc_code, str(dc_path), ts),
+    )
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (2, ?, '测试门店', ?, 'storefront', ?)",
+        (store_code, str(store_path), ts),
+    )
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (2, 2, 'staff')")
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (3, 2, 'manager')")
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (4, 1, 'staff')")
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (5, 1, 'manager')")
+    m.commit()
+    m.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    return app, client, master_path, dc_path, store_path
+
+
 def _seed_production_consumption(wh_path, item_id, qty):
     """插入一条生产消耗(自动建 product + production_run)。"""
     conn = _wh(wh_path)
