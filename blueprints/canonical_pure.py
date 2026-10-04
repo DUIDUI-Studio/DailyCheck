@@ -82,8 +82,10 @@ Public surface (this file):
                          reviewed_by, review_note=None) -> dict
 
   T8 — Fanout:
+    _build_category_id_map(wh_conn, canon_by_id, code_to_name) -> dict[int, int|None]
     apply_canonical_to_warehouse(wh_conn, canonical, last_snapshot,
-                                 action='overwrite', force=False) -> dict
+                                 action='overwrite', force=False,
+                                 category_id_map=None) -> dict
     fanout_canonical_items(master_conn, wh_db_map, *, canonical_ids,
                            warehouse_codes, action='overwrite',
                            force=False, dry_run=False, started_by=None,
@@ -1521,17 +1523,76 @@ def _syncable_snapshot(canonical_row: dict) -> dict[str, Any]:
     return snap
 
 
+def _build_category_id_map(
+    wh_conn: sqlite3.Connection,
+    canon_by_id: dict[int, dict],
+    code_to_name: dict[str, str],
+) -> dict[int, int | None]:
+    """T8 —— 预解析本批次每个 canonical_items.id → target categories.id。
+
+    解析策略(顺序):
+      1. 按 categories.canonical_code = canonical_items.category_code
+      2. 兜底按 categories.name = canonical_categories.name(对应该 code)
+      3. 都没有 → 返回 None(供 apply_canonical_to_warehouse 跳过,不自动创建)
+
+    不调用现有 resolve_category_id(它会自动建行,在扇出路径上不合适:
+    我们这里对源头数据缺失的语义是「跳过」而不是「兜底建」)。
+    """
+    wh_conn.row_factory = sqlite3.Row
+    # 单次全表 categories 扫描,仓内品类数量固定 9,不用 IN 子句优化。
+    cat_rows = wh_conn.execute(
+        "SELECT id, name, canonical_code FROM categories"
+    ).fetchall()
+    by_code: dict[str, int] = {}
+    by_name: dict[str, int] = {}
+    for r in cat_rows:
+        if r["canonical_code"]:
+            # 同一 canonical_code 出现多次(历史脏数据)时,取最小 id,
+            # 与 resolve_category_id 的隐含语义一致。
+            cid = int(r["id"])
+            if r["canonical_code"] not in by_code or cid < by_code[r["canonical_code"]]:
+                by_code[r["canonical_code"]] = cid
+        if r["name"]:
+            nid = int(r["id"])
+            if r["name"] not in by_name or nid < by_name[r["name"]]:
+                by_name[r["name"]] = nid
+
+    out: dict[int, int | None] = {}
+    for cid, canon in canon_by_id.items():
+        code = canon.get("category_code")
+        if not code:
+            out[cid] = None
+            continue
+        local_id = by_code.get(code)
+        if local_id is None:
+            name = code_to_name.get(code)
+            if name:
+                local_id = by_name.get(name)
+        out[cid] = local_id
+    return out
+
+
 def apply_canonical_to_warehouse(
     wh_conn: sqlite3.Connection,
     canonical: dict[str, Any],
     last_snapshot: dict[str, Any] | None,
     action: str = "overwrite",
     force: bool = False,
+    category_id_map: dict[int, int | None] | None = None,
 ) -> dict:
     """Spec §3.5 判定顺序:
       1) 先算冻结(local != last_synced)
       2) action 只决定"对未冻结字段怎么处理"
       3) force 跳过第 1 步
+
+    Args:
+      category_id_map: 仅 INSERT 分支使用。
+        - None: 调用方没传 → 在 INSERT 分支抛 RuntimeError（防御:直调本函数
+          又想 INSERT 的代码路径应该先建映射,不应静默写死 0）。
+        - dict: {canonical_items.id: target_wh.categories.id | None}。
+          值是 None 表示目标仓无对应品类 → 跳过该 canonical_id,返回
+          skipped_reason="no matching category",不写 items,不进 conflict 队列
+          (源头数据缺失,不是门店冲突)。
 
     Returns: {
       "written": {field: value, ...},
@@ -1557,6 +1618,24 @@ def apply_canonical_to_warehouse(
 
     if existing is None:
         # 未命中 —— INSERT 新行(quantity=0, safety_stock=0)
+        # 防御:直调本函数又没传 category_id_map 的旧代码路径,不再静默写死
+        # category_id=0 (FK 会拦下来),直接抛异常以防漏改。
+        if category_id_map is None:
+            raise RuntimeError(
+                "apply_canonical_to_warehouse: INSERT 分支要求 category_id_map "
+                "(由 fanout_canonical_items 预解析后传入)"
+            )
+        local_category_id = category_id_map.get(canon_id)
+        if local_category_id is None:
+            # 源头数据缺失:目标仓无对应品类。Spec 决策是跳过(不强行创建,
+            # 不写 items,不进 conflict 队列)。fanout_canonical_items 会把
+            # 这条事件记成 status='skipped' + error_message。
+            return {
+                "written": {},
+                "frozen": {},
+                "inserted": False,
+                "skipped_reason": "no matching category",
+            }
         new_sku = f"AUTO-{canonical['canonical_sku']}"  # 唯一不撞门店 SKU
         wh_conn.execute(
             """INSERT INTO items
@@ -1564,11 +1643,11 @@ def apply_canonical_to_warehouse(
                 unit, gram_per_unit, aux_unit, aux_rate,
                 updated_at, canonical_id, is_alias, canonical_status,
                 canonical_synced_json)
-               VALUES (?, ?, 0, 0, 0,
+               VALUES (?, ?, ?, 0, 0,
                        ?, ?, ?, ?,
                        ?, ?, 0, 'active', ?)""",
             (
-                new_sku, canonical["name"],
+                new_sku, canonical["name"], local_category_id,
                 canonical["unit"], canonical["gram_per_unit"],
                 canonical["aux_unit"], canonical["aux_rate"],
                 _now_str(), canon_id,
@@ -1698,6 +1777,44 @@ def fanout_canonical_items(
         event_id = int(cur.lastrowid)
         master_conn.commit()
 
+    # ─────────────────────────────────────────────────────────────────
+    # 预加载:本批次所有 canonical_items(避免循环里反复 SELECT)。
+    # 还要拿 canonical_categories.name,这样目标仓 categories.canonical_code
+    # 为空(比如 rd_001)时,可以用 name 兜底映射。
+    # ─────────────────────────────────────────────────────────────────
+    canon_by_id: dict[int, dict] = {}
+    for cid in canonical_ids:
+        row = master_conn.execute(
+            "SELECT * FROM canonical_items WHERE id=?", (cid,)
+        ).fetchone()
+        if row is not None:
+            canon_by_id[cid] = dict(row)
+
+    code_to_name: dict[str, str] = {
+        r["code"]: r["name"]
+        for r in master_conn.execute(
+            "SELECT code, name FROM canonical_categories"
+        ).fetchall()
+    }
+
+    # 每个目标仓预解析一份 category_id_map:
+    #   {canonical_items.id: target_wh.categories.id | None}
+    # None 表示该仓无对应品类(写库时会被 apply_canonical_to_warehouse 跳过)。
+    # 这里查询失败时退化为空 dict,后续 INSERT 分支会全部走"跳过"分支,
+    # 不会出现部分写入部分崩溃的中间态。
+    per_wh_category_maps: dict[str, dict[int, int | None]] = {}
+    for wh_code in warehouse_codes:
+        conn = wh_db_map.get(wh_code)
+        if conn is None:
+            continue
+        try:
+            per_wh_category_maps[wh_code] = _build_category_id_map(
+                conn, canon_by_id, code_to_name,
+            )
+        except Exception:  # noqa: BLE001
+            # 预解析失败:留空 dict,所有 INSERT 都会走 skipped 分支
+            per_wh_category_maps[wh_code] = {}
+
     per_canonical: list[dict] = []
     total_written = 0
     total_frozen = 0
@@ -1705,17 +1822,15 @@ def fanout_canonical_items(
     backup_paths: list[str] = []
 
     for cid in canonical_ids:
-        canon_row = master_conn.execute(
-            "SELECT * FROM canonical_items WHERE id=?", (cid,)
-        ).fetchone()
-        if canon_row is None:
+        canon = canon_by_id.get(cid)
+        if canon is None:
             continue
-        canon = dict(canon_row)
         per_wh: list[dict] = []
         for wh_code in warehouse_codes:
             conn = wh_db_map.get(wh_code)
             if conn is None:
                 continue
+            category_id_map = per_wh_category_maps.get(wh_code, {})
             try:
                 conn.row_factory = sqlite3.Row
                 # 读上一次同步快照
@@ -1730,10 +1845,39 @@ def fanout_canonical_items(
                     except json.JSONDecodeError:
                         last_snapshot = None
 
-                result = apply_canonical_to_warehouse(
-                    conn, canon, last_snapshot,
-                    action=action, force=force,
-                )
+                # ─────────────────────────────────────────────────────
+                # 把 INSERT/UPDATE 失败(主要是 FK 兜底)隔离到 inner try:
+                # 外层 except 之前会漏掉 event_items 记录(参见 issue:
+                # rd_001 第一次扇出 0 行 event_items 的根因)。
+                # 隔离后,异常会被转成 status='failed' + error_message,
+                # 调用方在 /canonical/fanout_event 看到完整 per-item 失败表。
+                # ─────────────────────────────────────────────────────
+                try:
+                    result = apply_canonical_to_warehouse(
+                        conn, canon, last_snapshot,
+                        action=action, force=force,
+                        category_id_map=category_id_map,
+                    )
+                except Exception as apply_exc:  # noqa: BLE001
+                    err_msg = str(apply_exc)[:200]
+                    if not dry_run and event_id is not None:
+                        master_conn.execute(
+                            """INSERT INTO canonical_publish_event_items
+                               (publish_event_id, canonical_id, target_warehouse_code,
+                                local_item_id, status, applied_fields_json,
+                                skipped_fields_json, error_message)
+                               VALUES (?, ?, ?, NULL, 'failed',
+                                       '[]', '[]', ?)""",
+                            (event_id, cid, wh_code, err_msg),
+                        )
+                    per_wh.append({
+                        "warehouse_code": wh_code,
+                        "error": err_msg,
+                        "inserted": False,
+                        "skipped_reason": None,
+                    })
+                    any_partial = True
+                    continue
 
                 # 写入主数据字段
                 if not dry_run and result["written"]:
@@ -1794,10 +1938,20 @@ def fanout_canonical_items(
                         )
 
                 # 写 per-item 事件
+                # 状态优先级: skipped (源头数据缺失) > conflict (门店改了字段) >
+                #           success (正常)。任何字段写到 master_conn 都在
+                #           同一个事务里;失败的 case 已在 inner try 拦截并写入
+                #           自己的 event_items 行。
                 if not dry_run and event_id is not None:
-                    item_status = (
-                        "conflict" if result["frozen"] else "success"
-                    )
+                    if result.get("skipped_reason"):
+                        item_status = "skipped"
+                        event_err = result["skipped_reason"]
+                    elif result["frozen"]:
+                        item_status = "conflict"
+                        event_err = None
+                    else:
+                        item_status = "success"
+                        event_err = None
                     local_row = conn.execute(
                         "SELECT id FROM items WHERE canonical_id=?", (cid,)
                     ).fetchone()
@@ -1805,8 +1959,8 @@ def fanout_canonical_items(
                         """INSERT INTO canonical_publish_event_items
                            (publish_event_id, canonical_id, target_warehouse_code,
                             local_item_id, status, applied_fields_json,
-                            skipped_fields_json)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            skipped_fields_json, error_message)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             event_id, cid, wh_code,
                             int(local_row["id"]) if local_row else None,
@@ -1818,6 +1972,7 @@ def fanout_canonical_items(
                             ),
                             json.dumps(list(result["frozen"].keys()),
                                        ensure_ascii=False),
+                            event_err,
                         ),
                     )
 
@@ -1831,6 +1986,7 @@ def fanout_canonical_items(
                     "written": result["written"],
                     "frozen": result["frozen"],
                     "inserted": result["inserted"],
+                    "skipped_reason": result.get("skipped_reason"),
                 })
             except Exception as exc:  # noqa: BLE001
                 per_wh.append({
