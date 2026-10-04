@@ -42,6 +42,10 @@ def store_env(tmp_path, monkeypatch):
         (ts,),
     )
     m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (3, 'store_other', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute(
         "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (1, 'dc_test', '测试配送中心', ?, 'distribution_center', ?)",
         (str(dc_path), ts),
     )
@@ -51,6 +55,7 @@ def store_env(tmp_path, monkeypatch):
     )
     m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1, 2, 'staff')")
     m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (2, 1, 'manager')")
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (3, 2, 'staff')")
     m.execute(
         "INSERT INTO canonical_categories (code, name, description, created_at, updated_at) VALUES ('PACKAGING', '包材', '', ?, ?)",
         (ts, ts),
@@ -232,3 +237,37 @@ def test_order_detail(store_env):
     assert resp.status_code == 200
     body = resp.data.decode()
     assert "测试包材A" in body
+
+
+def _login_as(client, user_id, warehouse_id):
+    with client.session_transaction() as s:
+        s["user_id"] = user_id
+        s["warehouse_id"] = warehouse_id
+
+
+def test_other_user_cannot_modify_my_cart_item(store_env):
+    """User 3 must not update or remove cart items belonging to user 1."""
+    client = store_env["client"]
+    client.post(
+        "/store-ordering/cart/add",
+        data={"dc": "dc_test", "canonical_id": 101, "quantity": "5", "unit": "件"},
+    )
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    cart_item_id = master.execute(
+        "SELECT id FROM store_order_cart_items ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    master.close()
+
+    _login_as(client, 3, 2)
+    resp = client.post(
+        f"/store-ordering/cart/update/{cart_item_id}",
+        data={"quantity": "99"},
+    )
+    assert resp.status_code == 403
+
+    resp = client.post(
+        f"/store-ordering/cart/remove/{cart_item_id}",
+        data={},
+    )
+    assert resp.status_code == 403

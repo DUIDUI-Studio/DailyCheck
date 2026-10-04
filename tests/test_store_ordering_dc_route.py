@@ -19,6 +19,7 @@ def dc_env(tmp_path, monkeypatch):
     wh_dir = tmp_path / "warehouses"
     wh_dir.mkdir()
     dc_path = wh_dir / "dc_test.db"
+    dc2_path = wh_dir / "dc2_test.db"
     store_path = wh_dir / "store_test.db"
 
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
@@ -28,6 +29,7 @@ def dc_env(tmp_path, monkeypatch):
 
     init_master_db()
     init_warehouse_db(dc_path)
+    init_warehouse_db(dc2_path)
     init_warehouse_db(store_path)
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -46,8 +48,16 @@ def dc_env(tmp_path, monkeypatch):
         (ts,),
     )
     m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (4, 'dc2_mgr', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute(
         "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (1, 'dc_test', '测试配送中心', ?, 'distribution_center', ?)",
         (str(dc_path), ts),
+    )
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (4, 'dc2_test', '测试配送中心2', ?, 'distribution_center', ?)",
+        (str(dc2_path), ts),
     )
     m.execute(
         "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (2, 'store_test', '测试门店', ?, 'storefront', ?)",
@@ -56,6 +66,7 @@ def dc_env(tmp_path, monkeypatch):
     m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1, 2, 'staff')")
     m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (2, 1, 'manager')")
     m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (3, 1, 'staff')")
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (4, 4, 'manager')")
     m.execute(
         "INSERT INTO canonical_categories (code, name, description, created_at, updated_at) VALUES ('PACKAGING', '包材', '', ?, ?)",
         (ts, ts),
@@ -79,6 +90,16 @@ def dc_env(tmp_path, monkeypatch):
     )
     dc.commit()
     dc.close()
+
+    dc2 = sqlite3.connect(str(dc2_path))
+    dc2.row_factory = sqlite3.Row
+    cat_id = dc2.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    dc2.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("DC2-A", "测试包材A", cat_id, 100.0, "件", 101, ts),
+    )
+    dc2.commit()
+    dc2.close()
 
     store = sqlite3.connect(str(store_path))
     store.row_factory = sqlite3.Row
@@ -118,6 +139,7 @@ def dc_env(tmp_path, monkeypatch):
         "client": client,
         "master_path": master_path,
         "dc_path": dc_path,
+        "dc2_path": dc2_path,
         "store_path": store_path,
         "order_id": order_id,
     }
@@ -229,4 +251,39 @@ def test_dc_staff_cannot_review(dc_env):
     client = dc_env["client"]
     _login_as(client, 3, 1)
     resp = client.get("/store-ordering/review")
+    assert resp.status_code == 403
+
+
+def test_review_and_ship_other_dc_order_forbidden(dc_env):
+    """DC manager of dc_test must not review/ship an order bound to dc2_test."""
+    client = dc_env["client"]
+    # Create an order bound to dc2_test as store user.
+    _login_as(client, 1, 2)
+    client.post(
+        "/store-ordering/cart/add",
+        data={"dc": "dc2_test", "canonical_id": 101, "quantity": "3", "unit": "件"},
+    )
+    client.post(
+        "/store-ordering/cart/submit",
+        data={"expected_delivery_date": datetime.now().strftime("%Y-%m-%d"), "note": ""},
+    )
+    master = sqlite3.connect(str(dc_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    order_id = master.execute("SELECT id FROM store_orders WHERE dc_warehouse_code='dc2_test'").fetchone()["id"]
+    master.close()
+
+    # dc_test manager attempts review.
+    _login_as(client, 2, 1)
+    resp = client.post(
+        f"/store-ordering/orders/{order_id}/review",
+        data={"decision": "approved", "note": "ok"},
+    )
+    assert resp.status_code == 403
+
+    # dc_test staff attempts ship.
+    _login_as(client, 3, 1)
+    resp = client.post(
+        f"/store-ordering/orders/{order_id}/ship",
+        data={"tracking_note": ""},
+    )
     assert resp.status_code == 403

@@ -105,6 +105,14 @@ def _order_viewable(order: dict[str, Any]) -> bool:
     return order["store_warehouse_code"] == code or order["dc_warehouse_code"] == code
 
 
+def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: int) -> None:
+    order_dc = sop.get_order_dc_code(master, order_id)
+    if order_dc is None:
+        abort(404)
+    if order_dc != _current_warehouse_code():
+        abort(403)
+
+
 # ---------------------------------------------------------------------------
 # Storefront catalog / cart
 # ---------------------------------------------------------------------------
@@ -220,6 +228,14 @@ def cart_view() -> str:
     )
 
 
+def _assert_cart_item_owner(master: sqlite3.Connection, cart_item_id: int) -> None:
+    owner_id = sop.get_cart_item_user_id(master, cart_item_id)
+    if owner_id is None:
+        abort(404)
+    if owner_id != g.user["id"]:
+        abort(403)
+
+
 @bp.route("/cart/update/<int:cart_item_id>", methods=["POST"])
 @require_login
 @_storefront_or_admin
@@ -227,6 +243,7 @@ def update_cart_item(cart_item_id: int) -> str:
     """Update cart item quantity."""
     quantity = parse_qty(request.form.get("quantity", "0"))
     master = get_master_db()
+    _assert_cart_item_owner(master, cart_item_id)
     try:
         sop.update_cart_item_quantity(master, cart_item_id, quantity)
         flash("数量已更新")
@@ -241,6 +258,7 @@ def update_cart_item(cart_item_id: int) -> str:
 def remove_cart_item_route(cart_item_id: int) -> str:
     """Remove item from cart."""
     master = get_master_db()
+    _assert_cart_item_owner(master, cart_item_id)
     sop.remove_cart_item(master, cart_item_id)
     flash("已删除")
     return redirect(url_for("store_ordering.cart_view"))
@@ -415,6 +433,7 @@ def review_order_route(order_id: int) -> str:
         return redirect(url_for("store_ordering.review_list"))
 
     master = get_master_db()
+    _assert_order_belongs_to_current_dc(master, order_id)
     try:
         order = sop.review_order(master, order_id, decision, g.user["id"], note or None)
     except ValueError as e:
@@ -451,6 +470,7 @@ def ship_order_route(order_id: int) -> str:
     """Ship an approved order."""
     tracking_note = (request.form.get("tracking_note") or "").strip() or None
     master = get_master_db()
+    _assert_order_belongs_to_current_dc(master, order_id)
     try:
         order = sop.ship_order(master, order_id, g.user["id"], tracking_note)
     except ValueError as e:

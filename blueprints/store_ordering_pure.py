@@ -263,6 +263,22 @@ def clear_cart(
     master_conn.commit()
 
 
+def get_cart_item_user_id(
+    master_conn: sqlite3.Connection,
+    cart_item_id: int,
+) -> int | None:
+    """Return the user_id owning the cart that contains cart_item_id, or None."""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        """SELECT c.user_id
+           FROM store_order_cart_items ci
+           JOIN store_order_carts c ON c.id = ci.cart_id
+           WHERE ci.id=?""",
+        (cart_item_id,),
+    ).fetchone()
+    return int(row["user_id"]) if row else None
+
+
 # ---------------------------------------------------------------------------
 # Available DC items
 # ---------------------------------------------------------------------------
@@ -518,6 +534,18 @@ def list_orders(
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_order_dc_code(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+) -> str | None:
+    """Return the dc_warehouse_code for an order, or None if not found."""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT dc_warehouse_code FROM store_orders WHERE id=?", (order_id,)
+    ).fetchone()
+    return str(row["dc_warehouse_code"]) if row else None
 
 
 def get_order_detail(
