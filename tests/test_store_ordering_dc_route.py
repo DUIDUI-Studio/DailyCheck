@@ -52,6 +52,10 @@ def dc_env(tmp_path, monkeypatch):
         (ts,),
     )
     m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (5, 'admin', 'x', 1, ?)",
+        (ts,),
+    )
+    m.execute(
         "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) VALUES (1, 'dc_test', '测试配送中心', ?, 'distribution_center', ?)",
         (str(dc_path), ts),
     )
@@ -287,3 +291,37 @@ def test_review_and_ship_other_dc_order_forbidden(dc_env):
         data={"tracking_note": ""},
     )
     assert resp.status_code == 403
+
+
+def test_admin_can_review_and_ship_any_dc_order(dc_env):
+    """Platform admin logged into a storefront can still review/ship DC orders."""
+    client = dc_env["client"]
+    order_id = dc_env["order_id"]
+
+    # Admin logged into storefront reviews an order bound to dc_test.
+    _login_as(client, 5, 2)
+    resp = client.post(
+        f"/store-ordering/orders/{order_id}/review",
+        data={"decision": "approved", "note": "admin ok"},
+    )
+    assert resp.status_code == 302
+
+    master = sqlite3.connect(str(dc_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    status = master.execute("SELECT status FROM store_orders WHERE id=?", (order_id,)).fetchone()["status"]
+    master.close()
+    assert status == "approved"
+
+    # Admin ships the order as well.
+    _login_as(client, 5, 2)
+    resp = client.post(
+        f"/store-ordering/orders/{order_id}/ship",
+        data={"tracking_note": "admin ship"},
+    )
+    assert resp.status_code == 302
+
+    master = sqlite3.connect(str(dc_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    status = master.execute("SELECT status FROM store_orders WHERE id=?", (order_id,)).fetchone()["status"]
+    master.close()
+    assert status == "shipped"

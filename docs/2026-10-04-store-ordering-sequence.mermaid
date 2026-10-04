@@ -1,0 +1,104 @@
+sequenceDiagram
+    actor SU as 门店用户
+    participant B as Browser
+    participant S as StoreOrderingBlueprint
+    participant P as StoreOrderingPure
+    participant M as MasterDB
+    participant D as DC_WarehouseDB
+    participant N as NotificationService
+
+    SU->>B: 选择配送中心、浏览 catalog
+    B->>S: GET /store-ordering/catalog?dc=dc_001
+    S->>P: list_available_dc_items(dc_001)
+    P->>M: JOIN canonical_items + 查询 dc items
+    M-->>P: 可订商品列表
+    P-->>S: 商品列表
+    S-->>B: 渲染 catalog.html
+
+    SU->>B: 添加商品到购物车
+    B->>S: POST /store-ordering/cart/add
+    S->>P: get_or_create_cart(user_id, store, dc)
+    P->>M: INSERT/UPDATE store_order_carts
+    P->>M: INSERT/UPDATE store_order_cart_items
+    M-->>P: cart_id, cart_item_id
+    P-->>S: 购物车对象
+    S-->>B: 重定向到 /cart
+
+    SU->>B: 填写期望到货日期、备注，提交订单
+    B->>S: POST /cart/submit
+    S->>P: validate_cart_for_submit(cart)
+    P->>M: 读购物车明细
+    P->>D: 查询配送中心库存
+    P->>M: 查询门店 canonical_id 绑定
+    alt 库存不足或门店未绑定
+        P-->>S: {"ok": False, shortages/unbound}
+        S-->>B: 渲染 submit.html 并提示错误
+    else 校验通过
+        P->>P: submit_order(cart_id, ...)
+        P->>M: INSERT store_orders
+        P->>M: INSERT store_order_items
+        P->>M: DELETE store_order_cart_items
+        M-->>P: order dict
+        P->>N: notify_order_event(submitted, order)
+        N->>M: emit_event() 写 notifications
+        P-->>S: 订单对象
+        S-->>B: 重定向到 /orders/{id}
+    end
+
+    actor DC as 配送中心经理
+    DC->>B: 查看待审批列表
+    B->>S: GET /store-ordering/review
+    S->>P: list_orders(dc_warehouse_code=dc_001, status=pending)
+    P->>M: 查询 store_orders
+    M-->>P: pending 订单列表
+    P-->>S: 订单列表
+    S-->>B: 渲染 review.html
+
+    DC->>B: 审批通过
+    B->>S: POST /orders/{id}/review (decision=approved)
+    S->>P: review_order(order_id, approved, actor_id)
+    P->>M: UPDATE store_orders status=approved
+    P->>M: INSERT store_order_status_history
+    P->>N: notify_order_event(approved, order)
+    N->>M: emit_event() 通知门店
+    P-->>S: 更新后订单
+    S-->>B: 重定向到 /review
+
+    actor DS as 配送中心店员
+    DS->>B: 查看出库清单
+    B->>S: GET /store-ordering/shipments
+    S->>P: list_orders(dc_warehouse_code=dc_001, status=approved)
+    P->>M: 查询 approved 订单
+    M-->>P: 订单列表
+    S-->>B: 渲染 shipments.html
+
+    DS->>B: 确认出库
+    B->>S: POST /orders/{id}/ship
+    S->>P: ship_order(order_id, shipped_by)
+    P->>D: 再次校验库存
+    alt 库存不足
+        P-->>S: raise ValueError("库存不足")
+        S-->>B: flash 错误，订单保持 approved
+    else 库存充足
+        P->>D: UPDATE items.quantity -= qty
+        P->>D: INSERT stock_movements (action=门店订货出库)
+        P->>M: INSERT store_order_deliveries
+        P->>M: UPDATE store_orders status=shipped
+        P->>M: UPDATE store_order_items fulfilled_quantity=qty, status=fulfilled
+        P->>M: INSERT store_order_status_history
+        P->>N: notify_order_event(shipped, order)
+        N->>M: 通知门店
+        P-->>S: 配送记录
+        S-->>B: 重定向到 /shipments
+    end
+
+    SU->>B: 确认收货（P0 可自动/手动）
+    B->>S: POST /orders/{id}/deliver
+    S->>P: mark_order_delivered(order_id, actor_id)
+    P->>M: UPDATE store_orders status=delivered, delivered_at=now
+    P->>M: UPDATE store_order_deliveries delivered_at=now
+    P->>M: INSERT store_order_status_history
+    P->>N: notify_order_event(delivered, order)
+    N->>M: 通知门店
+    P-->>S: 订单对象
+    S-->>B: 重定向到 /orders/{id}

@@ -1,0 +1,139 @@
+classDiagram
+    direction TB
+
+    class StoreOrderCart {
+        +int id
+        +int user_id
+        +str store_warehouse_code
+        +str dc_warehouse_code
+        +str created_at
+        +str updated_at
+    }
+
+    class StoreOrderCartItem {
+        +int id
+        +int cart_id
+        +int canonical_id
+        +float quantity
+        +str unit
+        +str created_at
+        +str updated_at
+    }
+
+    class StoreOrder {
+        +int id
+        +str order_no
+        +str store_warehouse_code
+        +str dc_warehouse_code
+        +str status
+        +int requested_by
+        +str expected_delivery_date
+        +str note
+        +str created_at
+        +str updated_at
+        +int approved_by
+        +str approved_at
+        +str approved_note
+        +int shipped_by
+        +str shipped_at
+        +str delivered_at
+        +int cancelled_by
+        +str cancelled_at
+        +str cancel_reason
+    }
+
+    class StoreOrderItem {
+        +int id
+        +int order_id
+        +int canonical_id
+        +int dc_item_id
+        +int store_item_id
+        +float quantity
+        +str unit
+        +float fulfilled_quantity
+        +str status
+        +str created_at
+    }
+
+    class StoreOrderStatusHistory {
+        +int id
+        +int order_id
+        +str from_status
+        +str to_status
+        +int actor_id
+        +str note
+        +str created_at
+    }
+
+    class StoreOrderDelivery {
+        +int id
+        +int order_id
+        +str delivery_no
+        +int shipped_by
+        +str shipped_at
+        +str delivered_at
+        +str tracking_note
+        +str created_at
+    }
+
+    class StoreOrderingService {
+        +generate_order_no(master_conn) str
+        +open_warehouse_db(code) Connection
+        +get_or_create_cart(...) dict
+        +list_cart_items(...) list
+        +add_cart_item(...) None
+        +update_cart_item_quantity(...) None
+        +remove_cart_item(...) None
+        +clear_cart(...) None
+        +list_available_dc_items(...) list
+        +get_dc_item_by_canonical(...) dict|None
+        +get_store_binding_by_canonical(...) dict|None
+        +validate_cart_for_submit(...) dict
+        +submit_order(...) dict
+        +list_orders(...) list
+        +get_order_detail(...) dict|None
+        +review_order(...) dict
+        +ship_order(...) dict
+        +mark_order_delivered(...) dict
+        +notify_order_event(...) int
+    }
+
+    class StoreOrderingBlueprint {
+        +catalog() str
+        +add_to_cart() str
+        +cart_view() str
+        +update_cart_item(id) str
+        +remove_cart_item_route(id) str
+        +clear_cart_route() str
+        +submit_order_route() str
+        +store_orders_list() str
+        +order_detail(id) str
+        +review_list() str
+        +review_order_route(id) str
+        +shipment_list() str
+        +ship_order_route(id) str
+        +deliver_order_route(id) str
+        +admin_orders() str
+    }
+
+    class NotificationService {
+        +emit_event(db, event_type, summary, target_url, user_ids) int
+    }
+
+    class WarehouseDB {
+        +items.id
+        +items.quantity
+        +items.canonical_id
+        +stock_movements.action
+        +stock_movements.delta
+    }
+
+    StoreOrderCart "1" --> "0..*" StoreOrderCartItem : contains
+    StoreOrder "1" --> "0..*" StoreOrderItem : contains
+    StoreOrder "1" --> "0..*" StoreOrderStatusHistory : tracks
+    StoreOrder "1" --> "0..*" StoreOrderDelivery : has
+    StoreOrderingService ..> StoreOrderCart : manages
+    StoreOrderingService ..> StoreOrder : manages
+    StoreOrderingService ..> WarehouseDB : reads/writes
+    StoreOrderingService ..> NotificationService : calls
+    StoreOrderingBlueprint ..> StoreOrderingService : uses

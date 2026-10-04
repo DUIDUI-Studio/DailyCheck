@@ -106,6 +106,8 @@ def _order_viewable(order: dict[str, Any]) -> bool:
 
 
 def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: int) -> None:
+    if _is_admin():
+        return
     order_dc = sop.get_order_dc_code(master, order_id)
     if order_dc is None:
         abort(404)
