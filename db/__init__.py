@@ -372,6 +372,133 @@ CREATE TABLE IF NOT EXISTS canonical_publish_event_items (
 );
 CREATE INDEX IF NOT EXISTS idx_canonical_publish_event_items_event
     ON canonical_publish_event_items(publish_event_id);
+
+-- ============================================================
+-- 门店订货（Store Ordering）跨仓数据模型
+-- ============================================================
+
+-- 购物车：每个门店用户在同一门店下只有一个购物车
+CREATE TABLE IF NOT EXISTS store_order_carts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    store_warehouse_code TEXT NOT NULL,
+    dc_warehouse_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (user_id, store_warehouse_code),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (store_warehouse_code) REFERENCES warehouses(code),
+    FOREIGN KEY (dc_warehouse_code) REFERENCES warehouses(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_carts_user
+    ON store_order_carts(user_id, store_warehouse_code);
+
+-- 购物车明细：以 canonical_id 为跨仓统一键
+CREATE TABLE IF NOT EXISTS store_order_cart_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cart_id INTEGER NOT NULL,
+    canonical_id INTEGER NOT NULL,
+    quantity REAL NOT NULL,
+    unit TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (cart_id) REFERENCES store_order_carts(id) ON DELETE CASCADE,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_cart_items_cart
+    ON store_order_cart_items(cart_id);
+
+-- 订单主表
+CREATE TABLE IF NOT EXISTS store_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT NOT NULL UNIQUE,
+    store_warehouse_code TEXT NOT NULL,
+    dc_warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_by INTEGER NOT NULL,
+    expected_delivery_date TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    approved_by INTEGER,
+    approved_at TEXT,
+    approved_note TEXT,
+    shipped_by INTEGER,
+    shipped_at TEXT,
+    delivered_at TEXT,
+    cancelled_by INTEGER,
+    cancelled_at TEXT,
+    cancel_reason TEXT,
+    FOREIGN KEY (store_warehouse_code) REFERENCES warehouses(code),
+    FOREIGN KEY (dc_warehouse_code) REFERENCES warehouses(code),
+    FOREIGN KEY (requested_by) REFERENCES users(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id),
+    FOREIGN KEY (shipped_by) REFERENCES users(id),
+    FOREIGN KEY (cancelled_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_orders_store
+    ON store_orders(store_warehouse_code, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_store_orders_dc
+    ON store_orders(dc_warehouse_code, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_store_orders_created
+    ON store_orders(created_at DESC);
+
+-- 订单明细
+CREATE TABLE IF NOT EXISTS store_order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    canonical_id INTEGER NOT NULL,
+    dc_item_id INTEGER,                 -- 配送中心仓内 items.id（出库时回填）
+    store_item_id INTEGER,              -- 门店仓内 items.id（用于收货/入库，P0 仅记录）
+    quantity REAL NOT NULL,             -- 订货数量（基础单位）
+    unit TEXT NOT NULL,
+    fulfilled_quantity REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending / fulfilled / partial / cancelled
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_items_order
+    ON store_order_items(order_id);
+
+-- 订单状态历史
+CREATE TABLE IF NOT EXISTS store_order_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    actor_id INTEGER,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_status_history_order
+    ON store_order_status_history(order_id, created_at DESC);
+
+-- 配送记录
+CREATE TABLE IF NOT EXISTS store_order_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    delivery_no TEXT NOT NULL UNIQUE,
+    shipped_by INTEGER,
+    shipped_at TEXT NOT NULL,
+    delivered_at TEXT,
+    tracking_note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (shipped_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_deliveries_order
+    ON store_order_deliveries(order_id);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
@@ -708,6 +835,9 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
                     (name, "系统固定品类", ts),
                 )
         conn.commit()
+    # Ensure new warehouse dbs also receive all column migrations that
+    # are normally applied lazily by get_warehouse_db().
+    migrate_warehouse_db_columns(db_path)
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:

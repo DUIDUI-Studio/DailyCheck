@@ -29,7 +29,7 @@ def _require_storefront():
         return None
     if wh["warehouse_type"] == "rd":
         return None  # rd 可以看 items，只是模板里不显示 unit_cost
-    if wh["warehouse_type"] != "storefront":
+    if wh["warehouse_type"] not in ("storefront", "distribution_center"):
         flash("该仓库类型不支持库存管理功能")
         abort(403)
         return None

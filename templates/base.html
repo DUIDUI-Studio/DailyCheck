@@ -43,6 +43,9 @@
     <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
     <a href="{{ url_for('production.products_list') }}">生产录入</a>
     {% endif %}
+    {% if is_admin or is_storefront or is_distribution_center %}
+    <a href="{{ url_for('store_ordering.catalog') }}">门店订货</a>
+    {% endif %}
     {% if is_rd %}
     <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
     {% endif %}
@@ -113,6 +116,9 @@
       <a href="{{ url_for('restock.restock_list') }}">入库</a>
       <a href="{{ url_for('outbound.outbound_list') }}">出库</a>
       <a href="{{ url_for('production.products_list') }}">生产</a>
+      {% endif %}
+      {% if is_admin or is_storefront or is_distribution_center %}
+      <a href="{{ url_for('store_ordering.catalog') }}">订货</a>
       {% endif %}
       {% if is_admin or is_rd %}
       <a href="{{ url_for('recipe_cost.landing') }}">配方</a>

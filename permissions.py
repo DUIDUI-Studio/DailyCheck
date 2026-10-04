@@ -127,3 +127,12 @@ def storefront_only(view: Callable) -> Callable:
     """
     return require_warehouse_type("storefront")(view)
 
+
+def distribution_center_only(view: Callable) -> Callable:
+    """Decorator: 403 unless the current warehouse is a distribution center.
+
+    Used by store-ordering DC-side routes (review / ship) to express the
+    domain concept rather than the raw type string.
+    """
+    return require_warehouse_type("distribution_center")(view)
+

@@ -18,6 +18,11 @@ ALLOWED_EVENT_TYPES = frozenset({
     "canonical_published",
     "canonical_conflict_open",
     "canonical_claim_submitted",
+    "store_order_submitted",
+    "store_order_approved",
+    "store_order_rejected",
+    "store_order_shipped",
+    "store_order_delivered",
 })
 
 SUMMARY_MAX_LEN = 200

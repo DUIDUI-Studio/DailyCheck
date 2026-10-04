@@ -219,6 +219,7 @@ def register_template_context(app) -> None:
             # R&D center. Inject globally so all templates can use them.
             "is_rd": wh_type == "rd",
             "is_storefront": wh_type == "storefront",
+            "is_distribution_center": wh_type == "distribution_center",
         }
 
 
