@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}扇出事件 #{{ event['id'] }}{% endblock %}
+{% block content %}
+<div class="page-header"><h2>扇出事件 #{{ event['id'] }}</h2></div>
+
+<table class="info-table">
+  <tr><th>status</th><td>{{ event['status'] }}</td></tr>
+  <tr><th>summary</th><td>{{ event['summary'] or '—' }}</td></tr>
+  <tr><th>started_at</th><td>{{ event['started_at'] }}</td></tr>
+  <tr><th>completed_at</th><td>{{ event['completed_at'] or '—' }}</td></tr>
+  <tr><th>started_by</th><td>{{ event['started_by'] or '—' }}</td></tr>
+  <tr><th>item_count</th><td>{{ event['item_count'] }}</td></tr>
+  <tr><th>targets</th><td><code>{{ event['target_warehouse_codes_json'] }}</code></td></tr>
+</table>
+
+<h3>Per-warehouse ({{ warehouses|length }})</h3>
+<table class="data-table">
+  <thead><tr><th>warehouse</th><th>status</th><th>error</th><th>applied_at</th></tr></thead>
+  <tbody>
+    {% for w in warehouses %}
+    <tr>
+      <td>{{ w['warehouse_code'] }}</td>
+      <td>{{ w['status'] }}</td>
+      <td><small>{{ w['error_message'] or '' }}</small></td>
+      <td><small>{{ w['applied_at'] or '' }}</small></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Per-item ({{ items|length }})</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>canonical</th><th>target</th><th>local_item_id</th>
+        <th>status</th><th>applied</th><th>skipped</th></tr>
+  </thead>
+  <tbody>
+    {% for it in items %}
+    <tr>
+      <td><code>{{ it['canonical_sku'] }}</code> {{ it['canonical_name'] }}</td>
+      <td>{{ it['target_warehouse_code'] }}</td>
+      <td>{{ it['local_item_id'] or '—' }}</td>
+      <td>{{ it['status'] }}</td>
+      <td><small>{{ it['applied_fields_json'] or '' }}</small></td>
+      <td><small>{{ it['skipped_fields_json'] or '' }}</small></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

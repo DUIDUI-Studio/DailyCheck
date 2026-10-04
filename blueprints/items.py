@@ -65,6 +65,65 @@ def items_list():
             flash("名称、品类为必填")
             return redirect(url_for("items.items_list"))
 
+        # ─────────────────────────────────────────────────────────────────
+        # Q1=deny 三出路拦截 (Spec §1.6.4) + US-2 强信号检测
+        # ─────────────────────────────────────────────────────────────────
+        from db import get_master_db
+        from blueprints import canonical_pure as cp
+
+        m = get_master_db()
+        # 拿到本仓品类的 canonical_code
+        cat_row = m.execute(
+            """SELECT cc.code FROM canonical_categories cc
+               JOIN warehouses w ON w.id IS NOT NULL
+               WHERE 1=0"""
+        ).fetchone()  # placeholder; we'll use a different approach below
+        # 直接读本仓 categories 的 canonical_code
+        cat_code_row = db.execute(
+            "SELECT canonical_code FROM categories WHERE id=?", (int(category_id),)
+        ).fetchone()
+        category_code = cat_code_row["canonical_code"] if cat_code_row else None
+
+        # US-2 强信号候选(T6 检测:按 name + unit 跨仓找相似)
+        similar = _us2_strong_signal_suggestions(m, name, unit)
+
+        # check_new_item_policy — canonical_id=None 表示新建
+        policy = cp.check_new_item_policy(
+            name=name, canonical_id=None,
+            category_code=category_code,
+            similar_canonicals=similar,
+        )
+        if not policy["allowed"]:
+            # 拒绝 + 给出三条出路(Spec §1.6.4)
+            flash(policy["reason"])
+            # 把候选存入 session,渲染选用页时使用
+            session_suggestions = [
+                {
+                    "canonical_id": s.get("canonical_id"),
+                    "name": s.get("name"),
+                    "score": s.get("score", 0),
+                }
+                for s in policy["suggestions"]
+            ]
+            from flask import session as _sess
+            _sess["pending_new_item"] = {
+                "name": name,
+                "category_id": int(category_id),
+                "unit": unit,
+                "quantity": quantity,
+                "safety_stock": safety_stock,
+                "unit_cost": unit_cost,
+                "selling_price": selling_price,
+                "aux_unit": aux_unit,
+                "aux_rate": aux_rate,
+                "category_code": category_code,
+                "suggestions": session_suggestions,
+                "next_action": policy["next_action"],
+                "reason": policy["reason"],
+            }
+            return redirect(url_for("items.new_item_redirect"))
+
+        is_store_exclusive = bool(policy["requires_store_exclusive"])
         # gram_per_unit 同步：仅当 aux_unit=='克'
         gram_per_unit = aux_rate if aux_unit == "克" else 0.0
 
@@ -73,16 +132,18 @@ def items_list():
                 """INSERT INTO items
                    (sku, name, category_id, quantity, safety_stock, unit_cost,
                     selling_price, selling_price_updated_at,
-                    unit, gram_per_unit, aux_unit, aux_rate, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    unit, gram_per_unit, aux_unit, aux_rate, updated_at,
+                    is_store_exclusive)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (gen_sku(), name, int(category_id), quantity, safety_stock,
                  unit_cost, selling_price, now() if selling_price > 0 else None,
-                 unit, gram_per_unit, aux_unit, aux_rate, now()),
+                 unit, gram_per_unit, aux_unit, aux_rate, now(),
+                 1 if is_store_exclusive else 0),
             )
             new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
             db.commit()
             audit("items.create", "item", new_id, {"name": name})
-            flash("库存品创建成功")
+            flash("库存品创建成功" + (" (门店专属)" if is_store_exclusive else ""))
         except sqlite3.IntegrityError:
             flash("库存品创建失败，请重试")
         return redirect(url_for("items.items_list"))
@@ -362,3 +423,82 @@ def _list_storefront_warehouses():
             "WHERE warehouse_type = 'storefront' ORDER BY code"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _us2_strong_signal_suggestions(master_conn, name: str, unit: str) -> list[dict]:
+    """US-2 强信号候选(Spec §3.1)。
+
+    返回与拟新建品项的 (name + unit) 相近的 canonical_items 列表,
+    按相似度降序,最多 5 条。
+    """
+    from blueprints import canonical_pure as cp
+
+    items = cp.list_canonical_items(master_conn, status="active", limit=500)
+    norm = cp.normalize_name(name)
+    out: list[dict] = []
+    for it in items:
+        if it["unit"] != unit:
+            continue
+        sim = cp.name_similarity(norm, cp.normalize_name(it["name"]))
+        if sim >= 0.5:
+            out.append({
+                "canonical_id": it["id"],
+                "name": it["name"],
+                "score": round(sim, 3),
+            })
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out[:5]
+
+
+@bp.route("/items/new-item-redirect")
+@require_role("manager")
+def new_item_redirect():
+    """Q1=deny 拒绝后渲染三条出路页。"""
+    from flask import session
+    pending = session.pop("pending_new_item", None)
+    if not pending:
+        flash("没有待处理的申请")
+        return redirect(url_for("items.items_list"))
+    return render_template("items/new_item_redirect.html", pending=pending)
+
+
+@bp.route("/items/new-item-redirect/submit", methods=["POST"])
+@require_role("manager")
+def new_item_redirect_submit():
+    """三条出路的提交分支。
+
+    next_action:
+      choose       → 已选某个候选:跳到跨仓差异页供管理员操作
+      request_new  → 写一条 canonical_claim_requests,跳转申请单列表
+    """
+    from flask import session
+    from db import get_master_db
+    import blueprints.canonical_pure as cp
+    m = get_master_db()
+    pending = session.pop("pending_new_item", None)
+    if not pending:
+        flash("没有待处理的申请")
+        return redirect(url_for("items.items_list"))
+    action = request.form.get("action", "")
+    if action == "choose":
+        cid = request.form.get("canonical_id")
+        flash(f"请到「跨仓差异」选用候选主数据 (id={cid})")
+        return redirect(url_for("canonical.canonical_diff"))
+    elif action == "request_new":
+        try:
+            rid = cp.submit_claim_request(
+                m,
+                warehouse_code=g.warehouse["code"],
+                local_name=pending["name"],
+                proposed_category_code=pending.get("category_code"),
+                proposed_unit=pending.get("unit"),
+                request_type="new_item",
+                reason=request.form.get("reason"),
+                submitted_by=g.user["id"],
+            )
+            flash(f"已提交新增申请 #{rid},等总部审批")
+        except ValueError as e:
+            flash(f"提交失败: {e}")
+        return redirect(url_for("canonical.canonical_claim_requests"))
+    flash("未知动作")
+    return redirect(url_for("items.items_list"))

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}主数据项 {{ canonical['canonical_sku'] }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>{{ canonical['name'] }} <small>{{ canonical['canonical_sku'] }}</small></h2>
+  <div>
+    {% if g.user and g.user['is_admin'] %}
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', canonical_id=canonical['id']) }}">编辑</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout', canonical_id=canonical['id']) }}">扇出</a>
+    {% endif %}
+  </div>
+</div>
+
+<h3>基本信息</h3>
+<table class="info-table">
+  <tr><th>ID</th><td>{{ canonical['id'] }}</td></tr>
+  <tr><th>SKU</th><td><code>{{ canonical['canonical_sku'] }}</code></td></tr>
+  <tr><th>名称</th><td>{{ canonical['name'] }}</td></tr>
+  <tr><th>品类 code</th><td>{{ canonical['category_code'] or '—' }}</td></tr>
+  <tr><th>单位</th><td>{{ canonical['unit'] }}</td></tr>
+  <tr><th>gram_per_unit</th><td>{{ canonical['gram_per_unit'] }}</td></tr>
+  <tr><th>aux_unit / aux_rate</th><td>{{ canonical['aux_unit'] or '—' }} / {{ canonical['aux_rate'] }}</td></tr>
+  <tr><th>barcode</th><td>{{ canonical['barcode'] or '—' }}</td></tr>
+  <tr><th>状态</th><td>{{ canonical['status'] }}</td></tr>
+  <tr><th>created_from</th><td>{{ canonical['created_from'] }}</td></tr>
+  <tr><th>created_at</th><td>{{ canonical['created_at'] }}</td></tr>
+  <tr><th>updated_at</th><td>{{ canonical['updated_at'] }}</td></tr>
+</table>
+
+<h3>别名</h3>
+{% if canonical['aliases'] %}
+<table class="data-table">
+  <thead><tr><th>alias</th><th>normalized</th><th>warehouse_code</th><th>source</th></tr></thead>
+  <tbody>
+    {% for a in canonical['aliases'] %}
+    <tr>
+      <td>{{ a['alias'] }}</td>
+      <td>{{ a['normalized_alias'] }}</td>
+      <td>{{ a['warehouse_code'] or '（全局）' }}</td>
+      <td>{{ a['source'] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">无别名</p>
+{% endif %}
+
+<h3>已绑定仓 ({{ bindings|length }})</h3>
+{% if bindings %}
+<table class="data-table">
+  <thead><tr><th>仓库</th><th>items.id</th><th>sku</th><th>name</th><th>is_alias</th><th>canonical_status</th></tr></thead>
+  <tbody>
+    {% for b in bindings %}
+    <tr>
+      <td>{{ b['warehouse_code'] }}</td>
+      <td>{{ b['id'] }}</td>
+      <td><code>{{ b['sku'] }}</code></td>
+      <td>{{ b['name'] }}</td>
+      <td>{{ '✓' if b['is_alias'] else '' }}</td>
+      <td>{{ b['canonical_status'] or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">该主数据项尚未绑任何仓</p>
+{% endif %}
+{% endblock %}

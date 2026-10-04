@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}扇出{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>扇出 (T8)
+    {% if selected %}<small>{{ selected['canonical_sku'] }} {{ selected['name'] }}</small>{% endif %}
+  </h2>
+</div>
+
+<form method="post" class="form-section">
+  {% if not selected %}
+  <label>
+    <span>选择主数据项（多选）</span>
+    <select name="canonical_ids" multiple size="10" required>
+      {% for it in items %}
+      <option value="{{ it['id'] }}">{{ it['canonical_sku'] }} — {{ it['name'] }} ({{ it['unit'] }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% else %}
+  <input type="hidden" name="canonical_ids" value="{{ selected['id'] }}" />
+  <p>将扇出 <strong>{{ selected['canonical_sku'] }} {{ selected['name'] }}</strong> 到下列仓:</p>
+  {% endif %}
+
+  <fieldset>
+    <legend>目标仓库（多选）</legend>
+    {% for wh in warehouses %}
+    <label class="checkbox-row">
+      <input type="checkbox" name="warehouse_codes" value="{{ wh['code'] }}" />
+      {{ wh['code'] }} — {{ wh['name'] }}
+    </label>
+    {% endfor %}
+  </fieldset>
+
+  <label>
+    <span>动作</span>
+    <select name="action">
+      <option value="overwrite">overwrite（覆盖 — Q4=freeze 下冲突字段会被冻结）</option>
+      <option value="keep">keep（保留门店已有）</option>
+      <option value="merge">merge（仅补空）</option>
+    </select>
+  </label>
+
+  <fieldset>
+    <legend>force (强制覆盖 — P0-4.1 二次确认 + 审计)</legend>
+    <label class="checkbox-row">
+      <input type="checkbox" name="force" />
+      强制覆盖冻结字段
+    </label>
+    <label>
+      <span>二次确认（输入主数据名称 "{{ selected['name'] if selected else 'N/A' }}"）</span>
+      <input name="confirm_text" placeholder="仅在勾选 force 时必填" />
+    </label>
+  </fieldset>
+
+  <label class="checkbox-row">
+    <input type="checkbox" name="dry_run" checked />
+    dry_run（只算不写，先看效果）
+  </label>
+
+  <label>
+    <span>summary（可选）</span>
+    <input name="summary" placeholder="例: 2026-10 名称规范化" />
+  </label>
+
+  <div class="form-actions">
+    <button type="submit" class="btn">执行扇出</button>
+    <a class="btn-link" href="{{ url_for('canonical.canonical_list') }}">取消</a>
+  </div>
+</form>
+{% endblock %}

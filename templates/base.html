@@ -32,6 +32,10 @@
     {# 总览 / 汇总 / 通知: 所有仓库类型可见。 #}
     <a href="{{ url_for('core.dashboard') }}">总览</a>
     <a href="{{ url_for('core.summary') }}">汇总</a>
+    {# 品项主数据 — 仅 admin / 研发中心可见(T10a) #}
+    {% if g.user and g.user['is_admin'] or is_rd %}
+    <a href="{{ url_for('canonical.canonical_list') }}">品项主数据</a>
+    {% endif %}
     {% if is_admin or is_storefront %}
     <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
     <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>

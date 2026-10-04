@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}品项主数据{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>品项主数据</h2>
+  <div>
+    {% if g.user and g.user['is_admin'] %}
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_edit') }}">➕ 新建</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_bulk_import') }}">📥 批量导入</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout') }}">📤 扇出</a>
+    {% endif %}
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_diff') }}">🌐 跨仓差异</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_conflicts') }}">⚠️ 冲突</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_unbound') }}">🔍 未纳管</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_claim_requests') }}">📋 申请单</a>
+  </div>
+</div>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>ID</th><th>SKU</th><th>名称</th><th>品类</th>
+      <th>单位</th><th>状态</th><th>created_from</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for it in items %}
+    <tr>
+      <td>{{ it['id'] }}</td>
+      <td><code>{{ it['canonical_sku'] }}</code></td>
+      <td>{{ it['name'] }}</td>
+      <td>{{ it['category_code'] or '—' }}</td>
+      <td>{{ it['unit'] }}</td>
+      <td>
+        {% if it['status'] == 'active' %}
+          <span class="badge-ok">active</span>
+        {% else %}
+          <span class="badge-warn">{{ it['status'] }}</span>
+        {% endif %}
+      </td>
+      <td><small>{{ it['created_from'] }}</small></td>
+      <td>
+        <a class="btn-sm" href="{{ url_for('canonical.canonical_detail', canonical_id=it['id']) }}">查看</a>
+        {% if g.user and g.user['is_admin'] %}
+        <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', canonical_id=it['id']) }}">编辑</a>
+        <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout', canonical_id=it['id']) }}">扇出</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

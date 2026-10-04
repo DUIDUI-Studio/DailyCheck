@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}批量导入主数据{% endblock %}
+{% block content %}
+<div class="page-header"><h2>批量导入主数据 (T22)</h2></div>
+
+<form method="post" enctype="multipart/form-data" class="form-section">
+  <p>CSV 列: <code>warehouse_code, current_sku, item_id, current_name,
+    current_unit, current_quantity, bind_to_canonical, is_store_exclusive, will_change</code></p>
+  <p><small>系统按 <code>(name, unit)</code> 唯一组合判定:已存在则 UPDATE,
+    不存在则 INSERT。</small></p>
+  <label>
+    <span>CSV 文件</span>
+    <input type="file" name="csv" accept=".csv" required />
+  </label>
+  <div class="form-actions">
+    <button type="submit" class="btn">上传并导入</button>
+    <a class="btn-link" href="{{ url_for('canonical.canonical_list') }}">取消</a>
+  </div>
+</form>
+{% endblock %}

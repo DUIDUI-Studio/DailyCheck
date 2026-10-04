@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Q1=deny 三条出路{% endblock %}
+{% block content %}
+<div class="page-header"><h2>新建品项被 Q1=deny 拒绝</h2></div>
+
+<div class="alert">
+  <p>{{ pending['reason'] }}</p>
+</div>
+
+{% if pending['next_action'] == 'choose' %}
+<h3>路径 ①：选用主数据里已有相近品项</h3>
+<p>主数据里有以下相近品项（{{ pending['suggestions']|length }} 个）：</p>
+<form method="post" action="{{ url_for('items.new_item_redirect_submit') }}">
+  <input type="hidden" name="action" value="choose" />
+  {% for s in pending['suggestions'] %}
+  <label class="radio-row">
+    <input type="radio" name="canonical_id" value="{{ s['canonical_id'] }}" required />
+    <strong>{{ s['name'] }}</strong> (id={{ s['canonical_id'] }}, score={{ s['score'] }})
+  </label>
+  {% endfor %}
+  <button type="submit" class="btn">选用</button>
+  <a class="btn-link" href="{{ url_for('items.items_list') }}">取消</a>
+</form>
+
+{% elif pending['next_action'] == 'request_new' %}
+<h3>路径 ③：提交新增申请给总部审批</h3>
+<p>主数据里没有相近项，且本仓品类不在白名单内。请提交申请，由总部在「品项主数据」审批后该品项即可选用。</p>
+<form method="post" action="{{ url_for('items.new_item_redirect_submit') }}">
+  <input type="hidden" name="action" value="request_new" />
+  <label>
+    <span>申请原因（必填）</span>
+    <textarea name="reason" required rows="3" placeholder="说明为什么要新增这个品项（业务场景、采购来源等）"></textarea>
+  </label>
+  <div class="form-actions">
+    <button type="submit" class="btn">提交申请</button>
+    <a class="btn-link" href="{{ url_for('items.items_list') }}">取消</a>
+  </div>
+</form>
+
+{% else %}
+<h3>路径 ②：白名单放行 + 标记门店专属</h3>
+<p>品类 <code>{{ pending.get('category_code', '—') }}</code> 在白名单内。请重新提交表单，将自动标记 <code>is_store_exclusive=1</code>（门店专属）。</p>
+<a class="btn-link" href="{{ url_for('items.items_list') }}">返回表单</a>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}未纳管品项{% endblock %}
+{% block content %}
+<div class="page-header"><h2>未纳管品项</h2></div>
+
+<h3>未纳管 (canonical_id IS NULL) — {{ unbound|length }} 行</h3>
+{% if unbound %}
+<table class="data-table">
+  <thead>
+    <tr><th>仓库</th><th>id</th><th>sku</th><th>name</th><th>unit</th><th>quantity</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for u in unbound %}
+    <tr>
+      <td>{{ u['warehouse_code'] }}</td>
+      <td>{{ u['id'] }}</td>
+      <td><code>{{ u['sku'] }}</code></td>
+      <td>{{ u['name'] }}</td>
+      <td>{{ u['unit'] }}</td>
+      <td>{{ u['quantity'] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">全部品项已纳管</p>
+{% endif %}
+
+<h3>门店专属 (is_store_exclusive=1) — {{ store_exclusive|length }} 行</h3>
+{% if store_exclusive %}
+<table class="data-table">
+  <thead><tr><th>仓库</th><th>id</th><th>sku</th><th>name</th><th>canonical_id</th></tr></thead>
+  <tbody>
+    {% for s in store_exclusive %}
+    <tr>
+      <td>{{ s['warehouse_code'] }}</td>
+      <td>{{ s['id'] }}</td>
+      <td><code>{{ s['sku'] }}</code></td>
+      <td>{{ s['name'] }}</td>
+      <td>{{ s['canonical_id'] or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h3>孤儿引用 — {{ orphans|length }} 行</h3>
+{% if orphans %}
+<table class="data-table">
+  <thead><tr><th>仓库</th><th>id</th><th>sku</th><th>name</th><th>canonical_id</th></tr></thead>
+  <tbody>
+    {% for o in orphans %}
+    <tr>
+      <td>{{ o['warehouse_code'] }}</td>
+      <td>{{ o['id'] }}</td>
+      <td><code>{{ o['sku'] }}</code></td>
+      <td>{{ o['name'] }}</td>
+      <td>{{ o['canonical_id'] }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">无孤儿引用</p>
+{% endif %}
+{% endblock %}

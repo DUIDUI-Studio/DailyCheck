@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}申请单{% endblock %}
+{% block content %}
+<div class="page-header"><h2>申请单 ({{ requests_|length }})</h2></div>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>id</th><th>type</th><th>status</th><th>仓</th>
+      <th>local_item_id</th><th>canonical</th><th>proposed</th>
+      <th>提交人</th><th>创建时间</th><th>审批备注</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in requests_ %}
+    <tr>
+      <td>{{ r['id'] }}</td>
+      <td>{{ r['request_type'] }}</td>
+      <td>
+        {% if r['status'] == 'pending' %}<span class="badge-warn">pending</span>
+        {% elif r['status'] == 'approved' %}<span class="badge-ok">approved</span>
+        {% else %}<span class="badge">{{ r['status'] }}</span>{% endif %}
+      </td>
+      <td>{{ r['warehouse_code'] }}</td>
+      <td>{{ r['local_item_id'] or '—' }}</td>
+      <td>{% if r['canonical_sku'] %}<code>{{ r['canonical_sku'] }}</code> {{ r['canonical_name'] }}{% else %}—{% endif %}</td>
+      <td><small>{{ r['proposed_category_code'] or '' }} {{ r['proposed_unit'] or '' }}</small></td>
+      <td>{{ r['submitted_by'] or '—' }}</td>
+      <td><small>{{ r['created_at'] }}</small></td>
+      <td><small>{{ r['review_note'] or '' }}</small></td>
+      <td>
+        {% if r['status'] == 'pending' and g.user and g.user['is_admin'] %}
+        <form method="post" action="{{ url_for('canonical.canonical_review_claim_request', request_id=r['id']) }}" style="display:inline">
+          <select name="decision"><option value="approved">approve</option><option value="rejected">reject</option></select>
+          <input name="note" placeholder="备注" />
+          <button type="submit" class="btn-sm">提交</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

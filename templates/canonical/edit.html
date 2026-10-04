@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{% if canonical %}编辑{% else %}新建{% endif %}主数据项{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>{% if canonical %}编辑 {{ canonical['canonical_sku'] }}{% else %}新建主数据项{% endif %}</h2>
+</div>
+
+<form method="post" class="grid cols-2">
+  <label>
+    <span>名称 *</span>
+    <input name="name" required value="{{ canonical['name'] if canonical else '' }}" />
+  </label>
+  <label>
+    <span>单位 *</span>
+    <input name="unit" required value="{{ canonical['unit'] if canonical else '件' }}" />
+  </label>
+  <label>
+    <span>品类 code</span>
+    <select name="category_code">
+      <option value="">— 不选 —</option>
+      {% for c in categories %}
+      <option value="{{ c['code'] }}"
+        {% if canonical and canonical['category_code'] == c['code'] %}selected{% endif %}>
+        {{ c['code'] }} — {{ c['name'] }}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>状态</span>
+    <select name="status">
+      <option value="active" {% if canonical and canonical['status'] == 'active' %}selected{% endif %}>active</option>
+      <option value="disabled" {% if canonical and canonical['status'] == 'disabled' %}selected{% endif %}>disabled (Q3 停用)</option>
+    </select>
+  </label>
+  <label>
+    <span>gram_per_unit</span>
+    <input name="gram_per_unit" type="number" step="0.01"
+           value="{{ canonical['gram_per_unit'] if canonical else 0 }}" />
+  </label>
+  <label>
+    <span>aux_unit</span>
+    <input name="aux_unit" value="{{ canonical['aux_unit'] or '' if canonical else '' }}" />
+  </label>
+  <label>
+    <span>aux_rate</span>
+    <input name="aux_rate" type="number" step="0.01"
+           value="{{ canonical['aux_rate'] if canonical else 0 }}" />
+  </label>
+  <label>
+    <span>barcode (P0 不下发)</span>
+    <input name="barcode" value="{{ canonical['barcode'] or '' if canonical else '' }}" />
+  </label>
+  <div class="form-actions">
+    <button type="submit" class="btn">保存</button>
+    <a class="btn-link" href="{{ url_for('canonical.canonical_list') }}">取消</a>
+  </div>
+</form>
+{% endblock %}

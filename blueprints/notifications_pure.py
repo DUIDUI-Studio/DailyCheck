@@ -12,7 +12,13 @@ from typing import Any
 
 # PRD §2.5.4: first-cut event types. Only recipe_published is wired up in
 # this subproject; the others are reserved for subprojects 4/5/6.
-ALLOWED_EVENT_TYPES = frozenset({"recipe_published"})
+# M2 (canonical-item) extends with three new types (Spec §4.1 T13).
+ALLOWED_EVENT_TYPES = frozenset({
+    "recipe_published",
+    "canonical_published",
+    "canonical_conflict_open",
+    "canonical_claim_submitted",
+})
 
 SUMMARY_MAX_LEN = 200
 

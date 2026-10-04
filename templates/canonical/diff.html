@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}跨仓差异看板{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>跨仓差异看板</h2>
+</div>
+
+<div class="diff-summary">
+  <div class="stat">
+    <div class="stat-num">{{ summary['by_canonical']|length }}</div>
+    <div class="stat-label">已纳管主数据</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">{{ summary['unbound_count'] }}</div>
+    <div class="stat-label">未纳管品项</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">{{ summary['store_exclusive_count'] }}</div>
+    <div class="stat-label">门店专属</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">{{ summary['conflicts_open'] }}</div>
+    <div class="stat-label">open 冲突</div>
+  </div>
+</div>
+
+<h3>各主数据跨仓覆盖情况</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>主数据</th><th>名称</th><th>单位</th><th>覆盖仓数</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for row in by_canonical %}
+    <tr>
+      <td><code>{{ row['canonical_sku'] }}</code></td>
+      <td>{{ row['name'] }}</td>
+      <td>{{ row['unit'] }}</td>
+      <td>{{ row['warehouse_count'] }}</td>
+      <td>
+        <a class="btn-sm" href="{{ url_for('canonical.canonical_detail', canonical_id=row['canonical_id']) }}">详情</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

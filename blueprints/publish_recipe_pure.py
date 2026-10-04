@@ -328,7 +328,12 @@ ITEM_DEFAULT_ACTION = "overwrite"  # default if not specified
 
 
 def snapshot_item(conn, item_id: int) -> dict:
-    """Capture a single item (in its warehouse db) with category info."""
+    """Capture a single item (in its warehouse db) with category info.
+
+    Returns the row as a dict, including canonical_id / canonical_status /
+    is_alias / is_store_exclusive / canonical_synced_json columns when
+    present in the schema (idempotent across schema versions).
+    """
     conn.row_factory = sqlite3.Row
     row = conn.execute(
         """SELECT i.*, c.name AS category_name
@@ -347,9 +352,15 @@ def apply_item_to_warehouse(
     """Apply an item snapshot to a target warehouse db. Returns final action.
 
     `action`:
-    - 'overwrite': UPDATE if item exists (matched by sku), else INSERT.
-                   Always sets name/category/unit/gram_per_unit/unit_cost/selling_price.
-    - 'keep':      if item exists by sku, do nothing. else INSERT.
+    - 'overwrite': UPDATE if item exists, else INSERT.
+                   MATCH key (per Spec §6.1.1 + design §1.2):
+                     1. canonical_id (T7 已纳管 → 走主数据身份)
+                     2. sku 兜底(原始 SKU,与 canonical_sku 区分)
+                   WRITE fields (per Spec §2.2 + §7.2):
+                     - INSERT: 写 name/category/unit/gram_per_unit/aux_unit/aux_rate/safety_stock
+                     - OVERWRITE: 写 name/category/unit/gram_per_unit/aux_unit/aux_rate
+                       **不写** unit_cost/selling_price/safety_stock(Q4=freeze + Q6=storefront_autonomous)
+    - 'keep':      if item exists, do nothing. else INSERT.
     - 'merge':     UPDATE non-null snapshot fields on existing item,
                    else INSERT.
     Category is auto-created on first use if missing.
@@ -374,17 +385,28 @@ def apply_item_to_warehouse(
         cat_id = int(row["id"])
 
     sku = source_snapshot["sku"]
-    existing = target_conn.execute(
-        "SELECT id FROM items WHERE sku = ?", (sku,)
-    ).fetchone()
+
+    # ─────────────────────────────────────────────────────────────────
+    # T12: 匹配键改为 canonical_id 优先, sku 兜底
+    # ─────────────────────────────────────────────────────────────────
+    canonical_id = source_snapshot.get("canonical_id")
+    existing = None
+    if canonical_id is not None:
+        existing = target_conn.execute(
+            "SELECT id FROM items WHERE canonical_id = ?", (canonical_id,)
+        ).fetchone()
+    if existing is None:
+        existing = target_conn.execute(
+            "SELECT id FROM items WHERE sku = ?", (sku,)
+        ).fetchone()
 
     if existing is None:
         target_conn.execute(
             """INSERT INTO items
                (sku, name, category_id, quantity, safety_stock,
                 unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
-                selling_price, updated_at)
-               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                selling_price, updated_at, canonical_id)
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sku, source_snapshot["name"], cat_id,
                 float(source_snapshot["safety_stock"] or 0),
@@ -393,6 +415,7 @@ def apply_item_to_warehouse(
                 source_snapshot["aux_unit"], float(source_snapshot["aux_rate"] or 0),
                 float(source_snapshot["selling_price"] or 0),
                 now_str(),
+                canonical_id,
             ),
         )
         return "inserted"
@@ -401,20 +424,19 @@ def apply_item_to_warehouse(
         return "kept"
 
     if action == "overwrite":
+        # T12: 不再覆盖 unit_cost / selling_price / safety_stock(§7.2 措施)
         target_conn.execute(
             """UPDATE items SET
-               name=?, category_id=?, safety_stock=?, unit=?,
-               unit_cost=?, gram_per_unit=?, aux_unit=?, aux_rate=?,
-               selling_price=?, updated_at=?
-               WHERE sku=?""",
+               name=?, category_id=?, unit=?,
+               gram_per_unit=?, aux_unit=?, aux_rate=?,
+               updated_at=?
+               WHERE id=?""",
             (
                 source_snapshot["name"], cat_id,
-                float(source_snapshot["safety_stock"] or 0),
-                source_snapshot["unit"], float(source_snapshot["unit_cost"] or 0),
+                source_snapshot["unit"],
                 float(source_snapshot["gram_per_unit"] or 0),
                 source_snapshot["aux_unit"], float(source_snapshot["aux_rate"] or 0),
-                float(source_snapshot["selling_price"] or 0),
-                now_str(), sku,
+                now_str(), int(existing["id"]),
             ),
         )
         return "overwritten"
@@ -422,25 +444,22 @@ def apply_item_to_warehouse(
     # merge: only fill fields that are non-null/zero in target but set in source.
     if action == "merge":
         cur = target_conn.execute(
-            "SELECT * FROM items WHERE sku=?", (sku,)
+            "SELECT * FROM items WHERE id=?", (int(existing["id"]),)
         ).fetchone()
         updates = {}
-        if not cur["unit_cost"]:
-            updates["unit_cost"] = float(source_snapshot["unit_cost"] or 0)
-        if not cur["selling_price"]:
-            updates["selling_price"] = float(source_snapshot["selling_price"] or 0)
         if not cur["gram_per_unit"]:
             updates["gram_per_unit"] = float(source_snapshot["gram_per_unit"] or 0)
         if not cur["aux_unit"]:
             updates["aux_unit"] = source_snapshot["aux_unit"]
         if not cur["aux_rate"]:
             updates["aux_rate"] = float(source_snapshot["aux_rate"] or 0)
+        # 注: 不再 merge unit_cost / selling_price (§7.2)
         updates["updated_at"] = now_str()
         if updates:
             set_clause = ", ".join(f"{k}=?" for k in updates)
             target_conn.execute(
-                f"UPDATE items SET {set_clause} WHERE sku=?",
-                (*updates.values(), sku),
+                f"UPDATE items SET {set_clause} WHERE id=?",
+                (*updates.values(), int(existing["id"])),
             )
         return "merged"
 

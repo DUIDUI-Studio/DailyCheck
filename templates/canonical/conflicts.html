@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}冲突列表{% endblock %}
+{% block content %}
+<div class="page-header"><h2>open 冲突 ({{ conflicts|length }})</h2></div>
+
+{% if conflicts %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>id</th><th>主数据</th><th>仓</th><th>local_item_id</th>
+      <th>field</th><th>类型</th>
+      <th>canonical</th><th>local</th><th>last_synced</th><th>created_at</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in conflicts %}
+    <tr>
+      <td>{{ c['id'] }}</td>
+      <td><code>{{ c['canonical_sku'] }}</code> {{ c['canonical_name'] }}</td>
+      <td>{{ c['warehouse_code'] }}</td>
+      <td>{{ c['local_item_id'] }}</td>
+      <td>{{ c['field'] }}</td>
+      <td>{{ c['conflict_type'] }}</td>
+      <td>{{ c['canonical_value'] }}</td>
+      <td>{{ c['local_value'] }}</td>
+      <td>{{ c['last_synced_value'] or '—' }}</td>
+      <td><small>{{ c['created_at'] }}</small></td>
+      <td><a class="btn-sm" href="{{ url_for('canonical.canonical_resolve_conflict', conflict_id=c['id']) }}">裁决</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">暂无 open 冲突</p>
+{% endif %}
+{% endblock %}

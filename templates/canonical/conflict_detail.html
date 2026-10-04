@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}冲突裁决 #{{ conflict['id'] }}{% endblock %}
+{% block content %}
+<div class="page-header"><h2>冲突裁决 #{{ conflict['id'] }}</h2></div>
+
+<table class="info-table">
+  <tr><th>主数据</th><td><code>{{ conflict['canonical_sku'] }}</code> {{ conflict['canonical_name'] }}</td></tr>
+  <tr><th>仓库</th><td>{{ conflict['warehouse_code'] }}</td></tr>
+  <tr><th>local_item_id</th><td>{{ conflict['local_item_id'] }}</td></tr>
+  <tr><th>field</th><td>{{ conflict['field'] }}</td></tr>
+  <tr><th>conflict_type</th><td>{{ conflict['conflict_type'] }}</td></tr>
+  <tr><th>canonical_value</th><td><code>{{ conflict['canonical_value'] }}</code></td></tr>
+  <tr><th>local_value</th><td><code>{{ conflict['local_value'] }}</code></td></tr>
+  <tr><th>last_synced_value</th><td><code>{{ conflict['last_synced_value'] or '—' }}</code></td></tr>
+  <tr><th>created_at</th><td>{{ conflict['created_at'] }}</td></tr>
+</table>
+
+<form method="post" class="form-section">
+  <label>
+    <span>裁决</span>
+    <select name="decision" required>
+      <option value="keep_local">keep_local（保留门店值）</option>
+      <option value="accept_canonical">accept_canonical（接受主数据值）</option>
+      <option value="waive">waive（豁免，不再提示）</option>
+    </select>
+  </label>
+  <label>
+    <span>备注</span>
+    <textarea name="note" rows="3"></textarea>
+  </label>
+  <div class="form-actions">
+    <button type="submit" class="btn">提交裁决</button>
+    <a class="btn-link" href="{{ url_for('canonical.canonical_conflicts') }}">返回</a>
+  </div>
+</form>
+{% endblock %}
