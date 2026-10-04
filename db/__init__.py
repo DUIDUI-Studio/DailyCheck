@@ -236,6 +236,142 @@ CREATE TABLE IF NOT EXISTS item_publish_event_items (
     action TEXT NOT NULL DEFAULT 'overwrite',  -- 'overwrite'|'keep'|'merge'
     FOREIGN KEY (publish_event_id) REFERENCES item_publish_events(id)
 );
+
+-- ─────────────────────────────────────────────────────────────────────
+-- Canonical items (master-data) — Spec docs/2026-10-03-canonical-item-design.md
+-- Q1=deny / Q2=open / Q3=deactivate_only / Q4=freeze / Q7=strict
+-- ─────────────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS canonical_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,             -- 跨仓稳定键（如 PRODUCE_CONSUMABLE）
+    name TEXT NOT NULL,                    -- 标准名（如 生产消耗品）
+    description TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_categories_code
+    ON canonical_categories(code);
+
+CREATE TABLE IF NOT EXISTS canonical_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_sku TEXT NOT NULL UNIQUE,    -- IC-000001，业务上只读（两阶段写入）
+    name TEXT NOT NULL,                    -- 标准名
+    category_code TEXT,                    -- 指向 canonical_categories.code（不存 id）
+    unit TEXT NOT NULL,                    -- 锁死
+    gram_per_unit REAL NOT NULL DEFAULT 0, -- 锁死
+    aux_unit TEXT,                         -- 锁死
+    aux_rate REAL NOT NULL DEFAULT 0,      -- 锁死
+    selling_price REAL,                    -- Q6=canonical_managed 时使用
+    unit_cost REAL,                        -- Q6=canonical_managed 时使用
+    barcode TEXT,                          -- P0 不下发，留在主数据侧
+    status TEXT NOT NULL DEFAULT 'active', -- 'active'|'inactive' (Q3)
+    created_from TEXT NOT NULL DEFAULT 'rd_manual', -- 'rd_manual'|'rd_publish'|'claim_merge'
+    created_by INTEGER,                    -- users.id
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_items_status
+    ON canonical_items(status);
+CREATE INDEX IF NOT EXISTS idx_canonical_items_category
+    ON canonical_items(category_code);
+
+CREATE TABLE IF NOT EXISTS canonical_item_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_id INTEGER NOT NULL,
+    alias TEXT NOT NULL,                   -- 归一化前的原始写法
+    normalized_alias TEXT,                 -- 归一化后，用于查重
+    warehouse_code TEXT,                   -- 空=全局别名；非空=某仓独有
+    source TEXT NOT NULL DEFAULT 'system_suggested', -- 'rd_manual'|'storefront_claim'|'system_suggested'
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_item_aliases_canon
+    ON canonical_item_aliases(canonical_id);
+
+CREATE TABLE IF NOT EXISTS canonical_claim_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    warehouse_code TEXT NOT NULL,          -- 申请方
+    local_item_id INTEGER,                 -- 申请方仓内 items.id（new_item 时为 NULL）
+    local_sku TEXT,                        -- 申请方仓内 sku
+    local_name TEXT,                       -- 申请方拟建或拟认领的品项名
+    canonical_id INTEGER,                  -- 目标主数据（new_item 时为 NULL）
+    local_keep_name TEXT,                  -- 申请方想保留的叫法，空=跟随主数据
+    proposed_category_code TEXT,           -- new_item 时建议的品类 code
+    proposed_unit TEXT,                    -- new_item 时建议的单位
+    request_type TEXT NOT NULL DEFAULT 'claim',  -- 'claim'|'new_item'|'exempt'
+    reason TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',-- 'pending'|'approved'|'rejected'|'cancelled'
+    submitted_by INTEGER,
+    reviewed_by INTEGER,
+    reviewed_at TEXT,
+    review_note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_claim_requests_status
+    ON canonical_claim_requests(status);
+
+CREATE TABLE IF NOT EXISTS canonical_conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    local_item_id INTEGER NOT NULL,
+    publish_event_id INTEGER,
+    field TEXT NOT NULL,                   -- 冲突字段名
+    conflict_type TEXT NOT NULL,           -- 'value'|'unit_conversion'|'double_bind'
+    canonical_value TEXT,                  -- 下发值
+    local_value TEXT,                      -- 门店本地值
+    last_synced_value TEXT,                -- 上次下发值
+    status TEXT NOT NULL DEFAULT 'open',   -- 'open'|'resolved_keep_local'|'resolved_accept_canonical'|'waived'
+    resolution_note TEXT,
+    resolved_by INTEGER,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_conflicts_status
+    ON canonical_conflicts(status, warehouse_code);
+
+CREATE TABLE IF NOT EXISTS canonical_publish_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary TEXT,
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending'|'partial'|'complete'|'failed'
+    started_by INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    target_warehouse_codes_json TEXT NOT NULL,
+    item_count INTEGER NOT NULL DEFAULT 0,
+    backup_paths_json TEXT                -- 措施①：记录本事件触发的备份路径
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_publish_events_status
+    ON canonical_publish_events(status, started_at);
+
+CREATE TABLE IF NOT EXISTS canonical_publish_event_warehouses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL,                  -- 'success'|'failed'|'partial_conflict'
+    error_message TEXT,
+    applied_at TEXT,
+    FOREIGN KEY (publish_event_id) REFERENCES canonical_publish_events(id),
+    UNIQUE(publish_event_id, warehouse_code)
+);
+
+CREATE TABLE IF NOT EXISTS canonical_publish_event_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    publish_event_id INTEGER NOT NULL,
+    canonical_id INTEGER NOT NULL,
+    target_warehouse_code TEXT NOT NULL,
+    local_item_id INTEGER,                 -- 命中/新建的仓内 items.id
+    status TEXT NOT NULL,                  -- 'success'|'failed'|'conflict'|'skipped'
+    applied_fields_json TEXT,              -- 实际写入的字段
+    skipped_fields_json TEXT,              -- 因冲突冻结的字段
+    error_message TEXT,
+    FOREIGN KEY (publish_event_id) REFERENCES canonical_publish_events(id)
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_publish_event_items_event
+    ON canonical_publish_event_items(publish_event_id);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
@@ -623,4 +759,43 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN selling_price_updated_at TEXT"
             )
+        # ─────────────────────────────────────────────────────────────────
+        # Canonical-item columns (Spec §2.2). All idempotent via PRAGMA.
+        # Safe with SQLite weak typing: NOT NULL DEFAULT 0 for booleans,
+        # nullable for foreign keys and JSON snapshots.
+        # ─────────────────────────────────────────────────────────────────
+        if "canonical_id" not in item_cols:
+            conn.execute("ALTER TABLE items ADD COLUMN canonical_id INTEGER")
+        if "is_alias" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN is_alias INTEGER NOT NULL DEFAULT 0"
+            )
+        if "canonical_status" not in item_cols:
+            conn.execute("ALTER TABLE items ADD COLUMN canonical_status TEXT")
+        if "canonical_synced_json" not in item_cols:
+            conn.execute("ALTER TABLE items ADD COLUMN canonical_synced_json TEXT")
+        if "is_store_exclusive" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN is_store_exclusive INTEGER NOT NULL DEFAULT 0"
+            )
+        # Spec §2.2: future-proofing for Q6=canonical_managed (M1 keeps default 0)
+        if "price_follow_canonical" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN price_follow_canonical INTEGER NOT NULL DEFAULT 0"
+            )
+        # Index for canonical_id lookups (used by fanout engine + claim verification)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_items_canonical_id "
+            "ON items(canonical_id)"
+        )
+        # categories.canonical_code (Spec §2.3): nullable — empty means "纯本仓自定义"
+        cat_cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(categories)").fetchall()
+        }
+        if "canonical_code" not in cat_cols:
+            conn.execute("ALTER TABLE categories ADD COLUMN canonical_code TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_categories_canonical_code "
+            "ON categories(canonical_code)"
+        )
         conn.commit()

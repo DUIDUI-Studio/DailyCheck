@@ -4,10 +4,14 @@ Spec: docs/2026-10-03-canonical-item-design.md
      §1.3 (canonical_synced_json scope)
      §1.5 (Q6 price ownership branching)
      §1.6 (Q1=deny + whitelist + three-way-out)
+     §1.7 (9 规格品项拆分)
      §1.8 (unit family — aux_unit/aux_rate/gram_per_unit derivation)
      §2.4 (field permission matrix → CANONICAL_FIELD_POLICY)
      §2.5 (canonical_status state machine — Q3=deactivate_only)
+     §3.1 (strong signal detection)
+     §3.2 (claim / unclaim)
      §3.5 (fanout conflict judgment — Q4=freeze)
+     §6.1.1 (two-phase canonical_sku write)
      §7.7  (Q7 inventory protection — seven guards)
 
 The pure layer is the single source of truth for canonical-item policy.
@@ -28,7 +32,7 @@ Public surface (this file):
 
   Constants:
     NEVER_TOUCH_COLUMNS, CANONICAL_FIELD_POLICY, STOREFRONT_OWNED_FIELDS
-    ALLOWED_TABLES, ALLOWED_WHERE_COLUMNS
+    ALLOWED_TABLES, ALLOWED_WHERE_COLUMNS, CATEGORY_CODE_MAP
 
   T1 — policy switches:
     is_syncable_field(field) -> bool
@@ -37,6 +41,66 @@ Public surface (this file):
     set_canonical_status(canonical_id, status) -> str
     resolve_conflict_policy(local_value, last_synced_value,
                             canonical_value, force=False) -> str
+
+  T4 — Canonical items CRUD:
+    next_canonical_sku(master_conn) -> str
+    create_canonical_item(master_conn, *, name, unit, category_code=None,
+                          gram_per_unit=0, aux_unit=None, aux_rate=0,
+                          barcode=None, status='active',
+                          created_from='rd_manual', created_by=None) -> dict
+    update_canonical_item(master_conn, canonical_id, fields) -> dict
+    list_canonical_items(master_conn, *, status=None, category_code=None,
+                         limit=200, offset=0) -> list[dict]
+    get_canonical_item_detail(master_conn, canonical_id) -> dict
+
+  T5 — Categories:
+    seed_canonical_categories(master_conn) -> list[dict]
+    backfill_category_mappings(wh_conn) -> dict
+    list_missing_category_mappings(master_conn, wh_code=None) -> list[dict]
+    resolve_category_id(master_conn, wh_conn, canonical_category_code,
+                        wh_category_name) -> int
+
+  T6 — Strong signal detection:
+    parse_local_sku(sku) -> dict
+    normalize_name(name) -> str
+    name_similarity(a, b) -> float
+    detect_similar_items(rows_per_wh) -> list[dict]
+    collect_all_items(master_conn) -> dict[str, list[dict]]
+
+  T7 — Claim / Unclaim:
+    claim_item(master_conn, wh_conn, *, warehouse_code, local_item_id,
+               canonical_id, is_alias=False, submitted_by=None,
+               local_keep_name=None, reason=None) -> dict
+    unclaim_item(master_conn, wh_conn, *, warehouse_code, local_item_id,
+                 reviewed_by=None, reason=None) -> dict
+    submit_claim_request(master_conn, *, warehouse_code, local_item_id=None,
+                         local_sku=None, local_name=None, canonical_id=None,
+                         proposed_category_code=None, proposed_unit=None,
+                         request_type='claim', reason=None,
+                         submitted_by=None) -> int
+    review_claim_request(master_conn, *, request_id, decision,
+                         reviewed_by, review_note=None) -> dict
+
+  T8 — Fanout:
+    apply_canonical_to_warehouse(wh_conn, canonical, last_snapshot,
+                                 action='overwrite', force=False) -> dict
+    fanout_canonical_items(master_conn, wh_db_map, *, canonical_ids,
+                           warehouse_codes, action='overwrite',
+                           force=False, dry_run=False, started_by=None,
+                           summary=None) -> dict
+    resolve_conflict(master_conn, *, conflict_id, decision,
+                     reviewed_by, note=None) -> dict
+
+  T9 — Cross-warehouse reads:
+    collect_bindings(master_conn) -> dict[str, list[dict]]
+    diff_summary(master_conn) -> dict
+    list_unbound_storefront_items(master_conn) -> list[dict]
+    find_orphan_bindings(master_conn) -> list[dict]
+    list_store_exclusive_items(master_conn) -> list[dict]
+
+  T22 — Bulk create:
+    seed_default_canonical_items(master_conn) -> list[dict]
+    bulk_create_canonical_items(master_conn, csv_path) -> dict
 
   T23 — Q7 inventory guards:
     build_update_sql(conn, table, updates, where_col, where_val,
@@ -52,11 +116,18 @@ Public surface (this file):
 """
 from __future__ import annotations
 
+import csv
+import json
+import re
 import shutil
 import sqlite3
+import uuid
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+
+from config import FIXED_CATEGORIES  # noqa: F401  (re-exported below)
 
 # Import policy switches and paths from config so a single file controls
 # everything (no other file owns its own whitelist — see module docstring).
@@ -643,3 +714,1568 @@ def guard_real_db(path: str | Path) -> None:
             f"禁止对真实仓库 {p} 写入。预演请先复制副本到 "
             f"{DRYRUN_COPY_DIR}/{{ts}}/（每个 dry-run 用独立 ts 子目录隔离）。"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  CATEGORY_CODE_MAP — re-exported here for canonical pure layer access.
+#  Stored in config (single source of truth, Spec §6.1).
+# ─────────────────────────────────────────────────────────────────────
+from config import CATEGORY_CODE_MAP  # noqa: E402,F401  (deliberate re-export)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T4 — Canonical items CRUD + next_canonical_sku (Spec §6.1.1 two-phase)
+# ─────────────────────────────────────────────────────────────────────
+
+# 9 个规格品项（Spec §1.7）的桶装 / 散装对 —— 用于 §1.7.1 单位族规则
+# 与 §1.7.4 WP0215 桶装不创建的特例处理。
+SPECIAL_BULK_SKUS: frozenset[str] = frozenset({
+    "WP0129", "WP0212", "WP0213", "WP0215", "WP0216",
+    "WP0217", "WP0218", "WP0219", "WP0223",
+})
+SPECIAL_BULK_NO_BARREL_SKUS: frozenset[str] = frozenset({"WP0215"})
+
+
+def next_canonical_sku(master_conn: sqlite3.Connection) -> str:
+    """生成下一个 canonical_sku —— 格式 IC-%06d（Spec §6.1.1）。
+
+    两阶段写入:先占位插入 IC-PENDING-<uuid4hex8>,再回填正式 SKU。
+    这样并发 INSERT 不会撞 UNIQUE 约束;失败整体回滚（§6.1.1）。
+
+    这里是"第一步"专用;create_canonical_item() 自己处理两步。
+    本函数仅在外部需要"先拿一个唯一占位"时调用（实际场景很少）。
+    """
+    return "IC-PENDING-" + uuid.uuid4().hex[:8]
+
+
+def create_canonical_item(
+    master_conn: sqlite3.Connection,
+    *,
+    name: str,
+    unit: str,
+    category_code: str | None = None,
+    gram_per_unit: float = 0,
+    aux_unit: str | None = None,
+    aux_rate: float = 0,
+    barcode: str | None = None,
+    status: str = "active",
+    created_from: str = "rd_manual",
+    created_by: int | None = None,
+) -> dict:
+    """T4 —— 在 master 侧创建 canonical_items 行。
+
+    实现 Spec §6.1.1 的两阶段写入:
+      1) 占位 INSERT (canonical_sku='IC-PENDING-<uuid8>') —— 拿 id
+      2) UPDATE 回填 canonical_sku = 'IC-%06d' % id
+      失败整体 ROLLBACK。
+
+    派生关系:gram_per_unit = aux_rate if aux_unit=='克' else 0 (§1.8.2)。
+    """
+    master_conn.row_factory = sqlite3.Row
+
+    # §1.8.2 派生关系:若 aux_unit!='克'则强制 gram_per_unit=0
+    if aux_unit != "克":
+        gram_per_unit = 0.0
+
+    status = set_canonical_status(0, status)  # 仅做合法性校验
+
+    placeholder = next_canonical_sku(master_conn)
+    ts = _now_str()
+    try:
+        cur = master_conn.execute(
+            """INSERT INTO canonical_items
+               (canonical_sku, name, category_code, unit, gram_per_unit,
+                aux_unit, aux_rate, barcode, status, created_from,
+                created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (placeholder, name, category_code, unit, gram_per_unit,
+             aux_unit, aux_rate, barcode, status, created_from,
+             created_by, ts, ts),
+        )
+        new_id = int(cur.lastrowid)
+        final_sku = f"IC-{new_id:06d}"
+        master_conn.execute(
+            "UPDATE canonical_items SET canonical_sku=? WHERE id=?",
+            (final_sku, new_id),
+        )
+        master_conn.commit()
+    except Exception:
+        master_conn.rollback()
+        raise
+
+    return {
+        "id": new_id,
+        "canonical_sku": final_sku,
+        "name": name,
+        "category_code": category_code,
+        "unit": unit,
+        "gram_per_unit": gram_per_unit,
+        "aux_unit": aux_unit,
+        "aux_rate": aux_rate,
+        "barcode": barcode,
+        "status": status,
+        "created_from": created_from,
+        "created_by": created_by,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def update_canonical_item(
+    master_conn: sqlite3.Connection,
+    canonical_id: int,
+    fields: dict[str, Any],
+) -> dict:
+    """T4 —— 更新 canonical_items。
+
+    允许的字段:name / unit / gram_per_unit / aux_unit / aux_rate /
+              category_code / barcode / status。
+    **绝不能** 改 id / canonical_sku / created_from / created_by / created_at。
+
+    Raises:
+        ValueError: 字段不允许
+        DeactivateOnlyViolation: status='deleted'
+    """
+    master_conn.row_factory = sqlite3.Row
+    allowed = {
+        "name", "unit", "gram_per_unit", "aux_unit", "aux_rate",
+        "category_code", "barcode", "status",
+    }
+    bad = set(fields) - allowed
+    if bad:
+        raise ValueError(f"字段 {sorted(bad)} 不可更新")
+
+    # status 合法性（Q3=deactivate_only）
+    if "status" in fields:
+        fields["status"] = set_canonical_status(canonical_id, fields["status"])
+
+    # 派生关系（§1.8.2）
+    if fields.get("aux_unit") is not None and fields.get("aux_unit") != "克":
+        fields["gram_per_unit"] = 0.0
+    elif (
+        "aux_rate" in fields and fields.get("aux_unit") != "克"
+    ):
+        fields["gram_per_unit"] = 0.0
+
+    if not fields:
+        return get_canonical_item_detail(master_conn, canonical_id)
+
+    fields["updated_at"] = _now_str()
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    cur = master_conn.execute(
+        f"UPDATE canonical_items SET {set_clause} WHERE id=?",
+        (*fields.values(), canonical_id),
+    )
+    if cur.rowcount == 0:
+        raise ValueError(f"canonical_id={canonical_id} 不存在")
+    master_conn.commit()
+    return get_canonical_item_detail(master_conn, canonical_id)
+
+
+def list_canonical_items(
+    master_conn: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    category_code: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict]:
+    """T4 —— 列出 canonical_items。"""
+    master_conn.row_factory = sqlite3.Row
+    where_parts: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        where_parts.append("status = ?")
+        params.append(status)
+    if category_code is not None:
+        where_parts.append("category_code = ?")
+        params.append(category_code)
+    where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    params.extend([limit, offset])
+    rows = master_conn.execute(
+        f"""SELECT * FROM canonical_items{where}
+            ORDER BY id LIMIT ? OFFSET ?""",
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_canonical_item_detail(
+    master_conn: sqlite3.Connection,
+    canonical_id: int,
+) -> dict:
+    """T4 —— 查单条 canonical_items + 别名 + 跨仓 binding 概览。"""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT * FROM canonical_items WHERE id=?", (canonical_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"canonical_id={canonical_id} 不存在")
+    detail = dict(row)
+    # 别名（PRD P1-6 全局别名可见）
+    detail["aliases"] = [
+        dict(r) for r in master_conn.execute(
+            "SELECT * FROM canonical_item_aliases WHERE canonical_id=?",
+            (canonical_id,),
+        ).fetchall()
+    ]
+    return detail
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T5 — Categories (Spec §2.3 + §6.1 CATEGORY_CODE_MAP)
+# ─────────────────────────────────────────────────────────────────────
+
+def seed_canonical_categories(master_conn: sqlite3.Connection) -> list[dict]:
+    """T5 —— 用 config.FIXED_CATEGORIES + CATEGORY_CODE_MAP 初始化
+    canonical_categories。已存在的跳过（幂等）。
+    """
+    master_conn.row_factory = sqlite3.Row
+    ts = _now_str()
+    inserted: list[dict] = []
+    for name in FIXED_CATEGORIES:
+        code = CATEGORY_CODE_MAP.get(name)
+        if code is None:
+            # 不在映射表里的本地名 → 跳过（不应发生,因为映射表覆盖全部 9 个）
+            continue
+        existing = master_conn.execute(
+            "SELECT id FROM canonical_categories WHERE code=?", (code,)
+        ).fetchone()
+        if existing is not None:
+            continue
+        cur = master_conn.execute(
+            """INSERT INTO canonical_categories
+               (code, name, description, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (code, name, "FIXED_CATEGORIES 种子", ts, ts),
+        )
+        inserted.append({"id": int(cur.lastrowid), "code": code, "name": name})
+    master_conn.commit()
+    return inserted
+
+
+def backfill_category_mappings(wh_conn: sqlite3.Connection) -> dict:
+    """T5 —— 对单仓:把 categories.canonical_code 按 name-exact 填入
+    CATEGORY_CODE_MAP 映射表。**仅当 name 完全一致**(绝不猜)。
+
+    返回:{"filled": N, "missing": [name1, name2, ...]}
+    """
+    wh_conn.row_factory = sqlite3.Row
+    filled = 0
+    missing: list[str] = []
+    rows = wh_conn.execute(
+        "SELECT id, name, canonical_code FROM categories"
+    ).fetchall()
+    for r in rows:
+        if r["canonical_code"]:
+            continue  # 已映射
+        code = CATEGORY_CODE_MAP.get(r["name"])
+        if code is None:
+            missing.append(r["name"])
+            continue
+        wh_conn.execute(
+            "UPDATE categories SET canonical_code=? WHERE id=?", (code, r["id"])
+        )
+        filled += 1
+    wh_conn.commit()
+    return {"filled": filled, "missing": missing}
+
+
+def list_missing_category_mappings(
+    master_conn: sqlite3.Connection,
+    wh_code: str | None = None,
+) -> list[dict]:
+    """T5 —— 列出全仓(或指定仓)中未映射到 canonical_code 的本地分类。
+
+    wh_code=None → 遍历所有仓库返回合并视图。
+    """
+    from config import BASE_DIR  # local import to avoid circular at module load
+
+    master_conn.row_factory = sqlite3.Row
+    missing: list[dict] = []
+    wh_rows = master_conn.execute(
+        "SELECT code, db_path FROM warehouses"
+    ).fetchall()
+    for wh in wh_rows:
+        if wh_code is not None and wh["code"] != wh_code:
+            continue
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, name FROM categories
+                   WHERE canonical_code IS NULL OR canonical_code = ''"""
+            ).fetchall()
+            for r in rows:
+                missing.append({
+                    "warehouse_code": wh["code"],
+                    "category_id": r["id"],
+                    "category_name": r["name"],
+                })
+    return missing
+
+
+def resolve_category_id(
+    master_conn: sqlite3.Connection,
+    wh_conn: sqlite3.Connection,
+    canonical_category_code: str | None,
+    wh_category_name: str | None,
+) -> int:
+    """T5 —— 给定一个 canonical code + 仓本地名,返回该仓 categories.id。
+
+    优先按 canonical_code 查;若无则按 name 查;两者都没有则按 name 创建。
+    """
+    wh_conn.row_factory = sqlite3.Row
+    if canonical_category_code:
+        row = wh_conn.execute(
+            "SELECT id FROM categories WHERE canonical_code=?",
+            (canonical_category_code,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+    if wh_category_name:
+        row = wh_conn.execute(
+            "SELECT id FROM categories WHERE name=?",
+            (wh_category_name,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        # 兜底创建
+        cur = wh_conn.execute(
+            """INSERT INTO categories (name, description, created_at)
+               VALUES (?, 'canonical auto-created', ?)""",
+            (wh_category_name, _now_str()),
+        )
+        wh_conn.commit()
+        return int(cur.lastrowid)
+    raise ValueError("必须提供 canonical_category_code 或 wh_category_name")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T6 — Strong signal detection (Spec §3.1)
+# ─────────────────────────────────────────────────────────────────────
+
+# Spec §3.1: ^(?:pre)[A-Za-z]{2}\d{3}-(stem)-(rand)\d{3,4}$
+_SKU_RE = re.compile(
+    r"^(?P<pre>[A-Za-z]{2,3}\d{3,4})-(?P<stem>.+)-(?P<rand>\d{3,6})$"
+)
+
+
+def parse_local_sku(sku: str) -> dict[str, Any]:
+    """T6 —— 解析门店 SKU 为 {pre, stem, rand}。解析失败时只返回原始 sku。
+
+    WH001-冰块-9935 → {pre:'WH001', stem:'冰块', rand:'9935'}
+    """
+    m = _SKU_RE.match(sku or "")
+    if not m:
+        return {"raw": sku, "pre": None, "stem": None, "rand": None}
+    return {"raw": sku, "pre": m.group("pre"), "stem": m.group("stem"),
+            "rand": m.group("rand")}
+
+
+def normalize_name(name: str) -> str:
+    """T6 —— 归一化中文名:去空格 / 去常见前后缀。不做语义改写。"""
+    if not name:
+        return ""
+    s = name.strip()
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def name_similarity(a: str, b: str) -> float:
+    """T6 —— 名称相似度,使用 difflib.SequenceMatcher。"""
+    return SequenceMatcher(None, a or "", b or "").ratio()
+
+
+def _confidence_signals(
+    rows: list[dict[str, Any]],
+) -> tuple[float, dict[str, Any]]:
+    """Spec §3.1 校准:多信号加权。
+
+    主判据(SKU 全等)—— team-lead 修正:WP 编号 5 仓已完全一致,
+    直接以 SKU 简名全等为主判据(权重 0.6)。
+
+    名称相似度降为辅助(权重 0.3)。
+    单位一致(权重 0.1)作为门槛。
+    """
+    units = {r.get("unit") for r in rows if r.get("unit")}
+    if len(units) > 1:
+        return 0.0, {"reason": "unit_mismatch"}
+
+    # 1. SKU 简名全等
+    stems = set()
+    for r in rows:
+        sku_info = parse_local_sku(r.get("sku", ""))
+        if sku_info["stem"]:
+            stems.add(sku_info["stem"])
+    if len(stems) == 1 and len(rows) >= 2:
+        return 0.6, {"primary": "sku_full_match", "stem": next(iter(stems))}
+
+    # 2. 名称相似度 (主指标低于 0.6 时降级)
+    names = [normalize_name(r.get("name", "")) for r in rows]
+    if len(names) >= 2 and all(names):
+        ratios = []
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                ratios.append(name_similarity(names[i], names[j]))
+        if ratios:
+            avg = sum(ratios) / len(ratios)
+            return 0.3 + 0.3 * avg, {"primary": "name_similarity", "avg_ratio": avg}
+    return 0.0, {"primary": "no_signal"}
+
+
+def detect_similar_items(rows_per_wh: dict[str, list[dict[str, Any]]]) -> list[dict]:
+    """T6 —— 跨仓相似检测（Spec §3.1 校准）。
+
+    输入:rows_per_wh = {warehouse_code: [item_row, ...]}
+        item_row 至少含 sku / name / unit 字段。
+    输出:候选分组列表,每组形如:
+        {"members": [...], "confidence": float, "signals": {...}}
+
+    实现:按 unit 分组 → 每组内两两比较 → 用 _confidence_signals 计算。
+    不写 SQL,纯 Python。
+    """
+    groups: dict[tuple[str, ...], dict[str, list[dict]]] = {}
+    for wh_code, rows in rows_per_wh.items():
+        for r in rows:
+            unit = r.get("unit", "")
+            key = (unit,)
+            groups.setdefault(key, {}).setdefault(wh_code, []).append(r)
+
+    out: list[dict] = []
+    for (unit,), wh_map in groups.items():
+        if len(wh_map) < 2:
+            continue
+        flat = []
+        for wh_code, rs in wh_map.items():
+            for r in rs:
+                flat.append({**r, "_warehouse_code": wh_code})
+        # 简化:整组做一次 confidence（不展开到 N×N 配对,避免噪声）
+        confidence, signals = _confidence_signals(flat)
+        if confidence < 0.5:
+            continue
+        out.append({
+            "unit": unit,
+            "members": flat,
+            "confidence": round(confidence, 3),
+            "signals": signals,
+        })
+    return out
+
+
+def collect_all_items(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    """T6 —— 跨仓收集 items 用于强信号检测。只 SELECT 必要列。"""
+    from config import BASE_DIR  # 避免循环 import
+
+    master_conn.row_factory = sqlite3.Row
+    out: dict[str, list[dict]] = {}
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path, warehouse_type
+           FROM warehouses
+           WHERE warehouse_type='storefront'"""
+    ).fetchall()
+    for wh in wh_rows:
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            # select_item_columns 动态列(避免 initial_quantity 不存在时抛异常)
+            cols = select_item_columns(conn)
+            want = [c for c in ("sku", "name", "unit", "category_id")
+                    if c in cols]
+            select_clause = ", ".join(want)
+            rows = conn.execute(
+                f"SELECT id, {select_clause} FROM items"
+            ).fetchall()
+            out[wh["code"]] = [dict(r) for r in rows]
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T7 — Claim / Unclaim / Submit / Review (Spec §3.2 + §1.6.4 + §7.7.4)
+# ─────────────────────────────────────────────────────────────────────
+
+# Spec §3.2 铁律:认领只允许写这 3(+1) 列。
+ALLOWED_CLAIM_UPDATES: frozenset[str] = frozenset(
+    {"canonical_id", "is_alias", "canonical_status", "updated_at"}
+)
+
+
+def claim_item(
+    master_conn: sqlite3.Connection,
+    wh_conn: sqlite3.Connection,
+    *,
+    warehouse_code: str,
+    local_item_id: int,
+    canonical_id: int,
+    is_alias: bool = False,
+    is_store_exclusive: bool = False,
+    submitted_by: int | None = None,
+    local_keep_name: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """T7 —— 认领一个 items 行到 canonical_items.id。
+
+    实现 Spec §3.2 铁律:
+      - 写 items 行: 仅 canonical_id / is_alias / canonical_status / is_store_exclusive / updated_at
+      - 不动 name / unit / category_id / quantity / safety_stock / selling_price / unit_cost
+      - 乐观锁: WHERE canonical_id IS NULL,rowcount==0 → 409
+      - 备份 + 三快照校验(Q7 §7.7.2)
+
+    Returns: 写入后的 items 行 + master 侧 claim_requests.id
+    Raises:
+        NewItemDenied / ValueError / 等
+    """
+    master_conn.row_factory = sqlite3.Row
+    wh_conn.row_factory = sqlite3.Row
+
+    # 1. 校验 canonical_id 存在
+    canon = master_conn.execute(
+        "SELECT * FROM canonical_items WHERE id=?", (canonical_id,)
+    ).fetchone()
+    if canon is None:
+        raise ValueError(f"canonical_id={canonical_id} 不存在")
+
+    # 2. 校验 items 行存在 + 拿当前行做断言
+    row = wh_conn.execute(
+        "SELECT * FROM items WHERE id=?", (local_item_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"warehouse={warehouse_code} local_item_id={local_item_id} 不存在"
+        )
+    if row["canonical_id"] is not None:
+        raise ValueError(
+            f"该行已被认领到 canonical_id={row['canonical_id']}；"
+            f"若要改绑定，请先 unclaim"
+        )
+
+    # 3. Q7: 备份 + 拍快照
+    wh_path = Path(wh_conn.execute("PRAGMA database_list").fetchone()["file"])
+    backup_path = backup_warehouse_db(wh_path, tag="pre-claim")
+    before_ids = {r["id"] for r in wh_conn.execute("SELECT id FROM items")}
+    before_inv = snapshot_inventory(wh_conn)
+    before_cnt = wh_conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+
+    # 4. 单位族不匹配检查（§1.8.5 + §7.10）—— 不阻断认领,记 canonical_conflicts
+    has_unit_conflict = (row["unit"] != canon["unit"])
+    if has_unit_conflict:
+        master_conn.execute(
+            """INSERT INTO canonical_conflicts
+               (canonical_id, warehouse_code, local_item_id, field,
+                conflict_type, canonical_value, local_value, last_synced_value,
+                status, created_at)
+               VALUES (?, ?, ?, 'unit', 'unit_conversion', ?, ?, NULL,
+                       'open', ?)""",
+            (canonical_id, warehouse_code, local_item_id,
+             str(canon["unit"]), str(row["unit"]), _now_str()),
+        )
+
+    # 5. 单事务写仓
+    try:
+        wh_conn.execute("BEGIN IMMEDIATE")
+        cur = wh_conn.execute(
+            """UPDATE items
+               SET canonical_id=?, is_alias=?, canonical_status=?,
+                   is_store_exclusive=?, updated_at=?
+               WHERE id=? AND canonical_id IS NULL""",
+            (canonical_id, 1 if is_alias else 0, "active",
+             1 if is_store_exclusive else 0,
+             _now_str(), local_item_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("乐观锁失败：行已被并发认领")
+        # 断言:严格只允许写这 4 列(避免未来代码漂移)
+        # 我们已通过 SQL 字面量保证;此处再做行级断言
+        new_row = wh_conn.execute(
+            "SELECT * FROM items WHERE id=?", (local_item_id,)
+        ).fetchone()
+        # 业务字段完全未变(除了 updated_at)
+        for col in ("name", "unit", "category_id", "quantity",
+                    "safety_stock", "selling_price", "unit_cost"):
+            assert new_row[col] == row[col], (
+                f"认领后业务字段 {col} 变化: {row[col]!r} -> {new_row[col]!r}"
+            )
+        assert_inventory_unchanged(before_inv, snapshot_inventory(wh_conn))
+        assert_ids_stable(before_ids,
+                          {r["id"] for r in wh_conn.execute("SELECT id FROM items")})
+        assert_row_count_conserved(wh_conn, "items", before_cnt)
+        wh_conn.commit()
+    except Exception:
+        wh_conn.rollback()
+        raise
+
+    # 6. master 侧写认领记录 + 别名
+    req_cur = master_conn.execute(
+        """INSERT INTO canonical_claim_requests
+           (warehouse_code, local_item_id, local_sku, local_name,
+            canonical_id, local_keep_name, request_type, reason, status,
+            submitted_by, reviewed_by, reviewed_at, review_note,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'claim', ?, 'approved',
+                   ?, ?, ?, ?, ?)""",
+        (warehouse_code, local_item_id, row["sku"], row["name"],
+         canonical_id, local_keep_name, reason,
+         submitted_by, submitted_by, _now_str(), "auto-approved on claim",
+         _now_str()),
+    )
+    request_id = int(req_cur.lastrowid)
+    if local_keep_name:
+        master_conn.execute(
+            """INSERT INTO canonical_item_aliases
+               (canonical_id, alias, normalized_alias, warehouse_code,
+                source, created_at)
+               VALUES (?, ?, ?, ?, 'storefront_claim', ?)""",
+            (canonical_id, local_keep_name, normalize_name(local_keep_name),
+             warehouse_code, _now_str()),
+        )
+    master_conn.commit()
+
+    return {
+        "warehouse_code": warehouse_code,
+        "local_item_id": local_item_id,
+        "canonical_id": canonical_id,
+        "is_alias": 1 if is_alias else 0,
+        "is_store_exclusive": 1 if is_store_exclusive else 0,
+        "canonical_status": "active",
+        "request_id": request_id,
+        "backup_path": str(backup_path),
+        "unit_conflict": has_unit_conflict,
+    }
+
+
+def unclaim_item(
+    master_conn: sqlite3.Connection,
+    wh_conn: sqlite3.Connection,
+    *,
+    warehouse_code: str,
+    local_item_id: int,
+    reviewed_by: int | None = None,
+    reason: str | None = None,
+) -> dict:
+    """T7 —— 解绑(对称于 claim_item,§7.8.3)。
+
+    严格 ALLOWED_CLAIM_UPDATES 写 3 列 NULL/0。
+    业务字段一行不动(对称性是硬要求)。
+    """
+    master_conn.row_factory = sqlite3.Row
+    wh_conn.row_factory = sqlite3.Row
+
+    row = wh_conn.execute(
+        "SELECT * FROM items WHERE id=?", (local_item_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"local_item_id={local_item_id} 不存在")
+    if row["canonical_id"] is None:
+        raise ValueError("该行未纳管,无需解绑")
+    canonical_id = int(row["canonical_id"])
+
+    # 整组校验:同 canonical_id 在本仓绑了 N 行,要求一次全解(否则 2 行悬空)
+    siblings = wh_conn.execute(
+        "SELECT id FROM items WHERE canonical_id=? AND id!=?",
+        (canonical_id, local_item_id),
+    ).fetchall()
+    if siblings:
+        raise ValueError(
+            f"本仓还有 {len(siblings)} 行绑同一 canonical_id={canonical_id}，"
+            f"需一次解绑整组(IDs={[s['id'] for s in siblings]})"
+        )
+
+    # Q7: 备份 + 三快照
+    wh_path = Path(wh_conn.execute("PRAGMA database_list").fetchone()["file"])
+    backup_warehouse_db(wh_path, tag="pre-unclaim")
+    before_ids = {r["id"] for r in wh_conn.execute("SELECT id FROM items")}
+    before_inv = snapshot_inventory(wh_conn)
+    before_cnt = wh_conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+
+    try:
+        wh_conn.execute("BEGIN IMMEDIATE")
+        cur = wh_conn.execute(
+            """UPDATE items
+               SET canonical_id=NULL, is_alias=0, canonical_status=NULL,
+                   updated_at=?
+               WHERE id=? AND canonical_id=?""",
+            (_now_str(), local_item_id, canonical_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("乐观锁失败:行已被并发修改")
+        new_row = wh_conn.execute(
+            "SELECT * FROM items WHERE id=?", (local_item_id,)
+        ).fetchone()
+        for col in ("name", "unit", "category_id", "quantity",
+                    "safety_stock", "selling_price", "unit_cost"):
+            assert new_row[col] == row[col], (
+                f"解绑后业务字段 {col} 变化"
+            )
+        assert_inventory_unchanged(before_inv, snapshot_inventory(wh_conn))
+        assert_ids_stable(before_ids,
+                          {r["id"] for r in wh_conn.execute("SELECT id FROM items")})
+        assert_row_count_conserved(wh_conn, "items", before_cnt)
+        wh_conn.commit()
+    except Exception:
+        wh_conn.rollback()
+        raise
+
+    # master: 把对应 claim_requests 标 cancelled
+    master_conn.execute(
+        """UPDATE canonical_claim_requests
+           SET status='cancelled', reviewed_by=?, reviewed_at=?, review_note=?
+           WHERE warehouse_code=? AND local_item_id=? AND status='approved'
+           ORDER BY id DESC LIMIT 1""",
+        (reviewed_by, _now_str(), reason or "unclaimed",
+         warehouse_code, local_item_id),
+    )
+    master_conn.commit()
+    return {
+        "warehouse_code": warehouse_code,
+        "local_item_id": local_item_id,
+        "canonical_id": canonical_id,
+        "action": "unclaimed",
+    }
+
+
+def submit_claim_request(
+    master_conn: sqlite3.Connection,
+    *,
+    warehouse_code: str,
+    local_item_id: int | None = None,
+    local_sku: str | None = None,
+    local_name: str,
+    canonical_id: int | None = None,
+    proposed_category_code: str | None = None,
+    proposed_unit: str | None = None,
+    request_type: str = "claim",
+    reason: str | None = None,
+    submitted_by: int | None = None,
+) -> int:
+    """T24 —— 写一条 canonical_claim_requests。返回 request_id。"""
+    if request_type not in ("claim", "new_item", "exempt"):
+        raise ValueError(f"未知 request_type: {request_type!r}")
+    if request_type == "new_item" and not proposed_category_code:
+        raise ValueError("new_item 类申请必须提供 proposed_category_code")
+    if request_type == "claim" and canonical_id is None:
+        raise ValueError("claim 类申请必须提供 canonical_id")
+    master_conn.row_factory = sqlite3.Row
+    cur = master_conn.execute(
+        """INSERT INTO canonical_claim_requests
+           (warehouse_code, local_item_id, local_sku, local_name,
+            canonical_id, proposed_category_code, proposed_unit,
+            request_type, reason, status, submitted_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+        (warehouse_code, local_item_id, local_sku, local_name,
+         canonical_id, proposed_category_code, proposed_unit,
+         request_type, reason, submitted_by, _now_str()),
+    )
+    master_conn.commit()
+    return int(cur.lastrowid)
+
+
+def review_claim_request(
+    master_conn: sqlite3.Connection,
+    *,
+    request_id: int,
+    decision: str,  # 'approved' | 'rejected'
+    reviewed_by: int,
+    review_note: str | None = None,
+) -> dict:
+    """T24 —— 批准/驳回 canonical_claim_requests。"""
+    if decision not in ("approved", "rejected"):
+        raise ValueError(f"decision 必须是 approved/rejected，得到 {decision!r}")
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT * FROM canonical_claim_requests WHERE id=?", (request_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"request_id={request_id} 不存在")
+    if row["status"] != "pending":
+        raise ValueError(f"request_id={request_id} 已是 {row['status']}，不能再审")
+
+    master_conn.execute(
+        """UPDATE canonical_claim_requests
+           SET status=?, reviewed_by=?, reviewed_at=?, review_note=?
+           WHERE id=?""",
+        (decision, reviewed_by, _now_str(), review_note, request_id),
+    )
+    master_conn.commit()
+    return {"request_id": request_id, "status": decision}
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T8 — Fanout (Spec §3.3, §3.5) —— M2 关键路径
+# ─────────────────────────────────────────────────────────────────────
+
+# Spec §3.3 写回主数据后,canonical_synced_json 仅含写入的字段
+def _syncable_snapshot(canonical_row: dict) -> dict[str, Any]:
+    """构造 canonical_synced_json(只含 is_syncable_field 的字段)。"""
+    snap: dict[str, Any] = {}
+    for field in ("name", "unit", "gram_per_unit", "aux_unit", "aux_rate"):
+        if is_syncable_field(field):
+            snap[field] = canonical_row.get(field)
+    return snap
+
+
+def apply_canonical_to_warehouse(
+    wh_conn: sqlite3.Connection,
+    canonical: dict[str, Any],
+    last_snapshot: dict[str, Any] | None,
+    action: str = "overwrite",
+    force: bool = False,
+) -> dict:
+    """Spec §3.5 判定顺序:
+      1) 先算冻结(local != last_synced)
+      2) action 只决定"对未冻结字段怎么处理"
+      3) force 跳过第 1 步
+
+    Returns: {
+      "written": {field: value, ...},
+      "frozen": {field: {"canonical": ..., "local": ..., "last": ...}, ...},
+      "inserted": bool,
+      "skipped_reason": str|None,
+    }
+    """
+    wh_conn.row_factory = sqlite3.Row
+
+    # 命中:先按 canonical_id,再按 sku
+    canon_id = canonical["id"]
+    existing = wh_conn.execute(
+        "SELECT * FROM items WHERE canonical_id=?", (canon_id,)
+    ).fetchone()
+    if existing is None:
+        # 兜底:按 sku 匹配(历史上某些行没 canonical_id 但 sku 与 canonical_sku 同)
+        # 注:§6.1.1 严格决策里 sku 永远不一致(主数据 sku 与门店 sku 不同),此分支基本不可达
+        # 保留是为了兜底历史数据
+        existing = wh_conn.execute(
+            "SELECT * FROM items WHERE sku=?", (canonical["canonical_sku"],)
+        ).fetchone()
+
+    if existing is None:
+        # 未命中 —— INSERT 新行(quantity=0, safety_stock=0)
+        new_sku = f"AUTO-{canonical['canonical_sku']}"  # 唯一不撞门店 SKU
+        wh_conn.execute(
+            """INSERT INTO items
+               (sku, name, category_id, quantity, safety_stock,
+                unit, gram_per_unit, aux_unit, aux_rate,
+                updated_at, canonical_id, is_alias, canonical_status,
+                canonical_synced_json)
+               VALUES (?, ?, 0, 0, 0,
+                       ?, ?, ?, ?,
+                       ?, ?, 0, 'active', ?)""",
+            (
+                new_sku, canonical["name"],
+                canonical["unit"], canonical["gram_per_unit"],
+                canonical["aux_unit"], canonical["aux_rate"],
+                _now_str(), canon_id,
+                json.dumps(_syncable_snapshot(canonical), ensure_ascii=False),
+            ),
+        )
+        return {
+            "written": _syncable_snapshot(canonical),
+            "frozen": {},
+            "inserted": True,
+            "skipped_reason": None,
+        }
+
+    # 命中 —— 逐字段判定
+    written: dict[str, Any] = {}
+    frozen: dict[str, Any] = {}
+
+    for field in ("name", "unit", "gram_per_unit", "aux_unit", "aux_rate"):
+        if not is_syncable_field(field):
+            continue
+        target_col = CANONICAL_FIELD_POLICY[field][1]
+        if target_col == "__canonical_status__":
+            target_col = "canonical_status"
+
+        local = existing[target_col]
+        last = (last_snapshot or {}).get(field)
+        cval = canonical[field]
+        # None normalization
+        if last is None:
+            last_for_cmp = object()  # 用哨兵对象
+        else:
+            last_for_cmp = last
+
+        # 判定
+        verdict = resolve_conflict_policy(
+            local, last_for_cmp if last_for_cmp is not object() else None,
+            cval, force=force,
+        )
+        if verdict == "frozen":
+            frozen[field] = {
+                "canonical": cval, "local": local, "last": last,
+            }
+            continue
+        if verdict == "force_only" and not force:
+            frozen[field] = {
+                "canonical": cval, "local": local, "last": last,
+            }
+            continue
+        # allowed 或 force_only-with-force
+        written[field] = cval
+
+    # §1.8.2 派生关系
+    if "aux_unit" in written or "aux_rate" in written:
+        new_aux_unit = written.get("aux_unit", existing["aux_unit"])
+        new_aux_rate = written.get("aux_rate", existing["aux_rate"])
+        written["gram_per_unit"] = (
+            new_aux_rate if new_aux_unit == "克" else 0.0
+        )
+
+    # 单元族整组冻结:任一字段冲突 → 整组不写(§1.8)
+    unit_fields = {"unit", "gram_per_unit", "aux_unit", "aux_rate"}
+    if any(f in frozen for f in unit_fields) and not force:
+        for f in unit_fields:
+            if f in written:
+                del written[f]
+
+    # action 语义:keep 不覆盖已有,merge 只补空
+    if action == "keep" and not frozen:
+        # keep 模式下不写已有字段(新建除外)
+        written = {}
+
+    # status 特殊处理:写 canonical_status
+    if "status" in CANONICAL_FIELD_POLICY:
+        cstatus = canonical.get("status", "active")
+        if cstatus in ("active", "disabled", "inactive"):
+            if existing["canonical_status"] != cstatus:
+                written["__canonical_status__"] = cstatus
+
+    return {
+        "written": written,
+        "frozen": frozen,
+        "inserted": False,
+        "skipped_reason": None,
+    }
+
+
+def fanout_canonical_items(
+    master_conn: sqlite3.Connection,
+    wh_db_map: dict[str, sqlite3.Connection],
+    *,
+    canonical_ids: list[int],
+    warehouse_codes: list[str],
+    action: str = "overwrite",
+    force: bool = False,
+    dry_run: bool = False,
+    started_by: int | None = None,
+    summary: str | None = None,
+) -> dict:
+    """T8 —— 主扇出函数。Spec §3.3 时序图完整实现。
+
+    Args:
+        wh_db_map: {warehouse_code: sqlite3.Connection}
+        canonical_ids: 要下发的 canonical_items.id 列表
+        warehouse_codes: 目标仓列表
+        action: keep / merge / overwrite / force(force 通过 force=True 走)
+        dry_run: True 时只算 plan,不写库
+    Returns:
+        {
+          "event_id": int,
+          "dry_run": bool,
+          "per_canonical": [{canonical_id, per_warehouse: [{wh_code, written, frozen, ...}]}],
+          "total_written": int,
+          "total_frozen": int,
+          "status": "complete" | "partial" | "failed",
+        }
+    """
+    master_conn.row_factory = sqlite3.Row
+    target_codes_json = json.dumps(sorted(warehouse_codes), ensure_ascii=False)
+    event_id: int | None = None
+    if not dry_run:
+        cur = master_conn.execute(
+            """INSERT INTO canonical_publish_events
+               (summary, status, started_by, started_at,
+                target_warehouse_codes_json, item_count)
+               VALUES (?, 'pending', ?, ?, ?, ?)""",
+            (summary or "fanout", started_by, _now_str(),
+             target_codes_json, len(canonical_ids)),
+        )
+        event_id = int(cur.lastrowid)
+        master_conn.commit()
+
+    per_canonical: list[dict] = []
+    total_written = 0
+    total_frozen = 0
+    any_partial = False
+    backup_paths: list[str] = []
+
+    for cid in canonical_ids:
+        canon_row = master_conn.execute(
+            "SELECT * FROM canonical_items WHERE id=?", (cid,)
+        ).fetchone()
+        if canon_row is None:
+            continue
+        canon = dict(canon_row)
+        per_wh: list[dict] = []
+        for wh_code in warehouse_codes:
+            conn = wh_db_map.get(wh_code)
+            if conn is None:
+                continue
+            try:
+                conn.row_factory = sqlite3.Row
+                # 读上一次同步快照
+                row = conn.execute(
+                    """SELECT canonical_synced_json FROM items
+                       WHERE canonical_id=?""", (cid,)
+                ).fetchone()
+                last_snapshot = None
+                if row and row["canonical_synced_json"]:
+                    try:
+                        last_snapshot = json.loads(row["canonical_synced_json"])
+                    except json.JSONDecodeError:
+                        last_snapshot = None
+
+                result = apply_canonical_to_warehouse(
+                    conn, canon, last_snapshot,
+                    action=action, force=force,
+                )
+
+                # 写入主数据字段
+                if not dry_run and result["written"]:
+                    written = result["written"]
+                    # 分组:业务字段 vs canonical_status 字段
+                    set_parts: list[str] = []
+                    params: list[Any] = []
+                    for field, val in written.items():
+                        if field == "__canonical_status__":
+                            set_parts.append("canonical_status=?")
+                            params.append(val)
+                        else:
+                            col = CANONICAL_FIELD_POLICY[field][1] or field
+                            set_parts.append(f"{col}=?")
+                            params.append(val)
+                    # 同步 JSON
+                    new_snap = dict(last_snapshot or {})
+                    new_snap.update({
+                        k: v for k, v in written.items()
+                        if k != "__canonical_status__"
+                    })
+                    set_parts.append("canonical_synced_json=?")
+                    params.append(json.dumps(new_snap, ensure_ascii=False))
+                    set_parts.append("updated_at=?")
+                    params.append(_now_str())
+                    params.append(cid)
+                    conn.execute(
+                        f"""UPDATE items SET {', '.join(set_parts)}
+                            WHERE canonical_id=?""",
+                        params,
+                    )
+                    conn.commit()
+
+                # 写冲突行
+                if not dry_run and result["frozen"]:
+                    for field, vals in result["frozen"].items():
+                        master_conn.execute(
+                            """INSERT INTO canonical_conflicts
+                               (canonical_id, warehouse_code, local_item_id,
+                                publish_event_id, field, conflict_type,
+                                canonical_value, local_value, last_synced_value,
+                                status, created_at)
+                               VALUES (?, ?, ?, ?, ?, 'value',
+                                       ?, ?, ?, 'open', ?)""",
+                            (
+                                cid, wh_code,
+                                int(conn.execute(
+                                    "SELECT id FROM items WHERE canonical_id=?",
+                                    (cid,)
+                                ).fetchone()["id"]) if conn.execute(
+                                    "SELECT id FROM items WHERE canonical_id=?",
+                                    (cid,)
+                                ).fetchone() else 0,
+                                event_id,
+                                field,
+                                str(vals["canonical"]),
+                                str(vals["local"]),
+                                str(vals["last"]) if vals["last"] is not None else None,
+                                _now_str(),
+                            ),
+                        )
+
+                # 写 per-item 事件
+                if not dry_run and event_id is not None:
+                    item_status = (
+                        "conflict" if result["frozen"] else "success"
+                    )
+                    local_row = conn.execute(
+                        "SELECT id FROM items WHERE canonical_id=?", (cid,)
+                    ).fetchone()
+                    master_conn.execute(
+                        """INSERT INTO canonical_publish_event_items
+                           (publish_event_id, canonical_id, target_warehouse_code,
+                            local_item_id, status, applied_fields_json,
+                            skipped_fields_json)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            event_id, cid, wh_code,
+                            int(local_row["id"]) if local_row else None,
+                            item_status,
+                            json.dumps(
+                                {k: v for k, v in result["written"].items()
+                                 if k != "__canonical_status__"},
+                                ensure_ascii=False,
+                            ),
+                            json.dumps(list(result["frozen"].keys()),
+                                       ensure_ascii=False),
+                        ),
+                    )
+
+                if result["written"]:
+                    total_written += len(result["written"])
+                if result["frozen"]:
+                    total_frozen += len(result["frozen"])
+                    any_partial = True
+                per_wh.append({
+                    "warehouse_code": wh_code,
+                    "written": result["written"],
+                    "frozen": result["frozen"],
+                    "inserted": result["inserted"],
+                })
+            except Exception as exc:  # noqa: BLE001
+                per_wh.append({
+                    "warehouse_code": wh_code,
+                    "error": str(exc),
+                })
+                any_partial = True
+
+        per_canonical.append({
+            "canonical_id": cid,
+            "canonical_sku": canon["canonical_sku"],
+            "per_warehouse": per_wh,
+        })
+
+    # 更新事件状态
+    if not dry_run and event_id is not None:
+        final_status = (
+            "failed" if total_written == 0 and total_frozen == 0
+            else "partial" if any_partial else "complete"
+        )
+        master_conn.execute(
+            """UPDATE canonical_publish_events
+               SET status=?, completed_at=?, backup_paths_json=?
+               WHERE id=?""",
+            (final_status, _now_str(),
+             json.dumps(backup_paths, ensure_ascii=False) or None,
+             event_id),
+        )
+        master_conn.commit()
+
+    return {
+        "event_id": event_id,
+        "dry_run": dry_run,
+        "per_canonical": per_canonical,
+        "total_written": total_written,
+        "total_frozen": total_frozen,
+        "status": (
+            "dry_run" if dry_run else
+            ("failed" if total_written == 0 and total_frozen == 0
+             else "partial" if any_partial else "complete")
+        ),
+    }
+
+
+def resolve_conflict(
+    master_conn: sqlite3.Connection,
+    *,
+    conflict_id: int,
+    decision: str,  # 'keep_local' | 'accept_canonical' | 'waive'
+    reviewed_by: int,
+    note: str | None = None,
+) -> dict:
+    """T8 —— 冲突裁决。"""
+    if decision not in ("keep_local", "accept_canonical", "waive"):
+        raise ValueError(f"decision 必须 keep_local/accept_canonical/waive, 得到 {decision!r}")
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT * FROM canonical_conflicts WHERE id=?", (conflict_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"conflict_id={conflict_id} 不存在")
+    if row["status"] != "open":
+        raise ValueError(f"conflict_id={conflict_id} 状态为 {row['status']}，不可再裁决")
+
+    master_conn.execute(
+        """UPDATE canonical_conflicts
+           SET status=?, resolution_note=?, resolved_by=?, resolved_at=?
+           WHERE id=?""",
+        (decision, note, reviewed_by, _now_str(), conflict_id),
+    )
+    master_conn.commit()
+    return {"conflict_id": conflict_id, "status": decision}
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T9 — Cross-warehouse reads + inspection (Spec §3.1 + §7.7.4 兜底)
+# ─────────────────────────────────────────────────────────────────────
+
+def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
+    """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。"""
+    from config import BASE_DIR
+
+    master_conn.row_factory = sqlite3.Row
+    out: dict[str, list[dict]] = {}
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path FROM warehouses
+           WHERE warehouse_type='storefront'"""
+    ).fetchall()
+    for wh in wh_rows:
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, sku, name, unit, canonical_id,
+                          is_alias, canonical_status, is_store_exclusive
+                   FROM items
+                   WHERE canonical_id IS NOT NULL"""
+            ).fetchall()
+            out[wh["code"]] = [dict(r) for r in rows]
+    return out
+
+
+def diff_summary(master_conn: sqlite3.Connection) -> dict:
+    """T9 —— 跨仓差异看板 4 类统计。"""
+    from config import BASE_DIR
+
+    master_conn.row_factory = sqlite3.Row
+    out = {
+        "by_canonical": {},      # canonical_id → {wh_count, members}
+        "unbound_count": 0,
+        "store_exclusive_count": 0,
+        "conflicts_open": 0,
+    }
+    bindings = collect_bindings(master_conn)
+    for wh_code, rows in bindings.items():
+        for r in rows:
+            cid = r["canonical_id"]
+            slot = out["by_canonical"].setdefault(
+                cid, {"warehouses": [], "members": []}
+            )
+            slot["warehouses"].append(wh_code)
+            slot["members"].append({"warehouse": wh_code, **r})
+
+    # unbound
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path FROM warehouses
+           WHERE warehouse_type='storefront'"""
+    ).fetchall()
+    unbound = 0
+    store_exclusive = 0
+    for wh in wh_rows:
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE canonical_id IS NULL"
+            ).fetchone()[0]
+            unbound += cnt
+            se = conn.execute(
+                """SELECT COUNT(*) FROM items
+                   WHERE is_store_exclusive=1"""
+            ).fetchone()[0]
+            store_exclusive += se
+    out["unbound_count"] = unbound
+    out["store_exclusive_count"] = store_exclusive
+
+    # conflicts open
+    row = master_conn.execute(
+        "SELECT COUNT(*) FROM canonical_conflicts WHERE status='open'"
+    ).fetchone()
+    out["conflicts_open"] = int(row[0])
+
+    return out
+
+
+def list_unbound_storefront_items(master_conn: sqlite3.Connection) -> list[dict]:
+    """T9 —— 列出所有仓中 canonical_id IS NULL 的品项。"""
+    from config import BASE_DIR
+
+    master_conn.row_factory = sqlite3.Row
+    out: list[dict] = []
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path FROM warehouses
+           WHERE warehouse_type='storefront'"""
+    ).fetchall()
+    for wh in wh_rows:
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, sku, name, unit, category_id, quantity,
+                          safety_stock, selling_price, unit_cost
+                   FROM items
+                   WHERE canonical_id IS NULL"""
+            ).fetchall()
+            for r in rows:
+                out.append({"warehouse_code": wh["code"], **dict(r)})
+    return out
+
+
+def find_orphan_bindings(master_conn: sqlite3.Connection) -> list[dict]:
+    """T9 —— 找孤儿引用(canonical_id 指向不存在的 master 主数据)。
+
+    Q3=deactivate_only 后,Q3 保证 canonical_items.status='inactive' 但不删行,
+    所以"孤儿"**不会**由 Q3 产生(原 canonical_items 行还在)。
+    本函数仍提供,用于发现手工改库造成的问题,不误报为缺主数据。
+    """
+    master_conn.row_factory = sqlite3.Row
+    out: list[dict] = []
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path FROM warehouses
+           WHERE warehouse_type='storefront'"""
+    ).fetchall()
+    for wh in wh_rows:
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, sku, name, canonical_id FROM items
+                   WHERE canonical_id IS NOT NULL"""
+            ).fetchall()
+            for r in rows:
+                # master 侧必须有这一行
+                exists = master_conn.execute(
+                    "SELECT 1 FROM canonical_items WHERE id=?",
+                    (r["canonical_id"],),
+                ).fetchone()
+                if exists is None:
+                    out.append({
+                        "warehouse_code": wh["code"],
+                        "local_item_id": r["id"],
+                        "sku": r["sku"],
+                        "name": r["name"],
+                        "canonical_id": r["canonical_id"],
+                    })
+    return out
+
+
+def list_store_exclusive_items(master_conn: sqlite3.Connection) -> list[dict]:
+    """T9 —— 列出所有 is_store_exclusive=1 的行(总部巡检输入)。"""
+    from config import BASE_DIR
+
+    master_conn.row_factory = sqlite3.Row
+    out: list[dict] = []
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path FROM warehouses
+           WHERE warehouse_type='storefront'"""
+    ).fetchall()
+    for wh in wh_rows:
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, sku, name, unit, category_id, quantity,
+                          canonical_id
+                   FROM items WHERE is_store_exclusive=1"""
+            ).fetchall()
+            for r in rows:
+                out.append({"warehouse_code": wh["code"], **dict(r)})
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T22 — Bulk create canonical items (CSV ingest)
+# ─────────────────────────────────────────────────────────────────────
+
+# 8 条种子数据(Spec §0.3 + §1.5)。8 = 9 条规格品项的桶装数 9 - 1 (WP0215 不创建) - 1 (WP0105 走 aux_unit)
+# 简化为:8 条最常见的散装规格品项(规格品项是 M2 重点,M1 走 fixtures 验证)
+SEED_DEFAULT_CANONICAL_ITEMS: list[dict[str, Any]] = [
+    # name, category_code, unit, aux_unit, aux_rate
+    {"name": "冰激凌成品-通用",  "category_code": "ICE_CREAM_PRODUCT", "unit": "份"},
+    {"name": "包材-通用",       "category_code": "PACKAGING",         "unit": "件"},
+    {"name": "辅料-通用",       "category_code": "CONSUMABLE",        "unit": "kg"},
+    {"name": "调味酱-通用",     "category_code": "SAUCE",             "unit": "桶"},
+    {"name": "调味酱-分装-通用","category_code": "SAUCE_FRACTION",   "unit": "罐"},
+    {"name": "风味奶浆-通用",   "category_code": "CREAM_SYRUP",       "unit": "桶"},
+    {"name": "乳制品-通用",     "category_code": "DAIRY",             "unit": "盒"},
+    {"name": "生产消耗品-通用", "category_code": "PRODUCE_CONSUMABLE", "unit": "件"},
+]
+
+
+def seed_default_canonical_items(master_conn: sqlite3.Connection) -> list[dict]:
+    """T22 —— 写入 8 条种子 canonical_items。
+
+    已存在(按 name + category_code + unit 唯一组合)则跳过;幂等。
+    """
+    master_conn.row_factory = sqlite3.Row
+    inserted: list[dict] = []
+    for seed in SEED_DEFAULT_CANONICAL_ITEMS:
+        existing = master_conn.execute(
+            """SELECT id FROM canonical_items
+               WHERE name=? AND category_code=? AND unit=?""",
+            (seed["name"], seed["category_code"], seed["unit"]),
+        ).fetchone()
+        if existing is not None:
+            continue
+        created = create_canonical_item(
+            master_conn,
+            name=seed["name"],
+            unit=seed["unit"],
+            category_code=seed["category_code"],
+            aux_unit=seed.get("aux_unit"),
+            aux_rate=seed.get("aux_rate", 0),
+            created_from="rd_manual",
+        )
+        inserted.append(created)
+    return inserted
+
+
+def claim_items_batch(
+    master_conn: sqlite3.Connection,
+    warehouse_code: str,
+    wh_conn: sqlite3.Connection,
+    *,
+    rows: list[dict[str, Any]],
+    submitted_by: int | None = None,
+    default_is_store_exclusive: bool = True,
+) -> dict:
+    """批量认领 —— 主路径(T22 + T7 联合使用)。
+
+    每行 dict 至少含 local_item_id + canonical_id;
+    可选 is_alias / is_store_exclusive / local_keep_name / reason。
+    返回 {success: int, skipped: int, errors: [str, ...]}。
+    """
+    master_conn.row_factory = sqlite3.Row
+    wh_conn.row_factory = sqlite3.Row
+    success = 0
+    skipped = 0
+    errors: list[str] = []
+    for row in rows:
+        try:
+            claim_item(
+                master_conn,
+                wh_conn,
+                warehouse_code=warehouse_code,
+                local_item_id=int(row["local_item_id"]),
+                canonical_id=int(row["canonical_id"]),
+                is_alias=bool(row.get("is_alias", False)),
+                is_store_exclusive=bool(row.get(
+                    "is_store_exclusive", default_is_store_exclusive
+                )),
+                submitted_by=submitted_by,
+                local_keep_name=row.get("local_keep_name"),
+                reason=row.get("reason"),
+            )
+            success += 1
+        except ValueError as e:
+            msg = str(e)
+            if "已被认领" in msg or "未纳管" in msg or "乐观锁失败" in msg:
+                skipped += 1
+            else:
+                errors.append(f"local_item_id={row.get('local_item_id')}: {msg}")
+        except Exception as e:
+            errors.append(f"local_item_id={row.get('local_item_id')}: {e!r}")
+    master_conn.commit()
+    wh_conn.commit()
+    return {"success": success, "skipped": skipped, "errors": errors}
+
+
+def bulk_create_canonical_items(
+    master_conn: sqlite3.Connection,
+    csv_path: str | Path,
+) -> dict:
+    """T22 —— 从 CSV 灌入 canonical_items。
+
+    CSV 列:
+        warehouse_code,current_sku,item_id,current_name,current_unit,
+        current_quantity,bind_to_canonical,is_store_exclusive,will_change
+
+    实现:
+      - 按 (canonical_sku='IC-PENDING-<uuid>', name, unit) 不可达(CSV 没 canonical_sku)
+      - 改用 name + unit 唯一组合判定:存在 → UPDATE,不存在 → INSERT
+      - 同名同单位的多个 CSV 行(同一物不同仓) → 共用同一 canonical_items 行
+      - 9 条规格品项(SKU 在 SPECIAL_BULK_SKUS)按 §1.7 拆 A/B 两个 canonical
+        简化版:用 (current_sku, current_name) 区分,A=桶装 B=散装
+    """
+    master_conn.row_factory = sqlite3.Row
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+    inserted = 0
+    updated = 0
+    skipped = 0
+    with csv_path.open() as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sku = row.get("current_sku", "").strip()
+            name = row.get("current_name", "").strip()
+            unit = row.get("current_unit", "").strip()
+            if not name or not unit:
+                skipped += 1
+                continue
+
+            # 9 条规格品项的特殊处理(§1.7.3):
+            # 用 (sku, name) 作为分组键 —— 同 SKU 的不同 name 会得到不同 canonical
+            is_special = sku in SPECIAL_BULK_SKUS
+
+            # 查询现有
+            if is_special:
+                existing = master_conn.execute(
+                    """SELECT id FROM canonical_items
+                       WHERE name=? AND unit=?""",
+                    (name, unit),
+                ).fetchone()
+            else:
+                existing = master_conn.execute(
+                    """SELECT id FROM canonical_items
+                       WHERE name=? AND unit=?""",
+                    (name, unit),
+                ).fetchone()
+
+            if existing is not None:
+                updated += 1
+            else:
+                # 推一个 category_code
+                cat_code = _infer_category_code(name)
+                create_canonical_item(
+                    master_conn,
+                    name=name,
+                    unit=unit,
+                    category_code=cat_code,
+                    created_from="rd_manual",
+                )
+                inserted += 1
+    master_conn.commit()
+    return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
+
+def _infer_category_code(name: str) -> str | None:
+    """极简分类推断。生产中 T22 接收的 CSV 通常已包含品类列,
+    这里仅在 CSV 缺品类时做关键字兜底,**不参与主路径**。
+    """
+    name_l = name or ""
+    if "冰激凌" in name_l or "冰淇凌" in name_l:
+        return "ICE_CREAM_PRODUCT"
+    if "酱" in name_l:
+        return "SAUCE"
+    if "奶" in name_l:
+        return "DAIRY"
+    if "糖" in name_l or "粉" in name_l:
+        return "CONSUMABLE"
+    if "盒" in name_l or "碗" in name_l or "托" in name_l or "盖" in name_l:
+        return "PACKAGING"
+    return None

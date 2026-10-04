@@ -35,6 +35,22 @@ FIXED_CATEGORIES = (
     "冰激凌成品",
 )
 
+# CATEGORY_CODE_MAP — Spec §6.1: 9 个 FIXED_CATEGORIES 手写映射到稳定的
+# canonical_categories.code。**不做通用 slugify**（理由见 §6.1）。
+# 命名约定: <大类>_<小类>（全大写 + 下划线）。门店可能持有的本地分类若
+# 不在本表里,进 list_missing_category_mappings() 走人工映射,不自动猜测。
+CATEGORY_CODE_MAP = {
+    "包材":       "PACKAGING",
+    "辅料":       "CONSUMABLE",
+    "调味酱":     "SAUCE",
+    "调味酱 分":  "SAUCE_FRACTION",
+    "风味奶浆":   "CREAM_SYRUP",
+    "乳制品":     "DAIRY",
+    "生产消耗品": "PRODUCE_CONSUMABLE",
+    "生产工具":   "PRODUCE_TOOL",
+    "冰激凌成品": "ICE_CREAM_PRODUCT",
+}
+
 # Role rank for require_role().
 ROLE_RANK = {"staff": 1, "manager": 2, "admin": 3}
 
