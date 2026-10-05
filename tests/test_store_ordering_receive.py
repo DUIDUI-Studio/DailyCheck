@@ -24,7 +24,6 @@ def receive_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
-    import config as config_module
     monkeypatch.setattr(config_module, "MASTER_DB", master_path)
     monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
 

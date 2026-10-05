@@ -262,7 +262,7 @@ def cart_add_batch() -> str:
 
     added = 0
     skipped = 0
-    for cid_raw, qty_raw, unit_raw in zip(selected_list, qty_list, unit_list):
+    for cid_raw, qty_raw, unit_raw in zip(selected_list, qty_list, unit_list, strict=False):
         qty = parse_qty(qty_raw)
         if qty <= 0:
             skipped += 1

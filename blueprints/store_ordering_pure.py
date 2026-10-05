@@ -437,7 +437,6 @@ def category_name_for_display(
     """
     master_conn.row_factory = sqlite3.Row
     if dc_item and dc_item.get("category_id"):
-        cat_id = int(dc_item["category_id"])
         # Look up via the dc_item's warehouse db. Use the dc_item's
         # `category_name` attribute if present (some callers pre-join).
         if "category_name" in dc_item and dc_item["category_name"]:
