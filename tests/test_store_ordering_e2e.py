@@ -179,7 +179,13 @@ def test_switch_dc_clears_cart(e2e_env):
     assert "购物车为空" in resp.data.decode()
 
 
-def test_shortage_blocks_submit_and_ship(e2e_env):
+def test_shortage_does_not_block_submit_but_blocks_at_ship(e2e_env):
+    """v3 F1=A / A7: 提交订单不再因 DC 库存不足被拦截（门店不感知库存）。
+
+    DC=100，订 200 件：v3 允许提交；后续 ship 允许跌负（A7）。
+    本测试只验证「提交」环节：响应里没有「库存不足」字样，
+    订单成功入库 status=pending。
+    """
     client = e2e_env["client"]
     _login_as(client, 1, 3)
     # DC1 has 100, order 200 to trigger shortage.
@@ -194,7 +200,20 @@ def test_shortage_blocks_submit_and_ship(e2e_env):
         follow_redirects=True,
     )
     assert resp.status_code == 200
-    assert "库存不足" in resp.data.decode()
+    body = resp.data.decode()
+    # 不应再出现「库存不足」flash。
+    assert "库存不足" not in body
+    # 应提交成功。
+    assert "提交成功" in body
+    assert "SO-" in body
+    # DB 验证。
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute(
+        "SELECT status FROM store_orders ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    master.close()
+    assert row["status"] == "pending"
 
 
 def test_unbound_canonical_blocks_submit(e2e_env):

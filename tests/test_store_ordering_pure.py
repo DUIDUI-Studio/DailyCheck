@@ -228,15 +228,30 @@ def test_list_available_dc_items(ordering_env):
     assert 103 not in ids  # inactive canonical
 
 
-def test_validate_cart_shortage(ordering_env):
+def test_validate_cart_for_submit_ignores_shortage(ordering_env):
+    """v3 A7: 库存不足不再阻止下单——门店不感知 DC 库存。
+    shortages 字段已从返回结构中移除；unbound 仍要拦截未绑定品项。"""
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
-    sop.add_cart_item(conn, cart["id"], 102, 10.0, "件")  # DC only has 5
+    # canonical 101 在门店已绑定（fixture），但这里人为把 DC 库存扣到 0 让 v2 会 shortages。
+    dc_conn = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc_conn.execute("UPDATE items SET quantity=? WHERE canonical_id=?", (0.0, 101))
+    dc_conn.commit()
+    dc_conn.close()
+    sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")
     result = sop.validate_cart_for_submit(conn, cart)
-    assert result["ok"] is False
-    assert len(result["shortages"]) == 1
-    assert result["shortages"][0]["available"] == 5.0
-    assert result["shortages"][0]["requested"] == 10.0
+    assert result["ok"] is True, f"non-shortage should not block, got {result}"
+    assert result["unbound"] == []
+    # 确认 shortages 字段已从返回中移除（A7）。
+    assert "shortages" not in result
+
+    # 反向验证：unbound 仍要拦截。
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.clear_cart(conn, cart["id"])
+    sop.add_cart_item(conn, cart["id"], 102, 1.0, "件")  # 102 在 store 未绑定
+    result2 = sop.validate_cart_for_submit(conn, cart)
+    assert result2["ok"] is False
+    assert len(result2["unbound"]) == 1
 
 
 def test_validate_cart_unbound(ordering_env):
@@ -305,14 +320,28 @@ def test_review_invalid_transition(ordering_env):
         sop.review_order(conn, order["id"], sop.ORDER_STATUS_SHIPPED, actor_id=5)
 
 
-def test_ship_order_success(ordering_env):
+def test_ship_order_full_changes_status_to_shipped(ordering_env):
+    """v3 T10: 全量一次 ship（legacy ship_order_full）→ status=shipped + 通知元数据齐全。
+
+    ship_order_full 内部遍历所有明细调用新 ship_order 接口；订单 status
+    翻转 + is_fully_shipped=True + delivery_id 非空 + 通知元数据齐全。
+    """
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
     sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
-    assert order["status"] == sop.ORDER_STATUS_SHIPPED
+    result = sop.ship_order_full(conn, order["id"], shipped_by=4, tracking_note="batch-1")
+    assert result["status"] == sop.ORDER_STATUS_SHIPPED
+    assert result["is_fully_shipped"] is True
+    assert result["new_order_status"] == sop.ORDER_STATUS_SHIPPED
+    assert result["delivery_id"] > 0
+    # 累计到 quantity 一致，明细状态全部 fulfilled。
+    assert len(result["shipped_items"]) == 1
+    assert result["shipped_items"][0]["shipped_quantity"] == 10.0
+    for item in result["order_items"]:
+        assert item["shipped_quantity"] == 10.0
+        assert item["status"] == sop.ORDER_ITEM_STATUS_FULFILLED
 
     # DC stock deducted
     dc = sqlite3.connect(str(ordering_env["dc_path"]))
@@ -322,10 +351,10 @@ def test_ship_order_success(ordering_env):
     # stock movement recorded
     mv = dc.execute("SELECT * FROM stock_movements WHERE action=?", (sop.SHIPMENT_ACTION,)).fetchone()
     assert mv["delta"] == -10.0
-    assert str(order["order_no"]) in mv["note"]
+    assert str(result["order_no"]) in mv["note"]
     dc.close()
 
-    # P0: store inventory unchanged
+    # P0: store inventory unchanged at ship time
     store = sqlite3.connect(str(ordering_env["store_path"]))
     store.row_factory = sqlite3.Row
     row = store.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()
@@ -333,26 +362,40 @@ def test_ship_order_success(ordering_env):
     store.close()
 
 
-def test_ship_order_insufficient_stock_keeps_approved(ordering_env):
+def test_ship_order_negative_stock_allowed(ordering_env):
+    """v3 F1=A: DC 库存不足时仍允许发货，库存跌为负值。
+
+    即使把 DC 库存扣到 0 以下，ship_order 不抛异常；订单完成发货后
+    状态正常推进到 shipped；DC items.quantity 跌为负值。"""
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
     sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")  # DC has 100 initially
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
 
-    # Deplete DC stock after approval so shipping fails.
+    # Deplete DC stock so DC=5 但要出 10 件。
     dc = sqlite3.connect(str(ordering_env["dc_path"]))
     dc.execute("UPDATE items SET quantity=? WHERE canonical_id=?", (5.0, 101))
     dc.commit()
     dc.close()
 
-    with pytest.raises(ValueError, match="库存不足"):
-        sop.ship_order(conn, order["id"], shipped_by=4)
+    # v3: 不抛异常。
+    result = sop.ship_order_full(conn, order["id"], shipped_by=4)
+    assert result["status"] == sop.ORDER_STATUS_SHIPPED
+    assert result["is_fully_shipped"] is True
 
-    order = sop.get_order_detail(conn, order["id"])
-    assert order["status"] == sop.ORDER_STATUS_APPROVED
-    # No delivery created
-    assert order["deliveries"] == []
+    # DC 库存跌为 -5（5 - 10 = -5）。
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    row = dc.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()
+    assert row["quantity"] == -5.0
+    # stock_movements 仍然记录 delta=-10。
+    mv = dc.execute(
+        "SELECT delta FROM stock_movements WHERE action=?",
+        (sop.SHIPMENT_ACTION,),
+    ).fetchone()
+    assert mv["delta"] == -10.0
+    dc.close()
 
 
 def test_mark_order_delivered(ordering_env):
@@ -361,7 +404,7 @@ def test_mark_order_delivered(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.ship_order_full(conn, order["id"], shipped_by=4)
     order = sop.mark_order_delivered(conn, order["id"], actor_id=3)
     assert order["status"] == sop.ORDER_STATUS_DELIVERED
     assert order["delivered_at"] is not None
@@ -374,7 +417,7 @@ def test_receive_order_item_basic(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.ship_order_full(conn, order["id"], shipped_by=4)
     order_item_id = order["order_items"][0]["id"]
 
     result = sop.receive_order_item(
@@ -408,7 +451,7 @@ def test_receive_order_item_partial_then_full(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.ship_order_full(conn, order["id"], shipped_by=4)
     order_item_id = order["order_items"][0]["id"]
 
     r1 = sop.receive_order_item(
@@ -446,7 +489,7 @@ def test_receive_order_item_over_remaining_rejected(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.ship_order_full(conn, order["id"], shipped_by=4)
     order_item_id = order["order_items"][0]["id"]
 
     # First, receive 4 valid.
@@ -535,7 +578,7 @@ def test_list_order_receipts_descending(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.ship_order_full(conn, order["id"], shipped_by=4)
     order_item_id = order["order_items"][0]["id"]
 
     sop.receive_order_item(
@@ -574,7 +617,7 @@ def test_mark_order_delivered_legacy_compat(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 4.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
     order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
-    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.ship_order_full(conn, order["id"], shipped_by=4)
     order = sop.mark_order_delivered(conn, order["id"], actor_id=3)
     assert order["status"] == sop.ORDER_STATUS_DELIVERED
     # Legacy path wrote receipts for the whole remaining qty.
@@ -614,3 +657,197 @@ def test_allowed_event_types_include_store_ordering():
         sop.EVENT_ORDER_DELIVERED,
     ):
         assert et in ALLOWED_EVENT_TYPES
+
+
+# ---------------------------------------------------------------------------
+# v3 T10: 部分发货 + 库存校验移除 + DC 库存视图
+# ---------------------------------------------------------------------------
+
+def _make_approved_order(ordering_env, qty=5.0, canonical_id=101):
+    """Helper: build a cart, submit, approve. Return (conn, order_id)."""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], canonical_id, qty, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    return conn, order["id"]
+
+
+def test_ship_order_partial_single_item(ordering_env):
+    """v3 T10: 部分发货不抛错，shipped_quantity 累计。
+
+    单次 ship 1/3：DC -1，明细 shipped_quantity=1，明细 status=partial，
+    订单仍 approved，deliveries 1 行，is_fully_shipped=False。
+    """
+    conn, order_id = _make_approved_order(ordering_env, qty=3.0)
+    order = sop.get_order_detail(conn, order_id)
+    item_id = int(order["order_items"][0]["id"])
+
+    result = sop.ship_order(conn, order_id, {item_id: 1.0}, shipped_by=4, tracking_note="batch-1")
+
+    assert result["status"] == sop.ORDER_STATUS_APPROVED  # partial — 不翻转
+    assert result["is_fully_shipped"] is False
+    assert result["new_order_status"] == sop.ORDER_STATUS_APPROVED
+    assert result["delivery_id"] > 0
+    assert len(result["shipped_items"]) == 1
+    assert result["shipped_items"][0]["order_item_id"] == item_id
+    assert result["shipped_items"][0]["shipped_quantity"] == 1.0
+
+    # 明细状态推进到 partial。
+    item = next(it for it in result["order_items"] if int(it["id"]) == item_id)
+    assert item["shipped_quantity"] == 1.0
+    assert item["status"] == sop.ORDER_ITEM_STATUS_PARTIAL
+
+    # DC 库存 -1。
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    row = dc.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()
+    assert row["quantity"] == 99.0
+    # stock_movements delta=-1，note 含订单号 + partial + 数量。
+    mv = dc.execute(
+        "SELECT * FROM stock_movements WHERE action=? ORDER BY id DESC LIMIT 1",
+        (sop.SHIPMENT_ACTION,),
+    ).fetchone()
+    assert mv["delta"] == -1.0
+    assert str(order["order_no"]) in mv["note"]
+    assert "partial 1" in mv["note"]
+    dc.close()
+
+    # deliveries 1 行。
+    refreshed = sop.get_order_detail(conn, order_id)
+    assert len(refreshed["deliveries"]) == 1
+    assert refreshed["deliveries"][0]["shipped_by"] == 4
+    assert refreshed["deliveries"][0]["tracking_note"] == "batch-1"
+    # 写入一条状态历史（approved → approved，note 写本批发货 X 件）。
+    history_notes = [h["note"] for h in refreshed["status_history"]]
+    assert any("本批发货" in (n or "") for n in history_notes)
+
+
+def test_ship_order_partial_multi_batch(ordering_env):
+    """v3 T10: 多次部分发货累计 → 最终一票发齐 → status=shipped。
+    """
+    conn, order_id = _make_approved_order(ordering_env, qty=3.0)
+    order = sop.get_order_detail(conn, order_id)
+    item_id = int(order["order_items"][0]["id"])
+
+    # 第一次：发 1 件。
+    r1 = sop.ship_order(conn, order_id, {item_id: 1.0}, shipped_by=4)
+    assert r1["is_fully_shipped"] is False
+    assert r1["new_order_status"] == sop.ORDER_STATUS_APPROVED
+
+    # 第二次：发 2 件，凑齐 3 件。
+    r2 = sop.ship_order(conn, order_id, {item_id: 2.0}, shipped_by=4)
+    assert r2["is_fully_shipped"] is True
+    assert r2["new_order_status"] == sop.ORDER_STATUS_SHIPPED
+
+    # 累计验证。
+    refreshed = sop.get_order_detail(conn, order_id)
+    item = next(it for it in refreshed["order_items"] if int(it["id"]) == item_id)
+    assert item["shipped_quantity"] == 3.0
+    assert item["status"] == sop.ORDER_ITEM_STATUS_FULFILLED
+    assert refreshed["status"] == sop.ORDER_STATUS_SHIPPED
+    assert refreshed["shipped_at"] is not None
+    # deliveries 2 行。
+    assert len(refreshed["deliveries"]) == 2
+
+
+def test_ship_order_zero_qty_skipped(ordering_env):
+    """v3 T10: shipped_items_map 中 qty=0 的明细视为「本批不发」，不动库存不写 movements。
+
+    整张 map 全是 0 → raise ValueError；qty=0 + 正常 qty 混合 → 静默跳过 0，
+    仅处理 >0 的明细。无效 key（非订单明细）→ ValueError（不静默）。
+    """
+    conn, order_id = _make_approved_order(ordering_env, qty=5.0)
+    order = sop.get_order_detail(conn, order_id)
+    item_id = int(order["order_items"][0]["id"])
+
+    # 全部 qty=0：抛错（"本批发货数量全部为空"）。
+    with pytest.raises(ValueError, match="本批发货数量全部为空"):
+        sop.ship_order(conn, order_id, {item_id: 0}, shipped_by=4)
+
+    with pytest.raises(ValueError, match="本批发货数量全部为空"):
+        sop.ship_order(conn, order_id, {item_id: 0.0}, shipped_by=4)
+
+    # 混合：把无效 key 放在前面，验证依然抛错（设计：无效 key 显式拒绝）。
+    with pytest.raises(ValueError, match="不属于"):
+        sop.ship_order(conn, order_id, {999999: 0.0, item_id: 5.0}, shipped_by=4)
+
+    # 单 key + 正常值：发齐。
+    result = sop.ship_order(conn, order_id, {item_id: 5.0}, shipped_by=4)
+    assert result["is_fully_shipped"] is True
+    assert result["shipped_items"][0]["shipped_quantity"] == 5.0
+
+    # DC 应该 -5：发 5 件，所以 100 - 5 = 95。
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    row = dc.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()
+    assert row["quantity"] == 95.0
+    # 仅一次成功的 ship 写了 stock_movement（前两次被拒）。
+    mv_count = dc.execute(
+        "SELECT COUNT(*) FROM stock_movements WHERE action=?",
+        (sop.SHIPMENT_ACTION,),
+    ).fetchone()[0]
+    assert mv_count == 1
+    dc.close()
+
+
+def test_ship_order_partial_invalid_item_id(ordering_env):
+    """shipped_items_map 包含不属于该订单的 id → ValueError。"""
+    conn, order_id = _make_approved_order(ordering_env, qty=3.0)
+    with pytest.raises(ValueError, match="不属于"):
+        sop.ship_order(conn, order_id, {99999: 1.0}, shipped_by=4)
+
+
+def test_ship_order_partial_overshoot_rejected(ordering_env):
+    """累计发货超过 quantity → ValueError。"""
+    conn, order_id = _make_approved_order(ordering_env, qty=3.0)
+    order = sop.get_order_detail(conn, order_id)
+    item_id = int(order["order_items"][0]["id"])
+    sop.ship_order(conn, order_id, {item_id: 2.0}, shipped_by=4)
+    # 已发 2 / 3，再发 2 件就超发。
+    with pytest.raises(ValueError, match="累计发货"):
+        sop.ship_order(conn, order_id, {item_id: 2.0}, shipped_by=4)
+
+
+def test_ship_order_partial_not_approved(ordering_env):
+    """订单非 approved 时调用 partial ship → ValueError。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 3.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    item_id = int(order["order_items"][0]["id"])
+    # pending 状态。
+    with pytest.raises(ValueError, match="approved"):
+        sop.ship_order(conn, order["id"], {item_id: 1.0}, shipped_by=4)
+
+
+def test_get_dc_items_for_order_detail(ordering_env):
+    """v3 T10 / A6: 返回 {order_item_id: {name, dc_available, unit_price, category_name}}。"""
+    conn, order_id = _make_approved_order(ordering_env, qty=3.0)
+    order = sop.get_order_detail(conn, order_id)
+    item_id = int(order["order_items"][0]["id"])
+
+    info = sop.get_dc_items_for_order_detail(conn, order_id)
+    assert info, "应至少返回 1 条明细的 DC 库存信息"
+    assert item_id in info
+    row = info[item_id]
+    # name：canonical_items.name
+    assert row["name"] == "测试包材A"
+    # dc_available：DC 仓 items.quantity（发货前）
+    assert row["dc_available"] == 100.0
+    # unit_price：selling_price > unit_cost > 0；fixture 都 0 所以 0。
+    assert row["unit_price"] == 0.0
+    # category_name：canonical_categories.name 中文 fallback
+    assert row["category_name"] == "包材"
+
+    # 部分发货后，dc_available 下降。
+    sop.ship_order(conn, order_id, {item_id: 2.0}, shipped_by=4)
+    info2 = sop.get_dc_items_for_order_detail(conn, order_id)
+    assert info2[item_id]["dc_available"] == 98.0
+
+    # 不存在的订单 → {}。
+    assert sop.get_dc_items_for_order_detail(conn, 99999) == {}

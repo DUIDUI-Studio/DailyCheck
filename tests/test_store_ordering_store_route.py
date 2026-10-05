@@ -166,11 +166,21 @@ def test_submit_order_success(store_env):
     assert "pending" in body or "待审批" in body
 
 
-def test_submit_order_shortage_blocked(store_env):
+def test_submit_order_shortage_allowed(store_env):
+    """v3 A7: DC 库存不足不再阻止下单——门店不感知 DC 库存。
+
+    canonical 101 已绑定，DC=100；订 200 件 > DC 库存。
+    v3 不再拦截，订单成功提交为 pending。
+    """
     client = store_env["client"]
+    # Deplete DC stock to 0 so the order is clearly over-stock.
+    dc = sqlite3.connect(str(store_env["dc_path"]))
+    dc.execute("UPDATE items SET quantity=? WHERE canonical_id=?", (0.0, 101))
+    dc.commit()
+    dc.close()
     client.post(
         "/store-ordering/cart/add",
-        data={"dc": "dc_test", "canonical_id": 102, "quantity": "10", "unit": "件"},
+        data={"dc": "dc_test", "canonical_id": 101, "quantity": "200", "unit": "件"},
     )
     tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
     resp = client.post(
@@ -180,7 +190,19 @@ def test_submit_order_shortage_blocked(store_env):
     )
     assert resp.status_code == 200
     body = resp.data.decode()
-    assert "库存不足" in body
+    # 不应再出现「库存不足」flash。
+    assert "库存不足" not in body
+    # 应提交成功：看到订单号 + pending 状态。
+    assert "提交成功" in body
+    assert "SO-" in body
+    # DB 状态确认 pending。
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute(
+        "SELECT status FROM store_orders ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    master.close()
+    assert row["status"] == "pending"
 
 
 def test_submit_order_unbound_blocked(store_env):

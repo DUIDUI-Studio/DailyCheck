@@ -221,7 +221,12 @@ def test_shipment_list_and_ship(dc_env):
     assert status == "shipped"
 
 
-def test_ship_insufficient_stock_keeps_approved(dc_env):
+def test_ship_insufficient_stock_succeeds_with_negative_dc(dc_env):
+    """v3 F1=A / A7: DC 库存不足仍允许发货（库存跌负不抛错）。
+
+    路由层 /ship 不应返回「库存不足」flash；订单状态正常推进到 shipped；
+    DC 库存跌为负数。
+    """
     client = dc_env["client"]
     # Approve as manager
     _login_as(client, 2, 1)
@@ -229,12 +234,12 @@ def test_ship_insufficient_stock_keeps_approved(dc_env):
         f"/store-ordering/orders/{dc_env['order_id']}/review",
         data={"decision": "approved", "note": "ok"},
     )
-    # Deplete DC stock
+    # Deplete DC stock to 1, but order quantity is > 1 (canonical 101 订 10 件).
     dc = sqlite3.connect(str(dc_env["dc_path"]))
     dc.execute("UPDATE items SET quantity=? WHERE canonical_id=?", (1.0, 101))
     dc.commit()
     dc.close()
-    # Try ship as staff
+    # Try ship as staff — v3 不会拒绝。
     _login_as(client, 3, 1)
     resp = client.post(
         f"/store-ordering/orders/{dc_env['order_id']}/ship",
@@ -243,12 +248,25 @@ def test_ship_insufficient_stock_keeps_approved(dc_env):
     )
     assert resp.status_code == 200
     body = resp.data.decode()
-    assert "出库失败" in body or "库存不足" in body
+    # 不应出现「库存不足」/「出库失败」字样。
+    assert "库存不足" not in body
+    assert "出库失败" not in body
+    # 应出现「出库成功」flash。
+    assert "出库成功" in body
+
+    # 订单推进到 shipped。
     master = sqlite3.connect(str(dc_env["master_path"]))
     master.row_factory = sqlite3.Row
     status = master.execute("SELECT status FROM store_orders WHERE id=?", (dc_env["order_id"],)).fetchone()["status"]
     master.close()
-    assert status == "approved"
+    assert status == "shipped"
+
+    # DC 库存跌为负数（fixture 订 5 件，DC=1 → -4）。
+    dc = sqlite3.connect(str(dc_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    qty = dc.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()["quantity"]
+    assert qty == -4.0
+    dc.close()
 
 
 def test_dc_staff_cannot_review(dc_env):

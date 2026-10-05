@@ -524,6 +524,10 @@ CREATE INDEX IF NOT EXISTS idx_store_order_receipts_item
     ON store_order_receipts(order_item_id, created_at DESC);
 """
 
+# v3 P0 增量：ALTER 必须在 MASTER_SCHEMA 之外，否则 executescript 在已迁移的
+# master.db 上会因列已存在而崩溃。沿用 warehouses.warehouse_type 的迁移模式：
+# 由 init_master_db() 的 PRAGMA 守卫负责幂等 ALTER。
+
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
 WAREHOUSE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
@@ -757,6 +761,19 @@ def init_master_db() -> None:
                     conn.execute(
                         "ALTER TABLE warehouses ADD COLUMN warehouse_type TEXT "
                         "NOT NULL DEFAULT 'storefront'"
+                    )
+
+                # v3 P0: store_order_items.shipped_quantity (partial-ship accumulator).
+                # SQLite 没有 ADD COLUMN IF NOT EXISTS，用 PRAGMA 守卫做幂等迁移。
+                soi_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(store_order_items)"
+                    ).fetchall()
+                }
+                if "shipped_quantity" not in soi_cols:
+                    conn.execute(
+                        "ALTER TABLE store_order_items ADD COLUMN "
+                        "shipped_quantity REAL NOT NULL DEFAULT 0"
                     )
 
                 # recipe_versions UNIQUE constraint fix.
