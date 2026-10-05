@@ -49,6 +49,6 @@
     <span>备注</span>
     <textarea name="note" rows="3">{{ note }}</textarea>
   </label>
-  <button type="submit" class="btn" {% if errors.shortages or errors.unbound %}disabled{% endif %}>确认提交</button>
+  <button type="submit" class="btn" {% if errors.shortages or errors.unbound %}disabled{% endif %}>发送</button>
 </form>
 {% endblock %}

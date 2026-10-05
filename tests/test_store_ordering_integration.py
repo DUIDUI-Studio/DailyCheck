@@ -194,11 +194,17 @@ def test_full_lifecycle_and_notifications(integration_env):
     # Deliver actor (store manager) is excluded from own notification.
     assert delivered_count == 1
 
-    # P0: store inventory unchanged.
+    # v2: store inventory increased by the received qty (10 base + 8 received).
     store = sqlite3.connect(str(integration_env["store_path"]))
     store.row_factory = sqlite3.Row
     store_qty = store.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()["quantity"]
-    assert store_qty == 10.0
+    assert store_qty == 18.0
+    # And a 门店订货入库 stock_movement was written.
+    inbound = store.execute(
+        "SELECT * FROM stock_movements WHERE action=?", (sop.RECEIPT_ACTION,)
+    ).fetchone()
+    assert inbound["delta"] == 8.0
+    assert order["order_no"] in inbound["note"]
     store.close()
 
     master.close()

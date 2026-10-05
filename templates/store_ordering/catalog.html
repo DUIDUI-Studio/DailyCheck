@@ -39,50 +39,227 @@
     <button type="submit">查询</button>
   </form>
 
-  {% if categories %}
+  {% if category_names %}
   <div class="cat-bar" role="tablist" aria-label="按品类筛选">
     <a class="cat-chip {% if not current_cat %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, q=keyword) }}" role="tab">全部</a>
-    {% for c in categories %}
-    <a class="cat-chip {% if current_cat == c %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, cat=c, q=keyword) }}" role="tab">{{ c }}</a>
+    {% for code, name in category_names %}
+    <a class="cat-chip {% if current_cat == code %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, cat=code, q=keyword) }}" role="tab">{{ name }}</a>
     {% endfor %}
   </div>
   {% endif %}
 
-  {% if items %}
-  <div class="inv-grid">
-    {% for item in items %}
-    <div class="inv-card">
-      <div class="inv-card-head">
-        <div class="inv-card-name">
-          <span class="inv-cat">{{ item.category_code or '—' }}</span>
-          <span class="inv-name">{{ item.name }}</span>
+  {# Batch-add-to-cart form. Each card ships 3 hidden inputs (selected[]/qty[]/unit[]); the JS fills qty/unit when the user confirms the modal. #}
+  <form method="post" action="{{ url_for('store_ordering.cart_add_batch') }}" id="catalog-form">
+    <input type="hidden" name="dc" value="{{ selected_dc }}" />
+
+    {% if items %}
+    <div class="inv-grid">
+      {% for item in items %}
+      <div class="inv-card"
+           data-canonical-id="{{ item.canonical_id }}"
+           data-name="{{ item.canonical_name }}"
+           data-unit="{{ item.canonical_unit or item.unit }}"
+           data-aux-unit="{{ item.aux_unit or '' }}"
+           data-aux-rate="{{ item.aux_rate or 0 }}"
+           data-stock="{{ item.quantity | fmt_qty }}"
+           data-unit-price="{{ item.unit_price or 0 }}"
+           data-cat="{{ item.category_code }}"
+           onclick="openCatalogModal(this)">
+        <div class="inv-card-head">
+          <div class="inv-card-name">
+            <span class="inv-cat">{{ item.category_name or item.category_code or '—' }}</span>
+            <span class="inv-name">{{ item.canonical_name }}</span>
+          </div>
+          <div class="inv-card-status">
+            {% if item.quantity <= 0 %}<span class="status-pill danger">0 库存</span>
+            {% else %}<span class="status-pill ok">库存 {{ item.quantity | fmt_qty }}</span>{% endif %}
+          </div>
         </div>
-        <div class="inv-card-status">
-          {% if item.quantity <= 0 %}<span class="status-pill danger">0 库存</span>
-          {% else %}<span class="status-pill ok">库存 {{ item.quantity | fmt_qty }}</span>{% endif %}
+        <div class="inv-card-body">
+          <div class="inv-metric">
+            <span class="metric-label">单价</span>
+            <span class="metric-value small">¥ {{ (item.unit_price or 0) | fmt_money }}</span>
+          </div>
+          <div class="inv-metric">
+            <span class="metric-label">已填</span>
+            <span class="metric-value small" data-display-qty>—</span>
+          </div>
         </div>
+        <div class="inv-card-foot">
+          <span class="muted">点击卡片选数量</span>
+        </div>
+        <span class="catalog-hidden" hidden>
+            <input name="selected[]" value="{{ item.canonical_id }}" />
+            <input name="qty[]"      value="" data-input-qty />
+            <input name="unit[]"     value="base" data-input-unit />
+          </span>
       </div>
-      <div class="inv-card-body">
-        <form method="post" action="{{ url_for('store_ordering.add_to_cart') }}" class="grid cols-3">
-          <input type="hidden" name="dc" value="{{ selected_dc }}" />
-          <input type="hidden" name="canonical_id" value="{{ item.canonical_id }}" />
-          <input type="hidden" name="unit" value="{{ item.canonical_unit or item.unit }}" />
-          <label>
-            <span>数量</span>
-            <input name="quantity" type="number" min="0.01" step="0.01" value="1" required />
-          </label>
-          <label>
-            <span>单位</span>
-            <input value="{{ item.canonical_unit or item.unit }}" disabled />
-          </label>
-          <button type="submit" class="btn-sm" style="align-self:flex-end">加入购物车</button>
-        </form>
-      </div>
+      {% endfor %}
     </div>
-    {% endfor %}
-  </div>
-  {% else %}
-  <p class="empty">该配送中心暂无可订商品</p>
-  {% endif %}
+
+    <div class="actions" style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end;">
+      <button type="button" class="btn-sm" onclick="resetCatalogForm()">清空选择</button>
+      <button type="submit" class="btn">加入购物车</button>
+    </div>
+    {% else %}
+    <p class="empty">该配送中心暂无可订商品</p>
+    {% endif %}
+  </form>
 {% endif %}
+
+<!-- Modal: click a card → pick unit/qty → confirm writes back to the card's hidden inputs. -->
+<div id="catalog-modal" class="modal-overlay" hidden onclick="closeCatalogModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeCatalogModal()">&times;</button>
+    <h3 id="cm-name"></h3>
+    <p class="modal-stock" id="cm-stock"></p>
+
+    <div class="pill-group" id="cm-pills">
+      <button type="button" class="pill pill--active" data-u="base" id="cm-pill-base"></button>
+      <button type="button" class="pill" data-u="aux" id="cm-pill-aux"></button>
+    </div>
+
+    <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:4px">数量</label>
+    <input id="cm-qty" type="number" step="0.01" min="0" inputmode="decimal"
+           style="width:100%;padding:10px 12px;font-size:16px;border:1.5px solid var(--border);border-radius:10px;box-sizing:border-box" />
+
+    <div id="cm-amount" class="calc-hint" style="margin:8px 0 0">金额 ¥ 0.00</div>
+
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button type="button" class="btn-cancel" style="flex:1" onclick="closeCatalogModal()">取消</button>
+      <button type="button" class="btn" style="flex:1" onclick="confirmCatalogModal()">确认</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var modalOverlay = document.getElementById('catalog-modal');
+  if (!modalOverlay) return;
+  var cmName = document.getElementById('cm-name');
+  var cmStock = document.getElementById('cm-stock');
+  var cmPillBase = document.getElementById('cm-pill-base');
+  var cmPillAux = document.getElementById('cm-pill-aux');
+  var cmQty = document.getElementById('cm-qty');
+  var cmAmount = document.getElementById('cm-amount');
+
+  var _currentId = null, _currentUnit = null, _currentAuxUnit = null,
+      _currentAuxRate = 0, _currentUnitPrice = 0, _currentStock = 0;
+
+  function setActiveCmPill(u) {
+    var btns = document.querySelectorAll('#cm-pills .pill');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('pill--active', btns[i].getAttribute('data-u') === u);
+    }
+  }
+
+  window.openCatalogModal = function (el) {
+    _currentId = el.getAttribute('data-canonical-id');
+    var name = el.getAttribute('data-name');
+    var unit = el.getAttribute('data-unit');
+    var auxUnit = el.getAttribute('data-aux-unit');
+    var auxRate = parseFloat(el.getAttribute('data-aux-rate') || '0');
+    var stock = el.getAttribute('data-stock');
+    var unitPrice = parseFloat(el.getAttribute('data-unit-price') || '0');
+
+    _currentUnit = unit;
+    _currentAuxUnit = auxUnit;
+    _currentAuxRate = auxRate;
+    _currentUnitPrice = unitPrice;
+    _currentStock = parseFloat(stock);
+
+    cmName.textContent = name;
+    cmStock.textContent = '当前库存: ' + stock + ' ' + unit + ' / 单价 ¥ ' + unitPrice.toFixed(2);
+
+    cmPillBase.textContent = unit;
+    if (auxUnit && auxRate > 0) {
+      cmPillAux.textContent = auxUnit;
+      cmPillAux.style.display = '';
+    } else {
+      cmPillAux.style.display = 'none';
+    }
+
+    // restore from previous edit
+    var qtyInput = el.querySelector('[data-input-qty]');
+    var unitInput = el.querySelector('[data-input-unit]');
+    var savedUnit = unitInput ? unitInput.value : 'base';
+    setActiveCmPill(savedUnit);
+
+    var savedQty = qtyInput && qtyInput.value ? qtyInput.value : '';
+    cmQty.value = savedQty;
+    updateCatalogAmount();
+    modalOverlay.removeAttribute('hidden');
+    cmQty.focus();
+    cmQty.select();
+  };
+
+  window.closeCatalogModal = function (e) {
+    if (e && e.target !== modalOverlay) return;
+    modalOverlay.setAttribute('hidden', '');
+  };
+
+  var pillBar = document.getElementById('cm-pills');
+  pillBar.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('.pill');
+    if (!btn || btn.style.display === 'none') return;
+    setActiveCmPill(btn.getAttribute('data-u'));
+    updateCatalogAmount();
+  });
+
+  cmQty.addEventListener('input', updateCatalogAmount);
+
+  function updateCatalogAmount() {
+    var v = parseFloat(cmQty.value || '0');
+    var price = _currentUnitPrice || 0;
+    var line = isNaN(v) ? 0 : Math.round(v * price * 100) / 100;
+    cmAmount.textContent = '金额 ¥ ' + line.toFixed(2);
+  }
+
+  window.confirmCatalogModal = function () {
+    var v = cmQty.value.trim();
+    var activePill = document.querySelector('#cm-pills .pill--active');
+    if (!activePill) return;
+    var u = activePill.getAttribute('data-u');
+
+    var card = document.querySelector('.inv-card[data-canonical-id="' + _currentId + '"]');
+    if (!card) { closeCatalogModal(); return; }
+
+    var qtyInput = card.querySelector('[data-input-qty]');
+    var unitInput = card.querySelector('[data-input-unit]');
+    if (qtyInput) qtyInput.value = v;
+    if (unitInput) unitInput.value = u;
+
+    card.setAttribute('data-saved-qty', v);
+    card.setAttribute('data-saved-unit', u);
+
+    var display = card.querySelector('[data-display-qty]');
+    var n = parseFloat(v);
+    if (v && !isNaN(n) && n > 0) {
+      card.classList.add('card--filled');
+      var labelUnit = (u === 'aux') ? _currentAuxUnit : _currentUnit;
+      display.textContent = v + ' ' + (labelUnit || '');
+    } else {
+      card.classList.remove('card--filled');
+      display.textContent = '—';
+    }
+    closeCatalogModal();
+  };
+
+  window.resetCatalogForm = function () {
+    var cards = document.querySelectorAll('.inv-card');
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i];
+      var qi = card.querySelector('[data-input-qty]');
+      var ui = card.querySelector('[data-input-unit]');
+      if (qi) qi.value = '';
+      if (ui) ui.value = 'base';
+      card.removeAttribute('data-saved-qty');
+      card.removeAttribute('data-saved-unit');
+      card.classList.remove('card--filled');
+      var d = card.querySelector('[data-display-qty]');
+      if (d) d.textContent = '—';
+    }
+  };
+})();
+</script>
 {% endblock %}

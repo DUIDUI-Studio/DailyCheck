@@ -166,14 +166,26 @@ def catalog() -> str:
     category_code = request.args.get("cat", "").strip() or None
     keyword = request.args.get("q", "").strip() or None
     items = sop.list_available_dc_items(master, dc_code, category_code, keyword)
-    categories = sorted({(i.get("category_code") or "") for i in items})
+    # Build (code, display_name) tuples for chips, deduped by code while keeping
+    # the Chinese display name (display = canonical_categories.name).
+    code_name_pairs: list[tuple[str, str]] = []
+    seen_codes: set[str] = set()
+    for it in items:
+        code = it.get("category_code") or ""
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        name = it.get("category_name") or code
+        code_name_pairs.append((code, str(name)))
+    category_names = sorted(code_name_pairs, key=lambda x: x[1])
 
     return render_template(
         "store_ordering/catalog.html",
         dcs=dcs,
         selected_dc=dc_code,
         items=items,
-        categories=categories,
+        categories=[c for c, _ in category_names],
+        category_names=category_names,
         current_cat=category_code or "",
         keyword=keyword or "",
         cart_summary=cart_summary,
@@ -184,7 +196,12 @@ def catalog() -> str:
 @require_login
 @_storefront_or_admin
 def add_to_cart() -> str:
-    """Add item to cart."""
+    """DEPRECATED single-item form submit; catalog.html uses /cart/add-batch now.
+
+    Kept for backward compatibility (e.g. legacy links, future "quick +1"
+    affordances). The catalog page renders an inline modal-driven batch form
+    pointing at /cart/add-batch.
+    """
     dc_code = request.form.get("dc") or session.get("store_ordering_dc")
     if not dc_code:
         flash("请先选择配送中心")
@@ -209,6 +226,62 @@ def add_to_cart() -> str:
     return redirect(url_for("store_ordering.catalog", dc=dc_code))
 
 
+@bp.route("/cart/add-batch", methods=["POST"])
+@require_login
+@_storefront_or_admin
+def cart_add_batch() -> str:
+    """Batch add items from the catalog modal.
+
+    Form contract (catalog.html):
+        selected[]: canonical_id (one per card)
+        qty[]:      number (may be empty = skipped)
+        unit[]:     'base' | 'aux' (default 'base')
+
+    Items with empty qty are skipped. After processing, redirect to /cart.
+    """
+    dc_code = request.form.get("dc") or session.get("store_ordering_dc")
+    if not dc_code:
+        flash("请先选择配送中心")
+        return redirect(url_for("store_ordering.catalog"))
+    session["store_ordering_dc"] = dc_code
+
+    selected_list = request.form.getlist("selected[]")
+    qty_list = request.form.getlist("qty[]")
+    unit_list = request.form.getlist("unit[]")
+    if len(selected_list) != len(qty_list) or len(selected_list) != len(unit_list):
+        flash("表单字段不一致，请重试")
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+
+    store_code = _current_warehouse_code()
+    if not store_code:
+        flash("当前未绑定门店仓库")
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+
+    master = get_master_db()
+    cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
+
+    added = 0
+    skipped = 0
+    for cid_raw, qty_raw, unit_raw in zip(selected_list, qty_list, unit_list):
+        qty = parse_qty(qty_raw)
+        if qty <= 0:
+            skipped += 1
+            continue
+        try:
+            cid = int(cid_raw)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        unit = (unit_raw or "base").strip() or "base"
+        sop.add_cart_item(master, cart["id"], cid, qty, unit)
+        added += 1
+    if added:
+        flash(f"已加入购物车 {added} 项")
+    else:
+        flash("没有可加入购物车的品项（请先在卡片弹窗中填写数量）")
+    return redirect(url_for("store_ordering.cart_view"))
+
+
 @bp.route("/cart")
 @require_login
 @_storefront_or_admin
@@ -222,11 +295,13 @@ def cart_view() -> str:
     master = get_master_db()
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
     items = sop.list_cart_items(master, cart["id"])
+    cart_total = sum(parse_qty(i.get("line_subtotal") or 0) for i in items)
     return render_template(
         "store_ordering/cart.html",
         cart=cart,
         items=items,
         dc_code=dc_code,
+        cart_total=cart_total,
     )
 
 
