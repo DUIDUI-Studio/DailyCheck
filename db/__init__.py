@@ -499,6 +499,29 @@ CREATE TABLE IF NOT EXISTS store_order_deliveries (
 
 CREATE INDEX IF NOT EXISTS idx_store_order_deliveries_order
     ON store_order_deliveries(order_id);
+
+-- ============================================================
+-- 门店订货收货（Store Order Receiving）—— v2 P0
+-- 多次部分收货：fulfilled_quantity 累计；全部收齐 → delivered
+-- ============================================================
+CREATE TABLE IF NOT EXISTS store_order_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    order_item_id INTEGER NOT NULL,
+    quantity REAL NOT NULL,
+    received_by INTEGER NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (order_item_id) REFERENCES store_order_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (received_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_receipts_order
+    ON store_order_receipts(order_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_receipts_item
+    ON store_order_receipts(order_item_id, created_at DESC);
 """
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.

@@ -50,6 +50,7 @@ ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
 }
 
 SHIPMENT_ACTION: str = "门店订货出库"
+RECEIPT_ACTION: str = "门店订货入库"
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +144,13 @@ def list_cart_items(
     master_conn: sqlite3.Connection,
     cart_id: int,
 ) -> list[dict[str, Any]]:
-    """Return cart items enriched with canonical info and dc/store stock/binding."""
+    """Return cart items enriched with canonical info and dc/store stock/binding.
+
+    Each item dict now includes `category_name` (Chinese category name) and
+    `unit_price` (selling_price → unit_cost → 0) for cart total / line subtotal
+    display. `line_subtotal = unit_price * quantity` (rounded to 2 dp) is also
+    included for direct template rendering.
+    """
     master_conn.row_factory = sqlite3.Row
     cart = master_conn.execute(
         "SELECT * FROM store_order_carts WHERE id=?", (cart_id,)
@@ -174,6 +181,16 @@ def list_cart_items(
         binding = get_store_binding_by_canonical(master_conn, store_code, canonical_id)
         item["store_bound"] = binding is not None
         item["store_item_id"] = binding["id"] if binding else None
+        item["category_name"] = category_name_for_display(
+            master_conn, dc_item, item["category_code"]
+        )
+        unit_price = (
+            float(dc_item["selling_price"] or 0)
+            if dc_item and dc_item["selling_price"] is not None and float(dc_item["selling_price"]) > 0
+            else (float(dc_item["unit_cost"] or 0) if dc_item else 0.0)
+        )
+        item["unit_price"] = unit_price
+        item["line_subtotal"] = parse_qty(unit_price * float(item["quantity"]))
         out.append(item)
     return out
 
@@ -289,7 +306,15 @@ def list_available_dc_items(
     category_code: str | None = None,
     keyword: str | None = None,
 ) -> list[dict[str, Any]]:
-    """List DC items that have a non-null canonical_id and active canonical item."""
+    """List DC items that have a non-null canonical_id and active canonical item.
+
+    Each returned dict is enriched with:
+      - canonical_name / canonical_unit (from canonical_items)
+      - category_code (from canonical_items; for chip filtering)
+      - category_name (Chinese; from DC categories.name → fallback to
+        canonical_categories.name → fallback to category_code → fallback to '—')
+      - unit_price (selling_price → unit_cost → 0)
+    """
     master_conn.row_factory = sqlite3.Row
     # Resolve canonical_ids in master first so category filtering does not
     # require cross-database subqueries.
@@ -299,10 +324,12 @@ def list_available_dc_items(
         where_parts.append("category_code = ?")
         params.append(category_code)
     where = " AND ".join(where_parts)
-    active_canonical_ids = {
-        r["id"] for r in master_conn.execute(
-            f"SELECT id FROM canonical_items WHERE {where}", params
-        ).fetchall()
+    canonical_rows = master_conn.execute(
+        f"SELECT id, name, category_code, unit, aux_unit, aux_rate FROM canonical_items WHERE {where}",
+        params,
+    ).fetchall()
+    active_canonical_map = {
+        int(r["id"]): dict(r) for r in canonical_rows
     }
 
     dc_conn = open_warehouse_db(dc_warehouse_code)
@@ -326,17 +353,20 @@ def list_available_dc_items(
         for r in rows:
             item = dict(r)
             canonical_id = item["canonical_id"]
-            if canonical_id not in active_canonical_ids:
-                continue
-            canon = master_conn.execute(
-                "SELECT name, category_code, unit FROM canonical_items WHERE id=?",
-                (canonical_id,),
-            ).fetchone()
+            canon = active_canonical_map.get(canonical_id)
             if canon is None:
                 continue
             item["canonical_name"] = canon["name"]
             item["category_code"] = canon["category_code"]
             item["canonical_unit"] = canon["unit"]
+            item["aux_unit"] = canon["aux_unit"]
+            item["aux_rate"] = canon["aux_rate"]
+            item["category_name"] = category_name_for_display(
+                master_conn, item, canon["category_code"]
+            )
+            selling_price = float(item.get("selling_price") or 0)
+            unit_cost = float(item.get("unit_cost") or 0)
+            item["unit_price"] = selling_price if selling_price > 0 else unit_cost
             out.append(item)
         return out
     finally:
@@ -389,6 +419,41 @@ def get_store_binding_by_canonical(
         return dict(row) if row else None
     finally:
         store_conn.close()
+
+
+def category_name_for_display(
+    master_conn: sqlite3.Connection,
+    dc_item: dict[str, Any] | None,
+    canonical_category_code: str | None,
+) -> str:
+    """Resolve a Chinese category name for display.
+
+    Priority:
+      1. DC warehouse `categories.name` joined on `items.category_id`
+         (only if dc_item was provided and has category_id).
+      2. `canonical_categories.name` joined on canonical_category_code.
+      3. canonical_category_code itself (raw code).
+      4. '—' (placeholder).
+    """
+    master_conn.row_factory = sqlite3.Row
+    if dc_item and dc_item.get("category_id"):
+        cat_id = int(dc_item["category_id"])
+        # Look up via the dc_item's warehouse db. Use the dc_item's
+        # `category_name` attribute if present (some callers pre-join).
+        if "category_name" in dc_item and dc_item["category_name"]:
+            name = str(dc_item["category_name"])
+            if name:
+                return name
+        # Otherwise, we don't have a warehouse db handle here; fall through.
+    if canonical_category_code:
+        row = master_conn.execute(
+            "SELECT name FROM canonical_categories WHERE code=?",
+            (canonical_category_code,),
+        ).fetchone()
+        if row and row["name"]:
+            return str(row["name"])
+        return str(canonical_category_code)
+    return "—"
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +666,19 @@ def get_order_detail(
             (order_id,),
         ).fetchall()
     ]
+    order["receipts"] = [
+        dict(r) for r in master_conn.execute(
+            """SELECT r.*, u.username AS receiver_username,
+                      ci.name AS canonical_name
+               FROM store_order_receipts r
+               LEFT JOIN users u ON u.id = r.received_by
+               JOIN store_order_items soi ON soi.id = r.order_item_id
+               JOIN canonical_items ci ON ci.id = soi.canonical_id
+               WHERE r.order_id=?
+               ORDER BY r.created_at DESC, r.id DESC""",
+            (order_id,),
+        ).fetchall()
+    ]
     return order
 
 
@@ -718,15 +796,17 @@ def ship_order(
             (ORDER_STATUS_SHIPPED, shipped_by, ts, ts, order_id),
         )
         for item in order["order_items"]:
-            requested = parse_qty(item["quantity"])
+            # v2: keep fulfilled_quantity at 0 here so receive_order_item can
+            # drive partial receipts. We only backfill dc_item_id so the
+            # receipt flow can locate the shipped item.
             master_conn.execute(
                 """UPDATE store_order_items
-                   SET dc_item_id=?, fulfilled_quantity=?,
-                       status=?, created_at=?
+                   SET dc_item_id=?, status=?
                    WHERE id=?""",
                 (
-                    dc_item_id_map[item["canonical_id"]], requested,
-                    ORDER_ITEM_STATUS_FULFILLED, ts, item["id"],
+                    dc_item_id_map[item["canonical_id"]],
+                    ORDER_ITEM_STATUS_PENDING,
+                    item["id"],
                 ),
             )
         _insert_status_history(
@@ -751,28 +831,292 @@ def mark_order_delivered(
     order_id: int,
     actor_id: int,
 ) -> dict[str, Any]:
-    """Mark order as delivered. P0 does not increase store inventory."""
+    """DEPRECATED wrapper — single-shot deliver using receive_order_item().
+
+    v2: the canonical path is to call ``receive_order_item`` once per order
+    item. This legacy entry-point is preserved so v1's
+    ``test_mark_order_delivered`` keeps passing: if the order is already
+    shipped and there are no receipts yet, we forward by issuing one
+    ``receive_order_item`` call per order item to consume the entire
+    remaining quantity, then return the post-delivery order detail.
+    """
     master_conn.row_factory = sqlite3.Row
     order = get_order_detail(master_conn, order_id)
     if order is None:
         raise ValueError(f"order_id={order_id} not found")
-    _assert_transition(order["status"], ORDER_STATUS_DELIVERED)
     if order["status"] != ORDER_STATUS_SHIPPED:
         raise ValueError(f"order must be shipped to deliver, got {order['status']}")
-    ts = now()
-    master_conn.execute(
-        "UPDATE store_orders SET status=?, delivered_at=?, updated_at=? WHERE id=?",
-        (ORDER_STATUS_DELIVERED, ts, ts, order_id),
-    )
-    master_conn.execute(
-        "UPDATE store_order_deliveries SET delivered_at=? WHERE order_id=?",
-        (ts, order_id),
-    )
-    _insert_status_history(
-        master_conn, order_id, order["status"], ORDER_STATUS_DELIVERED, actor_id, None,
-    )
-    master_conn.commit()
+    for item in order["order_items"]:
+        pending = parse_qty(item["quantity"]) - parse_qty(item["fulfilled_quantity"])
+        if pending <= 0:
+            continue
+        receive_order_item(
+            master_conn, order_id=order_id, order_item_id=item["id"],
+            qty=pending, actor_id=actor_id, note="legacy auto-receive",
+        )
     return get_order_detail(master_conn, order_id)
+
+
+def receive_order_item(
+    master_conn: sqlite3.Connection,
+    *,
+    order_id: int,
+    order_item_id: int,
+    qty: float,
+    actor_id: int,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Receive (partial or full) a single order_item at the storefront warehouse.
+
+    - Validates order.status == 'shipped'.
+    - Validates the order_item belongs to the order.
+    - Validates qty > 0 and qty <= (quantity - fulfilled_quantity).
+    - Writes a row to ``store_order_receipts``.
+    - Adds ``qty`` to the storefront warehouse ``items.quantity`` (auto-creating
+      a local row if needed; see §3.1 + §9.1). Writes a ``stock_movements``
+      entry with action='门店订货入库'.
+    - Increments ``store_order_items.fulfilled_quantity`` and bumps its
+      status to 'partial' / 'fulfilled' accordingly.
+    - When every order_item is fulfilled, flips ``store_orders.status`` to
+      'delivered' (sets delivered_at, history). Does NOT emit notifications;
+      the route layer is responsible for calling ``notify_order_event``.
+
+    Returns a dict with ``order_id``, ``order_item_id``, ``receipt_id``,
+    ``fulfilled_quantity``, ``new_order_status``, ``is_fully_received``.
+    Raises ValueError for any of the validation failures listed above.
+    """
+    master_conn.row_factory = sqlite3.Row
+    if qty is None:
+        raise ValueError("qty is required")
+    qty = parse_qty(qty)
+    if qty <= 0:
+        raise ValueError("收货数量必须大于 0")
+
+    order = get_order_detail(master_conn, order_id)
+    if order is None:
+        raise ValueError(f"order_id={order_id} not found")
+    if order["status"] != ORDER_STATUS_SHIPPED:
+        raise ValueError(
+            f"order must be shipped to receive, got {order['status']!r}"
+        )
+
+    target_item = next(
+        (it for it in order["order_items"] if int(it["id"]) == int(order_item_id)),
+        None,
+    )
+    if target_item is None:
+        raise ValueError(
+            f"order_item_id={order_item_id} 不属于 order_id={order_id}"
+        )
+
+    remaining = parse_qty(target_item["quantity"]) - parse_qty(
+        target_item["fulfilled_quantity"]
+    )
+    if qty > remaining + 1e-9:
+        raise ValueError(
+            f"收货数量 {qty} 超过待收 {remaining}"
+        )
+
+    # 1. write receipt row.
+    ts = now()
+    cur = master_conn.execute(
+        """INSERT INTO store_order_receipts
+           (order_id, order_item_id, quantity, received_by, note, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (order_id, order_item_id, qty, actor_id, note, ts),
+    )
+    receipt_id = int(cur.lastrowid)
+
+    # 2. open storefront warehouse and update stock + write movement.
+    store_code = order["store_warehouse_code"]
+    canonical_id = int(target_item["canonical_id"])
+    canon = master_conn.execute(
+        "SELECT name, category_code FROM canonical_items WHERE id=?",
+        (canonical_id,),
+    ).fetchone()
+    if canon is None:
+        raise ValueError(f"canonical_id={canonical_id} not found")
+    canonical_category_code = canon["category_code"]
+
+    store_conn = open_warehouse_db(store_code)
+    try:
+        store_conn.row_factory = sqlite3.Row
+        store_item = store_conn.execute(
+            "SELECT * FROM items WHERE canonical_id=?",
+            (canonical_id,),
+        ).fetchone()
+        if store_item is None:
+            # Auto-create: pick category by canonical_code → categories.name.
+            cat_id: int | None = None
+            if canonical_category_code:
+                row = store_conn.execute(
+                    "SELECT id FROM categories WHERE canonical_code=?",
+                    (canonical_category_code,),
+                ).fetchone()
+                if row is not None:
+                    cat_id = int(row["id"])
+                else:
+                    # Fallback: pick by Chinese name from canonical_categories.
+                    cc = master_conn.execute(
+                        "SELECT name FROM canonical_categories WHERE code=?",
+                        (canonical_category_code,),
+                    ).fetchone()
+                    cn = cc["name"] if cc else None
+                    if cn:
+                        row = store_conn.execute(
+                            "SELECT id FROM categories WHERE name=?",
+                            (cn,),
+                        ).fetchone()
+                        if row is not None:
+                            cat_id = int(row["id"])
+            if cat_id is None:
+                # Last-resort: first category row (init seeds all 9).
+                row = store_conn.execute(
+                    "SELECT id FROM categories ORDER BY id LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f"门店仓 {store_code} 尚未初始化品类，"
+                        f"无法为 canonical_id={canonical_id} 自动创建 items"
+                    )
+                cat_id = int(row["id"])
+            sku = f"AUTO-RECEIVE-{canonical_id}"
+            cur = store_conn.execute(
+                """INSERT INTO items
+                   (sku, name, category_id, quantity, safety_stock,
+                    unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
+                    canonical_id, updated_at)
+                   VALUES (?, ?, ?, 0, 0, ?, 0, 0, NULL, 0, ?, ?)""",
+                (sku, str(canon["name"]), cat_id, "件", canonical_id, ts),
+            )
+            new_id = int(cur.lastrowid)
+            store_conn.commit()
+            # Re-open a fresh read so the row is visible to subsequent reads
+            # (in case the same connection's read transaction snapshots the
+            # state before the insert).
+            store_conn.close()
+            store_conn = open_warehouse_db(store_code)
+            store_conn.row_factory = sqlite3.Row
+            store_item = store_conn.execute(
+                "SELECT * FROM items WHERE id=?", (new_id,)
+            ).fetchone()
+        assert store_item is not None
+        new_qty = parse_qty(float(store_item["quantity"]) + qty)
+        store_conn.execute(
+            "UPDATE items SET quantity=?, updated_at=? WHERE id=?",
+            (new_qty, ts, store_item["id"]),
+        )
+        store_conn.execute(
+            """INSERT INTO stock_movements
+               (item_id, action, delta, note, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                store_item["id"], RECEIPT_ACTION, qty,
+                f"{RECEIPT_ACTION} #{order['order_no']}", ts,
+            ),
+        )
+        store_conn.commit()
+        # Backfill store_item_id on the order item so subsequent receipts can
+        # locate it directly.
+        master_conn.execute(
+            "UPDATE store_order_items SET store_item_id=? WHERE id=?",
+            (store_item["id"], order_item_id),
+        )
+    except Exception:
+        store_conn.rollback()
+        store_conn.close()
+        raise
+    else:
+        store_conn.close()
+
+    # 3. update order item fulfilled_quantity + status.
+    new_fulfilled = parse_qty(float(target_item["fulfilled_quantity"]) + qty)
+    if abs(new_fulfilled - float(target_item["quantity"])) < 1e-9:
+        new_item_status = ORDER_ITEM_STATUS_FULFILLED
+    elif new_fulfilled > 0:
+        new_item_status = ORDER_ITEM_STATUS_PARTIAL
+    else:
+        new_item_status = ORDER_ITEM_STATUS_PENDING
+    master_conn.execute(
+        """UPDATE store_order_items
+           SET fulfilled_quantity=?, status=?
+           WHERE id=?""",
+        (new_fulfilled, new_item_status, order_item_id),
+    )
+
+    # 4. decide whether to flip the order to delivered.
+    new_order_status = order["status"]
+    is_fully_received = False
+    # Reload items because we just updated one.
+    refreshed = get_order_detail(master_conn, order_id)
+    if refreshed is not None:
+        all_done = all(
+            abs(parse_qty(it["fulfilled_quantity"]) - parse_qty(it["quantity"])) < 1e-9
+            for it in refreshed["order_items"]
+        )
+        if all_done and refreshed["status"] == ORDER_STATUS_SHIPPED:
+            master_conn.execute(
+                """UPDATE store_orders
+                   SET status=?, delivered_at=?, updated_at=?
+                   WHERE id=?""",
+                (ORDER_STATUS_DELIVERED, ts, ts, order_id),
+            )
+            master_conn.execute(
+                "UPDATE store_order_deliveries SET delivered_at=? WHERE order_id=?",
+                (ts, order_id),
+            )
+            _insert_status_history(
+                master_conn, order_id, ORDER_STATUS_SHIPPED,
+                ORDER_STATUS_DELIVERED, actor_id, note or "门店收货自动完成",
+            )
+            new_order_status = ORDER_STATUS_DELIVERED
+            is_fully_received = True
+    master_conn.commit()
+
+    return {
+        "order_id": order_id,
+        "order_item_id": order_item_id,
+        "receipt_id": receipt_id,
+        "fulfilled_quantity": new_fulfilled,
+        "new_order_status": new_order_status,
+        "is_fully_received": is_fully_received,
+    }
+
+
+def list_order_receipts(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+) -> list[dict[str, Any]]:
+    """Return all receipts for an order, newest first."""
+    master_conn.row_factory = sqlite3.Row
+    return [
+        dict(r) for r in master_conn.execute(
+            """SELECT r.*, u.username AS receiver_username,
+                      ci.name AS canonical_name
+               FROM store_order_receipts r
+               LEFT JOIN users u ON u.id = r.received_by
+               JOIN store_order_items soi ON soi.id = r.order_item_id
+               JOIN canonical_items ci ON ci.id = soi.canonical_id
+               WHERE r.order_id=?
+               ORDER BY r.created_at DESC, r.id DESC""",
+            (order_id,),
+        ).fetchall()
+    ]
+
+
+def get_order_item_pending_qty(
+    master_conn: sqlite3.Connection,
+    order_item_id: int,
+) -> float:
+    """Return quantity - fulfilled_quantity for an order_item."""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT quantity, fulfilled_quantity FROM store_order_items WHERE id=?",
+        (order_item_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"order_item_id={order_item_id} not found")
+    return parse_qty(float(row["quantity"]) - float(row["fulfilled_quantity"]))
 
 
 def cancel_order(

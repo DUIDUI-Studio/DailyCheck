@@ -367,6 +367,222 @@ def test_mark_order_delivered(ordering_env):
     assert order["delivered_at"] is not None
 
 
+def test_receive_order_item_basic(ordering_env):
+    """Single full receipt: order_item fulfilled, order delivered."""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order_item_id = order["order_items"][0]["id"]
+
+    result = sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id,
+        qty=5.0, actor_id=3, note="ok",
+    )
+    assert result["new_order_status"] == sop.ORDER_STATUS_DELIVERED
+    assert result["is_fully_received"] is True
+    assert result["fulfilled_quantity"] == 5.0
+
+    # Store stock increased by 5.
+    store = sqlite3.connect(str(ordering_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    qty = store.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101"
+    ).fetchone()["quantity"]
+    assert qty == 5.0
+    # stock_movements written.
+    mv = store.execute(
+        "SELECT action, delta FROM stock_movements WHERE action=?",
+        (sop.RECEIPT_ACTION,),
+    ).fetchone()
+    assert mv["delta"] == 5.0
+    store.close()
+
+
+def test_receive_order_item_partial_then_full(ordering_env):
+    """Two partial receipts → 全部收齐 → delivered."""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order_item_id = order["order_items"][0]["id"]
+
+    r1 = sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id,
+        qty=3.0, actor_id=3,
+    )
+    assert r1["is_fully_received"] is False
+    assert r1["new_order_status"] == sop.ORDER_STATUS_SHIPPED  # still shipped
+    # Item is partial, fulfilled=3
+    item = conn.execute(
+        "SELECT fulfilled_quantity, status FROM store_order_items WHERE id=?",
+        (order_item_id,),
+    ).fetchone()
+    assert item["fulfilled_quantity"] == 3.0
+    assert item["status"] == sop.ORDER_ITEM_STATUS_PARTIAL
+
+    r2 = sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id,
+        qty=7.0, actor_id=3,
+    )
+    assert r2["is_fully_received"] is True
+    assert r2["new_order_status"] == sop.ORDER_STATUS_DELIVERED
+
+    # Receipts: 2 rows.
+    receipts = sop.list_order_receipts(conn, order["id"])
+    assert len(receipts) == 2
+    # Newest first.
+    assert float(receipts[0]["quantity"]) == 7.0
+    assert float(receipts[1]["quantity"]) == 3.0
+
+
+def test_receive_order_item_over_remaining_rejected(ordering_env):
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order_item_id = order["order_items"][0]["id"]
+
+    # First, receive 4 valid.
+    sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id,
+        qty=4.0, actor_id=3,
+    )
+    # Now try to over-collect (remaining=1).
+    with pytest.raises(ValueError):
+        sop.receive_order_item(
+            conn, order_id=order["id"], order_item_id=order_item_id,
+            qty=2.0, actor_id=3,
+        )
+
+
+def test_receive_order_item_status_must_be_shipped(ordering_env):
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order_item_id = order["order_items"][0]["id"]
+
+    # status=pending — not shipped yet.
+    with pytest.raises(ValueError, match="shipped"):
+        sop.receive_order_item(
+            conn, order_id=order["id"], order_item_id=order_item_id,
+            qty=1.0, actor_id=3,
+        )
+
+
+def test_receive_order_item_auto_creates_store_item(ordering_env):
+    """When the storefront has no local items row for the canonical_id, receive
+    must auto-create one (quantity=0) and immediately add the received qty."""
+    conn = ordering_env["master_conn"]
+    # canonical_id 102 is NOT bound in store_test (intentional from fixture).
+    # We bypass submit_order (which would block unbound) by inserting the order
+    # directly. This still exercises the receive_order_item auto-create path.
+    ts = sop.now()
+    cur = conn.execute(
+        """INSERT INTO store_orders
+           (order_no, store_warehouse_code, dc_warehouse_code, status,
+            requested_by, expected_delivery_date, note, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, NULL, '', ?, ?)""",
+        ("SO-AUTO-0001", "store_test", "dc_test",
+         sop.ORDER_STATUS_SHIPPED, 2, ts, ts),
+    )
+    order_id = int(cur.lastrowid)
+    # ship_order logic needs dc_item_id resolved; reuse ship_order's effect by
+    # inserting one shipped order_item.
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    dc_item_id = int(dc.execute(
+        "SELECT id FROM items WHERE canonical_id=102"
+    ).fetchone()["id"])
+    dc.close()
+    cur = conn.execute(
+        """INSERT INTO store_order_items
+           (order_id, canonical_id, dc_item_id, quantity, unit,
+            fulfilled_quantity, status, created_at)
+           VALUES (?, ?, ?, 3.0, '件', 0, 'pending', ?)""",
+        (order_id, 102, dc_item_id, ts),
+    )
+    order_item_id = int(cur.lastrowid)
+
+    result = sop.receive_order_item(
+        conn, order_id=order_id, order_item_id=order_item_id,
+        qty=3.0, actor_id=3,
+    )
+    assert result["is_fully_received"] is True
+
+    # Store has a new row for canonical_id=102, quantity=3.
+    store = sqlite3.connect(str(ordering_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    row = store.execute(
+        "SELECT quantity, canonical_id FROM items WHERE canonical_id=102"
+    ).fetchone()
+    assert row is not None
+    assert row["quantity"] == 3.0
+    store.close()
+
+
+def test_list_order_receipts_descending(ordering_env):
+    """list_order_receipts must return newest first."""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order_item_id = order["order_items"][0]["id"]
+
+    sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id,
+        qty=2.0, actor_id=3, note="first",
+    )
+    sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id,
+        qty=3.0, actor_id=3, note="second",
+    )
+
+    receipts = sop.list_order_receipts(conn, order["id"])
+    assert [float(r["quantity"]) for r in receipts] == [3.0, 2.0]
+    assert [r["note"] for r in receipts] == ["second", "first"]
+
+
+def test_list_available_dc_items_includes_category_name_and_unit_price(ordering_env):
+    conn = ordering_env["master_conn"]
+    items = sop.list_available_dc_items(conn, "dc_test")
+    assert items, "fixture should expose at least one DC item"
+    for it in items:
+        assert "category_name" in it
+        assert "unit_price" in it
+        # category_name for fixture 'PACKAGING' must be the Chinese name from
+        # canonical_categories.
+        if it["canonical_id"] == 101:
+            assert it["category_name"] == "包材"
+            # unit_price is 0 because fixture did not set selling_price/unit_cost.
+            assert float(it["unit_price"]) == 0.0
+
+
+def test_mark_order_delivered_legacy_compat(ordering_env):
+    """mark_order_delivered must still work end-to-end (calls receive internally)."""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 4.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order = sop.ship_order(conn, order["id"], shipped_by=4)
+    order = sop.mark_order_delivered(conn, order["id"], actor_id=3)
+    assert order["status"] == sop.ORDER_STATUS_DELIVERED
+    # Legacy path wrote receipts for the whole remaining qty.
+    receipts = sop.list_order_receipts(conn, order["id"])
+    assert len(receipts) == 1
+    assert float(receipts[0]["quantity"]) == 4.0
+
+
 def test_notify_order_event_targets(ordering_env):
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
