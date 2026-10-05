@@ -71,8 +71,8 @@
             <span class="inv-name">{{ item.canonical_name }}</span>
           </div>
           <div class="inv-card-status">
-            {% if item.quantity <= 0 %}<span class="status-pill danger">0 库存</span>
-            {% else %}<span class="status-pill ok">库存 {{ item.quantity | fmt_qty }}</span>{% endif %}
+            {# v3 A5: catalog 卡片不显示库存数字，统一样式「可订」绿 pill。 #}
+            <span class="status-pill ok">可订</span>
           </div>
         </div>
         <div class="inv-card-body">
@@ -169,7 +169,8 @@
     _currentStock = parseFloat(stock);
 
     cmName.textContent = name;
-    cmStock.textContent = '当前库存: ' + stock + ' ' + unit + ' / 单价 ¥ ' + unitPrice.toFixed(2);
+    {# v3 A5: 弹窗内移除库存数字，仅显示单价。 #}
+    cmStock.textContent = '单价 ¥ ' + unitPrice.toFixed(2);
 
     cmPillBase.textContent = unit;
     if (auxUnit && auxRate > 0) {

@@ -386,7 +386,7 @@ def submit_order_route() -> str:
             validation = sop.validate_cart_for_submit(master, cart)
             if not validation["ok"]:
                 errors = validation
-                flash("提交失败，请检查库存与门店绑定")
+                flash("提交失败，请检查门店绑定")
             else:
                 order = sop.submit_order(
                     master, cart["id"], g.user["id"],
@@ -449,7 +449,11 @@ def store_orders_list() -> str:
 @bp.route("/orders/<int:order_id>")
 @require_login
 def order_detail(order_id: int) -> str:
-    """Order detail view shared by store, DC and admin."""
+    """Order detail view shared by store, DC and admin.
+
+    v3 A4: 计算订单总金额 Σ(quantity × unit_price)。
+    v3 A6: 收集 DC 仓库当前库存（含允许欠货出库后的负值）。
+    """
     master = get_master_db()
     order = sop.get_order_detail(master, order_id)
     if order is None:
@@ -459,9 +463,30 @@ def order_detail(order_id: int) -> str:
     role = g.role["role"] if g.role else None
     wh_type = _current_warehouse_type()
     is_admin = _is_admin()
+
+    # v3 A6: 收集 DC 仓当前库存（每个明细：name / dc_available / unit_price /
+    # category_name）。同时把 unit_price / dc_available 写回 item，模板直接
+    # 用 item.unit_price / item.dc_available 取值，避免模板侧再二次查询。
+    dc_items_info = sop.get_dc_items_for_order_detail(master, order_id)
+    for item in order["order_items"]:
+        info = dc_items_info.get(int(item["id"]), {})
+        item["unit_price"] = info.get("unit_price", 0.0)
+        item["dc_available"] = info.get("dc_available", 0.0)
+
+    # v3 A4: 订单总金额 = Σ(item.quantity × item.unit_price)，2dp 量化。
+    total_amount = sum(
+        parse_qty(item["quantity"]) * parse_qty(item.get("unit_price") or 0)
+        for item in order["order_items"]
+    )
+
+    is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC
+
     return render_template(
         "store_ordering/order_detail.html",
         order=order,
+        total_amount=total_amount,
+        dc_items_info=dc_items_info,
+        is_dc_view=is_dc_view,
         can_review=(
             wh_type == sop.WAREHOUSE_TYPE_DC
             and role in ("manager", "admin")
@@ -547,18 +572,93 @@ def shipment_list() -> str:
 @require_warehouse_type("distribution_center")
 @require_role("staff")
 def ship_order_route(order_id: int) -> str:
-    """Ship an approved order."""
+    """DC 部分/全部发货（v3）。
+
+    表单字段约定：
+      - ``shipped_items[N]=qty``：多值，每行一个明细的本批发货数。N 是
+        ``store_order_items.id``，与 order_detail.html 中的 input name 配对。
+      - ``qty``：兼容 v1/v2 的「全量一次发货」字段；填了就给所有明细
+        各发 qty 件（仍受累计上限校验）。
+      - 上述两者都缺省：走 ``ship_order_full``（legacy full-ship），把
+        每个明细的剩余可发数量一次性发齐。该兼容路径保证旧测试 / 老 UI
+        不破。
+
+    通知：仅在订单全部发齐后写一条 ``store_order_shipped``；partial 不发
+    通知避免刷屏（v3 设计 §10.4）。
+    """
     tracking_note = (request.form.get("tracking_note") or "").strip() or None
     master = get_master_db()
     _assert_order_belongs_to_current_dc(master, order_id)
-    try:
-        order = sop.ship_order(master, order_id, g.user["id"], tracking_note)
-    except ValueError as e:
-        flash(f"出库失败：{e}")
-        return redirect(url_for("store_ordering.shipment_list"))
-    sop.notify_order_event(master, sop.EVENT_ORDER_SHIPPED, order, g.user["id"])
-    flash("出库成功")
-    return redirect(url_for("store_ordering.shipment_list"))
+
+    # 1. 解析 shipped_items[N] = qty 形式（v3 多值表单）。
+    shipped_items_map: dict[int, float] = {}
+    for key, value in request.form.items():
+        if key.startswith("shipped_items[") and key.endswith("]"):
+            try:
+                oid = int(key[len("shipped_items["):-1])
+                qty = parse_qty(value)
+                if qty > 0:
+                    shipped_items_map[oid] = qty
+            except (ValueError, TypeError):
+                continue
+
+    # 2. 兼容 v2 全量字段 'qty'：所有未发齐明细都发 qty。
+    if not shipped_items_map:
+        raw_qty = request.form.get("qty")
+        if raw_qty is not None and raw_qty != "":
+            qty_value = parse_qty(raw_qty)
+            if qty_value > 0:
+                detail = sop.get_order_detail(master, order_id)
+                if detail is not None:
+                    for it in detail["order_items"]:
+                        already = parse_qty(it.get("shipped_quantity") or 0)
+                        remaining = parse_qty(it["quantity"]) - already
+                        if remaining > 0:
+                            shipped_items_map[int(it["id"])] = min(
+                                qty_value, remaining
+                            )
+
+    # 3. 都没填 → 走 legacy full-ship（每明细剩余数量一次发齐）。
+    used_full_ship_fallback = False
+    if not shipped_items_map:
+        try:
+            order = sop.ship_order_full(
+                master, order_id, g.user["id"], tracking_note
+            )
+            used_full_ship_fallback = True
+        except ValueError as e:
+            flash(f"出库失败：{e}")
+            return redirect(url_for("store_ordering.shipment_list"))
+    else:
+        try:
+            order = sop.ship_order(
+                master, order_id, shipped_items_map,
+                shipped_by=g.user["id"], tracking_note=tracking_note,
+            )
+        except ValueError as e:
+            flash(f"出库失败：{e}")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    # 4. 通知：仅全部发齐才触发 store_order_shipped 通知（v3 §10.4）。
+    is_fully_shipped = bool(order.get("is_fully_shipped")) or (
+        order.get("status") == sop.ORDER_STATUS_SHIPPED and used_full_ship_fallback
+    )
+    if is_fully_shipped:
+        sop.notify_order_event(
+            master, sop.EVENT_ORDER_SHIPPED, order, g.user["id"]
+        )
+
+    # 5. flash 文案：全部发齐 → "出库成功"；部分 → "本批发货 X 件"。
+    if is_fully_shipped:
+        flash("出库成功")
+    else:
+        shipped_total = sum(
+            parse_qty(it.get("shipped_quantity") or 0)
+            for it in order.get("order_items", [])
+        )
+        flash(f"本批发货 {shipped_total:g} 件（订单仍可继续部分发货）")
+
+    return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
 
 @bp.route("/orders/<int:order_id>/deliver", methods=["POST"])
