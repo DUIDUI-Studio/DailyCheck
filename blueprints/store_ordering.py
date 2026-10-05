@@ -123,11 +123,10 @@ def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: in
 @require_login
 def catalog() -> str:
     """Show DC selector or item catalog for the selected DC."""
-    if _is_admin():
-        pass
-    elif _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC:
+    # DC users and admins in a DC warehouse go straight to the review queue.
+    if _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC:
         return redirect(url_for("store_ordering.review_list"))
-    elif _current_warehouse_type() != "storefront":
+    if _current_warehouse_type() != "storefront":
         flash("门店订货仅对门店或管理员开放")
         return redirect(url_for("core.dashboard"))
 
