@@ -1747,6 +1747,7 @@ def fanout_canonical_items(
     dry_run: bool = False,
     started_by: int | None = None,
     summary: str | None = None,
+    backup_paths: list[str] | None = None,
 ) -> dict:
     """T8 —— 主扇出函数。Spec §3.3 时序图完整实现。
 
@@ -1756,6 +1757,7 @@ def fanout_canonical_items(
         warehouse_codes: 目标仓列表
         action: keep / merge / overwrite / force(force 通过 force=True 走)
         dry_run: True 时只算 plan,不写库
+        backup_paths: 写前备份文件路径列表(Q7 措施①);写入事件 backup_paths_json。
     Returns:
         {
           "event_id": int,
@@ -1823,7 +1825,7 @@ def fanout_canonical_items(
     total_written = 0
     total_frozen = 0
     any_partial = False
-    backup_paths: list[str] = []
+    backup_paths = backup_paths or []
 
     for cid in canonical_ids:
         canon = canon_by_id.get(cid)
@@ -2508,9 +2510,13 @@ def dry_run_report(
                 f"SELECT id, {select_clause} FROM items"
             ).fetchall()
             item_rows = [dict(r) for r in rows]
-            bound = conn.execute(
-                "SELECT COUNT(*) FROM items WHERE canonical_id IS NOT NULL"
-            ).fetchone()[0]
+            # canonical_id 列可能缺失(旧仓尚未迁移):纯只读模式不做迁移、不写表,
+            # 缺失列按「已纳管 0」处理,维持 align-detect 的只读契约。
+            bound = 0
+            if "canonical_id" in cols:
+                bound = conn.execute(
+                    "SELECT COUNT(*) FROM items WHERE canonical_id IS NOT NULL"
+                ).fetchone()[0]
         rows_per_wh[code] = item_rows
         total = len(item_rows)
         coverage[code] = (total, int(bound))
@@ -2553,7 +2559,7 @@ def dry_run_report(
     lines.append("  - 已有主数据未认领: 用 /canonical/claim 或批量认领页绑定。")
     lines.append("  - 确认无误后执行:")
     lines.append("    flask --app app align-apply --canonical-ids <ids> "
-                "--warehouses <codes> [--action overwrite] --yes")
+                "--warehouses <codes> [--action overwrite|merge|keep] --yes")
     lines.append("  本报告为只读 dry-run,未写任何表。")
     lines.append("")
     return "\n".join(lines)

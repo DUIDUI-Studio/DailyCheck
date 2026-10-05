@@ -25,7 +25,7 @@ from flask import Flask
 from werkzeug.security import generate_password_hash
 
 from config import BASE_DIR, MASTER_DB
-from db import init_master_db
+from db import init_master_db, migrate_warehouse_db_columns
 from db.migrate import migrate_legacy_inventory
 
 
@@ -431,7 +431,13 @@ def align_apply_cmd(
     """
     from blueprints import canonical_pure as cp
 
-    ids = [int(x) for x in canonical_ids.split(",") if x.strip()]
+    raw_ids = [x.strip() for x in canonical_ids.split(",") if x.strip()]
+    try:
+        ids = [int(x) for x in raw_ids]
+    except ValueError as exc:
+        raise click.UsageError(
+            f"--canonical-ids 含非数字项: {raw_ids}(应为纯整数逗号分隔)"
+        ) from exc
     whs = [w.strip() for w in warehouse_codes.split(",") if w.strip()]
     if not ids:
         raise click.UsageError("--canonical-ids 不能为空")
@@ -453,6 +459,7 @@ def align_apply_cmd(
         master_conn.row_factory = sqlite3.Row
         # 解析各仓 db 路径(master.warehouses.db_path,相对路径按 BASE_DIR)
         wh_conns: dict[str, sqlite3.Connection] = {}
+        backup_paths: list[str] = []
         for code in whs:
             row = master_conn.execute(
                 "SELECT db_path FROM warehouses WHERE code=?", (code,)
@@ -464,6 +471,9 @@ def align_apply_cmd(
                 db_path = BASE_DIR / db_path
             if not db_path.exists():
                 raise click.UsageError(f"仓库 {code} 的 db 不存在: {db_path}")
+            migrate_warehouse_db_columns(db_path)
+            # Q7 §7.7.2 措施①:写前备份(失败即中止,绝不吞异常)
+            backup_paths.append(str(cp.backup_warehouse_db(db_path, tag="pre-fanout")))
             wh_conns[code] = sqlite3.connect(db_path)
 
         try:
@@ -472,6 +482,7 @@ def align_apply_cmd(
                 canonical_ids=ids, warehouse_codes=whs,
                 action=action, force=force, dry_run=False,
                 summary=f"cli align-apply {canonical_ids} -> {warehouse_codes}",
+                backup_paths=backup_paths,
             )
         finally:
             for conn in wh_conns.values():

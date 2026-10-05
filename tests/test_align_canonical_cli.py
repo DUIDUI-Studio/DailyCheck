@@ -27,6 +27,7 @@ import pytest
 
 @pytest.fixture
 def align_env(tmp_path: Path, monkeypatch):
+    import blueprints.canonical_pure as cp_module
     import cli as cli_module
     import config as config_module
     import db as db_module
@@ -42,6 +43,8 @@ def align_env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
     monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
     monkeypatch.setattr(cli_module, "MASTER_DB", master_path)
+    # align-apply 写前备份落 tmp_path,避免污染真实 backups/ 目录
+    monkeypatch.setattr(cp_module, "BACKUP_WAREHOUSE_DIR", tmp_path / "backups")
 
     init_master_db()
 
@@ -268,6 +271,16 @@ def test_align_apply_with_force_writes(seeded_env):
     assert _count(master_path, "canonical_publish_events") == 1
     assert _count(master_path, "canonical_publish_event_items") >= 1
 
+    # 写前备份(Q7 措施①):备份文件落 tmp 备份目录,事件记录 backup_paths_json
+    import blueprints.canonical_pure as cp_module
+    backups = list(cp_module.BACKUP_WAREHOUSE_DIR.glob("*.db"))
+    assert backups, "align-apply 写前应生成仓库备份"
+    with sqlite3.connect(master_path) as conn:
+        row = conn.execute(
+            "SELECT backup_paths_json FROM canonical_publish_events"
+        ).fetchone()
+        assert row[0] is not None, "事件应记录备份路径"
+
 
 def test_align_apply_respects_v4_scope(seeded_env):
     """--warehouses wh_010 → 拒绝(v4 范围外),不写库。"""
@@ -288,3 +301,50 @@ def test_align_apply_respects_v4_scope(seeded_env):
             "SELECT COUNT(*) FROM items WHERE canonical_id IS NOT NULL"
         ).fetchone()[0] == 0
     assert _count(master_path, "canonical_publish_events") == 0
+
+
+def test_align_apply_rejects_non_numeric_ids(seeded_env):
+    """--canonical-ids 含非数字 → 友好 UsageError,不写库。"""
+    runner = seeded_env["runner"]
+    master_path = seeded_env["master_path"]
+    wh_paths = seeded_env["wh_paths"]
+
+    r = runner.invoke(args=[
+        "align-apply", "--canonical-ids", "1,abc",
+        "--warehouses", "wh_002", "--yes",
+    ])
+    assert r.exit_code != 0
+    assert "非数字" in r.output
+
+    with sqlite3.connect(wh_paths["wh_002"]) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM items WHERE canonical_id IS NOT NULL"
+        ).fetchone()[0] == 0
+    assert _count(master_path, "canonical_publish_events") == 0
+
+
+def test_align_detect_readonly_without_canonical_column(align_env):
+    """align-detect 对缺 canonical_id 列的旧仓保持只读:不报错、不补列。"""
+    runner = align_env["runner"]
+    wh_paths = align_env["wh_paths"]
+
+    # 模拟未迁移旧仓:重建 items 表,去掉 canonical_id 等列
+    with sqlite3.connect(wh_paths["wh_002"]) as conn:
+        conn.execute("DROP TABLE items")
+        conn.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, sku TEXT, "
+            "name TEXT, unit TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO items (sku, name, unit) VALUES ('OLD-1', '旧品', '件')"
+        )
+        conn.commit()
+
+    r = runner.invoke(args=["align-detect"])
+    assert r.exit_code == 0, r.output
+    assert "wh_002" in r.output
+
+    # 只读契约:items 表未被补 canonical_id 列
+    with sqlite3.connect(wh_paths["wh_002"]) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(items)")]
+    assert "canonical_id" not in cols

@@ -709,6 +709,10 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
                 )
         conn.commit()
 
+    # 新建仓也跑一遍幂等列迁移(含 canonical_id / canonical_code 等),
+    # 否则下游(CLI align 命令 / canonical 扇出)会撞 `no such column: canonical_id`。
+    migrate_warehouse_db_columns(db_path)
+
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
     """Run idempotent column-add migrations on an EXISTING warehouse db.
