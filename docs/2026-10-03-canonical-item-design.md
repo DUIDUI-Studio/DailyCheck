@@ -2289,4 +2289,52 @@ T1 Q1-Q4/Q7 开关 ─┬─> T2 master 表 ─┬─> T4 主数据 CRUD ─┬�
 | §7.6 Q6 完整影响 | Q6 |
 | §8 开关速查 | 第 5 节 Q1-Q7 |
 
+## 附录 C：运维 CLI 入口（2026-10-05 加，issue #11）
+
+canonical 对齐全流程的三个 flask 命令。策略与范围常量全部在
+`blueprints/canonical_pure.py`（T25），命令本体在 `cli.py`，
+测试在 `tests/test_align_canonical_cli.py`。
+
+### 范围常量（冻结）
+
+```python
+# canonical_pure.py
+ALIGN_SCOPE_WAREHOUSES: tuple[str, ...] = (
+    "wh_000", "wh_002", "wh_003", "wh_004", "wh_006",
+)
+```
+
+v4 冻结范围：wh_001（已关）/ wh_010（空）/ rd_001（研发，无库存）不进。
+**v5 扩展前不许改**；改动必须同步本节并在 code review 说明。
+
+### 三个命令
+
+```bash
+# 1. 种子（幂等，无破坏性）——只写 master.canonical_categories / canonical_items
+flask --app app align-seed
+
+# 2. dry-run 报告（纯只读，不写任何表）——运营日常入口
+flask --app app align-detect              # 打到 stdout
+flask --app app align-detect --out /tmp/align-report.txt
+
+# 3. 真扇出（危险：写目标仓 items.canonical_id / canonical_synced_json）
+#    双确认：--yes + 交互确认提示；范围外仓库直接拒绝
+flask --app app align-apply \
+  --canonical-ids "1,2,3" \
+  --warehouses "wh_002,wh_003" \
+  --action overwrite \
+  [--force]          # 跳过冻结字段(local != last_synced)保护，Spec §3.5
+```
+
+### 语义对照
+
+| 命令 | 写 master | 写 wh_xxx.items | 对应 pure 函数 |
+| --- | --- | --- | --- |
+| align-seed | ✅ canonical_categories / canonical_items | ❌ | `seed_canonical_categories` + `seed_default_canonical_items` |
+| align-detect | ❌ | ❌ | `dry_run_report`（T25，调 `detect_similar_items`） |
+| align-apply | ✅ canonical_publish_events / canonical_conflicts | ✅ canonical_id / canonical_synced_json / canonical_status | `fanout_canonical_items(dry_run=False)` |
+
+Q7 库存零丢失不变量在 apply 路径依然成立：不动 quantity / sku / name /
+selling_price / unit_cost（NEVER_TOUCH_COLUMNS，Spec §7.7）。
+
 

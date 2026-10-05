@@ -115,6 +115,10 @@ Public surface (this file):
     assert_inventory_unchanged(before, after) -> None
     assert_ids_stable(before_ids, after_ids) -> None
     assert_row_count_conserved(conn, table, before) -> None
+
+  T25 — Canonical align CLI (issue #11):
+    ALIGN_SCOPE_WAREHOUSES
+    dry_run_report(master_conn, target_wh_codes=None) -> str
 """
 from __future__ import annotations
 
@@ -2430,3 +2434,126 @@ def _infer_category_code(name: str) -> str | None:
     if "盒" in name_l or "碗" in name_l or "托" in name_l or "盖" in name_l:
         return "PACKAGING"
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T25 — Canonical align CLI (issue #11, 2026-10-05)
+#
+#  对齐全流程的 CLI 支撑层：
+#    align-seed   → seed_canonical_categories + seed_default_canonical_items
+#    align-detect → dry_run_report()（纯只读）
+#    align-apply  → fanout_canonical_items(dry_run=False)（危险,双确认）
+#  命令本体在 cli.py；范围常量与报告格式化放本文件（单一真相源）。
+# ─────────────────────────────────────────────────────────────────────
+
+# v4 冻结的对齐范围（docs/2026-10-03-canonical-item-design.md §6）。
+# wh_001(已关) / wh_010(空) / rd_001(研发,无库存) 不进对齐范围。
+# v5 扩展前不许改本常量；改动必须在设计文档同步说明。
+ALIGN_SCOPE_WAREHOUSES: tuple[str, ...] = (
+    "wh_000", "wh_002", "wh_003", "wh_004", "wh_006",
+)
+
+
+def dry_run_report(
+    master_conn: sqlite3.Connection,
+    target_wh_codes: tuple[str, ...] | None = None,
+) -> str:
+    """T25 —— 跨仓同物候选 dry-run 报告（人类可读,纯只读,不写任何表）。
+
+    输出三段:
+      1. 各仓现状: items 总数 / canonical_id 覆盖数与覆盖率
+      2. 同物候选分组: 成员(仓+sku+name+unit) + confidence + signals
+      3. 推荐操作汇总
+
+    范围: 默认 ALIGN_SCOPE_WAREHOUSES,且只取 warehouse_type='storefront'
+    （rd_001 自动排除,与 collect_all_items 同语义）。
+
+    返回 str——不直接 print,让 CLI 命令决定 stdout / --out <file>。
+    """
+    from config import BASE_DIR  # call-time import：测试 monkeypatch 生效
+
+    scope = tuple(target_wh_codes) if target_wh_codes else ALIGN_SCOPE_WAREHOUSES
+    master_conn.row_factory = sqlite3.Row
+
+    lines: list[str] = []
+    ts = _now_str()
+    lines.append(f"Canonical 对齐 dry-run 报告  ({ts})")
+    lines.append(f"范围(冻结): {', '.join(scope)}")
+    lines.append("=" * 62)
+
+    # ── 1. 各仓现状 ──────────────────────────────────────────────────
+    wh_rows = master_conn.execute(
+        """SELECT code, db_path FROM warehouses
+           WHERE warehouse_type='storefront' ORDER BY code"""
+    ).fetchall()
+    rows_per_wh: dict[str, list[dict[str, Any]]] = {}
+    coverage: dict[str, tuple[int, int]] = {}  # code -> (total, bound)
+
+    for wh in wh_rows:
+        code = wh["code"]
+        if code not in scope:
+            continue
+        db_path = Path(wh["db_path"])
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
+        if not db_path.exists():
+            lines.append(f"[{code}] db 缺失({db_path}),跳过")
+            continue
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cols = select_item_columns(conn)
+            want = [c for c in ("sku", "name", "unit") if c in cols]
+            select_clause = ", ".join(want)
+            rows = conn.execute(
+                f"SELECT id, {select_clause} FROM items"
+            ).fetchall()
+            item_rows = [dict(r) for r in rows]
+            bound = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE canonical_id IS NOT NULL"
+            ).fetchone()[0]
+        rows_per_wh[code] = item_rows
+        total = len(item_rows)
+        coverage[code] = (total, int(bound))
+
+    lines.append("")
+    lines.append("【1】各仓现状")
+    if not coverage:
+        lines.append("  范围内没有可用的 storefront 仓库。")
+    for code in scope:
+        if code not in coverage:
+            continue
+        total, bound = coverage[code]
+        pct = (bound / total * 100) if total else 0.0
+        lines.append(
+            f"  {code}: items={total}, 已纳管={bound} (覆盖率 {pct:.1f}%)"
+        )
+
+    # ── 2. 同物候选分组 ──────────────────────────────────────────────
+    groups = detect_similar_items(rows_per_wh)
+    lines.append("")
+    lines.append(f"【2】同物候选分组 (共 {len(groups)} 组)")
+    if not groups:
+        lines.append("  未检测到跨仓相似候选（阈值 confidence>=0.5）。")
+    for i, g in enumerate(groups, 1):
+        lines.append(
+            f"  组{i} unit={g['unit']!r} confidence={g['confidence']} "
+            f"signals={g['signals']}"
+        )
+        for m in g["members"]:
+            lines.append(
+                f"    - {m['_warehouse_code']}/{m.get('sku', '?')}: "
+                f"{m.get('name', '?')} ({m.get('unit', '?')})"
+            )
+
+    # ── 3. 推荐操作 ──────────────────────────────────────────────────
+    lines.append("")
+    lines.append("【3】推荐操作")
+    lines.append("  - 新主数据: 对确认同物的组,先在 /canonical 页面创建")
+    lines.append("    canonical_items,再把各仓成员认领过去。")
+    lines.append("  - 已有主数据未认领: 用 /canonical/claim 或批量认领页绑定。")
+    lines.append("  - 确认无误后执行:")
+    lines.append("    flask --app app align-apply --canonical-ids <ids> "
+                "--warehouses <codes> [--action overwrite] --yes")
+    lines.append("  本报告为只读 dry-run,未写任何表。")
+    lines.append("")
+    return "\n".join(lines)
