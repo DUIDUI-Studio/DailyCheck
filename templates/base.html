@@ -45,6 +45,9 @@
     {% endif %}
     {% if is_admin or is_storefront or is_distribution_center %}
     <a href="{{ url_for('store_ordering.catalog') }}">门店订货</a>
+    {% if is_admin or is_storefront %}
+    <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
+    {% endif %}
     {% endif %}
     {% if is_rd %}
     <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
@@ -119,6 +122,9 @@
       {% endif %}
       {% if is_admin or is_storefront or is_distribution_center %}
       <a href="{{ url_for('store_ordering.catalog') }}">订货</a>
+      {% if is_admin or is_storefront %}
+      <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
+      {% endif %}
       {% endif %}
       {% if is_admin or is_rd %}
       <a href="{{ url_for('recipe_cost.landing') }}">配方</a>
