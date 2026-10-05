@@ -457,23 +457,27 @@ def order_detail(order_id: int) -> str:
         abort(404)
     if not _order_viewable(order):
         abort(403)
+    role = g.role["role"] if g.role else None
+    wh_type = _current_warehouse_type()
+    is_admin = _is_admin()
     return render_template(
         "store_ordering/order_detail.html",
         order=order,
         can_review=(
-            _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC
-            and g.role
-            and g.role["role"] in ("manager", "admin")
+            wh_type == sop.WAREHOUSE_TYPE_DC
+            and role in ("manager", "admin")
         ),
         can_ship=(
-            _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC
-            and g.role
-            and g.role["role"] in ("staff", "manager", "admin")
+            wh_type == sop.WAREHOUSE_TYPE_DC
+            and role in ("staff", "manager", "admin")
         ),
         can_deliver=(
-            _current_warehouse_type() == "storefront"
-            and g.role
-            and g.role["role"] in ("manager", "admin")
+            wh_type == "storefront"
+            and role in ("manager", "admin")
+        ),
+        can_receive=(
+            (wh_type == "storefront" and role in ("manager", "admin"))
+            or is_admin
         ),
     )
 
@@ -582,6 +586,68 @@ def deliver_order_route(order_id: int) -> str:
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     sop.notify_order_event(master, sop.EVENT_ORDER_DELIVERED, order, g.user["id"])
     flash("已确认收货")
+    return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+
+@bp.route("/orders/<int:order_id>/receive", methods=["POST"])
+@require_login
+@_storefront_or_admin
+def receive_order_route(order_id: int) -> str:
+    """Receive (partial or full) a single order_item into the storefront warehouse.
+
+    Form fields:
+      order_item_id: the store_order_items.id being received
+      quantity:      base-unit quantity being received this batch
+      note:          optional free-text note
+
+    Permission: storefront manager/admin (or platform admin). DC users are
+    redirected to review list by `_storefront_or_admin`.
+    """
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    if order is None:
+        abort(404)
+    if not _order_viewable(order):
+        abort(403)
+    if _current_warehouse_type() != "storefront":
+        flash("只有门店可以收货")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+    role = g.role["role"] if g.role else None
+    if role not in ("manager", "admin") and not _is_admin():
+        flash("需要经理及以上权限")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    order_item_id = request.form.get("order_item_id", type=int)
+    quantity = parse_qty(request.form.get("quantity", "0"))
+    note = (request.form.get("note") or "").strip() or None
+
+    if order_item_id is None or quantity <= 0:
+        flash("请填写有效的收货数量")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    try:
+        result = sop.receive_order_item(
+            master,
+            order_id=order_id,
+            order_item_id=order_item_id,
+            qty=quantity,
+            actor_id=g.user["id"],
+            note=note,
+        )
+    except ValueError as e:
+        flash(str(e))
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    if result["is_fully_received"]:
+        # Notify only when the whole order is fulfilled (matches v2 §9.3).
+        refreshed = sop.get_order_detail(master, order_id)
+        if refreshed is not None:
+            sop.notify_order_event(
+                master, sop.EVENT_ORDER_DELIVERED, refreshed, g.user["id"]
+            )
+        flash("已收齐该订单")
+    else:
+        flash(f"已收货 {quantity:g} 件")
     return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
 
