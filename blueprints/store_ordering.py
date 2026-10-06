@@ -369,6 +369,7 @@ def submit_order_route() -> str:
     master = get_master_db()
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
     items = sop.list_cart_items(master, cart["id"])
+    cart_total = sum(parse_qty(it.get("line_subtotal") or 0) for it in items)
     if not items:
         flash("购物车为空")
         return redirect(url_for("store_ordering.cart_view"))
@@ -405,6 +406,7 @@ def submit_order_route() -> str:
         "store_ordering/submit.html",
         cart=cart,
         items=items,
+        cart_total=cart_total,
         expected_date=_date_input(expected_date),
         note=note,
         errors=errors,

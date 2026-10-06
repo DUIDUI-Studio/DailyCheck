@@ -228,7 +228,9 @@
     var qtyInput = card.querySelector('[data-input-qty]');
     var unitInput = card.querySelector('[data-input-unit]');
     if (qtyInput) qtyInput.value = v;
-    if (unitInput) unitInput.value = u;
+    // Store the actual unit name (e.g. "件" / "箱"), not the "base"/"aux"
+    // pill key, so the unit column shows the right thing downstream.
+    if (unitInput) unitInput.value = (u === 'aux') ? (_currentAuxUnit || '') : (_currentUnit || '');
 
     card.setAttribute('data-saved-qty', v);
     card.setAttribute('data-saved-unit', u);
@@ -253,7 +255,7 @@
       var qi = card.querySelector('[data-input-qty]');
       var ui = card.querySelector('[data-input-unit]');
       if (qi) qi.value = '';
-      if (ui) ui.value = 'base';
+      if (ui) ui.value = '';  // cleared; backend defaults to canonical unit
       card.removeAttribute('data-saved-qty');
       card.removeAttribute('data-saved-unit');
       card.classList.remove('card--filled');
