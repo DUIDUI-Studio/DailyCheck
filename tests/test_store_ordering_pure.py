@@ -655,6 +655,7 @@ def test_allowed_event_types_include_store_ordering():
         sop.EVENT_ORDER_REJECTED,
         sop.EVENT_ORDER_SHIPPED,
         sop.EVENT_ORDER_DELIVERED,
+        sop.EVENT_ORDER_RECEIVED,
         sop.EVENT_ORDER_CANCELLED,
     ):
         assert et in ALLOWED_EVENT_TYPES
@@ -732,6 +733,26 @@ def test_notify_order_cancelled_targets_both_sides(ordering_env):
     ).fetchall()
     notified = {r["user_id"] for r in rows}
     assert notified == {1, 3, 5}
+
+
+def test_notify_order_received_targets_dc_reviewers(ordering_env):
+    """partial receive 通知发给 DC 审批人 + 平台管理员（去自己）。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+
+    # actor=2 (门店 requester)，DC manager 5 + platform admin 1 应被通知
+    count = sop.notify_order_event(conn, sop.EVENT_ORDER_RECEIVED, order, actor_user_id=2)
+    assert count == 2
+    rows = conn.execute(
+        "SELECT user_id FROM notifications WHERE event_type=?",
+        (sop.EVENT_ORDER_RECEIVED,),
+    ).fetchall()
+    notified = {r["user_id"] for r in rows}
+    assert notified == {1, 5}
 
 
 # ---------------------------------------------------------------------------
@@ -926,3 +947,128 @@ def test_get_dc_items_for_order_detail(ordering_env):
 
     # 不存在的订单 → {}。
     assert sop.get_dc_items_for_order_detail(conn, 99999) == {}
+
+
+# ---------------------------------------------------------------------------
+# P1-5: 订货量建议
+# ---------------------------------------------------------------------------
+
+def _seed_outbound(store_path, item_id, qty, days_ago, ts):
+    """在门店仓插入一条 outbound_requests（模拟历史消耗）。"""
+    import os
+    from datetime import timedelta
+    conn = sqlite3.connect(str(store_path))
+    ts_old = (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """INSERT INTO outbound_requests
+           (item_id, requested_quantity, rolled_back, created_at)
+           VALUES (?, ?, 0, ?)""",
+        (item_id, qty, ts_old),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_compute_suggested_order_qty_basic(ordering_env):
+    """门店无库存 + 7 天消耗 14 件 + cover_days=7 → safety=14, suggested=14."""
+    conn = ordering_env["master_conn"]
+    store_path = ordering_env["store_path"]
+    # 找到 store 里的 canonical_id=101 的 items.id
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    item_id = int(store.execute(
+        "SELECT id FROM items WHERE canonical_id=101"
+    ).fetchone()["id"])
+    store.close()
+    # 7 天前消耗 14 件（一次性）
+    _seed_outbound(store_path, item_id, 14.0, days_ago=2, ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    result = sop.compute_suggested_order_qty(store, conn, "store_test")
+    store.close()
+
+    # safety = 14 / 7 * 7 = 14, current=0, transit=0 → suggested=14
+    assert result.get(101) == 14
+
+
+def test_compute_suggested_order_qty_subtracts_current_and_transit(ordering_env):
+    """current + transit 应被减去；最终 suggested = safety - current - transit。"""
+    conn = ordering_env["master_conn"]
+    store_path = ordering_env["store_path"]
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    item_id = int(store.execute("SELECT id FROM items WHERE canonical_id=101").fetchone()["id"])
+    # 当前库存 +5
+    store.execute("UPDATE items SET quantity=? WHERE id=?", (5.0, item_id))
+    store.commit()
+    store.close()
+
+    # 7 天消耗 21 件 → daily_avg=3, safety=3*7=21
+    _seed_outbound(store_path, item_id, 21.0, days_ago=3, ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # 在途：建一个 pending 订单，quantity=6
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 6.0, "件")
+    sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    result = sop.compute_suggested_order_qty(store, conn, "store_test")
+    store.close()
+
+    # safety=21, current=5, transit=6 → suggested=10
+    assert result.get(101) == 10
+
+
+def test_compute_suggested_order_qty_skips_zero(ordering_env):
+    """消耗 + 在途都已覆盖时，不进建议列表（suggested=0 不返回）。"""
+    conn = ordering_env["master_conn"]
+    store_path = ordering_env["store_path"]
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    item_id = int(store.execute("SELECT id FROM items WHERE canonical_id=101").fetchone()["id"])
+    # 当前 100 件 + 零消耗 + 零在途
+    store.execute("UPDATE items SET quantity=? WHERE id=?", (100.0, item_id))
+    store.commit()
+    store.close()
+
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    result = sop.compute_suggested_order_qty(store, conn, "store_test")
+    store.close()
+
+    # 无消耗 → 不返回 101
+    assert 101 not in result
+
+
+def test_compute_suggested_order_qty_counts_in_transit_from_approved(ordering_env):
+    """approved / shipped 未收齐的也在 in_transit 范围。"""
+    conn = ordering_env["master_conn"]
+    store_path = ordering_env["store_path"]
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    item_id = int(store.execute("SELECT id FROM items WHERE canonical_id=101").fetchone()["id"])
+    store.execute("UPDATE items SET quantity=? WHERE id=?", (0.0, item_id))
+    store.commit()
+    store.close()
+
+    # 建 shipped 订单，fulfilled_quantity=0 → 全量在途
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 8.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    sop.ship_order_full(conn, order["id"], shipped_by=4)
+    # 0 消耗 → safety=0 → 不建议
+
+    # 加点消耗触发建议
+    _seed_outbound(store_path, item_id, 7.0, days_ago=1, ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    result = sop.compute_suggested_order_qty(store, conn, "store_test")
+    store.close()
+
+    # daily_avg=1, safety=7, current=0, transit=8 → suggested=0（被 transit 覆盖完）
+    # 不应返回 101
+    assert 101 not in result

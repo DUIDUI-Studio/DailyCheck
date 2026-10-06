@@ -333,6 +333,37 @@ def test_catalog_renders_chinese_categories_and_cards(e2e_env):
     assert "加入购物车" in body
 
 
+def test_catalog_renders_suggested_qty_pill(e2e_env):
+    """P1-5: catalog 显示「建议订 N」pill（基于近 7 天消耗 + 安全库存 + 在途）。"""
+    client = e2e_env["client"]
+    _login_as(client, 1, 3)  # store_staff 在 store_test
+    store_path = e2e_env["store_path"]
+    import db as db_module
+    store = sqlite3.connect(str(store_path))
+    store.row_factory = sqlite3.Row
+    # 找到 canonical_id=101 的 items.id
+    item_id = int(store.execute("SELECT id FROM items WHERE canonical_id=101").fetchone()["id"])
+    # 7 天前消耗 14 件 → daily_avg=2, safety=14, current=0, transit=0 → suggested=14
+    from datetime import datetime, timedelta
+    ts_old = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    store.execute(
+        """INSERT INTO outbound_requests
+           (item_id, requested_quantity, rolled_back, created_at)
+           VALUES (?, ?, 0, ?)""",
+        (item_id, 14.0, ts_old),
+    )
+    store.commit()
+    store.close()
+
+    resp = client.get("/store-ordering/catalog?dc=dc1_test")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "建议订" in body
+    assert "status-pill suggested" in body
+    # data-suggested="14" 出现在 canonical_id=101 卡片上
+    assert 'data-suggested="14"' in body
+
+
 def test_cart_view_renders_total_and_subtotals(e2e_env):
     """F6: cart page shows subtotals + cart total."""
     client = e2e_env["client"]

@@ -174,6 +174,17 @@ def catalog() -> str:
     category_code = request.args.get("cat", "").strip() or None
     keyword = request.args.get("q", "").strip() or None
     items = sop.list_available_dc_items(master, dc_code, category_code, keyword)
+    # P1-5: 订货量建议（仅当前门店有真实仓库时才计算，admin 无门店跳过）
+    suggestions: dict[int, int] = {}
+    if store_code and not _is_admin():
+        try:
+            from db import get_warehouse_db
+            store_conn = get_warehouse_db()
+            suggestions = sop.compute_suggested_order_qty(
+                store_conn, master, store_code,
+            )
+        except Exception:
+            suggestions = {}
     # Build (code, display_name) tuples for chips, deduped by code while keeping
     # the Chinese display name (display = canonical_categories.name).
     code_name_pairs: list[tuple[str, str]] = []
@@ -192,6 +203,7 @@ def catalog() -> str:
         dcs=dcs,
         selected_dc=dc_code,
         items=items,
+        suggestions=suggestions,
         categories=[c for c, _ in category_names],
         category_names=category_names,
         current_cat=category_code or "",
@@ -867,6 +879,12 @@ def receive_order_route(order_id: int) -> str:
             )
         flash("已收齐该订单")
     else:
+        # 部分收货：通知 DC 审批人 + 平台管理员，避免门店店长漏感知到货进度
+        refreshed = sop.get_order_detail(master, order_id)
+        if refreshed is not None:
+            sop.notify_order_event(
+                master, sop.EVENT_ORDER_RECEIVED, refreshed, g.user["id"]
+            )
         flash(f"已收货 {quantity:g} 件")
     return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 

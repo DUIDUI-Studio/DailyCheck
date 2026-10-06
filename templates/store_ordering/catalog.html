@@ -55,6 +55,7 @@
     {% if items %}
     <div class="inv-grid">
       {% for item in items %}
+      {% set sug = suggestions.get(item.canonical_id) %}
       <div class="inv-card"
            data-canonical-id="{{ item.canonical_id }}"
            data-name="{{ item.canonical_name }}"
@@ -63,6 +64,7 @@
            data-aux-rate="{{ item.aux_rate or 0 }}"
            data-stock="{{ item.quantity | fmt_qty }}"
            data-unit-price="{{ item.unit_price or 0 }}"
+           data-suggested="{{ sug if sug else 0 }}"
            data-cat="{{ item.category_code }}"
            onclick="openCatalogModal(this)">
         <div class="inv-card-head">
@@ -73,6 +75,10 @@
           <div class="inv-card-status">
             {# v3 A5: catalog 卡片不显示库存数字，统一样式「可订」绿 pill。 #}
             <span class="status-pill ok">可订</span>
+            {# P1-5: 「建议订 N」灰色 hint，仅当 > 0 时显示。 #}
+            {% if sug %}
+            <span class="status-pill suggested" title="基于近 7 天消耗、安全库存与在途订单的估算">建议订 {{ sug }}</span>
+            {% endif %}
           </div>
         </div>
         <div class="inv-card-body">
@@ -123,6 +129,11 @@
     <input id="cm-qty" type="number" step="0.01" min="0" inputmode="decimal"
            style="width:100%;padding:10px 12px;font-size:16px;border:1.5px solid var(--border);border-radius:10px;box-sizing:border-box" />
 
+    {# P1-5: 弹窗里「建议订 N」hint，点确认后自动填入 qty。 #}
+    <div id="cm-suggestion" class="calc-hint" style="margin:8px 0 0;display:none">
+      <a href="javascript:void(0)" id="cm-suggestion-fill" style="color:var(--accent)"></a>
+    </div>
+
     <div id="cm-amount" class="calc-hint" style="margin:8px 0 0">金额 ¥ 0.00</div>
 
     <div style="display:flex;gap:10px;margin-top:16px">
@@ -144,7 +155,7 @@
   var cmAmount = document.getElementById('cm-amount');
 
   var _currentId = null, _currentUnit = null, _currentAuxUnit = null,
-      _currentAuxRate = 0, _currentUnitPrice = 0, _currentStock = 0;
+      _currentAuxRate = 0, _currentUnitPrice = 0, _currentStock = 0, _currentSuggested = 0;
 
   function setActiveCmPill(u) {
     var btns = document.querySelectorAll('#cm-pills .pill');
@@ -161,6 +172,7 @@
     var auxRate = parseFloat(el.getAttribute('data-aux-rate') || '0');
     var stock = el.getAttribute('data-stock');
     var unitPrice = parseFloat(el.getAttribute('data-unit-price') || '0');
+    _currentSuggested = parseFloat(el.getAttribute('data-suggested') || '0');
 
     _currentUnit = unit;
     _currentAuxUnit = auxUnit;
@@ -171,6 +183,16 @@
     cmName.textContent = name;
     {# v3 A5: 弹窗内移除库存数字，仅显示单价。 #}
     cmStock.textContent = '单价 ¥ ' + unitPrice.toFixed(2);
+
+    {# P1-5: 弹窗「建议订 N」hint：点击填入 qty。 #}
+    var sugEl = document.getElementById('cm-suggestion');
+    var sugLink = document.getElementById('cm-suggestion-fill');
+    if (_currentSuggested > 0) {
+      sugLink.textContent = '建议订 ' + _currentSuggested + '（点击填入）';
+      sugEl.style.display = '';
+    } else {
+      sugEl.style.display = 'none';
+    }
 
     cmPillBase.textContent = unit;
     if (auxUnit && auxRate > 0) {
@@ -208,6 +230,16 @@
   });
 
   cmQty.addEventListener('input', updateCatalogAmount);
+
+  var sugLinkEl = document.getElementById('cm-suggestion-fill');
+  if (sugLinkEl) {
+    sugLinkEl.addEventListener('click', function () {
+      if (_currentSuggested > 0) {
+        cmQty.value = _currentSuggested;
+        updateCatalogAmount();
+      }
+    });
+  }
 
   function updateCatalogAmount() {
     var v = parseFloat(cmQty.value || '0');

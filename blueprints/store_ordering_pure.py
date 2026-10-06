@@ -18,6 +18,10 @@ from typing import Any
 import config
 from blueprints._helpers import now, parse_qty
 from blueprints.notifications_pure import emit_event
+from blueprints.procurement_pure import (
+    compute_safety_stock,
+    compute_suggested_qty,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -42,6 +46,7 @@ EVENT_ORDER_APPROVED: str = "store_order_approved"
 EVENT_ORDER_REJECTED: str = "store_order_rejected"
 EVENT_ORDER_SHIPPED: str = "store_order_shipped"
 EVENT_ORDER_DELIVERED: str = "store_order_delivered"
+EVENT_ORDER_RECEIVED: str = "store_order_received"
 EVENT_ORDER_CANCELLED: str = "store_order_cancelled"
 
 ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
@@ -372,6 +377,105 @@ def list_available_dc_items(
         return out
     finally:
         dc_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P1-5: 订货量建议（基于门店近 7 天消耗 + 安全库存）
+# ---------------------------------------------------------------------------
+
+def compute_suggested_order_qty(
+    store_conn: sqlite3.Connection,
+    master_conn: sqlite3.Connection,
+    store_warehouse_code: str,
+    *,
+    cover_days: int = 7,
+    min_absolute: float = 0.0,
+    window_days: int = 7,
+) -> dict[int, int]:
+    """Per-canonical suggested order quantity for a storefront warehouse.
+
+    Returns: ``{canonical_id: suggested_qty}``. canonical_ids with no
+    consumption and no in-transit orders are omitted.
+
+    Data sources:
+      - daily_avg = outbound_requests in last ``window_days``, grouped by
+        canonical_id via the store's local items.canonical_id
+      - current_qty = store's local items.quantity (sum if duplicate
+        canonical bindings exist)
+      - in_transit = sum of (quantity - fulfilled_quantity) for store's
+        own store_order_items whose parent order is in pending/approved/
+        shipped (尚未收齐的)
+
+    Formula (复用 procurement_pure):
+      safety_stock = compute_safety_stock(daily_avg, cover_days, min_absolute)
+      suggested    = ceil(max(0, safety_stock - current_qty - in_transit))
+    """
+    store_conn.row_factory = sqlite3.Row
+    master_conn.row_factory = sqlite3.Row
+
+    # 1. 每 canonical 7 天消耗
+    out_rows = store_conn.execute(
+        """SELECT i.canonical_id AS canonical_id,
+                  SUM(o.requested_quantity) AS total_qty
+           FROM outbound_requests o
+           JOIN items i ON i.id = o.item_id
+           WHERE o.rolled_back = 0
+             AND i.canonical_id IS NOT NULL
+             AND o.created_at >= datetime('now', ?)
+           GROUP BY i.canonical_id""",
+        (f"-{window_days} days",),
+    ).fetchall()
+    daily_avg_by_canonical: dict[int, float] = {
+        int(r["canonical_id"]): float(r["total_qty"]) / float(window_days)
+        for r in out_rows
+    }
+
+    # 2. 当前门店库存
+    cur_rows = store_conn.execute(
+        """SELECT canonical_id, SUM(quantity) AS total_qty
+           FROM items WHERE canonical_id IS NOT NULL
+           GROUP BY canonical_id""",
+    ).fetchall()
+    current_qty_by_canonical: dict[int, float] = {
+        int(r["canonical_id"]): float(r["total_qty"]) for r in cur_rows
+    }
+
+    # 3. 在途：pending / approved / shipped 未收齐的本店订单
+    transit_rows = master_conn.execute(
+        """SELECT soi.canonical_id AS canonical_id,
+                  SUM(soi.quantity - soi.fulfilled_quantity) AS pending_qty
+           FROM store_order_items soi
+           JOIN store_orders so ON so.id = soi.order_id
+           WHERE so.store_warehouse_code = ?
+             AND so.status IN (?, ?, ?)
+             AND (soi.quantity - soi.fulfilled_quantity) > 0
+           GROUP BY soi.canonical_id""",
+        (
+            store_warehouse_code,
+            ORDER_STATUS_PENDING,
+            ORDER_STATUS_APPROVED,
+            ORDER_STATUS_SHIPPED,
+        ),
+    ).fetchall()
+    transit_by_canonical: dict[int, float] = {
+        int(r["canonical_id"]): float(r["pending_qty"]) for r in transit_rows
+    }
+
+    # 4. 计算
+    all_canonicals = (
+        set(daily_avg_by_canonical)
+        | set(transit_by_canonical)
+    )
+    out: dict[int, int] = {}
+    for cid in all_canonicals:
+        daily_avg = daily_avg_by_canonical.get(cid, 0.0)
+        current = current_qty_by_canonical.get(cid, 0.0)
+        transit = transit_by_canonical.get(cid, 0.0)
+        safety = compute_safety_stock(daily_avg, cover_days, min_absolute)
+        suggested = compute_suggested_qty(safety, current, transit)
+        if suggested > 0:
+            out[cid] = suggested
+    return out
 
 
 def get_dc_item_by_canonical(
@@ -1472,6 +1576,11 @@ def notify_order_event(
         user_ids = _recipients_for_store_users(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"订货单 {order['order_no']} 已送达"
+    elif event_type == EVENT_ORDER_RECEIVED:
+        # 部分收货通知发给 DC 审批人 + 平台管理员，让 DC 知道门店收到多少
+        user_ids = _recipients_for_dc_reviewers(master_conn, order)
+        user_ids = _exclude_self(user_ids, actor_user_id)
+        summary = f"订货单 {order['order_no']} 部分收货"
     elif event_type == EVENT_ORDER_CANCELLED:
         # 取消通知发给对侧：门店取消 → DC 审批人；DC 取消 → 门店用户。
         # 简化做法：双侧都发给 requester + dc reviewers（去重 + 排自己）。

@@ -1598,4 +1598,5 @@ table.bom-table td .bom-temp-price {
 .status-pill.shipped { background: #ede9fe; color: #5b21b6; border: 1px solid #c4b5fd; }
 .status-pill.delivered { background: #ecfdf5; color: #047857; border: 1px solid #6ee7b7; }
 .status-pill.rejected { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+.status-pill.suggested { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
 .status-pill.cancelled { background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; }

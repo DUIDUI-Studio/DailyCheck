@@ -22,6 +22,7 @@ ALLOWED_EVENT_TYPES = frozenset({
     "store_order_rejected",
     "store_order_shipped",
     "store_order_delivered",
+    "store_order_received",
     "store_order_cancelled",
 })
 
