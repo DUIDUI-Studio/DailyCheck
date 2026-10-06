@@ -36,13 +36,36 @@ def _require_storefront():
 @bp.route("/restock", methods=["GET"])
 @require_login
 def restock_list():
+    """Inbound history: manual restock requests + 门店订货入库 stock_movements.
+
+    Both source rows land in `stock_movements`; the manual restock rows have
+    a matching `restock_requests` record so we can keep them grouped. The
+    page shows a unified timeline of inbound inventory moves for the current
+    warehouse.
+    """
     db = get_warehouse_db()
-    requests_data = db.execute(
-        """SELECT r.*, i.name AS item_name, i.unit
+    manual = db.execute(
+        """SELECT r.id AS request_id, r.created_at, i.name AS item_name,
+                  i.unit, r.requested_quantity AS quantity, r.reason,
+                  'manual' AS source
            FROM restock_requests r JOIN items i ON i.id = r.item_id
            ORDER BY r.id DESC LIMIT 100"""
     ).fetchall()
-    return render_template("restock.html", requests=requests_data)
+    store_order = db.execute(
+        """SELECT sm.id AS sm_id, sm.created_at, sm.note AS reason,
+                  i.name AS item_name, i.unit, sm.delta AS quantity,
+                  'store_order' AS source
+           FROM stock_movements sm JOIN items i ON i.id = sm.item_id
+           WHERE sm.action = ?
+           ORDER BY sm.id DESC LIMIT 100""",
+        ("门店订货入库",),
+    ).fetchall()
+    combined = sorted(
+        [dict(r) for r in manual] + [dict(r) for r in store_order],
+        key=lambda r: r["created_at"],
+        reverse=True,
+    )
+    return render_template("restock.html", records=combined)
 
 
 @bp.route("/restock/start", methods=["POST"])
