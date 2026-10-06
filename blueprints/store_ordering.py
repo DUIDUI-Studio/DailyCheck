@@ -494,17 +494,31 @@ def order_detail(order_id: int) -> str:
             wh_db.row_factory = sqlite3.Row
             for r in wh_db.execute(
                 """SELECT sm.created_at, sm.action, sm.delta, sm.note,
-                          ci.name AS canonical_name, i.unit
+                          i.unit, i.name AS local_name, i.canonical_id
                    FROM stock_movements sm
                    JOIN items i ON i.id = sm.item_id
-                   LEFT JOIN canonical_items ci ON ci.id = i.canonical_id
                    WHERE sm.action = ?
                      AND sm.note LIKE ?
                    ORDER BY sm.id DESC LIMIT 50""",
-                (sop.RECEIPT_ACTION, f"%{order.order_no}%"),
+                (sop.RECEIPT_ACTION, f"%{order['order_no']}%"),
             ).fetchall():
                 d = dict(r)
                 d["delta"] = parse_qty(d["delta"])
+                # Hydrate canonical_name from master.db; fall back to local
+                # name if the canonical link is missing or canonical item is
+                # not found.
+                cid = d.pop("canonical_id")
+                local_name = d.pop("local_name")
+                if cid is not None:
+                    cn = master.execute(
+                        "SELECT name FROM canonical_items WHERE id=?",
+                        (cid,),
+                    ).fetchone()
+                    if cn:
+                        d["canonical_name"] = cn["name"]
+                        store_inflows.append(d)
+                        continue
+                d["canonical_name"] = local_name
                 store_inflows.append(d)
             wh_db.close()
         except Exception:
