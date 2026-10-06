@@ -201,11 +201,19 @@ def test_shipment_list_and_ship(dc_env):
         f"/store-ordering/orders/{dc_env['order_id']}/review",
         data={"decision": "approved", "note": "ok"},
     )
-    # Ship as staff
+    # Ship as staff — DC operations (review + ship) live on the unified
+    # /review page; /shipments is now a legacy alias that redirects.
     _login_as(client, 3, 1)
     resp = client.get("/store-ordering/shipments")
+    assert resp.status_code == 302
+    assert "/store-ordering/review" in resp.headers.get("Location", "")
+
+    # The combined review page lists approved orders under
+    # 「已审批 · 待出库」.
+    resp = client.get("/store-ordering/review")
     assert resp.status_code == 200
     body = resp.data.decode()
+    assert "已审批 · 待出库" in body
     assert "SO-" in body
 
     resp = client.post(
@@ -269,11 +277,24 @@ def test_ship_insufficient_stock_succeeds_with_negative_dc(dc_env):
     dc.close()
 
 
-def test_dc_staff_cannot_review(dc_env):
+def test_dc_staff_can_view_review_but_cannot_approve(dc_env):
+    """Combined review page is read-only for DC staff — they see the lists but
+    cannot act. The inline approve/reject forms live on order_detail and
+    are guarded by can_review (manager+ only).
+    """
     client = dc_env["client"]
     _login_as(client, 3, 1)
+    # Page is reachable.
     resp = client.get("/store-ordering/review")
-    assert resp.status_code == 403
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "订货审批" in body
+    # But POST /review must fail (only managers can decide).
+    post_resp = client.post(
+        f"/store-ordering/orders/{dc_env['order_id']}/review",
+        data={"decision": "approved"},
+    )
+    assert post_resp.status_code == 403
 
 
 def test_review_and_ship_other_dc_order_forbidden(dc_env):

@@ -48,9 +48,6 @@
     {% if is_admin or is_storefront %}
     <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
     {% endif %}
-    {% if is_admin or is_distribution_center %}
-    <a href="{{ url_for('store_ordering.shipment_list') }}">出库清单</a>
-    {% endif %}
     {% endif %}
     {% if is_rd %}
     <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>

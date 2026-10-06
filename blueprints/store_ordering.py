@@ -557,13 +557,28 @@ def order_detail(order_id: int) -> str:
 @bp.route("/review")
 @require_login
 @require_warehouse_type("distribution_center")
-@require_role("manager")
+@require_role("staff")
 def review_list() -> str:
-    """List pending orders for current DC."""
+    """Combined DC dashboard: pending (待审批) + approved (待出库) orders.
+
+    Both sections render in a single page so the operator only needs to look
+    in one place. Outbound staff can reach `/orders/<id>/ship` from the
+    待出库 table; managers use the inline approve/reject forms on the
+    待审批 table.
+    """
     master = get_master_db()
     dc_code = _current_warehouse_code()
-    orders = sop.list_orders(master, dc_warehouse_code=dc_code, status=sop.ORDER_STATUS_PENDING)
-    return render_template("store_ordering/review.html", orders=orders)
+    pending = sop.list_orders(
+        master, dc_warehouse_code=dc_code, status=sop.ORDER_STATUS_PENDING
+    )
+    approved = sop.list_orders(
+        master, dc_warehouse_code=dc_code, status=sop.ORDER_STATUS_APPROVED
+    )
+    return render_template(
+        "store_ordering/review.html",
+        pending_orders=pending,
+        approved_orders=approved,
+    )
 
 
 @bp.route("/orders/<int:order_id>/review", methods=["POST"])
@@ -604,11 +619,9 @@ def review_order_route(order_id: int) -> str:
 @require_warehouse_type("distribution_center")
 @require_role("staff")
 def shipment_list() -> str:
-    """List approved orders ready to ship."""
-    master = get_master_db()
-    dc_code = _current_warehouse_code()
-    orders = sop.list_orders(master, dc_warehouse_code=dc_code, status=sop.ORDER_STATUS_APPROVED)
-    return render_template("store_ordering/shipments.html", orders=orders)
+    """Legacy alias. The combined /review page is the canonical entry; this
+    just redirects there for any bookmarked deep links."""
+    return redirect(url_for("store_ordering.review_list"))
 
 
 @bp.route("/orders/<int:order_id>/ship", methods=["POST"])
