@@ -1,9 +1,19 @@
 {% extends "base.html" %}
 {% block title %}订单详情 {{ order.order_no }}{% endblock %}
 {% block content %}
+{# —— 订单状态文案映射（中文）—— #}
+{% set status_labels = {
+  'pending': '待审批',
+  'approved': '已审批',
+  'rejected': '已拒绝',
+  'shipped': '已发货',
+  'delivered': '已送达',
+  'cancelled': '已取消',
+} %}
+
 <div class="page-header">
   <h2>订单 {{ order.order_no }}</h2>
-  <span class="status-pill {{ order.status }}">{{ order.status }}</span>
+  <span class="status-pill {{ order.status }}">{{ status_labels[order.status] or order.status }}</span>
 </div>
 
 {# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
@@ -141,7 +151,7 @@
 <p class="muted">明细表中的「本批发货」输入框会在表单提交时一次性批量提交。</p>
 {% endif %}
 
-{# —— 收货历史（如有）—— #}
+{# —— 收货历史（如有）—— 显眼位置放顶部，按时间倒序 —— #}
 {% if order.receipts %}
 <h3>收货历史</h3>
 <table class="data-table">
@@ -160,6 +170,31 @@
     {% endfor %}
   </tbody>
 </table>
+{% endif %}
+
+{# —— 门店入库流水（storefront 视角）：直接读门店仓 stock_movements —— #}
+{% if not is_dc_view %}
+<h3>门店入库流水</h3>
+{% if store_inflows %}
+<table class="data-table">
+  <thead>
+    <tr><th>时间</th><th>品项</th><th>入库数量</th><th>动作</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    {% for m in store_inflows %}
+    <tr>
+      <td>{{ m.created_at }}</td>
+      <td>{{ m.canonical_name or '—' }}{{ ' ' }}{{ m.unit or '' }}</td>
+      <td><strong>+{{ m.delta | fmt_qty }}</strong></td>
+      <td>{{ m.action }}</td>
+      <td>{{ m.note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">暂无门店入库流水（收货后会自动写入）</p>
+{% endif %}
 {% endif %}
 
 {# —— 发货历史（如有）—— #}

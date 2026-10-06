@@ -12,9 +12,10 @@
       <option value="">全部</option>
       <option value="pending" {% if status == 'pending' %}selected{% endif %}>待审批</option>
       <option value="approved" {% if status == 'approved' %}selected{% endif %}>已审批</option>
-      <option value="shipped" {% if status == 'shipped' %}selected{% endif %}>已出库</option>
+      <option value="shipped" {% if status == 'shipped' %}selected{% endif %}>已发货</option>
       <option value="delivered" {% if status == 'delivered' %}selected{% endif %}>已送达</option>
       <option value="rejected" {% if status == 'rejected' %}selected{% endif %}>已拒绝</option>
+      <option value="cancelled" {% if status == 'cancelled' %}selected{% endif %}>已取消</option>
     </select>
   </label>
   <label>
@@ -42,10 +43,18 @@
     </tr>
   </thead>
   <tbody>
+    {% set status_labels = {
+      'pending': '待审批',
+      'approved': '已审批',
+      'rejected': '已拒绝',
+      'shipped': '已发货',
+      'delivered': '已送达',
+      'cancelled': '已取消',
+    } %}
     {% for o in orders %}
     <tr>
       <td>{{ o.order_no }}</td>
-      <td><span class="status-pill {{ o.status }}">{{ o.status }}</span></td>
+      <td><span class="status-pill {{ o.status }}">{{ status_labels[o.status] or o.status }}</span></td>
       <td>{{ o.store_warehouse_code }}</td>
       <td>{{ o.dc_warehouse_code }}</td>
       <td>{{ o.created_at }}</td>

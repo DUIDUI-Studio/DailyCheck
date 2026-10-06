@@ -483,12 +483,40 @@ def order_detail(order_id: int) -> str:
 
     is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC
 
+    # Store-side inflow log: stock_movements with action='门店订货入库' for the
+    # order's store warehouse, joined to canonical_items for the name.
+    # Surfaced only on the storefront view so store users can see the inbound
+    # inventory moves triggered by their receiving.
+    store_inflows: list[dict[str, Any]] = []
+    if not is_dc_view:
+        try:
+            wh_db = sop.open_warehouse_db(order["store_warehouse_code"])
+            wh_db.row_factory = sqlite3.Row
+            for r in wh_db.execute(
+                """SELECT sm.created_at, sm.action, sm.delta, sm.note,
+                          ci.name AS canonical_name, i.unit
+                   FROM stock_movements sm
+                   JOIN items i ON i.id = sm.item_id
+                   LEFT JOIN canonical_items ci ON ci.id = i.canonical_id
+                   WHERE sm.action = ?
+                     AND sm.note LIKE ?
+                   ORDER BY sm.id DESC LIMIT 50""",
+                (sop.RECEIPT_ACTION, f"%{order.order_no}%"),
+            ).fetchall():
+                d = dict(r)
+                d["delta"] = parse_qty(d["delta"])
+                store_inflows.append(d)
+            wh_db.close()
+        except Exception:
+            store_inflows = []
+
     return render_template(
         "store_ordering/order_detail.html",
         order=order,
         total_amount=total_amount,
         dc_items_info=dc_items_info,
         is_dc_view=is_dc_view,
+        store_inflows=store_inflows,
         can_review=(
             wh_type == sop.WAREHOUSE_TYPE_DC
             and role in ("manager", "admin")
