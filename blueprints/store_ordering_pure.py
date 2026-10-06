@@ -478,6 +478,206 @@ def compute_suggested_order_qty(
     return out
 
 
+# ---------------------------------------------------------------------------
+# P2-4: 报表（按门店/DC/品类/品项汇总订货/出货/收货/欠收率）
+# ---------------------------------------------------------------------------
+
+def compute_store_order_report(
+    master_conn: sqlite3.Connection,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    store_warehouse_code: str | None = None,
+    dc_warehouse_code: str | None = None,
+    category_code: str | None = None,
+) -> dict[str, Any]:
+    """多维门店订货报表。
+
+    指标口径（基础单位）：
+      - ordered_qty  : store_order_items.quantity 累加（订货）
+      - shipped_qty  : store_order_items.shipped_quantity 累加（DC 出货）
+      - received_qty : store_order_items.fulfilled_quantity 累加（门店收货）
+      - shortfall_qty: max(0, ordered - received)（欠收量；为负时按 0 算）
+      - shortfall_rate: shortfall / ordered_qty（欠收率；ordered=0 时为 0）
+
+    时间范围过滤：store_orders.created_at ∈ [start_date 00:00, end_date 23:59]
+    类别过滤：canonical_items.category_code
+    返回：含 ``summary`` + 4 个分维数组的 dict（按 4 个 group key 求和）。
+    """
+    master_conn.row_factory = sqlite3.Row
+
+    where_parts = ["1=1"]
+    params: list[Any] = []
+    if start_date:
+        where_parts.append("so.created_at >= ?")
+        params.append(f"{start_date} 00:00:00")
+    if end_date:
+        where_parts.append("so.created_at <= ?")
+        params.append(f"{end_date} 23:59:59")
+    if store_warehouse_code:
+        where_parts.append("so.store_warehouse_code = ?")
+        params.append(store_warehouse_code)
+    if dc_warehouse_code:
+        where_parts.append("so.dc_warehouse_code = ?")
+        params.append(dc_warehouse_code)
+    if category_code:
+        where_parts.append("ci.category_code = ?")
+        params.append(category_code)
+    where = " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT
+            so.store_warehouse_code AS store_code,
+            so.dc_warehouse_code    AS dc_code,
+            ci.category_code        AS cat_code,
+            ci.name                 AS canonical_name,
+            soi.canonical_id        AS canonical_id,
+            SUM(soi.quantity)              AS ordered_qty,
+            SUM(soi.shipped_quantity)      AS shipped_qty,
+            SUM(soi.fulfilled_quantity)    AS received_qty,
+            COUNT(DISTINCT so.id)          AS order_count
+        FROM store_order_items soi
+        JOIN store_orders so ON so.id = soi.order_id
+        JOIN canonical_items ci ON ci.id = soi.canonical_id
+        WHERE {where}
+        GROUP BY so.store_warehouse_code, so.dc_warehouse_code,
+                 ci.category_code, ci.name, soi.canonical_id
+    """
+    rows = master_conn.execute(sql, params).fetchall()
+
+    by_store: dict[str, dict] = {}
+    by_dc: dict[str, dict] = {}
+    by_category: dict[str, dict] = {}
+    by_canonical: list[dict] = []
+    summary = {
+        "ordered_qty": 0.0,
+        "shipped_qty": 0.0,
+        "received_qty": 0.0,
+        "shortfall_qty": 0.0,
+        "order_count": 0,
+    }
+    total_shortfall = 0.0
+    total_ordered_for_rate = 0.0
+
+    for r in rows:
+        oq = float(r["ordered_qty"] or 0)
+        sq = float(r["shipped_qty"] or 0)
+        rq = float(r["received_qty"] or 0)
+        shortfall = max(0.0, oq - rq)
+
+        summary["ordered_qty"] += oq
+        summary["shipped_qty"] += sq
+        summary["received_qty"] += rq
+        summary["shortfall_qty"] += shortfall
+        total_shortfall += shortfall
+        total_ordered_for_rate += oq
+
+        # by_store
+        s = by_store.setdefault(
+            r["store_code"],
+            {"store_code": r["store_code"], "ordered_qty": 0.0,
+             "shipped_qty": 0.0, "received_qty": 0.0, "shortfall_qty": 0.0,
+             "order_count": 0},
+        )
+        s["ordered_qty"] += oq
+        s["shipped_qty"] += sq
+        s["received_qty"] += rq
+        s["shortfall_qty"] += shortfall
+
+        # by_dc
+        d = by_dc.setdefault(
+            r["dc_code"],
+            {"dc_code": r["dc_code"], "ordered_qty": 0.0,
+             "shipped_qty": 0.0, "received_qty": 0.0, "shortfall_qty": 0.0,
+             "order_count": 0},
+        )
+        d["ordered_qty"] += oq
+        d["shipped_qty"] += sq
+        d["received_qty"] += rq
+        d["shortfall_qty"] += shortfall
+
+        # by_category
+        c = by_category.setdefault(
+            r["cat_code"],
+            {"category_code": r["cat_code"], "ordered_qty": 0.0,
+             "shipped_qty": 0.0, "received_qty": 0.0, "shortfall_qty": 0.0},
+        )
+        c["ordered_qty"] += oq
+        c["shipped_qty"] += sq
+        c["received_qty"] += rq
+        c["shortfall_qty"] += shortfall
+
+        by_canonical.append({
+            "canonical_id": r["canonical_id"],
+            "canonical_name": r["canonical_name"],
+            "category_code": r["cat_code"],
+            "ordered_qty": oq,
+            "shipped_qty": sq,
+            "received_qty": rq,
+            "shortfall_qty": shortfall,
+        })
+
+    # 后算 order_count（去重）：每个 store 在过滤范围内出现的订单数
+    # oc_where_parts 复用 where_parts，但移除引用 ci. 的部分
+    oc_where_parts: list[str] = []
+    oc_params: list[Any] = []
+    p_iter = iter(params)
+    for w in where_parts:
+        if w == "1=1":
+            continue
+        if "ci." in w:
+            # skip ci-related predicate and its param
+            next(p_iter, None)
+            continue
+        oc_where_parts.append(w)
+        oc_params.append(next(p_iter))
+    if not oc_where_parts:
+        oc_where = "1=1"
+    else:
+        oc_where = " AND ".join(oc_where_parts)
+    oc_sql = f"""
+        SELECT so.store_warehouse_code AS store_code,
+               so.dc_warehouse_code    AS dc_code,
+               COUNT(DISTINCT so.id)   AS order_count
+        FROM store_orders so
+        WHERE {oc_where}
+        GROUP BY so.store_warehouse_code, so.dc_warehouse_code
+    """
+    for r in master_conn.execute(oc_sql, oc_params).fetchall():
+        if r["store_code"] in by_store:
+            by_store[r["store_code"]]["order_count"] = int(r["order_count"])
+        if r["dc_code"] in by_dc:
+            by_dc[r["dc_code"]]["order_count"] = int(r["order_count"])
+        summary["order_count"] += int(r["order_count"])
+
+    # 排序 + 算费率
+    for d in by_store.values():
+        d["shortfall_rate"] = (d["shortfall_qty"] / d["ordered_qty"]) if d["ordered_qty"] > 0 else 0.0
+    for d in by_dc.values():
+        d["shortfall_rate"] = (d["shortfall_qty"] / d["ordered_qty"]) if d["ordered_qty"] > 0 else 0.0
+    for d in by_category.values():
+        d["shortfall_rate"] = (d["shortfall_qty"] / d["ordered_qty"]) if d["ordered_qty"] > 0 else 0.0
+    for d in by_canonical:
+        d["shortfall_rate"] = (d["shortfall_qty"] / d["ordered_qty"]) if d["ordered_qty"] > 0 else 0.0
+
+    summary["shortfall_rate"] = (
+        total_shortfall / total_ordered_for_rate if total_ordered_for_rate > 0 else 0.0
+    )
+    # 排序：by_store / by_dc 按 ordered_qty DESC
+    by_store_list = sorted(by_store.values(), key=lambda x: x["ordered_qty"], reverse=True)
+    by_dc_list = sorted(by_dc.values(), key=lambda x: x["ordered_qty"], reverse=True)
+    by_category_list = sorted(by_category.values(), key=lambda x: x["ordered_qty"], reverse=True)
+    by_canonical_list = sorted(by_canonical, key=lambda x: x["ordered_qty"], reverse=True)
+
+    return {
+        "summary": summary,
+        "by_store": by_store_list,
+        "by_dc": by_dc_list,
+        "by_category": by_category_list,
+        "by_canonical": by_canonical_list,
+    }
+
+
 def get_dc_item_by_canonical(
     master_conn: sqlite3.Connection,
     dc_warehouse_code: str,

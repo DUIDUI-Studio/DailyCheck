@@ -768,3 +768,85 @@ def test_cancel_approved_order_by_dc_manager(e2e_env):
     row = master.execute("SELECT status FROM store_orders WHERE id=?", (oid,)).fetchone()
     assert row["status"] == "cancelled"
     master.close()
+
+
+# ---------------------------------------------------------------------------
+# P2-4: 报表（路由层）
+# ---------------------------------------------------------------------------
+
+def test_admin_report_renders(e2e_env):
+    """P2-4: admin/orders/report 200 + KPI + 4 维度表。"""
+    import blueprints.store_ordering_pure as sop
+
+    client = e2e_env["client"]
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    cart = sop.get_or_create_cart(
+        master, user_id=1, store_warehouse_code="store_test", dc_warehouse_code="dc1_test",
+    )
+    sop.add_cart_item(master, cart["id"], 101, 5.0, "件")
+    sop.submit_order(master, cart["id"], requested_by=1, expected_delivery_date=None, note="")
+    master.close()
+
+    _login_as(client, 4, 3)  # admin
+    resp = client.get("/store-ordering/admin/report")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "门店订货报表" in body
+    assert "总订货量" in body
+    assert "总出货量" in body
+    assert "总收货量" in body
+    assert "欠收率" in body
+    assert "按门店" in body
+    assert "按配送中心" in body
+    assert "按品类" in body
+    assert "按品项" in body
+    assert "store_test" in body  # 门店维度
+    assert "PACKAGING" in body  # 品类维度
+
+
+def test_admin_report_blocks_non_admin(e2e_env):
+    """非 admin 不能访问报表（403 或 302）。"""
+    client = e2e_env["client"]
+    _login_as(client, 1, 3)  # store_staff，不是 admin
+    resp = client.get("/store-ordering/admin/report")
+    # @require_role("admin") 应返回 403
+    assert resp.status_code == 403
+
+
+def test_admin_report_filter_by_store(e2e_env):
+    """?store= 筛选。"""
+    import blueprints.store_ordering_pure as sop
+
+    client = e2e_env["client"]
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    cart = sop.get_or_create_cart(
+        master, user_id=1, store_warehouse_code="store_test", dc_warehouse_code="dc1_test",
+    )
+    sop.add_cart_item(master, cart["id"], 101, 3.0, "件")
+    sop.submit_order(master, cart["id"], requested_by=1, expected_delivery_date=None, note="")
+    master.close()
+
+    _login_as(client, 4, 3)
+    resp = client.get("/store-ordering/admin/report?store=store_test")
+    assert resp.status_code == 200
+    assert b"store_test" in resp.data
+
+    # 错误的 store 应无数据
+    resp_empty = client.get("/store-ordering/admin/report?store=nonexistent")
+    assert resp_empty.status_code == 200
+    body = resp_empty.data.decode()
+    assert "该筛选范围无数据" in body
+
+
+def test_admin_nav_includes_report(e2e_env):
+    """admin 导航应包含「订货报表」入口。"""
+    client = e2e_env["client"]
+    _login_as(client, 4, 3)
+    resp = client.get("/")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "订货报表" in body or "报表" in body
+    # URL 应指向 admin/report
+    assert "/store-ordering/admin/report" in body

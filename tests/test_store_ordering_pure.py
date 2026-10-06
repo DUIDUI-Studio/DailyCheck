@@ -5,7 +5,7 @@ Tests do not require Flask; they exercise pure SQLite logic.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -1072,3 +1072,149 @@ def test_compute_suggested_order_qty_counts_in_transit_from_approved(ordering_en
     # daily_avg=1, safety=7, current=0, transit=8 → suggested=0（被 transit 覆盖完）
     # 不应返回 101
     assert 101 not in result
+
+
+# ---------------------------------------------------------------------------
+# P2-4: 报表（多维汇总）
+# ---------------------------------------------------------------------------
+
+def _make_report_order(
+    conn, *, canonical_id=101, qty=10.0, shipped_qty=None, fulfilled_qty=None,
+    dc_code="dc_test", store_code="store_test", requested_by=2,
+):
+    """建一个 pending → approved → shipped → partial-received 订单。
+
+    shipped_qty 默认等于 qty（全量发）。
+    fulfilled_qty 默认 min(8, qty)（欠 2 或全收齐）。
+    """
+    if shipped_qty is None:
+        shipped_qty = qty
+    if fulfilled_qty is None:
+        fulfilled_qty = min(8.0, qty)
+    cart = sop.get_or_create_cart(
+        conn, user_id=requested_by, store_warehouse_code=store_code,
+        dc_warehouse_code=dc_code,
+    )
+    sop.add_cart_item(conn, cart["id"], canonical_id, qty, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=requested_by, expected_delivery_date=None, note="")
+    sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    if shipped_qty > 0:
+        sop.ship_order(
+            conn, order["id"], {int(order["order_items"][0]["id"]): shipped_qty},
+            shipped_by=4,
+        )
+    if fulfilled_qty > 0:
+        sop.receive_order_item(
+            conn, order_id=order["id"], order_item_id=int(order["order_items"][0]["id"]),
+            qty=fulfilled_qty, actor_id=2,
+        )
+    return order
+
+
+def test_compute_store_order_report_basic(ordering_env):
+    """P2-4: 一个订单（欠收 2/10），summary 与 4 个维度都应有数据。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn, qty=10.0, shipped_qty=10.0, fulfilled_qty=8.0)
+
+    report = sop.compute_store_order_report(conn)
+    s = report["summary"]
+    assert s["ordered_qty"] == 10.0
+    assert s["shipped_qty"] == 10.0
+    assert s["received_qty"] == 8.0
+    assert s["shortfall_qty"] == 2.0
+    assert s["shortfall_rate"] == 0.2
+    assert s["order_count"] == 1
+
+    # 4 个维度都有数据
+    assert len(report["by_store"]) == 1
+    assert report["by_store"][0]["store_code"] == "store_test"
+    assert report["by_store"][0]["ordered_qty"] == 10.0
+
+    assert len(report["by_dc"]) == 1
+    assert report["by_dc"][0]["dc_code"] == "dc_test"
+
+    assert len(report["by_category"]) == 1
+    assert report["by_category"][0]["category_code"] == "PACKAGING"
+
+    assert len(report["by_canonical"]) == 1
+    assert report["by_canonical"][0]["canonical_name"] == "测试包材A"
+    assert report["by_canonical"][0]["ordered_qty"] == 10.0
+
+
+def test_compute_store_order_report_no_shortfall(ordering_env):
+    """全收齐时 shortfall=0、rate=0。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn, qty=5.0, shipped_qty=5.0, fulfilled_qty=5.0)
+
+    report = sop.compute_store_order_report(conn)
+    s = report["summary"]
+    assert s["shortfall_qty"] == 0.0
+    assert s["shortfall_rate"] == 0.0
+
+
+def test_compute_store_order_report_filter_by_store(ordering_env):
+    """?store= 过滤：只返回指定门店的数据。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn, store_code="store_test", dc_code="dc_test")
+
+    report = sop.compute_store_order_report(conn, store_warehouse_code="store_test")
+    assert report["summary"]["ordered_qty"] == 10.0
+
+    # 用一个不存在的门店，应该无数据
+    report_empty = sop.compute_store_order_report(conn, store_warehouse_code="nonexistent")
+    assert report_empty["summary"]["ordered_qty"] == 0.0
+    assert report_empty["summary"]["order_count"] == 0
+    assert report_empty["by_store"] == []
+
+
+def test_compute_store_order_report_filter_by_dc(ordering_env):
+    """?dc= 过滤。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn, dc_code="dc_test")
+
+    report = sop.compute_store_order_report(conn, dc_warehouse_code="dc_test")
+    assert report["summary"]["ordered_qty"] == 10.0
+
+
+def test_compute_store_order_report_filter_by_date_range(ordering_env):
+    """?start_date= ?end_date= 过滤：超范围订单不计入。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn)
+
+    # 今天日期
+    today = datetime.now().strftime("%Y-%m-%d")
+    report = sop.compute_store_order_report(conn, start_date=today, end_date=today)
+    assert report["summary"]["ordered_qty"] == 10.0
+
+    # 昨天的范围不应包含今天的订单
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    report_empty = sop.compute_store_order_report(conn, start_date=yesterday, end_date=yesterday)
+    assert report_empty["summary"]["ordered_qty"] == 0.0
+
+
+def test_compute_store_order_report_multiple_orders(ordering_env):
+    """多订单时 by_store / by_dc 应正确汇总（不重复 order_count）。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn, qty=10.0)
+    _make_report_order(conn, qty=5.0)
+
+    report = sop.compute_store_order_report(conn)
+    # 总订货 15
+    assert report["summary"]["ordered_qty"] == 15.0
+    # order_count 应该去重 = 2
+    assert report["summary"]["order_count"] == 2
+    # by_store 只有 1 行（都是 store_test）
+    assert len(report["by_store"]) == 1
+    assert report["by_store"][0]["ordered_qty"] == 15.0
+
+
+def test_compute_store_order_report_filter_by_category(ordering_env):
+    """?cat= 过滤：按品类。"""
+    conn = ordering_env["master_conn"]
+    _make_report_order(conn, canonical_id=101)  # PACKAGING
+
+    report = sop.compute_store_order_report(conn, category_code="PACKAGING")
+    assert report["summary"]["ordered_qty"] == 10.0
+
+    report_empty = sop.compute_store_order_report(conn, category_code="NONEXIST")
+    assert report_empty["summary"]["ordered_qty"] == 0.0

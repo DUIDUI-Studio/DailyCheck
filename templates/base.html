@@ -59,6 +59,7 @@
     {# /procurement/store: admin only #}
     {% if g.user and g.user['is_admin'] %}
     <a href="{{ url_for('procurement.procurement_store') }}">采购建议</a>
+    <a href="{{ url_for('store_ordering.admin_report') }}">订货报表</a>
     {% endif %}
     {# /notifications: everyone logged in, with unread badge (PRD §1.1 A6) #}
     {% if g.user %}
@@ -125,6 +126,9 @@
       {% if is_admin or is_storefront %}
       <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
       {% endif %}
+      {% endif %}
+      {% if g.user and g.user['is_admin'] %}
+      <a href="{{ url_for('store_ordering.admin_report') }}">报表</a>
       {% endif %}
       {% if is_admin or is_rd %}
       <a href="{{ url_for('recipe_cost.landing') }}">配方</a>

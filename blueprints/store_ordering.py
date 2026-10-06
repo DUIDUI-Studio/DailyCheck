@@ -893,6 +893,51 @@ def receive_order_route(order_id: int) -> str:
 # Admin board
 # ---------------------------------------------------------------------------
 
+@bp.route("/admin/report")
+@require_login
+@require_role("admin")
+def admin_report() -> str:
+    """Platform admin 报表 (P2-4)。
+
+    维度：门店 / DC / 品类 / 品项；指标：订货量 / 出货量 / 收货量 / 欠收量 / 欠收率。
+    筛选：日期范围、门店、DC、品类。
+    """
+    master = get_master_db()
+    start_date = request.args.get("start_date", "").strip() or None
+    end_date = request.args.get("end_date", "").strip() or None
+    store = request.args.get("store", "").strip() or None
+    dc = request.args.get("dc", "").strip() or None
+    category_code = request.args.get("cat", "").strip() or None
+
+    report = sop.compute_store_order_report(
+        master,
+        start_date=start_date,
+        end_date=end_date,
+        store_warehouse_code=store,
+        dc_warehouse_code=dc,
+        category_code=category_code,
+    )
+
+    # 拉品类下拉选项
+    cat_rows = master.execute(
+        "SELECT code, name FROM canonical_categories ORDER BY code"
+    ).fetchall()
+    categories = [(r["code"], r["name"]) for r in cat_rows]
+
+    return render_template(
+        "store_ordering/report.html",
+        report=report,
+        start_date=start_date or "",
+        end_date=end_date or "",
+        store=store or "",
+        dc=dc or "",
+        category_code=category_code or "",
+        categories=categories,
+        stores=_list_stores(master),
+        dcs=_list_dcs(master),
+    )
+
+
 @bp.route("/admin/orders")
 @require_login
 @require_role("admin")
