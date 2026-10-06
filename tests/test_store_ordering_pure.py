@@ -655,8 +655,83 @@ def test_allowed_event_types_include_store_ordering():
         sop.EVENT_ORDER_REJECTED,
         sop.EVENT_ORDER_SHIPPED,
         sop.EVENT_ORDER_DELIVERED,
+        sop.EVENT_ORDER_CANCELLED,
     ):
         assert et in ALLOWED_EVENT_TYPES
+
+
+# ---------------------------------------------------------------------------
+# P1-4: 取消订单（pure）
+# ---------------------------------------------------------------------------
+
+def test_cancel_order_pending_sets_status_and_history(ordering_env):
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    oid = order["id"]
+
+    result = sop.cancel_order(conn, oid, cancelled_by=2, reason="门店撤单")
+    assert result["status"] == sop.ORDER_STATUS_CANCELLED
+    assert result["cancel_reason"] == "门店撤单"
+    assert result["cancelled_by"] == 2
+
+    rows = conn.execute(
+        "SELECT to_status, from_status FROM store_order_status_history WHERE order_id=?",
+        (oid,),
+    ).fetchall()
+    assert any(r["from_status"] == "pending" and r["to_status"] == "cancelled" for r in rows)
+
+
+def test_cancel_order_approved_allowed(ordering_env):
+    """已审批状态仍可取消（DC manager/admin 路径）。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 3.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+
+    result = sop.cancel_order(conn, order["id"], cancelled_by=5, reason="库存调整")
+    assert result["status"] == sop.ORDER_STATUS_CANCELLED
+
+
+def test_cancel_order_shipped_rejected(ordering_env):
+    """已发货后不可取消（状态机限制）。"""
+    conn, order_id = _make_approved_order(ordering_env, qty=5.0)
+    order = sop.get_order_detail(conn, order_id)
+    item_id = int(order["order_items"][0]["id"])
+    sop.ship_order_full(conn, order_id, shipped_by=4)
+
+    try:
+        sop.cancel_order(conn, order_id, cancelled_by=5, reason="晚了")
+    except ValueError as e:
+        assert "invalid transition" in str(e)
+    else:
+        raise AssertionError("expected ValueError on cancel-after-ship")
+
+
+def test_notify_order_cancelled_targets_both_sides(ordering_env):
+    """取消通知同时发给门店用户 + DC 审批人，去重并去自己。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+
+    # user 2 (requester) + store manager 3 + dc manager 5 + platform admin 1
+    count = sop.notify_order_event(conn, sop.EVENT_ORDER_CANCELLED, order, actor_user_id=2)
+    assert count == 3  # 去重：4 个里去掉 actor=2
+    rows = conn.execute(
+        "SELECT user_id FROM notifications WHERE event_type=?",
+        (sop.EVENT_ORDER_CANCELLED,),
+    ).fetchall()
+    notified = {r["user_id"] for r in rows}
+    assert notified == {1, 3, 5}
 
 
 # ---------------------------------------------------------------------------

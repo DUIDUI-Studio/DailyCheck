@@ -161,6 +161,49 @@ def test_admin_can_access_admin_orders(e2e_env):
     assert resp.status_code == 200
 
 
+def test_admin_orders_filter_by_store_and_dc(e2e_env):
+    """P0-8 补全：admin/orders 支持 ?store= ?dc= 筛选。"""
+    import blueprints.store_ordering_pure as sop
+
+    client = e2e_env["client"]
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+
+    # 建两个 pending 单，分别指向 dc1_test 和 dc2_test
+    for dc_code in ("dc1_test", "dc2_test"):
+        cart = sop.get_or_create_cart(
+            master, user_id=1, store_warehouse_code="store_test", dc_warehouse_code=dc_code,
+        )
+        sop.add_cart_item(master, cart["id"], 101, 2.0, "件")
+        sop.submit_order(master, cart["id"], requested_by=1, expected_delivery_date=None, note="")
+    master.close()
+
+    _login_as(client, 4, 3)
+
+    # 全量
+    resp = client.get("/store-ordering/admin/orders")
+    assert resp.status_code == 200
+    assert b"dc1_test" in resp.data
+    assert b"dc2_test" in resp.data
+
+    # 按 dc 筛
+    resp = client.get("/store-ordering/admin/orders?dc=dc1_test")
+    assert resp.status_code == 200
+    assert b"dc1_test" in resp.data
+    # dc2_test 的单应被过滤；只要断言筛选表单 dc 下拉里有 dc1_test 即可（不在订单行）
+    assert b'<option value="dc1_test" selected' in resp.data
+    assert b'<option value="dc2_test" selected' not in resp.data
+
+    # 按 store 筛
+    resp = client.get("/store-ordering/admin/orders?store=store_test")
+    assert resp.status_code == 200
+    assert b'<option value="store_test" selected' in resp.data
+
+    # 组合筛选：dc + status
+    resp = client.get("/store-ordering/admin/orders?dc=dc2_test&status=pending")
+    assert resp.status_code == 200
+
+
 def test_switch_dc_clears_cart(e2e_env):
     client = e2e_env["client"]
     _login_as(client, 1, 3)
@@ -573,4 +616,124 @@ def test_partial_received_fulfilled_quantity_accumulates(e2e_env):
         (order_id,),
     ).fetchone()["c"]
     assert n == 3
+    master.close()
+
+
+# ---------------------------------------------------------------------------
+# P1-4: 取消订单（e2e 路由层）
+# ---------------------------------------------------------------------------
+
+def _create_pending_order(master_path, requester_user_id, store_wh_id, dc_wh_id):
+    """Helper: 创建一个 pending 订单并返回 order_id。"""
+    import blueprints.store_ordering_pure as sop
+
+    conn = sqlite3.connect(str(master_path))
+    conn.row_factory = sqlite3.Row
+    cart = sop.get_or_create_cart(
+        conn, user_id=requester_user_id,
+        store_warehouse_code="store_test", dc_warehouse_code="dc1_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=requester_user_id,
+        expected_delivery_date=None, note="",
+    )
+    oid = int(order["id"])
+    conn.close()
+    return oid
+
+
+def test_cancel_pending_order_by_requester(e2e_env):
+    """pending 状态：下单人本人可取消。"""
+    client = e2e_env["client"]
+    _login_as(client, 1, 3)  # store_staff 在 store_test
+    oid = _create_pending_order(e2e_env["master_path"], 1, 3, 1)
+
+    resp = client.post(
+        f"/store-ordering/orders/{oid}/cancel",
+        data={"reason": "门店改主意了"},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute("SELECT status, cancel_reason FROM store_orders WHERE id=?", (oid,)).fetchone()
+    assert row["status"] == "cancelled"
+    assert row["cancel_reason"] == "门店改主意了"
+    # 通知发出
+    n = master.execute(
+        "SELECT COUNT(*) AS c FROM notifications WHERE event_type=?",
+        ("store_order_cancelled",),
+    ).fetchone()["c"]
+    assert n >= 1
+    master.close()
+
+
+def test_cancel_pending_order_blocks_non_requester(e2e_env):
+    """pending 状态：非下单人门店用户不能取消。"""
+    client = e2e_env["client"]
+    oid = _create_pending_order(e2e_env["master_path"], 1, 3, 1)
+    # 切到 store_mgr（user 2）
+    _login_as(client, 2, 3)
+
+    resp = client.post(
+        f"/store-ordering/orders/{oid}/cancel",
+        data={"reason": "越权取消"},
+        follow_redirects=True,
+    )
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute("SELECT status FROM store_orders WHERE id=?", (oid,)).fetchone()
+    assert row["status"] == "pending"  # 没取消
+    master.close()
+
+
+def test_cancel_requires_reason(e2e_env):
+    """无 reason 拒绝。"""
+    client = e2e_env["client"]
+    _login_as(client, 1, 3)
+    oid = _create_pending_order(e2e_env["master_path"], 1, 3, 1)
+
+    resp = client.post(
+        f"/store-ordering/orders/{oid}/cancel",
+        data={"reason": ""},
+        follow_redirects=True,
+    )
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute("SELECT status FROM store_orders WHERE id=?", (oid,)).fetchone()
+    assert row["status"] == "pending"
+    master.close()
+
+
+def test_cancel_approved_order_by_dc_manager(e2e_env):
+    """approved 状态：DC manager 可取消。"""
+    import blueprints.store_ordering_pure as sop
+
+    client = e2e_env["client"]
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    cart = sop.get_or_create_cart(
+        master, user_id=1,
+        store_warehouse_code="store_test", dc_warehouse_code="dc1_test",
+    )
+    sop.add_cart_item(master, cart["id"], 101, 3.0, "件")
+    order = sop.submit_order(
+        master, cart["id"], requested_by=1, expected_delivery_date=None, note="",
+    )
+    sop.review_order(master, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=3)
+    oid = int(order["id"])
+    master.close()
+
+    # dc_mgr (user 3) 在 dc1_test
+    _login_as(client, 3, 1)
+    resp = client.post(
+        f"/store-ordering/orders/{oid}/cancel",
+        data={"reason": "库存调整"},
+        follow_redirects=True,
+    )
+    master = sqlite3.connect(str(e2e_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute("SELECT status FROM store_orders WHERE id=?", (oid,)).fetchone()
+    assert row["status"] == "cancelled"
     master.close()

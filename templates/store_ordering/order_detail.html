@@ -255,6 +255,14 @@
   </form>
   {% endif %}
 
+  {# —— P1-4: 取消按钮 —— #}
+  {% if order.status == 'pending' or order.status == 'approved' %}
+  <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form">
+    <input name="reason" placeholder="取消原因" required style="min-width:180px" />
+    <button type="submit" class="btn-sm danger">取消订单</button>
+  </form>
+  {% endif %}
+
   {% if is_dc_view %}
   <a class="btn-sm" href="{{ url_for('store_ordering.shipment_list') }}">返回出库清单</a>
   {% endif %}

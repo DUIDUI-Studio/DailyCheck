@@ -57,6 +57,15 @@ def _list_dcs(master_conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _list_stores(master_conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    master_conn.row_factory = sqlite3.Row
+    rows = master_conn.execute(
+        "SELECT code, name FROM warehouses WHERE warehouse_type=? ORDER BY code",
+        ("storefront",),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def _today() -> date:
     return date.today()
 
@@ -624,6 +633,61 @@ def shipment_list() -> str:
     return redirect(url_for("store_ordering.review_list"))
 
 
+@bp.route("/orders/<int:order_id>/cancel", methods=["POST"])
+@require_login
+def cancel_order_route(order_id: int) -> str:
+    """Cancel a pending or approved order (P1-4).
+
+    Permission matrix (PRD §5 + §P1-4):
+      - pending: 下单人本人（order.requested_by == g.user.id），或平台管理员
+      - approved: 当前 DC 的 manager/admin，或平台管理员
+      - 其他状态（shipped/delivered/cancelled/rejected）：不可取消
+    """
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    if order is None:
+        abort(404)
+    if not _order_viewable(order):
+        abort(403)
+
+    reason = (request.form.get("reason") or "").strip()
+    if not reason:
+        flash("取消订单时必须填写原因")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    status = order["status"]
+    actor_id = int(g.user["id"])
+    is_requestor = int(order["requested_by"]) == actor_id
+    wh_type = _current_warehouse_type()
+    role = g.role["role"] if g.role else None
+
+    if status == sop.ORDER_STATUS_PENDING:
+        if not (is_requestor or _is_admin()):
+            flash("只有下单人或管理员可以取消待审批订单")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+    elif status == sop.ORDER_STATUS_APPROVED:
+        # DC 已审批：必须当前 DC 的 manager/admin 或平台管理员
+        if not _is_admin():
+            if wh_type != sop.WAREHOUSE_TYPE_DC or role not in ("manager", "admin"):
+                flash("审批后只能由配送中心经理以上或管理员取消")
+                return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+            if order["dc_warehouse_code"] != _current_warehouse_code():
+                abort(403)
+    else:
+        flash(f"订单当前状态 {status} 不可取消")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    try:
+        order = sop.cancel_order(master, order_id, actor_id, reason)
+    except ValueError as e:
+        flash(str(e))
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    sop.notify_order_event(master, sop.EVENT_ORDER_CANCELLED, order, actor_id)
+    flash("订单已取消")
+    return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+
 @bp.route("/orders/<int:order_id>/ship", methods=["POST"])
 @require_login
 @require_warehouse_type("distribution_center")
@@ -818,10 +882,14 @@ def admin_orders() -> str:
     """Platform admin order board."""
     master = get_master_db()
     status = request.args.get("status", "").strip() or None
+    store = request.args.get("store", "").strip() or None
+    dc = request.args.get("dc", "").strip() or None
     start_date = request.args.get("start_date", "").strip() or None
     end_date = request.args.get("end_date", "").strip() or None
     orders = sop.list_orders(
         master,
+        store_warehouse_code=store,
+        dc_warehouse_code=dc,
         status=status,
         start_date=start_date,
         end_date=end_date,
@@ -830,7 +898,11 @@ def admin_orders() -> str:
         "store_ordering/orders.html",
         orders=orders,
         status=status or "",
+        store=store or "",
+        dc=dc or "",
         start_date=start_date or "",
         end_date=end_date or "",
+        stores=_list_stores(master),
+        dcs=_list_dcs(master),
         is_admin_view=True,
     )

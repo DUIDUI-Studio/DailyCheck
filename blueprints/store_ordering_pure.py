@@ -42,6 +42,7 @@ EVENT_ORDER_APPROVED: str = "store_order_approved"
 EVENT_ORDER_REJECTED: str = "store_order_rejected"
 EVENT_ORDER_SHIPPED: str = "store_order_shipped"
 EVENT_ORDER_DELIVERED: str = "store_order_delivered"
+EVENT_ORDER_CANCELLED: str = "store_order_cancelled"
 
 ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
     ORDER_STATUS_PENDING: (ORDER_STATUS_APPROVED, ORDER_STATUS_REJECTED, ORDER_STATUS_CANCELLED),
@@ -1092,14 +1093,14 @@ def mark_order_delivered(
     order_id: int,
     actor_id: int,
 ) -> dict[str, Any]:
-    """DEPRECATED wrapper — single-shot deliver using receive_order_item().
+    """Quick-path: mark the whole order delivered in a single action.
 
-    v2: the canonical path is to call ``receive_order_item`` once per order
-    item. This legacy entry-point is preserved so v1's
-    ``test_mark_order_delivered`` keeps passing: if the order is already
-    shipped and there are no receipts yet, we forward by issuing one
-    ``receive_order_item`` call per order item to consume the entire
-    remaining quantity, then return the post-delivery order detail.
+    The canonical path for receiving partial / full inventory is
+    ``receive_order_item`` (one call per order_item). This entry-point is
+    preserved as a "deliver the whole order at once" shortcut for the
+    storefront manager UI: it forwards by issuing one ``receive_order_item``
+    call per order_item to consume the entire remaining quantity, then
+    returns the post-delivery order detail.
     """
     master_conn.row_factory = sqlite3.Row
     order = get_order_detail(master_conn, order_id)
@@ -1471,6 +1472,16 @@ def notify_order_event(
         user_ids = _recipients_for_store_users(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"订货单 {order['order_no']} 已送达"
+    elif event_type == EVENT_ORDER_CANCELLED:
+        # 取消通知发给对侧：门店取消 → DC 审批人；DC 取消 → 门店用户。
+        # 简化做法：双侧都发给 requester + dc reviewers（去重 + 排自己）。
+        user_ids = _recipients_for_store_users(master_conn, order)
+        user_ids += [
+            uid for uid in _recipients_for_dc_reviewers(master_conn, order)
+            if uid not in user_ids
+        ]
+        user_ids = _exclude_self(user_ids, actor_user_id)
+        summary = f"订货单 {order['order_no']} 已取消"
     else:
         raise ValueError(f"unknown event_type {event_type!r}")
 

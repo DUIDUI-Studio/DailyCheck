@@ -8,6 +8,21 @@
 
 ---
 
+## Changelog（实施偏离记录）
+
+| 版本 | 日期 | 偏离点 | 实现说明 |
+|---|---|---|---|
+| v3 | 2026-10-06 | §8.3 改为：**收货自动入库**（v1 写"P0 不自动入库"） | `receive_order_item` 现在加门店 `items.quantity` + 写 `stock_movements action='门店订货入库'`。仓库绑定、品类继承都自动处理（参见 `store_ordering_pure.py:1117-1290`） |
+| v3 | 2026-10-06 | §P1-2 部分发货**升级为 P0 默认行为**（v1 写"P0 不允许"） | `ship_order_partial` + `store_order_items.shipped_quantity` 累计；测试 `test_ship_order_partial_single_item` 等覆盖 |
+| v3 | 2026-10-06 | §P1-4 取消订单已实现 | `POST /store-ordering/orders/<id>/cancel` + `cancel_order()` + `store_order_cancelled` 通知事件 |
+| v3 | 2026-10-06 | §P0-7 通知事件新增 `store_order_cancelled` | `ALLOWED_EVENT_TYPES` 已注册（5 → 6 个事件） |
+| v3 | 2026-10-06 | §P0-8 admin/orders 看板补 store/dc 筛选维度 | `/admin/orders?store=&dc=&status=&start_date=&end_date=` 全五维 |
+| v3 | 2026-10-06 | §7 页面「出库清单」合并到 DC 看板 | `/shipments` 改为 `/review` 的 302 alias（commit b8746d2） |
+
+未实施项：**P1-5 订货量建议**、**P2-1 物流单号**、**P2-2 订货周期**、**P2-3 额度**、**P2-4 报表**。
+
+---
+
 ## 0. 项目信息
 
 | 项 | 内容 |

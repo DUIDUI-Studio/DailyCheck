@@ -16,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from flask import current_app, g
+from flask import g
 
 from config import MASTER_DB, WAREHOUSE_DB_DIR
 
@@ -792,13 +792,9 @@ def init_master_db() -> None:
                     ).fetchall()
                 ]
                 if "sqlite_autoindex_recipe_versions_1" in rv_indexes:
-                    # Find which columns the auto-index covers.
-                    auto_idx_info = conn.execute(
-                        "SELECT sql FROM sqlite_master "
-                        "WHERE type='index' AND name='sqlite_autoindex_recipe_versions_1'"
-                    ).fetchone()
-                    # sql is None for auto-indexes (defined by UNIQUE clause);
-                    # query the columns directly via pragma_index_info.
+                    # Find which columns the auto-index covers. sql is None
+                    # for auto-indexes (defined by UNIQUE clause); query the
+                    # columns directly via pragma_index_info.
                     auto_cols = [
                         r[2] for r in conn.execute(
                             "PRAGMA index_info('sqlite_autoindex_recipe_versions_1')"

@@ -18,6 +18,26 @@
       <option value="cancelled" {% if status == 'cancelled' %}selected{% endif %}>已取消</option>
     </select>
   </label>
+  {% if is_admin_view %}
+  <label>
+    <span>门店</span>
+    <select name="store">
+      <option value="">全部</option>
+      {% for s in stores %}
+        <option value="{{ s.code }}" {% if store == s.code %}selected{% endif %}>{{ s.name }} ({{ s.code }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>配送中心</span>
+    <select name="dc">
+      <option value="">全部</option>
+      {% for d in dcs %}
+        <option value="{{ d.code }}" {% if dc == d.code %}selected{% endif %}>{{ d.name }} ({{ d.code }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% endif %}
   <label>
     <span>开始日期</span>
     <input type="date" name="start_date" value="{{ start_date }}" />

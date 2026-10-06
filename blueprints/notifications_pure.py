@@ -9,7 +9,6 @@ import sqlite3
 from datetime import datetime
 from typing import Any
 
-
 # PRD §2.5.4: first-cut event types. Only recipe_published is wired up in
 # this subproject; the others are reserved for subprojects 4/5/6.
 # M2 (canonical-item) extends with three new types (Spec §4.1 T13).
@@ -23,6 +22,7 @@ ALLOWED_EVENT_TYPES = frozenset({
     "store_order_rejected",
     "store_order_shipped",
     "store_order_delivered",
+    "store_order_cancelled",
 })
 
 SUMMARY_MAX_LEN = 200
