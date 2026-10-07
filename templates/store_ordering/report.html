@@ -59,6 +59,10 @@
     <div class="kpi-label">总收货量</div>
     <div class="kpi-value">{{ report.summary.received_qty | fmt_qty }}</div>
   </div>
+  <div class="kpi-card">
+    <div class="kpi-label">总运费</div>
+    <div class="kpi-value">¥ {{ report.summary.shipping_fee | fmt_money }}</div>
+  </div>
   <div class="kpi-card {% if report.summary.shortfall_rate > 0.05 %}kpi-warn{% endif %}">
     <div class="kpi-label">欠收率</div>
     <div class="kpi-value">{{ (report.summary.shortfall_rate * 100) | round(2, 'floor') }}%</div>
@@ -79,6 +83,7 @@
       <th>收货量</th>
       <th>欠收量</th>
       <th>欠收率</th>
+      <th>运费</th>
     </tr>
   </thead>
   <tbody>
@@ -91,6 +96,7 @@
       <td>{{ r.received_qty | fmt_qty }}</td>
       <td>{{ r.shortfall_qty | fmt_qty }}</td>
       <td>{% set rate = r.shortfall_rate * 100 %}{% if rate > 5 %}<span class="status-pill danger">{{ rate | round(2, 'floor') }}%</span>{% else %}{{ rate | round(2, 'floor') }}%{% endif %}</td>
+      <td>¥ {{ r.shipping_fee | fmt_money }}</td>
     </tr>
     {% endfor %}
   </tbody>
@@ -112,6 +118,7 @@
       <th>收货量</th>
       <th>欠收量</th>
       <th>欠收率</th>
+      <th>运费</th>
     </tr>
   </thead>
   <tbody>
@@ -124,6 +131,7 @@
       <td>{{ r.received_qty | fmt_qty }}</td>
       <td>{{ r.shortfall_qty | fmt_qty }}</td>
       <td>{% set rate = r.shortfall_rate * 100 %}{% if rate > 5 %}<span class="status-pill danger">{{ rate | round(2, 'floor') }}%</span>{% else %}{{ rate | round(2, 'floor') }}%{% endif %}</td>
+      <td>¥ {{ r.shipping_fee | fmt_money }}</td>
     </tr>
     {% endfor %}
   </tbody>

@@ -37,8 +37,16 @@
     <div><strong>送达时间：</strong>{{ order.delivered_at or '—' }}</div>
   </div>
   <div class="info-card-total">
-    <span class="info-card-total-label">订单总金额</span>
+    <span class="info-card-total-label">订单金额</span>
     <span class="info-card-total-value">¥ {{ total_amount | fmt_money }}</span>
+  </div>
+  <div class="info-card-total" style="margin-top:6px;background:#f8fafc">
+    <span class="info-card-total-label">运费</span>
+    <span class="info-card-total-value">¥ {{ (order.shipping_fee or 0) | fmt_money }}</span>
+  </div>
+  <div class="info-card-total" style="margin-top:6px;background:#ecfdf5">
+    <span class="info-card-total-label"><strong>订单总计</strong></span>
+    <span class="info-card-total-value"><strong>¥ {{ ((total_amount or 0) + (order.shipping_fee or 0)) | fmt_money }}</strong></span>
   </div>
 </div>
 
