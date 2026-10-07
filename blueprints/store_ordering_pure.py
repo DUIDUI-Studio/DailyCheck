@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import config
@@ -342,7 +343,7 @@ def list_available_dc_items(
     try:
         dc_conn.row_factory = sqlite3.Row
         params = []
-        where_parts = ["canonical_id IS NOT NULL"]
+        where_parts = ["canonical_id IS NOT NULL", "is_orderable = 1"]
         if keyword:
             where_parts.append("(name LIKE ? OR sku LIKE ?)")
             params.extend([f"%{keyword}%", f"%{keyword}%"])
@@ -375,6 +376,105 @@ def list_available_dc_items(
             item["unit_price"] = selling_price if selling_price > 0 else unit_cost
             out.append(item)
         return out
+    finally:
+        dc_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v3.1: 品项可订开关（DC manager + admin）
+# ---------------------------------------------------------------------------
+
+def list_dc_items_for_management(
+    master_conn: sqlite3.Connection,
+    dc_warehouse_code: str,
+) -> list[dict[str, Any]]:
+    """List ALL DC items (含不可订)，用于品项管理页面。
+
+    Enrichment 同 list_available_dc_items；按 category_code 分组返回。
+    """
+    master_conn.row_factory = sqlite3.Row
+    canonical_rows = master_conn.execute(
+        "SELECT id, name, category_code FROM canonical_items"
+    ).fetchall()
+    canonical_map = {int(r["id"]): dict(r) for r in canonical_rows}
+
+    dc_conn = open_warehouse_db(dc_warehouse_code)
+    try:
+        dc_conn.row_factory = sqlite3.Row
+        rows = dc_conn.execute(
+            """SELECT id, sku, name, unit, quantity, canonical_id, is_orderable
+               FROM items
+               WHERE canonical_id IS NOT NULL
+               ORDER BY name"""
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            canonical_id = item["canonical_id"]
+            canon = canonical_map.get(canonical_id)
+            if canon is None:
+                continue
+            item["canonical_name"] = canon["name"]
+            item["category_code"] = canon["category_code"]
+            out.append(item)
+        return out
+    finally:
+        dc_conn.close()
+
+
+def set_dc_item_orderable(
+    master_conn: sqlite3.Connection,
+    dc_warehouse_code: str,
+    canonical_id: int,
+    is_orderable: bool,
+) -> bool:
+    """Toggle a single DC item's orderability.
+
+    Returns True iff a row was updated. Raises ValueError if the DC has
+    no item bound to that canonical_id (so the UI can flash an error).
+    """
+    dc_conn = open_warehouse_db(dc_warehouse_code)
+    try:
+        dc_conn.row_factory = sqlite3.Row
+        cur = dc_conn.execute(
+            "UPDATE items SET is_orderable=? WHERE canonical_id=?",
+            (1 if is_orderable else 0, canonical_id),
+        )
+        dc_conn.commit()
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"DC {dc_warehouse_code} 无 canonical_id={canonical_id} 的品项"
+            )
+        return True
+    finally:
+        dc_conn.close()
+
+
+def list_unorderable_cart_canonicals(
+    master_conn: sqlite3.Connection,
+    dc_warehouse_code: str,
+    canonical_ids: list[int],
+) -> list[dict[str, Any]]:
+    """Return canonical_id → canonical_name for items that exist in
+    ``canonical_ids`` but have ``is_orderable=0`` in the given DC.
+
+    Used by submit-time validation to block cart submissions against
+    items that have been pulled since they were added.
+    """
+    if not canonical_ids:
+        return []
+    dc_conn = open_warehouse_db(dc_warehouse_code)
+    try:
+        dc_conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" * len(canonical_ids))
+        rows = dc_conn.execute(
+            f"""SELECT canonical_id, name AS canonical_name
+                FROM items
+                WHERE canonical_id IN ({placeholders})
+                  AND is_orderable = 0""",
+            canonical_ids,
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         dc_conn.close()
 
@@ -554,6 +654,7 @@ def compute_store_order_report(
         "shipped_qty": 0.0,
         "received_qty": 0.0,
         "shortfall_qty": 0.0,
+        "shipping_fee": 0.0,
         "order_count": 0,
     }
     total_shortfall = 0.0
@@ -577,6 +678,7 @@ def compute_store_order_report(
             r["store_code"],
             {"store_code": r["store_code"], "ordered_qty": 0.0,
              "shipped_qty": 0.0, "received_qty": 0.0, "shortfall_qty": 0.0,
+             "shipping_fee": 0.0,
              "order_count": 0},
         )
         s["ordered_qty"] += oq
@@ -589,6 +691,7 @@ def compute_store_order_report(
             r["dc_code"],
             {"dc_code": r["dc_code"], "ordered_qty": 0.0,
              "shipped_qty": 0.0, "received_qty": 0.0, "shortfall_qty": 0.0,
+             "shipping_fee": 0.0,
              "order_count": 0},
         )
         d["ordered_qty"] += oq
@@ -638,17 +741,22 @@ def compute_store_order_report(
     oc_sql = f"""
         SELECT so.store_warehouse_code AS store_code,
                so.dc_warehouse_code    AS dc_code,
-               COUNT(DISTINCT so.id)   AS order_count
+               COUNT(DISTINCT so.id)   AS order_count,
+               SUM(so.shipping_fee)    AS shipping_fee
         FROM store_orders so
         WHERE {oc_where}
         GROUP BY so.store_warehouse_code, so.dc_warehouse_code
     """
     for r in master_conn.execute(oc_sql, oc_params).fetchall():
+        sf = float(r["shipping_fee"] or 0)
         if r["store_code"] in by_store:
             by_store[r["store_code"]]["order_count"] = int(r["order_count"])
+            by_store[r["store_code"]]["shipping_fee"] += sf
         if r["dc_code"] in by_dc:
             by_dc[r["dc_code"]]["order_count"] = int(r["order_count"])
+            by_dc[r["dc_code"]]["shipping_fee"] += sf
         summary["order_count"] += int(r["order_count"])
+        summary["shipping_fee"] += sf
 
     # 排序 + 算费率
     for d in by_store.values():
@@ -799,7 +907,11 @@ def submit_order(
     expected_delivery_date: str | None,
     note: str | None,
 ) -> dict[str, Any]:
-    """Convert cart to order, return order dict."""
+    """Convert cart to order, return order dict.
+
+    v3.1: 写入 shipping_fee（基于当前 active 运费规则 + 订单金额合计）。
+    运费在 submit 时锁定，ship / receive 时不再重算。
+    """
     master_conn.row_factory = sqlite3.Row
     cart = master_conn.execute(
         "SELECT * FROM store_order_carts WHERE id=?", (cart_id,)
@@ -814,15 +926,23 @@ def submit_order(
     cart_items = list_cart_items(master_conn, cart_id)
     order_no = generate_order_no(master_conn)
     ts = now()
+    # v3.1: 算订单金额合计 + 运费
+    subtotal = sum(
+        parse_qty(ci.get("line_subtotal") or 0) for ci in cart_items
+    )
+    rule = get_active_shipping_rule(master_conn)
+    shipping_fee = compute_shipping_fee(subtotal, rule)
+
     cur = master_conn.execute(
         """INSERT INTO store_orders
            (order_no, store_warehouse_code, dc_warehouse_code, status,
-            requested_by, expected_delivery_date, note, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            requested_by, expected_delivery_date, note, created_at, updated_at,
+            shipping_fee)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             order_no, cart_dict["store_warehouse_code"], cart_dict["dc_warehouse_code"],
             ORDER_STATUS_PENDING, requested_by, expected_delivery_date,
-            note, ts, ts,
+            note, ts, ts, shipping_fee,
         ),
     )
     order_id = int(cur.lastrowid)
@@ -843,6 +963,61 @@ def submit_order(
     _insert_status_history(master_conn, order_id, None, ORDER_STATUS_PENDING, requested_by, note)
     master_conn.commit()
     return get_order_detail(master_conn, order_id)
+
+
+# ---------------------------------------------------------------------------
+# v3.1: 运费规则（admin 配置 + submit 时计算）
+# ---------------------------------------------------------------------------
+
+def compute_shipping_fee(subtotal: float, rule: dict | None) -> float:
+    """fee = base_fee + subtotal × pct_fee, 2dp 量化。
+
+    rule 为 None（无 active 规则）→ 返回 0（向后兼容）。
+    """
+    if rule is None:
+        return 0.0
+    base = float(rule.get("base_fee") or 0)
+    pct = float(rule.get("pct_fee") or 0)
+    raw = base + parse_qty(subtotal) * pct
+    # 2dp 量化，与货币一致
+    return float(Decimal(str(raw)).quantize(Decimal("0.01")))
+
+
+def get_active_shipping_rule(master_conn: sqlite3.Connection) -> dict | None:
+    """Return the single active rule, or None if no rule is active."""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT * FROM shipping_rules WHERE active=1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_shipping_rule(
+    master_conn: sqlite3.Connection,
+    *,
+    name: str = "默认",
+    base_fee: float,
+    pct_fee: float,
+    active: bool = True,
+) -> int:
+    """Create or update the active rule (MVP 单条规则)。
+
+    Strategy: deactivate any existing active row, then INSERT new.
+    Returns the new rule id.
+    """
+    ts = now()
+    master_conn.row_factory = sqlite3.Row
+    if active:
+        # 关闭所有现有 active（应只有一条）
+        master_conn.execute("UPDATE shipping_rules SET active=0, updated_at=?", (ts,))
+    cur = master_conn.execute(
+        """INSERT INTO shipping_rules
+           (name, base_fee, pct_fee, active, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (name, float(base_fee), float(pct_fee), 1 if active else 0, ts, ts),
+    )
+    master_conn.commit()
+    return int(cur.lastrowid)
 
 
 # ---------------------------------------------------------------------------

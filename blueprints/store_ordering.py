@@ -395,15 +395,23 @@ def submit_order_route() -> str:
         flash("购物车为空")
         return redirect(url_for("store_ordering.cart_view"))
 
+    # v3.1: 校验购物车里品项在 DC 端仍可订（防止「先加购后被下架」漏提交）
+    cart_canonicals = [int(it["canonical_id"]) for it in items if it.get("canonical_id")]
+    unorderable = sop.list_unorderable_cart_canonicals(master, dc_code, cart_canonicals)
+
     expected_date = _tomorrow()
     note = ""
-    errors: dict[str, Any] = {"shortages": [], "unbound": []}
+    errors: dict[str, Any] = {"shortages": [], "unbound": [], "unorderable": unorderable}
 
     if request.method == "POST":
         expected_date = _parse_date_input(request.form.get("expected_delivery_date")) or _tomorrow()
         note = (request.form.get("note") or "").strip()
         if expected_date < _today():
             flash("期望到货日期不能早于今天")
+        elif unorderable:
+            flash("以下品项已被下架，请移除后再提交：" + "、".join(
+                u["canonical_name"] for u in unorderable
+            ))
         else:
             validation = sop.validate_cart_for_submit(master, cart)
             if not validation["ok"]:
@@ -428,6 +436,9 @@ def submit_order_route() -> str:
         cart=cart,
         items=items,
         cart_total=cart_total,
+        shipping_fee=sop.compute_shipping_fee(
+            cart_total, sop.get_active_shipping_rule(master),
+        ),
         expected_date=_date_input(expected_date),
         note=note,
         errors=errors,
@@ -501,6 +512,9 @@ def order_detail(order_id: int) -> str:
         parse_qty(item["quantity"]) * parse_qty(item.get("unit_price") or 0)
         for item in order["order_items"]
     )
+    # v3.1: 订单含 shipping_fee（submit 时锁定）。order dict 已含 shipping_fee 字段。
+    if "shipping_fee" not in order:
+        order["shipping_fee"] = 0.0
 
     is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC
 
@@ -643,6 +657,52 @@ def shipment_list() -> str:
     """Legacy alias. The combined /review page is the canonical entry; this
     just redirects there for any bookmarked deep links."""
     return redirect(url_for("store_ordering.review_list"))
+
+
+@bp.route("/dc/items", methods=["GET", "POST"])
+@require_login
+@require_warehouse_type("distribution_center")
+@require_role("manager")
+def manage_dc_items() -> str:
+    """v3.1: DC 品项可订开关管理（DC manager + admin）。
+
+    GET  : 列当前 DC 所有品项（按品类分组），每行带可订 toggle。
+    POST : 切换单个品项的 is_orderable。
+    """
+    dc_code = _current_warehouse_code()
+    if dc_code is None and _is_admin():
+        # admin 没绑仓库时不绑，这里只允许具体仓库视角
+        flash("请先选择配送中心仓库")
+        return redirect(url_for("core.dashboard"))
+
+    master = get_master_db()
+    if request.method == "POST":
+        canonical_id_raw = request.form.get("canonical_id", "")
+        is_orderable_raw = request.form.get("is_orderable", "1")
+        try:
+            cid = int(canonical_id_raw)
+            is_orderable = is_orderable_raw == "1"
+        except ValueError:
+            flash("请求参数无效")
+            return redirect(url_for("store_ordering.manage_dc_items"))
+        try:
+            sop.set_dc_item_orderable(master, dc_code, cid, is_orderable)
+        except ValueError as e:
+            flash(str(e))
+        else:
+            flash("已切换为" + ("可订" if is_orderable else "不可订"))
+        return redirect(url_for("store_ordering.manage_dc_items"))
+
+    items = sop.list_dc_items_for_management(master, dc_code)
+    # 按 category_code 分组
+    groups: dict[str, list[dict]] = {}
+    for it in items:
+        groups.setdefault(it.get("category_code") or "未分类", []).append(it)
+    return render_template(
+        "store_ordering/dc_items.html",
+        dc_code=dc_code,
+        groups=groups,
+    )
 
 
 @bp.route("/orders/<int:order_id>/cancel", methods=["POST"])
@@ -892,6 +952,48 @@ def receive_order_route(order_id: int) -> str:
 # ---------------------------------------------------------------------------
 # Admin board
 # ---------------------------------------------------------------------------
+
+@bp.route("/admin/shipping", methods=["GET", "POST"])
+@require_login
+@require_role("admin")
+def manage_shipping_rule() -> str:
+    """v3.1: admin 配置运费规则。
+
+    GET  : 显示当前 active 规则的表单（含示例计算）
+    POST : 调 upsert_shipping_rule
+    """
+    master = get_master_db()
+    rule = sop.get_active_shipping_rule(master)
+
+    if request.method == "POST":
+        try:
+            base_fee = float(request.form.get("base_fee", "0") or 0)
+            pct_fee = float(request.form.get("pct_fee", "0") or 0) / 100.0
+            active = request.form.get("active", "1") == "1"
+        except ValueError:
+            flash("运费规则参数无效")
+            return redirect(url_for("store_ordering.manage_shipping_rule"))
+
+        sop.upsert_shipping_rule(
+            master,
+            base_fee=base_fee,
+            pct_fee=pct_fee,
+            active=active,
+        )
+        flash("运费规则已保存")
+        return redirect(url_for("store_ordering.manage_shipping_rule"))
+
+    # 表单展示：用 100 作为示例订单金额
+    sample_subtotal = 100.0
+    sample_fee = sop.compute_shipping_fee(sample_subtotal, rule)
+
+    return render_template(
+        "store_ordering/shipping.html",
+        rule=rule or {},
+        sample_fee=sample_fee,
+        sample_subtotal=sample_subtotal,
+    )
+
 
 @bp.route("/admin/report")
 @require_login

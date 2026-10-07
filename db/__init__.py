@@ -776,6 +776,31 @@ def init_master_db() -> None:
                         "shipped_quantity REAL NOT NULL DEFAULT 0"
                     )
 
+                # v3.1: store_orders.shipping_fee（运费，submit 时锁定）。
+                so_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(store_orders)"
+                    ).fetchall()
+                }
+                if "shipping_fee" not in so_cols:
+                    conn.execute(
+                        "ALTER TABLE store_orders ADD COLUMN "
+                        "shipping_fee REAL NOT NULL DEFAULT 0"
+                    )
+
+                # v3.1: shipping_rules 表（全局运费规则，admin 配置）。
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS shipping_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        base_fee REAL NOT NULL DEFAULT 0,
+                        pct_fee REAL NOT NULL DEFAULT 0,
+                        active INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+
                 # recipe_versions UNIQUE constraint fix.
                 # The original schema had UNIQUE(recipe_type,
                 # source_warehouse_code, version) — missing recipe_id — so
@@ -924,6 +949,11 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if "selling_price_updated_at" not in item_cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN selling_price_updated_at TEXT"
+            )
+        # v3.1: DC 品项可订开关 (PRD P2-Q7)。默认 1（可订），老仓自动满足。
+        if "is_orderable" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN is_orderable INTEGER NOT NULL DEFAULT 1"
             )
         # ─────────────────────────────────────────────────────────────────
         # Canonical-item columns (Spec §2.2). All idempotent via PRAGMA.

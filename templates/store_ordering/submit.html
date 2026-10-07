@@ -19,6 +19,17 @@
 </div>
 {% endif %}
 
+{% if errors.unorderable %}
+<div class="alert danger">
+  <p><strong>以下品项已被配送中心下架，请先到购物车移除：</strong></p>
+  <ul>
+    {% for u in errors.unorderable %}
+    <li>{{ u.canonical_name }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <table class="data-table">
   <thead>
     <tr>
@@ -50,6 +61,16 @@
       <th>¥ {{ cart_total | fmt_money }}</th>
       <th></th>
     </tr>
+    <tr>
+      <th colspan="5" style="text-align:right">运费预估</th>
+      <th>¥ {{ shipping_fee | fmt_money }}</th>
+      <th></th>
+    </tr>
+    <tr>
+      <th colspan="5" style="text-align:right"><strong>总计</strong></th>
+      <th><strong>¥ {{ (cart_total + shipping_fee) | fmt_money }}</strong></th>
+      <th></th>
+    </tr>
   </tfoot>
 </table>
 
@@ -62,6 +83,6 @@
     <span>备注</span>
     <textarea name="note" rows="3">{{ note }}</textarea>
   </label>
-  <button type="submit" class="btn" {% if errors.unbound %}disabled{% endif %}>发送</button>
+  <button type="submit" class="btn" {% if errors.unbound or errors.unorderable %}disabled{% endif %}>发送</button>
 </form>
 {% endblock %}

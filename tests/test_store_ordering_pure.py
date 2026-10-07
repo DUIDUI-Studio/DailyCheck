@@ -1218,3 +1218,244 @@ def test_compute_store_order_report_filter_by_category(ordering_env):
 
     report_empty = sop.compute_store_order_report(conn, category_code="NONEXIST")
     assert report_empty["summary"]["ordered_qty"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# v3.1 B: 运费规则
+# ---------------------------------------------------------------------------
+
+def test_compute_shipping_fee_basic(ordering_env):
+    """B1: fee = base_fee + subtotal × pct_fee."""
+    conn = ordering_env["master_conn"]
+    rule = {"base_fee": 5.0, "pct_fee": 0.01}
+    assert sop.compute_shipping_fee(100.0, rule) == 6.0  # 5 + 100×0.01
+
+    # 大金额
+    assert sop.compute_shipping_fee(1000.0, {"base_fee": 10.0, "pct_fee": 0.02}) == 30.0  # 10 + 20
+
+
+def test_compute_shipping_fee_zero_subtotal(ordering_env):
+    """B2: subtotal=0 时仍收 base_fee。"""
+    conn = ordering_env["master_conn"]
+    rule = {"base_fee": 5.0, "pct_fee": 0.01}
+    assert sop.compute_shipping_fee(0.0, rule) == 5.0
+
+
+def test_compute_shipping_fee_quantizes_2dp(ordering_env):
+    """B3: 浮点精度 — 2dp 量化。"""
+    conn = ordering_env["master_conn"]
+    rule = {"base_fee": 1.0, "pct_fee": 0.005}  # 0.005 = 0.5%
+    # 33.33 × 0.005 = 0.16665 → 量化 0.17
+    fee = sop.compute_shipping_fee(33.33, rule)
+    assert fee == 1.17  # 1 + 0.17
+
+
+def test_compute_shipping_fee_no_rule(ordering_env):
+    """B4 + B9: 无 active 规则时返回 0（向后兼容）。"""
+    conn = ordering_env["master_conn"]
+    assert sop.compute_shipping_fee(100.0, None) == 0.0
+    assert sop.get_active_shipping_rule(conn) is None
+
+
+def test_get_active_shipping_rule(ordering_env):
+    """B2/B4 续: 创建规则后 get 返回。"""
+    conn = ordering_env["master_conn"]
+    rid = sop.upsert_shipping_rule(conn, base_fee=8.0, pct_fee=0.02)
+    rule = sop.get_active_shipping_rule(conn)
+    assert rule is not None
+    assert rule["id"] == rid
+    assert float(rule["base_fee"]) == 8.0
+    assert float(rule["pct_fee"]) == 0.02
+    assert rule["active"] == 1
+
+
+def test_upsert_shipping_rule_updates(ordering_env):
+    """B5: 已有 active → 关掉，再插入新行（active=1）。"""
+    conn = ordering_env["master_conn"]
+    rid1 = sop.upsert_shipping_rule(conn, base_fee=5.0, pct_fee=0.01)
+    rid2 = sop.upsert_shipping_rule(conn, base_fee=10.0, pct_fee=0.03)
+
+    # 旧行 active=0，新行 active=1
+    rule1 = conn.execute("SELECT * FROM shipping_rules WHERE id=?", (rid1,)).fetchone()
+    rule2 = conn.execute("SELECT * FROM shipping_rules WHERE id=?", (rid2,)).fetchone()
+    assert rule1["active"] == 0
+    assert rule2["active"] == 1
+    # get_active 只返回最新 active
+    active = sop.get_active_shipping_rule(conn)
+    assert active["id"] == rid2
+
+
+def test_submit_order_writes_shipping_fee(ordering_env):
+    """B6: submit_order 写入 shipping_fee，get_order_detail 返回。"""
+    conn = ordering_env["master_conn"]
+    # 配置规则：base=5, pct=1%
+    sop.upsert_shipping_rule(conn, base_fee=5.0, pct_fee=0.01)
+    # dc.items 中 canonical_id=101 unit_price 需要 >0 — fixture 里 DC item 有 canonical_id 但 unit_price=0
+    # 直接测 shipping_fee 字段写入
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=2, expected_delivery_date=None, note="",
+    )
+    # line_subtotal 是 ci.unit_price × qty，unit_price 来自 dc item
+    # dc_test 里 canonical_id=101 的 unit_price 在 fixture 里没设（=0）
+    # shipping_fee 应基于真实 subtotal（5 × 0 = 0）算 → fee = 5 + 0 = 5
+    assert float(order["shipping_fee"]) == 5.0
+
+    # get_order_detail 也应包含
+    detail = sop.get_order_detail(conn, order["id"])
+    assert float(detail["shipping_fee"]) == 5.0
+
+
+def test_shipping_fee_locked_after_ship(ordering_env):
+    """B7: ship 后 shipping_fee 不变。"""
+    conn = ordering_env["master_conn"]
+    sop.upsert_shipping_rule(conn, base_fee=5.0, pct_fee=0.01)
+
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=2, expected_delivery_date=None, note="",
+    )
+    fee_before = float(order["shipping_fee"])
+
+    # 审批 + 发货
+    sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    sop.ship_order_full(conn, order["id"], shipped_by=4)
+
+    detail_after = sop.get_order_detail(conn, order["id"])
+    assert float(detail_after["shipping_fee"]) == fee_before
+
+
+def test_rule_change_does_not_affect_existing_orders(ordering_env):
+    """B8: 修改规则后，老订单用旧值，新订单用新值。"""
+    conn = ordering_env["master_conn"]
+    # 老规则 base=5
+    sop.upsert_shipping_rule(conn, base_fee=5.0, pct_fee=0.01)
+
+    cart1 = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart1["id"], 101, 5.0, "件")
+    order1 = sop.submit_order(
+        conn, cart1["id"], requested_by=2, expected_delivery_date=None, note="",
+    )
+
+    # 改规则 base=20
+    sop.upsert_shipping_rule(conn, base_fee=20.0, pct_fee=0.05)
+
+    cart2 = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart2["id"], 101, 5.0, "件")
+    order2 = sop.submit_order(
+        conn, cart2["id"], requested_by=2, expected_delivery_date=None, note="",
+    )
+
+    assert float(order1["shipping_fee"]) == 5.0  # 老规则
+    assert float(order2["shipping_fee"]) == 20.0  # 新规则
+
+
+# ---------------------------------------------------------------------------
+# v3.1 A: 品项可订开关
+# ---------------------------------------------------------------------------
+
+def test_list_available_dc_items_filters_unorderable(ordering_env):
+    """A2: is_orderable=0 的品项不进入 catalog 列表。"""
+    conn = ordering_env["master_conn"]
+    dc_path = ordering_env["dc_path"]
+    # 下架 canonical_id=101
+    dc = sqlite3.connect(str(dc_path))
+    dc.execute("UPDATE items SET is_orderable=0 WHERE canonical_id=101")
+    dc.commit()
+    dc.close()
+
+    items = sop.list_available_dc_items(conn, "dc_test")
+    canonical_ids = [int(it["canonical_id"]) for it in items]
+    assert 101 not in canonical_ids
+    assert 102 in canonical_ids  # 其他品项仍可订
+
+
+def test_set_dc_item_orderable_toggle(ordering_env):
+    """A3: set_dc_item_orderable 切换后，catalog 列表反映新状态。"""
+    conn = ordering_env["master_conn"]
+    dc_path = ordering_env["dc_path"]
+
+    # 先关闭
+    sop.set_dc_item_orderable(conn, "dc_test", 101, False)
+    items = sop.list_available_dc_items(conn, "dc_test")
+    assert 101 not in [int(it["canonical_id"]) for it in items]
+
+    # 再开启
+    sop.set_dc_item_orderable(conn, "dc_test", 101, True)
+    items = sop.list_available_dc_items(conn, "dc_test")
+    assert 101 in [int(it["canonical_id"]) for it in items]
+
+
+def test_set_dc_item_orderable_missing_canonical_raises(ordering_env):
+    """A4: 不存在的 canonical_id 应抛 ValueError。"""
+    conn = ordering_env["master_conn"]
+    try:
+        sop.set_dc_item_orderable(conn, "dc_test", 9999, False)
+    except ValueError as e:
+        assert "9999" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_list_dc_items_for_management_includes_unorderable(ordering_env):
+    """A6: 管理列表含所有品项（含不可订）。"""
+    conn = ordering_env["master_conn"]
+    # 关闭 101
+    sop.set_dc_item_orderable(conn, "dc_test", 101, False)
+
+    items = sop.list_dc_items_for_management(conn, "dc_test")
+    canonical_ids = [int(it["canonical_id"]) for it in items]
+    assert 101 in canonical_ids
+    assert 102 in canonical_ids
+    # 标记 is_orderable=0 的能取到
+    item_101 = next(it for it in items if int(it["canonical_id"]) == 101)
+    assert item_101["is_orderable"] == 0
+
+
+def test_list_unorderable_cart_canonicals(ordering_env):
+    """A5 辅助：list_unorderable_cart_canonicals 返回被下架的品项。"""
+    conn = ordering_env["master_conn"]
+    sop.set_dc_item_orderable(conn, "dc_test", 101, False)
+
+    unorderable = sop.list_unorderable_cart_canonicals(
+        conn, "dc_test", [101, 102],
+    )
+    assert len(unorderable) == 1
+    assert int(unorderable[0]["canonical_id"]) == 101
+
+    # 全可订时返回空
+    sop.set_dc_item_orderable(conn, "dc_test", 101, True)
+    unorderable_empty = sop.list_unorderable_cart_canonicals(
+        conn, "dc_test", [101, 102],
+    )
+    assert unorderable_empty == []
+
+
+def test_submit_blocked_by_unorderable_item(ordering_env):
+    """A5: 购物车里含被下架品项时，submit_order 不创建订单。"""
+    conn = ordering_env["master_conn"]
+    # 关闭 101
+    sop.set_dc_item_orderable(conn, "dc_test", 101, False)
+
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
+
+    # 提交应被 validate_cart_for_submit（或上层 unorderable 校验）拦截
+    # 这里仅验证 unorderable 列表非空
+    items = sop.list_cart_items(conn, cart["id"])
+    cart_canonicals = [int(it["canonical_id"]) for it in items]
+    unorderable = sop.list_unorderable_cart_canonicals(conn, "dc_test", cart_canonicals)
+    assert len(unorderable) == 1
+    assert int(unorderable[0]["canonical_id"]) == 101

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}DC 品项管理 {{ dc_code }}{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>DC 品项可订管理</h2>
+  <span class="muted">配送中心：<strong>{{ dc_code }}</strong></span>
+</div>
+
+<p class="muted">关闭后该品项将不再出现在门店 catalog 列表与新提交的订单中；存量订单不受影响。</p>
+
+{% if groups %}
+  {% for cat_code, items in groups.items() %}
+  <h3 style="margin-top:18px">{{ cat_code }}</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>品项</th>
+        <th>单位</th>
+        <th>库存</th>
+        <th>状态</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for it in items %}
+      <tr>
+        <td>{{ it.canonical_name }}</td>
+        <td>{{ it.unit }}</td>
+        <td>{{ it.quantity | fmt_qty }}</td>
+        <td>
+          {% if it.is_orderable %}
+            <span class="status-pill ok">可订</span>
+          {% else %}
+            <span class="status-pill danger">不可订</span>
+          {% endif %}
+        </td>
+        <td>
+          <form method="post" action="{{ url_for('store_ordering.manage_dc_items') }}" class="inline-form">
+            <input type="hidden" name="canonical_id" value="{{ it.canonical_id }}" />
+            <input type="hidden" name="is_orderable" value="{{ 0 if it.is_orderable else 1 }}" />
+            <button type="submit" class="btn-sm {{ 'danger' if it.is_orderable else 'ok' }}">
+              {{ '下架' if it.is_orderable else '恢复可订' }}
+            </button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+{% else %}
+<p class="empty">该配送中心暂无已绑定 canonical_id 的品项</p>
+{% endif %}
+
+<div style="margin-top:16px">
+  <a class="btn-sm" href="{{ url_for('store_ordering.review_list') }}">返回审批列表</a>
+</div>
+{% endblock %}
