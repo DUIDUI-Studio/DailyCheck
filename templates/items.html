@@ -11,14 +11,6 @@
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">
       📥 批量导入
     </a>
-    {% if is_rd %}
-    <a href="{{ url_for('canonical.canonical_fanout') }}" class="btn-sm">
-      📤 主数据扇出
-    </a>
-    <a href="{{ url_for('items.items_publish_history') }}" class="btn-sm">
-      🕘 同步历史
-    </a>
-    {% endif %}
   {% endif %}
 </div>
 
@@ -30,61 +22,13 @@
 </div>
 
 <h3>新增库存品</h3>
-<form method="post" class="grid cols-3">
-  <label>
-    <span>品项名称</span>
-    <input name="name" required />
-  </label>
-  <label>
-    <span>品类</span>
-    <select name="category_id" required>
-      <option value="">选择品类</option>
-      {% for c in categories %}
-      <option value="{{ c.id }}">{{ c.name }}</option>
-      {% endfor %}
-    </select>
-  </label>
-  <label>
-    <span>初始库存</span>
-    <input name="quantity" type="number" min="0" step="0.01" />
-  </label>
-  <label>
-    <span>安全库存（系统计算，不可手填）</span>
-    <input name="safety_stock" type="number" min="0" step="0.01" value="0" disabled />
-  </label>
-  {% if is_rd %}
-  <label>
-    <span>进货单价（¥）</span>
-    <input name="unit_cost" type="number" min="0" step="0.001" />
-  </label>
-  {% else %}
-  <input type="hidden" name="unit_cost" value="0" />
+<p class="muted">
+  品项已收敛到「品项主数据」统一维护，<strong>门店与研发中心不再自行新增品项</strong>。
+  如需新增品项，请联系平台管理员在主数据创建后扇出下发。
+  {% if g.user and g.user['is_admin'] %}
+  <a href="{{ url_for('canonical.canonical_list') }}">前往品项主数据 →</a>
   {% endif %}
-  <label>
-    <span>销售单价（¥）</span>
-    <input name="selling_price" type="number" min="0" step="0.001" value="0" />
-  </label>
-  <label>
-    <span>单位</span>
-    <input name="unit" placeholder="件" />
-  </label>
-  <label>
-    <span>辅单位</span>
-    <select name="aux_unit">
-      <option value="">无</option>
-      <option value="克">克</option>
-      <option value="个">个</option>
-      <option value="条">条</option>
-      <option value="袋">袋</option>
-      <option value="瓶">瓶</option>
-    </select>
-  </label>
-  <label>
-    <span>1 基础单位 = N 辅单位</span>
-    <input name="aux_rate" type="number" min="0" step="0.01" placeholder="0" />
-  </label>
-  <button type="submit">新增库存品</button>
-</form>
+</p>
 
 <h3>品项列表</h3>
 <table>

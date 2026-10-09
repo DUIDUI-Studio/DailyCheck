@@ -12,6 +12,7 @@ from flask import Blueprint, flash, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
+from . import canonical_pure as cp
 from ._helpers import now, parse_qty
 from .auth import audit
 
@@ -36,9 +37,9 @@ def adjustment_list():
 def adjustment_session():
     db = get_warehouse_db()
     items_data = db.execute(
-        """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock, c.name AS category_name
+        f"""SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
-           WHERE COALESCE(i.is_active, 1) = 1
+           WHERE {cp.store_selectable_clause('i')}
            ORDER BY c.name, i.name"""
     ).fetchall()
     return render_template("adjustment_session.html", items=items_data)

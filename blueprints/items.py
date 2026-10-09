@@ -1,14 +1,18 @@
-"""Items CRUD and inventory read view."""
-from __future__ import annotations
+"""Items CRUD and inventory read view.
 
-import sqlite3
+2026-10-10 收敛：门店 / 研发中心不再具备品项「创建权」与「跨仓发布权」。
+`warehouse.items` 主档的唯一创建入口是平台管理员的「品项主数据」
+(`/canonical/*`)；本蓝图只保留只读 + 单仓启停 + 安全库存重算等管理动作。
+"""
+from __future__ import annotations
 
 from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
 
-from ._helpers import gen_sku, now, parse_qty, warehouse_categories_in_clause
+from . import canonical_pure as cp
+from ._helpers import now, parse_qty, warehouse_categories_in_clause
 from .auth import audit
 
 bp = Blueprint("items", __name__)
@@ -42,111 +46,13 @@ def _require_storefront():
 def items_list():
     db = get_warehouse_db()
     if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        category_id = request.form.get("category_id", "").strip()
-        quantity = parse_qty(request.form.get("quantity", "0"))
-        # safety_stock 自 P0-12 起由系统计算（近 7 天消耗 × 系数），新建从 0 起。
-        safety_stock = 0.0
-        unit_cost = float(request.form.get("unit_cost", "0") or 0)
-        selling_price = float(request.form.get("selling_price", "0") or 0)
-        unit = request.form.get("unit", "件").strip() or "件"
-        aux_unit = request.form.get("aux_unit", "").strip() or None
-        aux_rate = parse_qty(request.form.get("aux_rate", "0"))
-
-        if aux_rate < 0:
-            flash("辅单位换算率不能为负数")
-            return redirect(url_for("items.items_list"))
-        if unit_cost < 0:
-            flash("进货单价不能为负数")
-            return redirect(url_for("items.items_list"))
-        if selling_price < 0:
-            flash("销售单价不能为负数")
-            return redirect(url_for("items.items_list"))
-        if not name or not category_id:
-            flash("名称、品类为必填")
-            return redirect(url_for("items.items_list"))
-
-        # ─────────────────────────────────────────────────────────────────
-        # Q1=deny 三出路拦截 (Spec §1.6.4) + US-2 强信号检测
-        # ─────────────────────────────────────────────────────────────────
-        from db import get_master_db
-        from blueprints import canonical_pure as cp
-
-        m = get_master_db()
-        # 拿到本仓品类的 canonical_code
-        cat_row = m.execute(
-            """SELECT cc.code FROM canonical_categories cc
-               JOIN warehouses w ON w.id IS NOT NULL
-               WHERE 1=0"""
-        ).fetchone()  # placeholder; we'll use a different approach below
-        # 直接读本仓 categories 的 canonical_code
-        cat_code_row = db.execute(
-            "SELECT canonical_code FROM categories WHERE id=?", (int(category_id),)
-        ).fetchone()
-        category_code = cat_code_row["canonical_code"] if cat_code_row else None
-
-        # US-2 强信号候选(T6 检测:按 name + unit 跨仓找相似)
-        similar = _us2_strong_signal_suggestions(m, name, unit)
-
-        # check_new_item_policy — canonical_id=None 表示新建
-        policy = cp.check_new_item_policy(
-            name=name, canonical_id=None,
-            category_code=category_code,
-            similar_canonicals=similar,
+        # 2026-10-10 收敛：品项创建权统一归「品项主数据」(/canonical/*)。
+        # 门店 / 研发中心 / 平台管理员在本页均不再新增品项；
+        # 旧书签与脚本一律引导到主数据页，不再走 Q1 三条出路的 session 流程。
+        flash(
+            "品项已在「品项主数据」统一维护：门店与研发中心不再自行新增。"
+            "如需新增品项，请联系平台管理员在主数据创建后扇出下发。"
         )
-        if not policy["allowed"]:
-            # 拒绝 + 给出三条出路(Spec §1.6.4)
-            flash(policy["reason"])
-            # 把候选存入 session,渲染选用页时使用
-            session_suggestions = [
-                {
-                    "canonical_id": s.get("canonical_id"),
-                    "name": s.get("name"),
-                    "score": s.get("score", 0),
-                }
-                for s in policy["suggestions"]
-            ]
-            from flask import session as _sess
-            _sess["pending_new_item"] = {
-                "name": name,
-                "category_id": int(category_id),
-                "unit": unit,
-                "quantity": quantity,
-                "safety_stock": safety_stock,
-                "unit_cost": unit_cost,
-                "selling_price": selling_price,
-                "aux_unit": aux_unit,
-                "aux_rate": aux_rate,
-                "category_code": category_code,
-                "suggestions": session_suggestions,
-                "next_action": policy["next_action"],
-                "reason": policy["reason"],
-            }
-            return redirect(url_for("items.new_item_redirect"))
-
-        is_store_exclusive = bool(policy["requires_store_exclusive"])
-        # gram_per_unit 同步：仅当 aux_unit=='克'
-        gram_per_unit = aux_rate if aux_unit == "克" else 0.0
-
-        try:
-            db.execute(
-                """INSERT INTO items
-                   (sku, name, category_id, quantity, safety_stock, unit_cost,
-                    selling_price, selling_price_updated_at,
-                    unit, gram_per_unit, aux_unit, aux_rate, updated_at,
-                    is_store_exclusive)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (gen_sku(), name, int(category_id), quantity, safety_stock,
-                 unit_cost, selling_price, now() if selling_price > 0 else None,
-                 unit, gram_per_unit, aux_unit, aux_rate, now(),
-                 1 if is_store_exclusive else 0),
-            )
-            new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            db.commit()
-            audit("items.create", "item", new_id, {"name": name})
-            flash("库存品创建成功" + (" (门店专属)" if is_store_exclusive else ""))
-        except sqlite3.IntegrityError:
-            flash("库存品创建失败，请重试")
         return redirect(url_for("items.items_list"))
 
     placeholders, params = warehouse_categories_in_clause()
@@ -154,10 +60,13 @@ def items_list():
         f"SELECT id, name, description FROM categories WHERE name IN ({placeholders}) ORDER BY name",
         params,
     ).fetchall()
+    # 2026-10-10：主数据「全公司停用」(canonical_status='disabled') 的门店行
+    # 从「品类与品项」列表隐藏（owner 拍板：列表直接隐藏）。
     rows = db.execute(
         f"""SELECT i.*, c.name AS category_name
             FROM items i JOIN categories c ON c.id = i.category_id
             WHERE c.name IN ({placeholders})
+              AND {cp.store_visible_clause('i')}
             ORDER BY i.id DESC""",
         params,
     ).fetchall()
@@ -402,6 +311,7 @@ def inventory_view():
                GROUP BY item_id
            ) c7 ON c7.item_id = i.id
            WHERE c.name IN ({placeholders})
+             AND {cp.store_visible_clause('i')}
              AND (? = '' OR i.name LIKE '%' || ? || '%' OR i.sku LIKE '%' || ? || '%')
              AND (? = '' OR c.name = ?)
            ORDER BY (i.quantity <= i.safety_stock) DESC, i.name""",
@@ -450,35 +360,15 @@ def items_publish_history(event_id: int | None = None):
     )
 
 
-def _us2_strong_signal_suggestions(master_conn, name: str, unit: str) -> list[dict]:
-    """US-2 强信号候选(Spec §3.1)。
-
-    返回与拟新建品项的 (name + unit) 相近的 canonical_items 列表,
-    按相似度降序,最多 5 条。
-    """
-    from blueprints import canonical_pure as cp
-
-    items = cp.list_canonical_items(master_conn, status="active", limit=500)
-    norm = cp.normalize_name(name)
-    out: list[dict] = []
-    for it in items:
-        if it["unit"] != unit:
-            continue
-        sim = cp.name_similarity(norm, cp.normalize_name(it["name"]))
-        if sim >= 0.5:
-            out.append({
-                "canonical_id": it["id"],
-                "name": it["name"],
-                "score": round(sim, 3),
-            })
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return out[:5]
-
-
 @bp.route("/items/new-item-redirect")
 @require_role("manager")
 def new_item_redirect():
-    """Q1=deny 拒绝后渲染三条出路页。"""
+    """【已停用，2026-10-10】Q1 三条出路页。
+
+    `/items` POST 已收敛为「只读提示 + 拒绝」，不再写入
+    session["pending_new_item"]，因此本页恒走「没有待处理的申请」分支。
+    保留路由仅为兼容旧书签 / 脚本（避免 404）。
+    """
     from flask import session
     pending = session.pop("pending_new_item", None)
     if not pending:

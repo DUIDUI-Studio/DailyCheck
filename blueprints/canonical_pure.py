@@ -225,6 +225,35 @@ ALLOWED_WHERE_COLUMNS: tuple[str, ...] = ("id", "sku", "canonical_id")
 
 
 # ─────────────────────────────────────────────────────────────────────
+#  门店侧可见性谓词（2026-10-10 · owner 拍板「全公司停用 → 门店列表直接隐藏」）
+# ─────────────────────────────────────────────────────────────────────
+# 主数据「全公司停用」(canonical_items.status='disabled') 经扇出落到门店行
+# items.canonical_status='disabled'。该类品项在门店侧：
+#   · 从列表隐藏（品类与品项 / 库存）
+#   · 从业务选择点排除（出库 / 入库 / 生产 / 盘点 / 调整）
+# 与 P0-10 单仓启停(items.is_active) 相互独立 —— 任一为停用即不可见 / 不可选。
+# ★ 未纳管行 canonical_status IS NULL → COALESCE 成 '' → 不等于 'disabled'
+#   → 保留可见（门店自建行不受影响）。
+# ★ 订货目录不在此列：store_ordering_pure.list_available_dc_items 已按
+#   canonical_items.status='active' 过滤，无需重复。
+CANONICAL_DISABLED: str = "disabled"
+
+
+def _not_disabled(alias: str = "i") -> str:
+    return f"COALESCE({alias}.canonical_status, '') <> '{CANONICAL_DISABLED}'"
+
+
+def store_visible_clause(alias: str = "i") -> str:
+    """门店列表可见性谓词：排除主数据已停用项（供 WHERE 拼接）。"""
+    return _not_disabled(alias)
+
+
+def store_selectable_clause(alias: str = "i") -> str:
+    """门店业务选择点谓词：本仓启用 且 未被主数据停用。"""
+    return f"COALESCE({alias}.is_active, 1) = 1 AND {_not_disabled(alias)}"
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  Domain exceptions (callers can import these to catch specific failures)
 # ─────────────────────────────────────────────────────────────────────
 
