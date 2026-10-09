@@ -377,66 +377,14 @@ def inventory_view():
 @bp.route("/items/publish", methods=["GET", "POST"])
 @require_platform_admin
 def items_publish():
-    """Per-storefront publish of selected items from current (rd) warehouse.
+    """【已下线，方案 P0-5】旧的 rd → 门店品项直发通道。
 
-    GET: show picker (all items in current warehouse + storefront checkbox list).
-    POST: do the publish via publish_items(), redirect to history.
+    2026-10-09 owner 拍板：品项下发统一走 canonical 扇出（/canonical/fanout），
+    本路由仅保留重定向，避免旧书签 / 脚本拿到 404。历史事件仍可在
+    /items/publish/history 查询（只读）。
     """
-    if request.method == "POST":
-        from contextlib import closing
-        from config import MASTER_DB
-        import sqlite3 as _sq
-        from blueprints.publish_recipe_pure import (
-            publish_items, list_item_publish_events,
-        )
-
-        item_ids = [int(x) for x in request.form.getlist("item_ids") if x]
-        target_codes = request.form.getlist("warehouse_codes")
-        default_action = request.form.get("default_action", "overwrite")
-        summary = request.form.get("summary", "").strip() or None
-
-        if not item_ids:
-            flash("请至少选择一个品项")
-            return redirect(url_for("items.items_publish"))
-        if not target_codes:
-            flash("请至少选择一个目标门店")
-            return redirect(url_for("items.items_publish"))
-
-        try:
-            wh_db = get_warehouse_db()
-        except RuntimeError:
-            flash("请先选择一个仓库")
-            return redirect(url_for("auth.warehouse_picker"))
-        with closing(_sq.connect(MASTER_DB)) as master_conn:
-            master_conn.execute("PRAGMA foreign_keys = ON")
-            wh_code = g.warehouse["code"] if g.get("warehouse") else "rd_001"
-            result = publish_items(
-                master_conn, wh_db, wh_code, item_ids, target_codes,
-                user_id=g.user["id"] if g.user else None,
-                summary=summary, default_action=default_action,
-            )
-            master_conn.commit()
-        audit(
-            "items.publish", "items_publish", result["event_id"],
-            {"item_count": result["item_count"],
-             "warehouses": target_codes,
-             "status": result["status"]},
-        )
-        flash(f"批量同步完成：{result['status']}，共 {result['item_count']} 个品项")
-        return redirect(url_for("items.items_publish_history",
-                                event_id=result["event_id"]))
-
-    # GET: show picker.
-    db = get_warehouse_db()
-    items = db.execute(
-        "SELECT id, sku, name, unit, gram_per_unit, unit_cost, selling_price "
-        "FROM items ORDER BY name"
-    ).fetchall()
-    return render_template(
-        "items_publish.html",
-        items=items,
-        available_warehouses=_list_storefront_warehouses(),
-    )
+    flash("品项下发已统一到「品项主数据 → 扇出」，请在新页面选择主数据项下发")
+    return redirect(url_for("canonical.canonical_fanout"))
 
 
 @bp.route("/items/publish/history", methods=["GET"])
@@ -460,23 +408,6 @@ def items_publish_history(event_id: int | None = None):
         detail=detail,
         event_id=event_id,
     )
-
-
-def _list_storefront_warehouses():
-    """All storefront warehouses (excludes rd_*) — for publish UI picker.
-
-    Mirrors recipe_cost._list_storefront_warehouses; could be DRY'd later.
-    """
-    from contextlib import closing
-    from config import MASTER_DB
-    import sqlite3 as _sq
-    with closing(_sq.connect(MASTER_DB)) as master_conn:
-        master_conn.row_factory = _sq.Row
-        rows = master_conn.execute(
-            "SELECT code, name FROM warehouses "
-            "WHERE warehouse_type = 'storefront' ORDER BY code"
-        ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def _us2_strong_signal_suggestions(master_conn, name: str, unit: str) -> list[dict]:

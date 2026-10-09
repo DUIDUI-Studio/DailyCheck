@@ -1,4 +1,11 @@
-"""Tests for the cross-warehouse item publish web routes."""
+"""Tests for the cross-warehouse item publish web routes.
+
+2026-10-09（方案 P0-5）：rd → 门店 的 `/items/publish` 直发通道已下线，
+品项下发统一走 canonical 扇出（/canonical/fanout）。本文件覆盖：
+  - 旧路由（GET/POST）重定向到 /canonical/fanout，且不再写任何数据
+  - 历史页 /items/publish/history 仍可查询（只读）
+事件数据用 pure `publish_items()` 直接构造（route 已不可用）。
+"""
 from datetime import datetime
 
 
@@ -63,138 +70,68 @@ def _setup_rd_with_two_storefronts(tmp_path, monkeypatch):
     return client, master, rd, wh1, wh2, x, y
 
 
-def test_items_publish_get_renders_picker(tmp_path, monkeypatch):
-    client, *_ = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
-    r = client.get("/items/publish")
-    assert r.status_code == 200
-    body = r.data.decode("utf-8")
-    assert "批量同步品项" in body
-    assert "SKU-X" in body
-    assert "wh_001" in body
-
-
-def test_items_publish_post_inserts_items_into_target_storefronts(tmp_path, monkeypatch):
-    """POST publishes items to selected warehouses."""
+def _publish_via_pure(master_path, rd_path, item_ids, target_codes,
+                      action="overwrite", summary=None):
+    """直接调用 pure publish_items 造发布事件（route 已下线后仍需要事件数据）。"""
     import sqlite3
-    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
+    from contextlib import closing
+
+    from blueprints.publish_recipe_pure import publish_items
+
+    with closing(sqlite3.connect(master_path)) as m:
+        m.row_factory = sqlite3.Row
+        m.execute("PRAGMA foreign_keys = ON")
+        with closing(sqlite3.connect(rd_path)) as rd:
+            rd.row_factory = sqlite3.Row
+            result = publish_items(
+                m, rd, "rd_001", item_ids, target_codes,
+                user_id=1, summary=summary, default_action=action,
+            )
+        m.commit()
+    return result
+
+
+def test_items_publish_route_redirects_to_canonical_fanout(tmp_path, monkeypatch):
+    """旧通道已下线：GET/POST 都 302 到 /canonical/fanout，且不写任何数据。"""
+    import sqlite3
+    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(
+        tmp_path, monkeypatch)
+
+    r = client.get("/items/publish", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/canonical/fanout" in r.headers["Location"]
 
     r = client.post("/items/publish", data={
         "item_ids": [str(x), str(y)],
         "warehouse_codes": ["wh_001", "wh_002"],
         "default_action": "overwrite",
-        "summary": "e2e test publish",
     }, follow_redirects=False)
     assert r.status_code == 302
+    assert "/canonical/fanout" in r.headers["Location"]
 
     for wh_path in (wh1, wh2):
         w = sqlite3.connect(wh_path)
-        w.row_factory = sqlite3.Row
-        rows = w.execute("SELECT sku, name, unit_cost, selling_price FROM items").fetchall()
-        skus = sorted(r["sku"] for r in rows)
-        assert skus == ["SKU-X", "SKU-Y"], f"{wh_path} missing items"
-        for r in rows:
-            if r["sku"] == "SKU-X":
-                assert float(r["unit_cost"]) == 1.0
-            else:
-                assert float(r["unit_cost"]) == 3.0
+        count = w.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         w.close()
-
-    # master.db has the publish event.
-    m = sqlite3.connect(master)
-    m.row_factory = sqlite3.Row
-    ev = m.execute(
-        "SELECT status, item_count FROM item_publish_events ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    assert ev["status"] == "complete"
-    assert ev["item_count"] == 2
-    wh_rows = m.execute(
-        "SELECT warehouse_code, status FROM item_publish_event_warehouses"
-    ).fetchall()
-    statuses = {r["warehouse_code"]: r["status"] for r in wh_rows}
-    assert statuses == {"wh_001": "success", "wh_002": "success"}
-    m.close()
-
-
-def test_items_publish_partial_when_invalid_warehouse(tmp_path, monkeypatch):
-    """Invalid warehouse → partial + valid ones still get the items."""
-    import sqlite3
-    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
-
-    r = client.post("/items/publish", data={
-        "item_ids": [str(x)],
-        "warehouse_codes": ["wh_001", "nonexistent"],
-        "default_action": "overwrite",
-        "summary": None,
-    }, follow_redirects=False)
-    assert r.status_code == 302
+        assert count == 0, f"{wh_path} 不应被旧通道写入"
 
     m = sqlite3.connect(master)
-    m.row_factory = sqlite3.Row
-    ev = m.execute(
-        "SELECT status FROM item_publish_events ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    assert ev["status"] == "partial"
-    wh_status = m.execute(
-        "SELECT warehouse_code, status FROM item_publish_event_warehouses"
-    ).fetchall()
-    statuses = {r["warehouse_code"]: r["status"] for r in wh_status}
-    assert statuses["wh_001"] == "success"
-    assert statuses["nonexistent"] == "failed"
-
-    # wh_001 got the item.
-    w = sqlite3.connect(wh1)
-    w.row_factory = sqlite3.Row
-    row = w.execute("SELECT sku FROM items WHERE sku='SKU-X'").fetchone()
-    assert row is not None
-    w.close()
+    count = m.execute("SELECT COUNT(*) FROM item_publish_events").fetchone()[0]
     m.close()
-
-
-def test_items_publish_keep_doesnt_touch_existing(tmp_path, monkeypatch):
-    """default_action=keep → existing storefront item is unchanged."""
-    import sqlite3
-    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
-
-    # Pre-populate wh_001 with SKU-X at different price.
-    w = sqlite3.connect(wh1)
-    cat = w.execute("SELECT id FROM categories WHERE name='乳制品'").fetchone()[0]
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    w.execute("INSERT INTO items (sku, name, category_id, unit, gram_per_unit, "
-               "unit_cost, selling_price, updated_at) "
-               "VALUES ('SKU-X', 'X-existing', ?, '件', 1000, 99.0, 199.0, ?)",
-               (cat, ts))
-    w.commit()
-    w.close()
-
-    r = client.post("/items/publish", data={
-        "item_ids": [str(x)],
-        "warehouse_codes": ["wh_001"],
-        "default_action": "keep",
-    }, follow_redirects=False)
-    assert r.status_code == 302
-
-    # wh_001 still has the original X at cost=99.
-    w = sqlite3.connect(wh1)
-    w.row_factory = sqlite3.Row
-    row = w.execute("SELECT sku, unit_cost FROM items WHERE sku='SKU-X'").fetchone()
-    assert float(row["unit_cost"]) == 99.0  # unchanged
-    w.close()
+    assert count == 0, "旧通道不应再产生发布事件"
 
 
 def test_items_publish_history_page_lists_events(tmp_path, monkeypatch):
-    """GET history page returns 200 + shows event rows after a publish."""
-    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
-    # First, do a publish so there's an event.
-    client.post("/items/publish", data={
-        "item_ids": [str(x)],
-        "warehouse_codes": ["wh_001"],
-        "default_action": "overwrite",
-    }, follow_redirects=False)
+    """GET history page returns 200 + shows event rows."""
+    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(
+        tmp_path, monkeypatch)
+    _publish_via_pure(master, rd, [x], ["wh_001"],
+                      summary="history page test")
+
     r = client.get("/items/publish/history")
     assert r.status_code == 200
     body = r.data.decode("utf-8")
     assert "品项同步历史" in body
-    assert "SKU-X" in body or "1" in body  # event count
 
 
 def test_history_detail_renders_event_items(tmp_path, monkeypatch):
@@ -205,24 +142,11 @@ def test_history_detail_renders_event_items(tmp_path, monkeypatch):
     builtin method) → TypeError → HTTP 500. Renamed the key to
     'event_items' in the pure helper; template uses detail.event_items.
     """
-    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
-
-    r = client.post("/items/publish", data={
-        "item_ids": [str(x)],
-        "warehouse_codes": ["wh_001"],
-        "default_action": "overwrite",
-        "summary": "history detail test",
-    }, follow_redirects=False)
-    assert r.status_code == 302
-
-    # Look up the new event_id from the master.
-    import sqlite3
-    m = sqlite3.connect(master)
-    m.row_factory = sqlite3.Row
-    event_id = m.execute(
-        "SELECT id FROM item_publish_events ORDER BY id DESC LIMIT 1"
-    ).fetchone()["id"]
-    m.close()
+    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(
+        tmp_path, monkeypatch)
+    result = _publish_via_pure(master, rd, [x], ["wh_001"],
+                               summary="history detail test")
+    event_id = result["event_id"]
 
     r = client.get(f"/items/publish/history/{event_id}")
     assert r.status_code == 200, "history detail must not 500"
@@ -234,34 +158,14 @@ def test_history_detail_renders_event_items(tmp_path, monkeypatch):
 
 
 def test_history_detail_shows_item_name(tmp_path, monkeypatch):
-    """Detail table must show item name + sku, not just the integer id.
+    """Detail table must show item name + sku, not just the integer id."""
+    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(
+        tmp_path, monkeypatch)
+    result = _publish_via_pure(master, rd, [x, y], ["wh_001"],
+                               summary="names test")
 
-    Regression: item_publish_event_items only stores item_id (master.db has
-    no item name) so the template showed the raw integer. Now the helper
-    looks up `(source_warehouse_code, item_id)` against the source
-    warehouse's items table and enriches each row with name + sku.
-    """
-    client, master, rd, wh1, wh2, x, y = _setup_rd_with_two_storefronts(tmp_path, monkeypatch)
-
-    r = client.post("/items/publish", data={
-        "item_ids": [str(x), str(y)],  # both items
-        "warehouse_codes": ["wh_001"],
-        "default_action": "overwrite",
-        "summary": "names test",
-    }, follow_redirects=False)
-    assert r.status_code == 302
-
-    import sqlite3
-    m = sqlite3.connect(master)
-    m.row_factory = sqlite3.Row
-    event_id = m.execute(
-        "SELECT id FROM item_publish_events ORDER BY id DESC LIMIT 1"
-    ).fetchone()["id"]
-    m.close()
-
-    r = client.get(f"/items/publish/history/{event_id}")
+    r = client.get(f"/items/publish/history/{result['event_id']}")
     assert r.status_code == 200
     body = r.data.decode("utf-8")
-    # SKU prefix 'SKU-X' + 'SKU-Y' comes from the fixture (see _setup).
     assert "SKU-X" in body, "item name 'SKU-X' should appear in detail table"
     assert "SKU-Y" in body, "item name 'SKU-Y' should appear in detail table"

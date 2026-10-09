@@ -1683,7 +1683,7 @@ def receive_order_item(
     store_code = order["store_warehouse_code"]
     canonical_id = int(target_item["canonical_id"])
     canon = master_conn.execute(
-        "SELECT name, category_code FROM canonical_items WHERE id=?",
+        "SELECT name, category_code, unit FROM canonical_items WHERE id=?",
         (canonical_id,),
     ).fetchone()
     if canon is None:
@@ -1733,13 +1733,15 @@ def receive_order_item(
                     )
                 cat_id = int(row["id"])
             sku = f"AUTO-RECEIVE-{canonical_id}"
+            # P0-8：单位取主数据值（此前硬编码 '件'，与主数据不一致）
+            recv_unit = str(canon["unit"] or "件")
             cur = store_conn.execute(
                 """INSERT INTO items
                    (sku, name, category_id, quantity, safety_stock,
                     unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
                     canonical_id, updated_at)
                    VALUES (?, ?, ?, 0, 0, ?, 0, 0, NULL, 0, ?, ?)""",
-                (sku, str(canon["name"]), cat_id, "件", canonical_id, ts),
+                (sku, str(canon["name"]), cat_id, recv_unit, canonical_id, ts),
             )
             new_id = int(cur.lastrowid)
             store_conn.commit()

@@ -12,8 +12,8 @@
       📥 批量导入
     </a>
     {% if is_rd %}
-    <a href="{{ url_for('items.items_publish') }}" class="btn-sm">
-      📤 同步到门店
+    <a href="{{ url_for('canonical.canonical_fanout') }}" class="btn-sm">
+      📤 主数据扇出
     </a>
     <a href="{{ url_for('items.items_publish_history') }}" class="btn-sm">
       🕘 同步历史

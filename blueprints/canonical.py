@@ -479,7 +479,7 @@ def canonical_fanout(canonical_id: int | None = None):
         selected = cp.get_canonical_item_detail(m, canonical_id)
     wh_rows = m.execute(
         "SELECT code, name FROM warehouses "
-        "WHERE warehouse_type='storefront' ORDER BY code"
+        "WHERE warehouse_type IN ('storefront', 'rd') ORDER BY code"
     ).fetchall()
     return render_template(
         "canonical/fanout.html",
