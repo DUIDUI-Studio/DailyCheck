@@ -133,17 +133,15 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from config import FIXED_CATEGORIES  # noqa: F401  (re-exported below)
-
 # Import policy switches and paths from config so a single file controls
 # everything (no other file owns its own whitelist — see module docstring).
 from config import (
-    BASE_DIR,
     BACKUP_WAREHOUSE_DIR,
+    BASE_DIR,
     CANONICAL_POLICY,
     DRYRUN_COPY_DIR,
+    FIXED_CATEGORIES,  # noqa: F401  (re-exported below)
 )
-
 
 # ─────────────────────────────────────────────────────────────────────
 #  Field permission matrix (Spec §2.4)
@@ -727,7 +725,6 @@ def guard_real_db(path: str | Path) -> None:
 #  Stored in config (single source of truth, Spec §6.1).
 # ─────────────────────────────────────────────────────────────────────
 from config import CATEGORY_CODE_MAP  # noqa: E402,F401  (deliberate re-export)
-
 
 # ─────────────────────────────────────────────────────────────────────
 #  T4 — Canonical items CRUD + next_canonical_sku (Spec §6.1.1 two-phase)
@@ -2454,6 +2451,155 @@ def _infer_category_code(name: str) -> str | None:
 ALIGN_SCOPE_WAREHOUSES: tuple[str, ...] = (
     "wh_000", "wh_002", "wh_003", "wh_004", "wh_006",
 )
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  T26 — bulk-publish-canonical (issue #14, 2026-10-09)
+#
+#  ops 救场工具：DC 仓已有真实 inventory 但全部 canonical_id IS NULL，
+#  storefront catalog 因此被 WHERE canonical_id IS NOT NULL 过滤掉。
+#  本函数一次扫整个 wh_XXX.items，按 (name, unit) 复用 master.canonical_items
+#  已有行 / 推 category_code + 两阶段创，回写 items.canonical_id 绑定。
+#  替代 ops 写 ad-hoc /tmp/publish_wh000_to_canonical.py 救场。
+# ─────────────────────────────────────────────────────────────────────
+
+
+def bulk_publish_canonical_items(
+    master_conn: sqlite3.Connection,
+    wh_conn: sqlite3.Connection,
+    *,
+    dc_warehouse_code: str,
+    include_bound: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    """T26 —— 把 wh_XXX.items 批量 publish 到 master.canonical_items（issue #14）。
+
+    默认行为：只处理 ``canonical_id IS NULL`` 的行（--only-no-canonical）。
+    ``include_bound=True`` 时扫全部行，但已绑的行会被 WHERE 子句过滤掉
+    （保持幂等：不会重复创建 canonical_items）。
+
+    分类映射策略（按 issue #14 期望）：
+      - 拿 items.category_id → wh.categories.name
+      - 按 name 查 master.canonical_categories.name → 拿 code
+      - 拿不到（罕见，name 漂移）→ 用 _infer_category_code(name) 兜底
+      - 兜底还拿不到 → category_code=None（canonical_items 允许 NULL）
+
+    重复判定：(name, unit) 命中 master.canonical_items 现有行 → 复用；
+    未命中 → create_canonical_item()（两阶段 SKU 写入）。
+
+    事务：调用方负责持 master_conn + wh_conn 的事务；失败时调用方
+    ROLLBACK 两个连接。本函数只 INSERT/UPDATE 不 COMMIT。
+
+    Returns:
+        {
+          "scanned":  int,    # 扫到 wh.items 行数
+          "created":  int,    # 新建 canonical_items 行数
+          "reused":   int,    # 复用现有 canonical_items 行数
+          "linked":   int,    # 回写 items.canonical_id 的行数
+          "skipped":  int,    # 因已绑/异常跳过的行数
+          "dry_run":  bool,
+          "no_category_code": int,  # 拿不到 category_code 的行数(供审查)
+        }
+    """
+    master_conn.row_factory = sqlite3.Row
+    wh_conn.row_factory = sqlite3.Row
+
+    # 1) 扫目标 wh 仓 items
+    where_clause = "" if include_bound else "WHERE canonical_id IS NULL"
+    rows = wh_conn.execute(
+        f"""SELECT id, sku, name, unit, category_id, canonical_id
+            FROM items
+            {where_clause}
+            ORDER BY id""",
+    ).fetchall()
+
+    # 2) 拿 wh 本地 category_id → name 映射(单次查询)
+    cat_rows = wh_conn.execute("SELECT id, name FROM categories").fetchall()
+    wh_cat_name_by_id = {int(r["id"]): str(r["name"]) for r in cat_rows}
+
+    # 3) 拿 master canonical_categories (name → code)
+    master_cats = master_conn.execute(
+        "SELECT code, name FROM canonical_categories"
+    ).fetchall()
+    cat_code_by_name = {str(r["name"]): str(r["code"]) for r in master_cats}
+
+    scanned = len(rows)
+    created = 0
+    reused = 0
+    linked = 0
+    skipped = 0
+    no_category_code = 0
+
+    for r in rows:
+        item_id = int(r["id"])
+        if r["canonical_id"] is not None and not include_bound:
+            # 已被绑定的行(理论不会进 WHERE canonical_id IS NULL,但 include_bound=False 防御一下)
+            skipped += 1
+            continue
+        name = str(r["name"])
+        unit = str(r["unit"]) if r["unit"] else "件"
+        if not name.strip():
+            skipped += 1
+            continue
+
+        # category_code 推算
+        wh_cat_name = wh_cat_name_by_id.get(int(r["category_id"]) if r["category_id"] is not None else 0)
+        cat_code: str | None = None
+        if wh_cat_name and wh_cat_name in cat_code_by_name:
+            cat_code = cat_code_by_name[wh_cat_name]
+        else:
+            cat_code = _infer_category_code(name)
+        if cat_code is None:
+            no_category_code += 1
+
+        # 查 (name, unit) 复用
+        existing = master_conn.execute(
+            "SELECT id FROM canonical_items WHERE name=? AND unit=?",
+            (name, unit),
+        ).fetchone()
+        if existing is not None:
+            canonical_id = int(existing["id"])
+            reused += 1
+        else:
+            if dry_run:
+                # dry-run 不创
+                created += 1
+                continue
+            new_row = create_canonical_item(
+                master_conn,
+                name=name,
+                unit=unit,
+                category_code=cat_code,
+                created_from="rd_publish",  # 标记为 publish 路径产物
+            )
+            canonical_id = int(new_row["id"])
+            created += 1
+
+        if dry_run:
+            linked += 1
+            continue
+
+        # 回写 wh.items.canonical_id
+        cur = wh_conn.execute(
+            "UPDATE items SET canonical_id=? WHERE id=? AND canonical_id IS NULL",
+            (canonical_id, item_id),
+        )
+        if cur.rowcount > 0:
+            linked += 1
+        else:
+            # 已被并发绑定 → 算 reuse
+            skipped += 1
+
+    return {
+        "scanned": scanned,
+        "created": created,
+        "reused": reused,
+        "linked": linked,
+        "skipped": skipped,
+        "dry_run": dry_run,
+        "no_category_code": no_category_code,
+        "dc_warehouse_code": dc_warehouse_code,
+    }
 
 
 def dry_run_report(
