@@ -45,3 +45,7 @@ issue-reports/
 
 # Frontend toolchain deps (not part of source — install per-machine)
 node_modules/
+
+# Forecast scheduler debug output (run-time counter of fcntl lock failures,
+# regenerated on every forecast tick — never source).
+forecast_lock_failures.txt
