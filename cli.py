@@ -28,7 +28,13 @@ import click
 from flask import Flask
 from werkzeug.security import generate_password_hash
 
-from config import AGENT_TOKEN_PREFIX_LEN, BASE_DIR, MASTER_DB
+from config import (
+    AGENT_TOKEN_PREFIX_LEN,
+    BASE_DIR,
+    MASTER_DB,
+    SAFETY_STOCK_FACTOR,
+    SAFETY_STOCK_WINDOW_DAYS,
+)
 from db import init_master_db, migrate_warehouse_db_columns
 from db.migrate import migrate_legacy_inventory
 
@@ -50,6 +56,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(align_detect_cmd)
     app.cli.add_command(align_apply_cmd)
     app.cli.add_command(bulk_publish_canonical_cmd)
+    app.cli.add_command(recompute_safety_stock_cmd)
 
 
 @click.command("init-master")
@@ -733,3 +740,80 @@ def bulk_publish_canonical_cmd(
             )
         if backup_paths:
             click.echo(f"  pre-flight backups: {backup_paths[0]}")
+
+
+@click.command("recompute-safety-stock")
+@click.option(
+    "--warehouse", "warehouse_codes", multiple=True,
+    help="目标仓 code（可重复，如 --warehouse wh_002 --warehouse wh_003）。"
+         "不传 = 全部 storefront / distribution_center 仓。",
+)
+@click.option(
+    "--window-days", default=SAFETY_STOCK_WINDOW_DAYS, show_default=True,
+    help="消耗统计窗口天数。",
+)
+@click.option(
+    "--factor", default=SAFETY_STOCK_FACTOR, show_default=True,
+    help="安全库存系数。",
+)
+@click.option("--dry-run", is_flag=True, help="只计算不写库（结果照常输出）。")
+def recompute_safety_stock_cmd(
+    warehouse_codes: tuple[str, ...],
+    window_days: int,
+    factor: float,
+    dry_run: bool,
+) -> None:
+    """P0-12 安全库存自动计算：safety_stock = Σ近 N 天消耗量 × 系数。
+
+    消耗口径与 /inventory 页一致（出库排除生产领料镜像 + 生产消耗），
+    品项消耗历史覆盖不满窗口时写 0。实现见 blueprints/items_pure.py。
+    """
+    from blueprints.items_pure import recompute_warehouse_safety_stocks
+
+    with closing(sqlite3.connect(MASTER_DB)) as m:
+        m.row_factory = sqlite3.Row
+        if warehouse_codes:
+            qmarks = ",".join("?" * len(warehouse_codes))
+            rows = m.execute(
+                f"SELECT code, name, db_path FROM warehouses "
+                f"WHERE code IN ({qmarks}) ORDER BY code",
+                list(warehouse_codes),
+            ).fetchall()
+            found = {row["code"] for row in rows}
+            missing = sorted(set(warehouse_codes) - found)
+            if missing:
+                click.echo(f"未知仓库: {', '.join(missing)}", err=True)
+                raise click.exceptions.Exit(1)
+        else:
+            rows = m.execute(
+                "SELECT code, name, db_path FROM warehouses "
+                "WHERE warehouse_type IN ('storefront', 'distribution_center') "
+                "ORDER BY code"
+            ).fetchall()
+
+    if not rows:
+        click.echo("没有匹配的仓库", err=True)
+        raise click.exceptions.Exit(1)
+
+    for row in rows:
+        wh_path = Path(row["db_path"])
+        if not wh_path.is_absolute():
+            wh_path = BASE_DIR / wh_path
+        if not wh_path.exists():
+            click.echo(f"[{row['code']}] db 不存在: {wh_path}", err=True)
+            continue
+        migrate_warehouse_db_columns(wh_path)
+        with closing(sqlite3.connect(wh_path)) as conn:
+            result = recompute_warehouse_safety_stocks(
+                conn, window_days=window_days, factor=factor,
+            )
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        tag = " [dry-run]" if dry_run else ""
+        click.echo(
+            f"[{row['code']}] {row['name']}: {result['updated']} 个品项已重算，"
+            f"{result['zeroed']} 个消耗历史不足 {result['window_days']} 天写 0"
+            f"（系数 {result['factor']}）{tag}"
+        )

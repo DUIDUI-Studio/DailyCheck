@@ -35,7 +35,7 @@ from flask import (
 )
 from werkzeug.exceptions import BadRequest
 
-from permissions import require_role, require_login
+from permissions import require_login, require_platform_admin, require_role
 from db import get_master_db
 from config import BASE_DIR
 
@@ -112,6 +112,7 @@ def canonical_detail(canonical_id: int):
 
 @bp.route("/edit", methods=["GET", "POST"])
 @bp.route("/edit/<int:canonical_id>", methods=["GET", "POST"])
+@require_platform_admin
 @require_role("manager")
 def canonical_edit(canonical_id: int | None = None):
     m = get_master_db()

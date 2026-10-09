@@ -1,6 +1,51 @@
 {% extends 'base.html' %}
 {% block content %}
 <h2>编辑库存品</h2>
+{% if bound %}
+<p class="hint">
+  该品项已纳入主数据：名称 / 品类 / 单位 / 辅单位 / 成本 / 售价 / 安全库存由「品项主数据」统一维护，本页仅供查看。
+  <a href="{{ url_for('canonical.canonical_detail', canonical_id=item.canonical_id) }}" class="btn-sm">去主数据查看</a>
+</p>
+<div class="grid cols-3">
+  <label>
+    <span>品项名称</span>
+    <input value="{{ item.name }}" disabled />
+  </label>
+  <label>
+    <span>品类</span>
+    <input value="{% for c in categories %}{% if c.id == item.category_id %}{{ c.name }}{% endif %}{% endfor %}" disabled />
+  </label>
+  <label>
+    <span>库存数量</span>
+    <input value="{{ item.quantity }}" disabled />
+  </label>
+  <label>
+    <span>安全库存（系统计算）</span>
+    <input value="{{ item.safety_stock }}" disabled />
+  </label>
+  <label>
+    <span>进货单价（¥）</span>
+    <input value="{{ item.unit_cost or 0 }}" disabled />
+  </label>
+  <label>
+    <span>销售单价（¥）</span>
+    <input value="{{ item.selling_price or 0 }}" disabled />
+  </label>
+  <label>
+    <span>单位</span>
+    <input value="{{ item.unit }}" disabled />
+  </label>
+  <label>
+    <span>辅单位</span>
+    <input value="{{ item.aux_unit or '无' }}" disabled />
+  </label>
+  <label>
+    <span>1 基础单位 = N 辅单位</span>
+    <input value="{{ item.aux_rate or 0 }}" disabled />
+  </label>
+</div>
+<a href="{{ url_for('items.items_list') }}" class="btn-cancel">返回</a>
+{% else %}
 <form method="post" class="grid cols-3">
   <label>
     <span>品项名称</span>
@@ -20,8 +65,8 @@
     <input name="quantity" type="number" min="0" step="0.01" value="{{ item.quantity }}" />
   </label>
   <label>
-    <span>安全库存</span>
-    <input name="safety_stock" type="number" min="0" step="0.01" value="{{ item.safety_stock }}" />
+    <span>安全库存（系统计算，不可手改）</span>
+    <input name="safety_stock" type="number" min="0" step="0.01" value="{{ item.safety_stock }}" disabled />
   </label>
   {% if is_rd %}
   <label>
@@ -57,4 +102,5 @@
   <a href="{{ url_for('items.items_list') }}" class="btn-cancel">取消</a>
   <button type="submit">保存修改</button>
 </form>
+{% endif %}
 {% endblock %}

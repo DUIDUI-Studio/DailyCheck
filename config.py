@@ -114,3 +114,18 @@ CANONICAL_POLICY = {
 BACKUP_WAREHOUSE_DIR = BASE_DIR / "backups" / "warehouses"
 # Where Q7 措施⑦ routes dry-run copies so they never reach db/warehouses/.
 DRYRUN_COPY_DIR = Path("/tmp/dc_dryrun")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 安全库存自动计算（2026-10-09 Eric 拍板，方案 P0-12）
+#
+#   safety_stock = Σ 近 WINDOW_DAYS 天消耗量 × FACTOR
+#
+# 消耗口径与 /inventory 页一致（outbound_requests 排除生产领料行 +
+# production_run_items），详见 blueprints/items_pure.py。
+# 品项的消耗历史覆盖不满 WINDOW_DAYS 窗口时写 0（数据不足以代表一周）。
+# 该字段对全角色只读，扇出（canonical fanout）永不覆盖。
+# ─────────────────────────────────────────────────────────────────────
+SAFETY_STOCK_WINDOW_DAYS = 7
+SAFETY_STOCK_FACTOR = 1.2
+SAFETY_STOCK_ROUND_DIGITS = 2

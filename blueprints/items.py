@@ -45,7 +45,8 @@ def items_list():
         name = request.form.get("name", "").strip()
         category_id = request.form.get("category_id", "").strip()
         quantity = parse_qty(request.form.get("quantity", "0"))
-        safety_stock = parse_qty(request.form.get("safety_stock", "0"))
+        # safety_stock 自 P0-12 起由系统计算（近 7 天消耗 × 系数），新建从 0 起。
+        safety_stock = 0.0
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         selling_price = float(request.form.get("selling_price", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
@@ -160,10 +161,14 @@ def items_list():
             ORDER BY i.id DESC""",
         params,
     ).fetchall()
+    from config import SAFETY_STOCK_FACTOR, SAFETY_STOCK_WINDOW_DAYS
+
     return render_template(
         "items.html",
         items=rows,
         categories=categories_data,
+        safety_stock_window=SAFETY_STOCK_WINDOW_DAYS,
+        safety_stock_factor=SAFETY_STOCK_FACTOR,
     )
 
 
@@ -172,10 +177,24 @@ def items_list():
 @require_role("manager")
 def edit_item(item_id: int):
     db = get_warehouse_db()
+    old = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if old is None:
+        from flask import abort
+        abort(404)
+    # P0-1 主数据收口：已绑定 canonical 的行，名称/品类/单位/辅单位/成本/
+    # 售价/安全库存统一由「品项主数据」或系统维护，本页只读。
+    bound = old["canonical_id"] is not None
+
     if request.method == "POST":
+        if bound:
+            flash("该品项已纳入主数据，字段与价格请在「品项主数据」中修改；本页仅供查看")
+            return redirect(url_for("items.edit_item", item_id=item_id))
+
         name = request.form.get("name", "").strip()
         category_id = request.form.get("category_id", "").strip()
-        safety_stock = parse_qty(request.form.get("safety_stock", "0"))
+        # safety_stock 自 P0-12 起由系统计算（近 7 天消耗 × 系数），全角色只读，
+        # 编辑时一律沿用库中现值，不采信表单。
+        safety_stock = float(old["safety_stock"] or 0)
         unit_cost = float(request.form.get("unit_cost", "0") or 0)
         selling_price = float(request.form.get("selling_price", "0") or 0)
         unit = request.form.get("unit", "件").strip() or "件"
@@ -195,9 +214,6 @@ def edit_item(item_id: int):
             return redirect(url_for("items.edit_item", item_id=item_id))
 
         # 生产配方锁：被 product_bom 引用且原启用克禁止切走克
-        old = db.execute(
-            "SELECT aux_unit, aux_rate, gram_per_unit, selling_price FROM items WHERE id=?", (item_id,)
-        ).fetchone()
         if (old["aux_unit"] == "克" and old["gram_per_unit"] > 0
                 and aux_unit != "克"):
             bom_ref = db.execute(
@@ -229,16 +245,25 @@ def edit_item(item_id: int):
         f"SELECT id, name FROM categories WHERE name IN ({placeholders}) ORDER BY name",
         params,
     ).fetchall()
-    item = db.execute(
-        "SELECT * FROM items WHERE id=?", (item_id,)
-    ).fetchone()
-    return render_template("edit_item.html", item=item, categories=categories_data)
+    return render_template(
+        "edit_item.html", item=old, categories=categories_data, bound=bound,
+    )
 
 
 @bp.route("/items/<int:item_id>/delete", methods=["POST"])
 @require_platform_admin
 def delete_item(item_id: int):
     db = get_warehouse_db()
+    row = db.execute(
+        "SELECT canonical_id FROM items WHERE id=?", (item_id,)
+    ).fetchone()
+    if row is None:
+        from flask import abort
+        abort(404)
+    # P0-2：已纳管主数据的行禁止物理删除（Q3 deactivate_only 的仓内侧）。
+    if row["canonical_id"] is not None:
+        flash("该品项已纳入主数据，不能删除；如需在本仓停用，请在「品项主数据」详情页操作")
+        return redirect(url_for("items.items_list"))
     usage = db.execute(
         """SELECT
               (SELECT COUNT(*) FROM stock_movements WHERE item_id=?) +
@@ -256,6 +281,35 @@ def delete_item(item_id: int):
     db.commit()
     audit("items.delete", "item", item_id)
     flash("已删除")
+    return redirect(url_for("items.items_list"))
+
+
+@bp.route("/items/recompute-safety-stock", methods=["POST"])
+@require_platform_admin
+def recompute_safety_stock():
+    """P0-12 安全库存自动计算：safety_stock = Σ近 N 天消耗量 × 系数。
+
+    消耗口径与 /inventory 页一致；品项消耗历史覆盖不满 N 天窗口则写 0。
+    系数与窗口天数见 config.SAFETY_STOCK_*。
+    """
+    from blueprints.items_pure import recompute_warehouse_safety_stocks
+    from config import SAFETY_STOCK_FACTOR, SAFETY_STOCK_WINDOW_DAYS
+
+    db = get_warehouse_db()
+    result = recompute_warehouse_safety_stocks(
+        db, window_days=SAFETY_STOCK_WINDOW_DAYS, factor=SAFETY_STOCK_FACTOR
+    )
+    db.commit()
+    audit(
+        "items.recompute_safety_stock",
+        "warehouse",
+        g.warehouse["id"] if g.get("warehouse") else None,
+        result,
+    )
+    flash(
+        f"安全库存已重算：共 {result['total']} 个品项，"
+        f"{result['zeroed']} 个因消耗历史不足 {result['window_days']} 天写 0"
+    )
     return redirect(url_for("items.items_list"))
 
 
