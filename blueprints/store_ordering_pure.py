@@ -85,8 +85,19 @@ def generate_order_no(master_conn: sqlite3.Connection) -> str:
 # ---------------------------------------------------------------------------
 
 def open_warehouse_db(warehouse_code: str) -> sqlite3.Connection:
-    """Open db/warehouses/{code}.db with Row factory and FK enabled."""
+    """Open db/warehouses/{code}.db with Row factory and FK enabled.
+
+    Triggers ``migrate_warehouse_db_columns`` so the connection always sees
+    the latest schema (canonical_id / is_orderable / …) — matches
+    ``db.get_warehouse_db``'s lazy-migration contract and prevents 500s
+    when a wh_XXX.db hasn't yet been touched by the request path that
+    would normally pull in the migration. See issue #12.
+    """
     path = config.WAREHOUSE_DB_DIR / f"{warehouse_code}.db"
+    # Local import: avoid an import cycle with ``db`` (which itself imports
+    # ``config`` and a few blueprints at module load).
+    from db import migrate_warehouse_db_columns
+    migrate_warehouse_db_columns(path)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

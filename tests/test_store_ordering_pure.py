@@ -171,6 +171,56 @@ def test_open_warehouse_db(ordering_env):
     conn.close()
 
 
+def test_open_warehouse_db_triggers_lazy_migration(tmp_path, monkeypatch):
+    """Regression for issue #12: open_warehouse_db must apply the latest
+    column migrations so callers (e.g. ``list_available_dc_items``) don't
+    500 with ``no such column: is_orderable`` on legacy wh_XXX.db files
+    that were never touched by the get_warehouse_db() lazy-migration path.
+    """
+    import config as config_module
+    import db as db_module
+    from db import WAREHOUSE_SCHEMA
+
+    wh_dir = tmp_path / "warehouses"
+    wh_dir.mkdir()
+    legacy_path = wh_dir / "legacy_dc.db"
+
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
+
+    # Simulate a "legacy" db: base schema only, no v3.1+ column migrations.
+    # Matches what init_warehouse_db() did before the lazy-migration hook
+    # was tightened (issue #12).
+    legacy = sqlite3.connect(legacy_path)
+    legacy.executescript(WAREHOUSE_SCHEMA)
+    legacy.commit()
+    legacy.close()
+
+    # Sanity: is_orderable must NOT be present yet (or this test is
+    # meaningless — the migration is a no-op on already-migrated dbs).
+    pre = sqlite3.connect(legacy_path)
+    pre_cols = {r[1] for r in pre.execute("PRAGMA table_info(items)").fetchall()}
+    pre.close()
+    assert "is_orderable" not in pre_cols, (
+        "test setup invariant broken: WAREHOUSE_SCHEMA itself contains "
+        "is_orderable; drop the assertion or use a smaller schema"
+    )
+
+    # Act: open_warehouse_db should run the lazy migration.
+    conn = sop.open_warehouse_db("legacy_dc")
+    try:
+        post_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+        assert "is_orderable" in post_cols
+        # And the column is actually queryable in the SELECT path that
+        # used to 500.
+        rows = conn.execute(
+            "SELECT is_orderable FROM items WHERE canonical_id IS NOT NULL"
+        ).fetchall()
+        assert rows == []
+    finally:
+        conn.close()
+
+
 def test_cart_crud(ordering_env):
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
