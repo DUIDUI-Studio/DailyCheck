@@ -12,7 +12,7 @@ import sqlite3
 import tempfile
 from collections import defaultdict
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import (
@@ -215,7 +215,7 @@ def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
     (suggested_qty would be 0, no actionable signal).
     """
     cover_days, min_absolute = _get_config()
-    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out: list[dict] = []
     with closing(sqlite3.connect(wh_path)) as w:
         w.row_factory = sqlite3.Row
@@ -320,7 +320,7 @@ def _store_procurement_json(wh_code: str) -> dict:
         it.pop("_computed_at", None)
     return {
         "warehouse_code": wh_code,
-        "computed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "items": items,
     }
 
@@ -357,7 +357,7 @@ def procurement_hub():
         m.row_factory = sqlite3.Row
         codes = [r["code"] for r in m.execute("SELECT code FROM warehouses ORDER BY code").fetchall()]
     if not codes:
-        return jsonify({"computed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "items": []})
+        return jsonify({"computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "items": []})
     reports = []
     for c in codes:
         body = _store_procurement_json(c)
@@ -377,7 +377,7 @@ def procurement_hub():
         })
     hub_items = aggregate_hub(reports)
     return jsonify({
-        "computed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "items": hub_items,
     })
 

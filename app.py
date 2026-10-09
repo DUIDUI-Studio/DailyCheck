@@ -100,8 +100,16 @@ def create_app() -> Flask:
                    ORDER BY finished_at DESC LIMIT 1"""
             ).fetchone()
             if row is not None and row["finished_at"]:
-                # Convert "YYYY-MM-DD HH:MM:SS" → ISO Z
-                last_success = row["finished_at"].replace(" ", "T") + "Z"
+                # finished_at is stored in local time ("YYYY-MM-DD HH:MM:SS").
+                # The endpoint contract is ISO-8601 UTC ("...Z"), so convert to
+                # real UTC — the previous code merely appended "Z" to a local
+                # timestamp, i.e. it lied about the zone.
+                from datetime import datetime as _dt, timezone as _tz
+                last_success = (
+                    _dt.strptime(row["finished_at"], "%Y-%m-%d %H:%M:%S")
+                    .astimezone(_tz.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
         except Exception:  # noqa: BLE001 — health must never 500
             pass
         return {

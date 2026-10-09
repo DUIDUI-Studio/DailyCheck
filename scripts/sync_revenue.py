@@ -52,7 +52,7 @@ def upsert_vps(date_str: str, amount: float) -> dict:
     import subprocess, json
     sql = (
         "INSERT INTO daily_revenue (date, amount, created_at) "
-        "VALUES ('{d}', {a}, datetime('now')) "
+        "VALUES ('{d}', {a}, datetime('now','localtime')) "
         "ON CONFLICT(date) DO UPDATE SET amount=excluded.amount, created_at=excluded.created_at;".format(
             d=date_str, a=amount
         )

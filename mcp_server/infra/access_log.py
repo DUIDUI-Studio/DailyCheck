@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp_server.config import BASE_DIR
@@ -20,7 +20,7 @@ def write_mcp_access_log(
     """追加一条 JSON 记录到 access.log。异常静默吞掉。"""
     try:
         rec = {
-            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             "agent_token_id": token_id,
             "path": path,
             "method": method,

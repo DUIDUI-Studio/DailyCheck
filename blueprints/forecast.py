@@ -18,7 +18,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template, request, url_for
@@ -124,7 +124,7 @@ def _build_response(
         "daily_avg": daily_avg,
         "forecast_total": forecast_total,
         "confidence": confidence,
-        "computed_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "data_status": data_status,
     }
 

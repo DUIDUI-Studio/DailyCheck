@@ -35,10 +35,6 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _iso_z() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def emit_event(
     db: sqlite3.Connection,
     event_type: str,
