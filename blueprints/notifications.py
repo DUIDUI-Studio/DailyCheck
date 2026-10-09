@@ -16,7 +16,7 @@ from contextlib import closing
 from flask import Blueprint, abort, g, jsonify, request
 
 from db import get_master_db, init_master_db
-from permissions import require_login, require_role
+from permissions import require_login, require_platform_admin
 from .notifications_pure import (
     ALLOWED_EVENT_TYPES,
     SUMMARY_MAX_LEN,
@@ -86,10 +86,17 @@ def mark_notification_read(event_id: int):
 
 
 @bp.route("/admin/notifications/test-emit", methods=["POST"])
-@require_role("manager")
+@require_platform_admin
 def test_emit():
-    """Emit one event for fanout testing. Dev-only — see spec §1.3."""
+    """Emit one event for fanout testing. Dev-only — see spec §1.3.
+
+    Restricted to platform admins (was manager) and hard-disabled in
+    production, because a single call can fan a notification out to every
+    user in the system.
+    """
     import config  # call-time lookup so conftest monkeypatch works
+    if config.IS_PRODUCTION:
+        abort(404)
     payload = request.get_json(silent=True) or request.form
     event_type = payload.get("event_type", "recipe_published")
     summary = payload.get("summary", "")

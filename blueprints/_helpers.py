@@ -24,7 +24,12 @@ def get_db():
 
 
 def fixed_category_ids() -> list[int]:
-    """Return ids of the four system-fixed categories for this warehouse."""
+    """Return the ids of every category in this warehouse.
+
+    NOTE: despite the historical name this returns ALL rows of the
+    warehouse's `categories` table, including store-local custom
+    categories — not only the fixed seed set.
+    """
     db = get_warehouse_db()
     rows = db.execute(
         "SELECT id, name FROM categories ORDER BY id"

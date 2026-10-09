@@ -219,6 +219,9 @@ def commit():
                 "product_bom",
                 "production_run_items",
             ]:
+                # Literal list, never user input — guard anyway (see users.py).
+                if not table.isidentifier():
+                    raise ValueError(f"unexpected table name: {table!r}")
                 conn.execute(f"DELETE FROM {table} WHERE {items_subq}", groups_order)
             # 3c. 现在可以安全删 items
             conn.execute(

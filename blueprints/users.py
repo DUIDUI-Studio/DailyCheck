@@ -402,6 +402,11 @@ def init_warehouse(warehouse_id: int):
         cur = wh_db.cursor()
         cur.execute("PRAGMA foreign_keys = OFF")
         for tbl in target_tables:
+            # target_tables is a hard-coded literal list (never user input);
+            # the f-string only avoids eight near-identical statements. Guard
+            # anyway so a future edit cannot smuggle a dynamic name in.
+            if not tbl.isidentifier():
+                raise ValueError(f"unexpected table name: {tbl!r}")
             cur.execute(f"DELETE FROM {tbl}")
         cur.execute("UPDATE items SET quantity = 0, safety_stock = 0")
         wh_db.commit()

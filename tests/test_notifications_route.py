@@ -184,6 +184,28 @@ def test_test_emit_rejects_invalid_event_type(logged_client):
     assert resp.status_code == 400
 
 
+def test_test_emit_requires_platform_admin(staff_client):
+    """A bound storefront staff user must not be able to broadcast events."""
+    client, _ = staff_client
+    resp = client.post(
+        "/admin/notifications/test-emit",
+        json={"event_type": "recipe_published", "summary": "x", "user_ids": [1]},
+    )
+    assert resp.status_code == 403
+
+
+def test_test_emit_disabled_in_production(logged_client, monkeypatch):
+    """Production hard-disables the dev-only emitter (404)."""
+    import config as config_module
+    monkeypatch.setattr(config_module, "IS_PRODUCTION", True)
+    client, _ = logged_client
+    resp = client.post(
+        "/admin/notifications/test-emit",
+        json={"event_type": "recipe_published", "summary": "x", "user_ids": [1]},
+    )
+    assert resp.status_code == 404
+
+
 def test_test_emit_rejects_oversized_summary(logged_client):
     client, _ = logged_client
     resp = client.post(
