@@ -1,7 +1,9 @@
 """Token 验证与 AuthContext。"""
 from __future__ import annotations
 
+import contextvars
 import json
+import os
 from dataclasses import dataclass
 
 from werkzeug.security import check_password_hash
@@ -92,3 +94,49 @@ def check_path(ctx: AuthContext, method: str, path: str) -> bool:
         if path_matches(pat, path):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Request-scoped auth context
+#
+# Tool handlers are plain sync functions invoked from the MCP SDK with just
+# (name, arguments) — they cannot see the ASGI scope. AuthMiddleware therefore
+# publishes the request's own AuthContext here, and handlers read it back via
+# resolve_ctx(). Without this, every handler re-authenticated the *process*
+# env token, so a caller's per-token warehouse/path ACLs were ignored.
+# ---------------------------------------------------------------------------
+
+_current_auth: contextvars.ContextVar[AuthContext | None] = contextvars.ContextVar(
+    "dailycheck_current_auth", default=None
+)
+
+
+def set_current_auth(ctx: AuthContext | None) -> None:
+    """Publish the AuthContext of the in-flight request (called by AuthMiddleware)."""
+    _current_auth.set(ctx)
+
+
+def resolve_ctx() -> AuthContext:
+    """Return the AuthContext governing the current tool call.
+
+    HTTP transport: AuthMiddleware already authenticated the caller's own
+    Bearer token and published it via set_current_auth() — use it, so that
+    token's warehouse/path ACLs actually apply.
+
+    stdio transport (local Claude Code etc.): there is no ASGI scope and no
+    per-request token, so the process-level DAILYCHECK_MCP_TOKEN *is* the
+    identity. That fallback is a required path there, not a convenience.
+
+    Raises UnauthorizedError when neither source yields a context.
+    """
+    ctx = _current_auth.get()
+    if ctx is not None:
+        return ctx
+    from mcp_server.infra.errors import UnauthorizedError
+    token = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
+    if not token:
+        raise UnauthorizedError("no auth context; DAILYCHECK_MCP_TOKEN not set")
+    ctx = authenticate(f"Bearer {token}")
+    if ctx is None:
+        raise UnauthorizedError("invalid token")
+    return ctx

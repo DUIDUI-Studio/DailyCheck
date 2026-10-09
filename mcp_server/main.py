@@ -91,11 +91,15 @@ class AuthMiddleware:
         # Lazy import to avoid loading SQLite connection machinery for the
         # env-only dev path (and to keep cold-start minimal).
         try:
-            from mcp_server.service.auth import authenticate
+            from mcp_server.service.auth import authenticate, set_current_auth
             ctx = authenticate(auth) if auth.startswith("Bearer ") else None
             if ctx is not None:
-                # Stash AuthContext in scope for downstream tool handlers.
+                # Publish the context two ways: in the ASGI scope (transport
+                # level) and in a ContextVar — tool handlers are sync functions
+                # with no access to scope, so the ContextVar is what actually
+                # reaches them.
                 scope.setdefault("state", {})["auth"] = ctx
+                set_current_auth(ctx)
                 await self.app(scope, receive, send)
                 return
         except Exception as e:

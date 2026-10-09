@@ -1,24 +1,21 @@
 """Inbound MCP Tools."""
 from __future__ import annotations
 
-import os
-from mcp_server.service.auth import authenticate, check_path, check_warehouse
+from mcp_server.service.auth import check_path, check_warehouse, resolve_ctx
 from mcp_server.service.inbound import (
     create_restock as svc_create_restock,
     list_restock as svc_list_restock,
 )
-from mcp_server.infra.errors import UnauthorizedError, ForbiddenError
+from mcp_server.infra.errors import ForbiddenError
 
 
 def _get_ctx():
-    """Extract and validate AuthContext from the env token."""
-    token = os.environ.get("DAILYCHECK_MCP_TOKEN")
-    if not token:
-        raise UnauthorizedError("DAILYCHECK_MCP_TOKEN not set")
-    ctx = authenticate(f"Bearer {token}")
-    if ctx is None:
-        raise UnauthorizedError("invalid token")
-    return ctx
+    """Return the AuthContext for this call.
+
+    Request-scoped when the token arrived over HTTP (published by
+    AuthMiddleware); falls back to the process env token for stdio.
+    """
+    return resolve_ctx()
 
 
 def restock_create_impl(args: dict) -> dict:

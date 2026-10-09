@@ -50,7 +50,16 @@ def load_user_and_warehouse():
     user_id = session.get("user_id")
     warehouse_id = session.get("warehouse_id")
 
-    if request.path.startswith("/api/v1/"):
+    # Agent MPC routes (/api/v1/*) authenticate with Bearer tokens, not
+    # sessions, so this hook must not bounce them to /login.
+    #
+    # Deliberately scoped by endpoint prefix instead of a bare "/api/v1/"
+    # path prefix: a path rule silently makes ANY future /api/v1/* route
+    # session-free, which is an auth bypass waiting to happen. The pending
+    # sub6-agent-mpc branch registers its routes under the "agent_mpc"
+    # blueprint, so this form matches it — when that branch lands, keep the
+    # endpoint-scoped check rather than reinstating the path prefix.
+    if request.endpoint is not None and request.endpoint.startswith("agent_mpc."):
         return None
 
     if user_id is None:

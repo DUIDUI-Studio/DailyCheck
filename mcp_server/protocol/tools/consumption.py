@@ -1,10 +1,8 @@
 """Consumption MCP Tools."""
 from __future__ import annotations
 
-import os
 
-from mcp_server.infra.errors import UnauthorizedError
-from mcp_server.service.auth import authenticate
+from mcp_server.service.auth import resolve_ctx
 from mcp_server.service.consumption import (
     item_consumption as svc_item_consumption,
 )
@@ -14,13 +12,12 @@ from mcp_server.service.consumption import (
 
 
 def _get_ctx():
-    token = os.environ.get("DAILYCHECK_MCP_TOKEN")
-    if not token:
-        raise UnauthorizedError("DAILYCHECK_MCP_TOKEN not set")
-    ctx = authenticate(f"Bearer {token}")
-    if ctx is None:
-        raise UnauthorizedError("invalid token")
-    return ctx
+    """Return the AuthContext for this call.
+
+    Request-scoped when the token arrived over HTTP (published by
+    AuthMiddleware); falls back to the process env token for stdio.
+    """
+    return resolve_ctx()
 
 
 def warehouse_consumption_impl(args: dict) -> list[dict]:
