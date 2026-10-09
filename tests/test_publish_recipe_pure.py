@@ -2,6 +2,7 @@
 recipe + item publishing logic. Runs without Flask, using only
 sqlite3, so the file fixtures are minimal.
 """
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -470,3 +471,130 @@ def test_apply_polymorphic_skips_ic_recipe_lines(tmp_path, monkeypatch):
     assert len(lines) == 0, f"expected 0 recipe_items, got {len(lines)}"
     wh_conn.close()
     m.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-4 —— BOM 纳管校验（docs/2026-10-09-item-master-unify-plan.md §3 P0-4）
+# ---------------------------------------------------------------------------
+
+def test_list_unmanaged_bom_items_flags_null_canonical(tmp_path):
+    """canonical_id 为空即视为未纳管；纳管后不再报。"""
+    from blueprints.publish_recipe_pure import list_unmanaged_bom_items
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+
+    rows = list_unmanaged_bom_items(rd, "ic_recipe", ic)
+    assert {r["sku"] for r in rows} == {"SKU-MILK", "SKU-SUGAR"}
+
+    rd.execute("UPDATE items SET canonical_id = id")
+    rd.commit()
+    assert list_unmanaged_bom_items(rd, "ic_recipe", ic) == []
+    rd.close()
+
+
+def test_list_unmanaged_bom_items_skips_polymorphic_ic_recipe(tmp_path):
+    """recipe 类型里 source_type='ic_recipe' 的行引用的是别的配方，不参与校验。"""
+    from blueprints.publish_recipe_pure import list_unmanaged_bom_items
+    master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
+    ts = "2026-10-09 12:00:00"
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    rd.execute(
+        "INSERT INTO recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('poly', 'g', 500, 30, ?, ?)", (ts, ts))
+    outer = rd.execute("SELECT id FROM recipes WHERE name='poly'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+        "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)", (outer, ic))
+    rd.commit()
+    # 纯多态行 → 无需纳管
+    assert list_unmanaged_bom_items(rd, "recipe", outer) == []
+
+    # 混一条未纳管的 item 行 → 只报这条
+    rd.execute(
+        "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
+        "qty_per_unit) VALUES (?, 'item', ?, NULL, 1.0)", (outer, milk))
+    rd.commit()
+    rows = list_unmanaged_bom_items(rd, "recipe", outer)
+    assert [r["sku"] for r in rows] == ["SKU-MILK"]
+    rd.close()
+
+
+def test_publish_rejects_unmanaged_bom(tmp_path, monkeypatch):
+    """未纳管 → POST 发布被拒（302 回原页），不产生任何 publish event。"""
+    import config as config_module
+    import db as db_module
+    from app import create_app
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+
+    master = tmp_path / "master.db"
+    rd_db = tmp_path / "rd.db"
+    wh_db = tmp_path / "wh.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "BASE_DIR", tmp_path)
+    init_master_db()
+    for p in (rd_db, wh_db):
+        init_warehouse_db(p)
+        migrate_warehouse_db_columns(p)
+
+    ts = "2026-10-09 12:00:00"
+    m = sqlite3.connect(master)
+    m.row_factory = sqlite3.Row
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+        "VALUES ('rd_001', 'R&D', ?, 'rd', ?)", (str(rd_db), ts))
+    m.execute(
+        "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+        "VALUES ('wh_001', '中央仓', ?, 'storefront', ?)", (str(wh_db), ts))
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1, 1, 'admin')")
+    m.commit()
+    m.close()
+
+    rd = sqlite3.connect(rd_db)
+    rd.row_factory = sqlite3.Row
+    cat = rd.execute("SELECT id FROM categories WHERE name='乳制品'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO items (sku, name, category_id, unit, gram_per_unit, unit_cost, "
+        "selling_price, updated_at) VALUES ('SKU-MILK', '牛奶', ?, '件', 1000, 6.0, 10.0, ?)",
+        (cat, ts))
+    milk = rd.execute("SELECT id FROM items WHERE sku='SKU-MILK'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('开心果1号', 'g', 740, 250, ?, ?)", (ts, ts))
+    ic = rd.execute("SELECT id FROM ic_recipes WHERE name='开心果1号'").fetchone()["id"]
+    rd.execute(
+        "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit) "
+        "VALUES (?, ?, 500)", (ic, milk))
+    rd.commit()
+    rd.close()
+
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 1
+        s["warehouse_id"] = 1   # rd_001
+
+    resp = client.post(
+        f"/recipe-cost/ic-recipes/{ic}/publish",
+        data={"warehouse_codes": ["wh_001"]},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+
+    # 未纳管 → 一条发布事件都不该产生
+    check = sqlite3.connect(master)
+    check.row_factory = sqlite3.Row
+    assert check.execute("SELECT COUNT(*) AS c FROM recipe_publish_events").fetchone()["c"] == 0
+    check.close()
+    # 目标仓也不该出现该品项
+    wh = sqlite3.connect(wh_db)
+    assert wh.execute("SELECT COUNT(*) AS c FROM items").fetchone()[0] == 0
+    wh.close()

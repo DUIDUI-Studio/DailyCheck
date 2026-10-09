@@ -161,6 +161,99 @@ def canonical_edit(canonical_id: int | None = None):
     )
 
 
+@bp.route("/binding-active", methods=["POST"])
+@require_platform_admin
+def canonical_binding_active():
+    """P0-10 —— 主数据详情页按仓停用/启用某个门店的绑定行。
+
+    只改目标仓 items.is_active（本仓字段，扇出 NEVER_TOUCH），
+    库存与历史记录不动；库存 >0 时回页面软提示。
+    """
+    from db import migrate_warehouse_db_columns
+
+    m = get_master_db()
+    try:
+        warehouse_code = request.form["warehouse_code"].strip()
+        canonical_id = int(request.form["canonical_id"])
+        active = request.form.get("active", "0") == "1"
+    except (KeyError, ValueError, BadRequest):
+        flash("表单数据错误")
+        return redirect(url_for("canonical.canonical_list"))
+
+    back = redirect(url_for("canonical.canonical_detail", canonical_id=canonical_id))
+    wh = m.execute(
+        "SELECT code, name, db_path FROM warehouses WHERE code = ?", (warehouse_code,)
+    ).fetchone()
+    if wh is None or not wh["db_path"]:
+        flash(f"仓库 {warehouse_code} 不存在或未配置文件")
+        return back
+    path = Path(wh["db_path"])
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    if not path.exists():
+        flash(f"仓库 {warehouse_code} 的数据文件不存在")
+        return back
+
+    # 直连仓库必须先补幂等列迁移（旧库可能还没有 is_active 列）。
+    migrate_warehouse_db_columns(path)
+    wh_conn = _open_warehouse(path)
+    try:
+        result = cp.set_binding_active(wh_conn, warehouse_code, canonical_id, active)
+    except ValueError as e:
+        flash(str(e))
+        return back
+    finally:
+        wh_conn.close()
+
+    from blueprints.auth import audit
+    audit("canonical.binding_active", "canonical_item", canonical_id, {
+        "warehouse_code": warehouse_code,
+        "active": result["active"],
+        "quantity": result["quantity"],
+    })
+    if active:
+        flash(f"{wh['name']}（{warehouse_code}）已启用该品项")
+    elif result["quantity"] > 0:
+        flash(
+            f"{wh['name']}（{warehouse_code}）已停用该品项；"
+            f"注意该仓仍有库存 {result['quantity']}，建议先出清或盘点"
+        )
+    else:
+        flash(f"{wh['name']}（{warehouse_code}）已停用该品项")
+    return back
+
+
+@bp.route("/batch-edit", methods=["POST"])
+@require_platform_admin
+def canonical_batch_edit():
+    """P0-11 —— 把勾选的主数据项某字段统一设为同一值（保存后可一键扇出）。
+
+    价格字段不在批量范围内（P0-9 价格收归未实施）。
+    """
+    m = get_master_db()
+    ids = [int(x) for x in request.form.getlist("canonical_ids") if str(x).strip()]
+    if not ids:
+        flash("请至少勾选一个主数据项")
+        return redirect(url_for("canonical.canonical_list"))
+    field = request.form.get("field", "").strip()
+    try:
+        value = cp.coerce_batch_value(field, request.form.get("value"))
+        result = cp.batch_update_canonical_items(m, ids, field, value)
+    except ValueError as e:
+        flash(f"批量修改失败: {e}")
+        return redirect(url_for("canonical.canonical_list"))
+
+    shown = "" if value is None else f" → {value}"
+    msg = f"批量修改完成：{result['updated']}/{len(ids)} 项已把「{result['label']}」统一设为{shown or '空'}"
+    if result["error_count"]:
+        msg += f"；{result['error_count']} 项失败（{'; '.join(result['errors'][:3])}）"
+    flash(msg)
+    # 改完直接把人送到扇出页，并预选刚改的这些主数据项。
+    return redirect(url_for(
+        "canonical.canonical_fanout", ids=",".join(str(i) for i in ids)
+    ))
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  Cross-warehouse: diff / conflicts / unbound / store_exclusive
 # ─────────────────────────────────────────────────────────────────────
@@ -477,6 +570,12 @@ def canonical_fanout(canonical_id: int | None = None):
     selected = None
     if canonical_id is not None:
         selected = cp.get_canonical_item_detail(m, canonical_id)
+    # P0-11：批量修改后跳过来时，用 ?ids=1,2,3 预选刚改的主数据项。
+    preselect_ids: list[int] = []
+    for raw in (request.args.get("ids") or "").split(","):
+        raw = raw.strip()
+        if raw.isdigit():
+            preselect_ids.append(int(raw))
     wh_rows = m.execute(
         "SELECT code, name FROM warehouses "
         "WHERE warehouse_type IN ('storefront', 'rd') ORDER BY code"
@@ -484,6 +583,7 @@ def canonical_fanout(canonical_id: int | None = None):
     return render_template(
         "canonical/fanout.html",
         items=items, selected=selected, warehouses=wh_rows,
+        preselect_ids=preselect_ids,
     )
 
 

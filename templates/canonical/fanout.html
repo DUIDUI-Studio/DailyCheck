@@ -13,9 +13,10 @@
     <span>选择主数据项（多选）</span>
     <select name="canonical_ids" multiple size="10" required>
       {% for it in items %}
-      <option value="{{ it['id'] }}">{{ it['canonical_sku'] }} — {{ it['name'] }} ({{ it['unit'] }})</option>
+      <option value="{{ it['id'] }}" {% if it['id'] in preselect_ids %}selected{% endif %}>{{ it['canonical_sku'] }} — {{ it['name'] }} ({{ it['unit'] }})</option>
       {% endfor %}
     </select>
+    {% if preselect_ids %}<small>已预选 {{ preselect_ids|length }} 项（来自批量修改）</small>{% endif %}
   </label>
   {% else %}
   <input type="hidden" name="canonical_ids" value="{{ selected['id'] }}" />

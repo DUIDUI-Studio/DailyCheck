@@ -88,7 +88,7 @@
 
 <h3>品项列表</h3>
 <table>
-  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th>{% if is_rd %}<th>进货单价（¥）</th>{% endif %}<th>销售单价（¥）</th><th>辅单位</th><th>更新时间</th><th>操作</th></tr>
+  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th>{% if is_rd %}<th>进货单价（¥）</th>{% endif %}<th>销售单价（¥）</th><th>辅单位</th><th>状态</th><th>更新时间</th><th>操作</th></tr>
   {% for i in items %}
   <tr data-cat="{{ i.category_name }}">
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
@@ -96,12 +96,25 @@
     {% if is_rd %}<td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>{% endif %}
     <td>{{ "%.3f"|format(i.selling_price) if i.selling_price else "-" }}</td>
     <td>{% if i.aux_unit and i.aux_rate > 0 %}{{ i.aux_rate | fmt_qty }} {{ i.aux_unit }}/{{ i.unit }}{% else %}—{% endif %}</td>
+    <td>
+      {% if i.is_active %}
+        <span class="badge-ok">启用</span>
+      {% else %}
+        <span class="badge-warn">已停用</span>
+      {% endif %}
+    </td>
     <td>{{ i.updated_at }}</td>
     <td class="inline">
       <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">{% if i.canonical_id %}查看{% else %}编辑{% endif %}</a>
       {% if current_role != 'staff' and not i.canonical_id %}
       <form method="post" action="{{ url_for('items.delete_item', item_id=i.id) }}" class="inline" onsubmit="return confirm('确认删除该库存品？');">
         <button type="submit" class="btn-sm btn-delete">删除</button>
+      </form>
+      {% endif %}
+      {% if i.canonical_id and g.user and g.user['is_admin'] %}
+      <form method="post" action="{{ url_for('items.toggle_item_active', item_id=i.id) }}" class="inline">
+        <input type="hidden" name="active" value="{{ '0' if i.is_active else '1' }}" />
+        <button type="submit" class="btn-sm">{{ '停用' if i.is_active else '启用' }}</button>
       </form>
       {% endif %}
     </td>

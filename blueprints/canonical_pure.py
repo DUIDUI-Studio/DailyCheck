@@ -170,6 +170,9 @@ NEVER_TOUCH_COLUMNS: tuple[str, ...] = (
     "selling_price",
     "unit_cost",
     "category_id",
+    # 本仓运营开关：DC 可订 / 单仓启停 —— 都不随主数据下发（P0-10）。
+    "is_orderable",
+    "is_active",
 )
 
 # 可下发字段：主数据字段名 -> (策略, 目标列名)
@@ -873,6 +876,97 @@ def update_canonical_item(
         raise ValueError(f"canonical_id={canonical_id} 不存在")
     master_conn.commit()
     return get_canonical_item_detail(master_conn, canonical_id)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  P0-11 —— 主数据批量统一修改
+#
+#  方案：docs/2026-10-09-item-master-unify-plan.md §3 P0-11
+#  原则：批量与单条走同一个 update_canonical_item()，绝不另开写路径；
+#        字段白名单、aux_unit/gram_per_unit 派生关系都在那一处强制。
+#  ⚠️ 价格（unit_cost / selling_price）不在批量范围内：价格收归主数据
+#     （P0-9）尚未实施，价格暂由各仓维护。
+# ─────────────────────────────────────────────────────────────────────
+
+BATCH_EDITABLE_FIELDS: tuple[str, ...] = (
+    "category_code",   # 品类
+    "unit",            # 单位
+    "gram_per_unit",   # 克重
+    "aux_unit",        # 辅单位
+    "aux_rate",        # 辅单位换算率
+)
+
+BATCH_FIELD_LABELS: dict[str, str] = {
+    "category_code": "品类",
+    "unit": "单位",
+    "gram_per_unit": "克重",
+    "aux_unit": "辅单位",
+    "aux_rate": "辅单位换算率",
+}
+
+
+def coerce_batch_value(field: str, raw: Any) -> Any:
+    """P0-11 —— 表单原始值 → 批量修改值（空串转 None，数字字段转 float）。"""
+    if field not in BATCH_EDITABLE_FIELDS:
+        raise ValueError(f"字段 {field!r} 不支持批量修改")
+    text = ("" if raw is None else str(raw)).strip()
+    if field in ("category_code", "aux_unit"):
+        return text or None
+    if field == "unit":
+        if not text:
+            raise ValueError("单位不能为空")
+        return text
+    try:
+        num = float(text or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"{BATCH_FIELD_LABELS[field]}必须是数字") from None
+    if num < 0:
+        raise ValueError(f"{BATCH_FIELD_LABELS[field]}不能为负数")
+    return num
+
+
+def batch_update_canonical_items(
+    master_conn: sqlite3.Connection,
+    canonical_ids: list[int],
+    field: str,
+    value: Any,
+) -> dict:
+    """P0-11 —— 把选中主数据项的某个字段统一设为同一值。
+
+    Returns:
+        {"field": str, "label": str, "value": Any,
+         "updated": int, "error_count": int, "errors": [str, ...]}
+    """
+    if field not in BATCH_EDITABLE_FIELDS:
+        raise ValueError(f"字段 {field!r} 不支持批量修改")
+    master_conn.row_factory = sqlite3.Row
+    updated = 0
+    errors: list[str] = []
+    for cid in canonical_ids:
+        row = master_conn.execute(
+            "SELECT aux_unit, name FROM canonical_items WHERE id=?", (int(cid),)
+        ).fetchone()
+        if row is None:
+            errors.append(f"#{cid}: 主数据项不存在")
+            continue
+        fields: dict[str, Any] = {field: value}
+        # aux_rate / gram_per_unit 的派生逻辑要看 aux_unit：把现值带上，
+        # 避免「只改换算率却把克重清零」的副作用（§1.8.2）。
+        if field in ("aux_rate", "gram_per_unit"):
+            fields["aux_unit"] = row["aux_unit"]
+        try:
+            update_canonical_item(master_conn, int(cid), fields)
+            updated += 1
+        except ValueError as e:  # noqa: PERF203
+            errors.append(f"#{cid} {row['name']}: {e}")
+    return {
+        "field": field,
+        "label": BATCH_FIELD_LABELS[field],
+        "value": value,
+        "updated": updated,
+        "error_count": len(errors),
+        "errors": errors,
+    }
 
 
 def list_canonical_items(
@@ -2069,8 +2163,12 @@ def resolve_conflict(
 # ─────────────────────────────────────────────────────────────────────
 
 def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
-    """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。"""
+    """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。
+
+    v2（P0-10）：带上 is_active，供主数据详情页按仓停用/启用。
+    """
     from config import BASE_DIR
+    from db import migrate_warehouse_db_columns
 
     master_conn.row_factory = sqlite3.Row
     out: dict[str, list[dict]] = {}
@@ -2084,16 +2182,56 @@ def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
             db_path = BASE_DIR / db_path
         if not db_path.exists():
             continue
+        # 直连仓库必须先补幂等列迁移，否则旧库会撞 no such column: is_active
+        migrate_warehouse_db_columns(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT id, sku, name, unit, canonical_id,
-                          is_alias, canonical_status, is_store_exclusive
+                          is_alias, canonical_status, is_store_exclusive,
+                          is_active
                    FROM items
                    WHERE canonical_id IS NOT NULL"""
             ).fetchall()
             out[wh["code"]] = [dict(r) for r in rows]
     return out
+
+
+def set_binding_active(
+    wh_conn: sqlite3.Connection,
+    warehouse_code: str,
+    canonical_id: int,
+    active: bool,
+) -> dict:
+    """P0-10 —— 按仓启停某个主数据项的绑定行（is_active）。
+
+    只写 items.is_active / updated_at：库存、历史流水、主数据字段一律不动
+    （Q7 零丢失精神）。返回 {"item_id", "warehouse_code", "canonical_id",
+    "active", "quantity"}，quantity 供调用方在停用时做「仍有库存」软提示。
+
+    Raises:
+        ValueError: 该仓没有绑定这一 canonical_id 的行
+    """
+    wh_conn.row_factory = sqlite3.Row
+    row = wh_conn.execute(
+        "SELECT id, quantity FROM items WHERE canonical_id = ?", (int(canonical_id),)
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"仓库 {warehouse_code} 没有绑定 canonical_id={canonical_id} 的品项"
+        )
+    wh_conn.execute(
+        "UPDATE items SET is_active = ?, updated_at = ? WHERE id = ?",
+        (1 if active else 0, _now_str(), int(row["id"])),
+    )
+    wh_conn.commit()
+    return {
+        "item_id": int(row["id"]),
+        "warehouse_code": warehouse_code,
+        "canonical_id": int(canonical_id),
+        "active": bool(active),
+        "quantity": float(row["quantity"] or 0),
+    }
 
 
 def diff_summary(master_conn: sqlite3.Connection) -> dict:

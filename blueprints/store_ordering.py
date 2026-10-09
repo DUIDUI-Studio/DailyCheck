@@ -173,7 +173,10 @@ def catalog() -> str:
 
     category_code = request.args.get("cat", "").strip() or None
     keyword = request.args.get("q", "").strip() or None
-    items = sop.list_available_dc_items(master, dc_code, category_code, keyword)
+    items = sop.list_available_dc_items(
+        master, dc_code, category_code, keyword,
+        store_warehouse_code=store_code or None,
+    )
     # P1-5: 订货量建议（仅当前门店有真实仓库时才计算，admin 无门店跳过）
     suggestions: dict[int, int] = {}
     if store_code and not _is_admin():

@@ -26,6 +26,37 @@ from config import (
     SAFETY_STOCK_WINDOW_DAYS,
 )
 
+# P0-10 —— 单仓品项启停：静默行的判定谓词。
+# 本仓字段，扇出永不覆盖（canonical_pure.NEVER_TOUCH_COLUMNS）。
+ACTIVE_CLAUSE = "COALESCE(i.is_active, 1) = 1"
+
+
+def set_item_active(conn, item_id: int, active: bool) -> dict:
+    """P0-10 —— 启停本仓某个品项（items.is_active）。
+
+    只写 is_active；库存、历史流水、主数据字段一律不动。返回
+    {"item_id", "active", "quantity"}，quantity 供调用方在停用时做
+    「仍有库存」软提示（不硬拦）。
+
+    Raises:
+        ValueError: item_id 不存在
+    """
+    row = conn.execute(
+        "SELECT id, quantity FROM items WHERE id = ?", (int(item_id),)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"品项 {item_id} 不存在")
+    conn.execute(
+        "UPDATE items SET is_active = ? WHERE id = ?",
+        (1 if active else 0, int(item_id)),
+    )
+    conn.commit()
+    return {
+        "item_id": int(item_id),
+        "active": bool(active),
+        "quantity": float(row[1] or 0),
+    }
+
 # 消耗口径 UNION（与 inventory_view 的 c7 子查询同源）。列：item_id, qty, ts
 CONSUMPTION_UNION_SQL = """
     SELECT o.item_id AS item_id,

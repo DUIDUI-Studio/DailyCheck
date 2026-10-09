@@ -60,6 +60,7 @@ def outbound_session():
         """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock,
                   i.aux_unit, i.aux_rate, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
+           WHERE COALESCE(i.is_active, 1) = 1
            ORDER BY c.name, i.name"""
     ).fetchall()
     return render_template("outbound_session.html", items=items_data)

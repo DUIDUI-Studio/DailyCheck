@@ -181,14 +181,37 @@ def edit_item(item_id: int):
     if old is None:
         from flask import abort
         abort(404)
-    # P0-1 主数据收口：已绑定 canonical 的行，名称/品类/单位/辅单位/成本/
-    # 售价/安全库存统一由「品项主数据」或系统维护，本页只读。
+    # P0-1 主数据收口：已绑定 canonical 的行，名称/品类/单位/辅单位/克重
+    # 统一由「品项主数据」维护，本页服务端强制忽略表单里的这些字段。
     bound = old["canonical_id"] is not None
 
     if request.method == "POST":
+        # 已纳管行：只放行「价格」这一对本仓字段。
+        # ⚠️ 价格收归主数据（P0-9）尚未实施（2026-10-09 owner 决定先不动价格），
+        # 若此处一并锁死，已纳管品项将没有任何价格维护出口 —— 所以本仓保留
+        # 进货单价 / 销售单价的可写权，待 P0-9 落地后再随之上锁。
         if bound:
-            flash("该品项已纳入主数据，字段与价格请在「品项主数据」中修改；本页仅供查看")
-            return redirect(url_for("items.edit_item", item_id=item_id))
+            unit_cost = float(request.form.get("unit_cost", old["unit_cost"] or 0) or 0)
+            selling_price = float(
+                request.form.get("selling_price", old["selling_price"] or 0) or 0
+            )
+            if unit_cost < 0 or selling_price < 0:
+                flash("价格不能为负数")
+                return redirect(url_for("items.edit_item", item_id=item_id))
+            sp_updated_at = (
+                now() if selling_price != float(old["selling_price"] or 0) else None
+            )
+            db.execute(
+                """UPDATE items SET unit_cost=?, selling_price=?,
+                   selling_price_updated_at=?, updated_at=? WHERE id=?""",
+                (unit_cost, selling_price, sp_updated_at, now(), item_id),
+            )
+            db.commit()
+            audit("items.update_price", "item", item_id, {
+                "unit_cost": unit_cost, "selling_price": selling_price,
+            })
+            flash("已更新价格；名称/单位/品类等请在「品项主数据」中修改")
+            return redirect(url_for("items.items_list"))
 
         name = request.form.get("name", "").strip()
         category_id = request.form.get("category_id", "").strip()
@@ -281,6 +304,40 @@ def delete_item(item_id: int):
     db.commit()
     audit("items.delete", "item", item_id)
     flash("已删除")
+    return redirect(url_for("items.items_list"))
+
+
+@bp.route("/items/<int:item_id>/toggle-active", methods=["POST"])
+@require_platform_admin
+def toggle_item_active(item_id: int):
+    """P0-10 —— 单仓品项启停（仅 platform admin）。
+
+    与「主数据停用」（全公司，走 /canonical 详情页）区分：本路由只改本仓
+    items.is_active，仅影响本仓的出库/入库/生产/盘点/调整/订货选择点，
+    库存与历史记录全保留。
+    """
+    from blueprints.items_pure import set_item_active
+
+    db = get_warehouse_db()
+    active = request.form.get("active", "0") == "1"
+    try:
+        result = set_item_active(db, item_id, active)
+    except ValueError as e:
+        flash(str(e))
+        return redirect(url_for("items.items_list"))
+
+    audit("items.set_active", "item", item_id, {
+        "active": result["active"], "quantity": result["quantity"],
+    })
+    if active:
+        flash("已在本仓启用该品项")
+    elif result["quantity"] > 0:
+        flash(
+            f"已在本仓停用该品项；注意本仓仍有库存 {result['quantity']}，"
+            f"建议先出清或盘点"
+        )
+    else:
+        flash("已在本仓停用该品项")
     return redirect(url_for("items.items_list"))
 
 

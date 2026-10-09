@@ -3,16 +3,17 @@
 <h2>编辑库存品</h2>
 {% if bound %}
 <p class="hint">
-  该品项已纳入主数据：名称 / 品类 / 单位 / 辅单位 / 成本 / 售价 / 安全库存由「品项主数据」统一维护，本页仅供查看。
+  该品项已纳入主数据：名称 / 品类 / 单位 / 辅单位 / 克重由「品项主数据」统一维护，安全库存由系统按消耗自动计算。
+  价格（进货单价 / 销售单价）暂由本仓维护。
   <a href="{{ url_for('canonical.canonical_detail', canonical_id=item.canonical_id) }}" class="btn-sm">去主数据查看</a>
 </p>
-<div class="grid cols-3">
+<form method="post" class="grid cols-3">
   <label>
-    <span>品项名称</span>
+    <span>品项名称（主数据）</span>
     <input value="{{ item.name }}" disabled />
   </label>
   <label>
-    <span>品类</span>
+    <span>品类（主数据）</span>
     <input value="{% for c in categories %}{% if c.id == item.category_id %}{{ c.name }}{% endif %}{% endfor %}" disabled />
   </label>
   <label>
@@ -25,26 +26,27 @@
   </label>
   <label>
     <span>进货单价（¥）</span>
-    <input value="{{ item.unit_cost or 0 }}" disabled />
+    <input name="unit_cost" type="number" min="0" step="0.001" value="{{ item.unit_cost or 0 }}" />
   </label>
   <label>
     <span>销售单价（¥）</span>
-    <input value="{{ item.selling_price or 0 }}" disabled />
+    <input name="selling_price" type="number" min="0" step="0.001" value="{{ '%.3f'|format(item.selling_price) if item.selling_price else '0' }}" />
   </label>
   <label>
-    <span>单位</span>
+    <span>单位（主数据）</span>
     <input value="{{ item.unit }}" disabled />
   </label>
   <label>
-    <span>辅单位</span>
+    <span>辅单位（主数据）</span>
     <input value="{{ item.aux_unit or '无' }}" disabled />
   </label>
   <label>
     <span>1 基础单位 = N 辅单位</span>
     <input value="{{ item.aux_rate or 0 }}" disabled />
   </label>
-</div>
-<a href="{{ url_for('items.items_list') }}" class="btn-cancel">返回</a>
+  <a href="{{ url_for('items.items_list') }}" class="btn-cancel">返回</a>
+  <button type="submit">保存价格</button>
+</form>
 {% else %}
 <form method="post" class="grid cols-3">
   <label>

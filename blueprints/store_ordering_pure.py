@@ -323,8 +323,13 @@ def list_available_dc_items(
     dc_warehouse_code: str,
     category_code: str | None = None,
     keyword: str | None = None,
+    store_warehouse_code: str | None = None,
 ) -> list[dict[str, Any]]:
     """List DC items that have a non-null canonical_id and active canonical item.
+
+    `store_warehouse_code`（P0-10）：传入后额外排除「该门店已单仓停用
+    （items.is_active = 0）」的主数据项 —— 门店停用某品项后，订货目录里
+    不再出现它；不传则不做该过滤（如 admin 无门店上下文）。
 
     Each returned dict is enriched with:
       - canonical_name / canonical_unit (from canonical_items)
@@ -334,6 +339,22 @@ def list_available_dc_items(
       - unit_price (selling_price → unit_cost → 0)
     """
     master_conn.row_factory = sqlite3.Row
+    # P0-10：先取该门店已停用的 canonical_id 集合（本仓字段，与 DC 无关）。
+    deactivated: set[int] = set()
+    if store_warehouse_code:
+        store_conn = open_warehouse_db(store_warehouse_code)
+        try:
+            deactivated = {
+                int(r["canonical_id"])
+                for r in store_conn.execute(
+                    """SELECT canonical_id FROM items
+                       WHERE canonical_id IS NOT NULL
+                         AND COALESCE(is_active, 1) = 0"""
+                ).fetchall()
+            }
+        finally:
+            store_conn.close()
+
     # Resolve canonical_ids in master first so category filtering does not
     # require cross-database subqueries.
     where_parts = ["status = 'active'"]
@@ -374,6 +395,8 @@ def list_available_dc_items(
             canon = active_canonical_map.get(canonical_id)
             if canon is None:
                 continue
+            if canonical_id in deactivated:
+                continue  # P0-10：该门店已单仓停用
             item["canonical_name"] = canon["name"]
             item["category_code"] = canon["category_code"]
             item["canonical_unit"] = canon["unit"]

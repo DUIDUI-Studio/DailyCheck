@@ -1,10 +1,11 @@
 {% extends "base.html" %}
 {% block title %}品项主数据{% endblock %}
 {% block content %}
+{% set is_admin = g.user and g.user['is_admin'] %}
 <div class="page-header">
   <h2>品项主数据</h2>
   <div>
-    {% if g.user and g.user['is_admin'] %}
+    {% if is_admin %}
     <a class="btn-sm" href="{{ url_for('canonical.canonical_edit') }}">➕ 新建</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_bulk_import') }}">📥 批量导入</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout') }}">📤 扇出</a>
@@ -16,9 +17,13 @@
   </div>
 </div>
 
+{% if is_admin %}
+<form method="post" action="{{ url_for('canonical.canonical_batch_edit') }}" id="batch-form">
+{% endif %}
 <table class="data-table">
   <thead>
     <tr>
+      {% if is_admin %}<th><input type="checkbox" id="check-all" /></th>{% endif %}
       <th>ID</th><th>SKU</th><th>名称</th><th>品类</th>
       <th>单位</th><th>状态</th><th>created_from</th><th></th>
     </tr>
@@ -26,6 +31,9 @@
   <tbody>
     {% for it in items %}
     <tr>
+      {% if is_admin %}
+      <td><input type="checkbox" name="canonical_ids" value="{{ it['id'] }}" class="row-check" /></td>
+      {% endif %}
       <td>{{ it['id'] }}</td>
       <td><code>{{ it['canonical_sku'] }}</code></td>
       <td>{{ it['name'] }}</td>
@@ -41,7 +49,7 @@
       <td><small>{{ it['created_from'] }}</small></td>
       <td>
         <a class="btn-sm" href="{{ url_for('canonical.canonical_detail', canonical_id=it['id']) }}">查看</a>
-        {% if g.user and g.user['is_admin'] %}
+        {% if is_admin %}
         <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', canonical_id=it['id']) }}">编辑</a>
         <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout', canonical_id=it['id']) }}">扇出</a>
         {% endif %}
@@ -50,4 +58,56 @@
     {% endfor %}
   </tbody>
 </table>
+
+{% if is_admin %}
+<div class="form-section">
+  <h3>批量统一修改</h3>
+  <p class="hint">
+    勾选上表若干行 → 选字段 → 填统一值 → 保存，随后进入扇出页下发到目标仓。
+    价格（成本 / 售价）暂不在此处统一（收归主数据尚未实施）。
+  </p>
+  <div class="grid cols-3">
+    <label>
+      <span>要统一修改的字段</span>
+      <select name="field" id="batch-field">
+        <option value="category_code">品类</option>
+        <option value="unit">单位</option>
+        <option value="gram_per_unit">克重</option>
+        <option value="aux_unit">辅单位</option>
+        <option value="aux_rate">辅单位换算率</option>
+      </select>
+    </label>
+    <label>
+      <span>统一设为</span>
+      <input name="value" id="batch-value" placeholder="留空 = 清空该字段（品类 / 辅单位）" />
+    </label>
+  </div>
+  <button type="submit">批量修改选中项</button>
+</div>
+</form>
+<script>
+(function () {
+  var all = document.getElementById('check-all');
+  if (all) {
+    all.addEventListener('change', function () {
+      document.querySelectorAll('.row-check').forEach(function (cb) {
+        cb.checked = all.checked;
+      });
+    });
+  }
+  var field = document.getElementById('batch-field');
+  var value = document.getElementById('batch-value');
+  var numeric = {gram_per_unit: 1, aux_rate: 1};
+  function syncType() {
+    if (!field || !value) return;
+    var n = numeric[field.value];
+    value.type = n ? 'number' : 'text';
+    value.min = n ? '0' : '';
+    value.step = n ? '0.01' : '';
+    value.placeholder = n ? '0' : '留空 = 清空该字段（品类 / 辅单位）';
+  }
+  if (field) { field.addEventListener('change', syncType); syncType(); }
+})();
+</script>
+{% endif %}
 {% endblock %}

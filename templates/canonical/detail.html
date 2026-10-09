@@ -49,7 +49,7 @@
 <h3>已绑定仓 ({{ bindings|length }})</h3>
 {% if bindings %}
 <table class="data-table">
-  <thead><tr><th>仓库</th><th>items.id</th><th>sku</th><th>name</th><th>is_alias</th><th>canonical_status</th></tr></thead>
+  <thead><tr><th>仓库</th><th>items.id</th><th>sku</th><th>name</th><th>is_alias</th><th>canonical_status</th><th>本仓状态</th><th></th></tr></thead>
   <tbody>
     {% for b in bindings %}
     <tr>
@@ -59,10 +59,31 @@
       <td>{{ b['name'] }}</td>
       <td>{{ '✓' if b['is_alias'] else '' }}</td>
       <td>{{ b['canonical_status'] or '—' }}</td>
+      <td>
+        {% if b['is_active'] %}
+          <span class="badge-ok">启用</span>
+        {% else %}
+          <span class="badge-warn">已停用</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if g.user and g.user['is_admin'] %}
+        <form method="post" action="{{ url_for('canonical.canonical_binding_active') }}" class="inline">
+          <input type="hidden" name="warehouse_code" value="{{ b['warehouse_code'] }}" />
+          <input type="hidden" name="canonical_id" value="{{ canonical['id'] }}" />
+          <input type="hidden" name="active" value="{{ '0' if b['is_active'] else '1' }}" />
+          <button type="submit" class="btn-sm">{{ '停用' if b['is_active'] else '启用' }}</button>
+        </form>
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+<p class="hint">
+  「本仓状态」= 单仓启停（P0-10）：停用后该门店的出库/入库/生产/盘点/调整/订货选择点
+  不再出现此品项，库存与历史记录全保留。与上方主数据「停用」（全公司生效）是两个粒度。
+</p>
 {% else %}
 <p class="empty">该主数据项尚未绑任何仓</p>
 {% endif %}

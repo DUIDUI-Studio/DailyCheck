@@ -56,6 +56,28 @@ def _setup_rd_with_warehouse(tmp_path, monkeypatch):
     rd.commit()
     rd.close()
 
+    # P0-4（docs/2026-10-09-item-master-unify-plan.md §3）：rd 品项是主数据的
+    # 镜像副本，发布前必须已纳管（canonical_id 非空），否则会被纳管校验拒绝。
+    # 这里先建主数据再把 rd 行回绑，使夹具符合新契约。
+    m2 = sqlite3.connect(master)
+    m2.row_factory = sqlite3.Row
+    canon_ids: dict[str, int] = {}
+    for sku, name in (("SKU-A", "A"), ("SKU-B", "B")):
+        cur = m2.execute(
+            "INSERT INTO canonical_items (canonical_sku, name, unit, status, "
+            "created_from, created_at, updated_at) "
+            "VALUES (?, ?, '件', 'active', 'rd_manual', ?, ?)",
+            (f"IC-TEST-{sku}", name, ts, ts))
+        canon_ids[sku] = cur.lastrowid
+    m2.commit()
+    m2.close()
+
+    rd = sqlite3.connect(rd_db)
+    for sku, cid in canon_ids.items():
+        rd.execute("UPDATE items SET canonical_id=? WHERE sku=?", (cid, sku))
+    rd.commit()
+    rd.close()
+
     from app import create_app
     app = create_app()
     app.config["TESTING"] = True

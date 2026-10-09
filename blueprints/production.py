@@ -68,6 +68,7 @@ def _load_items_for_bom():
     return db.execute(
         """SELECT i.id, i.name, i.unit, i.gram_per_unit, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
+           WHERE COALESCE(i.is_active, 1) = 1
            ORDER BY c.name, i.name"""
     ).fetchall()
 
