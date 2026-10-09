@@ -3,7 +3,8 @@
 Run via:
     flask --app app init-master
     flask --app app migrate-legacy
-    flask --app app create-warehouse <code> <name>
+    flask --app app create-warehouse <code> <name> [--type {storefront,distribution_center,rd}]
+    flask --app app set-warehouse-type <code> <type>
     flask --app app create-user <username> <password> [--admin]
     flask --app app assign-role <username> <warehouse_code> <role>
     flask --app app create-agent-token <name> [--read-paths *] [--warehouses wh_001]
@@ -12,6 +13,9 @@ Canonical align (issue #11, 2026-10-05):
     flask --app app align-seed
     flask --app app align-detect [--out report.txt]
     flask --app app align-apply --canonical-ids 1,2 --warehouses wh_002 [--action overwrite] [--force]
+
+DC bulk publish to canonical (issue #14, 2026-10-09):
+    flask --app app bulk-publish-canonical <dc_code> [--dry-run] [--include-bound]
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(init_master_cmd)
     app.cli.add_command(migrate_legacy_cmd)
     app.cli.add_command(create_warehouse_cmd)
+    app.cli.add_command(set_warehouse_type_cmd)
     app.cli.add_command(clone_warehouse_cmd)
     app.cli.add_command(create_user_cmd)
     app.cli.add_command(assign_role_cmd)
@@ -43,6 +48,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(align_seed_cmd)
     app.cli.add_command(align_detect_cmd)
     app.cli.add_command(align_apply_cmd)
+    app.cli.add_command(bulk_publish_canonical_cmd)
 
 
 @click.command("init-master")
@@ -65,9 +71,15 @@ def migrate_legacy_cmd() -> None:
 @click.option(
     "--type",
     "warehouse_type",
-    type=click.Choice(["storefront", "rd"], case_sensitive=False),
+    type=click.Choice(
+        ["storefront", "distribution_center", "rd"], case_sensitive=False,
+    ),
     default="storefront",
-    help="Warehouse type: storefront (default, has inventory ops) or rd (研发中心, recipe-only).",
+    help=(
+        "Warehouse type: storefront (default, 有实体库存), "
+        "distribution_center (配送中心, 服务 storefront 跨仓订货), "
+        "rd (研发中心, 无库存, recipe-only)."
+    ),
 )
 def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
     """Register a new warehouse. The db file is created if missing."""
@@ -93,6 +105,55 @@ def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
             )
         except sqlite3.IntegrityError:
             click.echo(f"Warehouse {code} already exists", err=True)
+
+
+# v3.1 fix for issue #13: 已建仓的 warehouse_type 走 schema DEFAULT
+# 'storefront', 老 wh_000「配送中心仓库」创建后 type 错,需 ops 手动 SQL。
+# 加 set-warehouse-type 补救 + 配套 create-warehouse --type 选项。
+VALID_WAREHOUSE_TYPES: tuple[str, ...] = (
+    "storefront", "distribution_center", "rd",
+)
+
+
+@click.command("set-warehouse-type")
+@click.argument("code")
+@click.argument(
+    "warehouse_type",
+    type=click.Choice(list(VALID_WAREHOUSE_TYPES), case_sensitive=False),
+)
+def set_warehouse_type_cmd(code: str, warehouse_type: str) -> None:
+    """Update an existing warehouse's warehouse_type (issue #13 补救命令).
+
+    Originally only ``create-warehouse`` could set the type, and it
+    lacked a ``distribution_center`` choice — so pre-v3.1 wh_000「配送
+    中心仓库」landed as ``storefront`` and ops had to patch it via raw
+    SQL. This command is the supported fix path.
+
+    Exit code is non-zero when ``code`` does not exist so CI / shell
+    scripts can catch the error.
+    """
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT code, warehouse_type FROM warehouses WHERE code=?", (code,),
+        ).fetchone()
+        if row is None:
+            click.echo(f"No warehouse {code}", err=True)
+            raise click.exceptions.Exit(1)
+        prev = row["warehouse_type"]
+        if prev == warehouse_type:
+            click.echo(
+                f"{code} warehouse_type already {warehouse_type!r}, no-op"
+            )
+            return
+        conn.execute(
+            "UPDATE warehouses SET warehouse_type=? WHERE code=?",
+            (warehouse_type, code),
+        )
+        conn.commit()
+    click.echo(
+        f"{code} warehouse_type: {prev!r} → {warehouse_type!r}"
+    )
 
 
 @click.command("clone-warehouse")
@@ -519,3 +580,114 @@ def align_apply_cmd(
                 f"{'; '.join(parts) if parts else 'no-op'}"
             )
         click.echo("\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  bulk-publish-canonical (issue #14, 2026-10-09)
+#
+#  ops 救场工具：DC 仓已有真实 inventory 但 canonical_id IS NULL 全部被
+#  storefront catalog WHERE canonical_id IS NOT NULL 过滤掉。本命令把
+#  wh_XXX.items 批量 publish 到 master.canonical_items，回写 items.canonical_id。
+# ─────────────────────────────────────────────────────────────────────
+
+@click.command("bulk-publish-canonical")
+@click.argument("dc_code")
+@click.option(
+    "--dry-run", is_flag=True,
+    help="只 plan, 不写 master.canonical_items 也不回写 wh.items.canonical_id。",
+)
+@click.option(
+    "--include-bound/--only-no-canonical", "include_bound", default=False,
+    help=(
+        "(default --only-no-canonical) 只 publish canonical_id IS NULL 的品项。"
+        " --include-bound 扫全部行(已绑的会被自动 skip,保持幂等)。"
+    ),
+)
+@click.confirmation_option(
+    prompt="真要 bulk publish?会写 master.canonical_items + wh_XXX.items.canonical_id"
+)
+def bulk_publish_canonical_cmd(
+    dc_code: str, dry_run: bool, include_bound: bool,
+) -> None:
+    """Bulk-publish wh_<dc_code>.items → master.canonical_items (issue #14).
+
+    替代 ops 写 ad-hoc /tmp/publish_*.py 救场脚本(2026-10-09 那次)。
+
+    默认行为（--only-no-canonical）：只处理 canonical_id IS NULL 的行；
+    按 (name, unit) 复用现有 canonical_items / 否则用 _infer_category_code
+    推 category_code + create_canonical_item 两阶段写入；UPDATE 回写
+    items.canonical_id。事务包（master + wh 一起 commit / 一起 rollback）。
+    Pre-flight 备份 master.db + wh_XXX.db 到 backups/warehouses/。
+    """
+    import blueprints.canonical_pure as cp
+    from config import BASE_DIR
+
+    if not dry_run:
+        init_master_db()  # 保险:确保 master schema 新
+
+    # 1) 找到 dc_code 对应的 db_path
+    with closing(sqlite3.connect(MASTER_DB)) as m:
+        m.row_factory = sqlite3.Row
+        wh_row = m.execute(
+            "SELECT code, db_path FROM warehouses WHERE code=?", (dc_code,),
+        ).fetchone()
+    if wh_row is None:
+        click.echo(f"No warehouse {dc_code}", err=True)
+        raise click.exceptions.Exit(1)
+    wh_path = Path(wh_row["db_path"])
+    if not wh_path.is_absolute():
+        wh_path = BASE_DIR / wh_path
+    if not wh_path.exists():
+        click.echo(f"Warehouse db not found: {wh_path}", err=True)
+        raise click.exceptions.Exit(1)
+
+    # 2) Pre-flight 备份（不备份 master—— spec 说主数据不备份；备份 wh）
+    backup_paths: list[str] = []
+    if not dry_run:
+        backup_paths.append(str(cp.backup_warehouse_db(wh_path, tag="pre-bulk-publish")))
+
+    # 3) 跑 bulk publish（事务包）
+    try:
+        with closing(sqlite3.connect(MASTER_DB)) as master_conn:
+            wh_conn = sqlite3.connect(wh_path)
+            try:
+                wh_conn.row_factory = sqlite3.Row
+                result = cp.bulk_publish_canonical_items(
+                    master_conn, wh_conn,
+                    dc_warehouse_code=dc_code,
+                    include_bound=include_bound,
+                    dry_run=dry_run,
+                )
+                if not dry_run:
+                    master_conn.commit()
+                    wh_conn.commit()
+            finally:
+                wh_conn.close()
+    except Exception:
+        # 显式 rollback(虽然 closing() 会自动关，但显式更清晰)
+        click.echo(
+            f"bulk-publish-canonical FAILED on {dc_code}; "
+            f"both master + wh connections rolled back",
+            err=True,
+        )
+        if backup_paths:
+            click.echo(f"  pre-flight backups: {backup_paths}", err=True)
+        raise
+
+    # 4) 报数
+    if dry_run:
+        click.echo(f"[dry-run] {dc_code}: {result}")
+    else:
+        click.echo(f"{dc_code} bulk-publish-canonical done:")
+        click.echo(f"  scanned:           {result['scanned']}")
+        click.echo(f"  created (master):  {result['created']}")
+        click.echo(f"  reused (master):   {result['reused']}")
+        click.echo(f"  linked (wh.items): {result['linked']}")
+        click.echo(f"  skipped:           {result['skipped']}")
+        if result["no_category_code"] > 0:
+            click.echo(
+                f"  ⚠ no_category_code: {result['no_category_code']} "
+                f"(行: category 推断失败,写了 category_code=NULL)"
+            )
+        if backup_paths:
+            click.echo(f"  pre-flight backups: {backup_paths[0]}")
