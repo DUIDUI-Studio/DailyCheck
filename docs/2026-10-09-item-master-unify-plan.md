@@ -1,6 +1,6 @@
 # 品项主数据统一 — 评估与改造方案
 
-> 2026-10-09 · 分支 `feat/item-master-unify` · 状态：P0 已完成 11/12（P0-9 价格收归经 owner 裁决暂缓），P1 存量清洗未开工
+> 2026-10-09 · 分支 `feat/item-master-unify` · 状态：**P0 全部完成（12/12，含 P0-9 价格收归）**，待 owner 审阅后推送 / 部署；P1 存量清洗未开工
 
 ## 0. 结论先行
 
@@ -76,22 +76,23 @@ canonical_items (master.db)      ← 唯一维护入口 /canonical/*（platform 
 
 ## 3. 分期改造方案
 
+
 ### P0 — 写路径收口（核心改造，先做）
 
-| #  | 改造点               | 位置                                                                                                      | 改法                                                                                                                                                                                                                                                                                                                                                                                                                         | 复杂度 |
-| -- | ----------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
-| 1  | 编辑页拆字段            | `items.py` + `templates/edit_item.html`                                                         | 已绑定行：name/unit/gram_per_unit/aux_unit/aux_rate/category/safety_stock 锁死（只读 + "去主数据修改"链接；safety_stock 由 P0-12 重算写入）；**价格（unit_cost/selling_price）暂留本仓可改** —— P0-9 未实施前锁死会让已纳管品项没有价格维护出口 | 中   |
-| 2  | 删除拦截              | `items.py:238-259`                                                                                      | 已绑定 canonical_id 的行拒绝删除，提示走主数据 deactivate                                                                                                                                                                                                                                                                                                                                                                                  | 低   |
-| 3  | 批量导入收口            | `import_items.py`                                                                               | 废除 DELETE+INSERT；改为「只更新本仓已存在品项的进货单价」，按 (品类名, 品项名) 匹配，未匹配行跳过并回报；不新建品项/品类（新品须先在主数据建档）；不写 safety_stock                                                                                                                                                                                                                                                                                                  | 中   |
-| 4  | 配方发布纳管校验      | `recipe_cost.py` + `publish_recipe_pure.py`                                                              | 发布前用 `list_unmanaged_bom_items()` 校验 BOM 品项全部已纳管，未纳管拒绝并列出清单+纳管指引；确保品项存在改用 `action="keep"`（已存在的行一个字段都不覆盖）；快照带 `canonical_id`，目标仓按主数据身份匹配，不再按 sku 重复建行                                                                                                                                                                                                                                                                                              | 中   |
-| 5  | 下线 /items/publish | `items.py:323-385`                                                                                      | **已拍板：直接下线**。route 重定向到 /canonical/fanout，历史页保留只读                                                                                                                                                                                                                                                                                                                                                                          | 低   |
-| 6  | 主数据维护权限收紧         | `canonical.py:113-160`                                                                                  | `/canonical/edit`、claim-requests review 由 manager 收紧到 platform admin（is_admin）                                                                                                                                                                                                                                                                                                                                             | 低   |
-| 7  | 扇出范围补 rd          | `canonical_pure.py:2451-2453`                                                                           | ALIGN_SCOPE 加入 rd_001（研发副本跟随主数据更新）；扇出 UI 目标仓列表（`canonical.py:479-482`）同步加 rd                                                                                                                                                                                                                                                                                                                                               | 低   |
-| 8  | 收货建行修正            | `store_ordering_pure.py:1736-1743`                                                                      | 保留自动建行（数据取自 canonical，方向正确），unit 硬编码 `'件'` 改用 canonical.unit                                                                                                                                                                                                                                                                                                                                                               | 低   |
-| 9  | ~~价格收归主数据~~（**本轮未实施**）       | `config.py:84-109` CANONICAL_POLICY + `canonical_pure.py:164-193`                                       | **owner 2026-10-09 裁决：先不动价格。** 原计划① Q6 由 `storefront_autonomous` 改 `canonical_managed`；② `NEVER_TOUCH_COLUMNS` 移除两列价格；③ `/canonical/edit` 与 bulk-import 启用价格编辑（列已存在）；④ 门店/rd 侧价格锁死；⑤ 冲突 freeze 对价格生效；⑥ 启用 `price_follow_canonical`。**切换前提仍是先做存量价格回填**，届时另行评审 | 中高  |
-| 10 | **单仓品项启停开关**      | `db/__init__.py` migrate + `canonical.py` / `items.py` + `templates/canonical/detail.html`、`items.html` | ① 门店 items 幂等加列 `is_active INTEGER DEFAULT 1`（migrate 内加，`WAREHOUSE_SCHEMA_VERSION` 升到 2）；② 管理员入口两处：主数据详情页跨仓绑定列表按仓「停用/启用」、门店品项页已绑定行加「停用/启用」按钮（均 platform admin）；③ 停用行在出库/入库/生产/盘点/调整/订货选择点排除，历史记录与报表保留，库存不丢（Q7 精神）；④ 停用时库存 >0 仅软提示不硬拦；⑤ `is_active` 属本仓字段，进 `NEVER_TOUCH_COLUMNS`，扇出永不覆盖                                                                                                                                                                                                    | 中   |
-| 11 | **主数据批量统一修改**     | `canonical.py` + `canonical_pure.py` + `templates/canonical/list.html`                                                        | `/canonical/list` 加勾选多行 →「批量统一修改」：对选中品项统一设置某字段（品类/单位/克重/辅单位/辅单位换算率）→ 保存 → 自动跳到扇出页并预选这些项。批量与单条走同一个 `update_canonical_item()`，不另开写路径；**价格字段不在批量范围**（P0-9 未实施）                                                                                                                                                                                                                                                                                                         | 中   |
-| 12 | **安全库存自动计算**      | pure 层新增 `recompute_safety_stocks()` + `items.py` 按钮 + CLI                                              | **规则（Eric 2026-10-09 拍板）：`safety_stock = Σ近7天出库量 × 1.2`；该品项出库历史覆盖不满 7 天窗口 → 写 0。** ① 消耗口径与采购建议/预测一致（`outbound_requests` 非 rolled_back 合计，参照 `procurement.py:141-152` 的 `_outbound_30d_sum` 改 7 天窗口）；② 覆盖判定：该行最早非 rollback 出库时间早于 `now-7d` 才算"有 7 天数据"，否则 0；③ 落库到各仓 items.safety_stock，按钮「重算安全库存」（platform admin，放各仓「品类与品项」页头）+ CLI 命令（后续可挂每日定时）；④ 系数 1.2 / 窗口 7 天进 config 常量便于调参；⑤ 扇出 NEVER_TOUCH safety_stock；⑥ 该字段对各角色只读 | 中   |
+| #  | 改造点                    | 位置                                                                                                      | 改法                                                                                                                                                                                                                                                                                                                                                                                                                         | 复杂度 |
+| -- | ---------------------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
+| 1  | 编辑页拆字段                 | `items.py` + `templates/edit_item.html`                                                                 | 已绑定行：name/unit/gram_per_unit/aux_unit/aux_rate/category/safety_stock 锁死（只读 + "去主数据修改"链接；safety_stock 由 P0-12 重算写入）；**价格（unit_cost/selling_price）暂留本仓可改** —— P0-9 未实施前锁死会让已纳管品项没有价格维护出口                                                                                                                                                                                                                                     | 中   |
+| 2  | 删除拦截                   | `items.py:238-259`                                                                                      | 已绑定 canonical_id 的行拒绝删除，提示走主数据 deactivate                                                                                                                                                                                                                                                                                                                                                                                  | 低   |
+| 3  | 批量导入收口                 | `import_items.py`                                                                                       | 废除 DELETE+INSERT；改为「只更新本仓已存在品项的进货单价」，按 (品类名, 品项名) 匹配，未匹配行跳过并回报；不新建品项/品类（新品须先在主数据建档）；不写 safety_stock                                                                                                                                                                                                                                                                                                                        | 中   |
+| 4  | 配方发布纳管校验               | `recipe_cost.py` + `publish_recipe_pure.py`                                                             | 发布前用 `list_unmanaged_bom_items()` 校验 BOM 品项全部已纳管，未纳管拒绝并列出清单+纳管指引；确保品项存在改用 `action="keep"`（已存在的行一个字段都不覆盖）；快照带 `canonical_id`，目标仓按主数据身份匹配，不再按 sku 重复建行                                                                                                                                                                                                                                                                       | 中   |
+| 5  | 下线 /items/publish      | `items.py:323-385`                                                                                      | **已拍板：直接下线**。route 重定向到 /canonical/fanout，历史页保留只读                                                                                                                                                                                                                                                                                                                                                                          | 低   |
+| 6  | 主数据维护权限收紧              | `canonical.py:113-160`                                                                                  | `/canonical/edit`、claim-requests review 由 manager 收紧到 platform admin（is_admin）                                                                                                                                                                                                                                                                                                                                             | 低   |
+| 7  | 扇出范围补 rd               | `canonical_pure.py:2451-2453`                                                                           | ALIGN_SCOPE 加入 rd_001（研发副本跟随主数据更新）；扇出 UI 目标仓列表（`canonical.py:479-482`）同步加 rd                                                                                                                                                                                                                                                                                                                                               | 低   |
+| 8  | 收货建行修正                 | `store_ordering_pure.py:1736-1743`                                                                      | 保留自动建行（数据取自 canonical，方向正确），unit 硬编码 `'件'` 改用 canonical.unit                                                                                                                                                                                                                                                                                                                                                               | 低   |
+| 9 ✅ | **价格收归主数据** | `config.py` CANONICAL_POLICY + `blueprints/canonical_pure.py` | **已实施（2026-10-09）**：① Q6 改 `canonical_managed`；② `NEVER_TOUCH_COLUMNS` 移除 selling_price/unit_cost（价格进 `CANONICAL_FIELD_POLICY` 可下发集 / `SYNCABLE_ITEM_FIELDS` / `BATCH_EDITABLE_FIELDS`），`STOREFRONT_OWNED_FIELDS` 同步降为 4 项，全部由 `is_syncable_field()` 一处开关驱动；③ `/canonical/edit` + `/canonical/batch-edit` 支持价格（留空 = 未定价）；④ 门店/rd 侧价格锁死（`items.py` 已绑定行整体忽略表单；`edit_item.html` 只读）；⑤ Q4=freeze 对价格同样生效；⑥ **NULL 守卫**：主数据未定价不下发、保留门店现价；⑦ 「存量价格回填」（全仓最高价）+ 扇出 INSERT 也带价；⑧ 配方发布 / 导入不再直写门店价。~~price_follow_canonical 跟随开关~~ 不做：价格全额收归、门店无编辑权，无逐店「跟随」需求 | 中高  |
+| 10 | **单仓品项启停开关**           | `db/__init__.py` migrate + `canonical.py` / `items.py` + `templates/canonical/detail.html`、`items.html` | ① 门店 items 幂等加列 `is_active INTEGER DEFAULT 1`（migrate 内加，`WAREHOUSE_SCHEMA_VERSION` 升到 2）；② 管理员入口两处：主数据详情页跨仓绑定列表按仓「停用/启用」、门店品项页已绑定行加「停用/启用」按钮（均 platform admin）；③ 停用行在出库/入库/生产/盘点/调整/订货选择点排除，历史记录与报表保留，库存不丢（Q7 精神）；④ 停用时库存 >0 仅软提示不硬拦；⑤ `is_active` 属本仓字段，进 `NEVER_TOUCH_COLUMNS`，扇出永不覆盖                                                                                                                                   | 中   |
+| 11 | **主数据批量统一修改**          | `canonical.py` + `canonical_pure.py` + `templates/canonical/list.html`                                  | `/canonical/list` 加勾选多行 →「批量统一修改」：对选中品项统一设置某字段（品类/单位/克重/辅单位/辅单位换算率）→ 保存 → 自动跳到扇出页并预选这些项。批量与单条走同一个 `update_canonical_item()`，不另开写路径；**价格字段不在批量范围**（P0-9 未实施）                                                                                                                                                                                                                                                                | 中   |
+| 12 | **安全库存自动计算**           | pure 层新增 `recompute_safety_stocks()` + `items.py` 按钮 + CLI                                              | **规则（Eric 2026-10-09 拍板）：`safety_stock = Σ近7天出库量 × 1.2`；该品项出库历史覆盖不满 7 天窗口 → 写 0。** ① 消耗口径与采购建议/预测一致（`outbound_requests` 非 rolled_back 合计，参照 `procurement.py:141-152` 的 `_outbound_30d_sum` 改 7 天窗口）；② 覆盖判定：该行最早非 rollback 出库时间早于 `now-7d` 才算"有 7 天数据"，否则 0；③ 落库到各仓 items.safety_stock，按钮「重算安全库存」（platform admin，放各仓「品类与品项」页头）+ CLI 命令（后续可挂每日定时）；④ 系数 1.2 / 窗口 7 天进 config 常量便于调参；⑤ 扇出 NEVER_TOUCH safety_stock；⑥ 该字段对各角色只读 | 中   |
 
 ### P1 — 存量清洗与同步补齐
 
@@ -110,7 +111,7 @@ canonical_items (master.db)      ← 唯一维护入口 /canonical/*（platform 
 
 | 风险                | 说明                                   | 缓解                                                                                                      |
 | ----------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------- |
-| **价格切换冲击**（P0-9）  | 门店现有售价与主数据（当前全 0 或空）不一致，直接扇出会把门店价格清零 | **先做价格回填**：以各仓现行价格为基准裁决出统一价写入 canonical_items（`/canonical/bulk-import` 或脚本），再开 Q6=canonical_managed 并扇出 |
+| **价格切换冲击**（P0-9）  | 门店现有售价与主数据（改造前全 NULL）不一致，直接扇出会把门店价格清零 | ✅ **已缓解（2026-10-09）**：① 新增「价格回填」——一键把各仓现行价按**全仓最高价**写入 canonical_items（列表页按钮 / CLI `backfill-prices`），dev 数据实测 102 项 / 202 字段可回填、23 项无值；② 扇出加 **NULL 守卫**——主数据未定价时不下发、保留门店现价，即使漏做回填也不会清零 |
 | 配方发布行为变化          | P0-4 后，BOM 品项未纳管的配方将无法发布             | 先跑预检脚本列出受影响配方，主数据补齐后再切拦截                                                                                |
 | 门店编辑页 UX          | 主数据字段+价格变只读，管理员可能困惑                  | 只读字段旁给"去主数据修改"跳转                                                                                        |
 | freeze 冲突爆量       | P1 清洗时 wh_002/003 大量行会进冲突队列（含价格）     | 冲突裁决页支持批量按 canonical 覆盖                                                                                 |
@@ -128,20 +129,22 @@ canonical_items (master.db)      ← 唯一维护入口 /canonical/*（platform 
 
 ## 5. 决策记录（2026-10-09 owner 拍板）
 
-- **A. 价格归属：~~收归主数据~~ → 本轮不动**（2026-10-09 owner 二次裁决：先不管价格）。原决议为"推翻 Q6、收归主数据"，因切换需先做存量价格回填（数据操作），owner 决定本轮跳过；因此 **P0-1 不再锁死价格**、P0-11 批量修改不含价格字段。P0-9 的完整设计保留在本文件 §3，待后续单独评审。
+- **A. 价格归属：收归主数据**（2026-10-09 owner 最终裁决，推翻 Q6 storefront_autonomous）。selling_price/unit_cost 在 /canonical 维护、扇出下发；门店/rd 不再改价格。配套两条子决策见下。
+  - **A-1 存量回填口径：取「全仓最高价」**。遍历所有仓（含配送中心 wh_000 / 研发 rd_001）该主数据全部绑定行的售价、进货价，各取**最高非零值**写入 `canonical_items`；全部为空/0 → 保持 NULL。默认只填空值、不覆盖已录入的价（CLI `--overwrite` 可强制）。
+  - **A-2 空价守卫：主数据价为 NULL 时不下发**。NULL = 「主数据未定价」，扇出跳过该字段、保留门店现行价，**绝不把门店价清 0**；主数据填了具体值（含 0）才下发。NULL 也从不写进 `canonical_synced_json`。
 - **B. /items/publish：直接下线**，统一走 canonical 扇出。
 - **C. safety_stock：系统自动算**（2026-10-09 二次裁决，覆盖原"归本仓手工"），规则 `Σ近 7 天消耗 × 1.2`，不足 7 天窗口写 0；各角色只读。
 - **D. wh_001：本轮排除**，维持设计文档原范围（wh_000/002/003/004/006 + rd_001），后续单独处理。
 
 ### 实施进度（2026-10-09）
 
-| 批次 | 内容 | 状态 |
-|---|---|---|
-| 批1+2 | P0-12 安全库存自动算、P0-1 编辑页拆字段、P0-2 禁删、P0-6 权限收紧 | ✅ `4b6cfd9` |
-| 批3 | P0-5 旧通道下线、P0-7 扇出补 rd、P0-8 收货单位 | ✅ `5a70f2e` |
-| 批4 | P0-3 导入收口、P0-4 配方发布纳管校验、P0-10 单仓启停、P0-11 批量统一修改 | ✅ 本轮 |
-| 待办 | P0-9 价格收归（需先价格回填，owner 已决定暂缓） | ⏸ 暂缓 |
-| 待办 | P1 存量清洗（名称漂移 / 双主数据合并 / is_store_exclusive 归零） | ⏸ 未开工 |
+| 批次   | 内容                                              | 状态          |
+| ---- | ----------------------------------------------- | ----------- |
+| 批1+2 | P0-12 安全库存自动算、P0-1 编辑页拆字段、P0-2 禁删、P0-6 权限收紧     | ✅ `4b6cfd9` |
+| 批3   | P0-5 旧通道下线、P0-7 扇出补 rd、P0-8 收货单位                | ✅ `5a70f2e` |
+| 批4   | P0-3 导入收口、P0-4 配方发布纳管校验、P0-10 单仓启停、P0-11 批量统一修改 | ✅ `8fb5ab9` |
+| 批5   | P0-9 价格收归（Q6 开关 + 全链路价格 + 存量回填 + 门店锁死） | ✅ 本轮 |
+| 待办   | P1 存量清洗（名称漂移 / 双主数据合并 / is_store_exclusive 归零）  | ⏸ 未开工       |
 
 ### 实施顺序建议
 
@@ -168,34 +171,38 @@ canonical_items (master.db)      ← 唯一维护入口 /canonical/*（platform 
 1. 「品项主数据」列表 → 点品项 → 编辑（名称/单位/克重）→ 保存
 2. 「扇出」下发到受影响仓
 3. 若目标仓有本地改动 → 「冲突」页出现记录 → 批量"按主数据覆盖"
-4. 价格（成本/售价）暂不在主数据维护（P0-9 未实施），仍在各仓「品类与品项」页改
+4. 价格（成本/售价）已在「品项主数据」维护（P0-9）：编辑页填售价/进货价（留空 = 未定价）→ 扇出下发；门店/rd 只读
 
 **批量统一修改（P0-11）：**
 
-「品项主数据」列表 → 勾选多行（表头全选）→ 底部「批量统一修改」选字段（品类/单位/克重/辅单位/辅单位换算率）→ 填统一值 → 保存 → 自动跳到「扇出」页且已预选刚改的这些项 → 勾目标仓 → 执行。
+「品项主数据」列表 → 勾选多行（表头全选）→ 底部「批量统一修改」选字段（品类/单位/克重/辅单位/辅单位换算率/销售单价/进货单价）→ 填统一值 → 保存 → 自动跳到「扇出」页且已预选刚改的这些项 → 勾目标仓 → 执行。
 
 **停用品项（两种粒度，注意区分）：**
 
-| 粒度                   | 操作                             | 影响范围                                                    |
-| -------------------- | ------------------------------ | ------------------------------------------------------- |
-| **全公司停用**            | 品项详情页 →「停用」                    | 所有仓随扇出标 `canonical_status=inactive`，历史业务数据全保留，无物理删除（Q3） |
-| **单仓停用**（P0-10） | ① 品项详情页 → 跨仓绑定列表 → 目标门店行 →「停用」<br>② 或切到该门店仓「品类与品项」页 → 该行「停用」 | 仅该门店：出库/入库/生产/盘点/调整/订货目录中不再出现，历史记录与报表保留，库存不动；恢复用同位置「启用」        |
+| 粒度              | 操作                                                             | 影响范围                                                    |
+| --------------- | -------------------------------------------------------------- | ------------------------------------------------------- |
+| **全公司停用**       | 品项详情页 →「停用」                                                    | 所有仓随扇出标 `canonical_status=inactive`，历史业务数据全保留，无物理删除（Q3） |
+| **单仓停用**（P0-10） | ① 品项详情页 → 跨仓绑定列表 → 目标门店行 →「停用」<br />② 或切到该门店仓「品类与品项」页 → 该行「停用」 | 仅该门店：出库/入库/生产/盘点/调整/订货目录中不再出现，历史记录与报表保留，库存不动；恢复用同位置「启用」 |
 
 单仓停用时若该门店仍有库存余量，页面软提示建议先出清或盘点归零，不硬拦。
 
-**价格回填（一次性操作，切 Q6 开关前）：** 「批量导入主数据」页上传 CSV（列：canonical_sku, unit_cost, selling_price）灌入各仓现行价。
+**价格回填（一次性操作，切 Q6 开关前 —— P0-9 已实现）：**
+
+1. 「品项主数据」列表页右上角 →「💴 价格回填（各仓→主数据）」→ 二次确认后一键执行；或 CLI `flask --app app backfill-prices`（`--dry-run` 只看结果、`--overwrite` 强制覆盖已有值）。
+2. 口径 = **全仓最高价**（见 §5 A-1）；默认只填空值，不动已录入的价。
+3. 回填后回列表核对「售价 / 成本」两列 → 进「扇出」页勾选目标仓下发。
 
 ### 6.2 门店（manager/admin）— 主数据只读 + 本仓参数
 
-| 操作                  | 改造前         | 改造后                    |
-| ------------------- | ----------- | ---------------------- |
-| 新增品项                | 平台管理员在门店仓可建 | ✗ 拦截页引导「从主数据选」或「提新增申请」 |
-| 改名称/单位/克重/品类        | 可           | ✗ 只读，字段旁「去主数据修改」跳转     |
-| 改售价/成本              | 可           | ✓ 暂保留（价格收归主数据 P0-9 未实施） |
-| 删除品项                | 可           | ✗ 已绑定行拒绝，提示走主数据停用      |
+| 操作                  | 改造前         | 改造后                              |
+| ------------------- | ----------- | -------------------------------- |
+| 新增品项                | 平台管理员在门店仓可建 | ✗ 拦截页引导「从主数据选」或「提新增申请」           |
+| 改名称/单位/克重/品类        | 可           | ✗ 只读，字段旁「去主数据修改」跳转               |
+| 改售价/成本              | 可           | ✗ 只读（已收归主数据，P0-9）               |
+| 删除品项                | 可           | ✗ 已绑定行拒绝，提示走主数据停用                |
 | 改安全库存               | 可           | ✗ 只读（系统按近 7 天消耗 × 1.2 自动算，P0-12） |
-| 单仓停用/启用品项          | 无此能力        | ✓ 平台管理员在「品类与品项」页按行「停用/启用」（P0-10） |
-| 库存操作（盘点/出入库/生产/收发货） | —           | ✓ 完全不变                 |
+| 单仓停用/启用品项           | 无此能力        | ✓ 平台管理员在「品类与品项」页按行「停用/启用」（P0-10） |
+| 库存操作（盘点/出入库/生产/收发货） | —           | ✓ 完全不变                           |
 
 **想要主数据里没有的新品项：**
 
@@ -218,7 +225,7 @@ canonical_items (master.db)      ← 唯一维护入口 /canonical/*（platform 
                                                         ├──▶ 门店行自动出现(AUTO-IC-*)
                                                         └──▶ rd 镜像同步
 日常字段/价格变更：/canonical 编辑 ──▶ 扇出 ──▶ 冲突页裁决 ──▶ 全仓一致
-门店自留权限：库存操作、is_store_exclusive、DC 可订开关、价格（暂，待 P0-9）
+门店自留权限：库存操作、is_store_exclusive、DC 可订开关、单仓启停
 门店只读：名称/品类/单位/克重/辅单位（主数据字段）、安全库存（系统计算）
 单仓粒度：主数据详情页 / 门店「品类与品项」页按仓「停用/启用」（P0-10）
 ```
@@ -236,22 +243,22 @@ ruff check . --output-format=concise | sed 's/:[0-9]*:[0-9]*:/:/' | sort > /tmp/
 
 ### 7.2 随写随验（每个收口点至少一条策略测试）
 
-新增 `tests/test_master_data_unify.py`（已落地 16 条）+ `tests/test_publish_recipe_pure.py` / `tests/test_import_items_route.py`，覆盖 11 个收口点：
+新增 `tests/test_master_data_unify.py`（20 条）+ `tests/test_price_managed.py`（10 条）+ `tests/test_publish_recipe_pure.py` / `tests/test_import_items_route.py`，覆盖 11 个收口点：
 
-| #  | 测试用例                                                                        | 落点 |
-| -- | --------------------------------------------------------------------------- | --- |
-| 1  | 已绑定行 POST `/items/<id>/edit` 改 name/unit → 忽略表单；价格仍可改；safety_stock 不采信表单 | `test_master_data_unify` |
-| 2  | 删除已绑定 canonical_id 的行 → 拒绝；未绑定行 → 放行                          | 同上 |
-| 3  | import-items：新 sku/新品类 → 不落库；匹配行只改单价；历史流水保留 | `test_import_items_route` |
-| 4  | 配方发布含未纳管 BOM 品项 → 拒绝 + 清单，且不产生 publish event | `test_publish_recipe_pure` |
-| 5  | POST `/items/publish` → 302 重定向 /canonical/fanout                           | `test_publish_item_route` |
-| 6  | 门店 manager 访问 `/canonical/edit`、`/canonical/batch-edit` → 403；platform admin → 放行          | `test_master_data_unify` |
-| 7  | 扇出目标含 rd_001（ALIGN_SCOPE） | `test_align_canonical_cli` |
-| 8  | ~~Q6 价格下发~~（P0-9 暂缓，无测试） | — |
-| 9  | 收货自动建行 unit 取 canonical.unit（不再硬编码 '件'） | `test_store_ordering_receive` |
-| 10 | 单仓启停：停用后 is_active=0、库存不动、出库选择点消失；manager 403；`/canonical/binding-active`；旧库迁移补列；`NEVER_TOUCH` 拦截 `is_active` | `test_master_data_unify` |
-| 11 | 批量统一修改：字段生效 + 跳扇出预选；价格字段被拒；派生关系（辅单位非克 → 克重归零） | `test_master_data_unify` |
-| 12 | 安全库存自动算：Σ近 7 天消耗 × 1.2 / 不足窗口写 0 / 回退与生产领料口径 | `test_safety_stock_pure` |
+| #  | 测试用例                                                                                                          | 落点                            |
+| -- | ------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| 1  | 已绑定行 POST `/items/<id>/edit` 改 name/unit/价格 → 全部忽略表单；safety_stock 不采信表单                                      | `test_master_data_unify`      |
+| 2  | 删除已绑定 canonical_id 的行 → 拒绝；未绑定行 → 放行                                                                          | 同上                            |
+| 3  | import-items：新 sku/新品类 → 不落库；匹配行只改单价；历史流水保留                                                                   | `test_import_items_route`     |
+| 4  | 配方发布含未纳管 BOM 品项 → 拒绝 + 清单，且不产生 publish event                                                                  | `test_publish_recipe_pure`    |
+| 5  | POST `/items/publish` → 302 重定向 /canonical/fanout                                                             | `test_publish_item_route`     |
+| 6  | 门店 manager 访问 `/canonical/edit`、`/canonical/batch-edit` → 403；platform admin → 放行                             | `test_master_data_unify`      |
+| 7  | 扇出目标含 rd_001（ALIGN_SCOPE）                                                                                     | `test_align_canonical_cli`    |
+| 8  | Q6=canonical_managed 下发售价/成本；NULL 守卫保留门店价；漂移进 freeze；回填取全仓最高价 | `test_price_managed` |
+| 9  | 收货自动建行 unit 取 canonical.unit（不再硬编码 '件'）                                                                       | `test_store_ordering_receive` |
+| 10 | 单仓启停：停用后 is_active=0、库存不动、出库选择点消失；manager 403；`/canonical/binding-active`；旧库迁移补列；`NEVER_TOUCH` 拦截 `is_active` | `test_master_data_unify`      |
+| 11 | 批量统一修改：字段生效 + 跳扇出预选；价格字段生效；派生关系（辅单位非克 → 克重归零）                                                                 | `test_master_data_unify`      |
+| 12 | 安全库存自动算：Σ近 7 天消耗 × 1.2 / 不足窗口写 0 / 回退与生产领料口径                                                                  | `test_safety_stock_pure`      |
 
 ### 7.3 全量回归对比（项目既定 SOP）
 
@@ -261,12 +268,11 @@ comm -13 /tmp/ruff_before /tmp/ruff_after          # 空 = 无新增告警
 diff /tmp/before_fails /tmp/after_fails            # 空 = 失败集不变（18 个 pre-existing 除外）
 ```
 
-
 ```
 
 ### 7.4 GUI 冒烟（dev 容器 wdg-systemd :8080，手工点击清单）
 
-1. **admin 登录 → 切仓 wh_002**：「品类与品项」页 → 新增被拦（引导页）、点编辑看名称/单位只读（价格仍可改）、删除被拒；点「重算安全库存」看 flash 统计
+1. **admin 登录 → 切仓 wh_002**：「品类与品项」页 → 新增被拦（引导页）、点编辑看名称/单位/价格全只读、删除被拒；点「重算安全库存」看 flash 统计
 2. **主数据链路**：`/canonical/edit` 建测试品项 → fanout 到 wh_002 → 切回 wh_002 确认新行出现
 3. **批量统一修改**：`/canonical/list` 勾 2 行 → 批量统一修改「单位=箱」→ 确认跳到扇出页且已预选
 4. **门店 manager（xsj）登录**：`/canonical/edit`、`/canonical/batch-edit` 应 403

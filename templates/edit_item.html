@@ -3,11 +3,15 @@
 <h2>编辑库存品</h2>
 {% if bound %}
 <p class="hint">
-  该品项已纳入主数据：名称 / 品类 / 单位 / 辅单位 / 克重由「品项主数据」统一维护，安全库存由系统按消耗自动计算。
-  价格（进货单价 / 销售单价）暂由本仓维护。
+  该品项已纳入主数据：名称 / 品类 / 单位 / 辅单位 / 克重 / <strong>售价 / 进货价</strong>
+  均由「品项主数据」统一维护并扇出下发；安全库存由系统按消耗自动计算。本页只读。
+  {% if g.user and g.user['is_admin'] %}
+  <a href="{{ url_for('canonical.canonical_edit', canonical_id=item.canonical_id) }}" class="btn-sm">去主数据修改</a>
+  {% else %}
   <a href="{{ url_for('canonical.canonical_detail', canonical_id=item.canonical_id) }}" class="btn-sm">去主数据查看</a>
+  {% endif %}
 </p>
-<form method="post" class="grid cols-3">
+<div class="grid cols-3">
   <label>
     <span>品项名称（主数据）</span>
     <input value="{{ item.name }}" disabled />
@@ -25,12 +29,12 @@
     <input value="{{ item.safety_stock }}" disabled />
   </label>
   <label>
-    <span>进货单价（¥）</span>
-    <input name="unit_cost" type="number" min="0" step="0.001" value="{{ item.unit_cost or 0 }}" />
+    <span>进货单价（¥，主数据）</span>
+    <input value="{{ '%.3f'|format(item.unit_cost) if item.unit_cost else '未定价' }}" disabled />
   </label>
   <label>
-    <span>销售单价（¥）</span>
-    <input name="selling_price" type="number" min="0" step="0.001" value="{{ '%.3f'|format(item.selling_price) if item.selling_price else '0' }}" />
+    <span>销售单价（¥，主数据）</span>
+    <input value="{{ '%.3f'|format(item.selling_price) if item.selling_price else '未定价' }}" disabled />
   </label>
   <label>
     <span>单位（主数据）</span>
@@ -45,8 +49,7 @@
     <input value="{{ item.aux_rate or 0 }}" disabled />
   </label>
   <a href="{{ url_for('items.items_list') }}" class="btn-cancel">返回</a>
-  <button type="submit">保存价格</button>
-</form>
+</div>
 {% else %}
 <form method="post" class="grid cols-3">
   <label>

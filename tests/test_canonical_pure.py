@@ -348,13 +348,21 @@ class TestAssertNoNeverTouch:
     @pytest.mark.parametrize(
         "bad_field",
         ["quantity", "safety_stock", "initial_quantity", "id", "sku",
-         "selling_price", "unit_cost", "category_id"],
+         "category_id", "is_orderable", "is_active"],
     )
     def test_each_never_touch_field_is_blocked(self, bad_field):
         from blueprints import canonical_pure as cp
 
         with pytest.raises(cp.NeverTouchViolation):
             cp.assert_no_never_touch({bad_field: 1})
+
+    @pytest.mark.parametrize("price_field", ["selling_price", "unit_cost"])
+    def test_price_not_never_touch_when_canonical_managed(self, price_field):
+        """P0-9：Q6=canonical_managed 时价格离开门禁集，可下发。"""
+        from blueprints import canonical_pure as cp
+
+        assert price_field not in cp.NEVER_TOUCH_COLUMNS
+        cp.assert_no_never_touch({price_field: 1.5})   # 不抛异常 = 可写
 
 
 class TestBuildUpdateSql:
@@ -743,8 +751,8 @@ class TestIsSyncableField:
             ("status",        True),    # overwritable (writes canonical_status)
             ("category_code", False),   # mapping_only
             ("barcode",       False),   # not_synced (P0)
-            ("selling_price", False),   # Q6 默认不在 → 不下发
-            ("unit_cost",     False),   # Q6 默认不在 → 不下发
+            ("selling_price", True),    # P0-9：Q6=canonical_managed → 可下发
+            ("unit_cost",     True),    # P0-9：Q6=canonical_managed → 可下发
             ("quantity",      False),   # 门禁字段 → 必须 False
             ("safety_stock",  False),
             ("initial_quantity", False),

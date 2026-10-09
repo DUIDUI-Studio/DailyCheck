@@ -273,15 +273,18 @@ def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
     after = wh.execute("SELECT COUNT(*) AS c FROM items WHERE sku='SKU-SUGAR'").fetchone()["c"]
     assert after == 1
     row = wh.execute("SELECT * FROM items WHERE sku='SKU-SUGAR'").fetchone()
-    assert float(row["unit_cost"]) == 1.0
+    # P0-9（2026-10-09）：价格收归主数据 —— 配方发布 INSERT 新行不再写价格
+    # （走 items 默认 0），价格由 canonical 扇出统一下发。
+    assert float(row["unit_cost"]) == 0.0
+    assert float(row["selling_price"]) == 0.0
     wh.commit(); wh.close()
 
 
 def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
     """Canonical Item M2 (T12) — overwrite now updates name/unit/unit_family
     but no longer touches unit_cost / selling_price / safety_stock (§7.2).
-    Q6=storefront_autonomous (default) keeps pricing fields as storefront-
-    owned; this test verifies the new behaviour."""
+    P0-9（2026-10-09）后价格收归主数据，由 canonical 扇出下发，配方发布
+    仍不是价格通道；本测试锁定「发布不覆盖门店价」这一不变式。"""
     import sqlite3
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)

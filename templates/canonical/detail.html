@@ -21,6 +21,15 @@
   <tr><th>gram_per_unit</th><td>{{ canonical['gram_per_unit'] }}</td></tr>
   <tr><th>aux_unit / aux_rate</th><td>{{ canonical['aux_unit'] or '—' }} / {{ canonical['aux_rate'] }}</td></tr>
   <tr><th>barcode</th><td>{{ canonical['barcode'] or '—' }}</td></tr>
+  <tr>
+    <th>销售单价 / 进货单价</th>
+    <td>
+      {{ ('%.3f'|format(canonical['selling_price'])) if canonical['selling_price'] is not none else '未定价' }}
+      /
+      {{ ('%.3f'|format(canonical['unit_cost'])) if canonical['unit_cost'] is not none else '未定价' }}
+      {% if g.user and g.user['is_admin'] %}<small>（收归主数据，扇出下发）</small>{% endif %}
+    </td>
+  </tr>
   <tr><th>状态</th><td>{{ canonical['status'] }}</td></tr>
   <tr><th>created_from</th><td>{{ canonical['created_from'] }}</td></tr>
   <tr><th>created_at</th><td>{{ canonical['created_at'] }}</td></tr>

@@ -181,37 +181,20 @@ def edit_item(item_id: int):
     if old is None:
         from flask import abort
         abort(404)
-    # P0-1 主数据收口：已绑定 canonical 的行，名称/品类/单位/辅单位/克重
-    # 统一由「品项主数据」维护，本页服务端强制忽略表单里的这些字段。
+    # P0-1 + P0-9 主数据收口：已绑定 canonical 的行，名称/品类/单位/辅单位/
+    # 克重/售价/进货价 全部由「品项主数据」维护，本页服务端强制忽略表单里的
+    # 这些字段（价格自 2026-10-09 收归主数据，见方案 P0-9）。
     bound = old["canonical_id"] is not None
 
     if request.method == "POST":
-        # 已纳管行：只放行「价格」这一对本仓字段。
-        # ⚠️ 价格收归主数据（P0-9）尚未实施（2026-10-09 owner 决定先不动价格），
-        # 若此处一并锁死，已纳管品项将没有任何价格维护出口 —— 所以本仓保留
-        # 进货单价 / 销售单价的可写权，待 P0-9 落地后再随之上锁。
+        # 已纳管行：主数据字段 + 价格一律不采信表单（本仓仅 is_store_exclusive
+        # / is_active 等本仓运营字段可动，且不在本页面提交）。
         if bound:
-            unit_cost = float(request.form.get("unit_cost", old["unit_cost"] or 0) or 0)
-            selling_price = float(
-                request.form.get("selling_price", old["selling_price"] or 0) or 0
+            flash(
+                "该品项已纳入主数据：名称/单位/品类/单位换算/售价/进货价"
+                "均由「品项主数据」统一维护，请到主数据修改后扇出。"
             )
-            if unit_cost < 0 or selling_price < 0:
-                flash("价格不能为负数")
-                return redirect(url_for("items.edit_item", item_id=item_id))
-            sp_updated_at = (
-                now() if selling_price != float(old["selling_price"] or 0) else None
-            )
-            db.execute(
-                """UPDATE items SET unit_cost=?, selling_price=?,
-                   selling_price_updated_at=?, updated_at=? WHERE id=?""",
-                (unit_cost, selling_price, sp_updated_at, now(), item_id),
-            )
-            db.commit()
-            audit("items.update_price", "item", item_id, {
-                "unit_cost": unit_cost, "selling_price": selling_price,
-            })
-            flash("已更新价格；名称/单位/品类等请在「品项主数据」中修改")
-            return redirect(url_for("items.items_list"))
+            return redirect(url_for("items.edit_item", item_id=item_id))
 
         name = request.form.get("name", "").strip()
         category_id = request.form.get("category_id", "").strip()

@@ -89,7 +89,11 @@ def _all_warehouse_conns(master_conn) -> dict[str, sqlite3.Connection]:
 def canonical_list():
     m = get_master_db()
     items = cp.list_canonical_items(m, limit=500)
-    return render_template("canonical/list.html", items=items)
+    return render_template(
+        "canonical/list.html",
+        items=items,
+        price_managed=cp.is_syncable_field("selling_price"),
+    )
 
 
 @bp.route("/detail/<int:canonical_id>")
@@ -117,6 +121,11 @@ def canonical_detail(canonical_id: int):
 def canonical_edit(canonical_id: int | None = None):
     m = get_master_db()
     if request.method == "POST":
+        def _opt_price(key: str) -> float | None:
+            """空串/None → None（主数据未定价）；否则 float（非负校验在 pure 层）。"""
+            raw = (request.form.get(key) or "").strip()
+            return float(raw) if raw else None
+
         try:
             fields = {
                 "name": request.form["name"].strip(),
@@ -128,19 +137,33 @@ def canonical_edit(canonical_id: int | None = None):
                 "barcode": request.form.get("barcode") or None,
                 "status": request.form.get("status", "active"),
             }
+            # Q6=canonical_managed：售价/进货价收归主数据（P0-9）。
+            # is_syncable_field 是开关的唯一真相源 —— 不在这里重复判断 q6。
+            if cp.is_syncable_field("selling_price"):
+                fields["selling_price"] = _opt_price("selling_price")
+                fields["unit_cost"] = _opt_price("unit_cost")
         except (KeyError, ValueError) as e:
             flash(f"表单数据错误: {e}")
             return redirect(url_for("canonical.canonical_edit", canonical_id=canonical_id))
 
         if canonical_id is None:
+            # 新建时不带价格的字段先剔除（create 只接受已知 kwarg）
+            create_fields = {
+                k: v for k, v in fields.items()
+                if k in ("name", "unit", "category_code", "gram_per_unit",
+                         "aux_unit", "aux_rate", "barcode", "status",
+                         "selling_price", "unit_cost")
+            }
             created = cp.create_canonical_item(
                 m,
-                name=fields["name"], unit=fields["unit"],
-                category_code=fields["category_code"],
-                gram_per_unit=fields["gram_per_unit"],
-                aux_unit=fields["aux_unit"], aux_rate=fields["aux_rate"],
-                barcode=fields["barcode"],
-                status=fields["status"],
+                name=create_fields["name"], unit=create_fields["unit"],
+                category_code=create_fields["category_code"],
+                gram_per_unit=create_fields["gram_per_unit"],
+                aux_unit=create_fields["aux_unit"], aux_rate=create_fields["aux_rate"],
+                barcode=create_fields["barcode"],
+                status=create_fields["status"],
+                selling_price=create_fields.get("selling_price"),
+                unit_cost=create_fields.get("unit_cost"),
                 created_from="rd_manual",
                 created_by=g.user["id"] if g.get("user") else None,
             )
@@ -228,7 +251,7 @@ def canonical_binding_active():
 def canonical_batch_edit():
     """P0-11 —— 把勾选的主数据项某字段统一设为同一值（保存后可一键扇出）。
 
-    价格字段不在批量范围内（P0-9 价格收归未实施）。
+    Q6=canonical_managed 后价格（成本/售价）也在此批量范围内。
     """
     m = get_master_db()
     ids = [int(x) for x in request.form.getlist("canonical_ids") if str(x).strip()]
@@ -252,6 +275,48 @@ def canonical_batch_edit():
     return redirect(url_for(
         "canonical.canonical_fanout", ids=",".join(str(i) for i in ids)
     ))
+
+
+@bp.route("/backfill-prices", methods=["POST"])
+@require_platform_admin
+def canonical_backfill_prices():
+    """P0-9 —— 把各仓现行售价/采购价回填进主数据（全仓最高价）。
+
+    切 Q6=canonical_managed 前的一次性动作：主数据价为 NULL 时扇出会清空
+    门店价，所以先把存量价灌进主数据。默认只填空值，不覆盖已录入的价。
+    """
+    m = get_master_db()
+    wh_db_map = _all_warehouse_conns(m)
+    try:
+        result = cp.backfill_prices_from_warehouses(m, wh_db_map, overwrite=False)
+    except Exception as e:  # noqa: BLE001
+        flash(f"价格回填失败: {e}")
+        return redirect(url_for("canonical.canonical_list"))
+    finally:
+        for c in wh_db_map.values():
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if result["filled_count"]:
+        flash(
+            f"价格回填完成：{len(result['filled'])} 个主数据项、"
+            f"{result['filled_count']} 个价格字段已写入（全仓最高价）。"
+            f"另有 {result['skipped_existing']} 个字段因主数据已有值被跳过、"
+            f"{result['no_value']} 个品项各仓无有效价。"
+        )
+    else:
+        flash(
+            f"无可回填的价：{result['skipped_existing']} 个字段主数据已有值，"
+            f"{result['no_value']} 个品项各仓无有效价。"
+        )
+    from blueprints.auth import audit
+    audit("canonical.backfill_prices", "canonical_item", None, {
+        "filled_count": result["filled_count"],
+        "skipped_existing": result["skipped_existing"],
+    })
+    return redirect(url_for("canonical.canonical_list"))
 
 
 # ─────────────────────────────────────────────────────────────────────

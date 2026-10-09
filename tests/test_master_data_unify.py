@@ -1,9 +1,10 @@
 """品项主数据统一改造的策略测试（方案 §7.2）。
 
 覆盖：
-  #1 已绑定行：编辑页主数据字段只读（服务端强制）；价格仍可本仓维护
+  #1 已绑定行：编辑页主数据字段 + 价格只读（服务端强制）
   #2 已绑定行：禁止物理删除；未绑定行仍可删
   #6 主数据维护权限收紧：/canonical/edit 需 platform admin
+  #9 价格收归主数据：批量改价 + 存量价格回填（全仓最高价）
   #10 单仓启停：is_active 可停用/启用、扇出不覆盖、选择点排除
   #11 主数据批量统一修改：字段白名单 + 复用单条写入路径
 """
@@ -116,9 +117,9 @@ def test_edit_bound_item_ignores_master_fields(logged_client):
     assert row["name"] == "主数据品项"      # 未被改写
     assert row["unit"] == "件"              # 未被改写
     assert float(row["safety_stock"]) == 0  # 系统托管，不采信表单
-    # 价格收归主数据（P0-9）未实施 → 价格仍由本仓维护
-    assert float(row["unit_cost"]) == 888
-    assert float(row["selling_price"]) == 777
+    # P0-9：价格收归主数据 → 本页也不采信表单里的价格
+    assert float(row["unit_cost"]) == 5     # 维持原值（种子 unit_cost=5）
+    assert float(row["selling_price"]) == 0
 
 
 def test_edit_bound_item_page_is_readonly(logged_client):
@@ -129,11 +130,13 @@ def test_edit_bound_item_page_is_readonly(logged_client):
     resp = client.get(f"/items/{item_id}/edit")
     assert resp.status_code == 200
     body = resp.data.decode()
-    assert "暂由本仓维护" in body
-    assert "去主数据查看" in body
+    assert "由「品项主数据」统一维护" in body
+    assert "去主数据" in body                  # 提供去主数据的跳转
     assert 'name="name"' not in body          # 没有可提交的名称输入框
     assert 'name="unit"' not in body          # 单位不可提交
-    assert 'name="unit_cost"' in body         # 价格仍可编辑
+    assert 'name="unit_cost"' not in body     # P0-9：价格不再可提交
+    assert 'name="selling_price"' not in body
+    assert "未定价" in body or "0" in body      # 价格以只读文本展示
 
 
 def test_edit_unbound_item_still_updates(logged_client):
@@ -315,11 +318,11 @@ def test_batch_edit_unifies_field_and_redirects_to_fanout(logged_client):
     assert _canonical_row(master_path, c2)["unit"] == "箱"
 
 
-def test_batch_edit_rejects_price_field(logged_client):
-    """价格收归主数据（P0-9）未实施 → 批量修改不接受价格字段。"""
+def test_batch_edit_accepts_price_field(logged_client):
+    """P0-9：价格收归主数据后，批量修改支持售价 / 进货价。"""
     client, wh_path = logged_client
     master_path = wh_path.parent.parent / "master.db"
-    c1 = _seed_canonical(master_path, "不批价格", unit="件")
+    c1 = _seed_canonical(master_path, "批量改价", unit="件")
 
     resp = client.post("/canonical/batch-edit", data={
         "canonical_ids": [str(c1)],
@@ -327,7 +330,24 @@ def test_batch_edit_rejects_price_field(logged_client):
         "value": "99",
     }, follow_redirects=False)
     assert resp.status_code == 302
-    assert _canonical_row(master_path, c1)["selling_price"] in (None, 0)
+    assert float(_canonical_row(master_path, c1)["selling_price"]) == 99.0
+
+
+def test_batch_edit_price_blank_clears_to_null(logged_client):
+    """价格留空 = 主数据未定价（NULL），扇出时不下发。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "清空价", unit="件")
+    conn = sqlite3.connect(master_path)
+    conn.execute("UPDATE canonical_items SET unit_cost=12 WHERE id=?", (c1,))
+    conn.commit()
+    conn.close()
+
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": [str(c1)], "field": "unit_cost", "value": "",
+    })
+    assert resp.status_code == 302
+    assert _canonical_row(master_path, c1)["unit_cost"] is None
 
 
 def test_batch_edit_requires_platform_admin(manager_client):
@@ -336,6 +356,51 @@ def test_batch_edit_requires_platform_admin(manager_client):
         "canonical_ids": ["1"], "field": "unit", "value": "箱",
     })
     assert resp.status_code == 403
+
+
+def test_backfill_prices_route_fills_canonical(logged_client):
+    """P0-9 回填路由：各仓现行价 → canonical_items（全仓最高价）。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "回填路由品", unit="件")
+    item_id, _ = _seed_item(wh_path, "回填路由品", qty=0, unit_cost=0)
+    _bind_canonical(wh_path, item_id, canonical_id=c1)
+    conn = sqlite3.connect(wh_path)
+    conn.execute(
+        "UPDATE items SET selling_price=42, unit_cost=21 WHERE id=?", (item_id,)
+    )
+    conn.commit()
+    conn.close()
+
+    resp = client.post("/canonical/backfill-prices")
+    assert resp.status_code == 302
+    row = _canonical_row(master_path, c1)
+    assert float(row["selling_price"]) == 42.0
+    assert float(row["unit_cost"]) == 21.0
+
+
+def test_canonical_list_and_detail_render_prices(logged_client):
+    """P0-9 模板渲染：列表出价格列 + 回填按钮，详情显示价格。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "渲染品", unit="件")
+    conn = sqlite3.connect(master_path)
+    conn.execute(
+        "UPDATE canonical_items SET selling_price=9.5, unit_cost=4.25 WHERE id=?", (c1,)
+    )
+    conn.commit()
+    conn.close()
+
+    body = client.get("/canonical/list").data.decode()
+    assert "售价" in body and "价格回填" in body
+
+    detail = client.get(f"/canonical/detail/{c1}").data.decode()
+    assert "9.500" in detail and "4.250" in detail
+
+
+def test_backfill_prices_requires_platform_admin(manager_client):
+    client, _ = manager_client
+    assert client.post("/canonical/backfill-prices").status_code == 403
 
 
 def test_batch_edit_aux_unit_clears_gram(logged_client):

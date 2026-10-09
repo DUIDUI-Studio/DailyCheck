@@ -77,9 +77,9 @@ WAREHOUSE_TYPE_DC: str = "distribution_center"
 #
 # Spec: docs/2026-10-03-canonical-item-design.md §1.5, §1.6, §1.8, §7.7.
 # M1 scope: the switches below are Eric's v4 decisions.
-# Q6 (selling_price ownership) remains deferred per §1.5 — defaults to
-# "storefront_autonomous" until Eric retunes after the M1 observation
-# window.
+# Q6 (selling_price ownership) 于 2026-10-09 拍板为 "canonical_managed"：
+# 售价/采购价收归主数据（/canonical 维护 + 扇出下发），门店/rd 只读。
+# 见 docs/2026-10-09-item-master-unify-plan.md §3 P0-9 / §5-A。
 # ─────────────────────────────────────────────────────────────────────
 CANONICAL_POLICY = {
     # Q1 — 门店自建新主数据项
@@ -98,8 +98,8 @@ CANONICAL_POLICY = {
     # Q4 — 扇出冲突策略
     "q4_fanout_conflict": "freeze",              # 「冻结，然后人工处理」(§1.5, §3.5)
 
-    # Q6 — 售价/采购价归属（§1.5 仍未拍板，默认 storefront_autonomous）
-    "q6_price_ownership": "storefront_autonomous",
+    # Q6 — 售价/采购价归属（2026-10-09 拍板：收归主数据统一维护并扇出下发）
+    "q6_price_ownership": "canonical_managed",
 
     # Q7 — 库存数据零丢失（§7.7 — Eric 拍板的最高优先级项）
     "q7_inventory_protection": "strict",

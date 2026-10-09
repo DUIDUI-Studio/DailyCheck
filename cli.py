@@ -16,6 +16,9 @@ Canonical align (issue #11, 2026-10-05):
 
 DC bulk publish to canonical (issue #14, 2026-10-09):
     flask --app app bulk-publish-canonical <dc_code> [--dry-run] [--include-bound]
+
+Price backfill (P0-9, 2026-10-09):
+    flask --app app backfill-prices [--overwrite] [--dry-run]
 """
 from __future__ import annotations
 
@@ -57,6 +60,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(align_apply_cmd)
     app.cli.add_command(bulk_publish_canonical_cmd)
     app.cli.add_command(recompute_safety_stock_cmd)
+    app.cli.add_command(backfill_prices_cmd)
 
 
 @click.command("init-master")
@@ -817,3 +821,60 @@ def recompute_safety_stock_cmd(
             f"{result['zeroed']} 个消耗历史不足 {result['window_days']} 天写 0"
             f"（系数 {result['factor']}）{tag}"
         )
+
+
+@click.command("backfill-prices")
+@click.option(
+    "--overwrite", is_flag=True,
+    help="用回填值覆盖 canonical 现值（默认只填空值，保护已录入的价）。",
+)
+@click.option("--dry-run", is_flag=True, help="只计算不写库（结果照常输出）。")
+def backfill_prices_cmd(overwrite: bool, dry_run: bool) -> None:
+    """P0-9 存量价格回填：各仓现行售价/采购价 → canonical_items（全仓最高价）。
+
+    切 Q6=canonical_managed 前的一次性动作：主数据价为 NULL 时扇出会清空
+    门店价，所以先把存量价灌进主数据。规则见
+    blueprints.canonical_pure.backfill_prices_from_warehouses。
+    """
+    from blueprints import canonical_pure as cp
+
+    with closing(sqlite3.connect(MASTER_DB)) as m:
+        m.row_factory = sqlite3.Row
+        rows = m.execute(
+            "SELECT code, db_path FROM warehouses"
+        ).fetchall()
+
+        wh_map: dict[str, sqlite3.Connection] = {}
+        for row in rows:
+            if not row["db_path"]:
+                continue
+            wh_path = Path(row["db_path"])
+            if not wh_path.is_absolute():
+                wh_path = BASE_DIR / wh_path
+            if not wh_path.exists():
+                continue
+            migrate_warehouse_db_columns(wh_path)
+            wh_map[row["code"]] = sqlite3.connect(wh_path)
+
+        try:
+            result = cp.backfill_prices_from_warehouses(m, wh_map, overwrite=overwrite)
+            if dry_run:
+                m.rollback()
+                for c in wh_map.values():
+                    c.rollback()
+            else:
+                m.commit()
+        finally:
+            for c in wh_map.values():
+                c.close()
+
+    tag = " [dry-run]" if dry_run else ""
+    click.echo(
+        f"回填完成{tag}: {len(result['filled'])} 个主数据项 / "
+        f"{result['filled_count']} 个价格字段已写入；"
+        f"跳过已有值 {result['skipped_existing']} 个、"
+        f"无有效价 {result['no_value']} 个品项。"
+    )
+    for cid, updates in list(result["filled"].items())[:20]:
+        pairs = ", ".join(f"{k}={v:g}" for k, v in updates.items())
+        click.echo(f"  #{cid}: {pairs}")

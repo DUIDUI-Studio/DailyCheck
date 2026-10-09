@@ -390,7 +390,8 @@ def apply_item_to_warehouse(
                    WRITE fields (per Spec §2.2 + §7.2):
                      - INSERT: 写 name/category/unit/gram_per_unit/aux_unit/aux_rate/safety_stock
                      - OVERWRITE: 写 name/category/unit/gram_per_unit/aux_unit/aux_rate
-                       **不写** unit_cost/selling_price/safety_stock(Q4=freeze + Q6=storefront_autonomous)
+                       **不写** unit_cost/selling_price/safety_stock
+                       （Q4=freeze；P0-9 起价格收归主数据，配方发布非价格通道）
     - 'keep':      if item exists, do nothing. else INSERT.
     - 'merge':     UPDATE non-null snapshot fields on existing item,
                    else INSERT.
@@ -432,19 +433,21 @@ def apply_item_to_warehouse(
         ).fetchone()
 
     if existing is None:
+        # P0-9（2026-10-09）：价格收归主数据 —— 配方发布不是价格通道，
+        # INSERT 新行时**不写** unit_cost/selling_price（走 items 默认 0），
+        # 价格由 canonical 扇出统一下发。空值守卫保证主数据未定价时不误清。
         target_conn.execute(
             """INSERT INTO items
                (sku, name, category_id, quantity, safety_stock,
-                unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
-                selling_price, updated_at, canonical_id)
-               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                unit, gram_per_unit, aux_unit, aux_rate,
+                updated_at, canonical_id)
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sku, source_snapshot["name"], cat_id,
                 float(source_snapshot["safety_stock"] or 0),
-                source_snapshot["unit"], float(source_snapshot["unit_cost"] or 0),
+                source_snapshot["unit"],
                 float(source_snapshot["gram_per_unit"] or 0),
                 source_snapshot["aux_unit"], float(source_snapshot["aux_rate"] or 0),
-                float(source_snapshot["selling_price"] or 0),
                 now_str(),
                 canonical_id,
             ),

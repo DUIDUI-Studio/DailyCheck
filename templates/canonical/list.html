@@ -9,6 +9,12 @@
     <a class="btn-sm" href="{{ url_for('canonical.canonical_edit') }}">➕ 新建</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_bulk_import') }}">📥 批量导入</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout') }}">📤 扇出</a>
+    {% if price_managed %}
+    <form method="post" action="{{ url_for('canonical.canonical_backfill_prices') }}" class="inline"
+          onsubmit="return confirm('从各仓现行价回填主数据价格（全仓最高价）？只填空值，不覆盖已有价。');">
+      <button type="submit" class="btn-sm">💴 价格回填（各仓→主数据）</button>
+    </form>
+    {% endif %}
     {% endif %}
     <a class="btn-sm" href="{{ url_for('canonical.canonical_diff') }}">🌐 跨仓差异</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_conflicts') }}">⚠️ 冲突</a>
@@ -25,7 +31,9 @@
     <tr>
       {% if is_admin %}<th><input type="checkbox" id="check-all" /></th>{% endif %}
       <th>ID</th><th>SKU</th><th>名称</th><th>品类</th>
-      <th>单位</th><th>状态</th><th>created_from</th><th></th>
+      <th>单位</th>
+      {% if price_managed %}<th>售价</th><th>成本</th>{% endif %}
+      <th>状态</th><th>created_from</th><th></th>
     </tr>
   </thead>
   <tbody>
@@ -39,6 +47,10 @@
       <td>{{ it['name'] }}</td>
       <td>{{ it['category_code'] or '—' }}</td>
       <td>{{ it['unit'] }}</td>
+      {% if price_managed %}
+      <td>{{ ('%.3f'|format(it['selling_price'])) if it['selling_price'] is not none else '—' }}</td>
+      <td>{{ ('%.3f'|format(it['unit_cost'])) if it['unit_cost'] is not none else '—' }}</td>
+      {% endif %}
       <td>
         {% if it['status'] == 'active' %}
           <span class="badge-ok">active</span>
@@ -64,7 +76,7 @@
   <h3>批量统一修改</h3>
   <p class="hint">
     勾选上表若干行 → 选字段 → 填统一值 → 保存，随后进入扇出页下发到目标仓。
-    价格（成本 / 售价）暂不在此处统一（收归主数据尚未实施）。
+    {% if price_managed %}价格（成本 / 售价）已收归主数据，可在此统一设置；留空 = 未定价（不下发）。{% endif %}
   </p>
   <div class="grid cols-3">
     <label>
@@ -75,6 +87,10 @@
         <option value="gram_per_unit">克重</option>
         <option value="aux_unit">辅单位</option>
         <option value="aux_rate">辅单位换算率</option>
+        {% if price_managed %}
+        <option value="selling_price">销售单价</option>
+        <option value="unit_cost">进货单价</option>
+        {% endif %}
       </select>
     </label>
     <label>
@@ -97,7 +113,7 @@
   }
   var field = document.getElementById('batch-field');
   var value = document.getElementById('batch-value');
-  var numeric = {gram_per_unit: 1, aux_rate: 1};
+  var numeric = {gram_per_unit: 1, aux_rate: 1, selling_price: 1, unit_cost: 1};
   function syncType() {
     if (!field || !value) return;
     var n = numeric[field.value];

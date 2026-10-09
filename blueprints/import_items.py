@@ -189,6 +189,9 @@ def commit():
       - 本入口不再新建品项、不再新建品类：新品项必须先在「品项主数据」建档
         并扇出，未匹配的行一律跳过并回报；
       - 安全库存由系统按消耗计算（P0-12），本入口不写。
+    P0-9（2026-10-09）：价格收归主数据 —— 已纳管行（canonical_id 非空）的进货价
+      改写 canonical_items.unit_cost（随后需扇出下发），不再直写门店行；
+      未纳管的门店自建行仍写本仓 items.unit_cost。
     匹配键：(品类名, 品项名) —— 与 xlsx 的两列一一对应。
     """
     from blueprints._helpers import now
@@ -213,25 +216,36 @@ def commit():
 
     db_path = Path(BASE_DIR) / wh_row["db_path"]
 
-    updated = 0
+    from blueprints import canonical_pure as cp
+    price_managed = cp.is_syncable_field("unit_cost")
+
+    updated = 0            # 未纳管行：写本仓 items.unit_cost
+    updated_canonical = 0  # 已纳管行：写主数据 canonical_items.unit_cost
     skipped: list[str] = []
+    canon_updates: dict[int, float] = {}
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             ts = now()
             index = {
-                (r["category_name"], r["name"]): int(r["id"])
+                (r["category_name"], r["name"]): (int(r["id"]), r["canonical_id"])
                 for r in conn.execute(
-                    """SELECT i.id, i.name, c.name AS category_name
+                    """SELECT i.id, i.name, i.canonical_id, c.name AS category_name
                        FROM items i JOIN categories c ON c.id = i.category_id"""
                 ).fetchall()
             }
             for cat_name in groups_order:
                 for item in pv["groups_rows"][cat_name]:
-                    item_id = index.get((cat_name, item["name"]))
-                    if item_id is None:
+                    hit = index.get((cat_name, item["name"]))
+                    if hit is None:
                         skipped.append(f"{cat_name}/{item['name']}")
+                        continue
+                    item_id, canonical_id = hit
+                    # P0-9：已纳管行价格收归主数据 → 写 canonical_items（稍后扇出）。
+                    if price_managed and canonical_id is not None:
+                        canon_updates[int(canonical_id)] = float(item["unit_cost"])
+                        updated_canonical += 1
                         continue
                     conn.execute(
                         "UPDATE items SET unit_cost=?, updated_at=? WHERE id=?",
@@ -244,15 +258,31 @@ def commit():
         flash("导入失败,请重试")
         return redirect(url_for("import_items.upload_form"))
 
+    # 已纳管行的价写入主数据（master.db），随后由管理员扇出下发到门店。
+    if canon_updates:
+        ts2 = now()
+        for cid, cost in canon_updates.items():
+            master.execute(
+                "UPDATE canonical_items SET unit_cost=?, updated_at=? WHERE id=?",
+                (cost, ts2, cid),
+            )
+        master.commit()
+
     # 4. audit
     from blueprints.auth import audit
     audit("import_items.import", "warehouse", warehouse_code, {
         "updated": updated,
+        "updated_canonical": updated_canonical,
         "skipped": len(skipped),
         "filename": pv.get("filename"),
     })
     if updated:
-        flash(f"已更新 {updated} 条品项的进货单价")
+        flash(f"已更新 {updated} 条本仓自建品项的进货单价")
+    if updated_canonical:
+        flash(
+            f"{updated_canonical} 条已纳管品项的进货价已写入「品项主数据」；"
+            f"请到主数据页扇出下发到门店"
+        )
     if skipped:
         preview_txt = "；".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")
         flash(
