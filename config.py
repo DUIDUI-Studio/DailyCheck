@@ -13,9 +13,17 @@ DB_DIR = BASE_DIR / "db"
 MASTER_DB = DB_DIR / "master.db"
 WAREHOUSE_DB_DIR = DB_DIR / "warehouses"
 
+IS_PRODUCTION = os.environ.get("DAILYCHECK_ENV") == "production"
 SECRET_KEY = os.environ.get("DAILYCHECK_SECRET_KEY")
+# Known-insecure values that must never be accepted in production.
+_WEAK_SECRET_KEYS = frozenset({"dev-key-change-me", "dev-secret-key-not-for-prod"})
+if IS_PRODUCTION and (not SECRET_KEY or SECRET_KEY in _WEAK_SECRET_KEYS):
+    raise RuntimeError(
+        "DAILYCHECK_SECRET_KEY must be set to a strong, non-default value "
+        "when DAILYCHECK_ENV=production"
+    )
 if not SECRET_KEY:
-    # Dev fallback; production must set the env var.
+    # Dev/test fallback only — production is guarded above.
     SECRET_KEY = "dev-key-change-me"
 
 # Each warehouse ships with the same fixed categories.

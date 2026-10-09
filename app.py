@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from flask import Flask, redirect, url_for
 
-from config import SECRET_KEY
+from config import IS_PRODUCTION, SECRET_KEY
 from db import close_dbs, init_master_db
 from cli import register_cli
 
@@ -19,6 +19,9 @@ def create_app() -> Flask:
     # Make sessions a bit longer-lived; default is one browser session.
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_HTTPONLY"] = True
+    # Only mark the session cookie Secure in production — dev runs plain HTTP,
+    # where a Secure cookie would never be sent back by the browser.
+    app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION
     app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB uploads
 
     # Database teardown applies to both master + warehouse connections.

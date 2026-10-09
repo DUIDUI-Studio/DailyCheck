@@ -77,6 +77,26 @@ if [ -f "$DAILYCHECK_DIR/db/master.db" ]; then
   fi
 fi
 
+# 写环境变量文件 (secret 不入仓). dev 用弱默认值;
+# production 用强 key + DAILYCHECK_ENV=production 覆盖此文件.
+ENV_DIR="/etc/dailycheck"
+ENV_FILE="$ENV_DIR/app.env"
+mkdir -p "$ENV_DIR"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "==> 生成 $ENV_FILE (dev 默认值)..."
+  cat > "$ENV_FILE" <<'ENVEOF'
+# DailyCheck app/MCP environment. Not committed to the repo.
+# Production: set a strong DAILYCHECK_SECRET_KEY, set DAILYCHECK_ENV=production,
+# and DELETE DAILYCHECK_MCP_TOKEN to force per-token (agent_tokens) auth.
+DAILYCHECK_SECRET_KEY=dev-secret-key-not-for-prod
+DAILYCHECK_MCP_TOKEN=dev-mcp-token-for-testing
+ENVEOF
+  chown root:www-data "$ENV_FILE" 2>/dev/null || true
+  chmod 0640 "$ENV_FILE"
+else
+  echo "    $ENV_FILE 已存在, 跳过"
+fi
+
 # 写 systemd unit (模板从本仓库 deploy/systemd/ 拷到 /etc/systemd/system/)
 echo "==> 安装 systemd units..."
 mkdir -p "$DAILYCHECK_DIR/deploy/systemd"

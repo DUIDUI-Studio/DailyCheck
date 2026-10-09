@@ -13,12 +13,11 @@ Type=simple
 User=www-data
 Group=www-data
 WorkingDirectory=/opt/dailycheck
-Environment=DAILYCHECK_SECRET_KEY=dev-secret-key-not-for-prod
-# DAILYCHECK_MCP_TOKEN:dev/test fallback (legacy shared-secret path).
-# Production should REMOVE this line — auth will fall through to agent_tokens
-# table via AuthMiddleware (mcp_server/main.py).  See
-# docs/superpowers/specs/2026-07-23-mcp-token-secure-storage.md.
-Environment=DAILYCHECK_MCP_TOKEN=dev-mcp-token-for-testing
+# Secrets live outside the repo (see dailycheck-app.service). For production,
+# remove DAILYCHECK_MCP_TOKEN from /etc/dailycheck/app.env so auth falls
+# through to the agent_tokens table via AuthMiddleware (mcp_server/main.py).
+# See docs/superpowers/specs/2026-07-23-mcp-token-secure-storage.md.
+EnvironmentFile=-/etc/dailycheck/app.env
 Environment=PATH=/opt/dailycheck/.venv/bin:/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/opt/dailycheck/.venv/bin/python -m mcp_server --transport http --host 0.0.0.0 --port 5100
 Restart=always

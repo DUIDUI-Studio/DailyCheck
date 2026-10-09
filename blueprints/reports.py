@@ -14,7 +14,7 @@ from datetime import datetime
 from flask import Blueprint, render_template, request
 
 from db import get_warehouse_db
-from permissions import require_login
+from permissions import require_login, require_role
 from .auth import audit
 from .core import _compute_summary_metrics, _compute_category_stats
 
@@ -185,18 +185,26 @@ def export_consumption():
 # ---------------------------------------------------------------------------
 
 @bp.route("/api/revenue", methods=["POST"])
+@require_login
+@require_role("manager")
 def api_upload_revenue():
-    """Accepts date + amount + token via form data.
+    """Upsert daily_revenue (date + amount) for the current warehouse.
 
-    Token is read from REVENUE_TOKEN env var. Empty token disables auth —
-    this is intentional for the curl-from-Cron use case the original
-    app.py shipped.
+    Mutates a business metric, so it requires an authenticated manager —
+    plain staff must not be able to write it. If REVENUE_TOKEN is set in
+    the environment it is additionally enforced for scripted callers, using
+    a constant-time compare; when unset, the session role check above is the
+    sole gate. Note: a token-only caller has no session, so the endpoint
+    cannot be used directly from cron — use scripts/sync_revenue.py, which
+    writes via SSH instead.
     """
+    import hmac
     import os
     token = os.getenv("REVENUE_TOKEN", "")
-    expected = request.form.get("token", "")
-    if token and expected != token:
-        return "Unauthorized", 401
+    if token:
+        expected = request.form.get("token", "")
+        if not hmac.compare_digest(expected, token):
+            return "Unauthorized", 401
     date_str = request.form.get("date", "").strip()
     amount_str = request.form.get("amount", "0").strip()
     if not date_str:

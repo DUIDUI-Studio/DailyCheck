@@ -13,8 +13,11 @@ Type=simple
 User=www-data
 Group=www-data
 WorkingDirectory=/opt/dailycheck
-Environment=DAILYCHECK_SECRET_KEY=dev-secret-key-not-for-prod
-Environment=DAILYCHECK_MCP_TOKEN=dev-mcp-token-for-testing
+# Secrets live outside the repo. scripts/install-in-wdg-systemd.sh creates
+# /etc/dailycheck/app.env with dev defaults; production supplies a strong
+# DAILYCHECK_SECRET_KEY + DAILYCHECK_ENV=production there.
+# Leading '-' tolerates a missing file so a fresh container still boots.
+EnvironmentFile=-/etc/dailycheck/app.env
 Environment=FLASK_DEBUG=1
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/var/www/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
