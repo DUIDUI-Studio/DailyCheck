@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}订货审批{% endblock %}
+{% block content %}
+{# —— 状态文案映射（中文）—— #}
+{% set status_labels = {
+  'pending': '待审批',
+  'approved': '已审批',
+  'rejected': '已拒绝',
+  'shipped': '已发货',
+  'delivered': '已送达',
+  'cancelled': '已取消',
+} %}
+
+<div class="page-header"><h2>订货审批</h2></div>
+
+{# —— 待审批 —— #}
+<h3>待审批 <span class="muted">（{{ pending_orders | length }}）</span></h3>
+{% if pending_orders %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>订单号</th>
+      <th>门店</th>
+      <th>创建时间</th>
+      <th>期望到货</th>
+      <th>备注</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for o in pending_orders %}
+    <tr>
+      <td>{{ o.order_no }}</td>
+      <td>{{ o.store_warehouse_code }}</td>
+      <td>{{ o.created_at }}</td>
+      <td>{{ o.expected_delivery_date or '—' }}</td>
+      <td>{{ o.note or '—' }}</td>
+      <td>
+        <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情/审批</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">暂无待审批订单</p>
+{% endif %}
+
+{# —— 已审批 · 待出库 —— #}
+<h3 style="margin-top:24px">已审批 · 待出库 <span class="muted">（{{ approved_orders | length }}）</span></h3>
+{% if approved_orders %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>订单号</th>
+      <th>门店</th>
+      <th>审批时间</th>
+      <th>期望到货</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for o in approved_orders %}
+    <tr>
+      <td>{{ o.order_no }}</td>
+      <td>{{ o.store_warehouse_code }}</td>
+      <td>{{ o.approved_at or '—' }}</td>
+      <td>{{ o.expected_delivery_date or '—' }}</td>
+      <td>
+        <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情/出库</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">暂无待出库订单</p>
+{% endif %}
+{% endblock %}

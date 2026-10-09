@@ -16,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from flask import current_app, g
+from flask import g
 
 from config import MASTER_DB, WAREHOUSE_DB_DIR
 
@@ -372,7 +372,161 @@ CREATE TABLE IF NOT EXISTS canonical_publish_event_items (
 );
 CREATE INDEX IF NOT EXISTS idx_canonical_publish_event_items_event
     ON canonical_publish_event_items(publish_event_id);
+
+-- ============================================================
+-- 门店订货（Store Ordering）跨仓数据模型
+-- ============================================================
+
+-- 购物车：每个门店用户在同一门店下只有一个购物车
+CREATE TABLE IF NOT EXISTS store_order_carts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    store_warehouse_code TEXT NOT NULL,
+    dc_warehouse_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (user_id, store_warehouse_code),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (store_warehouse_code) REFERENCES warehouses(code),
+    FOREIGN KEY (dc_warehouse_code) REFERENCES warehouses(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_carts_user
+    ON store_order_carts(user_id, store_warehouse_code);
+
+-- 购物车明细：以 canonical_id 为跨仓统一键
+CREATE TABLE IF NOT EXISTS store_order_cart_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cart_id INTEGER NOT NULL,
+    canonical_id INTEGER NOT NULL,
+    quantity REAL NOT NULL,
+    unit TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (cart_id) REFERENCES store_order_carts(id) ON DELETE CASCADE,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_cart_items_cart
+    ON store_order_cart_items(cart_id);
+
+-- 订单主表
+CREATE TABLE IF NOT EXISTS store_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT NOT NULL UNIQUE,
+    store_warehouse_code TEXT NOT NULL,
+    dc_warehouse_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_by INTEGER NOT NULL,
+    expected_delivery_date TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    approved_by INTEGER,
+    approved_at TEXT,
+    approved_note TEXT,
+    shipped_by INTEGER,
+    shipped_at TEXT,
+    delivered_at TEXT,
+    cancelled_by INTEGER,
+    cancelled_at TEXT,
+    cancel_reason TEXT,
+    FOREIGN KEY (store_warehouse_code) REFERENCES warehouses(code),
+    FOREIGN KEY (dc_warehouse_code) REFERENCES warehouses(code),
+    FOREIGN KEY (requested_by) REFERENCES users(id),
+    FOREIGN KEY (approved_by) REFERENCES users(id),
+    FOREIGN KEY (shipped_by) REFERENCES users(id),
+    FOREIGN KEY (cancelled_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_orders_store
+    ON store_orders(store_warehouse_code, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_store_orders_dc
+    ON store_orders(dc_warehouse_code, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_store_orders_created
+    ON store_orders(created_at DESC);
+
+-- 订单明细
+CREATE TABLE IF NOT EXISTS store_order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    canonical_id INTEGER NOT NULL,
+    dc_item_id INTEGER,                 -- 配送中心仓内 items.id（出库时回填）
+    store_item_id INTEGER,              -- 门店仓内 items.id（用于收货/入库，P0 仅记录）
+    quantity REAL NOT NULL,             -- 订货数量（基础单位）
+    unit TEXT NOT NULL,
+    fulfilled_quantity REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending / fulfilled / partial / cancelled
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (canonical_id) REFERENCES canonical_items(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_items_order
+    ON store_order_items(order_id);
+
+-- 订单状态历史
+CREATE TABLE IF NOT EXISTS store_order_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    actor_id INTEGER,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_id) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_status_history_order
+    ON store_order_status_history(order_id, created_at DESC);
+
+-- 配送记录
+CREATE TABLE IF NOT EXISTS store_order_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    delivery_no TEXT NOT NULL UNIQUE,
+    shipped_by INTEGER,
+    shipped_at TEXT NOT NULL,
+    delivered_at TEXT,
+    tracking_note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (shipped_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_deliveries_order
+    ON store_order_deliveries(order_id);
+
+-- ============================================================
+-- 门店订货收货（Store Order Receiving）—— v2 P0
+-- 多次部分收货：fulfilled_quantity 累计；全部收齐 → delivered
+-- ============================================================
+CREATE TABLE IF NOT EXISTS store_order_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    order_item_id INTEGER NOT NULL,
+    quantity REAL NOT NULL,
+    received_by INTEGER NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (order_item_id) REFERENCES store_order_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (received_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_receipts_order
+    ON store_order_receipts(order_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_receipts_item
+    ON store_order_receipts(order_item_id, created_at DESC);
 """
+
+# v3 P0 增量：ALTER 必须在 MASTER_SCHEMA 之外，否则 executescript 在已迁移的
+# master.db 上会因列已存在而崩溃。沿用 warehouses.warehouse_type 的迁移模式：
+# 由 init_master_db() 的 PRAGMA 守卫负责幂等 ALTER。
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
 WAREHOUSE_SCHEMA = """
@@ -609,6 +763,44 @@ def init_master_db() -> None:
                         "NOT NULL DEFAULT 'storefront'"
                     )
 
+                # v3 P0: store_order_items.shipped_quantity (partial-ship accumulator).
+                # SQLite 没有 ADD COLUMN IF NOT EXISTS，用 PRAGMA 守卫做幂等迁移。
+                soi_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(store_order_items)"
+                    ).fetchall()
+                }
+                if "shipped_quantity" not in soi_cols:
+                    conn.execute(
+                        "ALTER TABLE store_order_items ADD COLUMN "
+                        "shipped_quantity REAL NOT NULL DEFAULT 0"
+                    )
+
+                # v3.1: store_orders.shipping_fee（运费，submit 时锁定）。
+                so_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(store_orders)"
+                    ).fetchall()
+                }
+                if "shipping_fee" not in so_cols:
+                    conn.execute(
+                        "ALTER TABLE store_orders ADD COLUMN "
+                        "shipping_fee REAL NOT NULL DEFAULT 0"
+                    )
+
+                # v3.1: shipping_rules 表（全局运费规则，admin 配置）。
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS shipping_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        base_fee REAL NOT NULL DEFAULT 0,
+                        pct_fee REAL NOT NULL DEFAULT 0,
+                        active INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+
                 # recipe_versions UNIQUE constraint fix.
                 # The original schema had UNIQUE(recipe_type,
                 # source_warehouse_code, version) — missing recipe_id — so
@@ -625,13 +817,9 @@ def init_master_db() -> None:
                     ).fetchall()
                 ]
                 if "sqlite_autoindex_recipe_versions_1" in rv_indexes:
-                    # Find which columns the auto-index covers.
-                    auto_idx_info = conn.execute(
-                        "SELECT sql FROM sqlite_master "
-                        "WHERE type='index' AND name='sqlite_autoindex_recipe_versions_1'"
-                    ).fetchone()
-                    # sql is None for auto-indexes (defined by UNIQUE clause);
-                    # query the columns directly via pragma_index_info.
+                    # Find which columns the auto-index covers. sql is None
+                    # for auto-indexes (defined by UNIQUE clause); query the
+                    # columns directly via pragma_index_info.
                     auto_cols = [
                         r[2] for r in conn.execute(
                             "PRAGMA index_info('sqlite_autoindex_recipe_versions_1')"
@@ -708,6 +896,9 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
                     (name, "系统固定品类", ts),
                 )
         conn.commit()
+    # Ensure new warehouse dbs also receive all column migrations that
+    # are normally applied lazily by get_warehouse_db().
+    migrate_warehouse_db_columns(db_path)
 
     # 新建仓也跑一遍幂等列迁移(含 canonical_id / canonical_code 等),
     # 否则下游(CLI align 命令 / canonical 扇出)会撞 `no such column: canonical_id`。
@@ -762,6 +953,11 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if "selling_price_updated_at" not in item_cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN selling_price_updated_at TEXT"
+            )
+        # v3.1: DC 品项可订开关 (PRD P2-Q7)。默认 1（可订），老仓自动满足。
+        if "is_orderable" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN is_orderable INTEGER NOT NULL DEFAULT 1"
             )
         # ─────────────────────────────────────────────────────────────────
         # Canonical-item columns (Spec §2.2). All idempotent via PRAGMA.

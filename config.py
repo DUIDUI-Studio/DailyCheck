@@ -54,6 +54,11 @@ CATEGORY_CODE_MAP = {
 # Role rank for require_role().
 ROLE_RANK = {"staff": 1, "manager": 2, "admin": 3}
 
+# Warehouse types used across the platform.
+WAREHOUSE_TYPE_STOREFRONT: str = "storefront"
+WAREHOUSE_TYPE_RD: str = "rd"
+WAREHOUSE_TYPE_DC: str = "distribution_center"
+
 # ─────────────────────────────────────────────────────────────────────
 # Canonical item policy switches (Q1-Q4 + Q7).
 #

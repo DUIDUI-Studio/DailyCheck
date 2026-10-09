@@ -1,0 +1,113 @@
+sequenceDiagram
+    actor SU as 门店用户
+    participant B as Browser
+    participant S as StoreOrderingBlueprint
+    participant P as StoreOrderingPure
+    participant M as MasterDB
+    participant D as DC_WarehouseDB
+    participant T as Store_WarehouseDB
+    participant N as NotificationService
+
+    %% ==== v2 catalog with modal + batch add ====
+    SU->>B: 进入 /store-ordering/catalog?dc=dc_001
+    B->>S: GET /store-ordering/catalog
+    S->>P: list_available_dc_items(dc_001) [增强：返回 category_name / unit_price]
+    P->>M: canonical_items status='active' filter
+    P->>D: SELECT items JOIN categories JOIN canonical_items (selling_price)
+    D-->>P: items list with category_name / unit_price
+    P-->>S: items
+    S-->>B: render catalog.html (.inv-card + modal skeleton + 批量加购 form)
+
+    SU->>B: 点卡片
+    B->>B: openCatalogModal(el) 读 data-* 填充 #cm-qty / pill-base/aux
+    SU->>B: 填数量
+    B->>B: updateCatalogAmount() 实时显示 金额 = qty × unit_price
+    SU->>B: 点「确认」
+    B->>B: confirmCatalogModal() 写卡片 .catalog-hidden 的 hidden input (selected/qty/unit)
+
+    SU->>B: 点页底「加入购物车」
+    B->>S: POST /store-ordering/cart/add-batch  (selected[]/qty[]/unit[])
+    S->>P: get_or_create_cart(user, store, dc)
+    P->>M: INSERT/UPDATE store_order_carts
+    loop 每个 selected/qty/unit
+        S->>P: add_cart_item(cart_id, canonical_id, qty, unit)
+        P->>M: INSERT/UPDATE store_order_cart_items (with line_subtotal)
+    end
+    P-->>S: cart updated
+    S-->>B: 重定向到 /cart (含 cart_total)
+
+    %% ==== v2 cart with subtotal/total + 发送 ====
+    B->>S: GET /store-ordering/cart
+    S->>P: list_cart_items(cart_id) [增强：返回 category_name / line_subtotal / unit_price]
+    P-->>S: items + cart_total (sum line_subtotal)
+    S-->>B: render cart.html (单价/小计/总金额 + 「发送」按钮)
+
+    SU->>B: 点「发送」
+    B->>S: POST /cart/submit (expected_delivery_date, note)
+    S->>P: validate_cart_for_submit (shortages / unbound)
+    alt 校验通过
+        S->>P: submit_order(cart_id, ...)
+        P->>M: INSERT store_orders / store_order_items / status_history
+        P->>P: clear_cart
+        P-->>S: order dict
+        S->>P: notify_order_event(submitted, order)
+        P->>N: emit_event store_order_submitted
+    else 校验失败
+        S-->>B: flash 错误，停留在 submit.html
+    end
+
+    %% ==== DC review + ship (v1, unchanged) ====
+    actor DC as 配送中心经理
+    DC->>B: GET /store-ordering/review
+    B->>S: GET /review
+    S->>P: list_orders(dc=dc_001, status=pending)
+    P-->>S: pending orders
+    S-->>B: render review.html
+
+    DC->>B: POST /orders/{id}/review (decision=approved)
+    B->>S: POST review_order_route
+    S->>P: review_order(order_id, approved, actor_id)
+    P->>M: UPDATE store_orders status=approved + history
+    S->>P: notify_order_event(approved, order)
+    P->>N: emit_event store_order_approved
+    S-->>B: 重定向到 /review
+
+    actor DS as 配送中心店员
+    DS->>B: POST /orders/{id}/ship
+    B->>S: POST ship_order_route
+    S->>P: ship_order(order_id, shipped_by)
+    P->>D: 校验后 UPDATE items.quantity -= qty + INSERT stock_movements (门店订货出库)
+    P->>M: UPDATE store_orders status=shipped + INSERT delivery + UPDATE store_order_items status=fulfilled
+    S->>P: notify_order_event(shipped, order)
+    P->>N: emit_event store_order_shipped
+    S-->>B: 重定向到 /shipments
+
+    %% ==== v2 部分收货 / 自动入库 (新) ====
+    actor SM as 门店经理
+    SM->>B: GET /store-ordering/orders/<id>
+    B->>S: GET order_detail
+    S->>P: get_order_detail(order_id) [增强：返回 receipts]
+    S-->>B: render order_detail.html (shipped 状态 + can_receive + 收货表单 + 收货历史)
+
+    SM->>B: POST /orders/<id>/receive (order_item_id, qty, note)
+    B->>S: POST receive_order_route
+    S->>P: receive_order_item(order_id, order_item_id, qty, actor_id, note)
+    P->>M: 校验订单 status='shipped' + order_item_id 归属
+    P->>M: INSERT store_order_receipts
+    P->>M: UPDATE store_order_items fulfilled_quantity += qty, status=partial/fulfilled
+    P->>T: open store db
+    alt items.canonical_id 不存在
+        P->>T: INSERT items (canonical_id=..., quantity=0, ...)
+    end
+    P->>T: UPDATE items.quantity += qty
+    P->>T: INSERT stock_movements (action='门店订货入库', delta=+qty, note='门店订货入库 #SO-...')
+    alt 所有 store_order_items.fulfilled_quantity == quantity
+        P->>M: UPDATE store_orders status='delivered', delivered_at=now()
+        P->>M: INSERT status_history
+        P-->>S: is_fully_received=True
+        S->>P: notify_order_event(delivered, order)
+        P->>N: emit_event store_order_delivered
+    else 仍有 pending
+        P-->>S: is_fully_received=False (不发通知)
+    end
+    S-->>B: 重定向到 /orders/<id> (订单明细状态 partial / fulfilled; 订单主表 shipped 或 delivered)

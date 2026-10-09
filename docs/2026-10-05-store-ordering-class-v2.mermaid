@@ -1,0 +1,180 @@
+classDiagram
+    direction TB
+
+    class StoreOrderCart {
+        +int id
+        +int user_id
+        +str store_warehouse_code
+        +str dc_warehouse_code
+        +str created_at
+        +str updated_at
+    }
+
+    class StoreOrderCartItem {
+        +int id
+        +int cart_id
+        +int canonical_id
+        +float quantity
+        +str unit
+        +str created_at
+        +str updated_at
+    }
+
+    class StoreOrder {
+        +int id
+        +str order_no
+        +str store_warehouse_code
+        +str dc_warehouse_code
+        +str status
+        +int requested_by
+        +str expected_delivery_date
+        +str note
+        +str created_at
+        +str updated_at
+        +int approved_by
+        +str approved_at
+        +str approved_note
+        +int shipped_by
+        +str shipped_at
+        +str delivered_at
+        +int cancelled_by
+        +str cancelled_at
+        +str cancel_reason
+    }
+
+    class StoreOrderItem {
+        +int id
+        +int order_id
+        +int canonical_id
+        +int dc_item_id
+        +int store_item_id
+        +float quantity
+        +str unit
+        +float fulfilled_quantity
+        +str status
+        +str created_at
+    }
+
+    %% v2 新增
+    class StoreOrderReceipt {
+        +int id
+        +int order_id
+        +int order_item_id
+        +float quantity
+        +int received_by
+        +str note
+        +str created_at
+    }
+
+    class StoreOrderStatusHistory {
+        +int id
+        +int order_id
+        +str from_status
+        +str to_status
+        +int actor_id
+        +str note
+        +str created_at
+    }
+
+    class StoreOrderDelivery {
+        +int id
+        +int order_id
+        +str delivery_no
+        +int shipped_by
+        +str shipped_at
+        +str delivered_at
+        +str tracking_note
+        +str created_at
+    }
+
+    class StoreOrderingService {
+        <<store_ordering_pure.py>>
+        +generate_order_no(master_conn) str
+        +open_warehouse_db(code) Connection
+        +get_or_create_cart(...) dict
+        +list_cart_items(...) list
+        +add_cart_item(...) None
+        +update_cart_item_quantity(...) None
+        +remove_cart_item(...) None
+        +clear_cart(...) None
+        +list_available_dc_items(...) list
+        +get_dc_item_by_canonical(...) dict
+        +get_store_binding_by_canonical(...) dict
+        +validate_cart_for_submit(...) dict
+        +submit_order(...) dict
+        +list_orders(...) list
+        +get_order_detail(...) dict
+        +review_order(...) dict
+        +ship_order(...) dict
+        +mark_order_delivered(...) dict
+        +cancel_order(...) dict
+        +notify_order_event(...) int
+        %% v2 新增
+        +receive_order_item(master, order_id, order_item_id, qty, actor_id, note) dict
+        +list_order_receipts(master, order_id) list
+        +get_order_item_pending_qty(master, order_item_id) float
+    }
+
+    class StoreOrderingBlueprint {
+        <<store_ordering.py>>
+        +catalog() str
+        +cart_view() str
+        +cart_add() str
+        %% v2 增加
+        +cart_add_batch() str
+        +update_cart_item(id) str
+        +remove_cart_item_route(id) str
+        +clear_cart_route() str
+        +submit_order_route() str
+        +store_orders_list() str
+        +order_detail(id) str
+        +review_list() str
+        +review_order_route(id) str
+        +shipment_list() str
+        +ship_order_route(id) str
+        +deliver_order_route(id) str
+        %% v2 增加
+        +receive_order_route(order_id) str
+        +admin_orders() str
+    }
+
+    class NotificationService {
+        +emit_event(db, event_type, summary, target_url, user_ids) int
+    }
+
+    class DCWarehouseDB {
+        +items.id
+        +items.quantity
+        +items.canonical_id
+        +items.selling_price
+        +items.unit_cost
+        +categories.name
+        +stock_movements.action
+        +stock_movements.delta
+    }
+
+    class StoreWarehouseDB {
+        +items.id
+        +items.quantity
+        +items.canonical_id
+        +categories.name
+        +stock_movements.action
+        +stock_movements.delta
+    }
+
+    StoreOrderCart "1" --> "0..*" StoreOrderCartItem : contains
+    StoreOrder "1" --> "0..*" StoreOrderItem : contains
+    StoreOrder "1" --> "0..*" StoreOrderStatusHistory : tracks
+    StoreOrder "1" --> "0..*" StoreOrderDelivery : has
+    StoreOrder "1" --> "0..*" StoreOrderReceipt : v2 部分收货记录
+    StoreOrderItem "1" --> "0..*" StoreOrderReceipt : v2 每次收货
+
+    StoreOrderingService ..> StoreOrderCart : manages
+    StoreOrderingService ..> StoreOrder : manages
+    StoreOrderingService ..> StoreOrderReceipt : v2 manages
+    StoreOrderingService ..> DCWarehouseDB : reads/writes (出库)
+    StoreOrderingService ..> StoreWarehouseDB : reads/writes (入库 v2)
+    StoreOrderingService ..> NotificationService : calls
+
+    StoreOrderingBlueprint ..> StoreOrderingService : uses
+    StoreOrderingBlueprint ..> StoreOrderReceipt : renders (order_detail)

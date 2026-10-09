@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}发送订单{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>发送订单</h2>
+  {% if cart_total %}
+  <span class="muted">购物车总金额 ¥ {{ cart_total | fmt_money }}</span>
+  {% endif %}
+</div>
+
+{% if errors.unbound %}
+<div class="alert danger">
+  <p><strong>无法提交：</strong></p>
+  <ul>
+    {% for u in errors.unbound %}
+    <li>{{ u.name }} 尚未在门店绑定主数据</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if errors.unorderable %}
+<div class="alert danger">
+  <p><strong>以下品项已被配送中心下架，请先到购物车移除：</strong></p>
+  <ul>
+    {% for u in errors.unorderable %}
+    <li>{{ u.canonical_name }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>品项</th>
+      <th>品类</th>
+      <th>单位</th>
+      <th>单价</th>
+      <th>数量</th>
+      <th>小计</th>
+      <th>门店绑定</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ item.category_name or item.category_code or '—' }}</td>
+      <td>{{ item.cart_unit }}</td>
+      <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
+      <td>{{ item.quantity | fmt_qty }}</td>
+      <td>¥ {{ (item.line_subtotal or 0) | fmt_money }}</td>
+      <td>{% if item.store_bound %}<span class="status-pill ok">已绑定</span>{% else %}<span class="status-pill danger">未绑定</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+  <tfoot>
+    <tr>
+      <th colspan="5" style="text-align:right">购物车总金额</th>
+      <th>¥ {{ cart_total | fmt_money }}</th>
+      <th></th>
+    </tr>
+    <tr>
+      <th colspan="5" style="text-align:right">运费预估</th>
+      <th>¥ {{ shipping_fee | fmt_money }}</th>
+      <th></th>
+    </tr>
+    <tr>
+      <th colspan="5" style="text-align:right"><strong>总计</strong></th>
+      <th><strong>¥ {{ (cart_total + shipping_fee) | fmt_money }}</strong></th>
+      <th></th>
+    </tr>
+  </tfoot>
+</table>
+
+<form method="post" class="grid cols-1" style="margin-top:16px;max-width:480px;">
+  <label>
+    <span>期望到货日期</span>
+    <input type="date" name="expected_delivery_date" value="{{ expected_date }}" min="{{ today }}" required />
+  </label>
+  <label>
+    <span>备注</span>
+    <textarea name="note" rows="3">{{ note }}</textarea>
+  </label>
+  <button type="submit" class="btn" {% if errors.unbound or errors.unorderable %}disabled{% endif %}>发送</button>
+</form>
+{% endblock %}

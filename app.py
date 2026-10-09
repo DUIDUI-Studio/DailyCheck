@@ -45,6 +45,7 @@ def create_app() -> Flask:
     from blueprints.agent_tokens import bp as agent_tokens_bp
     from blueprints.recipe_cost import bp as recipe_cost_bp
     from blueprints.canonical import bp as canonical_bp
+    from blueprints.store_ordering import bp as store_ordering_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -62,6 +63,7 @@ def create_app() -> Flask:
     app.register_blueprint(notifications_bp)
     app.register_blueprint(agent_tokens_bp)
     app.register_blueprint(canonical_bp)
+    app.register_blueprint(store_ordering_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp

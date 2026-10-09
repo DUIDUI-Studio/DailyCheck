@@ -1,0 +1,316 @@
+{% extends "base.html" %}
+{% block title %}订单详情 {{ order.order_no }}{% endblock %}
+{% block content %}
+{# —— 订单状态文案映射（中文）—— #}
+{% set status_labels = {
+  'pending': '待审批',
+  'approved': '已审批',
+  'rejected': '已拒绝',
+  'shipped': '已发货',
+  'delivered': '已送达',
+  'cancelled': '已取消',
+} %}
+
+<div class="page-header">
+  <h2>订单 {{ order.order_no }}</h2>
+  <span class="status-pill {{ order.status }}">{{ status_labels[order.status] or order.status }}</span>
+</div>
+
+{# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
+<div class="info-card">
+  <div class="info-card-grid">
+    <div><strong>门店：</strong>{{ order.store_warehouse_code }}</div>
+    <div><strong>配送中心：</strong>{{ order.dc_warehouse_code }}</div>
+    <div><strong>下单人：</strong>{{ order.requested_by_username or order.requested_by }}</div>
+    <div><strong>创建时间：</strong>{{ order.created_at }}</div>
+    <div><strong>期望到货：</strong>{{ order.expected_delivery_date or '—' }}</div>
+    <div><strong>备注：</strong>{{ order.note or '—' }}</div>
+    <div><strong>审批人：</strong>{{ order.approved_by_username or '—' }}</div>
+    <div><strong>审批时间：</strong>{{ order.approved_at or '—' }}</div>
+    <div><strong>发货人：</strong>{{ order.shipped_by_username or '—' }}</div>
+    <div><strong>发货时间：</strong>{{ order.shipped_at or '—' }}</div>
+    <div>
+      <strong>收货人：</strong>
+      {% if order.receipts %}{{ order.receipts[0].receiver_username or order.receipts[0].received_by }}
+      {% else %}—{% endif %}
+    </div>
+    <div><strong>送达时间：</strong>{{ order.delivered_at or '—' }}</div>
+  </div>
+  <div class="info-card-total">
+    <span class="info-card-total-label">订单金额</span>
+    <span class="info-card-total-value">¥ {{ total_amount | fmt_money }}</span>
+  </div>
+  <div class="info-card-total" style="margin-top:6px;background:#f8fafc">
+    <span class="info-card-total-label">运费</span>
+    <span class="info-card-total-value">¥ {{ (order.shipping_fee or 0) | fmt_money }}</span>
+  </div>
+  <div class="info-card-total" style="margin-top:6px;background:#ecfdf5">
+    <span class="info-card-total-label"><strong>订单总计</strong></span>
+    <span class="info-card-total-value"><strong>¥ {{ ((total_amount or 0) + (order.shipping_fee or 0)) | fmt_money }}</strong></span>
+  </div>
+</div>
+
+<h3>订单明细</h3>
+
+{# —— 明细表：按视角分支 —— #}
+{% if is_dc_view %}
+  {# DC 视角：含「仓库库存」「已发数」两列 + 部分发货表单 #}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>品项</th>
+        <th>单位</th>
+        <th>单价</th>
+        <th>数量</th>
+        <th>已发数</th>
+        <th>仓库库存</th>
+        {% if can_ship and order.status == 'approved' %}<th>本批发货</th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in order.order_items %}
+        {% set shipped = item.shipped_quantity or 0 %}
+        {% set pending = item.quantity - shipped %}
+        <tr>
+          <td>{{ item.canonical_name }}</td>
+          <td>{{ item.unit }}</td>
+          <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
+          <td>{{ item.quantity | fmt_qty }}</td>
+          <td>{{ shipped | fmt_qty }}</td>
+          <td>
+            {# A6: 仓库库存允许为负（A7 允许欠货出库） #}
+            <span class="dc-stock {% if item.dc_available < 0 %}negative{% endif %}">
+              {{ item.dc_available | fmt_qty }}
+            </span>
+          </td>
+          {% if can_ship and order.status == 'approved' %}
+          <td>
+            {% if pending > 0 %}
+            <input
+              type="number"
+              data-item-id="{{ item.id }}"
+              data-pending="{{ pending }}"
+              min="0"
+              step="0.01"
+              max="{{ pending }}"
+              placeholder="0"
+              style="width:90px"
+            />
+            {% else %}<span class="status-pill ok">已发齐</span>{% endif %}
+          </td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  {# storefront 视角：含「已收数」+ 部分收货表单（A2） #}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>品项</th>
+        <th>单位</th>
+        <th>单价</th>
+        <th>数量</th>
+        <th>已收数</th>
+        {% if can_receive and order.status == 'shipped' %}<th>本批收货</th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in order.order_items %}
+        {% set fulfilled = item.fulfilled_quantity or 0 %}
+        {% set pending = item.quantity - fulfilled %}
+        <tr>
+          <td>{{ item.canonical_name }}</td>
+          <td>{{ item.unit }}</td>
+          <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
+          <td>{{ item.quantity | fmt_qty }}</td>
+          <td>{{ fulfilled | fmt_qty }}</td>
+          {% if can_receive and order.status == 'shipped' %}
+          <td>
+            {% if pending > 0 %}
+            <form method="post" action="{{ url_for('store_ordering.receive_order_route', order_id=order.id) }}" class="inline-form">
+              <input type="hidden" name="order_item_id" value="{{ item.id }}" />
+              <input name="quantity" type="number" min="0.01" step="0.01" max="{{ pending }}" required style="width:90px" />
+              <input name="note" placeholder="可选备注" />
+              <button type="submit" class="btn-sm">收货</button>
+            </form>
+            {% else %}<span class="status-pill ok">已收齐</span>{% endif %}
+          </td>
+          {% endif %}
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+
+{# —— A1: DC 发货表单（DC 视角，仅在 approved 显示）—— #}
+{% if is_dc_view and can_ship and order.status == 'approved' %}
+<h3>DC 发货</h3>
+<p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。</p>
+<form method="post"
+      action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}"
+      id="shipment-form"
+      class="inline-form"
+      style="margin-top:8px;gap:10px">
+  <input name="tracking_note" placeholder="物流备注" />
+  <button type="submit" class="btn-sm ok">确认发货</button>
+</form>
+<p class="muted">明细表中的「本批发货」输入框会在表单提交时一次性批量提交。</p>
+{% endif %}
+
+{# —— 收货历史（如有）—— 显眼位置放顶部，按时间倒序 —— #}
+{% if order.receipts %}
+<h3>收货历史</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>时间</th><th>品项</th><th>数量</th><th>收货人</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    {% for r in order.receipts %}
+    <tr>
+      <td>{{ r.created_at }}</td>
+      <td>{{ r.canonical_name }}</td>
+      <td>{{ r.quantity | fmt_qty }}</td>
+      <td>{{ r.receiver_username or r.received_by }}</td>
+      <td>{{ r.note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# —— 门店入库流水（storefront 视角）：直接读门店仓 stock_movements —— #}
+{% if not is_dc_view %}
+<h3>门店入库流水</h3>
+{% if store_inflows %}
+<table class="data-table">
+  <thead>
+    <tr><th>时间</th><th>品项</th><th>入库数量</th><th>动作</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    {% for m in store_inflows %}
+    <tr>
+      <td>{{ m.created_at }}</td>
+      <td>{{ m.canonical_name or '—' }}{{ ' ' }}{{ m.unit or '' }}</td>
+      <td><strong>+{{ m.delta | fmt_qty }}</strong></td>
+      <td>{{ m.action }}</td>
+      <td>{{ m.note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">暂无门店入库流水（收货后会自动写入）</p>
+{% endif %}
+{% endif %}
+
+{# —— 发货历史（如有）—— #}
+{% if order.deliveries %}
+<h3>发货历史</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>配送单号</th><th>出库人</th><th>出库时间</th><th>物流备注</th></tr>
+  </thead>
+  <tbody>
+    {% for d in order.deliveries %}
+    <tr>
+      <td>{{ d.delivery_no }}</td>
+      <td>{{ d.shipped_by_username or d.shipped_by }}</td>
+      <td>{{ d.shipped_at }}</td>
+      <td>{{ d.tracking_note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h3>状态历史</h3>
+<table class="data-table">
+  <thead>
+    <tr><th>时间</th><th>从</th><th>到</th><th>操作人</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    {% for h in order.status_history %}
+    <tr>
+      <td>{{ h.created_at }}</td>
+      <td>{{ h.from_status or '—' }}</td>
+      <td>{{ h.to_status }}</td>
+      <td>{{ h.actor_username or h.actor_id or '—' }}</td>
+      <td>{{ h.note or '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="actions" style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;">
+  {# —— A8: 按钮样式统一 —— #}
+  {% if can_review and order.status == 'pending' %}
+  <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form">
+    <input type="hidden" name="decision" value="approved" />
+    <button type="submit" class="btn-sm ok">通过</button>
+  </form>
+  <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form">
+    <input type="hidden" name="decision" value="rejected" />
+    <input name="note" placeholder="拒绝原因" required />
+    <button type="submit" class="btn-sm danger">拒绝</button>
+  </form>
+  {% endif %}
+
+  {% if can_deliver and order.status == 'shipped' %}
+  <form method="post" action="{{ url_for('store_ordering.deliver_order_route', order_id=order.id) }}" class="inline-form">
+    <button type="submit" class="btn-sm">一次性收货</button>
+  </form>
+  {% endif %}
+
+  {# —— P1-4: 取消按钮 —— #}
+  {% if order.status == 'pending' or order.status == 'approved' %}
+  <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form">
+    <input name="reason" placeholder="取消原因" required style="min-width:180px" />
+    <button type="submit" class="btn-sm danger">取消订单</button>
+  </form>
+  {% endif %}
+
+  {% if is_dc_view %}
+  <a class="btn-sm" href="{{ url_for('store_ordering.shipment_list') }}">返回出库清单</a>
+  {% endif %}
+</div>
+
+{# —— A3: 部分发货表单提交前的 JS：把每行明细 input name 改写为 shipped_items[N] —— #}
+{% if is_dc_view and can_ship and order.status == 'approved' %}
+<script>
+(function () {
+  var form = document.getElementById('shipment-form');
+  if (!form) return;
+
+  form.addEventListener('submit', function (ev) {
+    var inputs = document.querySelectorAll('input[data-item-id]');
+    var first = true;
+    inputs.forEach(function (input) {
+      var itemId = input.getAttribute('data-item-id');
+      var pending = parseFloat(input.getAttribute('data-pending') || '0');
+      var v = parseFloat(input.value || '0');
+      if (!isFinite(v) || v <= 0 || !itemId) {
+        input.removeAttribute('name');
+        return;
+      }
+      // 上限校验：不超过剩余可发数量。
+      if (v > pending + 1e-9) {
+        ev.preventDefault();
+        alert('本批发货数量 ' + v + ' 超过剩余可发 ' + pending);
+        input.focus();
+        return;
+      }
+      input.setAttribute('name', 'shipped_items[' + itemId + ']');
+      first = false;
+    });
+    // 如果用户一行都没填，不允许空提交。
+    if (first) {
+      ev.preventDefault();
+      alert('请至少填写一项发货数量');
+    }
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

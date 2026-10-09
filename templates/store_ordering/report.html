@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}门店订货报表{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>门店订货报表</h2>
+  <a class="btn-sm" href="{{ url_for('store_ordering.admin_orders') }}">查看订单</a>
+</div>
+
+<form method="get" class="grid cols-4" style="margin-bottom:20px">
+  <label>
+    <span>开始日期</span>
+    <input type="date" name="start_date" value="{{ start_date }}" />
+  </label>
+  <label>
+    <span>结束日期</span>
+    <input type="date" name="end_date" value="{{ end_date }}" />
+  </label>
+  <label>
+    <span>门店</span>
+    <select name="store">
+      <option value="">全部</option>
+      {% for s in stores %}
+        <option value="{{ s.code }}" {% if store == s.code %}selected{% endif %}>{{ s.name }} ({{ s.code }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>配送中心</span>
+    <select name="dc">
+      <option value="">全部</option>
+      {% for d in dcs %}
+        <option value="{{ d.code }}" {% if dc == d.code %}selected{% endif %}>{{ d.name }} ({{ d.code }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>品类</span>
+    <select name="cat">
+      <option value="">全部</option>
+      {% for code, name in categories %}
+        <option value="{{ code }}" {% if category_code == code %}selected{% endif %}>{{ name }} ({{ code }})</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit" class="btn-sm" style="align-self:flex-end">筛选</button>
+</form>
+
+{# —— 顶部 KPI —— #}
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="kpi-label">总订货量</div>
+    <div class="kpi-value">{{ report.summary.ordered_qty | fmt_qty }}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">总出货量</div>
+    <div class="kpi-value">{{ report.summary.shipped_qty | fmt_qty }}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">总收货量</div>
+    <div class="kpi-value">{{ report.summary.received_qty | fmt_qty }}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">总运费</div>
+    <div class="kpi-value">¥ {{ report.summary.shipping_fee | fmt_money }}</div>
+  </div>
+  <div class="kpi-card {% if report.summary.shortfall_rate > 0.05 %}kpi-warn{% endif %}">
+    <div class="kpi-label">欠收率</div>
+    <div class="kpi-value">{{ (report.summary.shortfall_rate * 100) | round(2, 'floor') }}%</div>
+    <div class="kpi-sub">欠收 {{ report.summary.shortfall_qty | fmt_qty }} / 订单 {{ report.summary.order_count }} 单</div>
+  </div>
+</div>
+
+{# —— 维度 1：按门店 —— #}
+<h3>按门店</h3>
+{% if report.by_store %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>门店</th>
+      <th>订单数</th>
+      <th>订货量</th>
+      <th>出货量</th>
+      <th>收货量</th>
+      <th>欠收量</th>
+      <th>欠收率</th>
+      <th>运费</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in report.by_store %}
+    <tr>
+      <td>{{ r.store_code }}</td>
+      <td>{{ r.order_count }}</td>
+      <td>{{ r.ordered_qty | fmt_qty }}</td>
+      <td>{{ r.shipped_qty | fmt_qty }}</td>
+      <td>{{ r.received_qty | fmt_qty }}</td>
+      <td>{{ r.shortfall_qty | fmt_qty }}</td>
+      <td>{% set rate = r.shortfall_rate * 100 %}{% if rate > 5 %}<span class="status-pill danger">{{ rate | round(2, 'floor') }}%</span>{% else %}{{ rate | round(2, 'floor') }}%{% endif %}</td>
+      <td>¥ {{ r.shipping_fee | fmt_money }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">该筛选范围无数据</p>
+{% endif %}
+
+{# —— 维度 2：按 DC —— #}
+<h3 style="margin-top:24px">按配送中心</h3>
+{% if report.by_dc %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>配送中心</th>
+      <th>订单数</th>
+      <th>订货量</th>
+      <th>出货量</th>
+      <th>收货量</th>
+      <th>欠收量</th>
+      <th>欠收率</th>
+      <th>运费</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in report.by_dc %}
+    <tr>
+      <td>{{ r.dc_code }}</td>
+      <td>{{ r.order_count }}</td>
+      <td>{{ r.ordered_qty | fmt_qty }}</td>
+      <td>{{ r.shipped_qty | fmt_qty }}</td>
+      <td>{{ r.received_qty | fmt_qty }}</td>
+      <td>{{ r.shortfall_qty | fmt_qty }}</td>
+      <td>{% set rate = r.shortfall_rate * 100 %}{% if rate > 5 %}<span class="status-pill danger">{{ rate | round(2, 'floor') }}%</span>{% else %}{{ rate | round(2, 'floor') }}%{% endif %}</td>
+      <td>¥ {{ r.shipping_fee | fmt_money }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">该筛选范围无数据</p>
+{% endif %}
+
+{# —— 维度 3：按品类 —— #}
+<h3 style="margin-top:24px">按品类</h3>
+{% if report.by_category %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>品类</th>
+      <th>订货量</th>
+      <th>出货量</th>
+      <th>收货量</th>
+      <th>欠收量</th>
+      <th>欠收率</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in report.by_category %}
+    <tr>
+      <td>{{ r.category_code }}</td>
+      <td>{{ r.ordered_qty | fmt_qty }}</td>
+      <td>{{ r.shipped_qty | fmt_qty }}</td>
+      <td>{{ r.received_qty | fmt_qty }}</td>
+      <td>{{ r.shortfall_qty | fmt_qty }}</td>
+      <td>{% set rate = r.shortfall_rate * 100 %}{% if rate > 5 %}<span class="status-pill danger">{{ rate | round(2, 'floor') }}%</span>{% else %}{{ rate | round(2, 'floor') }}%{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">该筛选范围无数据</p>
+{% endif %}
+
+{# —— 维度 4：按品项 —— #}
+<h3 style="margin-top:24px">按品项</h3>
+{% if report.by_canonical %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>品项</th>
+      <th>品类</th>
+      <th>订货量</th>
+      <th>出货量</th>
+      <th>收货量</th>
+      <th>欠收量</th>
+      <th>欠收率</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in report.by_canonical %}
+    <tr>
+      <td>{{ r.canonical_name }}</td>
+      <td>{{ r.category_code }}</td>
+      <td>{{ r.ordered_qty | fmt_qty }}</td>
+      <td>{{ r.shipped_qty | fmt_qty }}</td>
+      <td>{{ r.received_qty | fmt_qty }}</td>
+      <td>{{ r.shortfall_qty | fmt_qty }}</td>
+      <td>{% set rate = r.shortfall_rate * 100 %}{% if rate > 5 %}<span class="status-pill danger">{{ rate | round(2, 'floor') }}%</span>{% else %}{{ rate | round(2, 'floor') }}%{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">该筛选范围无数据</p>
+{% endif %}
+
+{% endblock %}
