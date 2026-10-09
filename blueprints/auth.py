@@ -78,9 +78,10 @@ def load_user_and_warehouse():
                    WHERE user_id=? AND warehouse_id=?""",
                 (user_id, warehouse_id),
             ).fetchone()
-            # Run idempotent column migrations on the warehouse db so
-            # legacy dbs created before certain columns still work.
-            # Cheap when already up-to-date (just PRAGMA lookups).
+            # Run version-gated column migrations before any view runs, so
+            # code paths that open a warehouse db directly (canonical,
+            # procurement, store-ordering, ...) never hit a missing column
+            # on a legacy db. No-op once the db has been stamped.
             from db import migrate_warehouse_db_columns
             migrate_warehouse_db_columns(Path(g.warehouse_db_path))
         else:

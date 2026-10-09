@@ -41,8 +41,8 @@ def get_warehouse_db() -> sqlite3.Connection:
         path = g.get("warehouse_db_path")
         if not path:
             raise RuntimeError("No warehouse selected")
-        # Idempotent column migrations for legacy dbs. Cheap when
-        # already up-to-date (just a PRAGMA lookup).
+        # Version-gated column migrations for legacy dbs. When the db is
+        # already stamped this is a single PRAGMA read.
         migrate_warehouse_db_columns(Path(path))
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
@@ -896,27 +896,33 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
                     (name, "系统固定品类", ts),
                 )
         conn.commit()
-    # Ensure new warehouse dbs also receive all column migrations that
-    # are normally applied lazily by get_warehouse_db().
-    migrate_warehouse_db_columns(db_path)
-
     # 新建仓也跑一遍幂等列迁移(含 canonical_id / canonical_code 等),
     # 否则下游(CLI align 命令 / canonical 扇出)会撞 `no such column: canonical_id`。
     migrate_warehouse_db_columns(db_path)
+# Bump this whenever WAREHOUSE_SCHEMA or the ALTER block inside
+# migrate_warehouse_db_columns() changes. A db whose PRAGMA user_version
+# already equals it skips the whole migration, so the per-request call
+# degrades to a single PRAGMA read (previously every request replayed the
+# full executescript AND ran an unconditional UPDATE over items).
+WAREHOUSE_SCHEMA_VERSION = 1
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
     """Run idempotent column-add migrations on an EXISTING warehouse db.
 
-    Safe to call on every request — every check is gated by a
-    PRAGMA table_info lookup so the ALTER only runs when needed.
+    Version-gated: the first call on a db runs the full script and stamps
+    PRAGMA user_version; subsequent calls return after one PRAGMA read.
+    Bump WAREHOUSE_SCHEMA_VERSION when the schema or ALTER block changes,
+    otherwise already-stamped dbs would silently miss the new migration.
 
-    Called from get_warehouse_db() so legacy dbs get patched on the
-    fly without requiring a separate init step.
+    Called from get_warehouse_db() and the auth before_request hook so
+    legacy dbs get patched on the fly without a separate init step.
     """
     if not db_path.exists():
         return
     with closing(sqlite3.connect(db_path)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= WAREHOUSE_SCHEMA_VERSION:
+            return
         conn.executescript(WAREHOUSE_SCHEMA)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(stocktake_batches)").fetchall()}
         if "status" not in cols:
@@ -998,4 +1004,7 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
             "CREATE INDEX IF NOT EXISTS idx_categories_canonical_code "
             "ON categories(canonical_code)"
         )
+        conn.commit()
+        # Stamp the db so future calls short-circuit on the version read.
+        conn.execute(f"PRAGMA user_version = {WAREHOUSE_SCHEMA_VERSION}")
         conn.commit()
