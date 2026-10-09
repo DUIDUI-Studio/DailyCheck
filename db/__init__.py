@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
+    token_prefix TEXT,
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
@@ -851,6 +852,21 @@ def init_master_db() -> None:
                             CREATE INDEX IF NOT EXISTS idx_recipe_versions_lookup
                                 ON recipe_versions(recipe_type, recipe_id, status);
                         """)
+
+                # agent_tokens.token_prefix (indexed lookup): added after the
+                # initial release. Legacy rows keep NULL and fall back to a
+                # bounded scan in mcp_server.service.auth.authenticate().
+                at_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(agent_tokens)"
+                    ).fetchall()
+                }
+                if "token_prefix" not in at_cols:
+                    conn.execute("ALTER TABLE agent_tokens ADD COLUMN token_prefix TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_tokens_prefix "
+                    "ON agent_tokens(token_prefix)"
+                )
 
                 # Seed single-row procurement_config if missing (id=1 is the only row).
                 row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()

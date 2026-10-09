@@ -14,7 +14,7 @@ from datetime import datetime
 from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
 from werkzeug.security import generate_password_hash
 
-from config import MASTER_DB, SECRET_KEY
+from config import AGENT_TOKEN_PREFIX_LEN, MASTER_DB, SECRET_KEY
 from db import get_master_db
 from permissions import require_login
 
@@ -128,13 +128,14 @@ def create_token():
     try:
         db.execute(
             """INSERT INTO agent_tokens
-               (name, token_hash, encrypted_token, created_by, created_at,
+               (name, token_hash, token_prefix, encrypted_token, created_by, created_at,
                 allowed_read_paths_json, allowed_write_paths_json,
                 allowed_warehouse_codes_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 token_hash,
+                raw_token[:AGENT_TOKEN_PREFIX_LEN],
                 encrypted,
                 g.user["id"],
                 now,

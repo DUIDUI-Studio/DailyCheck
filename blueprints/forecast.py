@@ -326,60 +326,74 @@ def _run_daily_forecast() -> int:
     minute_start = now_str[:17] + "00"
 
     init_master_db()
-    with closing(sqlite3.connect(MASTER_DB)) as m:
+    # isolation_level=None → autocommit, so we can drive an explicit
+    # BEGIN IMMEDIATE. Taking the write lock *before* the idempotency
+    # SELECT closes the SELECT→INSERT race: with gunicorn's N workers all
+    # ticking at 03:00, the losers block here and then observe the winner's
+    # row instead of inserting a duplicate (the previous min() check alone
+    # did not serialize the two statements). The lock is held only for the
+    # cheap COUNT queries below.
+    with closing(sqlite3.connect(MASTER_DB, isolation_level=None)) as m:
         m.row_factory = sqlite3.Row
-        existing = m.execute(
-            """SELECT id FROM forecast_runs
-               WHERE status IN ('success', 'running')
-                 AND started_at >= ?
-               ORDER BY id DESC LIMIT 1""",
-            (minute_start,),
-        ).fetchone()
-        if existing is not None:
-            return existing["id"]
+        m.execute("BEGIN IMMEDIATE")
+        try:
+            existing = m.execute(
+                """SELECT id FROM forecast_runs
+                   WHERE status IN ('success', 'running')
+                     AND started_at >= ?
+                   ORDER BY id DESC LIMIT 1""",
+                (minute_start,),
+            ).fetchone()
+            if existing is not None:
+                m.execute("ROLLBACK")
+                return existing["id"]
 
-        items_processed = 0
-        last_error: str | None = None
-        if WAREHOUSE_DB_DIR.exists():
-            for wh_path in WAREHOUSE_DB_DIR.glob("*.db"):
-                attempt = 0
-                while attempt < 3:
-                    try:
-                        with closing(sqlite3.connect(wh_path)) as w:
-                            items_processed += w.execute(
-                                "SELECT COUNT(*) FROM items"
-                            ).fetchone()[0]
-                            items_processed += w.execute(
-                                "SELECT COUNT(*) FROM products"
-                            ).fetchone()[0]
-                        break
-                    except sqlite3.OperationalError as exc:
-                        attempt += 1
-                        if attempt >= 3:
+            items_processed = 0
+            last_error: str | None = None
+            if WAREHOUSE_DB_DIR.exists():
+                for wh_path in WAREHOUSE_DB_DIR.glob("*.db"):
+                    attempt = 0
+                    while attempt < 3:
+                        try:
+                            with closing(sqlite3.connect(wh_path)) as w:
+                                items_processed += w.execute(
+                                    "SELECT COUNT(*) FROM items"
+                                ).fetchone()[0]
+                                items_processed += w.execute(
+                                    "SELECT COUNT(*) FROM products"
+                                ).fetchone()[0]
+                            break
+                        except sqlite3.OperationalError as exc:
+                            attempt += 1
+                            if attempt >= 3:
+                                last_error = f"{wh_path.name}: {exc}"
+                                _logger.warning("forecast_lock: %s", last_error)
+                                _bump_lock_counter()
+                            else:
+                                time.sleep(0.05 * (2 ** (attempt - 1)))
+                        except sqlite3.Error as exc:  # noqa: BLE001
                             last_error = f"{wh_path.name}: {exc}"
                             _logger.warning("forecast_lock: %s", last_error)
-                            _bump_lock_counter()
-                        else:
-                            time.sleep(0.05 * (2 ** (attempt - 1)))
-                    except sqlite3.Error as exc:  # noqa: BLE001
-                        last_error = f"{wh_path.name}: {exc}"
-                        _logger.warning("forecast_lock: %s", last_error)
-                        break
+                            break
 
-        if last_error is not None:
-            cur = m.execute(
-                "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed, error_message) "
-                "VALUES (?, ?, 'failed', ?, ?)",
-                (now_str, now_str, items_processed, last_error),
-            )
-        else:
-            cur = m.execute(
-                "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed) "
-                "VALUES (?, ?, 'success', ?)",
-                (now_str, now_str, items_processed),
-            )
-        m.commit()
-        return cur.lastrowid
+            if last_error is not None:
+                cur = m.execute(
+                    "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed, error_message) "
+                    "VALUES (?, ?, 'failed', ?, ?)",
+                    (now_str, now_str, items_processed, last_error),
+                )
+            else:
+                cur = m.execute(
+                    "INSERT INTO forecast_runs (started_at, finished_at, status, items_processed) "
+                    "VALUES (?, ?, 'success', ?)",
+                    (now_str, now_str, items_processed),
+                )
+            run_id = cur.lastrowid
+            m.execute("COMMIT")
+            return run_id
+        except Exception:
+            m.execute("ROLLBACK")
+            raise
 
 
 def _scheduler_loop() -> None:
@@ -406,13 +420,19 @@ def _start_scheduler() -> None:
     """Idempotent: safe to call from create_app() multiple times.
 
     Recovers orphaned runs first, then starts the daemon thread. Thread
-    is daemon=True so it does not block process exit. NOTE: under
-    gunicorn multi-worker, each worker will run its own thread, so
-    the same /admin/health minute-bucket can absorb N inserts (the
-    idempotency key prevents that — only the first wins). Multi-worker
-    is acknowledged in spec §4 as a known limitation.
+    is daemon=True so it does not block process exit. Under gunicorn
+    multi-worker every worker runs its own thread; duplicate inserts are
+    prevented by the BEGIN IMMEDIATE + minute-bucket check in
+    _run_daily_forecast(). Set DAILYCHECK_DISABLE_SCHEDULER=1 to turn the
+    in-process thread off entirely (e.g. when driving the run from an
+    external systemd timer).
     """
+    import os
+
     global _scheduler_started
+    if os.environ.get("DAILYCHECK_DISABLE_SCHEDULER") == "1":
+        _logger.info("forecast scheduler disabled via DAILYCHECK_DISABLE_SCHEDULER")
+        return
     with _scheduler_lock:
         if _scheduler_started:
             return

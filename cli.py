@@ -28,7 +28,7 @@ import click
 from flask import Flask
 from werkzeug.security import generate_password_hash
 
-from config import BASE_DIR, MASTER_DB
+from config import AGENT_TOKEN_PREFIX_LEN, BASE_DIR, MASTER_DB
 from db import init_master_db, migrate_warehouse_db_columns
 from db.migrate import migrate_legacy_inventory
 
@@ -45,6 +45,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(bootstrap_cmd)
     app.cli.add_command(mcp_cmd)
     app.cli.add_command(create_agent_token_cmd)
+    app.cli.add_command(backfill_token_prefixes_cmd)
     app.cli.add_command(align_seed_cmd)
     app.cli.add_command(align_detect_cmd)
     app.cli.add_command(align_apply_cmd)
@@ -400,12 +401,13 @@ def create_agent_token_cmd(name: str, read_paths: str, write_paths: str, warehou
 
         conn.execute(
             """INSERT INTO agent_tokens
-               (name, token_hash, created_by, created_at,
+               (name, token_hash, token_prefix, created_by, created_at,
                 allowed_read_paths_json, allowed_write_paths_json, allowed_warehouse_codes_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 token_hash,
+                raw_token[:AGENT_TOKEN_PREFIX_LEN],
                 created_by,
                 now,
                 _parse_paths(read_paths),
@@ -417,6 +419,46 @@ def create_agent_token_cmd(name: str, read_paths: str, write_paths: str, warehou
 
     click.echo(f"Token '{name}' created.")
     click.echo(f"  DAILYCHECK_MCP_TOKEN={raw_token}")
+
+
+@click.command("backfill-token-prefixes")
+def backfill_token_prefixes_cmd() -> None:
+    """Backfill agent_tokens.token_prefix for rows created before the column.
+
+    Only Web-created tokens are recoverable (they also keep an encrypted
+    copy of the plaintext). CLI-created legacy tokens have no plaintext and
+    keep falling back to the bounded scan in authenticate(); re-issue them
+    with create-agent-token to move them onto the indexed fast path.
+    """
+    from blueprints.agent_tokens import _decrypt_token, _ensure_encrypted_token_col
+
+    init_master_db()
+    backfilled = skipped = undecryptable = 0
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_encrypted_token_col(conn)
+        rows = conn.execute(
+            "SELECT id, encrypted_token FROM agent_tokens WHERE token_prefix IS NULL"
+        ).fetchall()
+        for row in rows:
+            if not row["encrypted_token"]:
+                skipped += 1
+                continue
+            try:
+                raw = _decrypt_token(row["encrypted_token"])
+            except Exception:  # noqa: BLE001 — undecryptable row is skippable
+                undecryptable += 1
+                continue
+            conn.execute(
+                "UPDATE agent_tokens SET token_prefix = ? WHERE id = ?",
+                (raw[:AGENT_TOKEN_PREFIX_LEN], row["id"]),
+            )
+            backfilled += 1
+        conn.commit()
+    click.echo(
+        f"token_prefix backfilled: {backfilled}, "
+        f"skipped (no plaintext): {skipped}, undecryptable: {undecryptable}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────

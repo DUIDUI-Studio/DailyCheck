@@ -62,6 +62,11 @@ CATEGORY_CODE_MAP = {
 # Role rank for require_role().
 ROLE_RANK = {"staff": 1, "manager": 2, "admin": 3}
 
+# agent_tokens.token_prefix length — the plaintext head kept for an indexed
+# lookup, so authentication is one row + one pbkdf2 check instead of a
+# full-table scan. MUST match mcp_server.service.auth.TOKEN_PREFIX_LEN.
+AGENT_TOKEN_PREFIX_LEN = 8
+
 # Warehouse types used across the platform.
 WAREHOUSE_TYPE_STOREFRONT: str = "storefront"
 WAREHOUSE_TYPE_RD: str = "rd"
