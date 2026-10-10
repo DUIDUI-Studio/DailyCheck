@@ -8,6 +8,18 @@
 
 <p class="muted">关闭后该品项将不再出现在门店 catalog 列表与新提交的订单中；存量订单不受影响。</p>
 
+<p class="muted" style="line-height:1.7">
+  能否订货由<b>两道闸门</b>共同决定：<br />
+  ① <b>主数据总闸</b>（品项主数据的状态，总部/研发维护，<b>本页不可改</b>）；
+  ② <b>配送中心分闸</b>（本页开关）。<br />
+  只有两道都放行，门店才订得到。主数据停用的品项，本页即使显示「可订」门店也看不到。
+</p>
+
+{% if inactive_count %}
+<p class="muted">当前有 <strong>{{ inactive_count }}</strong> 项的主数据总闸未放行（下表已标注，开关不可用）。
+  需在 <a href="{{ url_for('canonical.canonical_list') }}">品项主数据</a> 中启用（无权限请联系总部/研发）。</p>
+{% endif %}
+
 {% if groups %}
   {% for cat_code, items in groups.items() %}
   <h3 style="margin-top:18px">{{ cat_code }}</h3>
@@ -23,18 +35,23 @@
     </thead>
     <tbody>
       {% for it in items %}
-      <tr>
+      <tr{% if not it.canonical_active %} style="opacity:.6"{% endif %}>
         <td>{{ it.canonical_name }}</td>
         <td>{{ it.unit }}</td>
         <td>{{ it.quantity | fmt_qty }}</td>
         <td>
-          {% if it.is_orderable %}
+          {% if not it.canonical_active %}
+            <span class="status-pill danger">{{ it.canonical_status_label }}</span>
+          {% elif it.is_orderable %}
             <span class="status-pill ok">可订</span>
           {% else %}
             <span class="status-pill danger">不可订</span>
           {% endif %}
         </td>
         <td>
+          {% if not it.canonical_active %}
+            <span class="muted" title="主数据总闸已关闭，订货目录已整体过滤该品项">由主数据控制</span>
+          {% else %}
           <form method="post" action="{{ url_for('store_ordering.manage_dc_items') }}" class="inline-form">
             <input type="hidden" name="canonical_id" value="{{ it.canonical_id }}" />
             <input type="hidden" name="is_orderable" value="{{ 0 if it.is_orderable else 1 }}" />
@@ -42,6 +59,7 @@
               {{ '下架' if it.is_orderable else '恢复可订' }}
             </button>
           </form>
+          {% endif %}
         </td>
       </tr>
       {% endfor %}

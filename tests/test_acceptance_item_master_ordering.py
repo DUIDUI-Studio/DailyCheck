@@ -24,6 +24,10 @@
     - 2026-10-10 追加设定（`test_B21`）：DC 发货量不得超过其现有库存
       （原 v3 A7「允许欠货出库、库存可跌为负」已废止）。超库存发货整批被拒，
       订单停在 `approved`，DC 库存不扣减、不跌负。
+    - 2026-10-10 追加修复（`test_B22` / `test_B23`）：主数据 disable 后，
+      `/store-ordering/dc/items` 仍显示「可订」（该页只读 DC 本仓
+      `is_orderable`，未看主数据总闸 `canonical_items.status`）。现该页透传
+      并标注主数据状态、开关置灰，写入路径同步加护栏。
 
 所有用例都在 tmp_path 下的临时 master.db / 仓库 db 上跑，绝不触碰真实 db。
 """
@@ -981,6 +985,90 @@ def test_B21_ship_cannot_exceed_dc_stock(env):
     assert "出库失败" not in resp2.get_data(as_text=True)
     assert float(_item_state(env, oiid)["shipped_quantity"]) == 30.0
     assert float(_item_by_canonical(env["dc_path"], 101)["quantity"]) == 0.0
+
+
+def test_B22_master_disabled_reflected_on_dc_items_page(env):
+    """主数据停用必须同时反映在「订货目录」与「DC 品项管理页」。
+
+    背景（2026-10-10 Eric 反馈）：主数据里 disable 了品项，但
+    `/store-ordering/dc/items` 仍显示「可订」—— 因为该页此前只读 DC 本仓
+    `is_orderable`，完全没看主数据总闸 `canonical_items.status`。
+
+    期望：
+      - 门店 catalog：品项消失（总闸关闭）；
+      - DC 品项管理页：该行仍列出（管理页需可见），但状态列标「主数据已停用」、
+        开关不可用（显示「由主数据控制」）。
+    """
+    client = env["client"]
+
+    # 停用前：门店 catalog 能看到 101。
+    _login(client, 3, 2)  # store_staff
+    body = client.get("/store-ordering/catalog?dc=dc_test").get_data(as_text=True)
+    assert "测试包材A" in body, "停用前 catalog 应含 101"
+
+    # 主数据总闸关闭。
+    conn = sqlite3.connect(str(env["master_path"]))
+    conn.execute("UPDATE canonical_items SET status='disabled' WHERE id=101")
+    conn.commit()
+    conn.close()
+
+    # 门店 catalog：101 消失，102 仍在。
+    body = client.get("/store-ordering/catalog?dc=dc_test").get_data(as_text=True)
+    assert "测试包材A" not in body, "主数据停用后 catalog 不应再有 101"
+    assert "测试乳制品B" in body, "未停用的 102 应仍然可订"
+
+    # DC 品项管理页：仍列出，但被标记且开关不可用。
+    _login(client, 4, 1)  # dc_mgr
+    resp = client.get("/store-ordering/dc/items")
+    assert resp.status_code == 200
+    page = resp.get_data(as_text=True)
+    assert "测试包材A" in page, "管理页应仍列出已停用品项（便于排查）"
+    assert "主数据已停用" in page
+    assert "由主数据控制" in page
+    assert "主数据总闸未放行" in page
+
+
+def test_B23_dc_toggle_rejected_while_master_disabled(env):
+    """主数据停用期间，DC 分闸开关必须拒绝写入；恢复后应能正常工作。"""
+    client = env["client"]
+
+    conn = sqlite3.connect(str(env["master_path"]))
+    conn.execute("UPDATE canonical_items SET status='disabled' WHERE id=101")
+    conn.commit()
+    conn.close()
+
+    before = _item_by_canonical(env["dc_path"], 101)["is_orderable"]
+
+    _login(client, 4, 1)  # dc_mgr
+    resp = client.post(
+        "/store-ordering/dc/items",
+        data={"canonical_id": "101", "is_orderable": "0"},
+        follow_redirects=True,
+    )
+    page = resp.get_data(as_text=True)
+    assert "主数据" in page, "应提示需先处理主数据状态"
+    assert _item_by_canonical(env["dc_path"], 101)["is_orderable"] == before, \
+        "主数据停用期间 DC 分闸不应被改写"
+
+    # 恢复主数据 → 开关恢复正常。
+    conn = sqlite3.connect(str(env["master_path"]))
+    conn.execute("UPDATE canonical_items SET status='active' WHERE id=101")
+    conn.commit()
+    conn.close()
+
+    resp = client.post(
+        "/store-ordering/dc/items",
+        data={"canonical_id": "101", "is_orderable": "0"},
+        follow_redirects=True,
+    )
+    assert "已切换为不可订" in resp.get_data(as_text=True)
+    assert _item_by_canonical(env["dc_path"], 101)["is_orderable"] == 0
+
+    # 还原，避免影响其他用例（fixture 每例独立，这里只是保持整洁）。
+    conn = sqlite3.connect(str(env["dc_path"]))
+    conn.execute("UPDATE items SET is_orderable=1 WHERE canonical_id=101")
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":

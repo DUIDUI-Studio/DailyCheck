@@ -418,6 +418,24 @@ def list_available_dc_items(
 # v3.1: 品项可订开关（DC manager + admin）
 # ---------------------------------------------------------------------------
 
+#: 主数据总闸的「放行」状态。canonical_items.status 取此值时品项才可能进入
+#: 订货目录（list_available_dc_items 的 WHERE 亦为 status = 'active'）。
+CANONICAL_ACTIVE_STATUS = "active"
+
+_CANONICAL_STATUS_LABELS = {
+    "active": "正常",
+    "disabled": "主数据已停用",
+    "inactive": "主数据未启用",
+}
+
+
+def canonical_status_label(status: str | None) -> str:
+    """把 canonical_items.status 转成人类可读文案（DC 品项管理页用）。"""
+    if status in _CANONICAL_STATUS_LABELS:
+        return _CANONICAL_STATUS_LABELS[status]
+    return f"主数据状态异常（{status or 'NULL'}）"
+
+
 def list_dc_items_for_management(
     master_conn: sqlite3.Connection,
     dc_warehouse_code: str,
@@ -425,10 +443,20 @@ def list_dc_items_for_management(
     """List ALL DC items (含不可订)，用于品项管理页面。
 
     Enrichment 同 list_available_dc_items；按 category_code 分组返回。
+
+    额外透传**主数据总闸**状态：
+      - ``canonical_status``：canonical_items.status 原值
+      - ``canonical_active``：是否 == 'active'
+      - ``canonical_status_label``：人类可读文案
+
+    为什么必须透传：本页只显示 DC 本仓 ``is_orderable`` 会误导 —— 主数据
+    ``status != 'active'`` 时，品项无论 ``is_orderable`` 为何都已从订货目录
+    消失（见 ``list_available_dc_items``），操作者看到「可订」会以为主数据
+    停用没生效。
     """
     master_conn.row_factory = sqlite3.Row
     canonical_rows = master_conn.execute(
-        "SELECT id, name, category_code FROM canonical_items"
+        "SELECT id, name, category_code, status FROM canonical_items"
     ).fetchall()
     canonical_map = {int(r["id"]): dict(r) for r in canonical_rows}
 
@@ -450,6 +478,10 @@ def list_dc_items_for_management(
                 continue
             item["canonical_name"] = canon["name"]
             item["category_code"] = canon["category_code"]
+            status = canon.get("status")
+            item["canonical_status"] = status
+            item["canonical_active"] = status == CANONICAL_ACTIVE_STATUS
+            item["canonical_status_label"] = canonical_status_label(status)
             out.append(item)
         return out
     finally:
@@ -465,8 +497,28 @@ def set_dc_item_orderable(
     """Toggle a single DC item's orderability.
 
     Returns True iff a row was updated. Raises ValueError if the DC has
-    no item bound to that canonical_id (so the UI can flash an error).
+    no item bound to that canonical_id (so the UI can flash an error), or
+    if the canonical item is not active in master.
+
+    Why the master-status guard: 主数据总闸（canonical_items.status）不是
+    'active' 时，该品项已被 list_available_dc_items 整体过滤掉 —— DC 分闸
+    无论怎么改，门店都看不到、也订不了。此时允许写入只会制造「我点了恢复
+    可订，门店还是订不了」的假象，故直接拒绝并提示去主数据处理。
     """
+    master_conn.row_factory = sqlite3.Row
+    canon = master_conn.execute(
+        "SELECT status FROM canonical_items WHERE id = ?",
+        (canonical_id,),
+    ).fetchone()
+    if canon is None:
+        raise ValueError(f"主数据中不存在 canonical_id={canonical_id} 的品项")
+    canon_status = canon["status"]
+    if canon_status != CANONICAL_ACTIVE_STATUS:
+        raise ValueError(
+            f"该品项主数据状态为「{canonical_status_label(canon_status)}」，"
+            "配送中心开关不生效；请先到品项主数据中启用后再调整。"
+        )
+
     dc_conn = open_warehouse_db(dc_warehouse_code)
     try:
         dc_conn.row_factory = sqlite3.Row

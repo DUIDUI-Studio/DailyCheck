@@ -1664,6 +1664,54 @@ def test_list_dc_items_for_management_includes_unorderable(ordering_env):
     assert item_101["is_orderable"] == 0
 
 
+def test_list_dc_items_for_management_exposes_canonical_status(ordering_env):
+    """管理列表必须透传主数据总闸状态（canonical#103 = inactive）。"""
+    conn = ordering_env["master_conn"]
+    items = sop.list_dc_items_for_management(conn, "dc_test")
+    by_cid = {int(it["canonical_id"]): it for it in items}
+
+    # active 行
+    assert by_cid[101]["canonical_status"] == "active"
+    assert by_cid[101]["canonical_active"] is True
+    assert by_cid[101]["canonical_status_label"] == "正常"
+
+    # inactive 行（主数据总闸关闭）仍需列出，但必须被标记
+    assert 103 in by_cid
+    assert by_cid[103]["canonical_status"] == "inactive"
+    assert by_cid[103]["canonical_active"] is False
+    assert by_cid[103]["canonical_status_label"] == "主数据未启用"
+
+
+def test_canonical_status_label_unknown_value():
+    """未知 / NULL 状态不应静默当 active。"""
+    assert sop.canonical_status_label("disabled") == "主数据已停用"
+    assert "异常" in sop.canonical_status_label(None)
+    assert "异常" in sop.canonical_status_label("whatever")
+
+
+def test_set_dc_item_orderable_rejected_when_master_not_active(ordering_env):
+    """主数据总闸关闭时，DC 分闸开关必须拒绝写入（而不是静默成功）。"""
+    conn = ordering_env["master_conn"]
+    dc_path = ordering_env["dc_path"]
+
+    # canonical#103 在 fixture 中 status='inactive'，DC 行初始 is_orderable=1
+    try:
+        sop.set_dc_item_orderable(conn, "dc_test", 103, False)
+    except ValueError as e:
+        assert "主数据" in str(e)
+    else:
+        raise AssertionError("expected ValueError for non-active canonical")
+
+    # 断言 DC 行未被改动（拒绝必须发生在写库之前）
+    dc = sqlite3.connect(str(dc_path))
+    dc.row_factory = sqlite3.Row
+    row = dc.execute(
+        "SELECT is_orderable FROM items WHERE canonical_id = 103"
+    ).fetchone()
+    dc.close()
+    assert row["is_orderable"] == 1
+
+
 def test_list_unorderable_cart_canonicals(ordering_env):
     """A5 辅助：list_unorderable_cart_canonicals 返回被下架的品项。"""
     conn = ordering_env["master_conn"]

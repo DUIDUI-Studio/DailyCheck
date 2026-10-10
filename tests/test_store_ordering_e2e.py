@@ -927,6 +927,68 @@ def test_dc_items_toggle_via_post(e2e_env):
     assert "不可订" not in body_restored or "下架" in body_restored  # 按钮文字
 
 
+def test_dc_items_page_flags_master_disabled_item(e2e_env):
+    """主数据 disable 的品项：DC 页必须标注「主数据已停用」+ 开关不可用。
+
+    回归 Eric 2026-10-10 反馈：主数据里 disable 了，DC 品项管理页仍显示「可订」。
+    """
+    master_path = e2e_env["master_path"]
+    dc1_path = e2e_env["dc1_path"]
+
+    # 造一条主数据已停用、但 DC 侧 is_orderable=1 的品项
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(str(master_path))
+    m.execute(
+        """INSERT INTO canonical_items
+           (id, canonical_sku, name, category_code, unit, gram_per_unit, aux_unit, aux_rate,
+            status, created_from, created_at, updated_at)
+           VALUES (999, 'IC-000999', '测试包材Z-停用', 'PACKAGING', '件', 0, NULL, 0,
+                   'disabled', 'rd_manual', ?, ?)""",
+        (ts, ts),
+    )
+    m.commit()
+    m.close()
+
+    dc1 = sqlite3.connect(str(dc1_path))
+    dc1.row_factory = sqlite3.Row
+    cat_id = dc1.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    dc1.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id, is_orderable, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("DC1-Z", "测试包材Z-停用", cat_id, 10.0, "件", 999, 1, ts),
+    )
+    dc1.commit()
+    dc1.close()
+
+    client = e2e_env["client"]
+    _login_as(client, 3, 1)  # dc_mgr
+    resp = client.get("/store-ordering/dc/items")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    # 行仍列出（管理页需要看到它），但必须被标记 + 开关不可用
+    assert "测试包材Z-停用" in body
+    assert "主数据已停用" in body
+    assert "由主数据控制" in body
+    assert "主数据总闸未放行" in body
+
+    # 直接 POST 也必须被拒（防陈旧页面 / 手工请求）
+    resp = client.post(
+        "/store-ordering/dc/items",
+        data={"canonical_id": "999", "is_orderable": "0"},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert "主数据" in resp.data.decode()
+
+    dc1 = sqlite3.connect(str(dc1_path))
+    dc1.row_factory = sqlite3.Row
+    row = dc1.execute(
+        "SELECT is_orderable FROM items WHERE canonical_id = 999"
+    ).fetchone()
+    dc1.close()
+    assert row["is_orderable"] == 1  # 未被改写
+
+
 def test_catalog_filters_unorderable_item(e2e_env):
     """A2 路由验证：catalog 不显示 is_orderable=0 的品项。"""
     import blueprints.store_ordering_pure as sop

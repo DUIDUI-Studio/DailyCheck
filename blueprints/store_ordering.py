@@ -698,6 +698,8 @@ def manage_dc_items() -> str:
         return redirect(url_for("store_ordering.manage_dc_items"))
 
     items = sop.list_dc_items_for_management(master, dc_code)
+    # 主数据总闸已关闭的行：开关无意义（订货目录已整体过滤），单独计数提示。
+    inactive_count = sum(1 for it in items if not it.get("canonical_active"))
     # 按 category_code 分组
     groups: dict[str, list[dict]] = {}
     for it in items:
@@ -706,6 +708,7 @@ def manage_dc_items() -> str:
         "store_ordering/dc_items.html",
         dc_code=dc_code,
         groups=groups,
+        inactive_count=inactive_count,
     )
 
 
