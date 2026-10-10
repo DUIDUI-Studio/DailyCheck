@@ -61,7 +61,7 @@
   {% set show_ship_form = can_ship and order.status == 'approved' %}
   {% if show_ship_form %}
   <h3>DC 发货</h3>
-  <p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。</p>
+  <p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。<strong>发货量不得超过配送中心现有库存。</strong></p>
   <form method="post"
         action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}"
         id="shipment-form">
@@ -82,6 +82,9 @@
       {% for item in order.order_items %}
         {% set shipped = item.shipped_quantity or 0 %}
         {% set pending = item.quantity - shipped %}
+        {% set stock = item.dc_available or 0 %}
+        {# 可发量 = min(剩余订单量, DC 库存)：发货禁止超库存（2026-10-10）。 #}
+        {% set shippable = ([pending, stock] | min) if stock > 0 else 0 %}
         <tr>
           <td>{{ item.canonical_name }}</td>
           <td>{{ item.unit }}</td>
@@ -89,28 +92,33 @@
           <td>{{ item.quantity | fmt_qty }}</td>
           <td>{{ shipped | fmt_qty }}</td>
           <td>
-            {# A6: 仓库库存允许为负（A7 允许欠货出库） #}
-            <span class="dc-stock {% if item.dc_available < 0 %}negative{% endif %}">
-              {{ item.dc_available | fmt_qty }}
+            {# 库存列：发货已禁止超库存，正常不为负；历史遗留负值仍红色高亮。 #}
+            <span class="dc-stock {% if stock < 0 %}negative{% endif %}">
+              {{ stock | fmt_qty }}
             </span>
           </td>
           {% if can_ship and order.status == 'approved' %}
           <td>
-            {% if pending > 0 %}
-            {# name 直接写死为 shipped_items[N] —— 本 form 的原生字段，无需 JS 改写；
-               值为空/0 时服务端按 v3 §4.1 静默跳过该行。 #}
+            {% if shippable > 0 %}
+            {# 上限 = min(剩余订单量, DC 库存)：禁止超库存发货（2026-10-10）。
+               name 直接写死为 shipped_items[N] —— 本 form 的原生字段，无需 JS
+               改写；值为空/0 时服务端按 v3 §4.1 静默跳过该行。 #}
             <input
               type="number"
               name="shipped_items[{{ item.id }}]"
               data-item-id="{{ item.id }}"
-              data-pending="{{ pending }}"
+              data-pending="{{ shippable }}"
               min="0"
               step="0.01"
-              max="{{ pending }}"
+              max="{{ shippable }}"
               placeholder="0"
               style="width:90px"
             />
-            {% else %}<span class="status-pill ok">已发齐</span>{% endif %}
+            {% elif pending <= 0 %}
+            <span class="status-pill ok">已发齐</span>
+            {% else %}
+            <span class="status-pill warn">库存不足</span>
+            {% endif %}
           </td>
           {% endif %}
         </tr>
@@ -321,10 +329,11 @@
       var pending = parseFloat(input.getAttribute('data-pending') || '0');
       var v = parseFloat(input.value || '0');
       if (!isFinite(v) || v <= 0) continue;
-      // 上限校验：不超过剩余可发数量。
+      // 上限校验：不超过可发量 = min(剩余订单量, DC 库存)。
       if (v > pending + 1e-9) {
         ev.preventDefault();
-        alert('本批发货数量 ' + v + ' 超过剩余可发 ' + pending);
+        alert('本批发货数量 ' + v + ' 超过可发量 ' + pending +
+              '（受配送中心库存与订单剩余量限制）');
         input.focus();
         return;
       }

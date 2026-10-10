@@ -1066,7 +1066,8 @@ def get_dc_items_for_order_detail(
 
     Used by ``order_detail`` to render the "DC 库存" column on every line of
     the DC-view table. Returns an empty dict when the order does not exist.
-    ``dc_available`` may be negative (A7 allows欠货出库, so 库存可为负).
+    发货已禁止超库存（2026-10-10），新建订单的 ``dc_available`` 不会为负；
+    历史遗留的负库存行仍会原样返回，模板以红色高亮提示。
 
     Lookup strategy for ``dc_available`` (per F4=A: DC 库存始终可见):
       - 优先用 ``store_order_items.dc_item_id``（出库后回填的 dc 仓 items.id）
@@ -1416,8 +1417,10 @@ def _ship_order_partial_impl(
           UI's blank rows are no-ops).
         * Validates ``qty + shipped_quantity <= quantity + 1e-9``; raises
           ``ValueError`` on over-shoot.
-        * Decrements ``dc.items.quantity`` by ``qty`` — no stock guard, so
-          DC stock may drop negative (F1=A: business accepts欠货出库).
+        * Validates DC stock is sufficient (``qty <= dc items.quantity``);
+          raises ``ValueError`` otherwise. DC 库存**永不跌为负**
+          （2026-10-10 决策反转：原 A7「允许欠货出库」已废止）。
+        * Decrements ``dc.items.quantity`` by ``qty``.
         * Writes a ``stock_movements`` row with ``action='门店订货出库'``,
           ``delta=-qty`` and ``note`` containing the order number plus a
           ``partial`` marker plus the batch quantity.
@@ -1496,8 +1499,18 @@ def _ship_order_partial_impl(
                 )
             dc_item_id = int(dc_item["id"])
             dc_item_id_map[order_item_id] = dc_item_id
-            # A7: 不校验 DC 库存是否足够，扣减后允许跌为负值。
-            new_qty = parse_qty(float(dc_item["quantity"]) - qty)
+            # ⚠️ 2026-10-10 决策反转：禁止超库存发货（原 v3 A7「允许欠货出库、
+            # 库存可跌为负」已废止）。本批发货量必须 ≤ DC 当前库存，否则整批
+            # 拒绝 —— 外层 try/except 回滚，保证 all-or-nothing，库存永不跌负。
+            # 注：同一 canonical 若被多行引用，本循环逐行重读（同连接可见前序
+            # UPDATE），因此也天然按累计量校验。
+            available = parse_qty(dc_item["quantity"])
+            if qty > available + 1e-9:
+                raise ValueError(
+                    f"库存不足：{item.get('canonical_name')} 本批发货 {qty:g}，"
+                    f"配送中心现有库存 {available:g}"
+                )
+            new_qty = parse_qty(available - qty)
             dc_conn.execute(
                 "UPDATE items SET quantity=? WHERE id=?",
                 (new_qty, dc_item_id),

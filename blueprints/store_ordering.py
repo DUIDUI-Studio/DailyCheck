@@ -489,7 +489,8 @@ def order_detail(order_id: int) -> str:
     """Order detail view shared by store, DC and admin.
 
     v3 A4: 计算订单总金额 Σ(quantity × unit_price)。
-    v3 A6: 收集 DC 仓库当前库存（含允许欠货出库后的负值）。
+    v3 A6: 收集 DC 仓库当前库存（发货已禁止超库存，故不再产生负值；
+            历史遗留负库存行仍原样展示、红色高亮）。
     """
     master = get_master_db()
     order = sop.get_order_detail(master, order_id)

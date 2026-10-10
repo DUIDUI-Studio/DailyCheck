@@ -412,11 +412,12 @@ def test_ship_order_full_changes_status_to_shipped(ordering_env):
     store.close()
 
 
-def test_ship_order_negative_stock_allowed(ordering_env):
-    """v3 F1=A: DC 库存不足时仍允许发货，库存跌为负值。
+def test_ship_order_insufficient_stock_rejected(ordering_env):
+    """2026-10-10 决策反转：禁止超库存发货（原 v3 A7「允许欠货出库」已废止）。
 
-    即使把 DC 库存扣到 0 以下，ship_order 不抛异常；订单完成发货后
-    状态正常推进到 shipped；DC items.quantity 跌为负值。"""
+    DC 库存 5，订单要出 10 件 → ``ship_order_full`` 抛 ValueError；
+    DC 库存保持 5（绝不跌负）、无 stock_movements、订单停在 approved。
+    """
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
     sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")  # DC has 100 initially
@@ -429,22 +430,82 @@ def test_ship_order_negative_stock_allowed(ordering_env):
     dc.commit()
     dc.close()
 
-    # v3: 不抛异常。
-    result = sop.ship_order_full(conn, order["id"], shipped_by=4)
-    assert result["status"] == sop.ORDER_STATUS_SHIPPED
-    assert result["is_fully_shipped"] is True
+    with pytest.raises(ValueError, match="库存不足"):
+        sop.ship_order_full(conn, order["id"], shipped_by=4)
 
-    # DC 库存跌为 -5（5 - 10 = -5）。
+    # DC 库存未被扣减、无出库流水。
     dc = sqlite3.connect(str(ordering_env["dc_path"]))
     dc.row_factory = sqlite3.Row
-    row = dc.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()
-    assert row["quantity"] == -5.0
-    # stock_movements 仍然记录 delta=-10。
-    mv = dc.execute(
-        "SELECT delta FROM stock_movements WHERE action=?",
+    assert dc.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101"
+    ).fetchone()["quantity"] == 5.0
+    assert dc.execute(
+        "SELECT COUNT(*) AS c FROM stock_movements WHERE action=?",
         (sop.SHIPMENT_ACTION,),
-    ).fetchone()
-    assert mv["delta"] == -10.0
+    ).fetchone()["c"] == 0
+    dc.close()
+
+    # 订单未推进、实发为 0。
+    after = sop.get_order_detail(conn, order["id"])
+    assert after["status"] == sop.ORDER_STATUS_APPROVED
+    assert float(after["order_items"][0]["shipped_quantity"] or 0) == 0.0
+
+
+def test_ship_order_at_stock_limit_ok(ordering_env):
+    """边界：本批发货量恰好等于 DC 库存时应放行（库存归零，不为负）。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.execute("UPDATE items SET quantity=? WHERE canonical_id=?", (10.0, 101))
+    dc.commit()
+    dc.close()
+
+    result = sop.ship_order_full(conn, order["id"], shipped_by=4)
+    assert result["status"] == sop.ORDER_STATUS_SHIPPED
+
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    assert dc.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101"
+    ).fetchone()["quantity"] == 0.0
+    dc.close()
+
+
+def test_ship_order_partial_stock_guard_per_line(ordering_env):
+    """多批累计：DC 库存 60、订单 100。首批发 60（库存→0）放行；
+    第二批再发 20（订单累计仅 80，未超订单量）应被库存校验拒绝。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")
+    sop.add_cart_item(conn, cart["id"], 101, 100.0, "件")
+    order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    oiid = int(order["order_items"][0]["id"])
+
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.execute("UPDATE items SET quantity=? WHERE canonical_id=?", (60.0, 101))
+    dc.commit()
+    dc.close()
+
+    sop.ship_order(conn, order["id"], {oiid: 60.0}, shipped_by=4)
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    assert dc.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101"
+    ).fetchone()["quantity"] == 0.0
+    dc.close()
+
+    with pytest.raises(ValueError, match="库存不足"):
+        sop.ship_order(conn, order["id"], {oiid: 20.0}, shipped_by=4)
+
+    dc = sqlite3.connect(str(ordering_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    assert dc.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101"
+    ).fetchone()["quantity"] == 0.0
     dc.close()
 
 

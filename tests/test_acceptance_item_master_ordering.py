@@ -21,6 +21,9 @@
       停在 `approved`（全部发齐才转 `shipped`），而收货入口此前只在 `shipped`
       渲染 → 部分发货的订单在门店端完全收不了货。现收货门禁放宽到
       `approved` + `shipped`，逐行按「已发未收」量放行，未发货的行不可收。
+    - 2026-10-10 追加设定（`test_B21`）：DC 发货量不得超过其现有库存
+      （原 v3 A7「允许欠货出库、库存可跌为负」已废止）。超库存发货整批被拒，
+      订单停在 `approved`，DC 库存不扣减、不跌负。
 
 所有用例都在 tmp_path 下的临时 master.db / 仓库 db 上跑，绝不触碰真实 db。
 """
@@ -938,6 +941,46 @@ def test_B20_multi_batch_ship_receive_then_delivered(env):
     st = _item_state(env, oiid)
     assert float(st["shipped_quantity"]) == 100.0
     assert float(st["fulfilled_quantity"]) == 100.0
+
+
+def test_B21_ship_cannot_exceed_dc_stock(env):
+    """DC 发货不得超过其现有库存（2026-10-10 新设定）。
+
+    构造：订单 100，把 DC 库存压到 30。
+    期望：
+      - 发 50 → 拒绝（flash「库存不足」），DC 库存仍 30、订单停在 approved；
+      - 发 30（恰好等于库存）→ 成功，DC 库存归 0、实发 30。
+    """
+    client = env["client"]
+    oid, oiid = _order_flow(env, qty=100.0)
+
+    conn = sqlite3.connect(str(env["dc_path"]))
+    conn.execute("UPDATE items SET quantity=? WHERE canonical_id=101", (30.0,))
+    conn.commit()
+    conn.close()
+
+    # 超库存 → 拒绝。
+    _login(client, 5, 1)  # dc_staff
+    resp = client.post(
+        f"/store-ordering/orders/{oid}/ship",
+        data={f"shipped_items[{oiid}]": "50", "tracking_note": ""},
+        follow_redirects=True,
+    )
+    body = resp.get_data(as_text=True)
+    assert "出库失败" in body and "库存不足" in body, "超库存发货未被拒绝"
+    assert float(_item_state(env, oiid)["shipped_quantity"] or 0) == 0.0
+    assert float(_item_by_canonical(env["dc_path"], 101)["quantity"]) == 30.0
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+
+    # 恰好等于库存 → 放行。
+    resp2 = client.post(
+        f"/store-ordering/orders/{oid}/ship",
+        data={f"shipped_items[{oiid}]": "30", "tracking_note": ""},
+        follow_redirects=True,
+    )
+    assert "出库失败" not in resp2.get_data(as_text=True)
+    assert float(_item_state(env, oiid)["shipped_quantity"]) == 30.0
+    assert float(_item_by_canonical(env["dc_path"], 101)["quantity"]) == 0.0
 
 
 if __name__ == "__main__":
