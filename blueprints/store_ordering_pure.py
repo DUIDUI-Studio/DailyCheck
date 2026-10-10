@@ -1622,7 +1622,13 @@ def mark_order_delivered(
     if order["status"] != ORDER_STATUS_SHIPPED:
         raise ValueError(f"order must be shipped to deliver, got {order['status']}")
     for item in order["order_items"]:
-        pending = parse_qty(item["quantity"]) - parse_qty(item["fulfilled_quantity"])
+        # 上限按「实发量」而非「订货量」：DC 可能只发了一部分，
+        # 门店最多只能收 min(实发, 订货) − 已收（缺陷修复 2026-10-10）。
+        # shipped_quantity 为空（v2 legacy 行）时回落到订货量。
+        shipped = parse_qty(item.get("shipped_quantity") or 0)
+        ordered = parse_qty(item["quantity"])
+        effective_shipped = shipped if shipped > 0 else ordered
+        pending = min(effective_shipped, ordered) - parse_qty(item["fulfilled_quantity"])
         if pending <= 0:
             continue
         receive_order_item(
@@ -1645,7 +1651,10 @@ def receive_order_item(
 
     - Validates order.status == 'shipped'.
     - Validates the order_item belongs to the order.
-    - Validates qty > 0 and qty <= (quantity - fulfilled_quantity).
+    - Validates qty > 0 and qty <= min(shipped_quantity, quantity) − fulfilled_quantity.
+      上限取「实发量与订货量的较小值」——配送中心可能只发了一部分，门店
+      最多只能收实发量（缺陷修复 2026-10-10：原按订货量计算，导致
+      「DC 发 2、门店可收 100」）。
     - Writes a row to ``store_order_receipts``.
     - Adds ``qty`` to the storefront warehouse ``items.quantity`` (auto-creating
       a local row if needed; see §3.1 + §9.1). Writes a ``stock_movements``
@@ -1684,7 +1693,15 @@ def receive_order_item(
             f"order_item_id={order_item_id} 不属于 order_id={order_id}"
         )
 
-    remaining = parse_qty(target_item["quantity"]) - parse_qty(
+    # 收货上限 = min(实发量, 订货量) − 已收量。
+    # 用实发量封顶：DC 可能只发了一部分，门店不得超收（缺陷修复 2026-10-10）。
+    # 兼容：v2 legacy 行未记录 shipped_quantity（NULL/0），此时订单状态已是
+    # shipped 即代表整单一次发齐，回落到订货量。v3 部分发货行 shipped_quantity
+    # 必为非 0 值，故不会误放开。
+    shipped_qty = parse_qty(target_item.get("shipped_quantity") or 0)
+    ordered_qty = parse_qty(target_item["quantity"])
+    effective_shipped = shipped_qty if shipped_qty > 0 else ordered_qty
+    remaining = min(effective_shipped, ordered_qty) - parse_qty(
         target_item["fulfilled_quantity"]
     )
     if qty > remaining + 1e-9:

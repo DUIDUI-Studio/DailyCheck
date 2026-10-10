@@ -54,7 +54,18 @@
 
 {# —— 明细表：按视角分支 —— #}
 {% if is_dc_view %}
-  {# DC 视角：含「仓库库存」「已发数」两列 + 部分发货表单 #}
+  {# DC 视角：含「仓库库存」「已发数」两列 + 部分发货表单。
+     ⚠️ 整张明细表必须包在 <form id="shipment-form"> 内 —— 每行的「本批发货」
+     数量 input 是 form 的后代，浏览器提交时才会带上它们。此前 input 与 form
+     互为兄弟节点（B16 根因）→ 提交时静默丢弃 → 服务端退化为「整单全发」。 #}
+  {% set show_ship_form = can_ship and order.status == 'approved' %}
+  {% if show_ship_form %}
+  <h3>DC 发货</h3>
+  <p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。</p>
+  <form method="post"
+        action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}"
+        id="shipment-form">
+  {% endif %}
   <table class="data-table">
     <thead>
       <tr>
@@ -86,8 +97,11 @@
           {% if can_ship and order.status == 'approved' %}
           <td>
             {% if pending > 0 %}
+            {# name 直接写死为 shipped_items[N] —— 本 form 的原生字段，无需 JS 改写；
+               值为空/0 时服务端按 v3 §4.1 静默跳过该行。 #}
             <input
               type="number"
+              name="shipped_items[{{ item.id }}]"
               data-item-id="{{ item.id }}"
               data-pending="{{ pending }}"
               min="0"
@@ -103,6 +117,14 @@
       {% endfor %}
     </tbody>
   </table>
+  {% if show_ship_form %}
+  <div class="inline-form" style="margin-top:8px;gap:10px">
+    <input name="tracking_note" placeholder="物流备注" />
+    <button type="submit" class="btn-sm ok">确认发货</button>
+  </div>
+  </form>
+  <p class="muted">只填需要本批发货的品项，留空的行本批不发；已发货数量会累计保留。</p>
+  {% endif %}
 {% else %}
   {# storefront 视角：含「已收数」+ 部分收货表单（A2） #}
   <table class="data-table">
@@ -119,7 +141,11 @@
     <tbody>
       {% for item in order.order_items %}
         {% set fulfilled = item.fulfilled_quantity or 0 %}
-        {% set pending = item.quantity - fulfilled %}
+        {# 待收上限按「实发量」而非订货量：DC 可能只发一部分，不得超收。
+           shipped 为空（v2 legacy 行）时回落到订货量。 #}
+        {% set shipped_qty = item.shipped_quantity or 0 %}
+        {% set effective_shipped = shipped_qty if shipped_qty > 0 else item.quantity %}
+        {% set pending = ([effective_shipped, item.quantity] | min) - fulfilled %}
         <tr>
           <td>{{ item.canonical_name }}</td>
           <td>{{ item.unit }}</td>
@@ -142,21 +168,6 @@
       {% endfor %}
     </tbody>
   </table>
-{% endif %}
-
-{# —— A1: DC 发货表单（DC 视角，仅在 approved 显示）—— #}
-{% if is_dc_view and can_ship and order.status == 'approved' %}
-<h3>DC 发货</h3>
-<p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。</p>
-<form method="post"
-      action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}"
-      id="shipment-form"
-      class="inline-form"
-      style="margin-top:8px;gap:10px">
-  <input name="tracking_note" placeholder="物流备注" />
-  <button type="submit" class="btn-sm ok">确认发货</button>
-</form>
-<p class="muted">明细表中的「本批发货」输入框会在表单提交时一次性批量提交。</p>
 {% endif %}
 
 {# —— 收货历史（如有）—— 显眼位置放顶部，按时间倒序 —— #}
@@ -276,7 +287,9 @@
   {% endif %}
 </div>
 
-{# —— A3: 部分发货表单提交前的 JS：把每行明细 input name 改写为 shipped_items[N] —— #}
+{# —— A3: 部分发货表单提交前的 JS 校验：数量上限 + 至少填一项 ——
+   输入框已带 name="shipped_items[N]"（表单原生字段），无需改写 name；
+   此处只做客户端校验，避免空提交/超发误触服务端全量兜底。 #}
 {% if is_dc_view and can_ship and order.status == 'approved' %}
 <script>
 (function () {
@@ -284,16 +297,13 @@
   if (!form) return;
 
   form.addEventListener('submit', function (ev) {
-    var inputs = document.querySelectorAll('input[data-item-id]');
-    var first = true;
-    inputs.forEach(function (input) {
-      var itemId = input.getAttribute('data-item-id');
+    var inputs = form.querySelectorAll('input[data-item-id]');
+    var anyPositive = false;
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
       var pending = parseFloat(input.getAttribute('data-pending') || '0');
       var v = parseFloat(input.value || '0');
-      if (!isFinite(v) || v <= 0 || !itemId) {
-        input.removeAttribute('name');
-        return;
-      }
+      if (!isFinite(v) || v <= 0) continue;
       // 上限校验：不超过剩余可发数量。
       if (v > pending + 1e-9) {
         ev.preventDefault();
@@ -301,11 +311,10 @@
         input.focus();
         return;
       }
-      input.setAttribute('name', 'shipped_items[' + itemId + ']');
-      first = false;
-    });
-    // 如果用户一行都没填，不允许空提交。
-    if (first) {
+      anyPositive = true;
+    }
+    // 用户一行都没填 → 不提交（服务端亦会拒绝空提交并走兜底，故前端先挡）。
+    if (!anyPositive) {
       ev.preventDefault();
       alert('请至少填写一项发货数量');
     }

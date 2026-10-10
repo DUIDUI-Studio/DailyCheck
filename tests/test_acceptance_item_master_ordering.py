@@ -10,11 +10,13 @@
     ~/.local/bin/python3.12 tests/test_acceptance_item_master_ordering.py
 
 预期结果：
-    - 除「已知缺陷」标记的用例（xfail）外，应**全部通过**。
-    - 有 **2 个 xfail**，指向同一个缺陷（2026-10-10 发现）：
-        * `test_B16_...` 为**根因**：DC 发货页的数量输入框不在 `<form>` 内 → 永远整单全发。
-        * `test_B15_...` 为**下游症状**：收货上限按订货量而非实发量。
-      两者修好后会自动变 XPASS。
+    - **全部通过**（0 failed / 0 xfail）。
+    - 2026-10-10 发现的两个缺陷已修复，原 xfail 用例已转为常规断言：
+        * `test_B16_...`（根因）：DC 发货页的数量输入框现已位于 `<form id="shipment-form">` 内，
+          浏览器提交时正常携带 `shipped_items[N]`；且服务端对「带字段但全空」的表单直接
+          拒绝，不再退化为「整单全发」。
+        * `test_B15_...`（症状）：门店收货上限改为 `min(实发量, 订货量) − 已收量`，
+          不得超过 DC 实发量。
 
 所有用例都在 tmp_path 下的临时 master.db / 仓库 db 上跑，绝不触碰真实 db。
 """
@@ -688,18 +690,12 @@ def test_B14_invalid_quantity_not_added(env):
     assert cart == 0
 
 
-@pytest.mark.xfail(
-    reason="【下游症状】已知缺陷（2026-10-10）：收货上限按【订货量】而非【实发量】计算 —— "
-           "订单一旦处于 shipped 而实发 < 订货，门店可收货超过实发量。"
-           "（根因见 test_B16：UI 发货永远整单全发，使这一状态在正常流程中被掩盖。）",
-    strict=False,
-)
 def test_B15_receive_must_not_exceed_shipped(env):
-    """【已知缺陷】门店收货不得超过 DC 实发量。
+    """门店收货不得超过 DC 实发量（2026-10-10 缺陷已修复）。
 
-    构造：订单 100，DC 实发 2（订单处于 shipped 状态，实发 2）。
-    期望：收货 100 被拒绝；实际：被受理 → 本用例 xfail。
-    （正常流程下订单需全发齐才转 shipped，故此状态需直接构造。）
+    构造：订单订货 100，DC 实发 2 → 订单被置 shipped（正常流程需发齐才转
+    shipped，故此处直接构造该状态）。
+    期望：收货 100 被拒绝（超上限），收货 2 被受理；总收货不得超过实发 2。
     """
     client = env["client"]
     oid, oiid = _order_flow(env, qty=100.0)
@@ -712,10 +708,38 @@ def test_B15_receive_must_not_exceed_shipped(env):
     conn.commit()
     conn.close()
 
-    _receive(client, oid, oiid, 100)
-    fulfilled = float(_item_state(env, oiid)["fulfilled_quantity"])
-    assert fulfilled <= 2.0, (
-        f"收货 {fulfilled} 超过实发的 2 —— 收货上限未按实发量限制（缺陷复现）")
+    # 1) 超收 100 → 拒绝，零写入。
+    resp = _receive(client, oid, oiid, 100)
+    assert "超过待收" in resp.get_data(as_text=True)
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 0.0
+
+    # 2) 收满实发量 2 → 受理。
+    _receive(client, oid, oiid, 2)
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 2.0
+
+    # 3) 再收 1 → 已收齐，拒绝。
+    resp = _receive(client, oid, oiid, 1)
+    assert "超过待收" in resp.get_data(as_text=True)
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 2.0
+
+
+def test_B15b_legacy_receive_all_respects_shipped(env):
+    """整单收货快捷入口（deliver）同样受实发量封顶，不得超收。"""
+    client = env["client"]
+    oid, oiid = _order_flow(env, qty=100.0)
+    _ship(client, oid, oiid, 2)
+    conn = sqlite3.connect(str(env["master_path"]))
+    conn.execute("UPDATE store_orders SET status='shipped' WHERE id=?", (oid,))
+    conn.execute("UPDATE store_order_items SET status='partial', shipped_quantity=2 WHERE id=?",
+                 (oiid,))
+    conn.commit()
+    conn.close()
+
+    # 门店经理调用「整单送达」快捷入口。
+    _login(client, 2, 2)
+    client.post(f"/store-ordering/orders/{oid}/deliver", data={}, follow_redirects=True)
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 2.0, (
+        "整单收货快捷入口超收，突破了实发量封顶")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -765,19 +789,12 @@ def test_C3_items_list_hides_canonically_disabled(env):
     assert "测试包材A" not in body
 
 
-@pytest.mark.xfail(
-    reason="【根因】已知缺陷（2026-10-10）：DC 发货页的「本批发货」数量输入框位于 "
-           "表格中，而提交按钮在另一个独立 <form id=\"shipment-form\"> 里 —— 输入框不在"
-           "表单内、永远不会被提交。JS 只给它们加了 name，但 DOM 上仍不属于该 form。"
-           "于是服务端收不到任何 shipped_items[] → 走全量发货兜底 → 整单发齐。"
-           "（现象：DC 输入 2 点击发货，系统却记 100 已发，订单转 shipped，门店可收 100。）",
-    strict=False,
-)
 def test_B16_dc_ship_form_contains_quantity_inputs(env):
-    """【根因】DC 发货页的「本批发货」数量输入框必须位于发货表单内。
+    """【根因回归】DC 发货页的「本批发货」数量输入框必须位于发货表单内。
 
-    当前它们渲染在 <table> 中，而 <form id="shipment-form"> 是另一个元素 → 浏览器
-    提交时不会带上这些字段，导致每次 UI 发货都退化为「整单全发」。
+    2026-10-10 缺陷：输入框渲染在 <table> 中，而 <form id="shipment-form">
+    是另一个元素（DOM 兄弟节点）→ 浏览器提交时不带这些字段 → 服务端走
+    「整单全发」兜底 → DC 输入 2 却记发 100。现已将整张表包进该 form。
     """
     client = env["client"]
     oid, oiid = _order_flow(env, qty=100.0)  # 停在 approved
@@ -792,6 +809,29 @@ def test_B16_dc_ship_form_contains_quantity_inputs(env):
     assert "data-item-id=" in form_html, (
         "「本批发货」数量输入框不在发货表单内 —— 浏览器不会提交它们，"
         "点击「确认发货」会退化为整单全发（缺陷复现）")
+    # input 必须带原生 name，保证即使 JS 未执行也会随表单一并提交。
+    assert f'name="shipped_items[{oiid}]"' in form_html
+
+
+def test_B16b_empty_ship_form_rejected_no_full_ship(env):
+    """【根因回归】新 UI 携带 shipped_items[] 字段但全空 → 明确拒绝，绝不整单全发。
+
+    服务端安全护栏：只要表单里出现 shipped_items[ 字段（哪怕全为空），
+    就视为「新 UI 提交」，空值一律 flash 拒绝，不再退化为 full-ship 兜底。
+    """
+    client = env["client"]
+    oid, oiid = _order_flow(env, qty=100.0)  # 停在 approved
+    _login(client, 5, 1)  # dc_staff
+    resp = client.post(
+        f"/store-ordering/orders/{oid}/ship",
+        data={f"shipped_items[{oiid}]": "", "tracking_note": ""},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert "请至少填写一项发货数量" in resp.get_data(as_text=True)
+    # 订单仍停在 approved，实发为 0，DC 库存未动。
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+    assert float(_item_state(env, oiid)["shipped_quantity"] or 0) == 0.0
 
 
 if __name__ == "__main__":
