@@ -12,6 +12,7 @@
     {% if price_managed %}
     <form method="post" action="{{ url_for('canonical.canonical_backfill_prices') }}" class="inline"
           onsubmit="return confirm('从各仓现行价回填主数据价格（全仓最高价）？只填空值，不覆盖已有价。');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="btn-sm">💴 价格回填（各仓→主数据）</button>
     </form>
     {% endif %}
@@ -62,6 +63,7 @@
 
 {% if is_admin %}
 <form method="post" action="{{ url_for('canonical.canonical_batch_edit') }}" id="batch-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 {% endif %}
 <table class="data-table">
   <thead>

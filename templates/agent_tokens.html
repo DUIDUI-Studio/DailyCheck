@@ -32,6 +32,7 @@
 <details class="card" style="margin-bottom:16px" open>
   <summary><strong>创建新 Token</strong></summary>
   <form method="post" action="{{ url_for('agent_tokens.create_token') }}" style="margin-top:12px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>Token 名称
       <input name="name" placeholder="例如: claude-code-prod" required autocomplete="off" />
     </label>
@@ -127,6 +128,7 @@
         <form method="post" action="{{ url_for('agent_tokens.revoke_token', token_id=t.id) }}"
               onsubmit="return confirm('撤销后使用此 Token 的 Agent 将无法连接。确认撤销 {{ t.name }} 吗？')"
               style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn btn-sm btn-danger">撤销</button>
         </form>
         {% endif %}

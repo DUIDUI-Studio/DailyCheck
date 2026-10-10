@@ -6,6 +6,7 @@
 </div>
 
 <form method="post" class="form-block" id="ic-recipe-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="grid cols-3">
     <label>配方名称 <input name="name" required value="{{ recipe['name'] if recipe else '' }}" /></label>
     <label>输出单位
@@ -28,6 +29,7 @@
 <p class="muted">可修改每行原料的<b>销售单价</b>来评估对整体毛利和利润的影响（仅影响销售价值和相关毛利项，不影响采购成本及采购毛利）。</p>
 
 <form method="post" id="bom-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="name" value="{{ recipe['name'] if recipe else '' }}" />
   <input type="hidden" name="note" value="{{ recipe['note'] or '' if recipe else '' }}" />
   <input type="hidden" name="output_unit" value="{{ recipe['output_unit'] if recipe else 'g' }}" />

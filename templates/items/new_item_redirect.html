@@ -11,6 +11,7 @@
 <h3>路径 ①：选用主数据里已有相近品项</h3>
 <p>主数据里有以下相近品项（{{ pending['suggestions']|length }} 个）：</p>
 <form method="post" action="{{ url_for('items.new_item_redirect_submit') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="action" value="choose" />
   {% for s in pending['suggestions'] %}
   <label class="radio-row">
@@ -26,6 +27,7 @@
 <h3>路径 ③：提交新增申请给总部审批</h3>
 <p>主数据里没有相近项，且本仓品类不在白名单内。请提交申请，由总部在「品项主数据」审批后该品项即可选用。</p>
 <form method="post" action="{{ url_for('items.new_item_redirect_submit') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="action" value="request_new" />
   <label>
     <span>申请原因（必填）</span>

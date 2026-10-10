@@ -50,6 +50,7 @@
 
   {# Batch-add-to-cart form. Each card ships 3 hidden inputs (selected[]/qty[]/unit[]); the JS fills qty/unit when the user confirms the modal. #}
   <form method="post" action="{{ url_for('store_ordering.cart_add_batch') }}" id="catalog-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="dc" value="{{ selected_dc }}" />
 
     {% if items %}

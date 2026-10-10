@@ -6,11 +6,11 @@ is bound in blueprints/auth.py's before_request hook from session.
 """
 from __future__ import annotations
 
-from flask import Flask, redirect, url_for
+from flask import Flask
 
+from cli import register_cli
 from config import IS_PRODUCTION, SECRET_KEY
 from db import close_dbs, init_master_db
-from cli import register_cli
 
 
 def create_app() -> Flask:
@@ -24,6 +24,24 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION
     app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB uploads
 
+    # CSRF 保护（P0-3）。必须在注册 CSRFProtect **之前**注册本 gate：
+    # Flask 的 before_request 按注册顺序执行，gate 先跑并按 TESTING 翻开关，
+    # 随后 CSRFProtect.protect() 读到 WTF_CSRF_ENABLED=False 即放行。
+    # - 生产/开发常态：CSRF 开启（所有 POST form 必带 csrf_token）。
+    # - TESTING=True：默认关闭（存量测试零改动）；专测 CSRF 的用例设
+    #   WTF_CSRF_FORCE_ENABLED=True 显式打开。
+    # - MCP（/api/mcp/ 等）跑在独立 Starlette 进程、Bearer 鉴权，不经本 app。
+    app.config.setdefault("WTF_CSRF_ENABLED", True)
+
+    @app.before_request
+    def _csrf_testing_gate() -> None:
+        force = app.config.get("WTF_CSRF_FORCE_ENABLED", False)
+        app.config["WTF_CSRF_ENABLED"] = force or not app.config.get("TESTING", False)
+
+    from flask_wtf import CSRFProtect
+
+    CSRFProtect(app)
+
     # Database teardown applies to both master + warehouse connections.
     app.teardown_appcontext(close_dbs)
 
@@ -32,23 +50,24 @@ def create_app() -> Flask:
         init_master_db()
 
     # Register blueprints.
-    from blueprints.auth import bp as auth_bp
-    from blueprints.core import bp as core_bp
-    from blueprints.items import bp as items_bp
-    from blueprints.stocktake import bp as stocktake_bp
-    from blueprints.restock import bp as restock_bp
-    from blueprints.outbound import bp as outbound_bp
-    from blueprints.reports import bp as reports_bp
-    from blueprints.production import bp as production_bp
-    from blueprints.users import bp as users_bp
-    from blueprints.import_items import bp as import_items_bp
-    from blueprints.forecast import bp as forecast_bp, _start_scheduler
-    from blueprints.procurement import bp as procurement_bp
-    from blueprints.notifications import bp as notifications_bp
     from blueprints.agent_tokens import bp as agent_tokens_bp
-    from blueprints.recipe_cost import bp as recipe_cost_bp
+    from blueprints.auth import bp as auth_bp
     from blueprints.canonical import bp as canonical_bp
+    from blueprints.core import bp as core_bp
+    from blueprints.forecast import _start_scheduler
+    from blueprints.forecast import bp as forecast_bp
+    from blueprints.import_items import bp as import_items_bp
+    from blueprints.items import bp as items_bp
+    from blueprints.notifications import bp as notifications_bp
+    from blueprints.outbound import bp as outbound_bp
+    from blueprints.procurement import bp as procurement_bp
+    from blueprints.production import bp as production_bp
+    from blueprints.recipe_cost import bp as recipe_cost_bp
+    from blueprints.reports import bp as reports_bp
+    from blueprints.restock import bp as restock_bp
+    from blueprints.stocktake import bp as stocktake_bp
     from blueprints.store_ordering import bp as store_ordering_bp
+    from blueprints.users import bp as users_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -89,8 +108,8 @@ def create_app() -> Flask:
         page in this subproject. Lock-failure counter is read from a
         file maintained by blueprints.forecast._bump_lock_counter.
         """
-        from db import get_master_db
         from blueprints.forecast import _read_lock_counter
+        from db import get_master_db
         last_success = None
         try:
             db = get_master_db()
@@ -104,7 +123,8 @@ def create_app() -> Flask:
                 # The endpoint contract is ISO-8601 UTC ("...Z"), so convert to
                 # real UTC — the previous code merely appended "Z" to a local
                 # timestamp, i.e. it lied about the zone.
-                from datetime import datetime as _dt, timezone as _tz
+                from datetime import datetime as _dt
+                from datetime import timezone as _tz
                 last_success = (
                     _dt.strptime(row["finished_at"], "%Y-%m-%d %H:%M:%S")
                     .astimezone(_tz.utc)

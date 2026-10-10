@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <form method="post" action="{{ url_for('outbound.outbound_submit') }}" class="session-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="session-head">
     <h2>出库录入</h2>
     <div class="session-actions">

@@ -6,6 +6,7 @@
   {% if g.user and g.user['is_admin'] %}
     <form method="post" action="{{ url_for('items.recompute_safety_stock') }}" class="inline"
           onsubmit="return confirm('按「近 {{ safety_stock_window }} 天消耗量 × {{ safety_stock_factor }}」重算本仓全部品项的安全库存？\n消耗历史不足 {{ safety_stock_window }} 天的品项将写 0。');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="btn-sm">🔄 重算安全库存</button>
     </form>
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">
@@ -52,11 +53,13 @@
       <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">{% if i.canonical_id %}查看{% else %}编辑{% endif %}</a>
       {% if current_role != 'staff' and not i.canonical_id %}
       <form method="post" action="{{ url_for('items.delete_item', item_id=i.id) }}" class="inline" onsubmit="return confirm('确认删除该库存品？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn-sm btn-delete">删除</button>
       </form>
       {% endif %}
       {% if i.canonical_id and g.user and g.user['is_admin'] %}
       <form method="post" action="{{ url_for('items.toggle_item_active', item_id=i.id) }}" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="active" value="{{ '0' if i.is_active else '1' }}" />
         <button type="submit" class="btn-sm">{{ '停用' if i.is_active else '启用' }}</button>
       </form>

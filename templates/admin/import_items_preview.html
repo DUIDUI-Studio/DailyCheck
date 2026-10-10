@@ -46,6 +46,7 @@
 
 <form method="post" action="{{ url_for('import_items.commit') }}"
       onsubmit="return confirm('确认导入到 {{ target_wh_name }}?\n将更新 {{ matched_rows }} 条已有品项的进货单价；未匹配的 {{ total_rows - matched_rows }} 条会被跳过。\n不会新增或删除任何品项。');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="form-actions">
     <a href="{{ url_for('items.items_list') }}" class="btn-sm">取消</a>
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">返回修改</a>

@@ -6,6 +6,7 @@
 </div>
 
 <form method="post" class="form-block">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="grid cols-3">
     <label>配方名称 <input name="name" required value="{{ recipe['name'] if recipe else '' }}" /></label>
     <label>输出单位
@@ -28,6 +29,7 @@
 <p class="muted">可引用 品项（item）或 冰激凌配方（ic_recipe）。启用「临时售价」可针对每行覆盖原料销售单价来评估影响。</p>
 
 <form method="post" id="bom-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="name" value="{{ recipe['name'] if recipe else '' }}" />
   <input type="hidden" name="note" value="{{ recipe['note'] or '' if recipe else '' }}" />
   <input type="hidden" name="output_unit" value="{{ recipe['output_unit'] if recipe else '件' }}" />

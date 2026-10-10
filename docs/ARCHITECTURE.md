@@ -541,6 +541,13 @@ flowchart TB
 
 **注意**：`@require_role` 和 `@require_platform_admin` 都允许 `is_admin=1` 通过。`@require_platform_admin` 反而**要求** `is_admin`，这是有意区分（前者"在这个仓库里权限够" vs 后者"全局管理权限"）。
 
+### 8.4 CSRF 保护（2026-10-10 起）
+
+- `app.py` 挂 `CSRFProtect`（Flask-WTF）；`_csrf_testing_gate` 在 `CSRFProtect` **之前**注册（Flask before_request 按 FIFO 执行），`TESTING=True` 时默认关闭 CSRF（存量测试零改动），专测设 `WTF_CSRF_FORCE_ENABLED=True` 打开。
+- 所有 `method="post"` 表单均带 `{{ csrf_token() }}`（`scripts/add_csrf_tokens.py` 注入 + `--check` 校验，新增模板后跑一次）。
+- MCP（`/api/mcp/`）在独立 Starlette 进程、Bearer 鉴权，不经 Flask CSRF。
+- 回归：`tests/test_csrf.py`（7 用例）。
+
 ---
 
 ## 9. MCP 架构
@@ -722,6 +729,7 @@ flowchart LR
 
 **现状**：
 - ✅ Service Worker 离线缓存 + PWA install
+- ✅ CSRF token 全表单覆盖（P0-3，2026-10-10）
 - ✅ manifest.webmanifest（standalone、minimal-ui、theme_color teal）
 - ❌ **无 push notifications**
 - ❌ **无 background sync**（离线写不能排队）
@@ -764,7 +772,7 @@ flowchart TB
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
 
-**基线（2026-10-10）**：18 failed / 711 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+**基线（2026-10-10）**：18 failed / 718 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。

@@ -10,6 +10,7 @@
 </p>
 
 <form method="post" action="{{ url_for('items.items_publish') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <h3>1. 选择品项</h3>
   <table>
     <tr>

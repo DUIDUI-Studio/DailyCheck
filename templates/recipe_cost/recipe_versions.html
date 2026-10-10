@@ -36,6 +36,7 @@
 {% if g.user and g.user.is_admin %}
 <h3>发布到门店</h3>
 <form method="post" action="{{ url_for(publish_endpoint, **publish_arg) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <p class="muted">选择要发布到的门店（多选）。当前草稿会被发布并应用到每个门店的数据库。</p>
   <fieldset style="border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px;margin-bottom:10px">
     {% for w in available_warehouses %}

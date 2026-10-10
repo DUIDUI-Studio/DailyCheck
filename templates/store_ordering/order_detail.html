@@ -65,6 +65,7 @@
   <form method="post"
         action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}"
         id="shipment-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   {% endif %}
   <table class="data-table">
     <thead>
@@ -172,6 +173,7 @@
           <td>
             {% if pending > 0 %}
             <form method="post" action="{{ url_for('store_ordering.receive_order_route', order_id=order.id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <input type="hidden" name="order_item_id" value="{{ item.id }}" />
               <input name="quantity" type="number" min="0.01" step="0.01" max="{{ pending }}" required style="width:90px" />
               <input name="note" placeholder="可选备注" />
@@ -276,10 +278,12 @@
   {# —— A8: 按钮样式统一 —— #}
   {% if can_review and order.status == 'pending' %}
   <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="decision" value="approved" />
     <button type="submit" class="btn-sm ok">通过</button>
   </form>
   <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="decision" value="rejected" />
     <input name="note" placeholder="拒绝原因" required />
     <button type="submit" class="btn-sm danger">拒绝</button>
@@ -295,6 +299,7 @@
   {% endfor %}
   {% if can_deliver and ns.has_receivable %}
   <form method="post" action="{{ url_for('store_ordering.deliver_order_route', order_id=order.id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit" class="btn-sm">一次性收货已到货物</button>
   </form>
   {% endif %}
@@ -302,6 +307,7 @@
   {# —— P1-4: 取消按钮 —— #}
   {% if order.status == 'pending' or order.status == 'approved' %}
   <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input name="reason" placeholder="取消原因" required style="min-width:180px" />
     <button type="submit" class="btn-sm danger">取消订单</button>
   </form>

@@ -75,6 +75,7 @@
 </table>
 
 <form method="post" class="grid cols-1" style="margin-top:16px;max-width:480px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>期望到货日期</span>
     <input type="date" name="expected_delivery_date" value="{{ expected_date }}" min="{{ today }}" required />

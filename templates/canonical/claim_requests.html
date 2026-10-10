@@ -31,6 +31,7 @@
       <td>
         {% if r['status'] == 'pending' and g.user and g.user['is_admin'] %}
         <form method="post" action="{{ url_for('canonical.canonical_review_claim_request', request_id=r['id']) }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <select name="decision"><option value="approved">approve</option><option value="rejected">reject</option></select>
           <input name="note" placeholder="备注" />
           <button type="submit" class="btn-sm">提交</button>

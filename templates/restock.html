@@ -3,6 +3,7 @@
 <div class="list-head">
   <h2>入库记录</h2>
   <form method="post" action="{{ url_for('restock.restock_start') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit">+ 新建入库</button>
   </form>
 </div>
@@ -36,6 +37,7 @@
         <div class="rc-actions">
           {% if current_role != 'staff' and r.source == 'manual' %}
           <form method="post" action="{{ url_for('restock.delete', req_id=r.request_id) }}" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn-sm btn-delete">删除</button>
           </form>
           {% endif %}

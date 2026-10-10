@@ -10,6 +10,7 @@
   {% for wh in warehouses %}
   <li>
     <form method="post" action="{{ url_for('auth.warehouse_select', warehouse_id=wh['id']) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="btn block">
         <strong>{{ wh['name'] }}</strong>
         <span class="muted">{{ wh['code'] }}</span>

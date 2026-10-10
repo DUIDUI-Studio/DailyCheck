@@ -34,6 +34,7 @@
       <td>
         {% if not e.read %}
         <form method="post" action="{{ url_for('notifications.mark_notification_read', event_id=e.event_id) }}" style="display:inline;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit">标记已读</button>
         </form>
         {% endif %}

@@ -7,6 +7,7 @@
   {% endif %}
 </div>
 <form method="post" action="{{ url_for('stocktake.stocktake_start') }}" class="form-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <button type="submit">开始盘点</button>
 </form>
 
@@ -29,10 +30,12 @@
       <div class="inline">
         <a href="{{ url_for('stocktake.edit', batch_id=b.id) }}" class="btn-sm btn-edit">查看</a>
         <form method="post" action="{{ url_for('stocktake.approve', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认审核通过？盘亏将计入出库，盘盈将调整为库存');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn-sm" style="background:var(--success);color:#fff;border:none;padding:2px 8px;border-radius:4px;cursor:pointer">审核通过</button>
         </form>
         {% if current_role != 'staff' %}
         <form method="post" action="{{ url_for('stocktake.rollback', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认删除该批次？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn-sm btn-delete">删除批次</button>
         </form>
         {% endif %}

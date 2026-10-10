@@ -8,6 +8,7 @@
 </div>
 
 <form method="post" class="form-section">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   {% if not selected %}
   <label>
     <span>选择主数据项（多选）</span>

@@ -35,12 +35,14 @@
         {% if r['rolled_back'] == 0 %}
         {% if current_role != 'staff' %}
         <form method="post" action="{{ url_for('production.rollback', run_id=r['id']) }}" onsubmit="return confirm('确认回退？库存将归还。');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm" type="submit">回退</button>
         </form>
         {% endif %}
         {% endif %}
         {% if current_role != 'staff' %}
         <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除该记录？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>
         {% endif %}
