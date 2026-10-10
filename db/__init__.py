@@ -156,7 +156,19 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
     revoked_at TEXT,
     allowed_read_paths_json TEXT NOT NULL DEFAULT '[]',
     allowed_write_paths_json TEXT NOT NULL DEFAULT '[]',
-    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]'
+    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]',
+    rate_limit INTEGER
+);
+
+-- 登录爆破锁定（P0-4）：按 (ip, username) 记失败计数与锁定到期时间。
+-- 时间一律 UTC naive（rate_limit_pure 约定），与进程时区无关。
+CREATE TABLE IF NOT EXISTS login_throttle (
+    ip TEXT NOT NULL,
+    username TEXT NOT NULL,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (ip, username)
 );
 
 -- Cross-warehouse recipe publishing (R&D → storefronts).
@@ -799,6 +811,30 @@ def init_master_db() -> None:
                         active INTEGER NOT NULL DEFAULT 1,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )"""
+                )
+
+                # P0-4: agent_tokens.rate_limit（per-token MCP 配额/分钟，
+                # NULL = 用 rate_limit_pure.MCP_DEFAULT_RATE_LIMIT）。
+                at_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(agent_tokens)"
+                    ).fetchall()
+                }
+                if "rate_limit" not in at_cols:
+                    conn.execute(
+                        "ALTER TABLE agent_tokens ADD COLUMN rate_limit INTEGER"
+                    )
+
+                # P0-4: login_throttle 表（登录爆破锁定，见 MASTER_SCHEMA 注释）。
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS login_throttle (
+                        ip TEXT NOT NULL,
+                        username TEXT NOT NULL,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        locked_until TEXT,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (ip, username)
                     )"""
                 )
 

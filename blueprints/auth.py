@@ -119,12 +119,52 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         master = get_master_db()
+
+        # 登录爆破锁定（P0-4）：先查锁再验密码。
+        # 时间一律 UTC naive（rate_limit_pure 约定），与进程时区无关。
+        from rate_limit_pure import login_lock_state, next_failure_state
+
+        ip = request.remote_addr or "unknown"
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        throttle = master.execute(
+            "SELECT failed_count, locked_until, updated_at FROM login_throttle "
+            "WHERE ip=? AND username=?",
+            (ip, username),
+        ).fetchone()
+        locked, remaining = login_lock_state(
+            throttle["failed_count"] if throttle else 0,
+            throttle["locked_until"] if throttle else None,
+        )
+        if locked:
+            flash(f"失败次数过多，已临时锁定，请 {remaining // 60 + 1} 分钟后再试")
+            return render_template("login.html"), 429
+
         row = master.execute(
             "SELECT * FROM users WHERE username=?", (username,)
         ).fetchone()
         if row is None or not check_password_hash(row["password_hash"], password):
+            new_count, new_lock = next_failure_state(
+                throttle["failed_count"] if throttle else 0,
+                throttle["updated_at"] if throttle else None,
+            )
+            master.execute(
+                """INSERT INTO login_throttle (ip, username, failed_count,
+                                               locked_until, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(ip, username) DO UPDATE SET
+                       failed_count=excluded.failed_count,
+                       locked_until=excluded.locked_until,
+                       updated_at=excluded.updated_at""",
+                (ip, username, new_count, new_lock, now_str),
+            )
+            master.commit()
             flash("账号或密码错误")
             return render_template("login.html"), 401
+
+        # 登录成功：清除该 (ip, username) 的失败计数。
+        master.execute(
+            "DELETE FROM login_throttle WHERE ip=? AND username=?", (ip, username)
+        )
         session.clear()
         session["user_id"] = row["id"]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

@@ -6,7 +6,7 @@ is bound in blueprints/auth.py's before_request hook from session.
 """
 from __future__ import annotations
 
-from flask import Flask
+from flask import Flask, request
 
 from cli import register_cli
 from config import IS_PRODUCTION, SECRET_KEY
@@ -41,6 +41,34 @@ def create_app() -> Flask:
     from flask_wtf import CSRFProtect
 
     CSRFProtect(app)
+
+    # 全局 IP 限速（P0-4）。内存滑动窗口，per-app 实例（app.extensions），
+    # gunicorn 多 worker 各自计数、重启清零（v1 约定，见 rate_limit_pure）。
+    # /health、static 不限；TESTING 默认关闭（RATE_LIMIT_FORCE_ENABLED 打开），
+    # 与 CSRF gate 同一模式。
+    import os as _os
+
+    from rate_limit_pure import GLOBAL_WEB_LIMIT_PER_MIN, SlidingWindowLimiter
+
+    app.extensions["rate_limiter"] = SlidingWindowLimiter(
+        max_events=int(
+            _os.environ.get("DAILYCHECK_RATE_LIMIT_PER_MIN", GLOBAL_WEB_LIMIT_PER_MIN)
+        ),
+        window_seconds=60.0,
+    )
+
+    @app.before_request
+    def _global_rate_limit_gate():
+        if request.path.startswith("/static") or request.endpoint == "health":
+            return None
+        force = app.config.get("RATE_LIMIT_FORCE_ENABLED", False)
+        if not (force or not app.config.get("TESTING", False)):
+            return None
+        limiter = app.extensions["rate_limiter"]
+        key = request.remote_addr or "unknown"
+        if not limiter.hit(key):
+            return {"error": "rate_limited"}, 429
+        return None
 
     # Database teardown applies to both master + warehouse connections.
     app.teardown_appcontext(close_dbs)
