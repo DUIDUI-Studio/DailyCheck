@@ -130,13 +130,10 @@ def test_global_rate_limit_disabled_in_testing_default(logged_client):
 def test_login_lockout_after_repeated_failures(logged_client):
     """连错 5 次后，正确密码也被锁定（429）。"""
     client, _ = logged_client
-    app = client.application
     # 建一个可验证密码的用户（conftest 的 hash='x' 无法通过校验）。
     import sqlite3
 
-    wh_path = None
-    # logged_client 返回 (client, wh_path)；master 路径从 app 拿不到，
-    # 直接用 conftest patch 过的 config.MASTER_DB。
+    # master 路径用 conftest patch 过的 config.MASTER_DB。
     import config as config_module
 
     master_path = str(config_module.MASTER_DB)

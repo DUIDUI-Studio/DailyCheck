@@ -13,15 +13,22 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import (
-    Blueprint, abort, flash, g, jsonify, redirect, render_template,
-    request, send_from_directory, session, url_for,
+    Blueprint,
+    abort,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    session,
+    url_for,
 )
 from werkzeug.security import check_password_hash
 
-from config import BASE_DIR, MASTER_DB, SECRET_KEY
-from db import get_master_db, init_warehouse_db
+from config import BASE_DIR
+from db import get_master_db
 from permissions import require_login
-
 
 bp = Blueprint("auth", __name__)
 pwa_bp = Blueprint("pwa", __name__)
@@ -258,7 +265,6 @@ def audit(action: str, target_type: str | None = None,
     """Append an audit_log row to the current warehouse db."""
     if g.warehouse_db_path is None:
         return
-    import sqlite3
     from db import get_warehouse_db
     db = get_warehouse_db()
     db.execute(
