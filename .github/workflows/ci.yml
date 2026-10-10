@@ -66,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Deploy to VPS
+      - name: Deploy to VPS (backup → switch → migrate → health-check → auto-rollback)
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
@@ -75,39 +75,25 @@ jobs:
         run: |
           echo "$VPS_SSH_KEY" > vps_key
           chmod 600 vps_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $VPS_PORT -i vps_key $VPS_USERNAME@$VPS_HOST"
 
-          # Build tar locally (exclude volatile/generated files)
+          # Build tar locally — 严格排除数据/运行时文件（*.db 覆盖所有库文件，
+          # 但保留 db/ Python 包），部署永不触碰生产数据
           tar --exclude='.git' \
               --exclude='__pycache__' \
               --exclude='*.log' \
+              --exclude='*.db' \
+              --exclude='backups' \
               --exclude='.venv' \
-              --exclude='inventory.db' \
-              --exclude='inventory.db.bak' \
+              --exclude='.workbuddy' \
+              --exclude='.claude' \
+              --exclude='node_modules' \
+              --exclude='issue-reports' \
+              --exclude='graphify-out' \
               -czf /tmp/dailycheck.tar.gz .
 
-          # Stream tar to VPS via SSH
-          cat /tmp/dailycheck.tar.gz | ssh -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=10 \
-              -p "$VPS_PORT" -i vps_key \
-              "$VPS_USERNAME@$VPS_HOST" \
-              'cat > /tmp/dailycheck.tar.gz'
-
-          # Full deploy on VPS
-          ssh -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=10 \
-              -p "$VPS_PORT" -i vps_key \
-              "$VPS_USERNAME@$VPS_HOST" << 'ENDSSH'
-            set -e
-            cd /root/DailyCheck
-            pkill -f "gunicorn.*app:app" || true
-            tar -xzf /tmp/dailycheck.tar.gz
-            rm -f /tmp/dailycheck.tar.gz
-            rm -rf .venv
-            python3 -m venv .venv
-            .venv/bin/pip install -r requirements.txt -q
-            .venv/bin/gunicorn -w 2 -b 0.0.0.0:8080 app:app \
-                --timeout 120 \
-                --access-logfile access.log \
-                --error-logfile error.log -D
-            echo "Deploy done"
-          ENDSSH
+          # 解压到带时间戳的 release 目录，由 deploy_vps.sh 完成切换/迁移/回滚
+          REL=$($SSH 'echo /root/releases/$(date +%Y%m%d-%H%M%S)')
+          $SSH "mkdir -p $REL && cat > /tmp/dailycheck.tar.gz"
+          cat /tmp/dailycheck.tar.gz | $SSH "tar -xzf /tmp/dailycheck.tar.gz -C $REL && rm -f /tmp/dailycheck.tar.gz"
+          $SSH "bash -s $REL" < scripts/deploy_vps.sh

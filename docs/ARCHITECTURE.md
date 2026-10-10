@@ -119,7 +119,7 @@ flowchart LR
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    GitHub -->|SSH: tar + pip install<br/>**前置 CI test 通过**| VPS
+    GitHub -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -134,7 +134,7 @@ flowchart LR
 | **进程管理器** | systemd in container | gunicorn -D（无 systemd） |
 | **Flask reload** | `--debug` 自动 reload | 无 |
 | **MCP 进程** | systemd unit | **未部署**（MCP 只在 dev 跑） |
-| **部署方式** | mount + edit | `ci.yml` test 通过后 `pkill gunicorn → tar → pip install → gunicorn -D`（回滚能力 M4 引入） |
+| **部署方式** | mount + edit | `ci.yml` test 通过后走 `scripts/deploy_vps.sh`：sqlite 热备全库 + 代码备份 → rsync 切换（`*.db`/log/venv 永不触碰）→ `flask migrate up` → systemd 重启 → `/health` 探活 → 失败自动回滚代码并重启。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
 ---
@@ -326,6 +326,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。
 
 ---
 
@@ -779,7 +780,7 @@ flowchart TB
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
 
-**基线（2026-10-10）**：18 failed / 733 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+**基线（2026-10-10）**：18 failed / 742 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
