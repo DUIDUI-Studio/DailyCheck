@@ -53,6 +53,7 @@ def load_user_and_warehouse():
     g.warehouse = None
     g.role = None
     g.warehouse_db_path = None
+    g.tenant_id = None  # P0-1 多租户 PoC：请求级租户上下文
 
     user_id = session.get("user_id")
     warehouse_id = session.get("warehouse_id")
@@ -82,11 +83,16 @@ def load_user_and_warehouse():
         session.clear()
         return redirect(url_for("auth.login"))
 
+    # P0-1 多租户 PoC：平台管理员（is_admin=1）跨租户；普通用户锁定本租户。
+    g.tenant_id = g.user["tenant_id"]
+
     if warehouse_id is not None:
         row = master.execute(
             "SELECT * FROM warehouses WHERE id=?", (warehouse_id,)
         ).fetchone()
-        if row is not None:
+        if row is not None and (
+            g.user["is_admin"] or row["tenant_id"] == g.tenant_id
+        ):
             g.warehouse = row
             g.warehouse_db_path = str(BASE_DIR / row["db_path"])
             g.role = master.execute(
@@ -209,13 +215,15 @@ def warehouse_picker():
             "SELECT id, code, name FROM warehouses ORDER BY id"
         ).fetchall()
     else:
+        # P0-1 多租户：非平台管理员只见本租户 + 有绑定关系的仓。
+        # （绑定与租户双闸——脏数据里跨租户绑定也不可见。）
         rows = master.execute(
             """SELECT w.id, w.code, w.name
                FROM warehouses w
                JOIN warehouse_users wu ON wu.warehouse_id = w.id
-               WHERE wu.user_id = ?
+               WHERE wu.user_id = ? AND w.tenant_id = ?
                ORDER BY w.id""",
-            (g.user["id"],),
+            (g.user["id"], g.user["tenant_id"]),
         ).fetchall()
     return render_template("warehouse_picker.html", warehouses=rows, no_sidebar=True)
 
@@ -230,6 +238,9 @@ def warehouse_select(warehouse_id: int):
     if wh is None:
         abort(404)
     if not g.user["is_admin"]:
+        # P0-1 多租户：租户闸先行（跨租户绑定视为脏数据，直接拒绝）。
+        if wh["tenant_id"] != g.user["tenant_id"]:
+            abort(403)
         binding = master.execute(
             "SELECT 1 FROM warehouse_users WHERE user_id=? AND warehouse_id=?",
             (g.user["id"], warehouse_id),

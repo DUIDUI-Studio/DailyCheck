@@ -159,12 +159,32 @@ def migrate_legacy_cmd() -> None:
         "rd (研发中心, 无库存, recipe-only)."
     ),
 )
-def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
+@click.option(
+    "--tenant", "tenant_id", type=int, default=1, show_default=True,
+    help="所属租户 id（P0-1 多租户；1 = 存量单租户）。",
+)
+def create_warehouse_cmd(
+    code: str, name: str, warehouse_type: str, tenant_id: int,
+) -> None:
     """Register a new warehouse. The db file is created if missing."""
     from config import WAREHOUSE_DB_DIR
     from db import init_warehouse_db
 
-    db_path = WAREHOUSE_DB_DIR / f"{code}.db"
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        tenant_exists = conn.execute(
+            "SELECT 1 FROM tenants WHERE id=?", (tenant_id,)
+        ).fetchone()
+    if not tenant_exists and tenant_id != 1:
+        click.echo(f"租户 {tenant_id} 不存在（先 INSERT INTO tenants）", err=True)
+        raise click.exceptions.Exit(1)
+    # 租户 1 = 存量单租户，隐式存在：缺失时自动补登记（老库平滑升级）。
+
+    # 多租户 PoC 路径布局：租户 1 保持 db/warehouses/（兼容存量），
+    # 其他租户落 db/tenants/<tid>/warehouses/
+    if tenant_id == 1:
+        db_path = WAREHOUSE_DB_DIR / f"{code}.db"
+    else:
+        db_path = BASE_DIR / "db" / "tenants" / str(tenant_id) / "warehouses" / f"{code}.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_warehouse_db(db_path)
 
@@ -173,13 +193,14 @@ def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         try:
             conn.execute(
-                "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (code, name, rel_path, warehouse_type, now),
+                "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at, tenant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (code, name, rel_path, warehouse_type, now, tenant_id),
             )
             conn.commit()
             click.echo(
-                f"Created warehouse {code} ({name}) type={warehouse_type}"
+                f"Created warehouse {code} ({name}) type={warehouse_type} "
+                f"tenant={tenant_id}"
             )
         except sqlite3.IntegrityError:
             click.echo(f"Warehouse {code} already exists", err=True)

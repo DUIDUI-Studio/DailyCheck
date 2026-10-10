@@ -42,7 +42,36 @@ def _m001_down(conn: sqlite3.Connection) -> None:
     raise RuntimeError("migration 0001 是基线，不可 down；请还原备份")
 
 
+def _m002_up(conn: sqlite3.Connection) -> None:
+    """多租户 PoC：tenants 表 + users/warehouses/canonical_items.tenant_id（默认 1）。"""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS tenants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        )"""
+    )
+    for table in ("users", "warehouses", "canonical_items"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if cols and "tenant_id" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN tenant_id INTEGER NOT NULL DEFAULT 1"
+            )
+
+
+def _m002_down(conn: sqlite3.Connection) -> None:
+    # SQLite 3.35+ 支持 DROP COLUMN（prod 3.45.1 / dev 容器 ≥3.40）。
+    for table in ("users", "warehouses", "canonical_items"):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "tenant_id" in cols:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN tenant_id")
+    conn.execute("DROP TABLE IF EXISTS tenants")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline: login_throttle + agent_tokens.rate_limit（P0-4 收编）",
      _m001_up, _m001_down),
+    (2, "multi-tenant PoC: tenants 表 + 三表 tenant_id（P0-1）",
+     _m002_up, _m002_down),
 ]

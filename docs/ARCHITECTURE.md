@@ -33,7 +33,8 @@
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
-- **核心约束**：单租户、单 SQLite 部署，**未做多租户隔离**（商业化首要改造项）。
+- **核心约束**：多租户 PoC 已落地（2026-10-10，轻方案：tenants 注册表 + 三表 tenant_id +
+  请求级租户闸；canonical 扇出/订单/MCP 全链路租户化为 PoC 后续阶段）。
 
 ---
 
@@ -145,16 +146,17 @@ flowchart LR
 
 ```
 db/
-├── master.db                          # 单文件，全局
-└── warehouses/
-    ├── wh_001.db  (中央仓 storefront)
-    ├── wh_002.db  (新世界 storefront)
-    ├── wh_003.db  (新天地 storefront)
-    ├── wh_004.db  (韩国街 storefront)
-    ├── wh_006.db  (浦发时光里 storefront)
-    ├── wh_010.db  (泰柯富阳 storefront)
-    ├── wh_000.db  (配送中心 distribution_center)
-    └── rd_001.db  (研发 rd)
+├── master.db                          # 单文件，全局（含 tenants 注册表）
+├── warehouses/                        # 租户 1（存量单租户）的仓
+│   ├── wh_001.db  (中央仓 storefront)
+│   ├── wh_002.db  (新世界 storefront)
+│   ├── wh_003.db  (新天地 storefront)
+│   ├── wh_004.db  (韩国街 storefront)
+│   ├── wh_006.db  (浦发时光里 storefront)
+│   ├── wh_010.db  (泰柯富阳 storefront)
+│   ├── wh_000.db  (配送中心 distribution_center)
+│   └── rd_001.db  (研发 rd)
+└── tenants/<tid>/warehouses/*.db      # 租户 N（PoC 起新租户的放置路径）
 ```
 
 ### 4.2 master.db 核心表（ER 简图）
@@ -542,6 +544,14 @@ flowchart TB
 
 **注意**：`@require_role` 和 `@require_platform_admin` 都允许 `is_admin=1` 通过。`@require_platform_admin` 反而**要求** `is_admin`，这是有意区分（前者"在这个仓库里权限够" vs 后者"全局管理权限"）。
 
+### 8.6 租户隔离（P0-1 轻方案 PoC，2026-10-10 起）
+
+- `master.db`：`tenants` 注册表 + `users/warehouses/canonical_items.tenant_id`（默认 1 = 存量单租户，老库 ALTER 自动回填）。
+- 请求上下文：`g.tenant_id`（auth 钩子从 user 行取）。
+- 三道闸：① 钩子加载仓库时校验 `warehouse.tenant_id == user.tenant_id`（`is_admin` 平台管理员豁免）② picker 只列本租户 ③ `/select-warehouse/<id>` 租户闸先行（跨租户脏绑定 → 403）。
+- 新仓放置：租户 1 保持 `db/warehouses/`；租户 N 落 `db/tenants/<N>/warehouses/`（`flask create-warehouse --tenant N`）。
+- **PoC 未覆盖（后续阶段）**：canonical 扇出/订单/MCP token/报表查询的租户化过滤；当前仅列/读仓与选择入口强制。回归 `tests/test_tenant_isolation.py`（8 用例）。
+
 ### 8.4 CSRF 保护（2026-10-10 起）
 
 - `app.py` 挂 `CSRFProtect`（Flask-WTF）；`_csrf_testing_gate` 在 `CSRFProtect` **之前**注册（Flask before_request 按 FIFO 执行），`TESTING=True` 时默认关闭 CSRF（存量测试零改动），专测设 `WTF_CSRF_FORCE_ENABLED=True` 打开。
@@ -780,7 +790,7 @@ flowchart TB
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
 
-**基线（2026-10-10）**：18 failed / 742 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+**基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。

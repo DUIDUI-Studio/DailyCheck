@@ -129,7 +129,7 @@ def test_pending_versions(tmp_path):
 
 
 def test_real_registry_baseline_up_on_legacy_db(tmp_path):
-    """真实 MIGRATIONS 基线在老库（user_version=0、含 agent_tokens 旧结构）应能跑通。"""
+    """真实注册表在老库（user_version=0、含 agent_tokens 旧结构）上应能全部跑通。"""
     db = tmp_path / "master.db"
     conn = sqlite3.connect(db)
     conn.execute(
@@ -139,9 +139,9 @@ def test_real_registry_baseline_up_on_legacy_db(tmp_path):
     conn.commit()
     conn.close()
     applied = migrate_up(db, MIGRATIONS, tmp_path / "bak")
-    assert applied == [1]
+    assert applied == sorted(v for v, *_ in MIGRATIONS)
     conn = sqlite3.connect(db)
-    assert current_version(conn) == 1
+    assert current_version(conn) == max(v for v, *_ in MIGRATIONS)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(agent_tokens)")}
     assert "rate_limit" in cols
     # 基线 down 应拒绝
