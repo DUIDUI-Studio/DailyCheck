@@ -1,0 +1,21 @@
+# 已知 pre-existing 失败清单（CI 零新增门禁基线）
+# 基线日期：2026-10-10（18 failed / 711 passed）
+# 规则：清单只许收缩不许扩张；修复一个就删一行；新增失败不允许加进来。
+tests/mcp_server/test_data/test_warehouse.py::test_create_restock_increases_quantity
+tests/mcp_server/test_service/test_inbound.py::TestCreateRestock::test_create_restock_success
+tests/test_aux_unit.py::test_create_item_with_game_syncs_gram_per_unit
+tests/test_aux_unit.py::test_create_item_no_aux_unit
+tests/test_forecast_pure.py::test_compute_daily_avg_single_today
+tests/test_forecast_pure.py::test_compute_daily_avg_uniform_30_days_is_one
+tests/test_forecast_pure.py::test_compute_daily_avg_uniform_15_days_is_one
+tests/test_forecast_pure.py::test_compute_daily_avg_sparse_five_days
+tests/test_forecast_pure.py::test_compute_daily_avg_recent_spike_dominates
+tests/test_forecast_pure.py::test_compute_daily_avg_old_data_weighs_less_than_recent
+tests/test_forecast_pure.py::test_compute_daily_avg_quantize_2dp
+tests/test_forecast_pure.py::test_compute_daily_avg_filters_outside_30d
+tests/test_items_route.py::test_manager_can_view_items
+tests/test_items_route.py::test_negative_gram_per_unit_rejected
+tests/test_nav_integration.py::test_sidebar_includes_procurement_for_staff
+tests/test_nav_integration.py::test_land_page_staff_sees_procurement_and_notifications_not_forecast
+tests/test_procurement_route.py::test_procurement_store_staff_can_access_own_warehouse
+tests/test_recipe_cost_route.py::test_create_item_stores_selling_price

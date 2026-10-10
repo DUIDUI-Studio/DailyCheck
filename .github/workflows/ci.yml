@@ -1,0 +1,113 @@
+# DailyCheck CI：测试门禁 + 部署（deploy 依赖 test 通过）
+#
+# 零新增失败门禁：tests/known_failures.txt 是已知 pre-existing 失败基线（只许收缩）。
+# tests/mcp_server 在 runner 上不经容器、无法等价复现，故 CI 跳过（known_failures.txt
+# 仍收录其 2 条，本地/容器全量跑时同样受门禁约束）。商业化前须归零并恢复 CI 覆盖。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -q
+          pip install pytest "ruff==0.16.10" -q
+
+      - name: Ruff (changed .py files only)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" -- '*.py')
+          else
+            FILES=$(git diff --name-only "HEAD~1" -- '*.py')
+          fi
+          if [ -n "$FILES" ]; then
+            echo "ruff checking: $FILES"
+            ruff check $FILES
+          else
+            echo "no python files changed, skip"
+          fi
+
+      - name: Pytest (full suite, mcp_server excluded — container-gated, see header)
+        run: |
+          set +e
+          python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
+            --ignore=tests/mcp_server > /tmp/pytest-output.txt
+          tail -3 /tmp/pytest-output.txt
+
+      - name: Zero-new-failure gate
+        run: python scripts/check_known_failures.py /tmp/pytest-output.txt
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Deploy to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USERNAME: ${{ secrets.VPS_USERNAME }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          echo "$VPS_SSH_KEY" > vps_key
+          chmod 600 vps_key
+
+          # Build tar locally (exclude volatile/generated files)
+          tar --exclude='.git' \
+              --exclude='__pycache__' \
+              --exclude='*.log' \
+              --exclude='.venv' \
+              --exclude='inventory.db' \
+              --exclude='inventory.db.bak' \
+              -czf /tmp/dailycheck.tar.gz .
+
+          # Stream tar to VPS via SSH
+          cat /tmp/dailycheck.tar.gz | ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -p "$VPS_PORT" -i vps_key \
+              "$VPS_USERNAME@$VPS_HOST" \
+              'cat > /tmp/dailycheck.tar.gz'
+
+          # Full deploy on VPS
+          ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -p "$VPS_PORT" -i vps_key \
+              "$VPS_USERNAME@$VPS_HOST" << 'ENDSSH'
+            set -e
+            cd /root/DailyCheck
+            pkill -f "gunicorn.*app:app" || true
+            tar -xzf /tmp/dailycheck.tar.gz
+            rm -f /tmp/dailycheck.tar.gz
+            rm -rf .venv
+            python3 -m venv .venv
+            .venv/bin/pip install -r requirements.txt -q
+            .venv/bin/gunicorn -w 2 -b 0.0.0.0:8080 app:app \
+                --timeout 120 \
+                --access-logfile access.log \
+                --error-logfile error.log -D
+            echo "Deploy done"
+          ENDSSH

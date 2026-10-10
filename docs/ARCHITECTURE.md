@@ -113,13 +113,13 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    GitHub["GitHub Actions<br/>(.github/workflows/deploy.yml)"]
+    GitHub["GitHub Actions<br/>(.github/workflows/ci.yml)"]
     VPS["VPS 112.124.18.246:33756 root<br/>/root/DailyCheck"]
     Gunicorn["gunicorn -w 2 --threads 4<br/>-b 127.0.0.1:8090 app:app<br/>(**非 wdg-systemd**)"]
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    GitHub -->|SSH: tar + pip install| VPS
+    GitHub -->|SSH: tar + pip install<br/>**前置 CI test 通过**| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -134,7 +134,7 @@ flowchart LR
 | **进程管理器** | systemd in container | gunicorn -D（无 systemd） |
 | **Flask reload** | `--debug` 自动 reload | 无 |
 | **MCP 进程** | systemd unit | **未部署**（MCP 只在 dev 跑） |
-| **部署方式** | mount + edit | `pkill gunicorn → tar → pip install → gunicorn -D`（无回滚） |
+| **部署方式** | mount + edit | `ci.yml` test 通过后 `pkill gunicorn → tar → pip install → gunicorn -D`（回滚能力 M4 引入） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
 ---
@@ -765,6 +765,11 @@ flowchart TB
 ```
 
 **基线（2026-10-10）**：18 failed / 711 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+
+**CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
+- ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
+- `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
+- `deploy` job `needs: test`：CI 不过不部署（PR 触发不部署）。
 
 **Pre-existing 18 failed 分布**：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / nav_integration×2 / procurement_route×1 / recipe_cost_route×1`
