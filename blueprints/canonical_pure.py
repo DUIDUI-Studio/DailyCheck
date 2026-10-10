@@ -956,6 +956,7 @@ BATCH_EDITABLE_FIELDS: tuple[str, ...] = (
     "gram_per_unit",   # 克重
     "aux_unit",        # 辅单位
     "aux_rate",        # 辅单位换算率
+    "status",          # 启用 / 停用（Q3=deactivate_only，不接受 deleted）
 ) + (_PRICE_FIELDS if _PRICE_IS_CANONICAL_MANAGED else ())
 
 BATCH_FIELD_LABELS: dict[str, str] = {
@@ -964,8 +965,16 @@ BATCH_FIELD_LABELS: dict[str, str] = {
     "gram_per_unit": "克重",
     "aux_unit": "辅单位",
     "aux_rate": "辅单位换算率",
+    "status": "状态",
     "selling_price": "销售单价",
     "unit_cost": "进货单价",
+}
+
+#: 批量改状态的可选值 —— 与 set_canonical_status() 的白名单同源。
+BATCH_STATUS_CHOICES: tuple[str, ...] = ("active", "disabled")
+BATCH_STATUS_LABELS: dict[str, str] = {
+    "active": "启用（active）",
+    "disabled": "停用（disabled）",
 }
 
 
@@ -977,6 +986,19 @@ def coerce_batch_value(field: str, raw: Any) -> Any:
     if field not in BATCH_EDITABLE_FIELDS:
         raise ValueError(f"字段 {field!r} 不支持批量修改")
     text = ("" if raw is None else str(raw)).strip()
+    if field == "status":
+        # 在这里先拒掉非法值，走 ValueError 让路由 flash；
+        # （'deleted' 由 set_canonical_status 抛 DeactivateOnlyViolation，
+        #  它同样是 ValueError 子类，但这里给出更直白的提示。）
+        if text == "deleted":
+            raise ValueError(
+                "Q3=deactivate_only：主数据不允许删除，只能停用（disabled）"
+            )
+        if text not in BATCH_STATUS_CHOICES:
+            raise ValueError(
+                f"状态只能是 {' 或 '.join(BATCH_STATUS_CHOICES)}"
+            )
+        return text
     if field in ("category_code", "aux_unit"):
         return text or None
     if field == "unit":
@@ -1046,32 +1068,115 @@ def batch_update_canonical_items(
     }
 
 
+#: 品类筛选里「未归品类」的哨兵值（与 list_canonical_categories 同源）。
+CATEGORY_FILTER_NONE = "__none__"
+
+
+def _like_pattern(text: str) -> str:
+    """把用户输入包成安全 LIKE 模式（转义 % _ \\，配合 ESCAPE '\\'）。"""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def build_canonical_filter(
+    *,
+    status: str | None = None,
+    category_code: str | None = None,
+    q: str | None = None,
+) -> tuple[str, list[Any]]:
+    """拼 canonical_items 的 WHERE 子句（list / count 共用一份，避免漂移）。
+
+    q 同时匹配 名称 / canonical_sku / 条码 —— 品项主数据页的搜索框。
+    """
+    where_parts: list[str] = []
+    params: list[Any] = []
+    if status:
+        where_parts.append("status = ?")
+        params.append(status)
+    if category_code == CATEGORY_FILTER_NONE:
+        where_parts.append(
+            "(category_code IS NULL OR category_code NOT IN"
+            " (SELECT code FROM canonical_categories))"
+        )
+    elif category_code:
+        where_parts.append("category_code = ?")
+        params.append(category_code)
+    if q:
+        pat = _like_pattern(q)
+        where_parts.append(
+            "(name LIKE ? ESCAPE '\\'"
+            " OR canonical_sku LIKE ? ESCAPE '\\'"
+            " OR COALESCE(barcode, '') LIKE ? ESCAPE '\\')"
+        )
+        params.extend([pat, pat, pat])
+    where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    return where, params
+
+
 def list_canonical_items(
     master_conn: sqlite3.Connection,
     *,
     status: str | None = None,
     category_code: str | None = None,
+    q: str | None = None,
     limit: int = 200,
     offset: int = 0,
 ) -> list[dict]:
-    """T4 —— 列出 canonical_items。"""
+    """T4 —— 列出 canonical_items（支持 状态 / 品类 / 关键词 筛选）。"""
     master_conn.row_factory = sqlite3.Row
-    where_parts: list[str] = []
-    params: list[Any] = []
-    if status is not None:
-        where_parts.append("status = ?")
-        params.append(status)
-    if category_code is not None:
-        where_parts.append("category_code = ?")
-        params.append(category_code)
-    where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
-    params.extend([limit, offset])
+    where, params = build_canonical_filter(
+        status=status, category_code=category_code, q=q
+    )
+    params = [*params, limit, offset]
     rows = master_conn.execute(
         f"""SELECT * FROM canonical_items{where}
             ORDER BY id LIMIT ? OFFSET ?""",
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_canonical_items(
+    master_conn: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    category_code: str | None = None,
+    q: str | None = None,
+) -> int:
+    """同筛选条件下的命中总数（供列表页显示「命中 N 条 / 是否被 limit 截断」）。"""
+    master_conn.row_factory = sqlite3.Row
+    where, params = build_canonical_filter(
+        status=status, category_code=category_code, q=q
+    )
+    row = master_conn.execute(
+        f"SELECT COUNT(*) AS c FROM canonical_items{where}", params
+    ).fetchone()
+    return int(row["c"])
+
+
+def list_canonical_categories(master_conn: sqlite3.Connection) -> list[dict]:
+    """canonical_categories（品类筛选下拉用），附各品类的主数据条数。"""
+    master_conn.row_factory = sqlite3.Row
+    rows = master_conn.execute(
+        """SELECT cc.code, cc.name,
+                  COUNT(ci.id) AS item_count
+           FROM canonical_categories cc
+           LEFT JOIN canonical_items ci ON ci.category_code = cc.code
+           GROUP BY cc.code, cc.name
+           ORDER BY cc.code"""
+    ).fetchall()
+    out = [dict(r) for r in rows]
+    # 未归品类（category_code 为空或不在 canonical_categories 里）也要能筛出来
+    orphan = master_conn.execute(
+        """SELECT COUNT(*) AS c FROM canonical_items ci
+           WHERE ci.category_code IS NULL
+              OR ci.category_code NOT IN (SELECT code FROM canonical_categories)"""
+    ).fetchone()["c"]
+    if orphan:
+        out.append({
+            "code": "__none__", "name": "（未归品类）", "item_count": int(orphan),
+        })
+    return out
 
 
 def get_canonical_item_detail(
@@ -2259,19 +2364,36 @@ def resolve_conflict(
 #  T9 — Cross-warehouse reads + inspection (Spec §3.1 + §7.7.4 兜底)
 # ─────────────────────────────────────────────────────────────────────
 
-def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
+#: collect_bindings 的默认仓类型 —— 跨仓差异（diff）比的是「门店之间」，
+#: 把 rd / 配送中心算进去会把口径搅浑，故默认仍只取 storefront。
+BINDING_STOREFRONT_ONLY: tuple[str, ...] = ("storefront",)
+#: 主数据详情页「已绑定仓」要看全部仓 —— 只看门店会让 DC/rd 已绑的品项
+#: 误报成「尚未绑任何仓」（2026-10-10 修正）。
+BINDING_ALL_TYPES: tuple[str, ...] = ("storefront", "rd", "distribution_center")
+
+
+def collect_bindings(
+    master_conn: sqlite3.Connection,
+    *,
+    warehouse_types: tuple[str, ...] = BINDING_STOREFRONT_ONLY,
+) -> dict[str, list[dict]]:
     """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。
 
     v2（P0-10）：带上 is_active，供主数据详情页按仓停用/启用。
+    v3：加 `warehouse_types` 参数 + 每行带 warehouse_type。
+        默认 storefront —— diff_summary() 依赖该默认值衡量「跨门店差异」。
     """
     from config import BASE_DIR
     from db import migrate_warehouse_db_columns
 
     master_conn.row_factory = sqlite3.Row
     out: dict[str, list[dict]] = {}
+    placeholders = ", ".join("?" for _ in warehouse_types)
     wh_rows = master_conn.execute(
-        """SELECT code, db_path FROM warehouses
-           WHERE warehouse_type='storefront'"""
+        f"""SELECT code, db_path, warehouse_type FROM warehouses
+            WHERE warehouse_type IN ({placeholders})
+            ORDER BY code""",
+        list(warehouse_types),
     ).fetchall()
     for wh in wh_rows:
         db_path = Path(wh["db_path"])
@@ -2290,7 +2412,12 @@ def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
                    FROM items
                    WHERE canonical_id IS NOT NULL"""
             ).fetchall()
-            out[wh["code"]] = [dict(r) for r in rows]
+            rows_out = []
+            for r in rows:
+                row = dict(r)
+                row["warehouse_type"] = wh["warehouse_type"]
+                rows_out.append(row)
+            out[wh["code"]] = rows_out
     return out
 
 

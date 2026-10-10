@@ -87,11 +87,42 @@ def _all_warehouse_conns(master_conn) -> dict[str, sqlite3.Connection]:
 @bp.route("/list")
 @require_login
 def canonical_list():
+    """主数据列表 —— 支持 关键词搜索 / 品类筛选 / 状态筛选（可组合）。"""
     m = get_master_db()
-    items = cp.list_canonical_items(m, limit=500)
+    q = (request.args.get("q") or "").strip()
+    category = (request.args.get("category") or "").strip()
+    status = (request.args.get("status") or "").strip()
+
+    # 只做长度收敛；值一律走参数化查询，不做「白名单否则静默忽略」——
+    # 静默忽略会让「筛了却没生效」难以排查。筛不到就是 0 条，语义可预期。
+    q, category, status = q[:200], category[:64], status[:32]
+
+    limit = 500
+    items = cp.list_canonical_items(
+        m,
+        status=status or None,
+        category_code=category or None,
+        q=q or None,
+        limit=limit,
+    )
+    total = cp.count_canonical_items(
+        m,
+        status=status or None,
+        category_code=category or None,
+        q=q or None,
+    )
+    categories = cp.list_canonical_categories(m)
     return render_template(
         "canonical/list.html",
         items=items,
+        total=total,
+        truncated=total > len(items),
+        limit=limit,
+        categories=categories,
+        category_names={c["code"]: c["name"] for c in categories},
+        status_choices=cp.BATCH_STATUS_CHOICES,
+        status_labels=cp.BATCH_STATUS_LABELS,
+        filters={"q": q, "category": category, "status": status},
         price_managed=cp.is_syncable_field("selling_price"),
     )
 
@@ -101,8 +132,9 @@ def canonical_list():
 def canonical_detail(canonical_id: int):
     m = get_master_db()
     detail = cp.get_canonical_item_detail(m, canonical_id)
-    # 跨仓 bindings
-    bindings = cp.collect_bindings(m)
+    # 跨仓 bindings —— 详情页要看「全部仓」（含配送中心 / 研发），
+    # 只看门店会把 DC/rd 已绑的品项误报成「尚未绑任何仓」。
+    bindings = cp.collect_bindings(m, warehouse_types=cp.BINDING_ALL_TYPES)
     matching = []
     for wh_code, rows in bindings.items():
         for r in rows:
@@ -639,9 +671,15 @@ def canonical_fanout(canonical_id: int | None = None):
         raw = raw.strip()
         if raw.isdigit():
             preselect_ids.append(int(raw))
+    # 目标仓 = 门店 + 研发 + **配送中心**。
+    # 2026-10-10 补入配送中心：/items 的新增入口已全仓关闭，扇出是唯一的
+    # 建行通道；而门店订货目录是从「配送中心自己的 items 行」出发的
+    # （list_available_dc_items），DC 没有绑定行 ⇒ 品项永远订不到。
     wh_rows = m.execute(
-        "SELECT code, name FROM warehouses "
-        "WHERE warehouse_type IN ('storefront', 'rd') ORDER BY code"
+        "SELECT code, name, warehouse_type FROM warehouses "
+        "WHERE warehouse_type IN ('storefront', 'rd', 'distribution_center') "
+        "ORDER BY CASE warehouse_type"
+        "  WHEN 'distribution_center' THEN 0 WHEN 'storefront' THEN 1 ELSE 2 END, code"
     ).fetchall()
     return render_template(
         "canonical/fanout.html",

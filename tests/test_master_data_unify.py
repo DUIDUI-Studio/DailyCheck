@@ -34,20 +34,32 @@ def _item_row(wh_path, item_id: int):
     return row
 
 
-def _seed_canonical(master_path, name, unit="件"):
+def _seed_canonical(master_path, name, unit="件", *, category_code=None,
+                    status="active", sku=None):
     """在主数据表插一行，返回 canonical_id。"""
     conn = sqlite3.connect(master_path)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cur = conn.execute(
-        "INSERT INTO canonical_items (canonical_sku, name, unit, status, "
-        "created_from, created_at, updated_at) VALUES (?, ?, ?, 'active', "
-        "'rd_manual', ?, ?)",
-        (f"IC-TEST-{name}", name, unit, ts, ts),
+        "INSERT INTO canonical_items (canonical_sku, name, category_code, unit, "
+        "status, created_from, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 'rd_manual', ?, ?)",
+        (sku or f"IC-TEST-{name}", name, category_code, unit, status, ts, ts),
     )
     new_id = cur.lastrowid
     conn.commit()
     conn.close()
     return new_id
+
+
+def _list_body(client, **params):
+    """GET /canonical/list 并返回 HTML（支持 q / category / status）。"""
+    from urllib.parse import urlencode
+
+    qs = urlencode({k: v for k, v in params.items() if v})
+    url = "/canonical/list" + (f"?{qs}" if qs else "")
+    resp = client.get(url)
+    assert resp.status_code == 200, f"{url} -> {resp.status_code}"
+    return resp.get_data(as_text=True)
 
 
 @pytest.fixture
@@ -433,6 +445,269 @@ def test_fanout_page_has_no_dry_run_option(logged_client):
     assert resp.status_code == 200
     body = resp.get_data(as_text=True)
     assert 'name="dry_run"' not in body
+
+
+# ─────────────── 扇出目标仓：补入配送中心（2026-10-10） ───────────────
+
+def _add_dc_warehouse(master_path, wh_dir, code="dc_target"):
+    """建一个 distribution_center 仓，返回它的 db 路径。"""
+    from db import init_warehouse_db
+
+    dc_path = wh_dir / f"{code}.db"
+    init_warehouse_db(dc_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(master_path)
+    conn.execute(
+        "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
+        "VALUES (?, ?, ?, 'distribution_center', ?)",
+        (code, "目标配送中心", str(dc_path), ts),
+    )
+    conn.commit()
+    conn.close()
+    return dc_path
+
+
+def test_fanout_page_offers_distribution_center(logged_client):
+    """扇出页的「目标仓库」必须包含配送中心（原写死只有 storefront + rd）。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    _add_dc_warehouse(master_path, wh_path.parent)
+
+    body = client.get("/canonical/fanout").get_data(as_text=True)
+    assert 'value="dc_target"' in body
+    assert "配送中心" in body
+
+
+def test_fanout_to_dc_creates_bound_row(logged_client):
+    """扇出到配送中心能建出绑定行（quantity=0，不凭空造库存）。
+
+    这是「新建品项 → 门店能订到」的唯一通路：门店订货目录读的就是 DC 的 items 行。
+    """
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    dc_path = _add_dc_warehouse(master_path, wh_path.parent)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO canonical_categories (code, name, description, created_at,"
+        " updated_at) VALUES ('PACKAGING', '包材', '', ?, ?)", (ts, ts))
+    m.commit()
+    m.close()
+    cid = _seed_canonical(master_path, "扇出到DC", category_code="PACKAGING")
+
+    resp = client.post("/canonical/fanout", data={
+        "canonical_ids": [str(cid)], "warehouse_codes": ["dc_target"],
+        "action": "overwrite",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+
+    dc = sqlite3.connect(dc_path)
+    dc.row_factory = sqlite3.Row
+    row = dc.execute(
+        "SELECT * FROM items WHERE canonical_id=?", (cid,)
+    ).fetchone()
+    dc.close()
+    assert row is not None, "配送中心没有生成绑定行"
+    assert row["name"] == "扇出到DC"
+    assert float(row["quantity"]) == 0.0
+    assert float(row["safety_stock"]) == 0.0
+    assert row["canonical_status"] == "active"
+
+
+# ─────────────── 批量修改状态（2026-10-10 Eric 需求） ───────────────
+
+def test_batch_edit_status_disables_items(logged_client):
+    """批量把若干主数据项设为 disabled。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "批量停用一")
+    c2 = _seed_canonical(master_path, "批量停用二")
+
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": [str(c1), str(c2)],
+        "field": "status",
+        "value": "disabled",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    assert "/canonical/fanout" in resp.headers["Location"]
+    assert _canonical_row(master_path, c1)["status"] == "disabled"
+    assert _canonical_row(master_path, c2)["status"] == "disabled"
+
+
+def test_batch_edit_status_can_reenable(logged_client):
+    """批量把停用项恢复为 active。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "批量恢复", status="disabled")
+
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": [str(c1)], "field": "status", "value": "active",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    assert _canonical_row(master_path, c1)["status"] == "active"
+
+
+def test_batch_edit_status_rejects_deleted(logged_client):
+    """Q3=deactivate_only：批量也不允许把状态改成 deleted。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "不许删除")
+
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": [str(c1)], "field": "status", "value": "deleted",
+    }, follow_redirects=True)
+    assert resp.status_code == 200
+    assert "不允许删除" in resp.get_data(as_text=True)
+    assert _canonical_row(master_path, c1)["status"] == "active"  # 未被改写
+
+
+def test_batch_edit_status_rejects_unknown_value(logged_client):
+    """非法状态值必须被拒且不落库。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "非法状态")
+
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": [str(c1)], "field": "status", "value": "inactive",
+    }, follow_redirects=True)
+    assert "状态只能是" in resp.get_data(as_text=True)
+    assert _canonical_row(master_path, c1)["status"] == "active"
+
+
+def test_list_page_exposes_status_batch_option(logged_client):
+    """列表页批量区必须能选「状态」，并带上状态下拉。"""
+    client, _ = logged_client
+    body = _list_body(client)
+    assert '<option value="status">状态（启用 / 停用）</option>' in body
+    assert 'id="batch-value-status"' in body
+
+
+# ─────────────── 搜索 / 筛选（2026-10-10 Eric 需求） ───────────────
+
+def test_canonical_list_search_matches_name_and_sku(logged_client):
+    """搜索同时命中 名称 与 SKU，且不误伤其他行。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    _seed_canonical(master_path, "草莓果酱", sku="SAUCE-001")
+    _seed_canonical(master_path, "巧克力脆片", sku="CHOC-777")
+
+    body = _list_body(client, q="草莓")
+    assert "草莓果酱" in body
+    assert "巧克力脆片" not in body
+
+    # 按 SKU 片段搜
+    body = _list_body(client, q="CHOC-77")
+    assert "巧克力脆片" in body
+    assert "草莓果酱" not in body
+
+
+def test_canonical_list_search_escapes_like_wildcards(logged_client):
+    """输入 % / _ 不能被当成通配符（否则一个 % 会命中全部）。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    c1 = _seed_canonical(master_path, "普通品项A")
+    c2 = _seed_canonical(master_path, "普通品项B")
+
+    body = _list_body(client, q="%")
+    assert "普通品项A" not in body
+    assert "普通品项B" not in body
+    # 全量仍能看到两行
+    assert "普通品项A" in _list_body(client)
+    assert c1 != c2
+
+
+def test_canonical_list_filters_by_category_and_status(logged_client):
+    """品类 + 状态可组合筛选。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    _seed_canonical(master_path, "包材甲", category_code="PACKAGING",
+                    status="active")
+    _seed_canonical(master_path, "包材乙", category_code="PACKAGING",
+                    status="disabled")
+    _seed_canonical(master_path, "辅料丙", category_code="CONSUMABLE",
+                    status="active")
+
+    body = _list_body(client, category="PACKAGING")
+    assert "包材甲" in body and "包材乙" in body
+    assert "辅料丙" not in body
+
+    body = _list_body(client, category="PACKAGING", status="disabled")
+    assert "包材乙" in body
+    assert "包材甲" not in body
+    assert "辅料丙" not in body
+
+    body = _list_body(client, status="active")
+    assert "包材甲" in body and "辅料丙" in body
+    assert "包材乙" not in body
+
+
+def test_canonical_list_bogus_filter_values_are_safe(logged_client):
+    """恶意 / 不存在的筛选值既不注入也不报错，只是筛不到东西。"""
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    _seed_canonical(master_path, "兜底品项", category_code="PACKAGING")
+
+    body = _list_body(client, status="'; DROP TABLE canonical_items; --")
+    assert "兜底品项" not in body
+
+    body = _list_body(client, category="NO_SUCH_CODE")
+    assert "兜底品项" not in body
+
+    # 表还在，正常查询仍然可用
+    assert _canonical_row(master_path, 1) is not None
+    assert "兜底品项" in _list_body(client)
+
+
+def test_canonical_list_shows_filter_controls(logged_client):
+    """搜索框 / 品类下拉 / 状态下拉都在页面上。"""
+    client, _ = logged_client
+    body = _list_body(client)
+    assert 'name="q"' in body
+    assert 'name="category"' in body
+    assert 'name="status"' in body
+
+
+# ─────────────── 详情页「已绑定仓」口径修正 ───────────────
+
+def test_canonical_detail_lists_dc_and_rd_bindings(logged_client, tmp_path):
+    """配送中心 / 研发的绑定也必须出现在「已绑定仓」。
+
+    回归：collect_bindings 原先只查 storefront，导致 DC 已绑的品项在详情页
+    被误报成「尚未绑任何仓」。
+    """
+    from db import init_warehouse_db
+
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    wh_dir = wh_path.parent
+    dc_path = wh_dir / "dc_bind.db"
+    init_warehouse_db(dc_path)
+
+    cid = _seed_canonical(master_path, "跨类型绑品")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, "
+        "created_at) VALUES (2, 'dc_bind', '绑定测试DC', ?, "
+        "'distribution_center', ?)", (str(dc_path), ts))
+    m.commit()
+    m.close()
+
+    dc = sqlite3.connect(dc_path)
+    dc.row_factory = sqlite3.Row
+    cat_id = dc.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    dc.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("DC-BIND", "跨类型绑品", cat_id, 0.0, "件", cid, ts))
+    dc.commit()
+    dc.close()
+
+    body = client.get(f"/canonical/detail/{cid}").get_data(as_text=True)
+    assert "尚未绑任何仓" not in body
+    assert "dc_bind" in body
+    assert "配送中心" in body
     assert "只算不写" not in body
 
 

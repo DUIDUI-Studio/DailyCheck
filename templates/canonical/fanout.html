@@ -23,14 +23,21 @@
   <p>将扇出 <strong>{{ selected['canonical_sku'] }} {{ selected['name'] }}</strong> 到下列仓:</p>
   {% endif %}
 
+  {% set wh_type_labels = {'storefront': '门店', 'rd': '研发', 'distribution_center': '配送中心'} %}
   <fieldset>
     <legend>目标仓库（多选）</legend>
     {% for wh in warehouses %}
     <label class="checkbox-row">
       <input type="checkbox" name="warehouse_codes" value="{{ wh['code'] }}" />
       {{ wh['code'] }} — {{ wh['name'] }}
+      <small>（{{ wh_type_labels.get(wh['warehouse_type'], wh['warehouse_type'] or '未分类') }}）</small>
     </label>
     {% endfor %}
+    <p class="hint">
+      ⚠️ <strong>配送中心是门店订货的来源</strong>：门店看到的「订货目录」就是配送中心的
+      items 行。新建品项如果只扇给门店、不扇给配送中心，门店在订货界面永远看不到它。
+      新建品项请把配送中心一并勾上（DC 新建行的库存为 0，不会凭空造库存）。
+    </p>
   </fieldset>
 
   <label>

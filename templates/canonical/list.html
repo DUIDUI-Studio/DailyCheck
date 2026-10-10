@@ -23,6 +23,43 @@
   </div>
 </div>
 
+<form method="get" action="{{ url_for('canonical.canonical_list') }}" class="form-section">
+  <div class="grid cols-3">
+    <label>
+      <span>搜索（名称 / SKU / 条码）</span>
+      <input name="q" value="{{ filters.q }}" placeholder="输入关键词，支持部分匹配" />
+    </label>
+    <label>
+      <span>品类</span>
+      <select name="category">
+        <option value="">全部品类</option>
+        {% for c in categories %}
+        <option value="{{ c.code }}" {% if filters.category == c.code %}selected{% endif %}>
+          {{ c.name }}（{{ c.item_count }}）
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>状态</span>
+      <select name="status">
+        <option value="">全部状态</option>
+        {% for s in status_choices %}
+        <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ status_labels[s] }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+  <div class="form-actions">
+    <button type="submit" class="btn-sm">筛选</button>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_list') }}">清除</a>
+  </div>
+</form>
+
+<p class="muted">
+  命中 <strong>{{ total }}</strong> 条{% if truncated %}（超过单页上限 {{ limit }}，仅显示前 {{ items|length }} 条，请用筛选缩小范围）{% endif %}
+</p>
+
 {% if is_admin %}
 <form method="post" action="{{ url_for('canonical.canonical_batch_edit') }}" id="batch-form">
 {% endif %}
@@ -45,7 +82,7 @@
       <td>{{ it['id'] }}</td>
       <td><code>{{ it['canonical_sku'] }}</code></td>
       <td>{{ it['name'] }}</td>
-      <td>{{ it['category_code'] or '—' }}</td>
+      <td>{{ category_names.get(it['category_code'], it['category_code']) or '—' }}</td>
       <td>{{ it['unit'] }}</td>
       {% if price_managed %}
       <td>{{ ('%.3f'|format(it['selling_price'])) if it['selling_price'] is not none else '—' }}</td>
@@ -67,6 +104,8 @@
         {% endif %}
       </td>
     </tr>
+    {% else %}
+    <tr><td colspan="10"><span class="muted">没有符合条件的品项</span></td></tr>
     {% endfor %}
   </tbody>
 </table>
@@ -77,6 +116,7 @@
   <p class="hint">
     勾选上表若干行 → 选字段 → 填统一值 → 保存，随后进入扇出页下发到目标仓。
     {% if price_managed %}价格（成本 / 售价）已收归主数据，可在此统一设置；留空 = 未定价（不下发）。{% endif %}
+    选「状态」即可批量启用 / 停用（停用后需扇出才会在各仓生效）。
   </p>
   <div class="grid cols-3">
     <label>
@@ -87,6 +127,7 @@
         <option value="gram_per_unit">克重</option>
         <option value="aux_unit">辅单位</option>
         <option value="aux_rate">辅单位换算率</option>
+        <option value="status">状态（启用 / 停用）</option>
         {% if price_managed %}
         <option value="selling_price">销售单价</option>
         <option value="unit_cost">进货单价</option>
@@ -96,6 +137,11 @@
     <label>
       <span>统一设为</span>
       <input name="value" id="batch-value" placeholder="留空 = 清空该字段（品类 / 辅单位）" />
+      <select name="value" id="batch-value-status" disabled>
+        {% for s in status_choices %}
+        <option value="{{ s }}">{{ status_labels[s] }}</option>
+        {% endfor %}
+      </select>
     </label>
   </div>
   <button type="submit">批量修改选中项</button>
@@ -113,9 +159,19 @@
   }
   var field = document.getElementById('batch-field');
   var value = document.getElementById('batch-value');
+  var statusSel = document.getElementById('batch-value-status');
   var numeric = {gram_per_unit: 1, aux_rate: 1, selling_price: 1, unit_cost: 1};
   function syncType() {
-    if (!field || !value) return;
+    if (!field) return;
+    var isStatus = field.value === 'status';
+    if (statusSel) {
+      statusSel.disabled = !isStatus;
+      statusSel.style.display = isStatus ? '' : 'none';
+    }
+    if (!value) return;
+    value.disabled = isStatus;
+    value.style.display = isStatus ? 'none' : '';
+    if (isStatus) return;
     var n = numeric[field.value];
     value.type = n ? 'number' : 'text';
     value.min = n ? '0' : '';

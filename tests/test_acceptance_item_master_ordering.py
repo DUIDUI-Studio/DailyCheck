@@ -28,6 +28,13 @@
       `/store-ordering/dc/items` 仍显示「可订」（该页只读 DC 本仓
       `is_orderable`，未看主数据总闸 `canonical_items.status`）。现该页透传
       并标注主数据状态、开关置灰，写入路径同步加护栏。
+    - 2026-10-10 追加能力（`test_A14` ~ `test_A16`）：品项主数据页支持
+      批量改状态（启用/停用，仍拒绝 deleted）、关键词搜索、品类/状态筛选；
+      详情页「已绑定仓」口径修正为「门店 + 研发 + 配送中心」全类型。
+    - 2026-10-10 追加修复（`test_A17`）：扇出目标仓补入**配送中心**。
+      此前写死 storefront + rd，而门店订货目录读的是 DC 的 items 行 ⇒
+      新建品项拿不到 DC 绑定行，门店永远订不到。现扇出页可选配送中心，
+      且 A17 覆盖「新建 → 扇出门店（订不到）→ 扇出 DC（订到了）」全链路。
 
 所有用例都在 tmp_path 下的临时 master.db / 仓库 db 上跑，绝不触碰真实 db。
 """
@@ -480,6 +487,122 @@ def test_A13_canonical_edit_invalid_price_is_rejected(env):
     after = _one(env["master_path"],
                  "SELECT COUNT(*) AS c FROM canonical_items WHERE name='非法价品项'")["c"]
     assert after == before
+
+
+# ───────────────────────────────────────────────────────────────────────
+#  A14 ~ A16：主数据页新增能力（2026-10-10 Eric 需求）
+# ───────────────────────────────────────────────────────────────────────
+
+
+def test_A14_batch_status_disable_then_fanout_hides_from_store(env):
+    """批量改状态（disabled）→ 扇出 → 门店行 canonical_status=disabled 且列表隐藏。
+
+    走的是「勾选 → 批量把状态设为停用 → 一键扇出」这条真实操作路径。
+    """
+    client = env["client"]
+    _login(client, 1, 1)  # admin
+
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": ["101"],
+        "field": "status",
+        "value": "disabled",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    assert "/canonical/fanout" in resp.headers["Location"]
+    assert _one(env["master_path"],
+                "SELECT status FROM canonical_items WHERE id=101")["status"] == "disabled"
+
+    client.post("/canonical/fanout", data={
+        "canonical_ids": ["101"], "warehouse_codes": ["store_test"],
+        "action": "overwrite",
+    })
+    assert _item_by_canonical(env["store_path"], 101)["canonical_status"] == "disabled"
+
+    _login(client, 2, 2)  # store_mgr
+    assert "测试包材A" not in client.get("/items").get_data(as_text=True)
+
+
+def test_A14b_batch_status_cannot_delete(env):
+    """Q3=deactivate_only：批量改状态也拒绝 deleted，且不落库。"""
+    client = env["client"]
+    _login(client, 1, 1)
+    resp = client.post("/canonical/batch-edit", data={
+        "canonical_ids": ["101"], "field": "status", "value": "deleted",
+    }, follow_redirects=True)
+    assert resp.status_code == 200
+    assert "不允许删除" in resp.get_data(as_text=True)
+    assert _one(env["master_path"],
+                "SELECT status FROM canonical_items WHERE id=101")["status"] == "active"
+
+
+def test_A15_canonical_list_search_and_category_filter(env):
+    """主数据列表：关键词搜索 + 品类筛选（可组合）。"""
+    client = env["client"]
+    _login(client, 1, 1)
+
+    body = client.get("/canonical/list").get_data(as_text=True)
+    assert 'name="q"' in body and 'name="category"' in body and 'name="status"' in body
+
+    # 关键词命中 101（测试包材A），不命中 102（测试乳制品B）
+    body = client.get("/canonical/list?q=包材A").get_data(as_text=True)
+    assert "测试包材A" in body
+    assert "测试乳制品B" not in body
+
+    # 品类筛选：DAIRY 只剩 102
+    body = client.get("/canonical/list?category=DAIRY").get_data(as_text=True)
+    assert "测试乳制品B" in body
+    assert "测试包材A" not in body
+
+    # 组合：PACKAGING + 搜索不匹配 → 空
+    body = client.get("/canonical/list?category=PACKAGING&q=乳制品").get_data(as_text=True)
+    assert "测试包材A" not in body and "测试乳制品B" not in body
+
+
+def test_A17_new_item_reaches_store_catalog_via_dc_fanout(env):
+    """全链路：新建主数据 → 扇出到「配送中心 + 门店」→ 门店订货目录能订到。
+
+    2026-10-10 前，扇出页的目标仓写死 storefront + rd，配送中心拿不到绑定行，
+    而门店订货目录读的正是 DC 的 items 行 ⇒ 新建品项永远订不到。
+    """
+    client = env["client"]
+    _login(client, 1, 1)  # admin
+
+    cid = _seed_canonical(env["master_path"], "全链路新品", category_code="PACKAGING")
+
+    # 只扇给门店 → 订货目录仍然看不到（这是缺口的表现）
+    client.post("/canonical/fanout", data={
+        "canonical_ids": [str(cid)], "warehouse_codes": ["store_test"],
+        "action": "overwrite",
+    })
+    _login(client, 3, 2)  # store_staff
+    body = client.get("/store-ordering/catalog?dc=dc_test").get_data(as_text=True)
+    assert "全链路新品" not in body
+
+    # 再扇给配送中心 → 门店订货目录出现
+    _login(client, 1, 1)
+    client.post("/canonical/fanout", data={
+        "canonical_ids": [str(cid)], "warehouse_codes": ["dc_test"],
+        "action": "overwrite",
+    })
+    assert _item_by_canonical(env["dc_path"], cid) is not None
+
+    _login(client, 3, 2)  # store_staff
+    body = client.get("/store-ordering/catalog?dc=dc_test").get_data(as_text=True)
+    assert "全链路新品" in body, "配送中心已绑定，门店订货目录仍看不到"
+
+
+def test_A16_canonical_detail_shows_dc_binding(env):
+    """详情页「已绑定仓」必须包含配送中心（原先只统计门店）。"""
+    client = env["client"]
+    _login(client, 1, 1)
+
+    # fixture：dc_test 与 store_test 都绑了 101
+    body = client.get("/canonical/detail/101").get_data(as_text=True)
+    assert "已绑定仓" in body
+    assert "dc_test" in body, "配送中心的绑定没显示出来"
+    assert "配送中心" in body
+    assert "store_test" in body
+    assert "尚未绑任何仓" not in body
 
 
 # ═══════════════════════════════════════════════════════════════════════
