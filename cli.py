@@ -594,7 +594,7 @@ def align_apply_cmd(
             result = cp.fanout_canonical_items(
                 master_conn, wh_conns,
                 canonical_ids=ids, warehouse_codes=whs,
-                action=action, force=force, dry_run=False,
+                action=action, force=force,
                 summary=f"cli align-apply {canonical_ids} -> {warehouse_codes}",
                 backup_paths=backup_paths,
             )

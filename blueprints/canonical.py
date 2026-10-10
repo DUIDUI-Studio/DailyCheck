@@ -582,7 +582,6 @@ def canonical_fanout(canonical_id: int | None = None):
             action = request.form.get("action", "overwrite")
             force = bool(request.form.get("force"))
             confirm_text = request.form.get("confirm_text", "")
-            dry_run = bool(request.form.get("dry_run"))
         except (ValueError, BadRequest) as e:
             flash(f"表单解析失败: {e}")
             return redirect(url_for("canonical.canonical_fanout"))
@@ -609,7 +608,6 @@ def canonical_fanout(canonical_id: int | None = None):
                 warehouse_codes=warehouse_codes,
                 action=action,
                 force=force,
-                dry_run=dry_run,
                 started_by=g.user["id"],
                 summary=request.form.get("summary"),
             )
@@ -624,11 +622,11 @@ def canonical_fanout(canonical_id: int | None = None):
                     pass
 
         flash(
-            f"扇出{'预演' if dry_run else ''}: 写入 {result['total_written']} 字段, "
+            f"扇出: 写入 {result['total_written']} 字段, "
             f"冻结 {result['total_frozen']} 字段, status={result['status']}"
         )
         return redirect(url_for(
-            "canonical.canonical_fanout_event", event_id=result["event_id"] or 0
+            "canonical.canonical_fanout_event", event_id=result["event_id"]
         ))
 
     items = cp.list_canonical_items(m, limit=500)

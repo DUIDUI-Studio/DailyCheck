@@ -422,3 +422,51 @@ def test_batch_edit_aux_unit_clears_gram(logged_client):
     row = _canonical_row(master_path, c1)
     assert row["aux_unit"] == "袋"
     assert float(row["gram_per_unit"]) == 0.0
+
+
+# ─────────────── 扇出：dry_run 预演模式已移除（2026-10-10） ───────────────
+
+def test_fanout_page_has_no_dry_run_option(logged_client):
+    """扇出页不再提供 dry_run 选项（该选项曾是 404 的触发点）。"""
+    client, _ = logged_client
+    resp = client.get("/canonical/fanout")
+    assert resp.status_code == 200
+    body = resp.get_data(as_text=True)
+    assert 'name="dry_run"' not in body
+    assert "只算不写" not in body
+
+
+def test_fanout_post_lands_on_real_event_page(logged_client):
+    """回归：POST 扇出必须跳到真实事件页。
+
+    移除 dry_run 前，预演模式不建事件行，路由 `or 0` 会跳到
+    `/canonical/fanout/event/0` → 事件不存在 → abort(404)。
+    """
+    client, wh_path = logged_client
+    master_path = wh_path.parent.parent / "master.db"
+    cid = _seed_canonical(master_path, "扇出页回归", unit="件")
+
+    resp = client.post("/canonical/fanout", data={
+        "canonical_ids": [str(cid)],
+        "warehouse_codes": ["wh_test"],
+        "action": "overwrite",
+        "summary": "pytest 扇出回归",
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    loc = resp.headers["Location"]
+    assert "/canonical/fanout/event/" in loc
+    assert not loc.endswith("/event/0")
+
+    # 事件页可访问（曾经这里是 404）
+    assert client.get(loc).status_code == 200
+
+    # 事件行确实落库
+    event_id = int(loc.rstrip("/").rsplit("/", 1)[-1])
+    conn = sqlite3.connect(master_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM canonical_publish_events WHERE id=?", (event_id,)
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["status"] in ("complete", "partial", "failed")

@@ -88,7 +88,7 @@ Public surface (this file):
                                  category_id_map=None) -> dict
     fanout_canonical_items(master_conn, wh_db_map, *, canonical_ids,
                            warehouse_codes, action='overwrite',
-                           force=False, dry_run=False, started_by=None,
+                           force=False, started_by=None,
                            summary=None) -> dict
     resolve_conflict(master_conn, *, conflict_id, decision,
                      reviewed_by, note=None) -> dict
@@ -1941,24 +1941,23 @@ def fanout_canonical_items(
     warehouse_codes: list[str],
     action: str = "overwrite",
     force: bool = False,
-    dry_run: bool = False,
     started_by: int | None = None,
     summary: str | None = None,
     backup_paths: list[str] | None = None,
 ) -> dict:
     """T8 —— 主扇出函数。Spec §3.3 时序图完整实现。
 
+    执行即写入（2026-10-10 移除 dry_run 预演模式）。
+
     Args:
         wh_db_map: {warehouse_code: sqlite3.Connection}
         canonical_ids: 要下发的 canonical_items.id 列表
         warehouse_codes: 目标仓列表
         action: keep / merge / overwrite / force(force 通过 force=True 走)
-        dry_run: True 时只算 plan,不写库
         backup_paths: 写前备份文件路径列表(Q7 措施①);写入事件 backup_paths_json。
     Returns:
         {
           "event_id": int,
-          "dry_run": bool,
           "per_canonical": [{canonical_id, per_warehouse: [{wh_code, written, frozen, ...}]}],
           "total_written": int,
           "total_frozen": int,
@@ -1967,18 +1966,16 @@ def fanout_canonical_items(
     """
     master_conn.row_factory = sqlite3.Row
     target_codes_json = json.dumps(sorted(warehouse_codes), ensure_ascii=False)
-    event_id: int | None = None
-    if not dry_run:
-        cur = master_conn.execute(
-            """INSERT INTO canonical_publish_events
-               (summary, status, started_by, started_at,
-                target_warehouse_codes_json, item_count)
-               VALUES (?, 'pending', ?, ?, ?, ?)""",
-            (summary or "fanout", started_by, _now_str(),
-             target_codes_json, len(canonical_ids)),
-        )
-        event_id = int(cur.lastrowid)
-        master_conn.commit()
+    cur = master_conn.execute(
+        """INSERT INTO canonical_publish_events
+           (summary, status, started_by, started_at,
+            target_warehouse_codes_json, item_count)
+           VALUES (?, 'pending', ?, ?, ?, ?)""",
+        (summary or "fanout", started_by, _now_str(),
+         target_codes_json, len(canonical_ids)),
+    )
+    event_id: int = int(cur.lastrowid)
+    master_conn.commit()
 
     # ─────────────────────────────────────────────────────────────────
     # 预加载:本批次所有 canonical_items(避免循环里反复 SELECT)。
@@ -2063,7 +2060,7 @@ def fanout_canonical_items(
                     )
                 except Exception as apply_exc:  # noqa: BLE001
                     err_msg = str(apply_exc)[:200]
-                    if not dry_run and event_id is not None:
+                    if event_id is not None:
                         master_conn.execute(
                             """INSERT INTO canonical_publish_event_items
                                (publish_event_id, canonical_id, target_warehouse_code,
@@ -2083,7 +2080,7 @@ def fanout_canonical_items(
                     continue
 
                 # 写入主数据字段
-                if not dry_run and result["written"]:
+                if result["written"]:
                     written = result["written"]
                     # 分组:业务字段 vs canonical_status 字段
                     set_parts: list[str] = []
@@ -2115,7 +2112,7 @@ def fanout_canonical_items(
                     conn.commit()
 
                 # 写冲突行
-                if not dry_run and result["frozen"]:
+                if result["frozen"]:
                     for field, vals in result["frozen"].items():
                         # 查 local_item_id
                         local_id_row = conn.execute(
@@ -2145,7 +2142,7 @@ def fanout_canonical_items(
                 #           success (正常)。任何字段写到 master_conn 都在
                 #           同一个事务里;失败的 case 已在 inner try 拦截并写入
                 #           自己的 event_items 行。
-                if not dry_run and event_id is not None:
+                if event_id is not None:
                     if result.get("skipped_reason"):
                         item_status = "skipped"
                         event_err = result["skipped_reason"]
@@ -2205,32 +2202,26 @@ def fanout_canonical_items(
         })
 
     # 更新事件状态
-    if not dry_run and event_id is not None:
-        final_status = (
-            "failed" if total_written == 0 and total_frozen == 0
-            else "partial" if any_partial else "complete"
-        )
-        master_conn.execute(
-            """UPDATE canonical_publish_events
-               SET status=?, completed_at=?, backup_paths_json=?
-               WHERE id=?""",
-            (final_status, _now_str(),
-             json.dumps(backup_paths, ensure_ascii=False) or None,
-             event_id),
-        )
-        master_conn.commit()
+    final_status = (
+        "failed" if total_written == 0 and total_frozen == 0
+        else "partial" if any_partial else "complete"
+    )
+    master_conn.execute(
+        """UPDATE canonical_publish_events
+           SET status=?, completed_at=?, backup_paths_json=?
+           WHERE id=?""",
+        (final_status, _now_str(),
+         json.dumps(backup_paths, ensure_ascii=False) or None,
+         event_id),
+    )
+    master_conn.commit()
 
     return {
         "event_id": event_id,
-        "dry_run": dry_run,
         "per_canonical": per_canonical,
         "total_written": total_written,
         "total_frozen": total_frozen,
-        "status": (
-            "dry_run" if dry_run else
-            ("failed" if total_written == 0 and total_frozen == 0
-             else "partial" if any_partial else "complete")
-        ),
+        "status": final_status,
     }
 
 
@@ -2791,7 +2782,7 @@ def _infer_category_code(name: str) -> str | None:
 #  对齐全流程的 CLI 支撑层：
 #    align-seed   → seed_canonical_categories + seed_default_canonical_items
 #    align-detect → dry_run_report()（纯只读）
-#    align-apply  → fanout_canonical_items(dry_run=False)（危险,双确认）
+#    align-apply  → fanout_canonical_items()（危险,双确认）
 #  命令本体在 cli.py；范围常量与报告格式化放本文件（单一真相源）。
 # ─────────────────────────────────────────────────────────────────────
 
