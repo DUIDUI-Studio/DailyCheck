@@ -1,6 +1,8 @@
 # DailyCheck — 轻量库存管理系统
 
-> **每次 session 启动先读 [`docs/DEV_ENV.md`](docs/DEV_ENV.md)**,里面记录了当前 dev 环境的部署方式(wdg-systemd 容器)、入口、调试命令和已知坑。错误的部署模型会导致走错方向(例如以为有独立 Dockerfile)。
+> **每次 session 启动按顺序先读**：
+> 1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — **项目技术架构图（系统拓扑/数据/模块/请求生命周期/鉴权/MCP/业务领域/部署/PWA/测试/约定）**。改动任何子系统前必须先读。
+> 2. [`docs/DEV_ENV.md`](docs/DEV_ENV.md) — 记录了当前 dev 环境的部署方式(wdg-systemd 容器)、入口、调试命令和已知坑。错误的部署模型会导致走错方向(例如以为有独立 Dockerfile)。
 
 ## 技术栈
 - **后端**: Flask 3.1.1 + Python 3.10+
@@ -209,11 +211,19 @@ pytest tests/mcp_server/ -v
 | `DAILYCHECK_MCP_TOKEN` | MCP HTTP 模式 Bearer Token |
 
 ## 提交前验证
-1. 测试通过：`pytest`
-2. Lint 检查：`ruff check .`
-3. 关键页面可访问：`/`、`/items`、`/stock-in`、`/stocktake`、`/restock`
-4. 盘点流程可走通
-5. 不提交运行时文件：`.venv/`、`*.db`、`*.log`、截图/PW 调试文件
+1. **必读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** —— 改子系统前先看，确认你对设计的理解与文档一致
+2. 测试通过：`pytest`
+3. Lint 检查：`ruff check .`
+4. 关键页面可访问：`/`、`/items`、`/stock-in`、`/stocktake`、`/restock`
+5. 盘点流程可走通
+6. 不提交运行时文件：`.venv/`、`*.db`、`*.log`、截图/PW 调试文件
+
+## 架构文档同步（铁律）
+- 任何 commit 触及 `blueprints/` / `db/` / `mcp_server/` / `app.py` / `config.py` / `permissions.py` / `templates/` / `static/` / `tests/` / `.github/workflows/` / `deploy/` / `scripts/` 时，**必须**在同一 commit 内更新 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 对应章节。
+- 门禁脚本：`scripts/git-hooks/pre-commit`（已装到 `~/.workbuddy/git-hooks/`）。触及子系统但 `docs/ARCHITECTURE.md` 未在同 commit → **拒绝 commit**。
+- 辅助工具：`python scripts/arch_touched_sections.py` —— 基于 `git diff --cached` 提示本 commit 须更新哪些章节。
+- 维护成本：通常 < 5 分钟/次。**不维护的代价**：下一个开发者必然踩同样的坑。
+- bypass 仅限纯测试/工具内部重构（git commit `--no-verify`）。**禁止把 bypass 当默认值**。
 
 ## 代码规范
 - Python 3.10+ target

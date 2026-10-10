@@ -4,7 +4,12 @@
 - 项目名：`DailyCheck`（轻量库存管理系统）
 - 技术栈：`Flask 3.1.1 + SQLite + Jinja2 + 原生 CSS + PWA`，并内置 `MCP Server`（Starlette + Uvicorn）
 - 目标场景：手机端优先的库存日常操作，覆盖品类管理、库存品管理、入库、出库、盘点、补货申请、生产录入；并通过 MCP 协议向 AI Agent 开放数据访问。
-- 权威文档：`CLAUDE.md`（详尽）、`docs/DEV_ENV.md`（dev 环境）、`docs/mcp-configuration.md`（MCP 配置）。本文件为精简开发指南。
+- 权威文档：
+  - [`CLAUDE.md`](CLAUDE.md)（详尽）
+  - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（**项目技术架构图**，必读）
+  - [`docs/DEV_ENV.md`](docs/DEV_ENV.md)（dev 环境）
+  - [`docs/mcp-configuration.md`](docs/mcp-configuration.md)（MCP 配置）
+  - 本文件（AGENT.md）为精简开发指南
 
 ## 运行方式
 1. 创建并激活虚拟环境
@@ -89,9 +94,11 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 
 ## 提交规范建议
 - 功能提交前至少验证：
+  - **必读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** —— 改动子系统前先看
   - 关键页面可访问（`/`、`/items`、`/stock-in`、`/stocktake`、`/restock`）
   - 盘点流程可走通（开始盘点 → 提交 → 回滚）
   - `pytest` 测试通过、`ruff check .` 无错
+  - **触及架构子系统时同步更新 `docs/ARCHITECTURE.md`**（门禁：`scripts/git-hooks/pre-commit` 自动检测）
 - 不要提交运行时文件：`.venv/`（含 `mcp_server/.venv/`）、`*.db`、`*.log`、截图、Playwright 调试文件（已在 `.gitignore` 覆盖）
 
 ## 后续优化建议

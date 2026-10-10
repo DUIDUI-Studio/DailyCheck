@@ -15,12 +15,23 @@
 # "Git push 必须先确认"). Pick no-args if you only want this repo.
 #
 # Both modes are idempotent. Re-running copies the latest hook
-# script into place. The script itself lives at
-# scripts/git-hooks/pre-push in this repo (or the canonical copy
-# in ~/.workbuddy/git-hooks/).
+# script into place.
+#
+# Hooks shipped in scripts/git-hooks/:
+#   pre-commit  — enforce docs/ARCHITECTURE.md stays in sync with code
+#                 (touches blueprints/ / db/ / mcp_server/ / app.py /
+#                  config.py / permissions.py / tests / CI / deploy /
+#                  templates / static / scripts requires the doc to be
+#                  staged in the same commit). See
+#                  docs/ARCHITECTURE.md §附.
+#   pre-push    — block every push until Eric has explicitly OK'd it
+#                 in the current agent conversation. See
+#                 ~/.workbuddy/MEMORY.md "Git push 必须先确认".
 #
 # Bypass (only after Eric explicitly says yes):
 #     git push --no-verify
+#     git commit --no-verify   ← only for pure test refactors with
+#                                 no architectural impact
 
 set -euo pipefail
 

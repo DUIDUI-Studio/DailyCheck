@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# DailyCheck — pre-commit hook.
+#
+# Enforces: any commit touching the project's architecture subsystems
+# (blueprints / db / mcp_server / app.py / config.py / permissions.py /
+#  tests / CI / deploy / docs/ARCHITECTURE.md itself) MUST also modify
+# docs/ARCHITECTURE.md in the same commit. The intent is to keep the
+# architecture document the single source of truth that tracks the code
+# — every release of the doc is versioned alongside the code it describes.
+#
+# Setup: scripts/install-git-hooks.sh (no args for local, --global for all repos)
+#
+# Bypass (only after explicit intent — e.g. pure test refactor that
+# doesn't change architecture):
+#     git commit --no-verify
+#
+# Heuristic: a file belongs to a "subsystem" iff its path matches one
+# of the patterns below. If at least one subsystem-touched file is
+# staged AND docs/ARCHITECTURE.md is NOT staged, the commit is blocked.
+# The list mirrors the mapping table in docs/ARCHITECTURE.md §附.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+ARCH_DOC="docs/ARCHITECTURE.md"
+
+# Files that belong to architecture subsystems. Patterns are anchored on
+# the repo root (git diff returns repo-relative paths).
+SUBSYSTEM_PATTERNS=(
+    '^app\.py$'
+    '^config\.py$'
+    '^permissions\.py$'
+    '^db/.*\.py$'
+    '^blueprints/.*\.py$'
+    '^mcp_server/.*\.py$'
+    '^templates/'
+    '^static/'
+    '^tests/.*\.py$'
+    '^\.github/workflows/'
+    '^deploy/'
+    '^scripts/'
+)
+
+# Stage list: one path per line, repo-relative.
+STAGED="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+# Quick exit when there's nothing architecture-relevant staged.
+subsystem_hit=0
+arch_hit=0
+touched_paths=()
+
+while IFS= read -r path; do
+    [ -z "$path" ] && continue
+    if [ "$path" = "$ARCH_DOC" ]; then
+        arch_hit=1
+        continue
+    fi
+    for pat in "${SUBSYSTEM_PATTERNS[@]}"; do
+        if [[ "$path" =~ $pat ]]; then
+            subsystem_hit=1
+            touched_paths+=("$path")
+            break
+        fi
+    done
+done <<< "$STAGED"
+
+# Allow commits that touch neither an architecture subsystem nor the doc
+# itself (e.g. pure README/typo fixes outside docs/).
+if [ "$subsystem_hit" -eq 0 ]; then
+    exit 0
+fi
+
+if [ "$arch_hit" -eq 1 ]; then
+    # Doc was updated alongside the change — pass.
+    exit 0
+fi
+
+cat <<EOF
+
+═══════════════════════════════════════════════════════════════════════
+  PRE-COMMIT HOOK: blocked — architecture document out of date.
+═══════════════════════════════════════════════════════════════════════
+
+  $ARCH_DOC must be updated in the same commit when touching
+  any architecture subsystem. This is the rule Eric set for keeping
+  the doc a single source of truth (see docs/ARCHITECTURE.md §附).
+
+  Staged files that triggered this gate:
+$(printf '    - %s\n' "${touched_paths[@]}")
+
+  → Run  python scripts/arch_touched_sections.py  to see which
+    sections of the doc correspond to your changes.
+  → Update $ARCH_DOC alongside this commit (typical cost: < 5 min).
+  → Re-stage it:  git add $ARCH_DOC
+  → Then  git commit  again.
+
+  Bypass only when your change is purely internal to a subsystem
+  (e.g. test refactor with no architectural impact). NEVER bypass by
+  reflex — bypass means the doc drifts. Use:
+        git commit --no-verify
+
+═══════════════════════════════════════════════════════════════════════
+
+EOF
+exit 1
