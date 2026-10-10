@@ -51,6 +51,18 @@
     <span>barcode (P0 不下发)</span>
     <input name="barcode" value="{{ canonical['barcode'] or '' if canonical else '' }}" />
   </label>
+  <label>
+    <span>销售单价 (¥) — 收归主数据，扇出下发</span>
+    <input name="selling_price" type="number" min="0" step="0.001"
+           placeholder="留空 = 未定价（不下发）"
+           value="{{ canonical['selling_price'] if canonical and canonical['selling_price'] is not none else '' }}" />
+  </label>
+  <label>
+    <span>进货单价 (¥) — 收归主数据，扇出下发</span>
+    <input name="unit_cost" type="number" min="0" step="0.001"
+           placeholder="留空 = 未定价（不下发）"
+           value="{{ canonical['unit_cost'] if canonical and canonical['unit_cost'] is not none else '' }}" />
+  </label>
   <div class="form-actions">
     <button type="submit" class="btn">保存</button>
     <a class="btn-link" href="{{ url_for('canonical.canonical_list') }}">取消</a>

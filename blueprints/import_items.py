@@ -134,7 +134,9 @@ def upload_parse():
 @require_login
 @require_role("admin")
 def preview():
-    """渲染预览页。"""
+    """渲染预览页。逐行标注是否已匹配到本仓现有品项（未匹配不会写入）。"""
+    from config import BASE_DIR
+
     pv = session.get("import_preview")
     if not pv:
         flash("预览已过期,请重新上传")
@@ -142,15 +144,35 @@ def preview():
 
     master = get_master_db()
     wh = master.execute(
-        "SELECT name FROM warehouses WHERE code = ?", (pv["warehouse_code"],)
+        "SELECT name, db_path FROM warehouses WHERE code = ?", (pv["warehouse_code"],)
     ).fetchone()
     target_wh_name = wh["name"] if wh else pv["warehouse_code"]
 
+    matched_keys: set[tuple[str, str]] = set()
+    if wh is not None and wh["db_path"]:
+        wh_path = Path(BASE_DIR) / wh["db_path"]
+        if wh_path.exists():
+            with closing(sqlite3.connect(wh_path)) as conn:
+                matched_keys = {
+                    (r[0], r[1]) for r in conn.execute(
+                        """SELECT c.name, i.name
+                           FROM items i JOIN categories c ON c.id = i.category_id"""
+                    ).fetchall()
+                }
+
     total_rows = sum(len(v) for v in pv["groups_rows"].values())
+    matched_rows = sum(
+        1
+        for cat_name, rows in pv["groups_rows"].items()
+        for item in rows
+        if (cat_name, item["name"]) in matched_keys
+    )
     return render_template(
         "admin/import_items_preview.html",
         target_wh_name=target_wh_name,
         total_rows=total_rows,
+        matched_keys=matched_keys,
+        matched_rows=matched_rows,
         **pv,
     )
 
@@ -159,8 +181,20 @@ def preview():
 @require_login
 @require_role("admin")
 def commit():
-    """事务化:DELETE 预览分组下 items + INSERT 预览数据,缺品类则拒绝。"""
-    from blueprints._helpers import gen_sku, now
+    """非破坏性批量更新：只更新「本仓已存在品项」的进货单价。
+
+    P0-3（docs/2026-10-09-item-master-unify-plan.md §3）：
+      - 废除旧的 DELETE + INSERT 整表替换——旧实现会连库存流水 / 出入库记录
+        一起删掉，且绕过全部主数据策略检查；
+      - 本入口不再新建品项、不再新建品类：新品项必须先在「品项主数据」建档
+        并扇出，未匹配的行一律跳过并回报；
+      - 安全库存由系统按消耗计算（P0-12），本入口不写。
+    P0-9（2026-10-09）：价格收归主数据 —— 已纳管行（canonical_id 非空）的进货价
+      改写 canonical_items.unit_cost（随后需扇出下发），不再直写门店行；
+      未纳管的门店自建行仍写本仓 items.unit_cost。
+    匹配键：(品类名, 品项名) —— 与 xlsx 的两列一一对应。
+    """
+    from blueprints._helpers import now
     from config import BASE_DIR
 
     pv = session.pop("import_preview", None)
@@ -172,7 +206,6 @@ def commit():
     warehouse_code = g.warehouse["code"]
     groups_order = pv["groups_order"]
 
-    # 1. 校验仓库存在
     master = get_master_db()
     wh_row = master.execute(
         "SELECT db_path, name FROM warehouses WHERE code = ?", (warehouse_code,)
@@ -183,82 +216,77 @@ def commit():
 
     db_path = Path(BASE_DIR) / wh_row["db_path"]
 
-    # 3. 事务化:创建缺失分类 + DELETE 子表 + DELETE items + INSERT
-    inserted = 0
-    created_cats: list[str] = []
+    from blueprints import canonical_pure as cp
+    price_managed = cp.is_syncable_field("unit_cost")
+
+    updated = 0            # 未纳管行：写本仓 items.unit_cost
+    updated_canonical = 0  # 已纳管行：写主数据 canonical_items.unit_cost
+    skipped: list[str] = []
+    canon_updates: dict[int, float] = {}
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             ts = now()
-            # 3a. 自动创建缺失的分组分类(同事务,保证原子性)
-            existing_cats = {
-                r["name"] for r in conn.execute("SELECT name FROM categories").fetchall()
+            index = {
+                (r["category_name"], r["name"]): (int(r["id"]), r["canonical_id"])
+                for r in conn.execute(
+                    """SELECT i.id, i.name, i.canonical_id, c.name AS category_name
+                       FROM items i JOIN categories c ON c.id = i.category_id"""
+                ).fetchall()
             }
             for cat_name in groups_order:
-                if cat_name not in existing_cats:
-                    conn.execute(
-                        "INSERT INTO categories (name, description, created_at) "
-                        "VALUES (?, ?, ?)",
-                        (cat_name, "导入自动创建", ts),
-                    )
-                    created_cats.append(cat_name)
-            placeholders = ",".join("?" for _ in groups_order)
-            # 子查询:本次导入分组下的所有 item_id
-            items_subq = (
-                f"item_id IN (SELECT id FROM items WHERE category_id IN "
-                f"(SELECT id FROM categories WHERE name IN ({placeholders})))"
-            )
-            # 3b. 先清掉引用这些 item 的子行,避免 FK 约束阻止 DELETE items
-            for table in [
-                "stock_movements",
-                "stocktakes",
-                "restock_requests",
-                "outbound_requests",
-                "adjustment_requests",
-                "product_bom",
-                "production_run_items",
-            ]:
-                # Literal list, never user input — guard anyway (see users.py).
-                if not table.isidentifier():
-                    raise ValueError(f"unexpected table name: {table!r}")
-                conn.execute(f"DELETE FROM {table} WHERE {items_subq}", groups_order)
-            # 3c. 现在可以安全删 items
-            conn.execute(
-                f"DELETE FROM items WHERE category_id IN "
-                f"(SELECT id FROM categories WHERE name IN ({placeholders}))",
-                groups_order,
-            )
-            cat_by_name = {
-                r["name"]: r["id"]
-                for r in conn.execute("SELECT id, name FROM categories").fetchall()
-            }
-            for cat_name in groups_order:
-                cid = cat_by_name[cat_name]
                 for item in pv["groups_rows"][cat_name]:
+                    hit = index.get((cat_name, item["name"]))
+                    if hit is None:
+                        skipped.append(f"{cat_name}/{item['name']}")
+                        continue
+                    item_id, canonical_id = hit
+                    # P0-9：已纳管行价格收归主数据 → 写 canonical_items（稍后扇出）。
+                    if price_managed and canonical_id is not None:
+                        canon_updates[int(canonical_id)] = float(item["unit_cost"])
+                        updated_canonical += 1
+                        continue
                     conn.execute(
-                        """INSERT INTO items
-                           (sku, name, category_id, quantity, safety_stock,
-                            unit_cost, unit, gram_per_unit, updated_at)
-                           VALUES (?, ?, ?, 0, 0, ?, ?, 0, ?)""",
-                        (gen_sku(), item["name"], cid,
-                         item["unit_cost"], item["unit"], ts),
+                        "UPDATE items SET unit_cost=?, updated_at=? WHERE id=?",
+                        (float(item["unit_cost"]), ts, item_id),
                     )
-                    inserted += 1
+                    updated += 1
             conn.commit()
-    except sqlite3.IntegrityError:
+    except sqlite3.Error:
+        current_app.logger.exception("批量导入写库失败")
         flash("导入失败,请重试")
         return redirect(url_for("import_items.upload_form"))
+
+    # 已纳管行的价写入主数据（master.db），随后由管理员扇出下发到门店。
+    if canon_updates:
+        ts2 = now()
+        for cid, cost in canon_updates.items():
+            master.execute(
+                "UPDATE canonical_items SET unit_cost=?, updated_at=? WHERE id=?",
+                (cost, ts2, cid),
+            )
+        master.commit()
 
     # 4. audit
     from blueprints.auth import audit
     audit("import_items.import", "warehouse", warehouse_code, {
-        "count": inserted,
+        "updated": updated,
+        "updated_canonical": updated_canonical,
+        "skipped": len(skipped),
         "filename": pv.get("filename"),
-        "created_categories": created_cats,
     })
-    msg = f"导入成功:{inserted} 条品项"
-    if created_cats:
-        msg += f"(自动创建分类:{', '.join(created_cats)})"
-    flash(msg)
+    if updated:
+        flash(f"已更新 {updated} 条本仓自建品项的进货单价")
+    if updated_canonical:
+        flash(
+            f"{updated_canonical} 条已纳管品项的进货价已写入「品项主数据」；"
+            f"请到主数据页扇出下发到门店"
+        )
+    if skipped:
+        preview_txt = "；".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")
+        flash(
+            f"{len(skipped)} 条未匹配本仓现有品项，已跳过（新品项请先在"
+            f"「品项主数据」建档后扇出）：{preview_txt}"
+        )
     return redirect(url_for("items.items_list"))

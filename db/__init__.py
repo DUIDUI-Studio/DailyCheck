@@ -920,7 +920,9 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 # already equals it skips the whole migration, so the per-request call
 # degrades to a single PRAGMA read (previously every request replayed the
 # full executescript AND ran an unconditional UPDATE over items).
-WAREHOUSE_SCHEMA_VERSION = 1
+#   v1 → canonical 列（canonical_id / is_alias / canonical_status / ...）
+#   v2 → items.is_active（方案 P0-10 单仓品项启停，2026-10-09）
+WAREHOUSE_SCHEMA_VERSION = 2
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
@@ -1004,6 +1006,13 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if "price_follow_canonical" not in item_cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN price_follow_canonical INTEGER NOT NULL DEFAULT 0"
+            )
+        # v2（方案 P0-10，2026-10-09）：单仓品项启停开关。
+        # 属「本仓字段」—— 扇出永不覆盖；停用行从出库/入库/生产/盘点/调整/
+        # 订货等选择点排除，历史记录与库存全保留。
+        if "is_active" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
             )
         # Index for canonical_id lookups (used by fanout engine + claim verification)
         conn.execute(

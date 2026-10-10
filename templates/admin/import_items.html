@@ -2,7 +2,11 @@
 {% block title %}品项批量导入{% endblock %}
 {% block content %}
 <h2>品项批量导入</h2>
-<p class="muted">仅管理员可操作;目标仓库的分类必须已存在。</p>
+<p class="muted">
+  仅管理员可操作。本入口<b>只更新本仓已有品项的「进货单价」</b>（按「品类 + 物料名称」匹配），
+  不会新增或删除任何品项，也不改动安全库存（该值由系统按消耗自动计算）。
+  新品项请先在「品项主数据」建档并扇出，再回到本页批量更新单价。
+</p>
 
 <form method="post" enctype="multipart/form-data" class="grid cols-2">
   <label>

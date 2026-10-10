@@ -49,3 +49,7 @@ node_modules/
 # Forecast scheduler debug output (run-time counter of fcntl lock failures,
 # regenerated on every forecast tick — never source).
 forecast_lock_failures.txt
+
+# pytest 临时 basetemp（本地沙箱下 /private/var 不可写时的替代目录，
+# 用 `pytest --basetemp=.pytest_tmp` 生成；绝不入库）
+.pytest_tmp/

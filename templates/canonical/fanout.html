@@ -13,9 +13,10 @@
     <span>选择主数据项（多选）</span>
     <select name="canonical_ids" multiple size="10" required>
       {% for it in items %}
-      <option value="{{ it['id'] }}">{{ it['canonical_sku'] }} — {{ it['name'] }} ({{ it['unit'] }})</option>
+      <option value="{{ it['id'] }}" {% if it['id'] in preselect_ids %}selected{% endif %}>{{ it['canonical_sku'] }} — {{ it['name'] }} ({{ it['unit'] }})</option>
       {% endfor %}
     </select>
+    {% if preselect_ids %}<small>已预选 {{ preselect_ids|length }} 项（来自批量修改）</small>{% endif %}
   </label>
   {% else %}
   <input type="hidden" name="canonical_ids" value="{{ selected['id'] }}" />
@@ -53,10 +54,7 @@
     </label>
   </fieldset>
 
-  <label class="checkbox-row">
-    <input type="checkbox" name="dry_run" checked />
-    dry_run（只算不写，先看效果）
-  </label>
+  <p class="muted">提交后<strong>立即写入</strong>目标仓（无预演、不可撤销），执行结果见「扇出事件」页。</p>
 
   <label>
     <span>summary（可选）</span>

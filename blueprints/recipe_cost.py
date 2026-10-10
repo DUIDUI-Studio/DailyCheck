@@ -954,13 +954,42 @@ def recipe_bom_export_csv(recipe_id: int):
 # Publish recipes to storefronts (cross-warehouse)
 # ---------------------------------------------------------------------------
 
+def _resolve_target_item_id(target_conn, line: dict) -> int:
+    """P0-4 —— 在目标仓定位 BOM 行对应的 items.id。
+
+    身份键优先级与 apply_item_to_warehouse 一致：canonical_id 优先，
+    sku 兜底（门店行可能是别名/旧 sku）。
+    """
+    canonical_id = line.get("canonical_id")
+    if canonical_id:
+        row = target_conn.execute(
+            "SELECT id FROM items WHERE canonical_id = ?", (int(canonical_id),)
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+    row = target_conn.execute(
+        "SELECT id FROM items WHERE sku = ?", (line["sku"],)
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"BOM 品项 {line['sku']}（{line.get('item_name') or ''}）"
+            f"在目标仓未能定位"
+        )
+    return int(row["id"])
+
+
 def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot: dict) -> None:
     """Open target warehouse db and replay the snapshot in.
 
     Steps:
       1. Ensure source category exists in target (idempotent INSERT).
-      2. Upsert each item in the BOM by sku (overwrite semantics).
+      2. Ensure each BOM item exists in the target: canonical_id 优先匹配，
+         缺失才 INSERT（action="keep"）；**已存在的行一个字段都不覆盖**
+         —— P0-4 起配方发布不再直写门店主数据字段或价格。
       3. Insert a NEW ic_recipe / recipe row + BOM lines.
+
+    前置：调用方（_handle_recipe_publish）已用 list_unmanaged_bom_items()
+    校验过 BOM 品项全部已纳管主数据。
 
     Each insert is in its own transaction; the whole apply is wrapped
     in `with sqlite3.connect(...)` so it's atomic per warehouse.
@@ -1002,7 +1031,11 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
         tc.execute("PRAGMA foreign_keys = ON")
         ts = now()
 
-        # Upsert items first so the BOM can reference them.
+        # Ensure items exist first so the BOM can reference them.
+        # P0-4（docs/2026-10-09-item-master-unify-plan.md §3）：配方发布
+        # 只负责「确保品项在本仓存在」，不再覆盖门店已存在行的任何字段
+        # （action="keep"）—— 名称/单位/克重属于主数据，价格属于本仓，
+        # 两者都不该由一次配方发布改写。
         # Skip polymorphic ic_recipe lines — they reference another ic_recipe,
         # not an item, so there's nothing to insert into the items table.
         sku_to_new_id: dict[str, int] = {}
@@ -1020,11 +1053,12 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
                 "aux_unit": None,
                 "aux_rate": 0,
                 "safety_stock": 0,
+                # P0-4：把主数据身份带过去，目标仓按 canonical_id 优先匹配，
+                # 避免同物因 sku 不同而在门店重复建行（通道身份键统一）。
+                "canonical_id": ln.get("canonical_id"),
             }
-            apply_item_to_warehouse(tc, snap_item, action="overwrite")
-            sku_to_new_id[ln["sku"]] = int(tc.execute(
-                "SELECT id FROM items WHERE sku = ?", (ln["sku"],)
-            ).fetchone()["id"])
+            apply_item_to_warehouse(tc, snap_item, action="keep")
+            sku_to_new_id[ln["sku"]] = _resolve_target_item_id(tc, ln)
 
         # Insert the recipe. output_unit is hard-coded 'g' in the
         # source (CostReview convention). We DO overwrite on publish —
@@ -1106,7 +1140,27 @@ def _handle_recipe_publish(recipe_type: str, recipe_id: int):
             else "recipe_cost.recipes_list"
         ))
 
-    # 3. Find the current draft version (or warn).
+    # 3. P0-4 —— BOM 纳管校验：品项未纳入主数据则拒绝发布。
+    #    依据 docs/2026-10-09-item-master-unify-plan.md §3 P0-4。
+    from blueprints.publish_recipe_pure import list_unmanaged_bom_items
+    unmanaged = list_unmanaged_bom_items(wh_db, recipe_type, recipe_id)
+    if unmanaged:
+        names = "；".join(
+            f"{r['name'] or r['sku']}（{r['category_name'] or '无品类'}）"
+            for r in unmanaged[:5]
+        )
+        more = f" 等 {len(unmanaged)} 项" if len(unmanaged) > 5 else ""
+        flash(
+            f"发布已拒绝：BOM 中有 {len(unmanaged)} 个品项尚未纳入品项主数据"
+            f"（{names}{more}）。请先在「品项主数据」建档并扇出到本仓，"
+            f"或在「未纳管」页认领后再发布。"
+        )
+        return redirect(request.referrer or url_for(
+            "recipe_cost.ic_recipes_list" if recipe_type == "ic_recipe"
+            else "recipe_cost.recipes_list"
+        ))
+
+    # 3b. Find the current draft version (or warn).
     with closing(_sq.connect(MASTER_DB)) as master_conn:
         master_conn.execute("PRAGMA foreign_keys = ON")
         master_conn.row_factory = _sq.Row

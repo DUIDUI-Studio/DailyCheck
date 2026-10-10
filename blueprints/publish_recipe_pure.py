@@ -81,6 +81,7 @@ def snapshot_recipe(conn, recipe_type: str, recipe_id: int) -> dict:
         SELECT {select_cols},
                i.sku, i.name AS item_name, i.unit AS item_unit,
                i.gram_per_unit, i.unit_cost, i.selling_price,
+               i.canonical_id,
                i.category_id, c.name AS category_name
         FROM {bom_table} t
         LEFT JOIN items i ON i.id = t.item_id
@@ -100,6 +101,36 @@ def snapshot_recipe(conn, recipe_type: str, recipe_id: int) -> dict:
         # always uses source_type='item' implicitly.
         "has_polymorphic_lines": any("source_type" in r.keys() for r in lines),
     })
+
+
+def list_unmanaged_bom_items(conn, recipe_type: str, recipe_id: int) -> list[dict]:
+    """P0-4 —— 列出某配方 BOM 中「未纳管主数据」的品项行。
+
+    未纳管 = items.canonical_id IS NULL，或 BOM 指向的 item 已不存在（悬空引用）。
+    多态 recipe 的行若 source_type='ic_recipe' 引用的是另一张配方而非品项，
+    不参与主数据校验。
+
+    依据 docs/2026-10-09-item-master-unify-plan.md §3 P0-4：
+    配方发布前必须校验 BOM 品项全部已纳管，未纳管则拒绝发布。
+    """
+    if recipe_type not in RECIPE_TYPES:
+        raise ValueError(f"unknown recipe_type: {recipe_type!r}")
+    conn.row_factory = sqlite3.Row
+    bom_table = "ic_recipe_items" if recipe_type == "ic_recipe" else "recipe_items"
+    bom_id_col = "ic_recipe_id" if recipe_type == "ic_recipe" else "recipe_id"
+    extra = " AND t.source_type = 'item'" if recipe_type == "recipe" else ""
+    rows = conn.execute(
+        f"""SELECT t.id AS line_id, i.sku, i.name, i.unit, i.canonical_id,
+                   c.name AS category_name
+            FROM {bom_table} t
+            LEFT JOIN items i ON i.id = t.item_id
+            LEFT JOIN categories c ON c.id = i.category_id
+            WHERE t.{bom_id_col} = ?{extra}
+              AND (i.id IS NULL OR i.canonical_id IS NULL)
+            ORDER BY t.id""",
+        (recipe_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def _next_version(conn, recipe_type: str, recipe_id: int) -> int:
@@ -359,7 +390,8 @@ def apply_item_to_warehouse(
                    WRITE fields (per Spec §2.2 + §7.2):
                      - INSERT: 写 name/category/unit/gram_per_unit/aux_unit/aux_rate/safety_stock
                      - OVERWRITE: 写 name/category/unit/gram_per_unit/aux_unit/aux_rate
-                       **不写** unit_cost/selling_price/safety_stock(Q4=freeze + Q6=storefront_autonomous)
+                       **不写** unit_cost/selling_price/safety_stock
+                       （Q4=freeze；P0-9 起价格收归主数据，配方发布非价格通道）
     - 'keep':      if item exists, do nothing. else INSERT.
     - 'merge':     UPDATE non-null snapshot fields on existing item,
                    else INSERT.
@@ -401,19 +433,21 @@ def apply_item_to_warehouse(
         ).fetchone()
 
     if existing is None:
+        # P0-9（2026-10-09）：价格收归主数据 —— 配方发布不是价格通道，
+        # INSERT 新行时**不写** unit_cost/selling_price（走 items 默认 0），
+        # 价格由 canonical 扇出统一下发。空值守卫保证主数据未定价时不误清。
         target_conn.execute(
             """INSERT INTO items
                (sku, name, category_id, quantity, safety_stock,
-                unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
-                selling_price, updated_at, canonical_id)
-               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                unit, gram_per_unit, aux_unit, aux_rate,
+                updated_at, canonical_id)
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 sku, source_snapshot["name"], cat_id,
                 float(source_snapshot["safety_stock"] or 0),
-                source_snapshot["unit"], float(source_snapshot["unit_cost"] or 0),
+                source_snapshot["unit"],
                 float(source_snapshot["gram_per_unit"] or 0),
                 source_snapshot["aux_unit"], float(source_snapshot["aux_rate"] or 0),
-                float(source_snapshot["selling_price"] or 0),
                 now_str(),
                 canonical_id,
             ),

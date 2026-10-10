@@ -5,21 +5,32 @@
 <p class="muted">文件:{{ filename }}</p>
 
 <p class="muted">
-  共 {{ total_rows }} 行 · {{ groups_order|length }} 个分组
+  共 {{ total_rows }} 行 · 已匹配 {{ matched_rows }} 行 · 未匹配 {{ total_rows - matched_rows }} 行
   {% if problems %} · <span class="warn">{{ problems|length }} 个数据问题</span>{% endif %}
+</p>
+<p class="hint">
+  只有<b>已匹配</b>的行会被写入（更新该品项的进货单价）。未匹配的行将被跳过 ——
+  新品项须先在「品项主数据」建档并扇出到本仓。
 </p>
 
 {% for cat_name in groups_order %}
 <details {% if loop.first %}open{% endif %}>
   <summary>{{ cat_name }} ({{ groups_rows[cat_name]|length }} 行)</summary>
   <table>
-    <tr><th>物料名称</th><th>规格</th><th>单位</th>{% if is_rd %}<th>单价(¥)</th>{% endif %}</tr>
+    <tr><th>物料名称</th><th>规格</th><th>单位</th><th>单价(¥)</th><th>匹配</th></tr>
     {% for item in groups_rows[cat_name] %}
     <tr>
       <td>{{ item.name }}</td>
       <td>{{ item.spec or '—' }}</td>
       <td>{{ item.unit }}</td>
-      {% if is_rd %}<td>{{ "%.3f"|format(item.unit_cost) }}</td>{% endif %}
+      <td>{{ "%.3f"|format(item.unit_cost) }}</td>
+      <td>
+        {% if (cat_name, item.name) in matched_keys %}
+          <span class="badge-ok">已匹配</span>
+        {% else %}
+          <span class="badge-warn">未匹配（跳过）</span>
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </table>
@@ -34,11 +45,11 @@
 {% endif %}
 
 <form method="post" action="{{ url_for('import_items.commit') }}"
-      onsubmit="return confirm('确认导入 {{ total_rows }} 条品项到 {{ target_wh_name }}?\n该仓库以上分类下的现有品项将被全部删除。');">
+      onsubmit="return confirm('确认导入到 {{ target_wh_name }}?\n将更新 {{ matched_rows }} 条已有品项的进货单价；未匹配的 {{ total_rows - matched_rows }} 条会被跳过。\n不会新增或删除任何品项。');">
   <div class="form-actions">
     <a href="{{ url_for('items.items_list') }}" class="btn-sm">取消</a>
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">返回修改</a>
-    <button type="submit" class="btn-danger">⚠️ 确认导入</button>
+    <button type="submit" class="btn-primary">确认导入（更新 {{ matched_rows }} 条）</button>
   </div>
 </form>
 {% endblock %}

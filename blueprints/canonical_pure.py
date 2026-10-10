@@ -88,7 +88,7 @@ Public surface (this file):
                                  category_id_map=None) -> dict
     fanout_canonical_items(master_conn, wh_db_map, *, canonical_ids,
                            warehouse_codes, action='overwrite',
-                           force=False, dry_run=False, started_by=None,
+                           force=False, started_by=None,
                            summary=None) -> dict
     resolve_conflict(master_conn, *, conflict_id, decision,
                      reviewed_by, note=None) -> dict
@@ -151,26 +151,33 @@ from config import (
 #  the constants and call is_syncable_field() — they do not have their
 #  own whitelists.
 #
-#  Q6 note (Spec §1.5): when q6_price_ownership == "canonical_managed",
-#  the two commented lines for "selling_price" and "unit_cost" are
-#  inserted into CANONICAL_FIELD_POLICY, and the same two names are
-#  removed from NEVER_TOUCH_COLUMNS / STOREFRONT_OWNED_FIELDS.
-#  is_syncable_field() is the only place that reads CANONICAL_FIELD_POLICY,
-#  so the rest of the codebase follows automatically.
+#  Q6 拍板（2026-10-09）：价格收归主数据。
+#  开关仍是唯一实现落点 —— 当 q6_price_ownership == "canonical_managed"：
+#    ① CANONICAL_FIELD_POLICY 追加 selling_price / unit_cost（可下发）；
+#    ② 同名两列从 NEVER_TOUCH_COLUMNS 移除；
+#    ③ 同名两列从 STOREFRONT_OWNED_FIELDS 移除（门店不再自治）。
+#  is_syncable_field() 是唯一读 CANONICAL_FIELD_POLICY 的地方，
+#  其余代码路径自动跟随，别处不许再写 if q6。
 # ─────────────────────────────────────────────────────────────────────
 
+# 价格两列：是否收归主数据完全由 Q6 开关决定。
+_PRICE_FIELDS: tuple[str, ...] = ("selling_price", "unit_cost")
+_PRICE_IS_CANONICAL_MANAGED: bool = (
+    CANONICAL_POLICY.get("q6_price_ownership") == "canonical_managed"
+)
+
 # 铁律：任何 action、任何分支（含 force）都不得出现在任何 UPDATE 的 SET 列表里。
-# ⚠️ selling_price / unit_cost 是否在此列表内取决于 Q6（§1.5）。
 NEVER_TOUCH_COLUMNS: tuple[str, ...] = (
     "id",
     "sku",
     "quantity",
     "safety_stock",
     "initial_quantity",
-    "selling_price",
-    "unit_cost",
     "category_id",
-)
+    # 本仓运营开关：DC 可订 / 单仓启停 —— 都不随主数据下发（P0-10）。
+    "is_orderable",
+    "is_active",
+) + (() if _PRICE_IS_CANONICAL_MANAGED else _PRICE_FIELDS)
 
 # 可下发字段：主数据字段名 -> (策略, 目标列名)
 #   策略取值:
@@ -186,22 +193,27 @@ CANONICAL_FIELD_POLICY: dict[str, tuple[str, str | None]] = {
     "status":         ("overwritable", "__canonical_status__"),  # 写 items.canonical_status
     "category_code":  ("mapping_only", None),                     # 只改 categories.canonical_code
     "barcode":        ("not_synced",   None),                     # P0 不下发（§2.2）
-    # ★ Q6=canonical_managed 时追加下面两行；Q6=storefront_autonomous 时不存在。
-    # 见 §1.5 —— 这是 Q6 的唯一实现落点，别处不许再写 if。
-    # "selling_price": ("overwritable", "selling_price"),
-    # "unit_cost":     ("overwritable", "unit_cost"),
 }
+# ★ Q6=canonical_managed 时价格进入可下发集（见 §1.5，唯一落点）。
+if _PRICE_IS_CANONICAL_MANAGED:
+    CANONICAL_FIELD_POLICY["selling_price"] = ("overwritable", "selling_price")
+    CANONICAL_FIELD_POLICY["unit_cost"] = ("overwritable", "unit_cost")
 
 # 门店自治字段：Q2=open 拍板后即为最终集合。
 # Q6=canonical_managed 时降为 4 项（售价/采购价升为「可下发」）。
 STOREFRONT_OWNED_FIELDS: tuple[str, ...] = (
     "local_alias",        # = items.name (当 is_alias=1 时)
     "category_id",
-    "selling_price",      # 门店售价；Q6=canonical_managed 时移出本集合
-    "unit_cost",          # 门店采购价；Q6=canonical_managed 时移出本集合
+    *(() if _PRICE_IS_CANONICAL_MANAGED else _PRICE_FIELDS),
     "safety_stock",
     "item_note",          # 门店备注
 )
+
+# 下发给门店 items 时的字段顺序（保持稳定 → canonical_synced_json 键序稳定）。
+# 价格两列仅在 Q6=canonical_managed 时存在（is_syncable_field 过滤）。
+SYNCABLE_ITEM_FIELDS: tuple[str, ...] = (
+    "name", "unit", "gram_per_unit", "aux_unit", "aux_rate",
+) + (_PRICE_FIELDS if _PRICE_IS_CANONICAL_MANAGED else ())
 
 
 # Q7 §7.7.2 措施③ 第1层：SQL 生成器只允许 update 这几张表的 items 业务字段，
@@ -210,6 +222,35 @@ ALLOWED_TABLES: tuple[str, ...] = ("items", "categories")
 # WHERE 子句只允许用主键/业务键：写错/漏写都直接抛 TypeError，
 # 这是 R5（漏 WHERE 全仓清空）的唯一防线（§7.7.2 措施③ 第1层）。
 ALLOWED_WHERE_COLUMNS: tuple[str, ...] = ("id", "sku", "canonical_id")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  门店侧可见性谓词（2026-10-10 · owner 拍板「全公司停用 → 门店列表直接隐藏」）
+# ─────────────────────────────────────────────────────────────────────
+# 主数据「全公司停用」(canonical_items.status='disabled') 经扇出落到门店行
+# items.canonical_status='disabled'。该类品项在门店侧：
+#   · 从列表隐藏（品类与品项 / 库存）
+#   · 从业务选择点排除（出库 / 入库 / 生产 / 盘点 / 调整）
+# 与 P0-10 单仓启停(items.is_active) 相互独立 —— 任一为停用即不可见 / 不可选。
+# ★ 未纳管行 canonical_status IS NULL → COALESCE 成 '' → 不等于 'disabled'
+#   → 保留可见（门店自建行不受影响）。
+# ★ 订货目录不在此列：store_ordering_pure.list_available_dc_items 已按
+#   canonical_items.status='active' 过滤，无需重复。
+CANONICAL_DISABLED: str = "disabled"
+
+
+def _not_disabled(alias: str = "i") -> str:
+    return f"COALESCE({alias}.canonical_status, '') <> '{CANONICAL_DISABLED}'"
+
+
+def store_visible_clause(alias: str = "i") -> str:
+    """门店列表可见性谓词：排除主数据已停用项（供 WHERE 拼接）。"""
+    return _not_disabled(alias)
+
+
+def store_selectable_clause(alias: str = "i") -> str:
+    """门店业务选择点谓词：本仓启用 且 未被主数据停用。"""
+    return f"COALESCE({alias}.is_active, 1) = 1 AND {_not_disabled(alias)}"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -764,6 +805,8 @@ def create_canonical_item(
     status: str = "active",
     created_from: str = "rd_manual",
     created_by: int | None = None,
+    selling_price: float | None = None,
+    unit_cost: float | None = None,
 ) -> dict:
     """T4 —— 在 master 侧创建 canonical_items 行。
 
@@ -789,11 +832,13 @@ def create_canonical_item(
             """INSERT INTO canonical_items
                (canonical_sku, name, category_code, unit, gram_per_unit,
                 aux_unit, aux_rate, barcode, status, created_from,
-                created_by, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_by, created_at, updated_at,
+                selling_price, unit_cost)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (placeholder, name, category_code, unit, gram_per_unit,
              aux_unit, aux_rate, barcode, status, created_from,
-             created_by, ts, ts),
+             created_by, ts, ts,
+             selling_price, unit_cost),
         )
         new_id = int(cur.lastrowid)
         final_sku = f"IC-{new_id:06d}"
@@ -821,6 +866,8 @@ def create_canonical_item(
         "created_by": created_by,
         "created_at": ts,
         "updated_at": ts,
+        "selling_price": selling_price,
+        "unit_cost": unit_cost,
     }
 
 
@@ -832,11 +879,12 @@ def update_canonical_item(
     """T4 —— 更新 canonical_items。
 
     允许的字段:name / unit / gram_per_unit / aux_unit / aux_rate /
-              category_code / barcode / status。
+              category_code / barcode / status
+              （Q6=canonical_managed 时另有 selling_price / unit_cost）。
     **绝不能** 改 id / canonical_sku / created_from / created_by / created_at。
 
     Raises:
-        ValueError: 字段不允许
+        ValueError: 字段不允许 / 价格非法
         DeactivateOnlyViolation: status='deleted'
     """
     master_conn.row_factory = sqlite3.Row
@@ -844,9 +892,27 @@ def update_canonical_item(
         "name", "unit", "gram_per_unit", "aux_unit", "aux_rate",
         "category_code", "barcode", "status",
     }
+    if _PRICE_IS_CANONICAL_MANAGED:
+        allowed |= set(_PRICE_FIELDS)
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"字段 {sorted(bad)} 不可更新")
+
+    # 价格归一化：空串/None → NULL（= 主数据未定价，扇出时不下发）；
+    # 数字必须非负。Q6=canonical_managed 才有这两个字段。
+    for pf in _PRICE_FIELDS:
+        if pf in fields and _PRICE_IS_CANONICAL_MANAGED:
+            raw = fields[pf]
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                fields[pf] = None
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"{pf} 必须为数字") from None
+            if val < 0:
+                raise ValueError(f"{pf} 不能为负数")
+            fields[pf] = val
 
     # status 合法性（Q3=deactivate_only）
     if "status" in fields:
@@ -873,6 +939,111 @@ def update_canonical_item(
         raise ValueError(f"canonical_id={canonical_id} 不存在")
     master_conn.commit()
     return get_canonical_item_detail(master_conn, canonical_id)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  P0-11 —— 主数据批量统一修改
+#
+#  方案：docs/2026-10-09-item-master-unify-plan.md §3 P0-11
+#  原则：批量与单条走同一个 update_canonical_item()，绝不另开写路径；
+#        字段白名单、aux_unit/gram_per_unit 派生关系都在那一处强制。
+#  Q6=canonical_managed（2026-10-09 拍板）后，价格（成本/售价）也纳入批量。
+# ─────────────────────────────────────────────────────────────────────
+
+BATCH_EDITABLE_FIELDS: tuple[str, ...] = (
+    "category_code",   # 品类
+    "unit",            # 单位
+    "gram_per_unit",   # 克重
+    "aux_unit",        # 辅单位
+    "aux_rate",        # 辅单位换算率
+) + (_PRICE_FIELDS if _PRICE_IS_CANONICAL_MANAGED else ())
+
+BATCH_FIELD_LABELS: dict[str, str] = {
+    "category_code": "品类",
+    "unit": "单位",
+    "gram_per_unit": "克重",
+    "aux_unit": "辅单位",
+    "aux_rate": "辅单位换算率",
+    "selling_price": "销售单价",
+    "unit_cost": "进货单价",
+}
+
+
+def coerce_batch_value(field: str, raw: Any) -> Any:
+    """P0-11 —— 表单原始值 → 批量修改值（空串转 None，数字字段转 float）。
+
+    价格字段：留空 = 清空为 NULL（主数据未定价，扇出不下发）。
+    """
+    if field not in BATCH_EDITABLE_FIELDS:
+        raise ValueError(f"字段 {field!r} 不支持批量修改")
+    text = ("" if raw is None else str(raw)).strip()
+    if field in ("category_code", "aux_unit"):
+        return text or None
+    if field == "unit":
+        if not text:
+            raise ValueError("单位不能为空")
+        return text
+    if field in _PRICE_FIELDS:
+        if not text:
+            return None
+        try:
+            num = float(text)
+        except (TypeError, ValueError):
+            raise ValueError(f"{BATCH_FIELD_LABELS[field]}必须是数字") from None
+        if num < 0:
+            raise ValueError(f"{BATCH_FIELD_LABELS[field]}不能为负数")
+        return num
+    try:
+        num = float(text or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"{BATCH_FIELD_LABELS[field]}必须是数字") from None
+    if num < 0:
+        raise ValueError(f"{BATCH_FIELD_LABELS[field]}不能为负数")
+    return num
+
+
+def batch_update_canonical_items(
+    master_conn: sqlite3.Connection,
+    canonical_ids: list[int],
+    field: str,
+    value: Any,
+) -> dict:
+    """P0-11 —— 把选中主数据项的某个字段统一设为同一值。
+
+    Returns:
+        {"field": str, "label": str, "value": Any,
+         "updated": int, "error_count": int, "errors": [str, ...]}
+    """
+    if field not in BATCH_EDITABLE_FIELDS:
+        raise ValueError(f"字段 {field!r} 不支持批量修改")
+    master_conn.row_factory = sqlite3.Row
+    updated = 0
+    errors: list[str] = []
+    for cid in canonical_ids:
+        row = master_conn.execute(
+            "SELECT aux_unit, name FROM canonical_items WHERE id=?", (int(cid),)
+        ).fetchone()
+        if row is None:
+            errors.append(f"#{cid}: 主数据项不存在")
+            continue
+        fields: dict[str, Any] = {field: value}
+        # aux_rate / gram_per_unit 的派生逻辑要看 aux_unit：把现值带上，
+        # 避免「只改换算率却把克重清零」的副作用（§1.8.2）。
+        if field in ("aux_rate", "gram_per_unit"):
+            fields["aux_unit"] = row["aux_unit"]
+        try:
+            update_canonical_item(master_conn, int(cid), fields)
+            updated += 1
+        except ValueError as e:  # noqa: PERF203
+            errors.append(f"#{cid} {row['name']}: {e}")
+    return {
+        "field": field,
+        "label": BATCH_FIELD_LABELS[field],
+        "value": value,
+        "updated": updated,
+        "error_count": len(errors),
+        "errors": errors,
+    }
 
 
 def list_canonical_items(
@@ -1516,9 +1687,12 @@ def review_claim_request(
 
 # Spec §3.3 写回主数据后,canonical_synced_json 仅含写入的字段
 def _syncable_snapshot(canonical_row: dict) -> dict[str, Any]:
-    """构造 canonical_synced_json(只含 is_syncable_field 的字段)。"""
+    """构造 canonical_synced_json(只含 is_syncable_field 的字段)。
+
+    字段集合随 Q6 开关变化：canonical_managed 时包含 selling_price/unit_cost。
+    """
     snap: dict[str, Any] = {}
-    for field in ("name", "unit", "gram_per_unit", "aux_unit", "aux_rate"):
+    for field in SYNCABLE_ITEM_FIELDS:
         if is_syncable_field(field):
             snap[field] = canonical_row.get(field)
     return snap
@@ -1638,25 +1812,39 @@ def apply_canonical_to_warehouse(
                 "skipped_reason": "no matching category",
             }
         new_sku = f"AUTO-{canonical['canonical_sku']}"  # 唯一不撞门店 SKU
+        # 同步快照 = 本次实际生效的可下发字段。NULL 价既不入库、也不写进快照
+        # （语义 = 主数据未定价）。⚠️ 不能把 None 价留在 written 里：fanout 在
+        # INSERT 之后还会拿 written 跑一次 UPDATE，会把 unit_cost 写成 NULL
+        # 而撞 items.unit_cost NOT NULL。
+        snap = {
+            k: v for k, v in _syncable_snapshot(canonical).items()
+            if not (k in _PRICE_FIELDS and v is None)
+        }
+        cols = [
+            "sku", "name", "category_id", "quantity", "safety_stock",
+            "unit", "gram_per_unit", "aux_unit", "aux_rate",
+            "updated_at", "canonical_id", "is_alias", "canonical_status",
+            "canonical_synced_json",
+        ]
+        vals: list[Any] = [
+            new_sku, canonical["name"], local_category_id, 0, 0,
+            canonical["unit"], canonical["gram_per_unit"],
+            canonical["aux_unit"], canonical["aux_rate"],
+            _now_str(), canon_id, 0, "active",
+            json.dumps(snap, ensure_ascii=False),
+        ]
+        # Q6=canonical_managed：新行也带主数据价格（空值不下发 → 用 items 默认 0）。
+        for pf in _PRICE_FIELDS:
+            if pf in snap:
+                cols.append(pf)
+                vals.append(snap[pf])
+        placeholders = ", ".join("?" for _ in vals)
         wh_conn.execute(
-            """INSERT INTO items
-               (sku, name, category_id, quantity, safety_stock,
-                unit, gram_per_unit, aux_unit, aux_rate,
-                updated_at, canonical_id, is_alias, canonical_status,
-                canonical_synced_json)
-               VALUES (?, ?, ?, 0, 0,
-                       ?, ?, ?, ?,
-                       ?, ?, 0, 'active', ?)""",
-            (
-                new_sku, canonical["name"], local_category_id,
-                canonical["unit"], canonical["gram_per_unit"],
-                canonical["aux_unit"], canonical["aux_rate"],
-                _now_str(), canon_id,
-                json.dumps(_syncable_snapshot(canonical), ensure_ascii=False),
-            ),
+            f"INSERT INTO items ({', '.join(cols)}) VALUES ({placeholders})",
+            vals,
         )
         return {
-            "written": _syncable_snapshot(canonical),
+            "written": snap,
             "frozen": {},
             "inserted": True,
             "skipped_reason": None,
@@ -1666,16 +1854,21 @@ def apply_canonical_to_warehouse(
     written: dict[str, Any] = {}
     frozen: dict[str, Any] = {}
 
-    for field in ("name", "unit", "gram_per_unit", "aux_unit", "aux_rate"):
+    for field in SYNCABLE_ITEM_FIELDS:
         if not is_syncable_field(field):
             continue
         target_col = CANONICAL_FIELD_POLICY[field][1]
         if target_col == "__canonical_status__":
             target_col = "canonical_status"
 
+        cval = canonical[field]
+        # 价格空值守卫（2026-10-09 owner 决策）：主数据未定价(NULL) → 不下发、
+        # 不覆盖门店现行价，避免把门店价格清 0。主数据填了具体值（含 0）才下发。
+        if field in _PRICE_FIELDS and cval is None:
+            continue
+
         local = existing[target_col]
         last = (last_snapshot or {}).get(field) if last_snapshot else None
-        cval = canonical[field]
 
         # Spec §3.5: last_synced_value 为 None(从未下发过,例如刚认领的门店行)
         # → 视为"门店没动过" → 正常下发,不算冲突
@@ -1725,6 +1918,13 @@ def apply_canonical_to_warehouse(
             if existing["canonical_status"] != cstatus:
                 written["__canonical_status__"] = cstatus
 
+    # 双保险（P0-9）：NULL 价永不进入 written。fanout 会把 written 直接拼成
+    # UPDATE ... SET 子句，若漏进 None 会撞 items.unit_cost/selling_price
+    # NOT NULL。这里再兜一次，避免将来新增路径踩同一个坑。
+    for _pf in _PRICE_FIELDS:
+        if written.get(_pf) is None:
+            written.pop(_pf, None)
+
     return {
         "written": written,
         "frozen": frozen,
@@ -1741,24 +1941,23 @@ def fanout_canonical_items(
     warehouse_codes: list[str],
     action: str = "overwrite",
     force: bool = False,
-    dry_run: bool = False,
     started_by: int | None = None,
     summary: str | None = None,
     backup_paths: list[str] | None = None,
 ) -> dict:
     """T8 —— 主扇出函数。Spec §3.3 时序图完整实现。
 
+    执行即写入（2026-10-10 移除 dry_run 预演模式）。
+
     Args:
         wh_db_map: {warehouse_code: sqlite3.Connection}
         canonical_ids: 要下发的 canonical_items.id 列表
         warehouse_codes: 目标仓列表
         action: keep / merge / overwrite / force(force 通过 force=True 走)
-        dry_run: True 时只算 plan,不写库
         backup_paths: 写前备份文件路径列表(Q7 措施①);写入事件 backup_paths_json。
     Returns:
         {
           "event_id": int,
-          "dry_run": bool,
           "per_canonical": [{canonical_id, per_warehouse: [{wh_code, written, frozen, ...}]}],
           "total_written": int,
           "total_frozen": int,
@@ -1767,18 +1966,16 @@ def fanout_canonical_items(
     """
     master_conn.row_factory = sqlite3.Row
     target_codes_json = json.dumps(sorted(warehouse_codes), ensure_ascii=False)
-    event_id: int | None = None
-    if not dry_run:
-        cur = master_conn.execute(
-            """INSERT INTO canonical_publish_events
-               (summary, status, started_by, started_at,
-                target_warehouse_codes_json, item_count)
-               VALUES (?, 'pending', ?, ?, ?, ?)""",
-            (summary or "fanout", started_by, _now_str(),
-             target_codes_json, len(canonical_ids)),
-        )
-        event_id = int(cur.lastrowid)
-        master_conn.commit()
+    cur = master_conn.execute(
+        """INSERT INTO canonical_publish_events
+           (summary, status, started_by, started_at,
+            target_warehouse_codes_json, item_count)
+           VALUES (?, 'pending', ?, ?, ?, ?)""",
+        (summary or "fanout", started_by, _now_str(),
+         target_codes_json, len(canonical_ids)),
+    )
+    event_id: int = int(cur.lastrowid)
+    master_conn.commit()
 
     # ─────────────────────────────────────────────────────────────────
     # 预加载:本批次所有 canonical_items(避免循环里反复 SELECT)。
@@ -1863,7 +2060,7 @@ def fanout_canonical_items(
                     )
                 except Exception as apply_exc:  # noqa: BLE001
                     err_msg = str(apply_exc)[:200]
-                    if not dry_run and event_id is not None:
+                    if event_id is not None:
                         master_conn.execute(
                             """INSERT INTO canonical_publish_event_items
                                (publish_event_id, canonical_id, target_warehouse_code,
@@ -1883,7 +2080,7 @@ def fanout_canonical_items(
                     continue
 
                 # 写入主数据字段
-                if not dry_run and result["written"]:
+                if result["written"]:
                     written = result["written"]
                     # 分组:业务字段 vs canonical_status 字段
                     set_parts: list[str] = []
@@ -1915,7 +2112,7 @@ def fanout_canonical_items(
                     conn.commit()
 
                 # 写冲突行
-                if not dry_run and result["frozen"]:
+                if result["frozen"]:
                     for field, vals in result["frozen"].items():
                         # 查 local_item_id
                         local_id_row = conn.execute(
@@ -1945,7 +2142,7 @@ def fanout_canonical_items(
                 #           success (正常)。任何字段写到 master_conn 都在
                 #           同一个事务里;失败的 case 已在 inner try 拦截并写入
                 #           自己的 event_items 行。
-                if not dry_run and event_id is not None:
+                if event_id is not None:
                     if result.get("skipped_reason"):
                         item_status = "skipped"
                         event_err = result["skipped_reason"]
@@ -2005,32 +2202,26 @@ def fanout_canonical_items(
         })
 
     # 更新事件状态
-    if not dry_run and event_id is not None:
-        final_status = (
-            "failed" if total_written == 0 and total_frozen == 0
-            else "partial" if any_partial else "complete"
-        )
-        master_conn.execute(
-            """UPDATE canonical_publish_events
-               SET status=?, completed_at=?, backup_paths_json=?
-               WHERE id=?""",
-            (final_status, _now_str(),
-             json.dumps(backup_paths, ensure_ascii=False) or None,
-             event_id),
-        )
-        master_conn.commit()
+    final_status = (
+        "failed" if total_written == 0 and total_frozen == 0
+        else "partial" if any_partial else "complete"
+    )
+    master_conn.execute(
+        """UPDATE canonical_publish_events
+           SET status=?, completed_at=?, backup_paths_json=?
+           WHERE id=?""",
+        (final_status, _now_str(),
+         json.dumps(backup_paths, ensure_ascii=False) or None,
+         event_id),
+    )
+    master_conn.commit()
 
     return {
         "event_id": event_id,
-        "dry_run": dry_run,
         "per_canonical": per_canonical,
         "total_written": total_written,
         "total_frozen": total_frozen,
-        "status": (
-            "dry_run" if dry_run else
-            ("failed" if total_written == 0 and total_frozen == 0
-             else "partial" if any_partial else "complete")
-        ),
+        "status": final_status,
     }
 
 
@@ -2069,8 +2260,12 @@ def resolve_conflict(
 # ─────────────────────────────────────────────────────────────────────
 
 def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
-    """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。"""
+    """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。
+
+    v2（P0-10）：带上 is_active，供主数据详情页按仓停用/启用。
+    """
     from config import BASE_DIR
+    from db import migrate_warehouse_db_columns
 
     master_conn.row_factory = sqlite3.Row
     out: dict[str, list[dict]] = {}
@@ -2084,16 +2279,162 @@ def collect_bindings(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
             db_path = BASE_DIR / db_path
         if not db_path.exists():
             continue
+        # 直连仓库必须先补幂等列迁移，否则旧库会撞 no such column: is_active
+        migrate_warehouse_db_columns(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT id, sku, name, unit, canonical_id,
-                          is_alias, canonical_status, is_store_exclusive
+                          is_alias, canonical_status, is_store_exclusive,
+                          is_active
                    FROM items
                    WHERE canonical_id IS NOT NULL"""
             ).fetchall()
             out[wh["code"]] = [dict(r) for r in rows]
     return out
+
+
+def set_binding_active(
+    wh_conn: sqlite3.Connection,
+    warehouse_code: str,
+    canonical_id: int,
+    active: bool,
+) -> dict:
+    """P0-10 —— 按仓启停某个主数据项的绑定行（is_active）。
+
+    只写 items.is_active / updated_at：库存、历史流水、主数据字段一律不动
+    （Q7 零丢失精神）。返回 {"item_id", "warehouse_code", "canonical_id",
+    "active", "quantity"}，quantity 供调用方在停用时做「仍有库存」软提示。
+
+    Raises:
+        ValueError: 该仓没有绑定这一 canonical_id 的行
+    """
+    wh_conn.row_factory = sqlite3.Row
+    row = wh_conn.execute(
+        "SELECT id, quantity FROM items WHERE canonical_id = ?", (int(canonical_id),)
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"仓库 {warehouse_code} 没有绑定 canonical_id={canonical_id} 的品项"
+        )
+    wh_conn.execute(
+        "UPDATE items SET is_active = ?, updated_at = ? WHERE id = ?",
+        (1 if active else 0, _now_str(), int(row["id"])),
+    )
+    wh_conn.commit()
+    return {
+        "item_id": int(row["id"]),
+        "warehouse_code": warehouse_code,
+        "canonical_id": int(canonical_id),
+        "active": bool(active),
+        "quantity": float(row["quantity"] or 0),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  P0-9 —— 存量价格回填（切 Q6=canonical_managed 前的一次性动作）
+#
+#  背景：主数据 canonical_items.selling_price/unit_cost 一直是 NULL，而各仓
+#  items 有真实价。若不先回填就扇出，会把门店价清 0（方案 §4 风险第一行）。
+#
+#  规则（2026-10-09 owner 拍板）：取**所有仓**（含配送中心/研发中心）该
+#  canonical 全部绑定行中出现的**最高非零值**写入主数据。全部为空/0 →
+#  跳过（保持 NULL = 未定价，扇出时按守卫不下发）。
+# ─────────────────────────────────────────────────────────────────────
+
+def backfill_prices_from_warehouses(
+    master_conn: sqlite3.Connection,
+    wh_db_map: dict[str, sqlite3.Connection],
+    *,
+    overwrite: bool = False,
+) -> dict:
+    """P0-9 —— 各仓现行售价/采购价 → canonical_items（全仓最高价）。
+
+    Args:
+        wh_db_map: {warehouse_code: wh_conn}（含 storefront / dc / rd 均可）。
+        overwrite: False（默认）只填充 canonical 现值为 NULL 的字段，
+                   保护管理员已录入的价；True 则用回填值覆盖现值。
+
+    Returns:
+        {
+          "filled": {canonical_id: {field: value}},
+          "filled_count": int,        # 被写入的 (canonical, field) 数
+          "skipped_existing": int,    # 已有非空值而跳过的字段数
+          "no_value": int,            # 各仓全空/0、无值可回填的 canonical 数
+        }
+    """
+    master_conn.row_factory = sqlite3.Row
+
+    # 1) 扫描各仓：cid -> {field: max(正值)}
+    best: dict[int, dict[str, float]] = {}
+    for conn in wh_db_map.values():
+        if conn is None:
+            continue
+        conn.row_factory = sqlite3.Row
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+        picked = [f for f in _PRICE_FIELDS if f in cols]
+        if not picked:
+            continue
+        select_cols = ", ".join(["canonical_id", *picked])
+        for r in conn.execute(
+            f"SELECT {select_cols} FROM items WHERE canonical_id IS NOT NULL"
+        ):
+            cid = r["canonical_id"]
+            if cid is None:
+                continue
+            slot = best.setdefault(int(cid), {})
+            for f in picked:
+                val = r[f]
+                if val is None:
+                    continue
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if fval <= 0:
+                    continue
+                if fval > slot.get(f, 0.0):
+                    slot[f] = fval
+
+    # 2) 写入 canonical_items
+    filled: dict[int, dict[str, float]] = {}
+    skipped_existing = 0
+    no_value = 0
+    for cid, slot in best.items():
+        row = master_conn.execute(
+            "SELECT selling_price, unit_cost FROM canonical_items WHERE id=?",
+            (cid,),
+        ).fetchone()
+        if row is None:
+            continue
+        updates: dict[str, float] = {}
+        for f, val in slot.items():
+            current = row[f]
+            if not overwrite and current is not None:
+                skipped_existing += 1
+                continue
+            updates[f] = val
+        if not updates:
+            continue
+        set_clause = ", ".join(f"{f}=?" for f in updates)
+        master_conn.execute(
+            f"UPDATE canonical_items SET {set_clause}, updated_at=? WHERE id=?",
+            (*updates.values(), _now_str(), cid),
+        )
+        filled[cid] = updates
+    master_conn.commit()
+
+    # 统计"完全无可用价"的 canonical（便于报告口径）
+    candidate_ids = set(best.keys())
+    filled_ids = set(filled.keys())
+    no_value = len(candidate_ids - filled_ids)
+
+    return {
+        "filled": filled,
+        "filled_count": sum(len(v) for v in filled.values()),
+        "skipped_existing": skipped_existing,
+        "no_value": no_value,
+    }
 
 
 def diff_summary(master_conn: sqlite3.Connection) -> dict:
@@ -2441,15 +2782,16 @@ def _infer_category_code(name: str) -> str | None:
 #  对齐全流程的 CLI 支撑层：
 #    align-seed   → seed_canonical_categories + seed_default_canonical_items
 #    align-detect → dry_run_report()（纯只读）
-#    align-apply  → fanout_canonical_items(dry_run=False)（危险,双确认）
+#    align-apply  → fanout_canonical_items()（危险,双确认）
 #  命令本体在 cli.py；范围常量与报告格式化放本文件（单一真相源）。
 # ─────────────────────────────────────────────────────────────────────
 
 # v4 冻结的对齐范围（docs/2026-10-03-canonical-item-design.md §6）。
-# wh_001(已关) / wh_010(空) / rd_001(研发,无库存) 不进对齐范围。
-# v5 扩展前不许改本常量；改动必须在设计文档同步说明。
+# wh_001(已关) / wh_010(空) 不进对齐范围。
+# v5（2026-10-09，方案 P0-7）纳入 rd_001：研发品项是主数据的镜像副本，
+# 必须跟随主数据更新；依据 docs/2026-10-09-item-master-unify-plan.md。
 ALIGN_SCOPE_WAREHOUSES: tuple[str, ...] = (
-    "wh_000", "wh_002", "wh_003", "wh_004", "wh_006",
+    "wh_000", "wh_002", "wh_003", "wh_004", "wh_006", "rd_001",
 )
 
 

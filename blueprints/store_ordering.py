@@ -173,7 +173,10 @@ def catalog() -> str:
 
     category_code = request.args.get("cat", "").strip() or None
     keyword = request.args.get("q", "").strip() or None
-    items = sop.list_available_dc_items(master, dc_code, category_code, keyword)
+    items = sop.list_available_dc_items(
+        master, dc_code, category_code, keyword,
+        store_warehouse_code=store_code or None,
+    )
     # P1-5: 订货量建议（仅当前门店有真实仓库时才计算，admin 无门店跳过）
     suggestions: dict[int, int] = {}
     if store_code and not _is_admin():
@@ -486,7 +489,8 @@ def order_detail(order_id: int) -> str:
     """Order detail view shared by store, DC and admin.
 
     v3 A4: 计算订单总金额 Σ(quantity × unit_price)。
-    v3 A6: 收集 DC 仓库当前库存（含允许欠货出库后的负值）。
+    v3 A6: 收集 DC 仓库当前库存（发货已禁止超库存，故不再产生负值；
+            历史遗留负库存行仍原样展示、红色高亮）。
     """
     master = get_master_db()
     order = sop.get_order_detail(master, order_id)
@@ -770,11 +774,17 @@ def ship_order_route(order_id: int) -> str:
     表单字段约定：
       - ``shipped_items[N]=qty``：多值，每行一个明细的本批发货数。N 是
         ``store_order_items.id``，与 order_detail.html 中的 input name 配对。
+        新 UI 的每个数量 input 都带该 name（即使留空也会随表单提交），因此
+        「字段存在」是「新 UI 提交」的可靠信号。
       - ``qty``：兼容 v1/v2 的「全量一次发货」字段；填了就给所有明细
         各发 qty 件（仍受累计上限校验）。
-      - 上述两者都缺省：走 ``ship_order_full``（legacy full-ship），把
-        每个明细的剩余可发数量一次性发齐。该兼容路径保证旧测试 / 老 UI
-        不破。
+      - 上述两者都缺省（且表单不含任何 ``shipped_items[`` 字段）：走
+        ``ship_order_full``（legacy full-ship），把每个明细的剩余可发数量
+        一次性发齐。仅用于无 shipped_items 字段的旧客户端 / 老测试。
+
+    ⚠️ 安全护栏（2026-10-10）：一旦表单携带 ``shipped_items[`` 字段但全部
+    为空/0，视为「用户未填写」→ 直接 flash 拒绝，**绝不**退化为整单全发。
+    这是「DC 只发 2、却被记发 100」缺陷的直接堵口。
 
     通知：仅在订单全部发齐后写一条 ``store_order_shipped``；partial 不发
     通知避免刷屏（v3 设计 §10.4）。
@@ -785,8 +795,10 @@ def ship_order_route(order_id: int) -> str:
 
     # 1. 解析 shipped_items[N] = qty 形式（v3 多值表单）。
     shipped_items_map: dict[int, float] = {}
+    has_multival_fields = False
     for key, value in request.form.items():
         if key.startswith("shipped_items[") and key.endswith("]"):
+            has_multival_fields = True
             try:
                 oid = int(key[len("shipped_items["):-1])
                 qty = parse_qty(value)
@@ -794,6 +806,11 @@ def ship_order_route(order_id: int) -> str:
                     shipped_items_map[oid] = qty
             except (ValueError, TypeError):
                 continue
+
+    # 1b. 新 UI 提交了 shipped_items[] 字段但全部为空 → 拒绝，不猜、不全发。
+    if not shipped_items_map and has_multival_fields:
+        flash("请至少填写一项发货数量")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     # 2. 兼容 v2 全量字段 'qty'：所有未发齐明细都发 qty。
     if not shipped_items_map:
@@ -811,7 +828,7 @@ def ship_order_route(order_id: int) -> str:
                                 qty_value, remaining
                             )
 
-    # 3. 都没填 → 走 legacy full-ship（每明细剩余数量一次发齐）。
+    # 3. 都没填（且不含 shipped_items 字段）→ 走 legacy full-ship（旧客户端兼容）。
     used_full_ship_fallback = False
     if not shipped_items_map:
         try:

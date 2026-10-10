@@ -7,6 +7,7 @@ from flask import Blueprint, flash, g, redirect, render_template, request, url_f
 from db import get_warehouse_db
 from permissions import require_login, require_role
 
+from . import canonical_pure as cp
 from ._helpers import now, parse_qty
 from .auth import audit
 
@@ -79,9 +80,10 @@ def restock_start():
 def restock_session():
     db = get_warehouse_db()
     items_data = db.execute(
-        """SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock,
+        f"""SELECT i.id, i.name, i.quantity, i.unit, i.safety_stock,
                   i.aux_unit, i.aux_rate, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
+           WHERE {cp.store_selectable_clause('i')}
            ORDER BY c.name, i.name"""
     ).fetchall()
     return render_template("restock_session.html", items=items_data)

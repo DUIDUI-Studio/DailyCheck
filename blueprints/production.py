@@ -12,6 +12,7 @@ from flask import Blueprint, flash, g, redirect, request, url_for
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
 
+from . import canonical_pure as cp
 from ._helpers import grams_to_stock, now, parse_qty, render
 from .auth import audit
 
@@ -66,8 +67,9 @@ def _load_items_for_bom():
     """Return items for the BOM item picker: id, name, unit, gram_per_unit, category_name."""
     db = get_warehouse_db()
     return db.execute(
-        """SELECT i.id, i.name, i.unit, i.gram_per_unit, c.name AS category_name
+        f"""SELECT i.id, i.name, i.unit, i.gram_per_unit, c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
+           WHERE {cp.store_selectable_clause('i')}
            ORDER BY c.name, i.name"""
     ).fetchall()
 

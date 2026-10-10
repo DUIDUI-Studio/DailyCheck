@@ -4,17 +4,13 @@
 <div class="page-header">
   <h2>品类与品项</h2>
   {% if g.user and g.user['is_admin'] %}
+    <form method="post" action="{{ url_for('items.recompute_safety_stock') }}" class="inline"
+          onsubmit="return confirm('按「近 {{ safety_stock_window }} 天消耗量 × {{ safety_stock_factor }}」重算本仓全部品项的安全库存？\n消耗历史不足 {{ safety_stock_window }} 天的品项将写 0。');">
+      <button type="submit" class="btn-sm">🔄 重算安全库存</button>
+    </form>
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">
       📥 批量导入
     </a>
-    {% if is_rd %}
-    <a href="{{ url_for('items.items_publish') }}" class="btn-sm">
-      📤 同步到门店
-    </a>
-    <a href="{{ url_for('items.items_publish_history') }}" class="btn-sm">
-      🕘 同步历史
-    </a>
-    {% endif %}
   {% endif %}
 </div>
 
@@ -26,65 +22,17 @@
 </div>
 
 <h3>新增库存品</h3>
-<form method="post" class="grid cols-3">
-  <label>
-    <span>品项名称</span>
-    <input name="name" required />
-  </label>
-  <label>
-    <span>品类</span>
-    <select name="category_id" required>
-      <option value="">选择品类</option>
-      {% for c in categories %}
-      <option value="{{ c.id }}">{{ c.name }}</option>
-      {% endfor %}
-    </select>
-  </label>
-  <label>
-    <span>初始库存</span>
-    <input name="quantity" type="number" min="0" step="0.01" />
-  </label>
-  <label>
-    <span>安全库存</span>
-    <input name="safety_stock" type="number" min="0" step="0.01" />
-  </label>
-  {% if is_rd %}
-  <label>
-    <span>进货单价（¥）</span>
-    <input name="unit_cost" type="number" min="0" step="0.001" />
-  </label>
-  {% else %}
-  <input type="hidden" name="unit_cost" value="0" />
+<p class="muted">
+  品项已收敛到「品项主数据」统一维护，<strong>门店与研发中心不再自行新增品项</strong>。
+  如需新增品项，请联系平台管理员在主数据创建后扇出下发。
+  {% if g.user and g.user['is_admin'] %}
+  <a href="{{ url_for('canonical.canonical_list') }}">前往品项主数据 →</a>
   {% endif %}
-  <label>
-    <span>销售单价（¥）</span>
-    <input name="selling_price" type="number" min="0" step="0.001" value="0" />
-  </label>
-  <label>
-    <span>单位</span>
-    <input name="unit" placeholder="件" />
-  </label>
-  <label>
-    <span>辅单位</span>
-    <select name="aux_unit">
-      <option value="">无</option>
-      <option value="克">克</option>
-      <option value="个">个</option>
-      <option value="条">条</option>
-      <option value="袋">袋</option>
-      <option value="瓶">瓶</option>
-    </select>
-  </label>
-  <label>
-    <span>1 基础单位 = N 辅单位</span>
-    <input name="aux_rate" type="number" min="0" step="0.01" placeholder="0" />
-  </label>
-  <button type="submit">新增库存品</button>
-</form>
+</p>
 
 <h3>品项列表</h3>
 <table>
-  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th>{% if is_rd %}<th>进货单价（¥）</th>{% endif %}<th>销售单价（¥）</th><th>辅单位</th><th>更新时间</th><th>操作</th></tr>
+  <tr><th>品项</th><th>品类</th><th>库存</th><th>安全库存</th>{% if is_rd %}<th>进货单价（¥）</th>{% endif %}<th>销售单价（¥）</th><th>辅单位</th><th>状态</th><th>更新时间</th><th>操作</th></tr>
   {% for i in items %}
   <tr data-cat="{{ i.category_name }}">
     <td>{{ i.name }}</td><td>{{ i.category_name }}</td>
@@ -92,12 +40,25 @@
     {% if is_rd %}<td>{{ "%.3f"|format(i.unit_cost) if i.unit_cost else "-" }}</td>{% endif %}
     <td>{{ "%.3f"|format(i.selling_price) if i.selling_price else "-" }}</td>
     <td>{% if i.aux_unit and i.aux_rate > 0 %}{{ i.aux_rate | fmt_qty }} {{ i.aux_unit }}/{{ i.unit }}{% else %}—{% endif %}</td>
+    <td>
+      {% if i.is_active %}
+        <span class="badge-ok">启用</span>
+      {% else %}
+        <span class="badge-warn">已停用</span>
+      {% endif %}
+    </td>
     <td>{{ i.updated_at }}</td>
     <td class="inline">
-      <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">编辑</a>
-      {% if current_role != 'staff' %}
+      <a href="{{ url_for('items.edit_item', item_id=i.id) }}" class="btn-sm btn-edit">{% if i.canonical_id %}查看{% else %}编辑{% endif %}</a>
+      {% if current_role != 'staff' and not i.canonical_id %}
       <form method="post" action="{{ url_for('items.delete_item', item_id=i.id) }}" class="inline" onsubmit="return confirm('确认删除该库存品？');">
         <button type="submit" class="btn-sm btn-delete">删除</button>
+      </form>
+      {% endif %}
+      {% if i.canonical_id and g.user and g.user['is_admin'] %}
+      <form method="post" action="{{ url_for('items.toggle_item_active', item_id=i.id) }}" class="inline">
+        <input type="hidden" name="active" value="{{ '0' if i.is_active else '1' }}" />
+        <button type="submit" class="btn-sm">{{ '停用' if i.is_active else '启用' }}</button>
       </form>
       {% endif %}
     </td>
