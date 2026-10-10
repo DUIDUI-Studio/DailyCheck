@@ -126,7 +126,12 @@
   <p class="muted">只填需要本批发货的品项，留空的行本批不发；已发货数量会累计保留。</p>
   {% endif %}
 {% else %}
-  {# storefront 视角：含「已收数」+ 部分收货表单（A2） #}
+  {# storefront 视角：含「已收数」+ 部分收货表单（A2）。
+     ⚠️「可收货」不能只看订单主状态：v3 订单在 DC 分批发货期间停在 approved，
+     只有全部发齐才转 shipped。若按 status == 'shipped' 渲染，部分发货的订单
+     在门店端永远看不到收货入口（2026-10-10 缺陷）。故放宽到
+     approved + shipped，再逐行按「已发未收」量决定是否给输入框。 #}
+  {% set show_receive_form = can_receive and order.status in ('approved', 'shipped') %}
   <table class="data-table">
     <thead>
       <tr>
@@ -134,25 +139,28 @@
         <th>单位</th>
         <th>单价</th>
         <th>数量</th>
+        <th>已发数</th>
         <th>已收数</th>
-        {% if can_receive and order.status == 'shipped' %}<th>本批收货</th>{% endif %}
+        {% if show_receive_form %}<th>本批收货</th>{% endif %}
       </tr>
     </thead>
     <tbody>
       {% for item in order.order_items %}
         {% set fulfilled = item.fulfilled_quantity or 0 %}
-        {# 待收上限按「实发量」而非订货量：DC 可能只发一部分，不得超收。
-           shipped 为空（v2 legacy 行）时回落到订货量。 #}
         {% set shipped_qty = item.shipped_quantity or 0 %}
-        {% set effective_shipped = shipped_qty if shipped_qty > 0 else item.quantity %}
+        {# 待收上限按「实发量」而非订货量：DC 可能只发一部分，不得超收。
+           shipped 为 0 时：仅当整单已转 shipped（v2 legacy 行未记录实发数）
+           才回落到订货量；否则该行尚未发货，可收量为 0。 #}
+        {% set effective_shipped = shipped_qty if shipped_qty > 0 else (item.quantity if order.status == 'shipped' else 0) %}
         {% set pending = ([effective_shipped, item.quantity] | min) - fulfilled %}
         <tr>
           <td>{{ item.canonical_name }}</td>
           <td>{{ item.unit }}</td>
           <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
           <td>{{ item.quantity | fmt_qty }}</td>
+          <td>{{ shipped_qty | fmt_qty }}</td>
           <td>{{ fulfilled | fmt_qty }}</td>
-          {% if can_receive and order.status == 'shipped' %}
+          {% if show_receive_form %}
           <td>
             {% if pending > 0 %}
             <form method="post" action="{{ url_for('store_ordering.receive_order_route', order_id=order.id) }}" class="inline-form">
@@ -161,6 +169,8 @@
               <input name="note" placeholder="可选备注" />
               <button type="submit" class="btn-sm">收货</button>
             </form>
+            {% elif effective_shipped <= 0 %}
+            <span class="muted">待配送中心发货</span>
             {% else %}<span class="status-pill ok">已收齐</span>{% endif %}
           </td>
           {% endif %}
@@ -268,9 +278,16 @@
   </form>
   {% endif %}
 
-  {% if can_deliver and order.status == 'shipped' %}
+  {# 「一次性收货」= 把 DC 已发出的部分全部收下。对分批发货中的订单
+     （status 仍为 approved）同样适用，但必须确有货可收才显示按钮。 #}
+  {% set ns = namespace(has_receivable=false) %}
+  {% for it in order.order_items %}
+    {% set _s = it.shipped_quantity or (it.quantity if order.status == 'shipped' else 0) %}
+    {% if _s > 0 and (it.fulfilled_quantity or 0) < _s %}{% set ns.has_receivable = true %}{% endif %}
+  {% endfor %}
+  {% if can_deliver and ns.has_receivable %}
   <form method="post" action="{{ url_for('store_ordering.deliver_order_route', order_id=order.id) }}" class="inline-form">
-    <button type="submit" class="btn-sm">一次性收货</button>
+    <button type="submit" class="btn-sm">一次性收货已到货物</button>
   </form>
   {% endif %}
 

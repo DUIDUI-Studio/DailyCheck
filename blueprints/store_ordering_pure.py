@@ -1601,6 +1601,44 @@ def _ship_order_partial_impl(
     return result
 
 
+# Order statuses in which the storefront is allowed to receive goods.
+# v3 keeps an order in ``approved`` while the DC ships it in batches and only
+# flips it to ``shipped`` once every line is fully shipped — so "may I receive?"
+# cannot be keyed off the order status alone, or partial shipments stall.
+# See ``order_item_receivable_qty`` for the per-line rule.
+RECEIVABLE_ORDER_STATUSES: tuple[str, ...] = (
+    ORDER_STATUS_APPROVED,
+    ORDER_STATUS_SHIPPED,
+)
+
+
+def order_item_receivable_qty(
+    order_status: str, item: dict[str, Any]
+) -> float:
+    """Return how much of ``item`` the storefront may still receive.
+
+    Derives the amount from the line itself (what the DC actually shipped vs
+    what the store already received) rather than from the order's coarse main
+    status — a partially-shipped order stays ``approved`` and never reaches
+    ``shipped`` until every line is complete, so a status-only check would make
+    partial shipments unreceivable (2026-10-10 fix).
+
+    - ``shipped`` orders whose ``shipped_quantity`` was never recorded (v2
+      legacy rows, written by the old one-shot path) are treated as fully
+      shipped → fall back to ``quantity``.
+    - ``approved`` orders expose only what has genuinely been shipped so far,
+      so an unshipped line yields ``0``.
+
+    Returns a non-negative float; ``0`` means "nothing to receive here".
+    """
+    ordered = parse_qty(item["quantity"])
+    fulfilled = parse_qty(item.get("fulfilled_quantity") or 0)
+    shipped = parse_qty(item.get("shipped_quantity") or 0)
+    if shipped <= 0 and order_status == ORDER_STATUS_SHIPPED:
+        shipped = ordered
+    return max(0.0, min(shipped, ordered) - fulfilled)
+
+
 def mark_order_delivered(
     master_conn: sqlite3.Connection,
     order_id: int,
@@ -1610,25 +1648,26 @@ def mark_order_delivered(
 
     The canonical path for receiving partial / full inventory is
     ``receive_order_item`` (one call per order_item). This entry-point is
-    preserved as a "deliver the whole order at once" shortcut for the
+    preserved as a "deliver everything already shipped" shortcut for the
     storefront manager UI: it forwards by issuing one ``receive_order_item``
-    call per order_item to consume the entire remaining quantity, then
+    call per order_item to consume whatever the DC has actually shipped, then
     returns the post-delivery order detail.
+
+    Works for both ``approved`` (DC shipped only part of the order) and
+    ``shipped`` (fully shipped) orders; lines with nothing shipped yet are
+    skipped, so a partially-shipped order stays ``approved`` afterwards.
     """
     master_conn.row_factory = sqlite3.Row
     order = get_order_detail(master_conn, order_id)
     if order is None:
         raise ValueError(f"order_id={order_id} not found")
-    if order["status"] != ORDER_STATUS_SHIPPED:
-        raise ValueError(f"order must be shipped to deliver, got {order['status']}")
+    if order["status"] not in RECEIVABLE_ORDER_STATUSES:
+        raise ValueError(
+            f"order must be approved or shipped to deliver, got {order['status']}"
+        )
     for item in order["order_items"]:
-        # 上限按「实发量」而非「订货量」：DC 可能只发了一部分，
-        # 门店最多只能收 min(实发, 订货) − 已收（缺陷修复 2026-10-10）。
-        # shipped_quantity 为空（v2 legacy 行）时回落到订货量。
-        shipped = parse_qty(item.get("shipped_quantity") or 0)
-        ordered = parse_qty(item["quantity"])
-        effective_shipped = shipped if shipped > 0 else ordered
-        pending = min(effective_shipped, ordered) - parse_qty(item["fulfilled_quantity"])
+        # 只收「已发未收」的部分；未发货的行 pending=0 自动跳过。
+        pending = order_item_receivable_qty(order["status"], item)
         if pending <= 0:
             continue
         receive_order_item(
@@ -1649,12 +1688,16 @@ def receive_order_item(
 ) -> dict[str, Any]:
     """Receive (partial or full) a single order_item at the storefront warehouse.
 
-    - Validates order.status == 'shipped'.
+    - Validates order.status in ('approved', 'shipped'). A v3 order stays
+      ``approved`` while the DC ships it in batches and only flips to
+      ``shipped`` once every line is complete, so receiving must be permitted
+      there too (2026-10-10 fix: a status-only gate left partial shipments
+      unreceivable at the store).
     - Validates the order_item belongs to the order.
     - Validates qty > 0 and qty <= min(shipped_quantity, quantity) − fulfilled_quantity.
       上限取「实发量与订货量的较小值」——配送中心可能只发了一部分，门店
       最多只能收实发量（缺陷修复 2026-10-10：原按订货量计算，导致
-      「DC 发 2、门店可收 100」）。
+      「DC 发 2、门店可收 100」）。未发货的行上限为 0，不可收。
     - Writes a row to ``store_order_receipts``.
     - Adds ``qty`` to the storefront warehouse ``items.quantity`` (auto-creating
       a local row if needed; see §3.1 + §9.1). Writes a ``stock_movements``
@@ -1664,6 +1707,11 @@ def receive_order_item(
     - When every order_item is fulfilled, flips ``store_orders.status`` to
       'delivered' (sets delivered_at, history). Does NOT emit notifications;
       the route layer is responsible for calling ``notify_order_event``.
+      Note: this can only ever fire from ``shipped``. An ``approved`` order
+      can never satisfy ``fulfilled == quantity`` on every line, because each
+      line's ceiling is its shipped quantity, which stays below ``quantity``
+      while the DC has not finished shipping. Receiving against ``approved``
+      therefore never short-circuits the order out of the shipping flow.
 
     Returns a dict with ``order_id``, ``order_item_id``, ``receipt_id``,
     ``fulfilled_quantity``, ``new_order_status``, ``is_fully_received``.
@@ -1679,9 +1727,9 @@ def receive_order_item(
     order = get_order_detail(master_conn, order_id)
     if order is None:
         raise ValueError(f"order_id={order_id} not found")
-    if order["status"] != ORDER_STATUS_SHIPPED:
+    if order["status"] not in RECEIVABLE_ORDER_STATUSES:
         raise ValueError(
-            f"order must be shipped to receive, got {order['status']!r}"
+            f"order must be approved or shipped to receive, got {order['status']!r}"
         )
 
     target_item = next(
@@ -1693,17 +1741,11 @@ def receive_order_item(
             f"order_item_id={order_item_id} 不属于 order_id={order_id}"
         )
 
-    # 收货上限 = min(实发量, 订货量) − 已收量。
-    # 用实发量封顶：DC 可能只发了一部分，门店不得超收（缺陷修复 2026-10-10）。
-    # 兼容：v2 legacy 行未记录 shipped_quantity（NULL/0），此时订单状态已是
-    # shipped 即代表整单一次发齐，回落到订货量。v3 部分发货行 shipped_quantity
-    # 必为非 0 值，故不会误放开。
-    shipped_qty = parse_qty(target_item.get("shipped_quantity") or 0)
-    ordered_qty = parse_qty(target_item["quantity"])
-    effective_shipped = shipped_qty if shipped_qty > 0 else ordered_qty
-    remaining = min(effective_shipped, ordered_qty) - parse_qty(
-        target_item["fulfilled_quantity"]
-    )
+    # 收货上限 = min(实发量, 订货量) − 已收量，由 order_item_receivable_qty
+    # 统一计算（含 v2 legacy 回落）。
+    # 门禁已放宽到 approved：DC 分批发货期间订单停在 approved，此时只放行
+    # 「本行已发且未收」的数量；未发货的行上限为 0，天然拒绝。
+    remaining = order_item_receivable_qty(order["status"], target_item)
     if qty > remaining + 1e-9:
         raise ValueError(
             f"收货数量 {qty} 超过待收 {remaining}"
@@ -1925,6 +1967,15 @@ def cancel_order(
     if order is None:
         raise ValueError(f"order_id={order_id} not found")
     _assert_transition(order["status"], ORDER_STATUS_CANCELLED)
+    # 已有收货记录则拒绝取消：货已实际入库，作废订单会造成账实不符。
+    # （2026-10-10：approved 状态开放「部分发货即可收货」后新增的防护路径；
+    #  此前 approved 不可收货，故不存在该状态。）
+    received = master_conn.execute(
+        "SELECT COUNT(*) AS n FROM store_order_receipts WHERE order_id=?",
+        (order_id,),
+    ).fetchone()
+    if received is not None and int(received["n"]) > 0:
+        raise ValueError("订单已有收货记录，无法取消")
     ts = now()
     master_conn.execute(
         """UPDATE store_orders

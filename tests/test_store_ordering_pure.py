@@ -533,6 +533,137 @@ def test_receive_order_item_partial_then_full(ordering_env):
     assert float(receipts[1]["quantity"]) == 3.0
 
 
+def test_receive_allowed_while_approved_after_partial_ship(ordering_env):
+    """v3 部分发货：订单停在 approved，门店应能收「已发」的那部分。
+
+    回归 2026-10-10 缺陷：收货门禁只看 status == 'shipped'，而分批发货
+    期间订单一直停在 approved（全部发齐才转 shipped）→ 门店端根本收不了货。
+    """
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test"
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 30.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=2, expected_delivery_date=None, note=""
+    )
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order_item_id = order["order_items"][0]["id"]
+
+    # DC 只发 5 / 30 → 订单仍在 approved。
+    shipped = sop.ship_order(conn, order["id"], {order_item_id: 5.0}, shipped_by=4)
+    assert shipped["is_fully_shipped"] is False
+    assert shipped["new_order_status"] == sop.ORDER_STATUS_APPROVED
+
+    # 门店可收已发的 5 件。
+    r = sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id, qty=5.0, actor_id=3,
+    )
+    assert r["fulfilled_quantity"] == 5.0
+    # 只收完「已发部分」不算整单收齐 → 订单保持 approved，
+    # 不得因为收完当前批次就跳到 delivered。
+    assert r["is_fully_received"] is False
+    assert r["new_order_status"] == sop.ORDER_STATUS_APPROVED
+    assert sop.get_order_detail(conn, order["id"])["status"] == sop.ORDER_STATUS_APPROVED
+
+
+def test_receive_beyond_shipped_rejected_when_approved(ordering_env):
+    """部分发货期间，门店收货上限 = 已发量（而非订货量）。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test"
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 100.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=2, expected_delivery_date=None, note=""
+    )
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order_item_id = order["order_items"][0]["id"]
+    sop.ship_order(conn, order["id"], {order_item_id: 2.0}, shipped_by=4)  # 发 2 / 100
+
+    # 收 100（=订货量）必须被拒 —— 只发了 2。
+    with pytest.raises(ValueError, match="超过待收"):
+        sop.receive_order_item(
+            conn, order_id=order["id"], order_item_id=order_item_id, qty=100.0, actor_id=3,
+        )
+    # 收 3（> 已发 2）也必须被拒。
+    with pytest.raises(ValueError, match="超过待收"):
+        sop.receive_order_item(
+            conn, order_id=order["id"], order_item_id=order_item_id, qty=3.0, actor_id=3,
+        )
+    # 收 2 正常。
+    r = sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id, qty=2.0, actor_id=3,
+    )
+    assert r["fulfilled_quantity"] == 2.0
+
+
+def test_receive_unshipped_line_rejected_when_approved(ordering_env):
+    """多明细订单：DC 只发了其中一行，未发货的那行不可收。"""
+    conn = ordering_env["master_conn"]
+    # fixture 门店侧默认只绑定了 canonical 101；补绑 102 才能下两行订单。
+    store = sqlite3.connect(str(ordering_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    cat_id = store.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    store.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("ST-B2", "测试包材B", cat_id, 0.0, "件", 102,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    store.commit()
+    store.close()
+
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test"
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 10.0, "件")
+    sop.add_cart_item(conn, cart["id"], 102, 10.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=2, expected_delivery_date=None, note=""
+    )
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    ids = {int(it["canonical_id"]): int(it["id"]) for it in order["order_items"]}
+    a, b = ids[101], ids[102]
+
+    sop.ship_order(conn, order["id"], {a: 10.0}, shipped_by=4)  # 只发 101 行
+
+    # 未发货行（102）收货 → 拒绝。
+    with pytest.raises(ValueError, match="超过待收"):
+        sop.receive_order_item(
+            conn, order_id=order["id"], order_item_id=b, qty=1.0, actor_id=3,
+        )
+    # 已发齐行（101）可收，但整单未收齐（102 还没发）。
+    r = sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=a, qty=10.0, actor_id=3,
+    )
+    assert r["fulfilled_quantity"] == 10.0
+    assert r["is_fully_received"] is False
+
+
+def test_cancel_rejected_after_partial_receipt(ordering_env):
+    """已有收货记录的订单不得取消 —— 货已实际入库，作废会造成账实不符。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test"
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 30.0, "件")
+    order = sop.submit_order(
+        conn, cart["id"], requested_by=2, expected_delivery_date=None, note=""
+    )
+    order = sop.review_order(conn, order["id"], sop.ORDER_STATUS_APPROVED, actor_id=5)
+    order_item_id = order["order_items"][0]["id"]
+    sop.ship_order(conn, order["id"], {order_item_id: 5.0}, shipped_by=4)
+    sop.receive_order_item(
+        conn, order_id=order["id"], order_item_id=order_item_id, qty=5.0, actor_id=3,
+    )
+
+    with pytest.raises(ValueError, match="已有收货记录"):
+        sop.cancel_order(conn, order["id"], cancelled_by=5, reason="想撤单")
+    # 订单状态未被改动。
+    assert sop.get_order_detail(conn, order["id"])["status"] == sop.ORDER_STATUS_APPROVED
+
+
 def test_receive_order_item_over_remaining_rejected(ordering_env):
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test")

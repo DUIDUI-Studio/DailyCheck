@@ -17,6 +17,10 @@
           拒绝，不再退化为「整单全发」。
         * `test_B15_...`（症状）：门店收货上限改为 `min(实发量, 订货量) − 已收量`，
           不得超过 DC 实发量。
+    - 2026-10-10 追加修复（`test_B17` ~ `test_B20`）：v3 订单在 DC 分批发货期间
+      停在 `approved`（全部发齐才转 `shipped`），而收货入口此前只在 `shipped`
+      渲染 → 部分发货的订单在门店端完全收不了货。现收货门禁放宽到
+      `approved` + `shipped`，逐行按「已发未收」量放行，未发货的行不可收。
 
 所有用例都在 tmp_path 下的临时 master.db / 仓库 db 上跑，绝不触碰真实 db。
 """
@@ -832,6 +836,108 @@ def test_B16b_empty_ship_form_rejected_no_full_ship(env):
     # 订单仍停在 approved，实发为 0，DC 库存未动。
     assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
     assert float(_item_state(env, oiid)["shipped_quantity"] or 0) == 0.0
+
+
+def test_B17_partial_ship_then_store_can_receive(env):
+    """【核心回归 2026-10-10】DC 部分发货后订单停在 approved，门店必须能收已发部分。
+
+    缺陷：收货入口此前只在 order.status == 'shipped' 时渲染，而分批发货
+    期间订单一直停在 approved（全部发齐才转 shipped）→ 门店端完全看不到
+    收货入口，「部分发货」等于把订单卡死，谁都收不了货。
+    """
+    client = env["client"]
+    oid, oiid = _order_flow(env, qty=100.0)
+
+    # DC 只发 30 / 100 → 订单仍在 approved。
+    _ship(client, oid, oiid, 30)
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+    assert float(_item_state(env, oiid)["shipped_quantity"]) == 30.0
+
+    # 门店详情页必须渲染出收货入口。
+    _login(client, 2, 2)  # store_mgr
+    body = client.get(f"/store-ordering/orders/{oid}").get_data(as_text=True)
+    assert "本批收货" in body, "部分发货的订单在门店端应显示收货入口（缺陷复现）"
+
+    # 可收已发的 30。
+    _receive(client, oid, oiid, 30)
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 30.0
+    # 只收完「已发部分」→ 订单保持 approved，不得跳到 delivered。
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+
+    # 再收 → 拒绝（实发量已收完）。
+    _receive(client, oid, oiid, 1)
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 30.0
+
+
+def test_B18_over_receive_rejected_during_partial_ship(env):
+    """部分发货期间，门店不得按订货量收货 —— 上限只认实发量。"""
+    client = env["client"]
+    oid, oiid = _order_flow(env, qty=100.0)
+    _ship(client, oid, oiid, 2)  # 发 2 / 100
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+
+    _receive(client, oid, oiid, 100)  # 收订货量 → 拒绝
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 0.0
+    _receive(client, oid, oiid, 3)    # 超实发 2 → 拒绝
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 0.0
+    _receive(client, oid, oiid, 2)    # = 实发量 → 受理
+    assert float(_item_state(env, oiid)["fulfilled_quantity"]) == 2.0
+
+
+def test_B19_unshipped_line_cannot_be_received(env):
+    """多明细订单：DC 只发了其中一行，未发货的行在门店端不可收。"""
+    client = env["client"]
+    # 门店补绑 102（fixture 默认只绑 101），以便下两行订单。
+    _raw_insert(env["store_path"], "测试乳制品B", CAT_DAIRY, 0.0, 102)
+
+    _login(client, 3, 2)  # store_staff
+    for cid in (101, 102):
+        client.post("/store-ordering/cart/add", data={
+            "dc": "dc_test", "canonical_id": cid, "quantity": "10", "unit": "件"})
+    client.post("/store-ordering/cart/submit", data={
+        "expected_delivery_date": datetime.now().strftime("%Y-%m-%d"), "note": ""})
+    oid = _one(env["master_path"],
+               "SELECT id FROM store_orders ORDER BY id DESC LIMIT 1")["id"]
+    rows = _q(env["master_path"],
+              "SELECT id, canonical_id FROM store_order_items WHERE order_id=?", (oid,))
+    oiid_a = next(r["id"] for r in rows if r["canonical_id"] == 101)
+    oiid_b = next(r["id"] for r in rows if r["canonical_id"] == 102)
+    _login(client, 4, 1)  # dc_mgr
+    client.post(f"/store-ordering/orders/{oid}/review",
+                data={"decision": "approved", "note": "ok"})
+
+    # DC 只发 101 那一行 → 订单仍 approved。
+    _ship(client, oid, oiid_a, 10)
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+
+    # 未发货行（102）收货 → 拒绝。
+    _receive(client, oid, oiid_b, 1)
+    assert float(_item_state(env, oiid_b)["fulfilled_quantity"]) == 0.0
+
+    # 已发货行（101）可收；整单仍未收齐。
+    _receive(client, oid, oiid_a, 10)
+    assert float(_item_state(env, oiid_a)["fulfilled_quantity"]) == 10.0
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+
+
+def test_B20_multi_batch_ship_receive_then_delivered(env):
+    """端到端分批：发 5 → 收 5 → 再发 95 → 再收 95 → delivered。"""
+    client = env["client"]
+    oid, oiid = _order_flow(env, qty=100.0)
+
+    _ship(client, oid, oiid, 5)
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+    _receive(client, oid, oiid, 5)
+    assert _order_status(env, oid) == sop.ORDER_STATUS_APPROVED
+
+    _ship(client, oid, oiid, 95)
+    assert _order_status(env, oid) == sop.ORDER_STATUS_SHIPPED  # 本批发齐
+    _receive(client, oid, oiid, 95)
+    assert _order_status(env, oid) == sop.ORDER_STATUS_DELIVERED
+
+    st = _item_state(env, oiid)
+    assert float(st["shipped_quantity"]) == 100.0
+    assert float(st["fulfilled_quantity"]) == 100.0
 
 
 if __name__ == "__main__":
