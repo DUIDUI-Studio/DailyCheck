@@ -15,7 +15,7 @@
 {% if products %}
   <div class="card-list card-list-3">
     {% for p in products %}
-    <div class="card" data-href="{{ url_for('production.session') }}?product_id={{ p['id'] }}">
+    <div class="card" data-href="{{ url_for('production.session') }}?product_id={{ p['id'] }}" data-row>
       <div class="card-main">
         <h3>{{ p['name'] }}</h3>
         <p class="muted">单位：{{ p['unit'] }}{% if p['note'] %} · {{ p['note'] }}{% endif %}</p>
@@ -24,7 +24,7 @@
       {% if is_platform_admin %}
       <div class="card-actions">
         <a class="btn-sm" href="{{ url_for('production.product_edit', product_id=p['id']) }}">编辑配方</a>
-        <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" onsubmit="return confirm('确认删除该产品？');">
+        <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" data-ajax data-ajax-confirm="确认删除该产品？">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>

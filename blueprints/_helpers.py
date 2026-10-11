@@ -8,8 +8,13 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
-from flask import Blueprint, abort, flash, g, redirect, render_template, request, url_for
-from werkzeug.security import generate_password_hash
+from flask import (
+    g,
+    jsonify,
+    render_template,
+    request,
+    session,
+)
 
 from db import get_warehouse_db
 
@@ -176,6 +181,61 @@ def register_jinja_filters(app) -> None:
     app.jinja_env.filters["fmt_money"] = fmt_money
 
 
+def wants_ajax() -> bool:
+    """True for AJAX requests sent by static/ajax-form.js.
+
+    We accept both `X-Requested-With: fetch` (set by our interceptor) and
+    `Accept: application/json` (forward-compatible for tools / tests).
+    """
+    h = request.headers
+    if h.get("X-Requested-With", "").lower() == "fetch":
+        return True
+    accept = h.get("Accept", "")
+    return "application/json" in accept
+
+
+def register_ajax_handlers(app) -> None:
+    """after_request hook: convert 3xx redirects into JSON for AJAX callers.
+
+    When a row-level action (delete / rollback / toggle / ...) is submitted
+    via the ajax-form.js interceptor, the view still does its PRG
+    `redirect(...)` as normal. This hook catches the resulting 3xx and
+    rewrites it into a 200 JSON envelope so the client can decide what to
+    do locally (default: remove the row from the DOM). The original
+    redirect target is preserved in `location`, and any pending flash
+    message is drained into `message`.
+
+    Non-AJAX requests (full-page POST, browser navigation, MCP, ...)
+    keep the existing redirect behaviour byte-for-byte — zero observable
+    change for everyone who doesn't use the interceptor.
+    """
+
+    @app.after_request
+    def _ajax_redirect_to_json(response):
+        if not wants_ajax():
+            return response
+        # Only intercept the success-path PRG redirects.
+        if not (300 <= response.status_code < 400):
+            return response
+        # Build JSON envelope. after_request MUST return a Response (not a
+        # tuple) — Flask later calls response.vary.add("Cookie") and other
+        # attrs on it, which tuples don't support.
+        location = response.headers.get("Location")
+        # Drain pending flash messages so the AJAX client can surface them.
+        # For AJAX callers there is no next full-page render to consume them,
+        # so popping is the right thing. Non-AJAX callers never reach here.
+        flashes = session.pop("_flashes", []) if "_flashes" in session else []
+        message = "\n".join(str(m) for _, m in flashes) if flashes else ""
+        payload = {"ok": True}
+        if location:
+            payload["location"] = location
+        if message:
+            payload["message"] = message
+        envelope = jsonify(payload)
+        envelope.status_code = 200  # explicit; jsonify defaults to 200 anyway
+        return envelope
+
+
 def register_template_context(app) -> None:
     """Expose current_role and g.user/is_admin to every template.
 
@@ -194,6 +254,7 @@ def register_template_context(app) -> None:
                 # available (e.g. CLI / error handlers). The read is
                 # idempotent; no row mutation.
                 import sqlite3 as _sq
+
                 from config import MASTER_DB
                 with _sq.connect(MASTER_DB) as m:
                     row = m.execute(

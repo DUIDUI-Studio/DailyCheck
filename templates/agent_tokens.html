@@ -81,7 +81,7 @@
   </thead>
   <tbody>
     {% for t in tokens %}
-    <tr>
+    <tr data-row>
       <td>
         <strong>{{ t.name }}</strong>
         <small class="muted">#{{ t.id }}</small>
@@ -126,7 +126,8 @@
       <td>
         {% if not t.revoked_at %}
         <form method="post" action="{{ url_for('agent_tokens.revoke_token', token_id=t.id) }}"
-              onsubmit="return confirm('撤销后使用此 Token 的 Agent 将无法连接。确认撤销 {{ t.name }} 吗？')"
+              data-ajax data-ajax-mode="reload-stay"
+              data-ajax-confirm="撤销后使用此 Token 的 Agent 将无法连接。确认撤销 {{ t.name }} 吗？"
               style="display:inline">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn btn-sm btn-danger">撤销</button>

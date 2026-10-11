@@ -15,7 +15,7 @@
 <table>
   <tr><th>批次ID</th><th>创建时间</th><th>备注</th><th>盘点品项数</th><th>状态</th><th>操作</th></tr>
   {% for b in batches %}
-  <tr>
+  <tr data-row>
     <td>#{{ b.id }}</td>
     <td>{{ b.created_at }}</td>
     <td>{{ b.note }}</td>
@@ -29,12 +29,12 @@
       {% if b.rolled_back == 0 and b.status != 'approved' %}
       <div class="inline">
         <a href="{{ url_for('stocktake.edit', batch_id=b.id) }}" class="btn-sm btn-edit">查看</a>
-        <form method="post" action="{{ url_for('stocktake.approve', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认审核通过？盘亏将计入出库，盘盈将调整为库存');">
+        <form method="post" action="{{ url_for('stocktake.approve', batch_id=b.id) }}" class="inline" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认审核通过？盘亏将计入出库，盘盈将调整为库存">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn-sm" style="background:var(--success);color:#fff;border:none;padding:2px 8px;border-radius:4px;cursor:pointer">审核通过</button>
         </form>
         {% if current_role != 'staff' %}
-        <form method="post" action="{{ url_for('stocktake.rollback', batch_id=b.id) }}" class="inline" onsubmit="return confirm('确认删除该批次？');">
+        <form method="post" action="{{ url_for('stocktake.rollback', batch_id=b.id) }}" class="inline" data-ajax data-ajax-confirm="确认删除该批次？">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn-sm btn-delete">删除批次</button>
         </form>

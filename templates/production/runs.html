@@ -26,7 +26,7 @@
 {% if runs %}
 <div class="runs-table">
   {% for r in runs %}
-  <div class="runs-row">
+  <div class="runs-row" data-row>
     <div class="runs-head">
       <span class="runs-time">{{ r['created_at'] }}</span>
       <span class="runs-product">{{ r['product_name'] }} <small class="muted">产出 {{ r['output_qty'] | fmt_qty }} {{ r['product_unit'] }}</small></span>
@@ -34,14 +34,14 @@
       <span class="runs-actions">
         {% if r['rolled_back'] == 0 %}
         {% if current_role != 'staff' %}
-        <form method="post" action="{{ url_for('production.rollback', run_id=r['id']) }}" onsubmit="return confirm('确认回退？库存将归还。');">
+        <form method="post" action="{{ url_for('production.rollback', run_id=r['id']) }}" data-ajax data-ajax-confirm="确认回退？库存将归还。">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm" type="submit">回退</button>
         </form>
         {% endif %}
         {% endif %}
         {% if current_role != 'staff' %}
-        <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" onsubmit="return confirm('确认删除该记录？');">
+        <form method="post" action="{{ url_for('production.delete_run', run_id=r['id']) }}" data-ajax data-ajax-confirm="确认删除该记录？">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>

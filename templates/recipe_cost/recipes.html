@@ -12,7 +12,7 @@
 {% if recipes %}
   <div class="card-list recipe-cards">
     {% for r in recipes %}
-    <div class="card recipe-card">
+    <div class="card recipe-card" data-row>
       <div class="recipe-card__head">
         <div class="recipe-card__title">
           <h3>{{ r['name'] }}</h3>
@@ -27,7 +27,7 @@
       <div class="recipe-card__actions">
         <a class="btn-sm" href="{{ url_for('recipe_cost.recipe_edit', recipe_id=r['id']) }}">编辑</a>
         <a class="btn-sm" href="{{ url_for('recipe_cost.recipe_bom_export_csv', recipe_id=r['id']) }}">📥 BOM</a>
-        <form method="post" action="{{ url_for('recipe_cost.recipe_delete', recipe_id=r['id']) }}" onsubmit="return confirm('确认删除该出品配方？');">
+        <form method="post" action="{{ url_for('recipe_cost.recipe_delete', recipe_id=r['id']) }}" data-ajax data-ajax-confirm="确认删除该出品配方？">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>

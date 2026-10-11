@@ -62,7 +62,7 @@
   <thead><tr><th>仓库</th><th>类型</th><th>items.id</th><th>sku</th><th>name</th><th>is_alias</th><th>canonical_status</th><th>本仓状态</th><th></th></tr></thead>
   <tbody>
     {% for b in bindings %}
-    <tr>
+    <tr data-row>
       <td>{{ b['warehouse_code'] }}</td>
       <td>{{ wh_type_labels.get(b['warehouse_type'], b['warehouse_type'] or '—') }}</td>
       <td>{{ b['id'] }}</td>
@@ -79,7 +79,7 @@
       </td>
       <td>
         {% if g.user and g.user['is_admin'] and b['warehouse_type'] == 'storefront' %}
-        <form method="post" action="{{ url_for('canonical.canonical_binding_active') }}" class="inline">
+        <form method="post" action="{{ url_for('canonical.canonical_binding_active') }}" class="inline" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="warehouse_code" value="{{ b['warehouse_code'] }}" />
           <input type="hidden" name="canonical_id" value="{{ canonical['id'] }}" />

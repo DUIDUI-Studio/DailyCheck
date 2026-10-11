@@ -467,6 +467,8 @@ sequenceDiagram
     F->>DB: teardown_appcontext → close_dbs()
 ```
 
+**AJAX 双路径契约**：`static/ajax-form.js` 给请求打 `X-Requested-With: fetch` + `Accept: application/json`。`register_ajax_handlers(app)` 注册的 after_request hook 检测到这两个头时，把视图的 3xx redirect 改写成 200 JSON 信封 `{ok, location, message}`，同时 drain Flask flash 进 `message`；非 AJAX 路径（浏览器整页 POST / curl / MCP）保留 302 redirect 字节级不变。详见 §13.7。
+
 ### 7.2 MCP（HTTP Bearer）
 
 ```mermaid
@@ -766,6 +768,7 @@ flowchart TB
         E2E["test_*_e2e.py<br/>端到端 ~5%"]
         Acceptance["test_acceptance_*.py<br/>验收脚本 39 用例全绿"]
         Aux["test_aux_unit.py /<br/>test_master_db_migrate.py /<br/>test_nav_integration.py<br/>pre-existing 18 failed 来源"]
+        Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>6 用例"]
     end
 
     subgraph Conftest["tests/conftest.py"]
@@ -791,7 +794,7 @@ flowchart TB
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
 
-**基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+**基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
@@ -856,13 +859,30 @@ with app.test_client() as c, c.session_transaction() as s:
 
 ⚠️ **坑**：手动 `Cookie: session=<签名串>` 在 `test_client` 里**不被识别**，必须用 `session_transaction()`。
 
+### 13.7 AJAX 双路径契约（2026-10-11 起）
+
+`static/ajax-form.js` + `register_ajax_handlers(app)` 联合实现"行内小动作不再整页重画"。
+
+**约定**：
+- 视图函数**不感知** AJAX / 非 AJAX 差异，依旧 `redirect(url) + flash(msg)`（PRG 模式不变）。
+- 客户端 marker：`X-Requested-With: fetch`（主） OR `Accept: application/json`（forward-compat）—— 任一即可。
+- 服务端 after_request hook 仅在 3xx 命中时改写；4xx / 5xx 原样透传（让 `fetch().ok=false` 走 alert 失败分支）。
+- ⚠️ **坑**：after_request hook **必须返回 Response 对象**，不能返回 `(jsonify(...), 200)` tuple。Flask 后处理 `response.vary.add("Cookie")` 对 tuple AttributeError。
+
+**模板侧**：
+- 行内 form 加 `data-ajax`；删除/回退类给行 `<tr>` / `<div>` 加 `data-row`，点完该行消失。
+- toggle 类（启用停用、角色保存、标记已读）显式 `data-ajax-mode="reload-stay"` —— reload 但用 sessionStorage 缓存 scrollY + pageshow 还原，**不能**用默认 remove（会把状态文字一起删）。
+- `onsubmit="return confirm(...)"` 在 ajax 路径下失效，必须迁移到 `data-ajax-confirm`。
+
+**非 AJAX 路径**（curl / Python 测试 / MCP / 浏览器整页 POST）—— 302 redirect 字节级不变。
+
 ---
 
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
-| 18 failed 测试 | 中 | pre-existing | 商业化前必须归零 |
+| 18 failed 测试（本地 16） | 中 | pre-existing | 商业化前必须归零 |
 | 时区不一致 | **高** | pre-existing | 多租户改造前必修 |
 | 配方成本 qty 语义不一致 | **高** | pre-existing (2026-09-02 起) | 财务对账会出错，待 owner 拍板 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |

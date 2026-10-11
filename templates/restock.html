@@ -16,7 +16,7 @@
       <div class="record-day">{{ day }}</div>
       {% set ns.prev_day = day %}
     {% endif %}
-    <div class="record-card">
+    <div class="record-card" data-row>
       <div class="rc-main">
         <p class="rc-name">
           {{ r.item_name }} <small class="muted">{{ r.unit }}</small>
@@ -36,7 +36,7 @@
         </div>
         <div class="rc-actions">
           {% if current_role != 'staff' and r.source == 'manual' %}
-          <form method="post" action="{{ url_for('restock.delete', req_id=r.request_id) }}" onsubmit="return confirm('确认删除该记录？删除后将回滚库存。');">
+          <form method="post" action="{{ url_for('restock.delete', req_id=r.request_id) }}" data-ajax data-ajax-confirm="确认删除该记录？删除后将回滚库存。">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn-sm btn-delete">删除</button>
           </form>
