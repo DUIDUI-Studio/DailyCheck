@@ -58,7 +58,9 @@ jobs:
 
   deploy:
     needs: test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # 生产部署暂禁自动触发（2026-10-11 Eric 拍板）：仅允许 workflow_dispatch 手动执行。
+    # 生产部署正式启用前须：VPS 安装备份 cron + 异地副本 + 一次真实部署演练。
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
