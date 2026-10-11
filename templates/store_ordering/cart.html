@@ -28,6 +28,7 @@
       <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
       <td>
         <form method="post" action="{{ url_for('store_ordering.update_cart_item', cart_item_id=item.cart_item_id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input name="quantity" type="number" min="0" step="0.01" value="{{ item.quantity | fmt_qty }}" required />
           <button type="submit" class="btn-sm">更新</button>
         </form>
@@ -35,6 +36,7 @@
       <td>¥ {{ (item.line_subtotal or 0) | fmt_money }}</td>
       <td>
         <form method="post" action="{{ url_for('store_ordering.remove_cart_item_route', cart_item_id=item.cart_item_id) }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn-sm danger">删除</button>
         </form>
       </td>
@@ -51,6 +53,7 @@
 
 <div class="actions" style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;">
   <form method="post" action="{{ url_for('store_ordering.clear_cart_route') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit" class="btn-sm">清空购物车</button>
   </form>
   <a class="btn-sm" href="{{ url_for('store_ordering.catalog') }}">继续购物</a>

@@ -5,6 +5,7 @@
 <p>未来 {{ horizon }} 天预测，基于过去 30 天加权日均消耗。</p>
 
 <form method="post" action="{{ url_for('forecast.forecast_recompute') }}" style="margin: 12px 0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <button type="submit">手动重算</button>
 </form>
 

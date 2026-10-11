@@ -13,6 +13,7 @@
 {% endif %}
 
 <form method="post" enctype="multipart/form-data" class="grid cols-2">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>Excel 文件(.xlsx)</span>
     <input type="file" name="file" accept=".xlsx" required>

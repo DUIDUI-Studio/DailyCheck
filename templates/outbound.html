@@ -2,6 +2,7 @@
 {% block content %}
 <h2>出库记录</h2>
 <form method="post" action="{{ url_for('outbound.outbound_start') }}" class="form-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <button type="submit">新建出库</button>
 </form>
 
@@ -26,6 +27,7 @@
         {% else %}
           {% if current_role != 'staff' %}
           <form method="post" action="{{ url_for('outbound.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该出库记录？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit">删除</button>
           </form>
           {% endif %}

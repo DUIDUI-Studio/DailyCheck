@@ -4,6 +4,7 @@
 <div class="page-header"><h2>批量导入主数据 (T22)</h2></div>
 
 <form method="post" enctype="multipart/form-data" class="form-section">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <p>CSV 列: <code>warehouse_code, current_sku, item_id, current_name,
     current_unit, current_quantity, bind_to_canonical, is_store_exclusive, will_change</code></p>
   <p><small>系统按 <code>(name, unit)</code> 唯一组合判定:已存在则 UPDATE,

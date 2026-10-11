@@ -17,6 +17,7 @@
       {% endif %}
     {% endwith %}
     <form method="post" action="{{ url_for('auth.login') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <label>账号
         <input name="username" required autofocus autocomplete="username" />
       </label>

@@ -18,7 +18,7 @@ TOKEN_PREFIX_LEN = 8
 
 _SELECT_COLS = (
     "SELECT id, token_hash, revoked_at, allowed_read_paths_json, "
-    "allowed_write_paths_json, allowed_warehouse_codes_json "
+    "allowed_write_paths_json, allowed_warehouse_codes_json, rate_limit "
     "FROM agent_tokens "
 )
 
@@ -34,6 +34,7 @@ class AuthContext:
     allowed_read_paths: list[str]
     allowed_write_paths: list[str]
     allowed_warehouses: list[str] | None  # None = all warehouses
+    rate_limit: int | None = None  # 每分钟配额，None = 默认（rate_limit_pure）
 
 
 def authenticate(authorization_header: str) -> AuthContext | None:
@@ -72,6 +73,7 @@ def authenticate(authorization_header: str) -> AuthContext | None:
                 allowed_read_paths=read_paths,
                 allowed_write_paths=write_paths,
                 allowed_warehouses=wh_codes,
+                rate_limit=row["rate_limit"],
             )
     return None
 

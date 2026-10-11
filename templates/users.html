@@ -6,6 +6,7 @@
 <details class="card" style="margin-bottom:16px" open>
   <summary><strong>新建账号</strong></summary>
   <form method="post" action="{{ url_for('users.create_user') }}" style="margin-top:12px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="grid cols-2">
       <label>账号
         <input name="username" required autocomplete="off" />
@@ -46,6 +47,7 @@
 <details class="card" style="margin-bottom:16px" open>
   <summary><strong>创建仓库</strong></summary>
   <form method="post" action="{{ url_for('users.create_warehouse') }}" style="margin-top:12px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <fieldset style="border:1px solid #e5e7eb;border-radius:8px;padding:8px 14px;margin-bottom:10px">
       <legend style="padding:0 6px;color:#374151">仓库类型</legend>
       <label style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">
@@ -152,6 +154,7 @@
             <span class="role-row-label"><strong>{{ w['name'] }}</strong></span>
             {% if bindings.get(w['id']) %}
               <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" class="role-row-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
                 <select name="role">
                   <option value="staff" {% if bindings[w['id']] == 'staff' %}selected{% endif %}>staff</option>
@@ -161,12 +164,14 @@
                 <button type="submit" class="btn-sm btn-edit">保存</button>
               </form>
               <form method="post" action="{{ url_for('users.unbind_role', user_id=u['id']) }}" class="role-row-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
                 <button type="submit" class="btn-sm btn-delete"
                         onclick="return confirm('确认解除 {{ u['username'] }} 在 {{ w['name'] }} 的权限?')">解绑</button>
               </form>
             {% else %}
               <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" class="role-row-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
                 <select name="role">
                   <option value="staff">staff</option>
@@ -184,6 +189,7 @@
     <details class="user-card-section">
       <summary>重置密码</summary>
       <form method="post" action="{{ url_for('users.reset_password', user_id=u['id']) }}" class="role-row-form" style="margin-top:8px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input name="password" type="password" required placeholder="新密码" autocomplete="new-password" />
         <button type="submit" class="btn-sm btn-edit">保存</button>
       </form>
@@ -192,11 +198,13 @@
     <div class="user-card-actions">
       {% if u['id'] != current_user_id %}
       <form method="post" action="{{ url_for('users.toggle_admin', user_id=u['id']) }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn-sm" onclick="return confirm('确认切换平台管理员状态?')">
           {% if u['is_admin'] %}取消管理员{% else %}设为管理员{% endif %}
         </button>
       </form>
       <form method="post" action="{{ url_for('users.delete_user', user_id=u['id']) }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn-sm btn-delete"
                 onclick="return confirm('确认永久删除 {{ u['username'] }}?此操作不可撤销。')">
           删除账号
@@ -223,6 +231,7 @@
     <details>
       <summary class="btn-sm btn-delete">初始化仓库</summary>
       <form method="post" action="{{ url_for('users.init_warehouse', warehouse_id=w['id']) }}" style="margin-top:8px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label style="display:block;font-size:13px;margin-bottom:6px">
           输入 <code>{{ w['code'] }}</code> 二次确认:
         </label>

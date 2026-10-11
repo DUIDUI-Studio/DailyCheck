@@ -52,6 +52,7 @@
 </div>
 {% else %}
 <form method="post" class="grid cols-3">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>品项名称</span>
     <input name="name" value="{{ item.name }}" required />

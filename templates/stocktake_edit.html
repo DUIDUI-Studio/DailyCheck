@@ -3,6 +3,7 @@
 <h2>修改盘点批次 #{{ batch.id }}</h2>
 <p class="meta">备注：{{ batch.note or "无" }}</p>
 <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <table>
     <tr>
       <th>品类</th>

@@ -8,6 +8,7 @@
 </div>
 
 <form method="post" class="form-block">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>产品名称 <input name="name" required value="{{ product['name'] if product else '' }}" /></label>
   <label>产出单位 <input name="unit" value="{{ product['unit'] if product else '件' }}" /></label>
   <label>备注 <input name="note" value="{{ product['note'] if product else '' }}" /></label>
@@ -20,6 +21,7 @@
 <p class="muted">每生产 1 单位产品，消耗多少该原料。</p>
 
 <form method="post" id="bom-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="name" value="{{ product['name'] }}" />
   <input type="hidden" name="unit" value="{{ product['unit'] }}" />
   <input type="hidden" name="note" value="{{ product['note'] or '' }}" />

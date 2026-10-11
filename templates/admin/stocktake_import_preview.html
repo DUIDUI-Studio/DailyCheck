@@ -50,6 +50,7 @@
 
 <form method="post" action="{{ url_for('stocktake.stocktake_csv_commit') }}"
       onsubmit="return confirm('确认将 {{ matched|length }} 条盘点数据写入批次 #{{ batch_id }}?');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="form-actions">
     <a href="{{ url_for('stocktake.stocktake_list') }}" class="btn-sm">取消</a>
     <a href="{{ url_for('stocktake.stocktake_csv_form') }}" class="btn-sm">返回修改</a>

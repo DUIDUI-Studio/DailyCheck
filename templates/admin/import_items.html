@@ -9,6 +9,7 @@
 </p>
 
 <form method="post" enctype="multipart/form-data" class="grid cols-2">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>目标仓库</span>
     <div><strong>{{ target_wh_name }}</strong> ({{ target_wh_code }})</div>

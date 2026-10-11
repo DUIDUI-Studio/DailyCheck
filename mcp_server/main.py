@@ -4,18 +4,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 import click
+from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
-from mcp.server.sse import SseServerTransport
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_server.protocol.server import build_server
 
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +71,9 @@ class AuthMiddleware:
 
     def __init__(self, app) -> None:
         self.app = app
+        # P0-4 per-token 配额：key=token_id，每 token 独立滑动窗口。
+        # 单 uvicorn 进程内共享；重启清零（v1 约定，见 rate_limit_pure）。
+        self._limiters: dict[int, object] = {}
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] != "http":
@@ -94,6 +97,23 @@ class AuthMiddleware:
             from mcp_server.service.auth import authenticate, set_current_auth
             ctx = authenticate(auth) if auth.startswith("Bearer ") else None
             if ctx is not None:
+                # P0-4: per-token 滑动窗口配额（默认 MCP_DEFAULT_RATE_LIMIT/分钟）。
+                from rate_limit_pure import SlidingWindowLimiter, mcp_quota_limit
+
+                limiter = self._limiters.get(ctx.token_id)
+                if limiter is None:
+                    limiter = SlidingWindowLimiter(
+                        max_events=mcp_quota_limit(ctx.rate_limit),
+                        window_seconds=60.0,
+                    )
+                    self._limiters[ctx.token_id] = limiter
+                if not limiter.hit(f"token-{ctx.token_id}"):
+                    resp = JSONResponse(
+                        {"error": "rate_limited", "message": "Token quota exceeded"},
+                        status_code=429,
+                    )
+                    await resp(scope, receive, send)
+                    return
                 # Publish the context two ways: in the ASGI scope (transport
                 # level) and in a ContextVar — tool handlers are sync functions
                 # with no access to scope, so the ContextVar is what actually

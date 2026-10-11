@@ -80,6 +80,7 @@
       <td>
         {% if g.user and g.user['is_admin'] and b['warehouse_type'] == 'storefront' %}
         <form method="post" action="{{ url_for('canonical.canonical_binding_active') }}" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="warehouse_code" value="{{ b['warehouse_code'] }}" />
           <input type="hidden" name="canonical_id" value="{{ canonical['id'] }}" />
           <input type="hidden" name="active" value="{{ '0' if b['is_active'] else '1' }}" />

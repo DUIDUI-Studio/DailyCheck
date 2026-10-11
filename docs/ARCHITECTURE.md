@@ -33,7 +33,8 @@
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
-- **核心约束**：单租户、单 SQLite 部署，**未做多租户隔离**（商业化首要改造项）。
+- **核心约束**：多租户 PoC 已落地（2026-10-10，轻方案：tenants 注册表 + 三表 tenant_id +
+  请求级租户闸；canonical 扇出/订单/MCP 全链路租户化为 PoC 后续阶段）。
 
 ---
 
@@ -113,13 +114,13 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    GitHub["GitHub Actions<br/>(.github/workflows/deploy.yml)"]
+    GitHub["GitHub Actions<br/>(.github/workflows/ci.yml)"]
     VPS["VPS 112.124.18.246:33756 root<br/>/root/DailyCheck"]
     Gunicorn["gunicorn -w 2 --threads 4<br/>-b 127.0.0.1:8090 app:app<br/>(**非 wdg-systemd**)"]
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    GitHub -->|SSH: tar + pip install| VPS
+    GitHub -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -134,7 +135,8 @@ flowchart LR
 | **进程管理器** | systemd in container | gunicorn -D（无 systemd） |
 | **Flask reload** | `--debug` 自动 reload | 无 |
 | **MCP 进程** | systemd unit | **未部署**（MCP 只在 dev 跑） |
-| **部署方式** | mount + edit | `pkill gunicorn → tar → pip install → gunicorn -D`（无回滚） |
+| **部署方式** | mount + edit | `ci.yml` test 通过后走 `scripts/deploy_vps.sh`：sqlite 热备全库 + 代码备份 → rsync 切换（`*.db`/log/venv 永不触碰）→ `flask migrate up` → systemd 重启 → `/health` 探活 → 失败自动回滚代码并重启。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑） |
+| **备份/DR** | 无 | `scripts/backup_all.sh`（cron 每日，integrity_check + tar + 可选异地）+ `scripts/verify_restore.sh`（每周还原演练）+ `docs/runbook-dr.md`（RPO=24h/RTO=1h） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
 ---
@@ -145,16 +147,17 @@ flowchart LR
 
 ```
 db/
-├── master.db                          # 单文件，全局
-└── warehouses/
-    ├── wh_001.db  (中央仓 storefront)
-    ├── wh_002.db  (新世界 storefront)
-    ├── wh_003.db  (新天地 storefront)
-    ├── wh_004.db  (韩国街 storefront)
-    ├── wh_006.db  (浦发时光里 storefront)
-    ├── wh_010.db  (泰柯富阳 storefront)
-    ├── wh_000.db  (配送中心 distribution_center)
-    └── rd_001.db  (研发 rd)
+├── master.db                          # 单文件，全局（含 tenants 注册表）
+├── warehouses/                        # 租户 1（存量单租户）的仓
+│   ├── wh_001.db  (中央仓 storefront)
+│   ├── wh_002.db  (新世界 storefront)
+│   ├── wh_003.db  (新天地 storefront)
+│   ├── wh_004.db  (韩国街 storefront)
+│   ├── wh_006.db  (浦发时光里 storefront)
+│   ├── wh_010.db  (泰柯富阳 storefront)
+│   ├── wh_000.db  (配送中心 distribution_center)
+│   └── rd_001.db  (研发 rd)
+└── tenants/<tid>/warehouses/*.db      # 租户 N（PoC 起新租户的放置路径）
 ```
 
 ### 4.2 master.db 核心表（ER 简图）
@@ -326,6 +329,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。
 
 ---
 
@@ -541,6 +545,28 @@ flowchart TB
 
 **注意**：`@require_role` 和 `@require_platform_admin` 都允许 `is_admin=1` 通过。`@require_platform_admin` 反而**要求** `is_admin`，这是有意区分（前者"在这个仓库里权限够" vs 后者"全局管理权限"）。
 
+### 8.6 租户隔离（P0-1 轻方案 PoC，2026-10-10 起）
+
+- `master.db`：`tenants` 注册表 + `users/warehouses/canonical_items.tenant_id`（默认 1 = 存量单租户，老库 ALTER 自动回填）。
+- 请求上下文：`g.tenant_id`（auth 钩子从 user 行取）。
+- 三道闸：① 钩子加载仓库时校验 `warehouse.tenant_id == user.tenant_id`（`is_admin` 平台管理员豁免）② picker 只列本租户 ③ `/select-warehouse/<id>` 租户闸先行（跨租户脏绑定 → 403）。
+- 新仓放置：租户 1 保持 `db/warehouses/`；租户 N 落 `db/tenants/<N>/warehouses/`（`flask create-warehouse --tenant N`）。
+- **PoC 未覆盖（后续阶段）**：canonical 扇出/订单/MCP token/报表查询的租户化过滤；当前仅列/读仓与选择入口强制。回归 `tests/test_tenant_isolation.py`（8 用例）。
+
+### 8.4 CSRF 保护（2026-10-10 起）
+
+- `app.py` 挂 `CSRFProtect`（Flask-WTF）；`_csrf_testing_gate` 在 `CSRFProtect` **之前**注册（Flask before_request 按 FIFO 执行），`TESTING=True` 时默认关闭 CSRF（存量测试零改动），专测设 `WTF_CSRF_FORCE_ENABLED=True` 打开。
+- 所有 `method="post"` 表单均带 `{{ csrf_token() }}`（`scripts/add_csrf_tokens.py` 注入 + `--check` 校验，新增模板后跑一次）。
+- MCP（`/api/mcp/`）在独立 Starlette 进程、Bearer 鉴权，不经 Flask CSRF。
+- 回归：`tests/test_csrf.py`（7 用例）。
+
+### 8.5 Rate limiting（P0-4，2026-10-10 起）
+
+- **全局**：`app.py` 内存滑动窗口（`rate_limit_pure.SlidingWindowLimiter`），每 IP 600 次/分钟（env `DAILYCHECK_RATE_LIMIT_PER_MIN` 可调），`/health`/static 豁免；TESTING 默认关（`RATE_LIMIT_FORCE_ENABLED` 打开）；超限 429。gunicorn 多 worker 各自计数、重启清零（v1 约定，Redis 升级路径预留）。
+- **登录锁定**：master.db `login_throttle` 表（跨 worker），(ip, username) 维度，15 分钟窗内连错 5 次 → 锁 30 分钟；成功登录清零。**时间一律 UTC naive**（`datetime.utcnow()`），与进程时区无关，规避生产 CST/UTC 坑。
+- **MCP per-token 配额**：`agent_tokens.rate_limit` 列（NULL=`MCP_DEFAULT_RATE_LIMIT`=120/分钟），`AuthMiddleware` 内存滑动窗口按 token_id 限速，超限 429；单进程内共享、重启清零。
+- 回归：`tests/test_rate_limit.py`（15 用例）。
+
 ---
 
 ## 9. MCP 架构
@@ -722,6 +748,7 @@ flowchart LR
 
 **现状**：
 - ✅ Service Worker 离线缓存 + PWA install
+- ✅ CSRF token 全表单覆盖（P0-3，2026-10-10）
 - ✅ manifest.webmanifest（standalone、minimal-ui、theme_color teal）
 - ❌ **无 push notifications**
 - ❌ **无 background sync**（离线写不能排队）
@@ -764,7 +791,12 @@ flowchart TB
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
 
-**基线（2026-10-10）**：18 failed / 711 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+**基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。
+
+**CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
+- ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
+- `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
+- `deploy` job `needs: test`：CI 不过不部署（PR 触发不部署）。
 
 **Pre-existing 18 failed 分布**：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / nav_integration×2 / procurement_route×1 / recipe_cost_route×1`
@@ -860,6 +892,8 @@ with app.test_client() as c, c.session_transaction() as s:
 ### 评估 / 计划
 
 - [`docs/2026-10-10-commercialization-gap-assessment.md`](2026-10-10-commercialization-gap-assessment.md) — 商业化差距评估
+- [`docs/2026-10-10-commercialization-p0-dev-test-plan.md`](2026-10-10-commercialization-p0-dev-test-plan.md) — P0 收敛开发/测试计划
+- [`docs/runbook-dr.md`](runbook-dr.md) — 灾难恢复手册（备份/还原/整机重建）
 
 ### 集成
 

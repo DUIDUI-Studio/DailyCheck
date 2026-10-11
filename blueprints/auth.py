@@ -13,15 +13,22 @@ from datetime import datetime
 from pathlib import Path
 
 from flask import (
-    Blueprint, abort, flash, g, jsonify, redirect, render_template,
-    request, send_from_directory, session, url_for,
+    Blueprint,
+    abort,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    session,
+    url_for,
 )
 from werkzeug.security import check_password_hash
 
-from config import BASE_DIR, MASTER_DB, SECRET_KEY
-from db import get_master_db, init_warehouse_db
+from config import BASE_DIR
+from db import get_master_db
 from permissions import require_login
-
 
 bp = Blueprint("auth", __name__)
 pwa_bp = Blueprint("pwa", __name__)
@@ -46,6 +53,7 @@ def load_user_and_warehouse():
     g.warehouse = None
     g.role = None
     g.warehouse_db_path = None
+    g.tenant_id = None  # P0-1 多租户 PoC：请求级租户上下文
 
     user_id = session.get("user_id")
     warehouse_id = session.get("warehouse_id")
@@ -75,11 +83,16 @@ def load_user_and_warehouse():
         session.clear()
         return redirect(url_for("auth.login"))
 
+    # P0-1 多租户 PoC：平台管理员（is_admin=1）跨租户；普通用户锁定本租户。
+    g.tenant_id = g.user["tenant_id"]
+
     if warehouse_id is not None:
         row = master.execute(
             "SELECT * FROM warehouses WHERE id=?", (warehouse_id,)
         ).fetchone()
-        if row is not None:
+        if row is not None and (
+            g.user["is_admin"] or row["tenant_id"] == g.tenant_id
+        ):
             g.warehouse = row
             g.warehouse_db_path = str(BASE_DIR / row["db_path"])
             g.role = master.execute(
@@ -119,12 +132,52 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         master = get_master_db()
+
+        # 登录爆破锁定（P0-4）：先查锁再验密码。
+        # 时间一律 UTC naive（rate_limit_pure 约定），与进程时区无关。
+        from rate_limit_pure import login_lock_state, next_failure_state
+
+        ip = request.remote_addr or "unknown"
+        now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        throttle = master.execute(
+            "SELECT failed_count, locked_until, updated_at FROM login_throttle "
+            "WHERE ip=? AND username=?",
+            (ip, username),
+        ).fetchone()
+        locked, remaining = login_lock_state(
+            throttle["failed_count"] if throttle else 0,
+            throttle["locked_until"] if throttle else None,
+        )
+        if locked:
+            flash(f"失败次数过多，已临时锁定，请 {remaining // 60 + 1} 分钟后再试")
+            return render_template("login.html"), 429
+
         row = master.execute(
             "SELECT * FROM users WHERE username=?", (username,)
         ).fetchone()
         if row is None or not check_password_hash(row["password_hash"], password):
+            new_count, new_lock = next_failure_state(
+                throttle["failed_count"] if throttle else 0,
+                throttle["updated_at"] if throttle else None,
+            )
+            master.execute(
+                """INSERT INTO login_throttle (ip, username, failed_count,
+                                               locked_until, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(ip, username) DO UPDATE SET
+                       failed_count=excluded.failed_count,
+                       locked_until=excluded.locked_until,
+                       updated_at=excluded.updated_at""",
+                (ip, username, new_count, new_lock, now_str),
+            )
+            master.commit()
             flash("账号或密码错误")
             return render_template("login.html"), 401
+
+        # 登录成功：清除该 (ip, username) 的失败计数。
+        master.execute(
+            "DELETE FROM login_throttle WHERE ip=? AND username=?", (ip, username)
+        )
         session.clear()
         session["user_id"] = row["id"]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -162,13 +215,15 @@ def warehouse_picker():
             "SELECT id, code, name FROM warehouses ORDER BY id"
         ).fetchall()
     else:
+        # P0-1 多租户：非平台管理员只见本租户 + 有绑定关系的仓。
+        # （绑定与租户双闸——脏数据里跨租户绑定也不可见。）
         rows = master.execute(
             """SELECT w.id, w.code, w.name
                FROM warehouses w
                JOIN warehouse_users wu ON wu.warehouse_id = w.id
-               WHERE wu.user_id = ?
+               WHERE wu.user_id = ? AND w.tenant_id = ?
                ORDER BY w.id""",
-            (g.user["id"],),
+            (g.user["id"], g.user["tenant_id"]),
         ).fetchall()
     return render_template("warehouse_picker.html", warehouses=rows, no_sidebar=True)
 
@@ -183,6 +238,9 @@ def warehouse_select(warehouse_id: int):
     if wh is None:
         abort(404)
     if not g.user["is_admin"]:
+        # P0-1 多租户：租户闸先行（跨租户绑定视为脏数据，直接拒绝）。
+        if wh["tenant_id"] != g.user["tenant_id"]:
+            abort(403)
         binding = master.execute(
             "SELECT 1 FROM warehouse_users WHERE user_id=? AND warehouse_id=?",
             (g.user["id"], warehouse_id),
@@ -218,7 +276,6 @@ def audit(action: str, target_type: str | None = None,
     """Append an audit_log row to the current warehouse db."""
     if g.warehouse_db_path is None:
         return
-    import sqlite3
     from db import get_warehouse_db
     db = get_warehouse_db()
     db.execute(

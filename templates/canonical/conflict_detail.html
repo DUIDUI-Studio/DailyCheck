@@ -16,6 +16,7 @@
 </table>
 
 <form method="post" class="form-section">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>裁决</span>
     <select name="decision" required>

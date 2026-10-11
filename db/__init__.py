@@ -70,7 +70,16 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     is_admin INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    last_login_at TEXT
+    last_login_at TEXT,
+    tenant_id INTEGER NOT NULL DEFAULT 1
+);
+
+-- 多租户注册表（P0-1 轻方案 PoC）。tenant 1 = 存量单租户（默认）。
+CREATE TABLE IF NOT EXISTS tenants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',   -- active | disabled
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS warehouses (
@@ -79,7 +88,8 @@ CREATE TABLE IF NOT EXISTS warehouses (
     name TEXT NOT NULL,
     db_path TEXT NOT NULL,
     warehouse_type TEXT NOT NULL DEFAULT 'storefront',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    tenant_id INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS warehouse_users (
@@ -156,7 +166,19 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
     revoked_at TEXT,
     allowed_read_paths_json TEXT NOT NULL DEFAULT '[]',
     allowed_write_paths_json TEXT NOT NULL DEFAULT '[]',
-    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]'
+    allowed_warehouse_codes_json TEXT NOT NULL DEFAULT '[]',
+    rate_limit INTEGER
+);
+
+-- 登录爆破锁定（P0-4）：按 (ip, username) 记失败计数与锁定到期时间。
+-- 时间一律 UTC naive（rate_limit_pure 约定），与进程时区无关。
+CREATE TABLE IF NOT EXISTS login_throttle (
+    ip TEXT NOT NULL,
+    username TEXT NOT NULL,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (ip, username)
 );
 
 -- Cross-warehouse recipe publishing (R&D → storefronts).
@@ -256,6 +278,7 @@ CREATE INDEX IF NOT EXISTS idx_canonical_categories_code
 
 CREATE TABLE IF NOT EXISTS canonical_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id INTEGER NOT NULL DEFAULT 1,
     canonical_sku TEXT NOT NULL UNIQUE,    -- IC-000001，业务上只读（两阶段写入）
     name TEXT NOT NULL,                    -- 标准名
     category_code TEXT,                    -- 指向 canonical_categories.code（不存 id）
@@ -801,6 +824,43 @@ def init_master_db() -> None:
                         updated_at TEXT NOT NULL
                     )"""
                 )
+
+                # P0-4: agent_tokens.rate_limit（per-token MCP 配额/分钟，
+                # NULL = 用 rate_limit_pure.MCP_DEFAULT_RATE_LIMIT）。
+                at_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(agent_tokens)"
+                    ).fetchall()
+                }
+                if "rate_limit" not in at_cols:
+                    conn.execute(
+                        "ALTER TABLE agent_tokens ADD COLUMN rate_limit INTEGER"
+                    )
+
+                # P0-4: login_throttle 表（登录爆破锁定，见 MASTER_SCHEMA 注释）。
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS login_throttle (
+                        ip TEXT NOT NULL,
+                        username TEXT NOT NULL,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        locked_until TEXT,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (ip, username)
+                    )"""
+                )
+
+                # P0-1 多租户 PoC：存量表补 tenant_id（默认 1 = 存量单租户）。
+                for table in ("users", "warehouses", "canonical_items"):
+                    cols = {
+                        r[1] for r in conn.execute(
+                            f"PRAGMA table_info({table})"
+                        ).fetchall()
+                    }
+                    if cols and "tenant_id" not in cols:
+                        conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN "
+                            "tenant_id INTEGER NOT NULL DEFAULT 1"
+                        )
 
                 # recipe_versions UNIQUE constraint fix.
                 # The original schema had UNIQUE(recipe_type,

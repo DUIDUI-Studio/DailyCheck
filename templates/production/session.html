@@ -14,6 +14,7 @@
 
 {% if chosen and bom %}
 <form method="post" action="{{ url_for('production.submit') }}" class="session-form" id="prod-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="product_id" value="{{ chosen['id'] }}" />
 
   <div class="session-grid">

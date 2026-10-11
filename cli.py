@@ -61,6 +61,72 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(bulk_publish_canonical_cmd)
     app.cli.add_command(recompute_safety_stock_cmd)
     app.cli.add_command(backfill_prices_cmd)
+    app.cli.add_command(migrate_cmd)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  migrate（P0-6）：master.db 显式迁移入口。
+#  init_master_db() 的启动期幂等 ALTER 仍是兜底；新 schema 变更一律走这里。
+# ─────────────────────────────────────────────────────────────────────
+
+@click.group("migrate")
+@click.option(
+    "--db", "db_path", type=click.Path(path_type=Path), default=None,
+    help="目标 db（默认 master.db）。",
+)
+@click.pass_context
+def migrate_cmd(ctx: click.Context, db_path: Path | None) -> None:
+    """master.db schema 迁移（PRAGMA user_version 门控，迁移前自动备份）。"""
+    ctx.ensure_object(dict)
+    ctx.obj["db_path"] = db_path or Path(MASTER_DB)
+
+
+@migrate_cmd.command("status")
+@click.pass_context
+def migrate_status_cmd(ctx: click.Context) -> None:
+    """查看当前版本与待应用迁移。"""
+    from migrations import MIGRATIONS
+    from migrations_runner import current_version, pending_versions
+
+    db_path = ctx.obj["db_path"]
+    if not db_path.exists():
+        click.echo(f"{db_path} 不存在（user_version 视为 0）")
+        current = 0
+    else:
+        with closing(sqlite3.connect(db_path)) as conn:
+            current = current_version(conn)
+    pending = pending_versions(db_path, MIGRATIONS) if db_path.exists() else \
+        sorted(v for v, *_ in MIGRATIONS if v > 0)
+    click.echo(f"db: {db_path}")
+    click.echo(f"当前 user_version: {current}")
+    click.echo(f"注册迁移: {[v for v, *_ in MIGRATIONS]}")
+    click.echo(f"待应用: {pending}")
+
+
+@migrate_cmd.command("up")
+@click.pass_context
+def migrate_up_cmd(ctx: click.Context) -> None:
+    """应用全部待执行迁移（每个迁移前自动备份到 backups/migrations/）。"""
+    from migrations import MIGRATIONS
+    from migrations_runner import migrate_up
+
+    db_path = ctx.obj["db_path"]
+    applied = migrate_up(db_path, MIGRATIONS, BASE_DIR / "backups" / "migrations")
+    click.echo(f"applied: {applied or '（无待应用迁移）'}")
+
+
+@migrate_cmd.command("down")
+@click.argument("target_version", type=int)
+@click.pass_context
+def migrate_down_cmd(ctx: click.Context, target_version: int) -> None:
+    """回滚到指定版本（每步前自动备份；基线不可逆走备份还原）。"""
+    from migrations import MIGRATIONS
+    from migrations_runner import migrate_down
+
+    db_path = ctx.obj["db_path"]
+    reverted = migrate_down(db_path, target_version, MIGRATIONS,
+                            BASE_DIR / "backups" / "migrations")
+    click.echo(f"reverted: {reverted or '（无需回滚）'}")
 
 
 @click.command("init-master")
@@ -93,12 +159,32 @@ def migrate_legacy_cmd() -> None:
         "rd (研发中心, 无库存, recipe-only)."
     ),
 )
-def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
+@click.option(
+    "--tenant", "tenant_id", type=int, default=1, show_default=True,
+    help="所属租户 id（P0-1 多租户；1 = 存量单租户）。",
+)
+def create_warehouse_cmd(
+    code: str, name: str, warehouse_type: str, tenant_id: int,
+) -> None:
     """Register a new warehouse. The db file is created if missing."""
     from config import WAREHOUSE_DB_DIR
     from db import init_warehouse_db
 
-    db_path = WAREHOUSE_DB_DIR / f"{code}.db"
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        tenant_exists = conn.execute(
+            "SELECT 1 FROM tenants WHERE id=?", (tenant_id,)
+        ).fetchone()
+    if not tenant_exists and tenant_id != 1:
+        click.echo(f"租户 {tenant_id} 不存在（先 INSERT INTO tenants）", err=True)
+        raise click.exceptions.Exit(1)
+    # 租户 1 = 存量单租户，隐式存在：缺失时自动补登记（老库平滑升级）。
+
+    # 多租户 PoC 路径布局：租户 1 保持 db/warehouses/（兼容存量），
+    # 其他租户落 db/tenants/<tid>/warehouses/
+    if tenant_id == 1:
+        db_path = WAREHOUSE_DB_DIR / f"{code}.db"
+    else:
+        db_path = BASE_DIR / "db" / "tenants" / str(tenant_id) / "warehouses" / f"{code}.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_warehouse_db(db_path)
 
@@ -107,13 +193,14 @@ def create_warehouse_cmd(code: str, name: str, warehouse_type: str) -> None:
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         try:
             conn.execute(
-                "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (code, name, rel_path, warehouse_type, now),
+                "INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at, tenant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (code, name, rel_path, warehouse_type, now, tenant_id),
             )
             conn.commit()
             click.echo(
-                f"Created warehouse {code} ({name}) type={warehouse_type}"
+                f"Created warehouse {code} ({name}) type={warehouse_type} "
+                f"tenant={tenant_id}"
             )
         except sqlite3.IntegrityError:
             click.echo(f"Warehouse {code} already exists", err=True)
@@ -241,7 +328,6 @@ def create_user_cmd(username: str, password: str, admin: bool) -> None:
 @click.argument("role", type=click.Choice(["staff", "manager", "admin"]))
 def assign_role_cmd(username: str, warehouse_code: str, role: str) -> None:
     """Grant <role> on <warehouse_code> to <username>."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         conn.row_factory = sqlite3.Row
         user = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()

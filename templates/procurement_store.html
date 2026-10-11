@@ -5,6 +5,7 @@
 <p>基于过去 30 天加权日均消耗 + 14 天安全库存。</p>
 
 <form method="post" action="{{ url_for('procurement.procurement_accept') }}" style="margin: 12px 0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="warehouse_code" value="{{ warehouse_code }}">
   <button type="submit">采纳 → 导出 CSV</button>
 </form>

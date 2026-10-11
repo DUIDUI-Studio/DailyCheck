@@ -6,6 +6,7 @@
 </div>
 
 <form method="post" class="grid cols-2">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>名称 *</span>
     <input name="name" required value="{{ canonical['name'] if canonical else '' }}" />
