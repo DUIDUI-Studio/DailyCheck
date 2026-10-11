@@ -19,7 +19,7 @@
 {% if ic_recipes %}
   <div class="card-list recipe-cards">
     {% for r in ic_recipes %}
-    <div class="card recipe-card">
+    <div class="card recipe-card" data-row>
       <div class="recipe-card__head">
         <div class="recipe-card__title">
           <h3>{{ r['name'] }}</h3>
@@ -34,7 +34,7 @@
       <div class="recipe-card__actions">
         <a class="btn-sm" href="{{ url_for('recipe_cost.ic_recipe_edit', ic_recipe_id=r['id']) }}">编辑</a>
         <a class="btn-sm" href="{{ url_for('recipe_cost.ic_recipe_bom_export_csv', ic_recipe_id=r['id']) }}">📥 BOM</a>
-        <form method="post" action="{{ url_for('recipe_cost.ic_recipe_delete', ic_recipe_id=r['id']) }}" onsubmit="return confirm('确认删除该冰激凌配方？');">
+        <form method="post" action="{{ url_for('recipe_cost.ic_recipe_delete', ic_recipe_id=r['id']) }}" data-ajax data-ajax-confirm="确认删除该冰激凌配方？">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>

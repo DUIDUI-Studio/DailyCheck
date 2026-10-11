@@ -1610,3 +1610,27 @@ table.bom-table td .bom-temp-price {
 .status-pill.rejected { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
 .status-pill.suggested { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
 .status-pill.cancelled { background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; }
+
+/* ajax-form.js 成功提示浮窗。
+   跟随 .is-show 类做淡入淡出；超时后自动消失。 */
+.ajax-flash {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-12px);
+  background: #047857;
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: 999px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+  font-size: 14px;
+  font-weight: 500;
+  z-index: 9999;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+.ajax-flash.is-show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}

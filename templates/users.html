@@ -114,7 +114,7 @@
 <h3>用户列表</h3>
 <div class="user-cards">
   {% for u in users %}
-  <article class="user-card">
+  <article class="user-card" data-row>
     <header class="user-card-head">
       <div>
         <strong>{{ u['username'] }}</strong>
@@ -150,10 +150,10 @@
       <div style="margin-top:8px">
         {% set bindings = bindings_by_user.get(u['id'], {}) %}
         {% for w in warehouses %}
-          <div class="role-row">
+          <div class="role-row" data-row>
             <span class="role-row-label"><strong>{{ w['name'] }}</strong></span>
             {% if bindings.get(w['id']) %}
-              <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" class="role-row-form">
+              <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
                 <select name="role">
@@ -163,14 +163,13 @@
                 </select>
                 <button type="submit" class="btn-sm btn-edit">保存</button>
               </form>
-              <form method="post" action="{{ url_for('users.unbind_role', user_id=u['id']) }}" class="role-row-form">
+              <form method="post" action="{{ url_for('users.unbind_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-confirm="确认解除 {{ u['username'] }} 在 {{ w['name'] }} 的权限?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                <button type="submit" class="btn-sm btn-delete"
-                        onclick="return confirm('确认解除 {{ u['username'] }} 在 {{ w['name'] }} 的权限?')">解绑</button>
+                <button type="submit" class="btn-sm btn-delete">解绑</button>
               </form>
             {% else %}
-              <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" class="role-row-form">
+              <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
                 <select name="role">
@@ -188,7 +187,7 @@
 
     <details class="user-card-section">
       <summary>重置密码</summary>
-      <form method="post" action="{{ url_for('users.reset_password', user_id=u['id']) }}" class="role-row-form" style="margin-top:8px">
+      <form method="post" action="{{ url_for('users.reset_password', user_id=u['id']) }}" class="role-row-form" style="margin-top:8px" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input name="password" type="password" required placeholder="新密码" autocomplete="new-password" />
         <button type="submit" class="btn-sm btn-edit">保存</button>
@@ -197,16 +196,15 @@
 
     <div class="user-card-actions">
       {% if u['id'] != current_user_id %}
-      <form method="post" action="{{ url_for('users.toggle_admin', user_id=u['id']) }}" style="display:inline">
+      <form method="post" action="{{ url_for('users.toggle_admin', user_id=u['id']) }}" style="display:inline" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认切换平台管理员状态?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn-sm" onclick="return confirm('确认切换平台管理员状态?')">
+        <button type="submit" class="btn-sm">
           {% if u['is_admin'] %}取消管理员{% else %}设为管理员{% endif %}
         </button>
       </form>
-      <form method="post" action="{{ url_for('users.delete_user', user_id=u['id']) }}" style="display:inline">
+      <form method="post" action="{{ url_for('users.delete_user', user_id=u['id']) }}" style="display:inline" data-ajax data-ajax-confirm="确认永久删除 {{ u['username'] }}?此操作不可撤销。">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn-sm btn-delete"
-                onclick="return confirm('确认永久删除 {{ u['username'] }}?此操作不可撤销。')">
+        <button type="submit" class="btn-sm btn-delete">
           删除账号
         </button>
       </form>
@@ -219,7 +217,7 @@
 <h3>仓库管理</h3>
 <div class="warehouse-cards">
   {% for w in warehouses %}
-  <article class="warehouse-card">
+  <article class="warehouse-card" data-row>
     <header>
       <strong>{{ w['name'] }}</strong>
       <small class="muted">({{ w['code'] }})</small>
@@ -230,16 +228,14 @@
     </p>
     <details>
       <summary class="btn-sm btn-delete">初始化仓库</summary>
-      <form method="post" action="{{ url_for('users.init_warehouse', warehouse_id=w['id']) }}" style="margin-top:8px">
+      <form method="post" action="{{ url_for('users.init_warehouse', warehouse_id=w['id']) }}" style="margin-top:8px" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认初始化 {{ w['name'] }}?业务数据将全部清空!">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label style="display:block;font-size:13px;margin-bottom:6px">
           输入 <code>{{ w['code'] }}</code> 二次确认:
         </label>
         <input name="confirm_token" required placeholder="{{ w['code'] }}" autocomplete="off"
                style="font-family:monospace;letter-spacing:1px" />
-        <button type="submit" class="btn-sm btn-delete"
-                style="margin-top:6px"
-                onclick="return confirm('确认初始化 {{ w['name'] }}?业务数据将全部清空!')">
+        <button type="submit" class="btn-sm btn-delete" style="margin-top:6px">
           确认初始化
         </button>
       </form>

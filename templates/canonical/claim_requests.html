@@ -13,7 +13,7 @@
   </thead>
   <tbody>
     {% for r in requests_ %}
-    <tr>
+    <tr data-row>
       <td>{{ r['id'] }}</td>
       <td>{{ r['request_type'] }}</td>
       <td>
@@ -30,7 +30,7 @@
       <td><small>{{ r['review_note'] or '' }}</small></td>
       <td>
         {% if r['status'] == 'pending' and g.user and g.user['is_admin'] %}
-        <form method="post" action="{{ url_for('canonical.canonical_review_claim_request', request_id=r['id']) }}" style="display:inline">
+        <form method="post" action="{{ url_for('canonical.canonical_review_claim_request', request_id=r['id']) }}" style="display:inline" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <select name="decision"><option value="approved">approve</option><option value="rejected">reject</option></select>
           <input name="note" placeholder="备注" />

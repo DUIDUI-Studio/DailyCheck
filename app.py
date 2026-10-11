@@ -122,9 +122,14 @@ def create_app() -> Flask:
     _start_scheduler()
 
     register_cli(app)
-    from blueprints._helpers import register_jinja_filters, register_template_context
+    from blueprints._helpers import (
+        register_ajax_handlers,
+        register_jinja_filters,
+        register_template_context,
+    )
     register_jinja_filters(app)
     register_template_context(app)
+    register_ajax_handlers(app)
 
     @app.route("/health")
     def health() -> tuple[dict, int]:

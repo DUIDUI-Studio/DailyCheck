@@ -9,7 +9,7 @@
 <table>
   <tr><th>时间</th><th>品项</th><th>调整数量</th><th>原因</th><th>状态</th><th>操作</th></tr>
   {% for r in requests %}
-  <tr>
+  <tr data-row>
     <td>{{ r.created_at }}</td>
     <td>{{ r.item_name }}</td>
     <td>{{ r.adjusted_quantity | fmt_qty }} {{ r.unit }}</td>
@@ -18,14 +18,14 @@
     <td>
       {% if r.rolled_back == 0 %}
       {% if current_role != 'staff' %}
-      <form method="post" action="{{ url_for('adjustment.rollback', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认回退该调整单？将恢复库存。');">
+      <form method="post" action="{{ url_for('adjustment.rollback', req_id=r.id) }}" class="inline" data-ajax data-ajax-confirm="确认回退该调整单？将恢复库存。">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn-sm btn-edit">回退</button>
       </form>
       {% endif %}
       {% endif %}
       {% if current_role != 'staff' %}
-      <form method="post" action="{{ url_for('adjustment.delete', req_id=r.id) }}" class="inline" onsubmit="return confirm('确认删除该调整记录？');">
+      <form method="post" action="{{ url_for('adjustment.delete', req_id=r.id) }}" class="inline" data-ajax data-ajax-confirm="确认删除该调整记录？">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn-sm btn-delete">删除</button>
       </form>
