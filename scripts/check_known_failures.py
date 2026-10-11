@@ -46,11 +46,33 @@ def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
+    text = Path(sys.argv[1]).read_text(errors="replace")
+
+    # 防假绿：收集错误不产生 FAILED 行，坏依赖会让本脚本空过 → 必须拒绝。
+    if "errors during collection" in text or "Interrupted:" in text:
+        print("FAIL: pytest 存在收集错误（依赖缺失/导入失败），门禁拒绝放行：")
+        for line in text.splitlines():
+            if line.startswith("ERROR "):
+                print(f"  - {line.strip()}")
+        return 1
+    if not text.strip():
+        print("FAIL: pytest 输出为空（进程异常/重定向失败），门禁拒绝放行。")
+        return 1
+    m = re.search(r"(\d+) passed", text)
+    # 完整输出（含 passed 摘要）才校验零用例；grep 后的 FAILED 行文件跳过此检查。
+    if m and int(m.group(1)) == 0:
+        print("FAIL: pytest 0 passed（无任何用例执行成功），门禁拒绝放行。")
+        return 1
+
     failed = extract_failed_ids(sys.argv[1])
     known = load_known_ids()
     new = failed - known
     if not new:
-        print(f"OK: 当前失败 {len(failed)} 个，全部在已知清单内（清单 {len(known)} 条）")
+        passed_info = f"，passed {m.group(1)}" if m else ""
+        print(
+            f"OK: 当前失败 {len(failed)} 个，全部在已知清单内"
+            f"（清单 {len(known)} 条{passed_info}）"
+        )
         return 0
     print(f"FAIL: 发现 {len(new)} 个新增失败（不在 tests/known_failures.txt）：")
     for nodeid in sorted(new):
