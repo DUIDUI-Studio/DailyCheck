@@ -53,3 +53,6 @@ forecast_lock_failures.txt
 # pytest 临时 basetemp（本地沙箱下 /private/var 不可写时的替代目录，
 # 用 `pytest --basetemp=.pytest_tmp` 生成；绝不入库）
 .pytest_tmp/
+
+# Claude/agent worktrees 含嵌套 .git，绝不能入索引（gitlink 会让 Actions checkout fatal）
+.claude/worktrees/
