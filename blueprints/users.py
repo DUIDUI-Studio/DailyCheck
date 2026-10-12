@@ -3,83 +3,342 @@
 - Create users (with optional per-warehouse role bindings at creation time)
 - Reset passwords
 - Toggle platform admin (is_admin)
+- Toggle account active (is_active) — v2
 - Bind / unbind / change role on a per-warehouse basis
+- Bulk bind (v2) — bind N users to one warehouse with one role in a single POST
+- Search / filter / paginate / tenant-scope the user list (v2)
 - Create warehouses (optionally cloning items / products / product_bom
   from an existing one)
+- v2 route hardening: every view is gated by ``@require_platform_admin``
+  (the canonical platform-admin decorator). The legacy in-module
+  ``_require_admin()`` shim has been removed; ``permissions.py`` owns the
+  semantics so admin guards stay in one place.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-import re
 
-from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
-from werkzeug.security import check_password_hash, generate_password_hash
+from flask import (
+    Blueprint,
+    abort,
+    flash,
+    g,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
+from werkzeug.security import generate_password_hash
 
-from config import BASE_DIR, MASTER_DB, ROLE_RANK, WAREHOUSE_DB_DIR
+from config import BASE_DIR, ROLE_RANK, WAREHOUSE_DB_DIR
 from db import get_master_db, init_warehouse_db
-from permissions import require_login
-
+from permissions import require_platform_admin
 
 bp = Blueprint("users", __name__)
 
 VALID_ROLES = set(ROLE_RANK.keys())  # staff / manager / admin
 
+# v2 list page — default page size for paginated listings.
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
 
-def _require_admin():
-    from flask import g
-    if not g.user or not g.user["is_admin"]:
-        abort(403)
+# v2 search — minimum query length to avoid full-table scans on every
+# keystroke. 2 chars matches the typical "search-as-you-type" UX without
+# accidentally filtering every user away on a 1-char typo.
+MIN_SEARCH_LEN = 2
 
 
-def _bindings_for(user_id: int) -> dict[int, str]:
-    """Return {warehouse_id: role} for a user."""
+# ---------------------------------------------------------------------------
+# v2 helpers — tenant scoping + listing
+# ---------------------------------------------------------------------------
+
+def _list_tenants() -> list[sqlite3.Row]:
+    """All tenants (used by admin's tenant filter dropdown).
+
+    Returns active + disabled tenants — the admin view is the place where
+    you'd discover a disabled tenant, so we don't pre-filter on status.
+    Sorted by id ascending so tenant 1 (default) is always first.
+    """
     db = get_master_db()
-    rows = db.execute(
-        "SELECT warehouse_id, role FROM warehouse_users WHERE user_id=?",
-        (user_id,),
+    return db.execute(
+        "SELECT id, name, status FROM tenants ORDER BY id"
     ).fetchall()
-    return {r["warehouse_id"]: r["role"] for r in rows}
 
+
+def _scoped_user_query(
+    *,
+    q: str | None,
+    role: str | None,
+    tenant_id: int | None,
+    is_active: int | None,
+    sort: str,
+    page: int,
+    page_size: int,
+) -> tuple[str, list]:
+    """Build (sql, params) for the filtered user list.
+
+    Tenant scoping rules:
+    - Platform admin (g.user['is_admin']=1): can ask for any tenant via
+      ?tenant_id=, OR see all (tenant_id is None).
+    - Non-platform-admin: hard-pinned to g.tenant_id. (In practice the
+      route is gated by @require_platform_admin so this branch is dead
+      today, but keeping the guard here makes the intent explicit and
+      future-proof if the route ever loosens.)
+
+    is_active:
+    - None → show both active and inactive (admin wants to see disabled rows).
+    - 0/1 → filter to that bucket.
+    """
+    where: list[str] = []
+    params: list = []
+
+    # Tenant scope — admin sees all by default.
+    effective_tenant = tenant_id
+    if not g.user["is_admin"]:
+        effective_tenant = g.user["tenant_id"]
+    if effective_tenant is not None:
+        where.append("u.tenant_id = ?")
+        params.append(effective_tenant)
+
+    if q and len(q) >= MIN_SEARCH_LEN:
+        where.append("u.username LIKE ?")
+        params.append(f"%{q}%")
+
+    if role in VALID_ROLES:
+        # Subquery: any user that has at least one binding with this role.
+        where.append(
+            "EXISTS (SELECT 1 FROM warehouse_users wu "
+            "WHERE wu.user_id = u.id AND wu.role = ?)"
+        )
+        params.append(role)
+
+    if is_active in (0, 1):
+        where.append("u.is_active = ?")
+        params.append(is_active)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    # Whitelist sort columns to avoid SQL injection via ?sort=.
+    sort_key = sort if sort in {"id", "username", "last_login_at"} else "id"
+    direction = "DESC" if sort.startswith("-") else "ASC"
+    order_sql = f"ORDER BY u.{sort_key.lstrip('-')} {direction}, u.id ASC"
+
+    offset = max(0, (page - 1) * page_size)
+    limit_sql = "LIMIT ? OFFSET ?"
+    params.extend([page_size, offset])
+
+    sql = f"""
+        SELECT u.id, u.username, u.is_admin, u.is_active, u.tenant_id,
+               u.last_login_at, u.created_at, t.name AS tenant_name
+        FROM users u
+        LEFT JOIN tenants t ON t.id = u.tenant_id
+        {where_sql}
+        {order_sql}
+        {limit_sql}
+    """
+    return sql, params
+
+
+def _count_scoped_users(
+    *,
+    q: str | None,
+    role: str | None,
+    tenant_id: int | None,
+    is_active: int | None,
+) -> tuple[str, list]:
+    """Same WHERE as _scoped_user_query but with COUNT(*). LIMIT/OFFSET excluded."""
+    where: list[str] = []
+    params: list = []
+    effective_tenant = tenant_id
+    if not g.user["is_admin"]:
+        effective_tenant = g.user["tenant_id"]
+    if effective_tenant is not None:
+        where.append("u.tenant_id = ?")
+        params.append(effective_tenant)
+    if q and len(q) >= MIN_SEARCH_LEN:
+        where.append("u.username LIKE ?")
+        params.append(f"%{q}%")
+    if role in VALID_ROLES:
+        where.append(
+            "EXISTS (SELECT 1 FROM warehouse_users wu "
+            "WHERE wu.user_id = u.id AND wu.role = ?)"
+        )
+        params.append(role)
+    if is_active in (0, 1):
+        where.append("u.is_active = ?")
+        params.append(is_active)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    return f"SELECT COUNT(*) AS c FROM users u {where_sql}", params
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @bp.route("/users", methods=["GET"])
-@require_login
+@require_platform_admin
 def list_users():
-    _require_admin()
-    from flask import g
+    """v2 list: search/filter/paginate/tenant-scope the user list.
+
+    Query params:
+    - q: substring of username (≥2 chars)
+    - role: filter by users who hold any binding with this role
+    - tenant_id: filter to one tenant (admin only; non-admin scoped to g.tenant_id)
+    - is_active: 0 / 1 / None (None = show both)
+    - sort: id / username / last_login_at, optional leading "-"
+    - page: 1-based, default 1
+    - page_size: default DEFAULT_PAGE_SIZE, capped at MAX_PAGE_SIZE
+    - format: "json" if Accept: application/json or ?format=json — returns a
+      JSON envelope used by the toolbar's debounced reload.
+    """
+    q = (request.args.get("q") or "").strip() or None
+    role = (request.args.get("role") or "").strip() or None
+    tenant_id_raw = (request.args.get("tenant_id") or "").strip()
+    tenant_id: int | None = None
+    if tenant_id_raw.isdigit():
+        tenant_id = int(tenant_id_raw)
+    is_active_raw = (request.args.get("is_active") or "").strip()
+    is_active: int | None = None
+    if is_active_raw in ("0", "1"):
+        is_active = int(is_active_raw)
+    sort = (request.args.get("sort") or "id").strip()
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except ValueError:
+        page = 1
+    try:
+        page_size = min(MAX_PAGE_SIZE, max(1, int(request.args.get("page_size") or DEFAULT_PAGE_SIZE)))
+    except ValueError:
+        page_size = DEFAULT_PAGE_SIZE
+
     db = get_master_db()
-    users = db.execute(
-        """SELECT u.id, u.username, u.is_admin, u.last_login_at, u.created_at,
-                  GROUP_CONCAT(w.code || ':' || wu.role, ', ') AS bindings
-           FROM users u
-           LEFT JOIN warehouse_users wu ON wu.user_id = u.id
-           LEFT JOIN warehouses w ON w.id = wu.warehouse_id
-           GROUP BY u.id
-           ORDER BY u.id"""
-    ).fetchall()
-    warehouses = db.execute("SELECT id, code, name FROM warehouses ORDER BY id").fetchall()
-    # Per-user full binding detail so the template can render editable rows.
-    detail: dict[int, dict[int, str]] = {}
-    for u in users:
-        detail[u["id"]] = _bindings_for(u["id"])
+
+    # Row fetch (paginated).
+    list_sql, list_params = _scoped_user_query(
+        q=q, role=role, tenant_id=tenant_id, is_active=is_active,
+        sort=sort, page=page, page_size=page_size,
+    )
+    user_rows = db.execute(list_sql, list_params).fetchall()
+
+    # Bindings per user — pulled in one round-trip, then grouped in Python
+    # (cheaper than per-row subquery in the main list SQL).
+    # Convert sqlite3.Row → dict so the template can | tojson safely.
+    user_rows = [dict(r) for r in user_rows]
+
+    user_ids = [r["id"] for r in user_rows]
+    bindings_by_user: dict[int, dict[int, str]] = {uid: {} for uid in user_ids}
+    if user_ids:
+        placeholders = ",".join("?" for _ in user_ids)
+        bind_rows = db.execute(
+            f"""SELECT wu.user_id, wu.warehouse_id, wu.role, w.code, w.name
+                FROM warehouse_users wu
+                JOIN warehouses w ON w.id = wu.warehouse_id
+                WHERE wu.user_id IN ({placeholders})
+                ORDER BY wu.user_id, w.code""",
+            user_ids,
+        ).fetchall()
+        for br in bind_rows:
+            bindings_by_user.setdefault(br["user_id"], {})[br["warehouse_id"]] = {
+                "role": br["role"],
+                "warehouse_code": br["code"],
+                "warehouse_name": br["name"],
+            }
+
+    # Total count for pagination UI (same WHERE, no LIMIT/OFFSET).
+    count_sql, count_params = _count_scoped_users(
+        q=q, role=role, tenant_id=tenant_id, is_active=is_active,
+    )
+    total = db.execute(count_sql, count_params).fetchone()["c"]
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    # Always load the warehouse list + tenants list — used by the create-
+    # account drawer regardless of pagination state. Convert Row → dict
+    # so the template's `| tojson` (used by users-admin.js to read the
+    # data into JS) doesn't trip on sqlite3.Row.
+    warehouses = [
+        dict(r) for r in db.execute(
+            "SELECT id, code, name, tenant_id FROM warehouses ORDER BY code"
+        ).fetchall()
+    ]
+    tenants = [dict(r) for r in _list_tenants()]
+
+    # JSON envelope: only when the caller explicitly opts in via
+    # ?format=json. Plain GET (browser navigation) MUST always render
+    # the HTML page so the toolbar / drawer JS can bootstrap from the
+    # SSR'd DOM. (Detecting application/json from Accept would also
+    # fire on the default "*/*" Accept header and break normal
+    # page navigation.)
+    if request.args.get("format") == "json":
+        return jsonify({
+            "users": [
+                {
+                    "id": r["id"],
+                    "username": r["username"],
+                    "is_admin": bool(r["is_admin"]),
+                    "is_active": bool(r["is_active"]),
+                    "tenant_id": r["tenant_id"],
+                    "tenant_name": r["tenant_name"],
+                    "last_login_at": r["last_login_at"],
+                    "created_at": r["created_at"],
+                    "bindings": [
+                        {"warehouse_id": wid, "role": info["role"],
+                         "warehouse_code": info["warehouse_code"],
+                         "warehouse_name": info["warehouse_name"]}
+                        for wid, info in bindings_by_user.get(r["id"], {}).items()
+                    ],
+                }
+                for r in user_rows
+            ],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+        })
+
     return render_template(
         "users.html",
-        users=users,
+        users=user_rows,
         warehouses=warehouses,
-        bindings_by_user=detail,
+        tenants=tenants,
+        bindings_by_user=bindings_by_user,
         current_user_id=g.user["id"],
+        # Echo filter state so the toolbar can rehydrate after reload.
+        filter_state={
+            "q": q or "",
+            "role": role or "",
+            "tenant_id": tenant_id,
+            "is_active": is_active_raw,
+            "sort": sort,
+            "page": page,
+            "page_size": page_size,
+        },
+        pagination={
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+        },
     )
 
 
 @bp.route("/users/create", methods=["POST"])
-@require_login
+@require_platform_admin
 def create_user():
-    _require_admin()
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
     is_admin = request.form.get("is_admin") == "1"
+    # v2: honor explicit tenant_id from the form so admin can create users
+    # into a non-default tenant. Falls back to the actor's tenant.
+    tenant_raw = (request.form.get("tenant_id") or "").strip()
+    if tenant_raw.isdigit():
+        tenant_id = int(tenant_raw)
+    else:
+        tenant_id = g.user["tenant_id"]
     if not username or not password:
         flash("账号和密码必填")
         return redirect(url_for("users.list_users"))
@@ -87,15 +346,16 @@ def create_user():
     db = get_master_db()
     try:
         db.execute(
-            """INSERT INTO users (username, password_hash, is_admin, created_at)
-               VALUES (?, ?, ?, ?)""",
-            (username, generate_password_hash(password, method="pbkdf2:sha256"), 1 if is_admin else 0, now),
+            """INSERT INTO users (username, password_hash, is_admin, created_at, tenant_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (username, generate_password_hash(password, method="pbkdf2:sha256"),
+             1 if is_admin else 0, now, tenant_id),
         )
         new_id = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
         db.commit()
         _apply_bindings_from_form(new_id, request.form, db)
         _log_admin_action(
-            f"create user #{new_id} {username} admin={is_admin} "
+            f"create user #{new_id} {username} admin={is_admin} tenant={tenant_id} "
             f"bindings={_bindings_summary(new_id, db)}"
         )
         flash(f"已创建账号 {username}")
@@ -105,10 +365,9 @@ def create_user():
 
 
 @bp.route("/users/<int:user_id>/bind", methods=["POST"])
-@require_login
+@require_platform_admin
 def bind_role(user_id: int):
     """Add a binding (warehouse_id + role) for an existing user."""
-    _require_admin()
     db = get_master_db()
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         abort(404)
@@ -131,10 +390,9 @@ def bind_role(user_id: int):
 
 
 @bp.route("/users/<int:user_id>/unbind", methods=["POST"])
-@require_login
+@require_platform_admin
 def unbind_role(user_id: int):
     """Remove a binding for an existing user."""
-    _require_admin()
     db = get_master_db()
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         abort(404)
@@ -154,10 +412,9 @@ def unbind_role(user_id: int):
 
 
 @bp.route("/users/<int:user_id>/change-role", methods=["POST"])
-@require_login
+@require_platform_admin
 def change_role(user_id: int):
     """Change the role on an existing binding."""
-    _require_admin()
     db = get_master_db()
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         abort(404)
@@ -183,9 +440,8 @@ def change_role(user_id: int):
 
 
 @bp.route("/users/<int:user_id>/reset-password", methods=["POST"])
-@require_login
+@require_platform_admin
 def reset_password(user_id: int):
-    _require_admin()
     password = request.form.get("password", "")
     if not password:
         flash("新密码必填")
@@ -205,10 +461,8 @@ def reset_password(user_id: int):
 
 
 @bp.route("/users/<int:user_id>/toggle-admin", methods=["POST"])
-@require_login
+@require_platform_admin
 def toggle_admin(user_id: int):
-    _require_admin()
-    from flask import g
     if g.user["id"] == user_id:
         flash("不能修改自己的平台管理员状态")
         return redirect(url_for("users.list_users"))
@@ -230,8 +484,109 @@ def toggle_admin(user_id: int):
     return redirect(url_for("users.list_users"))
 
 
+# ---------------------------------------------------------------------------
+# v2 endpoints — toggle-active + bulk-bind
+# ---------------------------------------------------------------------------
+
+@bp.route("/users/<int:user_id>/toggle-active", methods=["POST"])
+@require_platform_admin
+def toggle_active(user_id: int):
+    """Flip users.is_active (0 ↔ 1). Used by the drawer "停用账号" toggle.
+
+    Guards:
+    - Cannot deactivate self (would lock the only admin out of /users).
+    - Deactivation is reversible (re-enable by submitting the same route
+      again), unlike delete which is permanent.
+    """
+    if g.user["id"] == user_id:
+        flash("不能停用/启用自己的账号")
+        return redirect(url_for("users.list_users"))
+    db = get_master_db()
+    target = db.execute(
+        "SELECT username, is_active FROM users WHERE id=?", (user_id,)
+    ).fetchone()
+    if target is None:
+        abort(404)
+    new_state = 0 if target["is_active"] else 1
+    db.execute("UPDATE users SET is_active=? WHERE id=?", (new_state, user_id))
+    db.commit()
+    _log_admin_action(
+        f"toggle-active user #{user_id} {target['username']} -> {bool(new_state)}"
+    )
+    flash(
+        f"{target['username']} {'已停用' if new_state == 0 else '已启用'}"
+    )
+    return redirect(url_for("users.list_users"))
+
+
+@bp.route("/users/bulk-bind", methods=["POST"])
+@require_platform_admin
+def bulk_bind():
+    """Bind N users to one warehouse with one role, in a single POST.
+
+    Form fields:
+    - user_ids: comma-separated user ids (e.g. "2,3,5,7")
+    - warehouse_id: integer
+    - role: staff | manager | admin
+
+    Behavior:
+    - Each insert is INSERT OR IGNORE so already-bound (user, warehouse)
+      rows are skipped silently. The audit log records the requested
+      set and the actually-inserted count so the admin can reconcile.
+    - Invalid user_ids (non-existent) are skipped (not an error) so a
+      stale selection from the table doesn't break the whole POST.
+    - Invalid role / warehouse_id → flash error, no writes.
+    """
+    raw_ids = (request.form.get("user_ids") or "").strip()
+    wh_id_raw = (request.form.get("warehouse_id") or "").strip()
+    role = (request.form.get("role") or "").strip()
+
+    if role not in VALID_ROLES:
+        flash(f"角色必须是 {sorted(VALID_ROLES)} 之一")
+        return redirect(url_for("users.list_users"))
+    if not wh_id_raw.isdigit():
+        flash("仓库 id 必填")
+        return redirect(url_for("users.list_users"))
+    wh_id = int(wh_id_raw)
+
+    db = get_master_db()
+    if db.execute("SELECT 1 FROM warehouses WHERE id=?", (wh_id,)).fetchone() is None:
+        flash("仓库不存在")
+        return redirect(url_for("users.list_users"))
+
+    user_ids: list[int] = []
+    for tok in raw_ids.split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            user_ids.append(int(tok))
+    if not user_ids:
+        flash("至少选择一个用户")
+        return redirect(url_for("users.list_users"))
+
+    inserted = 0
+    for uid in user_ids:
+        # Make sure the user actually exists; otherwise the FK would
+        # raise IntegrityError and roll back the whole batch.
+        if db.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone() is None:
+            continue
+        cur = db.execute(
+            """INSERT OR IGNORE INTO warehouse_users (user_id, warehouse_id, role)
+               VALUES (?, ?, ?)""",
+            (uid, wh_id, role),
+        )
+        if cur.rowcount:
+            inserted += 1
+    db.commit()
+    _log_admin_action(
+        f"bulk-bind wh={wh_id} role={role} "
+        f"requested={len(user_ids)} inserted={inserted}"
+    )
+    flash(f"批量绑定完成:请求 {len(user_ids)} 人,实际新增 {inserted} 条")
+    return redirect(url_for("users.list_users"))
+
+
 @bp.route("/users/<int:user_id>/delete", methods=["POST"])
-@require_login
+@require_platform_admin
 def delete_user(user_id: int):
     """Permanently delete a user.
 
@@ -240,8 +595,6 @@ def delete_user(user_id: int):
     - Cannot delete the last platform admin (must keep ≥1 admin).
     - warehouse_users bindings cascade-delete with the user.
     """
-    _require_admin()
-    from flask import g
     if g.user["id"] == user_id:
         flash("不能删除自己的账号")
         return redirect(url_for("users.list_users"))
@@ -266,8 +619,12 @@ def delete_user(user_id: int):
     return redirect(url_for("users.list_users"))
 
 
+# ---------------------------------------------------------------------------
+# Warehouse routes (unchanged behavior, decorator upgraded to @require_platform_admin)
+# ---------------------------------------------------------------------------
+
 @bp.route("/warehouses/create", methods=["POST"])
-@require_login
+@require_platform_admin
 def create_warehouse():
     """Create a new warehouse. Supports two types:
 
@@ -277,8 +634,6 @@ def create_warehouse():
       warehouse starts empty and gets recipes/items populated manually
       (or via the rd seed script).
     """
-    _require_admin()
-
     code = request.form.get("code", "").strip().lower()
     name = request.form.get("name", "").strip()
     clone_from_code = request.form.get("clone_from_code", "").strip()
@@ -352,7 +707,7 @@ def create_warehouse():
 
 
 @bp.route("/warehouses/<int:warehouse_id>/init", methods=["POST"])
-@require_login
+@require_platform_admin
 def init_warehouse(warehouse_id: int):
     """Wipe business data for one warehouse, preserving the catalog.
 
@@ -371,10 +726,6 @@ def init_warehouse(warehouse_id: int):
     must equal the warehouse's code. Plain-text confirmation in the
     button label.
     """
-    _require_admin()
-    from flask import g
-    from config import BASE_DIR
-
     db = get_master_db()
     wh = db.execute(
         "SELECT code, name, db_path FROM warehouses WHERE id=?", (warehouse_id,)
@@ -420,8 +771,18 @@ def init_warehouse(warehouse_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (unchanged from v1 except where noted)
 # ---------------------------------------------------------------------------
+
+def _bindings_for(user_id: int) -> dict[int, str]:
+    """Return {warehouse_id: role} for a user."""
+    db = get_master_db()
+    rows = db.execute(
+        "SELECT warehouse_id, role FROM warehouse_users WHERE user_id=?",
+        (user_id,),
+    ).fetchall()
+    return {r["warehouse_id"]: r["role"] for r in rows}
+
 
 def _parse_binding(form, db) -> tuple[int | None, str | None, str | None]:
     """Parse and validate warehouse_id + role from a form. Returns
@@ -471,7 +832,6 @@ def _log_admin_action(detail: str) -> None:
     audit_log table; the per-warehouse audit_log only covers business writes."""
     import json
     from pathlib import Path
-    from flask import g
     log = Path(__file__).resolve().parent.parent / "admin_audit.log"
     with log.open("a", encoding="utf-8") as f:
         f.write(json.dumps({

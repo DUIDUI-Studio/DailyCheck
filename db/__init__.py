@@ -862,6 +862,22 @@ def init_master_db() -> None:
                             "tenant_id INTEGER NOT NULL DEFAULT 1"
                         )
 
+                # v2 账号管理（feat/user-admin-v2）：users.is_active 启停开关。
+                # 与 items.is_active 同语义：停用行从登录/选择点排除，历史记录全保留。
+                # 索引：列表筛选常用 (tenant_id, is_active) 组合，加复合索引加速。
+                u_cols = {
+                    r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()
+                }
+                if u_cols and "is_active" not in u_cols:
+                    conn.execute(
+                        "ALTER TABLE users ADD COLUMN "
+                        "is_active INTEGER NOT NULL DEFAULT 1"
+                    )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_users_tenant_active "
+                    "ON users(tenant_id, is_active)"
+                )
+
                 # recipe_versions UNIQUE constraint fix.
                 # The original schema had UNIQUE(recipe_type,
                 # source_warehouse_code, version) — missing recipe_id — so

@@ -1,66 +1,186 @@
 {% extends "base.html" %}
 {% block title %}账号管理{% endblock %}
+{# v2 账号管理（feat/user-admin-v2）：Notion/Linear 风格。
+   顶部工具栏（搜索 / 角色 / 租户 / 启停 / 新建） → 紧凑表格 → 右侧抽屉（编辑/创建/删除）。
+   行内表单（重置密码 / 切换平台管理员 / 解绑 / 启停）保留 ajax-form.js 的 reload-stay 模式。 #}
 {% block content %}
+<link rel="stylesheet" href="{{ url_for('static', filename='users-admin.css') }}?v=2" />
+<script defer src="{{ url_for('static', filename='users-admin.js') }}?v=2"></script>
+
+{# v2 账号管理：抽屉需要的隐藏数据 + CSRF meta + 当前用户/租户 token。
+   把数据放进 #warehouses-data / #tenants-data JSON script 块，users-admin.js
+   在打开抽屉时直接 JSON.parse 即可，避免再多发一次 /users?...&format=json。 #}
+<meta name="csrf-token" content="{{ csrf_token() }}" />
+<script id="warehouses-data" type="application/json">
+  {{ warehouses | tojson }}
+</script>
+<script id="tenants-data" type="application/json">
+  {{ tenants | tojson }}
+</script>
+<script id="current-user-id" type="application/json">{{ current_user_id }}</script>
+<script id="current-tenant-id" type="application/json">{{ current_tenant_id or 1 }}</script>
+
 <h2>账号管理</h2>
 
-<details class="card" style="margin-bottom:16px" open>
-  <summary><strong>新建账号</strong></summary>
-  <form method="post" action="{{ url_for('users.create_user') }}" style="margin-top:12px">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <div class="grid cols-2">
-      <label>账号
-        <input name="username" required autocomplete="off" />
-      </label>
-      <label>密码
-        <input name="password" type="password" required autocomplete="new-password" />
-      </label>
-    </div>
-    <label style="display:flex;align-items:center;gap:6px;margin-top:8px">
-      <input type="checkbox" name="is_admin" value="1" />
-      平台管理员(可访问所有仓库,绕过权限)
+{# ────────────────────────────────────────────────────────────────
+   工具栏：搜索 / 角色 / 租户 / 启停 / 新建
+   ──────────────────────────────────────────────────────────────── #}
+<form id="users-toolbar" class="users-toolbar" autocomplete="off">
+  <div class="users-toolbar-row">
+    <label class="users-search">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M20 20l-3.5-3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <input type="search" name="q" value="{{ filter_state.q }}"
+             placeholder="搜索用户名（至少 2 字）…" minlength="2" />
     </label>
 
-    {% if warehouses %}
-    <fieldset style="margin-top:14px;border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px">
-      <legend style="padding:0 6px;color:#374151">仓库权限(可选,创建时直接绑定)</legend>
-      <table class="role-matrix">
-        <tr>
-          <th>仓库</th><th>无权限</th><th>staff</th><th>manager</th><th>admin</th>
-        </tr>
-        {% for w in warehouses %}
-        <tr>
-          <td><strong>{{ w['name'] }}</strong> <small class="muted">({{ w['code'] }})</small></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="" checked /></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="staff" /></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="manager" /></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="admin" /></td>
-        </tr>
-        {% endfor %}
-      </table>
-    </fieldset>
-    {% endif %}
+    <select name="role" aria-label="角色筛选">
+      <option value="">所有角色</option>
+      <option value="staff" {% if filter_state.role == 'staff' %}selected{% endif %}>staff</option>
+      <option value="manager" {% if filter_state.role == 'manager' %}selected{% endif %}>manager</option>
+      <option value="admin" {% if filter_state.role == 'admin' %}selected{% endif %}>admin</option>
+    </select>
 
-    <button type="submit" class="btn primary" style="margin-top:12px">创建</button>
-  </form>
-</details>
+    <select name="tenant_id" aria-label="租户筛选">
+      <option value="">所有租户</option>
+      {% for t in tenants %}
+        <option value="{{ t['id'] }}"
+                {% if filter_state.tenant_id == t['id'] %}selected{% endif %}>
+          {{ t['name'] }}（租户 {{ t['id'] }}{% if t['status'] == 'disabled' %} · 已停用{% endif %}）
+        </option>
+      {% endfor %}
+    </select>
 
-<details class="card" style="margin-bottom:16px" open>
+    <select name="is_active" aria-label="启停筛选">
+      <option value="" {% if filter_state.is_active == '' %}selected{% endif %}>全部</option>
+      <option value="1" {% if filter_state.is_active == '1' %}selected{% endif %}>仅启用</option>
+      <option value="0" {% if filter_state.is_active == '0' %}selected{% endif %}>仅停用</option>
+    </select>
+
+    <select name="sort" aria-label="排序">
+      <option value="id" {% if filter_state.sort == 'id' %}selected{% endif %}>按 ID</option>
+      <option value="username" {% if filter_state.sort == 'username' %}selected{% endif %}>按用户名</option>
+      <option value="-last_login_at" {% if filter_state.sort == '-last_login_at' %}selected{% endif %}>最近登录</option>
+    </select>
+
+    <button type="button" class="btn primary" data-action="open-create-drawer">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+        <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      新建账号
+    </button>
+  </div>
+</form>
+
+{# ────────────────────────────────────────────────────────────────
+   紧凑表格：一行一用户，点击行打开抽屉
+   ──────────────────────────────────────────────────────────────── #}
+<div class="users-table-wrap">
+  <table class="users-table" id="users-table">
+    <thead>
+      <tr>
+        <th>用户名</th>
+        <th>角色</th>
+        <th>租户</th>
+        <th>最后登录</th>
+        <th>状态</th>
+      </tr>
+    </thead>
+    <tbody id="users-tbody">
+      {% for u in users %}
+      <tr class="users-row" data-user-id="{{ u['id'] }}"
+          data-username="{{ u['username'] }}"
+          data-is-admin="{{ u['is_admin'] }}"
+          data-is-active="{{ u['is_active'] }}"
+          data-tenant-id="{{ u['tenant_id'] }}"
+          data-tenant-name="{{ u['tenant_name'] or '' }}">
+        <td>
+          <strong>{{ u['username'] }}</strong>
+          {% if u['is_admin'] %}<span class="tag admin">平台管理员</span>{% endif %}
+          {% if u['id'] == current_user_id %}<span class="muted">(我)</span>{% endif %}
+        </td>
+        <td class="users-roles">
+          {% set bindings = bindings_by_user.get(u['id'], {}) %}
+          {% if bindings %}
+            {% for wid, info in bindings.items() %}
+              <span class="tag" title="{{ info['warehouse_code'] }}">{{ info['warehouse_code'] }}:{{ info['role'] }}</span>
+            {% endfor %}
+          {% else %}
+            <span class="muted">— 无 —</span>
+          {% endif %}
+          {% if u['is_admin'] %}
+            <span class="muted small">(管理员可访问全部)</span>
+          {% endif %}
+        </td>
+        <td>{{ u['tenant_name'] or '—' }}</td>
+        <td class="muted">{{ u['last_login_at'] or '—' }}</td>
+        <td>
+          {% if u['is_active'] %}
+            <span class="badge badge-on">已启用</span>
+          {% else %}
+            <span class="badge badge-off">已停用</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="users-empty">没有匹配的用户</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{# 分页控件（v2 P1） #}
+{% if pagination.total_pages > 1 %}
+<nav class="users-pagination" aria-label="分页">
+  <a class="users-page-link {% if pagination.page == 1 %}is-disabled{% endif %}"
+     data-page="{{ pagination.page - 1 }}" href="#">上一页</a>
+  <span class="muted">第 {{ pagination.page }} / {{ pagination.total_pages }} 页 · 共 {{ pagination.total }} 条</span>
+  <a class="users-page-link {% if pagination.page == pagination.total_pages %}is-disabled{% endif %}"
+     data-page="{{ pagination.page + 1 }}" href="#">下一页</a>
+</nav>
+{% endif %}
+
+{# ────────────────────────────────────────────────────────────────
+   抽屉：复用同一个容器，靠 [data-mode] 切换内容
+   ──────────────────────────────────────────────────────────────── #}
+<aside class="users-drawer" id="users-drawer" aria-hidden="true">
+  <div class="users-drawer-backdrop" data-action="close-drawer"></div>
+  <div class="users-drawer-panel" role="dialog" aria-labelledby="users-drawer-title">
+    <header class="users-drawer-head">
+      <h3 id="users-drawer-title">账号</h3>
+      <button type="button" class="users-drawer-close" data-action="close-drawer" aria-label="关闭">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </header>
+    <div class="users-drawer-body" id="users-drawer-body">
+      {# 内容由 JS 根据模式（create/edit）渲染 #}
+    </div>
+  </div>
+</aside>
+
+{# ────────────────────────────────────────────────────────────────
+   仓库管理（既有卡片网格，保留）
+   ──────────────────────────────────────────────────────────────── #}
+<h3>仓库管理</h3>
+<details class="card" style="margin-bottom:16px">
   <summary><strong>创建仓库</strong></summary>
   <form method="post" action="{{ url_for('users.create_warehouse') }}" style="margin-top:12px">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <fieldset style="border:1px solid #e5e7eb;border-radius:8px;padding:8px 14px;margin-bottom:10px">
       <legend style="padding:0 6px;color:#374151">仓库类型</legend>
       <label style="display:inline-flex;align-items:center;gap:4px;margin-right:14px">
         <input type="radio" name="warehouse_type" value="storefront" checked
-               data-code-prefix="wh_" data-code-pattern="wh_\w+"
-               data-code-placeholder="例如 wh_004"
+               data-code-pattern="wh_\w+" data-code-placeholder="例如 wh_004"
                data-name-placeholder="例如 新天地店" />
         门店(storefront,有实体库存)
       </label>
       <label style="display:inline-flex;align-items:center;gap:4px">
         <input type="radio" name="warehouse_type" value="rd"
-               data-code-prefix="rd_" data-code-pattern="rd_\w+"
-               data-code-placeholder="例如 rd_001"
+               data-code-pattern="rd_\w+" data-code-placeholder="例如 rd_001"
                data-name-placeholder="例如 研发中心" />
         研发中心(rd,仅配方与成本)
       </label>
@@ -111,110 +231,6 @@
   </script>
 </details>
 
-<h3>用户列表</h3>
-<div class="user-cards">
-  {% for u in users %}
-  <article class="user-card" data-row>
-    <header class="user-card-head">
-      <div>
-        <strong>{{ u['username'] }}</strong>
-        {% if u['id'] == current_user_id %}<span class="muted">(我)</span>{% endif %}
-        {% if u['is_admin'] %}<span class="tag admin">平台管理员</span>
-        {% else %}<span class="tag user">普通用户</span>{% endif %}
-      </div>
-      <div class="user-card-meta muted">
-        最近登录: {{ u['last_login_at'] or '—' }}<br>
-        创建: {{ u['created_at'] }}
-      </div>
-    </header>
-
-    <div class="user-card-section">
-      <span class="user-card-label">仓库权限</span>
-      {% set bindings = bindings_by_user.get(u['id'], {}) %}
-      {% if bindings %}
-        {% for w in warehouses %}
-          {% if bindings.get(w['id']) %}
-            <span class="tag">{{ w['name'] }}:{{ bindings[w['id']] }}</span>
-          {% endif %}
-        {% endfor %}
-      {% else %}
-        <span class="muted">— 无 —</span>
-      {% endif %}
-      {% if u['is_admin'] %}
-        <span class="muted" style="font-size:12px">(平台管理员可访问全部)</span>
-      {% endif %}
-    </div>
-
-    <details class="user-card-section">
-      <summary>编辑仓库权限</summary>
-      <div style="margin-top:8px">
-        {% set bindings = bindings_by_user.get(u['id'], {}) %}
-        {% for w in warehouses %}
-          <div class="role-row" data-row>
-            <span class="role-row-label"><strong>{{ w['name'] }}</strong></span>
-            {% if bindings.get(w['id']) %}
-              <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-mode="reload-stay">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                <select name="role">
-                  <option value="staff" {% if bindings[w['id']] == 'staff' %}selected{% endif %}>staff</option>
-                  <option value="manager" {% if bindings[w['id']] == 'manager' %}selected{% endif %}>manager</option>
-                  <option value="admin" {% if bindings[w['id']] == 'admin' %}selected{% endif %}>admin</option>
-                </select>
-                <button type="submit" class="btn-sm btn-edit">保存</button>
-              </form>
-              <form method="post" action="{{ url_for('users.unbind_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-confirm="确认解除 {{ u['username'] }} 在 {{ w['name'] }} 的权限?">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                <button type="submit" class="btn-sm btn-delete">解绑</button>
-              </form>
-            {% else %}
-              <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-mode="reload-stay">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                <select name="role">
-                  <option value="staff">staff</option>
-                  <option value="manager" selected>manager</option>
-                  <option value="admin">admin</option>
-                </select>
-                <button type="submit" class="btn-sm btn-edit">绑定</button>
-              </form>
-            {% endif %}
-          </div>
-        {% endfor %}
-      </div>
-    </details>
-
-    <details class="user-card-section">
-      <summary>重置密码</summary>
-      <form method="post" action="{{ url_for('users.reset_password', user_id=u['id']) }}" class="role-row-form" style="margin-top:8px" data-ajax data-ajax-mode="reload-stay">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <input name="password" type="password" required placeholder="新密码" autocomplete="new-password" />
-        <button type="submit" class="btn-sm btn-edit">保存</button>
-      </form>
-    </details>
-
-    <div class="user-card-actions">
-      {% if u['id'] != current_user_id %}
-      <form method="post" action="{{ url_for('users.toggle_admin', user_id=u['id']) }}" style="display:inline" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认切换平台管理员状态?">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn-sm">
-          {% if u['is_admin'] %}取消管理员{% else %}设为管理员{% endif %}
-        </button>
-      </form>
-      <form method="post" action="{{ url_for('users.delete_user', user_id=u['id']) }}" style="display:inline" data-ajax data-ajax-confirm="确认永久删除 {{ u['username'] }}?此操作不可撤销。">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn-sm btn-delete">
-          删除账号
-        </button>
-      </form>
-      {% endif %}
-    </div>
-  </article>
-  {% endfor %}
-</div>
-
-<h3>仓库管理</h3>
 <div class="warehouse-cards">
   {% for w in warehouses %}
   <article class="warehouse-card" data-row>
@@ -246,6 +262,7 @@
 
 <p class="muted" style="margin-top:16px;font-size:13px">
   平台管理员(is_admin=1)不受仓库级权限检查约束。<br>
-  仓库级 admin 等价于"该仓全权";manager 可审批/删除单据;staff 仅录入。
+  仓库级 admin 等价于"该仓全权";manager 可审批/删除单据;staff 仅录入。<br>
+  v2 新增：账号可停用（保留历史）、批量绑定、租户筛选。
 </p>
 {% endblock %}
