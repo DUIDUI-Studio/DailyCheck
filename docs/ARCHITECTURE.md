@@ -720,6 +720,13 @@ flowchart TB
 
 主数据 disable 后**不自动扇出到仓内**（`is_active` 仍是 1）；仓内列表要等手动 `/canonical/fanout` 才生效。
 
+**跨页跳转契约 — 筛选条件透传**（`feat/canonical-list-filter-preserve`，2026-10-12）：
+- list → edit/detail：`url_for` 把当前 `q/category/status` 拼到 query string（URL 即状态、可分享）
+- edit POST 成功：直跳带筛选的 list（不再过 detail），避免「保存→详情→后退」两步走
+- edit POST 缺筛选字段：`referer` 同源 list URL 兜底（外部直链进 edit 时不丢上下文）
+- detail 页头部「← 返回筛选结果」（有筛选时）/「← 返回品项列表」（无筛选时）
+- 目的：用户在筛选结果里点编辑/查看 → 保存 → 直接回到原筛选上下文，不丢工作流
+
 ---
 
 ## 11. PWA / 移动端

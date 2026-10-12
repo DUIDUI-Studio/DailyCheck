@@ -30,6 +30,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from urllib.parse import parse_qs, urlencode, urlparse
+
 from flask import (
     Blueprint, abort, flash, g, redirect, render_template, request, url_for,
 )
@@ -43,6 +45,57 @@ import blueprints.canonical_pure as cp
 
 
 bp = Blueprint("canonical", __name__, url_prefix="/canonical")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Helpers — 透传 /canonical/list 的筛选条件 (q/category/status)
+#
+#  列表→编辑/详情页：query string 透传（URL 即状态，可分享）
+#  编辑/详情页→列表：表单隐藏字段透传；缺失时用 referer 兜底
+# ─────────────────────────────────────────────────────────────────────
+_FILTER_KEYS = ("q", "category", "status")
+
+
+def _normalize_filters(args) -> dict[str, str]:
+    """从 request.args 取筛选参数，做和 list() 一致的长度收敛。"""
+    q = (args.get("q") or "").strip()[:200]
+    category = (args.get("category") or "").strip()[:64]
+    status = (args.get("status") or "").strip()[:32]
+    return {"q": q, "category": category, "status": status}
+
+
+def _filters_query(filters: dict[str, str]) -> str:
+    """把筛选 dict 拼成 query string（空值丢弃）。"""
+    return urlencode({k: v for k, v in filters.items() if v})
+
+
+def _list_url_with_filters(filters: dict[str, str]) -> str:
+    """带筛选的列表页 URL；空筛选等价于不带 query。"""
+    qs = _filters_query(filters)
+    base = url_for("canonical.canonical_list")
+    return f"{base}?{qs}" if qs else base
+
+
+def _fallback_list_url(args) -> str:
+    """优先用 query 透传的筛选；缺失时用 referer 兜底；都没有 → 无筛选列表。
+
+    referer 兜底只接受同源 /canonical/list 的 URL，避免外部链接把用户带回奇怪的地方。
+    """
+    filters = _normalize_filters(args)
+    if any(filters.values()):
+        return _list_url_with_filters(filters)
+    ref = request.referrer
+    if ref:
+        try:
+            parsed = urlparse(ref)
+            if parsed.netloc == request.host and parsed.path == url_for("canonical.canonical_list"):
+                ref_q = {k: v[0] for k, v in parse_qs(parsed.query).items() if k in _FILTER_KEYS}
+                if ref_q:
+                    return _list_url_with_filters(ref_q)
+                return ref
+        except Exception:
+            pass
+    return url_for("canonical.canonical_list")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -140,9 +193,11 @@ def canonical_detail(canonical_id: int):
         for r in rows:
             if r["canonical_id"] == canonical_id:
                 matching.append({"warehouse_code": wh_code, **r})
+    # 透传筛选条件，用于「← 返回筛选结果」按钮
+    filters = _normalize_filters(request.args)
     return render_template(
         "canonical/detail.html",
-        canonical=detail, bindings=matching,
+        canonical=detail, bindings=matching, filters=filters,
     )
 
 
@@ -204,15 +259,18 @@ def canonical_edit(canonical_id: int | None = None):
         else:
             cp.update_canonical_item(m, canonical_id, fields)
             flash("已更新")
-            return redirect(url_for("canonical.canonical_detail", canonical_id=canonical_id))
+            # 保存成功 → 直接跳回带筛选的列表，避免「保存→详情→后退」两步走
+            return redirect(_fallback_list_url(request.form))
 
     canonical = None
     if canonical_id is not None:
         canonical = cp.get_canonical_item_detail(m, canonical_id)
     cats = m.execute("SELECT code, name FROM canonical_categories ORDER BY code").fetchall()
+    # 把列表的筛选条件透传到模板：「取消」按钮和隐藏字段都需要
+    filters = _normalize_filters(request.args)
     return render_template(
         "canonical/edit.html",
-        canonical=canonical, categories=cats,
+        canonical=canonical, categories=cats, filters=filters,
     )
 
 

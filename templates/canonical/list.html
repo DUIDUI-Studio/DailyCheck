@@ -99,9 +99,11 @@
       </td>
       <td><small>{{ it['created_from'] }}</small></td>
       <td>
-        <a class="btn-sm" href="{{ url_for('canonical.canonical_detail', canonical_id=it['id']) }}">查看</a>
+        {% set edit_args = {'canonical_id': it['id'], 'q': filters.q or none, 'category': filters.category or none, 'status': filters.status or none} %}
+        {% set detail_args = {'canonical_id': it['id'], 'q': filters.q or none, 'category': filters.category or none, 'status': filters.status or none} %}
+        <a class="btn-sm" href="{{ url_for('canonical.canonical_detail', **detail_args) }}">查看</a>
         {% if is_admin %}
-        <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', canonical_id=it['id']) }}">编辑</a>
+        <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', **edit_args) }}">编辑</a>
         <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout', canonical_id=it['id']) }}">扇出</a>
         {% endif %}
       </td>
