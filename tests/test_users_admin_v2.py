@@ -738,3 +738,43 @@ def test_create_with_explicit_role_binds_only_that_warehouse(users_v2_env):
     ).fetchall()
     m.close()
     assert rows == [(1, "manager")]
+
+
+# ---------------------------------------------------------------------------
+# /users 不可缓存
+#
+# 回归：本 PR 让工具栏用 fetch 拉取 /users 的整页 HTML，而这属于"非导航 GET"，
+# 会被 sw.js 的 cache-first 分支写进 Cache API。实测后果：① 服务端数据变了
+# 列表仍显示旧的；② 缓存副本按 URL 命中即返回、不经过服务端鉴权 —— 匿名会话
+# 也能拿到 200 的管理员页面。sw.js 已收窄为只缓存 /static/，这里守住第二道闸。
+# ---------------------------------------------------------------------------
+
+def test_users_html_is_no_store(users_v2_env):
+    app, _, client = users_v2_env
+    r = client.get("/users")
+    assert r.status_code == 200
+    assert r.headers.get("Cache-Control") == "no-store"
+
+
+def test_users_json_is_no_store(users_v2_env):
+    app, _, client = users_v2_env
+    r = client.get("/users?format=json")
+    assert r.status_code == 200
+    assert r.headers.get("Cache-Control") == "no-store"
+
+
+def test_users_service_worker_does_not_cache_dynamic_get():
+    """sw.js 不得再对非 /static/ 的 GET 走 cache-first。
+
+    这条是静态断言（JS 侧没有 pytest 覆盖的替代品）：把 sw.js 里"只缓存
+    /static/"的那道判断钉住，防止有人把它改回"所有非导航 GET 都缓存"。
+    """
+    from pathlib import Path
+
+    sw = (Path(__file__).resolve().parent.parent / "static" / "sw.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'url.pathname.indexOf("/static/") !== 0' in sw, "sw.js 缺少 /static/ 范围判断"
+    assert "cache.put(req, copy)" in sw
+    # cache.put 必须受 res.ok 与范围判断保护，不能无条件写入
+    assert "if (res.ok) {" in sw

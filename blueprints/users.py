@@ -28,6 +28,7 @@ from flask import (
     flash,
     g,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -282,7 +283,7 @@ def list_users():
     # fire on the default "*/*" Accept header and break normal
     # page navigation.)
     if request.args.get("format") == "json":
-        return jsonify({
+        payload = {
             "users": [
                 {
                     "id": r["id"],
@@ -306,9 +307,10 @@ def list_users():
             "page_size": page_size,
             "total": total,
             "total_pages": total_pages,
-        })
+        }
+        return _no_store(jsonify(payload))
 
-    return render_template(
+    resp = make_response(render_template(
         "users.html",
         users=user_rows,
         warehouses=warehouses,
@@ -331,7 +333,21 @@ def list_users():
             "total": total,
             "total_pages": total_pages,
         },
-    )
+    ))
+    return _no_store(resp)
+
+
+def _no_store(resp):
+    """标记响应不可缓存。
+
+    /users 是「账号状态的事实来源」，且只有平台管理员能看。默认响应没有任何
+    Cache-Control，一旦被 Service Worker 的 Cache API 存下来，缓存副本按 URL
+    命中即可返回、**不经过服务端鉴权**（实测匿名会话也能拿到 200 的管理员页面），
+    并且列表会静默显示陈旧数据。sw.js 已收窄为只缓存 /static/，这里是第二道闸：
+    `Cache-Control: no-store` 还会让 Cache API 的 put() 直接抛错。
+    """
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @bp.route("/users/create", methods=["POST"])

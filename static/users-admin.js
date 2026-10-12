@@ -23,7 +23,7 @@
   var SEARCH_DEBOUNCE_MS = 200;
 
   // ────────────────────────────────────────────────────────────────
-  // 工具栏筛选（debounce + JSON 拉取）
+  // 工具栏筛选（debounce + fetch 局部刷新）
   // ────────────────────────────────────────────────────────────────
 
   var toolbar = document.getElementById('users-toolbar');
@@ -31,11 +31,12 @@
   var debounceTimer = null;
 
   function currentFilters() {
-    var fd = new FormData(toolbar);
     // 以地址栏现有参数为基底，只覆盖工具栏管的字段 —— 这样 page_size 等
     // 不在工具栏里的参数不会在第一次筛选后被静默丢掉。
     var params = new URLSearchParams(window.location.search);
     params.delete('format');  // JSON 开关永不进地址栏 / 请求 URL
+    if (!toolbar) return params;  // 只有分页条没有工具栏的页面（防御性）
+    var fd = new FormData(toolbar);
     ['q', 'role', 'tenant_id', 'is_active', 'sort'].forEach(function (name) {
       var value = fd.get(name);
       if (value) params.set(name, value);
