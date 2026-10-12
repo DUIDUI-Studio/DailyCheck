@@ -627,3 +627,114 @@ def test_existing_delete_blocks_self(users_v2_env):
     r2 = client.get("/users", follow_redirects=False)
     body = r2.get_data(as_text=True)
     assert "不能删除自己" in body
+
+
+# ---------------------------------------------------------------------------
+# 排序（sort whitelist + 方向）
+#
+# 回归：v1 的 whitelist 用未剥离 "-" 的原始字符串做集合判断，导致
+# "-last_login_at" 落到 fallback "id" 而方向仍是 DESC —— 工具栏「最近登录」
+# 实际按 id 倒序，任何降序排序都静默失效。
+# ---------------------------------------------------------------------------
+
+def _seed_sort_users(master_path):
+    """插入 id 顺序 / 字典序 / 登录时间三者互不一致的数据，用于判别排序生效。"""
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at, "
+        "tenant_id, is_active, last_login_at) "
+        "VALUES (6, 'zzz', 'x', 0, ?, 1, 1, '2026-03-01')",
+        (TS,),
+    )
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at, "
+        "tenant_id, is_active, last_login_at) "
+        "VALUES (7, 'aaa', 'x', 0, ?, 1, 1, '2026-01-05')",
+        (TS,),
+    )
+    # userB(3) 是最新登录 —— id 排在中间，能区分「按 id」与「按登录时间」。
+    m.execute("UPDATE users SET last_login_at=? WHERE id=3", ("2026-05-01",))
+    m.commit()
+    m.close()
+
+
+def _user_order(client, query):
+    r = client.get(f"/users?{query}&format=json&page_size=100")
+    assert r.status_code == 200, (query, r.status_code)
+    return [u["username"] for u in r.get_json()["users"]]
+
+
+def test_sort_asc_username_orders_by_username(users_v2_env):
+    app, master_path, client = users_v2_env
+    _seed_sort_users(master_path)
+    assert _user_order(client, "sort=username")[0] == "aaa"
+
+
+def test_sort_desc_username_orders_by_username(users_v2_env):
+    """?sort=-username 必须按用户名字典序倒序（而不是 id 倒序）。"""
+    app, master_path, client = users_v2_env
+    _seed_sort_users(master_path)
+    order = _user_order(client, "sort=-username")
+    assert order[0] == "zzz", order
+    assert order == sorted(order, reverse=True), order
+
+
+def test_sort_desc_last_login_at_orders_by_last_login(users_v2_env):
+    """?sort=-last_login_at（工具栏「最近登录」）必须按 last_login_at 倒序。"""
+    app, master_path, client = users_v2_env
+    _seed_sort_users(master_path)
+    order = _user_order(client, "sort=-last_login_at")
+    assert order[0] == "userB", order
+    assert order[1] == "zzz", order
+
+
+def test_sort_unknown_column_falls_back_and_stays_safe(users_v2_env):
+    """未知/注入式 sort 值必须被 whitelist 拦下，回退 id 升序且不报错。"""
+    app, _, client = users_v2_env
+    order = _user_order(client, "sort=username%3B%20DROP%20TABLE%20users")
+    assert order == ["super", "userA", "userB", "userC", "userD"], order
+    # 表还在 → 后续请求仍正常
+    assert client.get("/users").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 创建账号的权限矩阵默认值
+#
+# 回归：抽屉里给 manager 也加了 checked，浏览器取文档序靠后的那个，于是
+# 「不动矩阵直接创建」会给新账号授上**每个仓库**的 manager（v1 默认无权限）。
+# JS 侧的 checked 数量由浏览器冒烟验证；这里守住服务端那一半。
+# ---------------------------------------------------------------------------
+
+def test_create_with_default_empty_matrix_grants_no_bindings(users_v2_env):
+    """wh_<id>="" （默认「无」）提交时不得写入任何仓库绑定。"""
+    app, master_path, client = users_v2_env
+    r = client.post("/users/create", data={
+        "username": "newbie", "password": "pw",
+        "csrf_token": "x", "wh_1": "", "wh_2": "",
+    })
+    assert r.status_code == 302
+    m = sqlite3.connect(master_path)
+    uid = m.execute("SELECT id FROM users WHERE username='newbie'").fetchone()[0]
+    n = m.execute(
+        "SELECT COUNT(*) FROM warehouse_users WHERE user_id=?", (uid,)
+    ).fetchone()[0]
+    m.close()
+    assert n == 0
+
+
+def test_create_with_explicit_role_binds_only_that_warehouse(users_v2_env):
+    """显式选 manager 时只绑定被选中的那一个仓库。"""
+    app, master_path, client = users_v2_env
+    r = client.post("/users/create", data={
+        "username": "newbie2", "password": "pw",
+        "csrf_token": "x", "wh_1": "manager", "wh_2": "",
+    })
+    assert r.status_code == 302
+    m = sqlite3.connect(master_path)
+    uid = m.execute("SELECT id FROM users WHERE username='newbie2'").fetchone()[0]
+    rows = m.execute(
+        "SELECT warehouse_id, role FROM warehouse_users WHERE user_id=? ORDER BY warehouse_id",
+        (uid,),
+    ).fetchall()
+    m.close()
+    assert rows == [(1, "manager")]

@@ -2,8 +2,9 @@
  *
  * 行为：
  *  1) 工具栏即时筛选：搜索/角色/租户/启停/排序变化 → debounce 200ms 后
- *     以 query string 重新拉取 /users（带 ?format=json），把 tbody 替换。
- *     滚动位置通过 sessionStorage 保活（ajax-form.js 已在 pageshow 里还原）。
+ *     fetch 带筛选参数的 /users，用返回的整页 HTML 替换 tbody + 分页控件
+ *     （不整页导航；地址栏用 replaceState 同步）。
+ *     表格标记仍由 Jinja 模板渲染，JS 不重复实现一遍行渲染。
  *  2) 行点击 → 抽屉打开，渲染该用户的「编辑」面板（含重置密码 / 切换
  *     平台管理员 / 切换启停 / 仓库角色 / 删除）。
  *  3) "新建账号" 按钮 → 抽屉打开，渲染「创建」面板（含仓库权限矩阵）。
@@ -27,32 +28,84 @@
 
   var toolbar = document.getElementById('users-toolbar');
   var tbody = document.getElementById('users-tbody');
-  var paginationEl = document.querySelector('.users-pagination');
   var debounceTimer = null;
 
   function currentFilters() {
     var fd = new FormData(toolbar);
-    var params = new URLSearchParams();
-    params.set('format', 'json');
-    if (fd.get('q')) params.set('q', fd.get('q'));
-    if (fd.get('role')) params.set('role', fd.get('role'));
-    if (fd.get('tenant_id')) params.set('tenant_id', fd.get('tenant_id'));
-    if (fd.get('is_active')) params.set('is_active', fd.get('is_active'));
-    if (fd.get('sort')) params.set('sort', fd.get('sort'));
+    // 以地址栏现有参数为基底，只覆盖工具栏管的字段 —— 这样 page_size 等
+    // 不在工具栏里的参数不会在第一次筛选后被静默丢掉。
+    var params = new URLSearchParams(window.location.search);
+    params.delete('format');  // JSON 开关永不进地址栏 / 请求 URL
+    ['q', 'role', 'tenant_id', 'is_active', 'sort'].forEach(function (name) {
+      var value = fd.get(name);
+      if (value) params.set(name, value);
+      else params.delete(name);
+    });
     return params;
   }
 
-  function reloadList(page) {
+  // 目标 URL 只带筛选参数，**不带** format=json —— 这个 URL 会被写进地址栏，
+  // 用户刷新/分享/后退拿到的必须是 HTML 页。
+  function listUrl(page) {
     var params = currentFilters();
     if (page) params.set('page', String(page));
-    // Save scroll position so the AJAX reload doesn't snap to top.
-    try {
-      sessionStorage.setItem(
-        'ajax:scrollY:' + window.location.pathname + window.location.search,
-        String(window.scrollY)
-      );
-    } catch (_) {}
-    window.location.assign(window.location.pathname + '?' + params.toString());
+    var qs = params.toString();
+    return window.location.pathname + (qs ? '?' + qs : '');
+  }
+
+  // 局部刷新：取整页 HTML（服务端模板是行标记 / 分页标记的唯一来源，
+  // 避免在 JS 里重写一遍表格），只替换 tbody 与分页控件。
+  //
+  // 关键：绝不能 window.location.assign(url) —— 早期版本把 format=json 拼进
+  // 导航 URL，点一下筛选/翻页整页就被裸 JSON 顶掉了。
+  //
+  // 只认最后一次请求：change 分支不 debounce，连点两个筛选会有两个请求在飞，
+  // 先回来的旧响应不能覆盖后发的结果（连带把地址栏写回旧参数）。
+  var refreshSeq = 0;
+
+  function reloadList(page) {
+    var url = listUrl(page);
+    var seq = ++refreshSeq;
+    window.fetch(url, { credentials: 'same-origin' })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.text();
+      })
+      .then(function (html) {
+        if (seq !== refreshSeq) return;  // 已有更新的请求，丢弃本次
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        var freshTbody = doc.getElementById('users-tbody');
+        if (!tbody || !freshTbody) throw new Error('users-tbody not found');
+        tbody.innerHTML = freshTbody.innerHTML;
+        swapPagination(doc.querySelector('.users-pagination'));
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState(null, '', url);
+        }
+      })
+      .catch(function () {
+        if (seq !== refreshSeq) return;
+        // 退化路径：整页导航仍然可用（服务端渲染会带上同一组筛选参数）。
+        window.location.assign(url);
+      });
+  }
+
+  // 分页控件在结果集变化时可能整块出现/消失，直接换掉节点。
+  // 点击事件用 document 级委托（见下），所以换节点不会丢监听。
+  function swapPagination(freshNav) {
+    var cur = document.querySelector('.users-pagination');
+    if (freshNav) {
+      if (cur) {
+        cur.outerHTML = freshNav.outerHTML;
+      } else {
+        // 锚点必须是 .users-table-wrap（与 SSR 里分页条的位置一致），
+        // **不能**用 tbody.insertAdjacentHTML —— table 上下文解析会触发
+        // foster parenting，分页条被塞进表格内部的匿名单元格里。
+        var anchor = document.querySelector('.users-table-wrap') || tbody;
+        if (anchor) anchor.insertAdjacentHTML('afterend', freshNav.outerHTML);
+      }
+    } else if (cur && cur.parentNode) {
+      cur.parentNode.removeChild(cur);
+    }
   }
 
   function debounceReload() {
@@ -72,18 +125,15 @@
     });
   }
 
-  // 分页链接（用 data-page 触发）
-  if (paginationEl) {
-    paginationEl.addEventListener('click', function (ev) {
-      var a = ev.target.closest('a.users-page-link');
-      if (!a || a.classList.contains('is-disabled')) {
-        ev.preventDefault();
-        return;
-      }
-      ev.preventDefault();
-      reloadList(parseInt(a.getAttribute('data-page'), 10) || 1);
-    });
-  }
+  // 分页链接（用 data-page 触发）。分页节点会被 swapPagination 整块替换，
+  // 所以用 document 级委托，而不是把监听绑在节点本身上。
+  document.addEventListener('click', function (ev) {
+    var a = ev.target.closest('a.users-page-link');
+    if (!a) return;
+    ev.preventDefault();
+    if (a.classList.contains('is-disabled')) return;
+    reloadList(parseInt(a.getAttribute('data-page'), 10) || 1);
+  });
 
   // ────────────────────────────────────────────────────────────────
   // 抽屉组件
@@ -155,7 +205,7 @@
     tenantsData.forEach(function (t) {
       html += '<option value="' + t.id + '"' +
         (t.id === currentTenantId() ? ' selected' : '') + '>' +
-        t.name + '（租户 ' + t.id + '）</option>';
+        escapeHtml(t.name) + '（租户 ' + t.id + '）</option>';
     });
     html += '</select></label>';
 
@@ -163,11 +213,14 @@
       html += '<fieldset class="users-drawer-fieldset"><legend>仓库权限（可选）</legend>';
       html += '<table class="role-matrix"><tr><th>仓库</th><th>无</th><th>staff</th><th>manager</th><th>admin</th></tr>';
       warehousesData.forEach(function (w) {
-        html += '<tr><td><strong>' + w.name + '</strong> <small class="muted">(' + w.code + ')</small></td>';
+        html += '<tr><td><strong>' + escapeHtml(w.name) + '</strong> <small class="muted">(' + escapeHtml(w.code) + ')</small></td>';
+        // 新账号默认「无权限」（与 v1 矩阵一致）。同一个 radio group 里
+        // 只能有一处 checked —— 早先这里还给 manager 也加了 checked，
+        // 浏览器取文档序靠后的那个，于是"不动矩阵直接创建"会给新账号
+        // 静默授上**每个仓库**的 manager。
         html += '<td><input type="radio" name="wh_' + w.id + '" value="" checked /></td>';
         ['staff', 'manager', 'admin'].forEach(function (role) {
-          html += '<td><input type="radio" name="wh_' + w.id + '" value="' + role + '"' +
-            (role === 'manager' ? ' checked' : '') + ' /></td>';
+          html += '<td><input type="radio" name="wh_' + w.id + '" value="' + role + '" /></td>';
         });
         html += '</tr>';
       });
@@ -225,7 +278,7 @@
     // 批量绑定（v2）
     html += '<details class="users-drawer-section">';
     html += '<summary>批量绑定（本用户 → 仓库）</summary>';
-    html += renderBulkBindForm();
+    html += renderBulkBindForm(uid);
     html += '</details>';
 
     // 底部危险操作：切换平台管理员 / 切换启停 / 删除
@@ -287,7 +340,7 @@
         if (b.code === w.code) current = b.role;
       });
       html += '<div class="role-row" data-row>';
-      html += '<span class="role-row-label"><strong>' + w.name + '</strong> <small class="muted">(' + w.code + ')</small></span>';
+      html += '<span class="role-row-label"><strong>' + escapeHtml(w.name) + '</strong> <small class="muted">(' + escapeHtml(w.code) + ')</small></span>';
       if (current) {
         html += '<form method="post" action="/users/' + uid + '/change-role" class="role-row-form" data-ajax data-ajax-mode="reload-stay">';
         html += '<input type="hidden" name="csrf_token" value="' + csrfToken() + '">';
@@ -319,7 +372,10 @@
     return html;
   }
 
-  function renderBulkBindForm() {
+  // uid 由 renderEditDrawer 显式传入。早期版本从 drawerBody 的
+  // [data-editing-uid] DOM 属性里读，但那段 html 是在属性写入之前拼好的，
+  // 结果是首次打开提交空 user_ids、第二次打开还会带上上一个用户的 id。
+  function renderBulkBindForm(uid) {
     // 复用单仓库 + 角色选择 — 不在本抽屉内选多用户，多用户从列表里勾选
     // （v2 P1：列表加 checkbox 列后再扩展）。本期先用：单用户+单仓库+单角色。
     var warehousesData = [];
@@ -332,11 +388,11 @@
     var html = '<p class="muted small">把当前用户绑定到一个仓库一个角色。如需多用户批量绑定，请用列表勾选（v2 P1）。</p>';
     html += '<form method="post" action="/users/bulk-bind" class="users-drawer-inline-form">';
     html += '<input type="hidden" name="csrf_token" value="' + csrfToken() + '">';
-    html += '<input type="hidden" name="user_ids" value="' + currentEditingUserId() + '" />';
+    html += '<input type="hidden" name="user_ids" value="' + escapeHtml(uid) + '" />';
     html += '<select name="warehouse_id" required>';
     html += '<option value="">选择仓库</option>';
     warehousesData.forEach(function (w) {
-      html += '<option value="' + w.id + '">' + w.code + ' — ' + w.name + '</option>';
+      html += '<option value="' + w.id + '">' + escapeHtml(w.code) + ' — ' + escapeHtml(w.name) + '</option>';
     });
     html += '</select>';
     html += '<select name="role">';
@@ -353,25 +409,10 @@
   // 全局事件：行点击 + 新建按钮
   // ────────────────────────────────────────────────────────────────
 
-  var currentEditingUserId = function () {
-    var row = drawerBody && drawerBody.querySelector('[data-editing-uid]');
-    return row ? row.getAttribute('data-editing-uid') : '';
-  };
-  // 简单暴露给上面的 renderBulkBindForm 用
-  // (ES5 闭包传值麻烦，直接读 attribute)
   function currentUserId() {
     var el = document.getElementById('current-user-id');
     return el ? parseInt(el.textContent, 10) : 0;
   }
-  function currentEditingUid() {
-    return drawerBody ? drawerBody.getAttribute('data-editing-uid') || '' : '';
-  }
-  // Stash editing uid on the body element so renderBulkBindForm can find it.
-  var _origRenderEditDrawer = renderEditDrawer;
-  renderEditDrawer = function (row) {
-    _origRenderEditDrawer(row);
-    if (drawerBody) drawerBody.setAttribute('data-editing-uid', row.getAttribute('data-user-id'));
-  };
 
   if (tbody) {
     tbody.addEventListener('click', function (ev) {
@@ -409,13 +450,20 @@
     var el = document.getElementById('current-tenant-id');
     return el ? parseInt(el.textContent, 10) : 0;
   }
-  function currentActorId() {
-    var el = document.getElementById('current-user-id');
-    return el ? parseInt(el.textContent, 10) : 0;
-  }
+  // Escape a value before interpolating it into an innerHTML string.
+  // The entity table MUST contain real entities ("&amp;" etc.) — writing
+  // the bare characters here (as the first revision did) makes this a
+  // no-op and turns any user/tenant/warehouse name containing a quote or
+  // angle bracket into stored HTML injection.
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&', '<': '<', '>': '>', '"': '"', "'": '&#39;' }[c];
+      return {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[c];
     });
   }
 })();

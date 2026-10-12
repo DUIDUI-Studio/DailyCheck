@@ -124,9 +124,15 @@ def _scoped_user_query(
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     # Whitelist sort columns to avoid SQL injection via ?sort=.
-    sort_key = sort if sort in {"id", "username", "last_login_at"} else "id"
+    # Strip the optional leading "-" (descending marker) BEFORE the
+    # whitelist check — otherwise "-last_login_at" misses the set and
+    # silently falls back to "id" while keeping DIRECTION=DESC, which
+    # made every descending sort return id-descending order instead.
+    sort_key = sort[1:] if sort.startswith("-") else sort
+    if sort_key not in {"id", "username", "last_login_at"}:
+        sort_key = "id"
     direction = "DESC" if sort.startswith("-") else "ASC"
-    order_sql = f"ORDER BY u.{sort_key.lstrip('-')} {direction}, u.id ASC"
+    order_sql = f"ORDER BY u.{sort_key} {direction}, u.id ASC"
 
     offset = max(0, (page - 1) * page_size)
     limit_sql = "LIMIT ? OFFSET ?"
@@ -193,8 +199,10 @@ def list_users():
     - sort: id / username / last_login_at, optional leading "-"
     - page: 1-based, default 1
     - page_size: default DEFAULT_PAGE_SIZE, capped at MAX_PAGE_SIZE
-    - format: "json" if Accept: application/json or ?format=json — returns a
-      JSON envelope used by the toolbar's debounced reload.
+    - format: only the literal "json" switches the response to a JSON
+      envelope; anything else (including the browser's own Accept header)
+      renders the HTML page. The browser never asks for json — the toolbar
+      fetches the HTML page and swaps the tbody client-side.
     """
     q = (request.args.get("q") or "").strip() or None
     role = (request.args.get("role") or "").strip() or None
