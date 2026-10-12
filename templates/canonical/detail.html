@@ -4,8 +4,13 @@
 <div class="page-header">
   <h2>{{ canonical['name'] }} <small>{{ canonical['canonical_sku'] }}</small></h2>
   <div>
+    {% set has_filter = filters.q or filters.category or filters.status %}
+    {% set back_args = {'q': filters.q or none, 'category': filters.category or none, 'status': filters.status or none} %}
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_list', **back_args) }}">
+      ← {% if has_filter %}返回筛选结果{% else %}返回品项列表{% endif %}
+    </a>
     {% if g.user and g.user['is_admin'] %}
-    <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', canonical_id=canonical['id']) }}">编辑</a>
+    <a class="btn-sm" href="{{ url_for('canonical.canonical_edit', canonical_id=canonical['id'], **back_args) }}">编辑</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout', canonical_id=canonical['id']) }}">扇出</a>
     {% endif %}
   </div>

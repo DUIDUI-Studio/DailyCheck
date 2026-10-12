@@ -7,6 +7,10 @@
 
 <form method="post" class="grid cols-2">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {# 透传列表筛选条件 —— POST 成功后直接跳回带筛选的 list #}
+        {% if filters.q %}<input type="hidden" name="q" value="{{ filters.q }}">{% endif %}
+        {% if filters.category %}<input type="hidden" name="category" value="{{ filters.category }}">{% endif %}
+        {% if filters.status %}<input type="hidden" name="status" value="{{ filters.status }}">{% endif %}
   <label>
     <span>名称 *</span>
     <input name="name" required value="{{ canonical['name'] if canonical else '' }}" />
@@ -66,7 +70,8 @@
   </label>
   <div class="form-actions">
     <button type="submit" class="btn">保存</button>
-    <a class="btn-link" href="{{ url_for('canonical.canonical_list') }}">取消</a>
+    {% set cancel_args = {'q': filters.q or none, 'category': filters.category or none, 'status': filters.status or none} %}
+    <a class="btn-link" href="{{ url_for('canonical.canonical_list', **cancel_args) }}">取消</a>
   </div>
 </form>
 {% endblock %}
