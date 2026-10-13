@@ -43,7 +43,7 @@
 {% endfor %}
 ```
 
-- `role_display` 映射：staff→基础作业 / manager→管理审批 / admin→仓管理 / viewer→只读审计 / finance→财务。
+- `role_display` 映射：staff→基础作业 / manager→管理审批 / admin→仓管理 / viewer→只读/审计 / finance→财务。
 - 平台管理员 tag（`is_admin`）改类名为 `.role-tag--super`（沿用既有琥珀色，仅类名 token 化）。
 - 未知 code → 中性降级 tag（防未来自定义角色裸奔）：默认 `.role-tag--staff` 样式 + 显示原 code。
 

@@ -59,15 +59,15 @@
 | 角色 | 授予的权限点（预期 ●） | 计数 |
 |------|----------------------|------|
 | staff 基础作业 | order.create, order.receive, stock.outbound, stock.outbound.rollback, stock.stocktake, stock.adjust, stock.restock, item.view, report.view, report.export | 10 |
-| manager 管理审批 | staff ∪ order.approve, order.ship, item.edit, item.create, item.price.view, report.cost.view | 16 |
-| admin 仓管理 | manager ∪ stock.stocktake.approve, item.delete, item.price.edit | 19 |
+| manager 管理审批 | staff ∪ order.approve, order.ship, item.edit, item.create, item.price.view, report.cost.view, stock.stocktake.approve | 17 |
+| admin 仓管理 | manager ∪ item.price.edit | 18 |
 | viewer 只读/审计 | item.view, report.view, report.export | 3 |
 | finance 财务 | item.view, report.view, report.export, report.cost.view | 4 |
 | 平台管理员 | 全部 25（bypass，锁定列） | 25 |
 
 > 数据源：`permissions_manifest.ROLE_PACKAGES`（单一事实来源）。UI 不硬编码，从 manifest 渲染。
-> `admin.*` 5 点：5 个仓库角色均无（仅平台管理员列亮）；这是"管理权中心化"的直观表达。
-> `item.view` 归属为 OPEN 项（Spec 附录 B）：本表按 Spec 附录 A 默认值展示，实施时以逐条定级表复核结论为准。
+> `admin.*` 5 点 **+ `item.delete` + `order.cancel.any`** 共 7 点为平台级（`PLATFORM_ONLY_PERMS`），5 个仓库角色均无（仅平台管理员列亮）；这是"管理权中心化"的直观表达。
+> `item.view` 归属为 OPEN 项（Spec 附录 B）：本表按 manifest 现值展示，实施时以逐条定级表复核结论为准。
 
 ## 页面状态
 
