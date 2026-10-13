@@ -768,13 +768,20 @@ def test_users_service_worker_does_not_cache_dynamic_get():
 
     这条是静态断言（JS 侧没有 pytest 覆盖的替代品）：把 sw.js 里"只缓存
     /static/"的那道判断钉住，防止有人把它改回"所有非导航 GET 都缓存"。
+
+    用**顺序断言**而不是字面量 `in`：`in` 只能证明字符串存在，把范围判断挪到
+    `cache.put` 之后、或把 put 挪出 `res.ok` 守卫，都照样通过 —— 而那正是会
+    导致越权缓存落盘的改法。
     """
     from pathlib import Path
 
     sw = (Path(__file__).resolve().parent.parent / "static" / "sw.js").read_text(
         encoding="utf-8"
     )
-    assert 'url.pathname.indexOf("/static/") !== 0' in sw, "sw.js 缺少 /static/ 范围判断"
-    assert "cache.put(req, copy)" in sw
-    # cache.put 必须受 res.ok 与范围判断保护，不能无条件写入
-    assert "if (res.ok) {" in sw
+    scope_idx = sw.index("url.pathname.indexOf")  # /static/ 范围判断（代码，排除注释）
+    put_idx = sw.index("cache.put(req, copy)")  # 缓存写入（代码，排除注释）
+    ok_idx = sw.index("if (res.ok)")  # 写入守卫
+    last_respondwith = sw.rindex("event.respondWith")  # 缓存分支的 respondWith
+    assert scope_idx < put_idx, "范围判断必须早于 cache.put，否则非 /static/ 响应也会落盘"
+    assert ok_idx < put_idx, "cache.put 必须受 res.ok 守卫，不能无条件写入"
+    assert scope_idx < last_respondwith, "缓存分支必须先做 /static/ 范围早退再 respondWith"

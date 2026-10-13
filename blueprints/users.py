@@ -343,8 +343,13 @@ def _no_store(resp):
     /users 是「账号状态的事实来源」，且只有平台管理员能看。默认响应没有任何
     Cache-Control，一旦被 Service Worker 的 Cache API 存下来，缓存副本按 URL
     命中即可返回、**不经过服务端鉴权**（实测匿名会话也能拿到 200 的管理员页面），
-    并且列表会静默显示陈旧数据。sw.js 已收窄为只缓存 /static/，这里是第二道闸：
-    `Cache-Control: no-store` 还会让 Cache API 的 put() 直接抛错。
+    并且列表会静默显示陈旧数据。
+
+    注意 no-store 的作用域：它只约束**浏览器 HTTP 缓存与中间代理**，对
+    Service Worker 的 Cache API **无效** —— 实测 `cache.put()` 照样成功落盘
+    （MDN 的 Cache.put 异常清单里没有 no-store 规则）。所以挡住这条路的**唯一
+    防线是 `static/sw.js` 里「只缓存同源 /static/」的范围判断**；本头是纵深防御
+    的附加收益（避免 HTTP 层与代理缓存），不要把它当成可以放心回退范围判断的兜底。
     """
     resp.headers["Cache-Control"] = "no-store"
     return resp

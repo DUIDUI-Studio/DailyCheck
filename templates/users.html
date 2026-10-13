@@ -5,7 +5,7 @@
    行内表单（重置密码 / 切换平台管理员 / 解绑 / 启停）保留 ajax-form.js 的 reload-stay 模式。 #}
 {% block content %}
 <link rel="stylesheet" href="{{ url_for('static', filename='users-admin.css') }}?v=2" />
-<script defer src="{{ url_for('static', filename='users-admin.js') }}?v=2"></script>
+<script defer src="{{ url_for('static', filename='users-admin.js') }}?v=3"></script>
 
 {# v2 账号管理：抽屉需要的隐藏数据 + CSRF meta + 当前用户/租户 token。
    把数据放进 #warehouses-data / #tenants-data JSON script 块，users-admin.js

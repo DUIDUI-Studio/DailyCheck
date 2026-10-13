@@ -754,7 +754,7 @@ flowchart LR
     subgraph Client["浏览器 / 手机"]
         HTML["Jinja2 模板<br/>(mobile-first)"]
         CSS["static/style.css<br/>1612 行"]
-        SW["static/sw.js<br/>Service Worker (78 行)"]
+        SW["static/sw.js<br/>Service Worker (72 行)"]
         Manifest["static/manifest.webmanifest<br/>zh-CN / standalone"]
         Icons["static/icons/icon-192.png<br/>icon-512.png"]
     end
@@ -781,7 +781,9 @@ flowchart LR
 
 **SW 缓存边界（2026-10-13 收窄，重要）**：`sw.js` 的 cache-first 分支**只对同源 `/static/` 生效**，其余非导航 GET（HTML 片段、JSON、接口）一律 network-only（不 respondWith，交给浏览器直连）。导航请求仍 network-first + 离线回落 app shell / `offline.html`。
 - 反例（已实测复现，勿回退）：收窄前对所有非导航 GET 无差别 `cache-first` + `cache.put`。一旦页面内 `fetch` 一个 HTML 页面（`users-admin.js` 的工具栏就是这么刷 `/users?<筛选>` 的），该页面会被写进 Cache API，后果两条 —— ① 服务端数据变了列表仍返回旧副本且不报错；② 缓存副本按 URL 命中即返回、**不经过服务端鉴权**，匿名会话也能拿到 200 的管理员页面（响应自带的 `Vary: Cookie` 挡不住 Cache API 匹配，实测 len=24666 含 `bulk01`）。
-- 第二道闸：`/users` 的 HTML 与 `?format=json` 响应都带 `Cache-Control: no-store`（`blueprints/users.py:_no_store`）。带 no-store 的响应会让 Cache API 的 `put()` 抛错，即便 SW 范围判断被人改回去也不会落盘。
+- `/users` 的 HTML 与 `?format=json` 响应都带 `Cache-Control: no-store`（`blueprints/users.py:_no_store`）。⚠️ **no-store 只约束浏览器 HTTP 缓存与中间代理，对 Cache API 无效**——实测 `cache.put()` 照常落盘（MDN 的 `Cache.put` 异常清单里没有 no-store 规则）。所以**唯一防线是上面那条范围判断**，no-store 只是纵深防御的附加收益，不要据此放宽范围判断。
+  - 唯一例外：`_helpers.py` 的 AJAX 3xx 信封（`X-Requested-With: fetch` 时返回的 `{ok, location, message}`）是新响应对象、不带 no-store；它不含管理员数据，无可利用面，登记备查。
+- **改 `/static/` 下的资源必须 bump 模板里的 `?v=`（或 bump `CACHE_NAME`）**：`/static/` 走 cache-first 且不回源，暖缓存客户端会永久拿到旧文件。
 - 改 `sw.js` 的缓存策略记得 bump `CACHE_NAME`（当前 `dailycheck-v5`）：activate 时按名字清旧缓存，否则已中毒的缓存条目会一直活着。
 - ❌ **无 background sync**（离线写不能排队）
 - ❌ iOS Safari PWA 有已知限制（storage quota、push）
