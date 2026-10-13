@@ -57,7 +57,7 @@
   {% if is_admin or is_storefront or is_distribution_center %}
   <section class="land-card">
     <h3>门店订货</h3>
-    <p>{% if is_admin %}订货目录 / 我的订单 / 审单 / 品项管理{% elif is_storefront %}订货目录 / 我的订单{% else %}订货目录 / 品项管理{% endif %}</p>
+    <p>{% if is_admin %}订货目录 / 我的订单 / 审单 / 品项管理{% elif is_storefront %}订货目录 / 我的订单{% elif g.role and g.role['role'] in ('manager', 'admin') %}订货目录 / 品项管理{% else %}订货目录{% endif %}</p>
     <ul class="land-links">
       <li><a href="{{ url_for('store_ordering.catalog') }}">订货目录</a></li>
       {% if is_admin or is_storefront %}

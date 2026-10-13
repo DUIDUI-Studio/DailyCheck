@@ -1,5 +1,8 @@
 # 已知 pre-existing 失败清单（CI 零新增门禁基线）
-# 基线日期：2026-10-10（18 failed / 711 passed）
+# 基线：2026-10-10 起 18 条失败；2026-10-13 起 16 条（nav_integration×2 修复后移除）。
+# 口径：清单按「失败集逐行」维护，与 passed 总数无关。passed 随环境而变
+#      （CI 忽略 tests/mcp_server；本地可跑该目录，实测 2 failed / 78 passed），
+#      引用 passed 数时必须写明口径，否则跨环境对比会误判。
 # 2026-10-13：nav_integration×2 随导航模块化修复并移除（失败集 18→16）。
 # 规则：清单只许收缩不许扩张；修复一个就删一行；新增失败不允许加进来。
 tests/mcp_server/test_data/test_warehouse.py::test_create_restock_increases_quantity

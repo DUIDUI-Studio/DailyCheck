@@ -136,7 +136,7 @@ def nav_client_factory(tmp_path, monkeypatch):
 
     master_path = tmp_path / "master.db"
     wh_dir = tmp_path / "warehouses"
-    wh_dir.mkdir()
+    wh_dir.mkdir(exist_ok=True)
 
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
@@ -145,9 +145,17 @@ def nav_client_factory(tmp_path, monkeypatch):
 
     init_master_db()
 
-    from app import create_app
-    app = create_app()
-    app.config["TESTING"] = True
+    # 惰性建 app：不调用 _build 的用例（以及只用 fixture 做别的事的用例）不必付
+    # create_app() 的代价。
+    _app_cache: list = []
+
+    def _app():
+        if not _app_cache:
+            from app import create_app
+            application = create_app()
+            application.config["TESTING"] = True
+            _app_cache.append(application)
+        return _app_cache[0]
 
     built: dict[str, tuple] = {}
 
@@ -192,7 +200,7 @@ def nav_client_factory(tmp_path, monkeypatch):
         m.commit()
         m.close()
 
-        client = app.test_client()
+        client = _app().test_client()
         with client.session_transaction() as s:
             s["user_id"] = uid
             s["warehouse_id"] = uid
