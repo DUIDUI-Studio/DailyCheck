@@ -327,6 +327,88 @@ def test_viewer_resolves_three_perms(rbac_env):
 
 
 # ---------------------------------------------------------------------------
+# Test B3 — R1 配方成本读接口收紧至 report.cost.view（staff/viewer 403）
+#   配方模块仅 RD 仓可用；用 RD 仓夹具，避免 storefront 被 `_require_rd` 提前 403
+#   从而无法区分「权限点拦截」与「仓类型拦截」。
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def rbac_rd_env(tmp_path, monkeypatch):
+    """RD 仓 + 5 角色用户（1=admin 2=staff 3=manager 4=viewer 5=finance）+ 1 条 ic_recipe。"""
+    import config as config_module
+    import db as db_module
+    from db import init_master_db, init_warehouse_db
+
+    master_path = tmp_path / "master.db"
+    wh_dir = tmp_path / "warehouses"
+    wh_dir.mkdir()
+    wh_path = wh_dir / "rd_test.db"
+
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
+
+    init_master_db()
+    init_warehouse_db(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(master_path)
+    _seed_user(m, 1, "admin", 1)
+    for uid, role in ((2, "staff"), (3, "manager"), (4, "viewer"), (5, "finance")):
+        _seed_user(m, uid, f"{role}_user", 0)
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+        "VALUES (1, 'rd_test', '测试研发', ?, 'rd', ?)", (str(wh_path), ts))
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1,1,'admin')")
+    for uid, role in ((2, "staff"), (3, "manager"), (4, "viewer"), (5, "finance")):
+        m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (?,1,?)",
+                  (uid, role))
+    m.commit()
+    m.close()
+
+    w = sqlite3.connect(wh_path)
+    w.execute(
+        "INSERT INTO ic_recipes (name, output_unit, output_qty, sale_price, "
+        "created_at, updated_at) VALUES ('测试ic', 'g', 100, 25, ?, ?)", (ts, ts))
+    w.commit()
+    w.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    return app, app.test_client(), wh_path
+
+
+_R1_COSTVIEW_CASES = [
+    # staff / viewer 无 report.cost.view → 403
+    ("recipe_cost.api_cost", 2, True, {"kind": "ic_recipe", "rid": 1}),
+    ("recipe_cost.api_cost", 4, True, {"kind": "ic_recipe", "rid": 1}),
+    ("recipe_cost.recipes_export_csv", 2, True, None),
+    ("recipe_cost.ic_recipes_export_csv", 4, True, None),
+    ("recipe_cost.ic_recipe_bom_export_csv", 2, True, {"ic_recipe_id": 1}),
+    # manager / finance 持 report.cost.view → 放行
+    ("recipe_cost.api_cost", 3, False, {"kind": "ic_recipe", "rid": 1}),
+    ("recipe_cost.api_cost", 5, False, {"kind": "ic_recipe", "rid": 1}),
+    ("recipe_cost.recipes_export_csv", 3, False, None),
+    ("recipe_cost.recipes_export_csv", 5, False, None),
+]
+
+
+@pytest.mark.parametrize("endpoint,uid,expect_denied,url_args", _R1_COSTVIEW_CASES)
+def test_recipe_cost_costview_lockdown(rbac_rd_env, endpoint, uid, expect_denied, url_args):
+    """R1 终裁：api_cost + 4 CSV 导出挂 report.cost.view（staff/viewer 403）。"""
+    app, client, _ = rbac_rd_env
+    resp = _request(client, app, endpoint, uid, method="GET", url_args=url_args)
+    if expect_denied:
+        assert resp.status_code == 403, (
+            f"{endpoint} uid={uid} 期望 403（缺 report.cost.view），实得 {resp.status_code}")
+    else:
+        assert resp.status_code != 403 and resp.status_code < 500, (
+            f"{endpoint} uid={uid} 应放行，实得 {resp.status_code}")
+
+
+# ---------------------------------------------------------------------------
 # Test C — 反倒挂不变式（AC-13）
 # ---------------------------------------------------------------------------
 

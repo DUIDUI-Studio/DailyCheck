@@ -77,7 +77,7 @@
 ## 5. 权限点目录与端点映射（锁定）
 
 - **权限点目录**：25 个点全量见架构文档 §3.3（`order.*` 5 / `stock.*` 6 / `item.*` 6 / `report.*` 3 / `admin.*` 5），以 `PERMISSION_CATALOG` 常量落库。
-- **端点映射**：`ROUTE_MATRIX`（manifest）覆盖全部 156 条已注册路由（阶段 1 无新增 HTTP 端点；现有端点守卫等价收敛 + 逐条定级）。
+- **端点映射**：`ROUTE_MATRIX`（manifest）覆盖全部 **147** 条已注册路由（main 基线实测；PR #17 合并后按实际 `url_map` 复核）（阶段 1 无新增 HTTP 端点；现有端点守卫等价收敛 + 逐条定级）。
 - 关键端点示例（全量以 manifest 为准）：
 
 | 端点（示例） | 权限点 | 迁移方式 |
@@ -148,7 +148,7 @@
 
 ## 10. 边界与约束
 
-- **行为变化白名单**（除此外一律零变化）：① `report.cost.view` 默认收紧（staff/viewer 不可见成本列，manager+/finance 可见）——F4 的目的本身；② `stock.outbound` 显式化（行为不变）；③ **`stock.stocktake.approve` 收紧至 manager+**（终裁①，staff 失去盘点审批）。
+- **行为变化白名单**（除此外一律零变化）：① `report.cost.view` 默认收紧（staff/viewer 不可见成本列，manager+/finance 可见）——F4 的目的本身；② `stock.outbound` 显式化（行为不变）；③ **`stock.stocktake.approve` 收紧至 manager+**（终裁①，staff 失去盘点审批）；④ **`recipe_cost` 配方成本读接口收紧至 `report.cost.view`**（`api_cost` + 4 个 CSV 导出：`ic_recipes_export_csv` / `recipes_export_csv` / `ic_recipe_bom_export_csv` / `recipe_bom_export_csv`；staff/viewer 403，manager/finance/admin 放行）——Eric 终裁 2026-10-13（验证报告 R1），属 ① 的收口延伸。
 - **已知口径例外**（登记，非缺口）：`/summary`、`/inventory` 页成本金额**不脱敏**（终裁④，见附录 B.3）。
 - **OPEN 项**（附录 B）：`report.export` 是否从基础包收窄到管理岗——本期默认零变化，实施完成后第一轮复核提交 Eric。
 - 性能：权限解析每请求一次 JOIN（<1ms 量级），不显著增加请求耗时。
@@ -197,6 +197,7 @@ ruff check <改动文件>                                # 零新增
 |------|----------|------|----------|
 | 2026-10-13 | v1.0 生成 | 三文档确认 + Eric 拍板回填 | 全量（阶段 1 锁定） |
 | 2026-10-13 | v1.1 终裁回填 | Eric Phase 3 五项终裁（①-⑤）落库；附录 A 角色包修订（manager 16→17 / admin 19→18）；附录 B 拆分 LOCKED 裁定 + 口径例外登记 | 阶段 1 实施锁定 |
+| 2026-10-13 | v1.2 R1 收口 | `recipe_cost` 配方成本读接口（`api_cost` + 4 CSV 导出）收紧至 `report.cost.view`（Eric 终裁，验证报告 R1）；§5 路由数 156→147 校正（R4；PR #17 合并后复核）；§10 白名单追加 ④ | 阶段 1 实施（配方成本读收紧） |
 
 ---
 

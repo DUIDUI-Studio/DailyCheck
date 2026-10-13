@@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, flash, g, redirect, render_templat
 from blueprints._helpers import now, parse_qty
 from blueprints.auth import audit
 from db import get_warehouse_db
-from permissions import require_login, require_platform_admin
+from permissions import require_login, require_permission, require_platform_admin
 
 bp = Blueprint("recipe_cost", __name__)
 
@@ -713,7 +713,7 @@ def update_selling_price(item_id: int):
 
 
 @bp.route("/recipe-cost/api/cost/<kind>/<int:rid>", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def api_cost(kind: str, rid: int):
     """只读 JSON：当前 ic_recipe / recipe 的成本与毛利率（前端 sanity check 用）。"""
     db = get_warehouse_db()
@@ -741,7 +741,7 @@ def api_cost(kind: str, rid: int):
 # ---------------------------------------------------------------------------
 
 @bp.route("/recipe-cost/ic-recipes/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def ic_recipes_export_csv():
     """Flat list of every ic_recipe with computed cost / margin columns."""
     db = get_warehouse_db()
@@ -780,7 +780,7 @@ def ic_recipes_export_csv():
 
 
 @bp.route("/recipe-cost/recipes/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def recipes_export_csv():
     """Flat list of every serving recipe (出品配方) with computed columns."""
     db = get_warehouse_db()
@@ -819,7 +819,7 @@ def recipes_export_csv():
 
 
 @bp.route("/recipe-cost/ic-recipes/<int:ic_recipe_id>/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def ic_recipe_bom_export_csv(ic_recipe_id: int):
     """BOM rows (one per ingredient line) for a single ic_recipe."""
     db = get_warehouse_db()
@@ -872,7 +872,7 @@ def ic_recipe_bom_export_csv(ic_recipe_id: int):
 
 
 @bp.route("/recipe-cost/recipes/<int:recipe_id>/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def recipe_bom_export_csv(recipe_id: int):
     """BOM rows for a single recipe (出品配方), polymorphic (item or ic_recipe)."""
     db = get_warehouse_db()

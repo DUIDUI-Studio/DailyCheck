@@ -500,6 +500,7 @@ def mask_cost_csv_row(values: list, indices: set[int], allow: bool) -> list:
 | M3 | 路由总数 | 施工图 §1.0 记 153 | 本 worktree（`main @ 75af9c6`）实际 **147**（`blueprints/users.py` 无 `bulk_bind`/`toggle_active`，属 `user-admin-v2` 分支） | manifest 以实际 `app.url_map` 为准，147/147 覆盖 |
 | M4 | §1.3 #16 `store_ordering.cancel_order_route` | `require_any_permission("order.create","order.cancel.any")` | 保持（不变） | **team-lead 终裁（2026-10-13）：接受现方案 → 关闭**——`order.cancel.any` 不进任何角色包（测试已断言，属 `PLATFORM_ONLY_PERMS`）；`require_any_permission` 保留 owner（持 `order.create`）自撤能力，`order.cancel.any` 作平台级预留 |
 | M5 | 缺口 A `blueprints/users.py` `VALID_ROLES` | 沿用 `set(config.ROLE_RANK.keys())`（仅阶梯三包） | 改 `set(BUILTIN_ROLE_CODES)`（manifest 单一来源，5 包） | 绑定/展示**必须接纳 viewer/finance**，否则后端校验会挡前端绑定（Spec §7）。同时 `list_users` 注入 `role_options`（模板不硬编码角色集）；`_parse_binding` 提示文案改用 manifest 顺序+显示名 |
+| M6 | §1.3 `recipe_cost` 读接口（`api_cost` + 4 CSV 导出） | 5 条 `LOGIN`（`ic_recipes_export_csv`/`recipes_export_csv`/`ic_recipe_bom_export_csv`/`recipe_bom_export_csv`/`api_cost`） | 收紧为 `@require_permission("report.cost.view")`；`ROUTE_MATRIX` 5 条 intent 同步 `perm("report.cost.view")` | **R1 终裁（Eric，验证报告 R1，2026-10-13）**：配方成本属成本口径，与 `report.cost.view` 同源；staff/viewer 403、manager/finance/admin 放行。调用方仅模板导航链接（点击→403，符合收紧本意，**未额外美化**；无页面自动请求场景）。回归新增 9 用例。Spec §10 白名单 ④ |
 
 ### 7.1 Phase 3 收官裁定（team-lead 2026-10-13）
 
@@ -510,6 +511,10 @@ def mask_cost_csv_row(values: list, indices: set[int], allow: bool) -> list:
 1. **PR #17（`user-admin-v2`）合并 main 后**：`ROUTE_MATRIX` 需补其新增路由（`users.bulk_bind`、`users.toggle_active` 等）——否则 Test A 覆盖校验会失败（本 worktree 基于 main，仅 147 路由）。
 2. **`users.html` v2 与本期 v1 前端改动对账**：本期后端已注入 `role_options=[{code,label}×5]`（manifest 顺序）；v2 模板的角色下拉/toolbar 筛选/tag 渲染须以该变量为来源，不得硬编码角色集（设计师并行改 `templates/users.html`，架构侧不碰该文件）。
 3. **`order.ship` 语义**与"发货是否收紧 manager+"决议，留**阶段 2**连同自定义角色一起评审（当前 ship 走 DC 兼容层；`order.ship` 描述已核准为"DC 发货 / 门店整单交付确认"）。
+
+### 7.3 R2 备注（receive 守卫层 vs 函数体）
+
+`store_ordering.receive_order_route` 在 `ROUTE_MATRIX` 记录为守卫层 `perm:order.receive`，但函数体内联 `role not in ("manager","admin")` 使其**实际放行 manager+**（偏严、**非漏洞**，行为与 main 一致）。已在 `permissions_manifest.py` 的 receive 条目旁加同义注释；留**阶段 2**统一（改为纯 `order.receive` 语义，或明确收紧至 manager+）。
 
 ## 8. 规范化交付校验清单（本 worktree 实测）
 

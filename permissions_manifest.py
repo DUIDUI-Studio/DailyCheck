@@ -230,11 +230,13 @@ ROUTE_MATRIX: dict[str, str] = {
     "recipe_cost.recipe_edit": PLATFORM,
     "recipe_cost.recipe_delete": PLATFORM,
     "recipe_cost.update_selling_price": PLATFORM,
-    "recipe_cost.api_cost": LOGIN,
-    "recipe_cost.ic_recipes_export_csv": LOGIN,
-    "recipe_cost.recipes_export_csv": LOGIN,
-    "recipe_cost.ic_recipe_bom_export_csv": LOGIN,
-    "recipe_cost.recipe_bom_export_csv": LOGIN,
+    # R1 终裁（2026-10-13，验证报告 R1）：配方成本读接口收紧至 report.cost.view
+    # （staff/viewer 403；manager/finance/admin 放行）。
+    "recipe_cost.api_cost": perm("report.cost.view"),
+    "recipe_cost.ic_recipes_export_csv": perm("report.cost.view"),
+    "recipe_cost.recipes_export_csv": perm("report.cost.view"),
+    "recipe_cost.ic_recipe_bom_export_csv": perm("report.cost.view"),
+    "recipe_cost.recipe_bom_export_csv": perm("report.cost.view"),
     "recipe_cost.ic_recipe_publish": PLATFORM,
     "recipe_cost.recipe_publish": PLATFORM,
     "recipe_cost.recipe_versions_history": LOGIN,
@@ -286,6 +288,8 @@ ROUTE_MATRIX: dict[str, str] = {
     # staff 失去发货能力 → 非白名单行为变化）。施工图 §1.2-E 修正说明。
     "store_ordering.ship_order_route": f"{DC_PREFIX}{ROLE_PREFIX}staff",
     "store_ordering.deliver_order_route": perm("order.ship"),
+    # 守卫层记录为 perm:order.receive；但函数体 inline `role not in ("manager","admin")`
+    # 使实际放行 manager+（偏严、非漏洞，行为与 main 一致）——留阶段 2 统一。见施工图 §7 R2。
     "store_ordering.receive_order_route": perm("order.receive"),
     "store_ordering.manage_shipping_rule": f"{ROLE_PREFIX}admin",
     "store_ordering.admin_report": f"{ROLE_PREFIX}admin",
