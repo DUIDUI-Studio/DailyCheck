@@ -169,7 +169,7 @@ PYTHONPATH=.venv/lib/python3.12/site-packages /opt/homebrew/bin/python3.12 <scri
 
 **canonical**（25）：`canonical_edit`×2 清除死装饰器(PLATFORM)｜`binding_active`/`batch_edit`/`backfill_prices` PLATFORM 保持｜`claim`/`unclaim`/`review_claim_request`/`resolve_conflict` 兼容层 manager｜`bulk_import`/`fanout`×2 兼容层 admin｜其余读 login 保持
 
-**core**（6）：`summary` LOGIN 保持 **+ 成本脱敏**｜`dashboard`/`land`×2/`categories` LOGIN 保持｜`delete_category` 兼容层 staff
+**core**（6）：`summary` LOGIN 保持（终裁④不脱敏）｜`dashboard`/`land`×2/`categories` LOGIN 保持｜`delete_category` 兼容层 staff
 
 **forecast**（4）：`forecast_index` 清除死装饰器(PLATFORM)｜`forecast_item`/`forecast_product`/`forecast_recompute` 兼容层 manager
 
@@ -185,7 +185,7 @@ PYTHONPATH=.venv/lib/python3.12/site-packages /opt/homebrew/bin/python3.12 <scri
 
 **production**（10）：`products_list`/`session`/`runs_list`/`runs_csv` LOGIN｜`product_new`/`product_edit`/`product_delete` PLATFORM｜`submit` 残留 LOGIN(advisory)｜`rollback`/`delete_run` 兼容层 staff
 
-**recipe_cost**（19）：写路由 PLATFORM 保持（`ic_recipe_new/edit/delete/publish`、`recipe_new/edit/delete/publish`、`update_selling_price`）｜读路由 LOGIN 保持（`landing`/`ic_recipes_list`/`recipes_list`/`api_cost`/`*_export_csv`×4/`recipe_versions_history`）｜**advisory**：读路由含成本字段（§3.7 A/C 组），本期保持现状、建议纳入后续复核
+**recipe_cost**（19）：写路由 PLATFORM 保持（`ic_recipe_new/edit/delete/publish`、`recipe_new/edit/delete/publish`、`update_selling_price`）｜读路由：`landing`/`ic_recipes_list`/`recipes_list`/`recipe_versions_history` LOGIN 保持；`api_cost` 与 `*_export_csv`×4 **按 R1 终裁收紧至 report.cost.view（见 §7 M6）**
 
 **reports**（5）：`outbound`/`inbound` 新增 report.view（无成本列）｜`export_consumption`/`export_summary` 新增 report.export + 成本脱敏｜`api_upload_revenue` 兼容层 manager
 
@@ -193,7 +193,7 @@ PYTHONPATH=.venv/lib/python3.12/site-packages /opt/homebrew/bin/python3.12 <scri
 
 **stocktake**（12）：CSV 4 路由 兼容层 login>admin｜`stocktake_list`/`stocktake_session` LOGIN｜`stocktake_start` LOGIN(session)｜`stocktake_submit` 新增 stock.stocktake｜`rollback`/`edit`/`submit_edit` 等价迁移 stock.stocktake｜`approve` **收紧迁移 stock.stocktake.approve（终裁①，manager+）**
 
-**store_ordering**（21）：`catalog`/`cart_view`/`store_orders_list`/`order_detail` LOGIN｜cart 写×7 新增 order.create｜`cancel_order_route` 定级待复核 order.cancel.any｜`deliver_order_route` 新增 order.ship｜`receive_order_route` 新增 order.receive｜`review_order_route` 等价迁移 order.approve(+DC)｜`ship_order_route` 等价迁移 order.ship(+DC)｜`review_list`/`shipment_list` 兼容层(login>DC>staff)｜`manage_dc_items` 兼容层(login>DC>manager)｜`manage_shipping_rule`/`admin_report`/`admin_orders` 兼容层 login>admin
+**store_ordering**（21）：`catalog`/`cart_view`/`store_orders_list`/`order_detail` LOGIN｜cart 写×7 新增 order.create｜`cancel_order_route` any(order.create|cancel.any)（M4）｜`deliver_order_route` 新增 order.ship（M2：零变化）｜`receive_order_route` 新增 order.receive｜`review_order_route` 等价迁移 order.approve(+DC)｜`ship_order_route` **维持兼容层 role:staff(+DC)（M1）**｜`review_list`/`shipment_list` 兼容层(login>DC>staff)｜`manage_dc_items` 兼容层(login>DC>manager)｜`manage_shipping_rule`/`admin_report`/`admin_orders` 兼容层 login>admin
 
 **users**（12）：全部 PLATFORM 保持
 
