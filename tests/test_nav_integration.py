@@ -95,8 +95,8 @@ def test_sidebar_includes_forecast_for_admin(logged_client):
     client, _ = logged_client
     resp = client.get("/dashboard")
     assert resp.status_code == 200
-    body = resp.data.decode("utf-8")
-    assert "/forecast" in body
+    # 收窄到侧栏：整页 grep 会把正文（dashboard 卡、通知列表等）算进来，断言会失真
+    assert "/forecast" in _sidebar_block(resp.data.decode("utf-8"))
 
 
 def test_sidebar_procurement_hidden_for_staff(staff_client):
@@ -113,14 +113,13 @@ def test_sidebar_includes_notifications_for_staff(staff_client):
     """/notifications link visible to all logged-in users."""
     client, _ = staff_client
     resp = client.get("/dashboard")
-    body = resp.data.decode("utf-8")
-    assert "/notifications" in body
+    assert "/notifications" in _sidebar_block(resp.data.decode("utf-8"))
 
 
 def test_sidebar_forecast_hidden_for_staff(staff_client):
     """Forecast requires admin. Staff must NOT see the link."""
     client, _ = staff_client
-    body = client.get("/dashboard").data.decode("utf-8")
+    body = _sidebar_block(client.get("/dashboard").data.decode("utf-8"))
     hrefs = re.findall(r'href="(/forecast[^"]*)"', body)
     staff_forecast_hrefs = [
         h for h in hrefs
@@ -137,11 +136,11 @@ def test_sidebar_forecast_hidden_for_staff(staff_client):
 def test_sidebar_module_groups_for_admin(logged_client):
     """admin 侧边栏呈现 7 个模块分组 + 新补入口（生产记录 / 订单管理）。"""
     client, _ = logged_client
-    body = client.get("/dashboard").data.decode("utf-8")
+    sidebar = _sidebar_block(client.get("/dashboard").data.decode("utf-8"))
     for title in ("总览", "库存管理", "生产管理", "门店订货", "采购", "通知", "管理员"):
-        assert f'nav-group-title">{title}</p>' in body, f"missing nav group: {title}"
-    assert "/production/runs" in body  # 生产记录（新补入口）
-    assert "/store-ordering/admin/orders" in body  # 订单管理（新补入口）
+        assert f'nav-group-title">{title}</p>' in sidebar, f"missing nav group: {title}"
+    assert "/production/runs" in sidebar  # 生产记录（新补入口）
+    assert "/store-ordering/admin/orders" in sidebar  # 订单管理（新补入口）
 
 
 def test_sidebar_module_groups_for_staff(staff_client):
@@ -200,23 +199,32 @@ def test_nav_carriers_share_same_modules(nav_client_factory, case):
 
 @pytest.mark.parametrize("case", ROLE_MATRIX, ids=_matrix_id)
 def test_land_and_mobile_cover_every_sidebar_link(nav_client_factory, case):
-    """不变量：侧边栏的每个链接都必须能从 /land 或移动底栏到达。
+    """不变量：侧栏链接集 == /land 链接集，且移动底栏的每条（除「更多」）都出自侧栏。
 
-    <961px 侧边栏 `display:none`，此时「更多」→ /land + 底栏是全部入口。只断言
-    「模块标题一致」不够：模块标题不变而卡内漏掉一条二级页链接，导航在移动端
-    就断链（第 1 轮 #1 即此类）。故这里逐链接做集合差。
+    <961px 侧边栏 `display:none`，「更多」→ /land + 底栏是全部入口；≥961px 则底栏
+    隐藏、侧栏是唯一载体（侧栏内没有 /land 入口）。**两侧都必须钉住**：
+    - 只断言 `sidebar ⊆ land ∪ mobile`（单向）时，侧栏自己丢链接仍恒过 —— 第 3 轮
+      审核实测（删 `base.html` 的「采购建议」/「汇总」后全量 CI 仍 14F/768P、门禁
+      exit 0）证明这是门禁失效。故改为**双向相等**。
+    - 相等关系已在 10 组角色 × 仓库组合下实测精确成立，不会误报。
     """
     wh_type, role, is_admin, _ = case
     client, _ = nav_client_factory(wh_type, role, is_admin=is_admin)
+    label = _matrix_id(case)
 
     dash = client.get("/dashboard").data.decode("utf-8")
     sidebar = set(_hrefs(_sidebar_block(dash)))
     mobile = set(_hrefs(_mobile_nav_block(dash)))
     land = set(_hrefs(_land_grid(client.get("/land").data.decode("utf-8"))))
 
-    assert sidebar and land, "载体解析为空（断言会假绿）"
-    missing = sidebar - land - mobile
-    assert not missing, f"{_matrix_id(case)}: 侧栏链接在移动端无入口: {sorted(missing)}"
+    assert sidebar and land, f"{label}: 载体解析为空（断言会假绿），请检查模板结构"
+    assert sidebar == land, (
+        f"{label}: 侧栏与 /land 链接集不一致（对称差）: {sorted(sidebar ^ land)}"
+    )
+    extra_mobile = mobile - {"/land"}
+    assert extra_mobile <= sidebar, (
+        f"{label}: 底栏出现侧栏没有的链接: {sorted(extra_mobile - sidebar)}"
+    )
 
 
 @pytest.mark.parametrize("case", ROLE_MATRIX, ids=_matrix_id)
@@ -387,7 +395,7 @@ def test_land_page_staff_sees_modules_without_admin(staff_client):
     [
         ("storefront", "staff", False, "订货目录 / 我的订单", "品项管理"),
         ("storefront", "admin", False, "订货目录 / 我的订单", "品项管理"),
-        ("storefront", "staff", True, "订货目录 / 我的订单 / 审单 / 品项管理", None),
+        ("storefront", "staff", True, "订货目录 / 我的订单 / 订单管理 / 品项管理", None),
         ("distribution_center", "staff", False, "订货目录", "品项管理"),
         ("distribution_center", "manager", False, "订货目录 / 品项管理", None),
     ],

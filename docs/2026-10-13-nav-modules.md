@@ -65,7 +65,7 @@ is_storefront / is_distribution_center` 表达式）。三条链路只保证「�
 - 全量回归（rebase 至 `f00e490` 后，干净 basetemp）：**16 failed / 801 passed / 0 error**。
   ⚠️ 数字口径：这是**本地全量（含 `tests/mcp_server`）**——本地 python3.12 能跑 mcp 测试
   （实测 2 failed / 78 passed）。**CI 口径**是 `--ignore=tests/mcp_server`，同一份代码为
-  **14 failed / 723 passed**（整改分支为 746 passed，新增导航用例后）。
+  **14 failed / 723 passed**（整改分支为 768 passed，本地全量 846 passed，新增导航用例后）。
   两套数字都必须对得上 `tests/known_failures.txt`（清单 16 条 = 本地失败集，含 mcp×2），
   引用时务必写明口径，否则「零新增对比法」的锚点会失效。
 - 失败集 = 已知预置 16 条
@@ -75,8 +75,8 @@ is_storefront / is_distribution_center` 表达式）。三条链路只保证「�
   - 陷阱：复用被污染的 `--basetemp=/tmp/pytest-dc` 会随机出现 1~3 条
     `sqlite3.OperationalError: unable to open database file` ERROR（沙箱清理不完全，错误目标每轮漂移）；
     **换全新 basetemp 目录即消失**，与代码无关。
-- 测试变更：`tests/test_nav_integration.py` 重写（v0.1 为 12 用例；整改后 35 用例 =
-  模块集行列式 + 全链接可达性 + 移动底栏 + 移动端可达性守卫）；
+- 测试变更：`tests/test_nav_integration.py` 重写（v0.1 为 12 用例；整改后 57 用例 =
+  模块集行列式 + 三载体链接集相等 + 全链接可达性 + 移动底栏 + 移动端可达性守卫）；
   `tests/test_store_ordering_e2e.py` 3 条导航断言目标页 `/` → `/dashboard`
   （land 页无侧栏，入口链接改在带侧栏页面验证），并补回 A8「DC staff 403」真实断言。
 - Playwright 冒烟（admin / store_staff / rd_user × 桌面 1440 + 移动 375）：
@@ -112,3 +112,16 @@ is_storefront / is_distribution_center` 表达式）。三条链路只保证「�
   （隐藏式而非强制式权限）；对称地 DC 用户实际可访问 `/inventory` 但导航不展示。
   应在权限颗粒度项目按统一模型收敛。
 - 侧边栏 `<h1>库存管理</h1>` 与模块标题「库存管理」同名（文案问题，视觉/文案由 owner 定）。
+- `/production*` 模板把 `sidebar` block 覆盖为空 → 桌面端在这些页无侧栏（存量，本次
+  「生产记录」入口沿用同布局）。
+
+**第 2/3 轮审核抓到的两个「测试资产」缺陷（比代码缺陷更容易复发，必须记住）**：
+
+1. **可达性扫描不能扫整页**：`/land` 整页 href 含 ctx-bar 的「注销」(`/logout`)，
+   `auth.logout` 会 `session.clear()` —— 一旦 GET 到它，排序在其后的 10 个链接全部以
+   匿名身份拿到 302，`status_code < 400` 恒真（假绿）。取链必须收窄到载体内部
+   （`aside.sidebar` / `nav.mobile-nav` / `div.land-grid`），并断言目标集非空。
+2. **不变量必须双向**：`sidebar ⊆ /land ∪ 底栏` 单向时，「侧栏自己丢链接」恒过
+   （实测：删侧栏「采购建议」/「汇总」后全量 CI 仍全绿）。改为 `sidebar == /land` 双向
+   相等后两个方向都能挡住。**断言写完要做变异验证**（删链接 / 改可达性 / 挪位置看是否
+   真的 FAIL），静态审查看不出恒真式。
