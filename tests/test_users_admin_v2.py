@@ -746,7 +746,9 @@ def test_create_with_explicit_role_binds_only_that_warehouse(users_v2_env):
 # 回归：本 PR 让工具栏用 fetch 拉取 /users 的整页 HTML，而这属于"非导航 GET"，
 # 会被 sw.js 的 cache-first 分支写进 Cache API。实测后果：① 服务端数据变了
 # 列表仍显示旧的；② 缓存副本按 URL 命中即返回、不经过服务端鉴权 —— 匿名会话
-# 也能拿到 200 的管理员页面。sw.js 已收窄为只缓存 /static/，这里守住第二道闸。
+# 也能拿到 200 的管理员页面。真正堵住这条路的是 `sw.js` 只缓存同源 `/static/`
+# （见下一个用例）；下面这两个断言只守 **HTTP 缓存层** —— no-store 对 Cache API
+# 无效（实测 `cache.put()` 照常落盘），别把它当成 Cache API 的兜底。
 # ---------------------------------------------------------------------------
 
 def test_users_html_is_no_store(users_v2_env):
@@ -769,19 +771,30 @@ def test_users_service_worker_does_not_cache_dynamic_get():
     这条是静态断言（JS 侧没有 pytest 覆盖的替代品）：把 sw.js 里"只缓存
     /static/"的那道判断钉住，防止有人把它改回"所有非导航 GET 都缓存"。
 
-    用**顺序断言**而不是字面量 `in`：`in` 只能证明字符串存在，把范围判断挪到
-    `cache.put` 之后、或把 put 挪出 `res.ok` 守卫，都照样通过 —— 而那正是会
-    导致越权缓存落盘的改法。
+    两类断言必须**并存**，各守一半：
+    - **字面量断言**守「比较方向」：`indexOf("/static/") !== 0` 一旦被改成 `=== 0`
+      就变成"只缓存非 /static/"，等于把越权缓存原样放回来；顺序断言拦不住它。
+    - **顺序断言**守「位置」：把范围判断挪到 `cache.put` 之后、或把 put 挪出
+      `res.ok` 守卫，字符串都还在，只有顺序能发现。
     """
+    import re
     from pathlib import Path
 
-    sw = (Path(__file__).resolve().parent.parent / "static" / "sw.js").read_text(
+    raw = (Path(__file__).resolve().parent.parent / "static" / "sw.js").read_text(
         encoding="utf-8"
     )
-    scope_idx = sw.index("url.pathname.indexOf")  # /static/ 范围判断（代码，排除注释）
-    put_idx = sw.index("cache.put(req, copy)")  # 缓存写入（代码，排除注释）
-    ok_idx = sw.index("if (res.ok)")  # 写入守卫
-    last_respondwith = sw.rindex("event.respondWith")  # 缓存分支的 respondWith
+    # 先剥行注释再定位：注释里复述同样的表达式会让 index() 命中注释、造成假 PASS。
+    sw = re.sub(r"//[^\n]*", "", raw)
+
+    # ① 范围判断的语义（比较方向）—— 防"取反即放行"
+    assert 'url.pathname.indexOf("/static/") !== 0' in sw, (
+        "sw.js 的 /static/ 范围判断被改动：比较方向反了会把越权缓存放回来"
+    )
+    # ② 位置：范围早退必须在 cache.put 之前，写入必须受 res.ok 守卫
+    scope_idx = sw.index("url.pathname.indexOf")
+    put_idx = sw.index("cache.put(req, copy)")
+    ok_idx = sw.index("if (res.ok)")
+    last_respondwith = sw.rindex("event.respondWith")
     assert scope_idx < put_idx, "范围判断必须早于 cache.put，否则非 /static/ 响应也会落盘"
     assert ok_idx < put_idx, "cache.put 必须受 res.ok 守卫，不能无条件写入"
     assert scope_idx < last_respondwith, "缓存分支必须先做 /static/ 范围早退再 respondWith"

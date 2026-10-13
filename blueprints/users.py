@@ -347,9 +347,11 @@ def _no_store(resp):
 
     注意 no-store 的作用域：它只约束**浏览器 HTTP 缓存与中间代理**，对
     Service Worker 的 Cache API **无效** —— 实测 `cache.put()` 照样成功落盘
-    （MDN 的 Cache.put 异常清单里没有 no-store 规则）。所以挡住这条路的**唯一
-    防线是 `static/sw.js` 里「只缓存同源 /static/」的范围判断**；本头是纵深防御
-    的附加收益（避免 HTTP 层与代理缓存），不要把它当成可以放心回退范围判断的兜底。
+    （MDN 的 Cache.put 异常清单里没有 no-store 规则）。所以在这条「页面内
+    fetch 拉 HTML」的路径上，**唯一防线是 `static/sw.js` 里「只缓存同源
+    /static/」的范围判断**；本头只是 HTTP 层的附加收益，不要把它当成可以
+    放心回退范围判断的兜底。（sw.js 导航分支的离线回落缓存是另一码事，
+    见 ARCHITECTURE.md §11。）
     """
     resp.headers["Cache-Control"] = "no-store"
     return resp
