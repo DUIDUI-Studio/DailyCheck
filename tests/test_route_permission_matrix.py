@@ -244,6 +244,89 @@ def test_admin_perms_gate_staff(rbac_env):
 
 
 # ---------------------------------------------------------------------------
+# Test B2 — 绑定校验接纳 5 个内置角色包（缺口 A：含旁支 viewer / finance）
+#   校验层 VALID_ROLES 必须来自 manifest（BUILTIN_ROLE_CODES），而非
+#   仅阶梯三包的 ROLE_RANK —— 否则 viewer/finance 无法被管理员绑定。
+# ---------------------------------------------------------------------------
+
+def _master_conn(wh_path):
+    conn = sqlite3.connect(wh_path.parent.parent / "master.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _add_unbound_user(wh_path, uid, name):
+    conn = _master_conn(wh_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (?, ?, 'x', 0, ?)", (uid, name, ts))
+    conn.commit()
+    conn.close()
+
+
+def _binding_role_of(wh_path, uid, wh_id):
+    conn = _master_conn(wh_path)
+    row = conn.execute(
+        "SELECT role FROM warehouse_users WHERE user_id=? AND warehouse_id=?",
+        (uid, wh_id)).fetchone()
+    conn.close()
+    return row["role"] if row else None
+
+
+@pytest.mark.parametrize("role", ["viewer", "finance"])
+def test_bind_accepts_side_branch_roles(rbac_env, monkeypatch, role):
+    """平台管理员必须能把用户绑定到 viewer / finance（旁支角色，本期可绑定）。"""
+    app, client, wh_path = rbac_env
+    import blueprints.audit_pure as audit_pure
+    monkeypatch.setattr(
+        audit_pure, "ADMIN_AUDIT_LOG", wh_path.parent / "admin_audit.log")
+
+    uid = 6 if role == "viewer" else 7
+    _add_unbound_user(wh_path, uid, f"new_{role}")
+    _login(client, 1)  # 平台超管
+    resp = client.post(
+        f"/users/{uid}/bind", data={"warehouse_id": "1", "role": role})
+    assert resp.status_code in (200, 302), resp.status_code
+    assert _binding_role_of(wh_path, uid, 1) == role, f"{role} 绑定应被接受"
+
+
+def test_bind_rejects_unknown_role(rbac_env, monkeypatch):
+    """未知角色 code 必须被拒（绑定层先挡，配合运行时 fail-closed）。"""
+    app, client, wh_path = rbac_env
+    import blueprints.audit_pure as audit_pure
+    monkeypatch.setattr(
+        audit_pure, "ADMIN_AUDIT_LOG", wh_path.parent / "admin_audit.log")
+
+    _add_unbound_user(wh_path, 6, "new_bad")
+    _login(client, 1)
+    resp = client.post(
+        "/users/6/bind", data={"warehouse_id": "1", "role": "superuser"})
+    assert resp.status_code in (200, 302), resp.status_code
+    assert _binding_role_of(wh_path, 6, 1) is None, "未知角色不应落库绑定"
+
+
+def test_viewer_resolves_three_perms(rbac_env):
+    """viewer 运行时解析出恰好 3 个权限点（= 其角色包，端到端走真实解析）。"""
+    from flask import jsonify
+
+    from permissions import current_permissions
+
+    app, client, _ = rbac_env
+
+    @app.route("/__perm_probe__")
+    def _perm_probe():
+        return jsonify(sorted(current_permissions()))
+
+    _login(client, 4)  # viewer
+    resp = client.get("/__perm_probe__")
+    assert resp.status_code == 200
+    got = set(resp.get_json())
+    assert got == set(ROLE_PACKAGES["viewer"])
+    assert len(got) == 3
+
+
+# ---------------------------------------------------------------------------
 # Test C — 反倒挂不变式（AC-13）
 # ---------------------------------------------------------------------------
 

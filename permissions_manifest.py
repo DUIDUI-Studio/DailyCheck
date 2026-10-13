@@ -23,7 +23,7 @@ PERMISSION_CATALOG: dict[str, dict[str, str]] = {
     # order.*
     "order.create":            {"category": "order",  "risk": "normal",    "description": "创建订货单（含购物车增删改）"},
     "order.approve":           {"category": "order",  "risk": "critical",  "description": "审批订货单（DC 侧 review）"},
-    "order.ship":              {"category": "order",  "risk": "sensitive", "description": "发货 / 交付订货单（DC 侧）"},
+    "order.ship":              {"category": "order",  "risk": "sensitive", "description": "DC 发货 / 门店整单交付确认"},
     "order.receive":           {"category": "order",  "risk": "sensitive", "description": "门店收货确认"},
     "order.cancel.any":        {"category": "order",  "risk": "critical",  "description": "取消任意订货单（越权撤单，非 owner 场景）"},
     # stock.*

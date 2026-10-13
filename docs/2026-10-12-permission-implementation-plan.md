@@ -495,9 +495,21 @@ def mask_cost_csv_row(values: list, indices: set[int], allow: bool) -> list:
 
 | # | 位置 | 原施工图 | 施工修正 | 依据 |
 |---|---|---|---|---|
-| M1 | §1.2-E `store_ordering.ship_order_route` | 迁移为 `PERM:order.ship`（判"等价"） | **维持兼容层 `login > DC > require_role("staff")`** | `order.ship ∈ manager` 包；迁移会使 **DC staff 失去发货**（`store_ordering_*` 回归 20 用例）。发货是 DC 一线作业，非白名单行为变化 → 维持 |
-| M2 | §1.3 #16 `store_ordering.deliver_order_route` | `PERM:order.ship` | 保持 `PERM:order.ship`（不变） | 原守卫为 `@require_login`；门店"整单送达"快捷入口为 manager 动作（docstring: store manager/admin），现由 `order.ship`（manager+）把闸；现有测试以 store_mgr 调用，零回归。**advisory**：若需 staff 亦可整单送达，请下轮复核 |
+| M1 | §1.2-E `store_ordering.ship_order_route` | 迁移为 `PERM:order.ship`（判"等价"） | **维持兼容层 `login > DC > require_role("staff")`** | `order.ship ∈ manager` 包；迁移会使 **DC staff 失去发货**（`store_ordering_*` 回归 20 用例）。发货是 DC 一线作业，非白名单行为变化 → 维持。**team-lead 终裁（2026-10-13）：接受现状，代码保持不动**——`role:*` 兼容层本就有约 18 条未点化路由（`core.delete_category`、`outbound.delete`、`production.*`、`canonical_*` 等），ship 归入同一档而非孤例；若把 `order.ship` 移入 staff 包，`deliver` 的矩阵记录会失真 |
+| M2 | §1.3 #16 `store_ordering.deliver_order_route` | `PERM:order.ship` | 保持 `PERM:order.ship`（不变） | 原守卫为 `@require_login`；门店"整单送达"快捷入口为 manager 动作（docstring: store manager/admin），现由 `order.ship`（manager+）把闸；现有测试以 store_mgr 调用，零回归。**team-lead 终裁（2026-10-13）：核验后为零行为变化 → 关闭**——deliver 路由体自始就有 `role not in ("manager","admin") and not _is_admin()` 检查（与 main 一致、本次未改），旧守卫仅 `require_login`，实际可达人群本就是 manager/admin，与 `order.ship ∈ manager` 一致；唯一差异是 staff 被拒方式由 flash+302 变为 403，与其他路由拒绝模式统一，接受 |
 | M3 | 路由总数 | 施工图 §1.0 记 153 | 本 worktree（`main @ 75af9c6`）实际 **147**（`blueprints/users.py` 无 `bulk_bind`/`toggle_active`，属 `user-admin-v2` 分支） | manifest 以实际 `app.url_map` 为准，147/147 覆盖 |
+| M4 | §1.3 #16 `store_ordering.cancel_order_route` | `require_any_permission("order.create","order.cancel.any")` | 保持（不变） | **team-lead 终裁（2026-10-13）：接受现方案 → 关闭**——`order.cancel.any` 不进任何角色包（测试已断言，属 `PLATFORM_ONLY_PERMS`）；`require_any_permission` 保留 owner（持 `order.create`）自撤能力，`order.cancel.any` 作平台级预留 |
+| M5 | 缺口 A `blueprints/users.py` `VALID_ROLES` | 沿用 `set(config.ROLE_RANK.keys())`（仅阶梯三包） | 改 `set(BUILTIN_ROLE_CODES)`（manifest 单一来源，5 包） | 绑定/展示**必须接纳 viewer/finance**，否则后端校验会挡前端绑定（Spec §7）。同时 `list_users` 注入 `role_options`（模板不硬编码角色集）；`_parse_binding` 提示文案改用 manifest 顺序+显示名 |
+
+### 7.1 Phase 3 收官裁定（team-lead 2026-10-13）
+
+三项复核均**关闭**：① M1 ship 兼容层维持现状（接受）；② M2 deliver 零行为变化（关闭）；⑥ `order.cancel.any` 不进包、保留 `require_any_permission`（关闭）。另派两处必改缺口（A 绑定校验接纳 5 包 / B `role_options` 数据合约）与一处描述微调（C `order.ship`），均已在本次补齐（见 M5）。
+
+### 7.2 合并对账清单（Phase 3 → 阶段 2 / 合并回 main 时核对）
+
+1. **PR #17（`user-admin-v2`）合并 main 后**：`ROUTE_MATRIX` 需补其新增路由（`users.bulk_bind`、`users.toggle_active` 等）——否则 Test A 覆盖校验会失败（本 worktree 基于 main，仅 147 路由）。
+2. **`users.html` v2 与本期 v1 前端改动对账**：本期后端已注入 `role_options=[{code,label}×5]`（manifest 顺序）；v2 模板的角色下拉/toolbar 筛选/tag 渲染须以该变量为来源，不得硬编码角色集（设计师并行改 `templates/users.html`，架构侧不碰该文件）。
+3. **`order.ship` 语义**与"发货是否收紧 manager+"决议，留**阶段 2**连同自定义角色一起评审（当前 ship 走 DC 兼容层；`order.ship` 描述已核准为"DC 发货 / 门店整单交付确认"）。
 
 ## 8. 规范化交付校验清单（本 worktree 实测）
 

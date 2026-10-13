@@ -18,14 +18,17 @@ import re
 from flask import Blueprint, abort, flash, redirect, render_template, request, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from config import BASE_DIR, MASTER_DB, ROLE_RANK, WAREHOUSE_DB_DIR
+from config import BASE_DIR, MASTER_DB, WAREHOUSE_DB_DIR
 from db import get_master_db, init_warehouse_db
 from permissions import require_login, require_platform_admin
+from permissions_manifest import BUILTIN_ROLE_CODES, ROLE_META
 
 
 bp = Blueprint("users", __name__)
 
-VALID_ROLES = set(ROLE_RANK.keys())  # staff / manager / admin
+# 绑定 / 展示必须接纳**全部内置角色包**（含旁支 viewer / finance），
+# 单一来源 = permissions_manifest；不再从 ROLE_RANK（仅阶梯三包）推导。
+VALID_ROLES = set(BUILTIN_ROLE_CODES)  # staff / manager / admin / viewer / finance
 
 
 def _bindings_for(user_id: int) -> dict[int, str]:
@@ -64,6 +67,10 @@ def list_users():
         warehouses=warehouses,
         bindings_by_user=detail,
         current_user_id=g.user["id"],
+        # 角色下拉的单一来源：manifest 顺序即显示顺序；模板不得硬编码角色集。
+        role_options=[
+            {"code": c, "label": ROLE_META[c][0]} for c in BUILTIN_ROLE_CODES
+        ],
     )
 
 
@@ -426,7 +433,8 @@ def _parse_binding(form, db) -> tuple[int | None, str | None, str | None]:
         return None, None, "仓库 id 必填"
     wh_id = int(wh_id_raw)
     if role not in VALID_ROLES:
-        return None, None, f"角色必须是 {sorted(VALID_ROLES)} 之一"
+        allowed = "/".join(f"{c}({ROLE_META[c][0]})" for c in BUILTIN_ROLE_CODES)
+        return None, None, f"角色必须是 {allowed} 之一"
     if db.execute("SELECT 1 FROM warehouses WHERE id=?", (wh_id,)).fetchone() is None:
         return None, None, "仓库不存在"
     return wh_id, role, None
