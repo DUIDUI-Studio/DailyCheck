@@ -810,18 +810,20 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Pytest["pytest (58 个文件, 729 用例)"]
+    subgraph Pytest["pytest (59 个文件, ~817 用例)"]
         Pure["test_*_pure.py<br/>纯逻辑单测<br/>~60% 用例"]
         Route["test_*_route.py<br/>视图集成测试<br/>~30% 用例"]
         E2E["test_*_e2e.py<br/>端到端 ~5%"]
         Acceptance["test_acceptance_*.py<br/>验收脚本 39 用例全绿"]
         Aux["test_aux_unit.py /<br/>test_master_db_migrate.py /<br/>test_nav_integration.py<br/>pre-existing 18 failed 来源"]
         Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>6 用例"]
+        Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>36 用例（A 覆盖 / B deny-allow / C 不变式）"]
     end
 
     subgraph Conftest["tests/conftest.py"]
         LoggedClient["logged_client<br/>管理员 session"]
         StaffClient["staff_client<br/>staff 角色"]
+        RoleClients["manager_client /<br/>viewer_client / finance_client<br/>（权限精细化）"]
         SeedHelpers["_seed_item / _seed_outbound /<br/>_seed_production_consumption"]
     end
 
@@ -842,7 +844,7 @@ flowchart TB
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
 
-**基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。
+**基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。`feat/permission-granularity`（2026-10-13）新增 `test_route_permission_matrix.py`（36）+ `test_master_db_migrate.py` RBAC 用例（7），实测 **18 failed / 799 passed**，与 `main @ 75af9c6` 基线**同一失败集**（零新增）。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。

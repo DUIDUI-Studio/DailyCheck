@@ -122,6 +122,81 @@ def _wh(wh_path):
     return conn
 
 
+# ---------------------------------------------------------------------------
+# 权限精细化（Phase 3）：按角色构造客户端。
+#   统一 temp-db 布局：admin(1) + 目标角色用户(2)，均绑定同一个 storefront 仓。
+#   目标角色用户默认登录（session user_id=2）。返回 (client, wh_path)。
+# ---------------------------------------------------------------------------
+
+def _role_client(tmp_path, monkeypatch, role: str):
+    """构造一个「目标角色用户已登录」的 test client（含 1 个 admin 同仓）。
+
+    复用 logged_client / staff_client 的 temp-db + 直设 session 模式；
+    权限解析走真实 master.db 的 roles/role_permissions 播种（init_master_db）。
+    """
+    import db as db_module
+    from db import init_master_db, init_warehouse_db
+
+    master_path = tmp_path / "master.db"
+    wh_dir = tmp_path / "warehouses"
+    wh_dir.mkdir()
+    wh_path = wh_dir / "wh_test.db"
+
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    import config as config_module
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
+
+    init_master_db()
+    init_warehouse_db(wh_path)
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(master_path)
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (1, 'admin', 'x', 1, ?)", (ts,))
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (2, ?, 'x', 0, ?)", (f"{role}_user", ts))
+    m.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+        "VALUES (1, 'wh_test', '测试门店', ?, 'storefront', ?)",
+        (str(wh_path), ts))
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (1, 1, 'admin')")
+    m.execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (2, 1, ?)",
+        (role,))
+    m.commit()
+    m.close()
+
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    with client.session_transaction() as s:
+        s["user_id"] = 2
+        s["warehouse_id"] = 1
+
+    return client, wh_path
+
+
+@pytest.fixture
+def manager_client(tmp_path, monkeypatch):
+    return _role_client(tmp_path, monkeypatch, "manager")
+
+
+@pytest.fixture
+def viewer_client(tmp_path, monkeypatch):
+    return _role_client(tmp_path, monkeypatch, "viewer")
+
+
+@pytest.fixture
+def finance_client(tmp_path, monkeypatch):
+    return _role_client(tmp_path, monkeypatch, "finance")
+
+
 def _seed_item(wh_path, name, qty, unit_cost, gram_per_unit=0):
     """插入一个测试品项,返回 (item_id, category_id)。"""
     conn = _wh(wh_path)
