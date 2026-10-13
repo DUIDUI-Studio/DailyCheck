@@ -870,9 +870,22 @@ def test_dc_manager_can_access_dc_items_page(e2e_env):
 
 def test_dc_staff_blocked_from_dc_items(e2e_env):
     """A8: DC staff 403（@require_role("manager")）。"""
-    # 注：e2e_env 里没有 dc_staff，跳过此用例（权限逻辑由装饰器保证，route 测已覆盖）
-    # 改为测 store_user 403（A9）
-    pass
+    client = e2e_env["client"]
+    # e2e_env 的 4 个用户里 DC 侧只有 dc_mgr；本用例就地补一个 dc_staff
+    # （id=5，绑 dc1 role=staff），避免为一个断言改动共享夹具。
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(str(e2e_env["master_path"]))
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (5, 'dc_staff', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (5, 1, 'staff')")
+    m.commit()
+    m.close()
+
+    _login_as(client, 5, 1)
+    assert client.get("/store-ordering/dc/items").status_code == 403
 
 
 def test_store_user_blocked_from_dc_items(e2e_env):

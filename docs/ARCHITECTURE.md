@@ -799,10 +799,14 @@ flowchart LR
   模块内无可见子项则整块不渲染；管理员模块置底。
 - 移动底栏（`base.html:nav.mobile-nav`）：≤5 个高频模块入口 + 「更多」→ `/land`；
   flex 布局（角色不同条目数 3~5 动态），不再固定 5 列 grid。
-- 模块选择页（`land.html`，`/land`，no_sidebar）：每模块一张卡，按角色过滤；
-  卡片描述按角色出文案（不列出该角色不可见的页）。
+- 模块索引页（`land.html`，`/land`，no_sidebar）：每模块一张 `section.land-card`，按角色过滤；
+  **卡内 `ul.land-links` 必须列全该角色在该模块可见的每一个页面**（不是只链模块首屏）。
+- ⚠️ **不变量（有测试固化）**：三载体的模块归属与角色口径逐条一致；
+  `<961px` 时侧边栏 `display:none`，**「更多」→ `/land` 是移动端唯一全模块入口**，
+  故 `/land` 一旦漏列二级页，该页在移动端即整页无路可达（v0.1 曾漏 汇总/盘点/入库/出库 4 页）。
+  守卫用例：`tests/test_nav_integration.py`（模块集行列式 + 移动端可达性）。
 - ⚠️ 角色口径一律取 `_helpers.register_template_context` 注入变量，禁止 block 内 `{% set %}`（§13.2）。
-- 改 `static/*` 后按约定 bump 模板里的 `?v=`（本次 `style.css?v=15`）。
+- 改 `static/*` 后按约定 bump 模板里的 `?v=`（本次 `style.css?v=16` / `login.html?v=12`）。
 
 ---
 
@@ -845,6 +849,13 @@ flowchart TB
 **基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。`feat/user-admin-v2`（PR #17，2026-10-12）新增 `test_users_admin_v2.py` 40 用例，基线升至 **18 failed / 796 passed**，零新增失败。
 
 **基线更新（2026-10-13，`feat/nav-modules`，rebase 至 `f00e490` 后）**：16 failed / 801 passed — `test_nav_integration.py` 旧断言（staff 应见采购）随导航模块化修正并扩充为 12 用例（796→801），失败集 18→16；`tests/known_failures.txt` 同步删 2 行（清单收缩为 16，与实际失败集逐条一致）。零新增。⚠️ 复用旧 basetemp（`/tmp/pytest-dc`）会因沙箱清理不完全随机出现 1~3 条 `sqlite3.OperationalError` ERROR；换全新 basetemp 即消失，与代码无关。
+
+**整改基线（2026-10-14，`fix/pr-18-nav-modules-defects`）**：14 failed / 746 passed（CI 口径 `--ignore=tests/mcp_server`）。导航用例 12→35（`nav_client_factory` 角色矩阵 + 全链接可达性 + 移动端可达性守卫），门禁 exit 0。
+
+⚠️ **基线数字必须写明口径**（两套数字不能混用）：
+- **CI 口径** = `pytest tests/ --ignore=tests/mcp_server`：14 failed / 746 passed。CI 以此为准，`known_failures.txt` 的 `mcp_server` 两行在 CI 里永不触发（属超集）。
+- **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：16 failed / 801~824 passed。
+- 「零新增对比法」比对的是**失败集逐行**，不是 passed 总数；引用总数时必须带口径，否则跨环境对比会误判。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
@@ -936,12 +947,14 @@ with app.test_client() as c, c.session_transaction() as s:
 
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
-| 16 failed 测试（本地，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
+| 16 failed 测试（本地全量口径，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
 | 时区不一致 | **高** | pre-existing | 多租户改造前必修 |
 | 配方成本 qty 语义不一致 | **高** | pre-existing (2026-09-02 起) | 财务对账会出错，待 owner 拍板 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |
+| 导航是「隐藏式」而非「强制式」权限 | 中 | pre-existing（2026-10-14 登记） | `/canonical/list` 仅 `@require_login`，任何登录角色可直接访问；导航只对 admin/rd 展示。对称地 DC 用户实际可访问 `/inventory` 但导航不展示。需在权限颗粒度项目中按统一权限模型收敛 |
+| 侧边栏 `<h1>` 与模块标题同名 | 低 | pre-existing（2026-10-14 登记） | `base.html` 侧栏 `<h1>库存管理</h1>` 与「库存管理」模块标题重复；文案由 owner 定 |
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 

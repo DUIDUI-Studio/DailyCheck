@@ -10,7 +10,7 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=15" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=16" />
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
@@ -140,7 +140,8 @@
     </main>
 
     {# 移动底栏（2026-10-13）：收敛为 ≤5 个高频模块入口 + 「更多」→ /land 全模块页。
-       原 15 项平铺已超载；其余模块从「更多」进入。 #}
+       原 15 项平铺已超载；其余模块/子页一律从「更多」进入 —— 因此 /land 必须列全
+       各模块内该角色可见的每一个页面（见 templates/land.html 顶部注释）。 #}
     <nav class="mobile-nav mobile-only">
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       {% if is_admin or is_storefront %}
@@ -149,8 +150,9 @@
       {% if is_admin or is_storefront or is_distribution_center %}
       <a href="{{ url_for('store_ordering.catalog') }}">门店订货</a>
       {% endif %}
-      {% if is_admin or is_storefront %}
-      <a href="{{ url_for('production.products_list') }}">生产管理</a>
+      {# rd 无实体库存，其「生产管理」模块唯一可见子项是配方成本，故底栏直接指向它 #}
+      {% if is_admin or is_storefront or is_rd %}
+      <a href="{% if is_rd and not is_admin %}{{ url_for('recipe_cost.landing') }}{% else %}{{ url_for('production.products_list') }}{% endif %}">{% if is_rd and not is_admin %}配方成本{% else %}生产管理{% endif %}</a>
       {% endif %}
       <a href="{{ url_for('core.land') }}">更多</a>
     </nav>

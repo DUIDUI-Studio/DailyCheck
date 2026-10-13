@@ -101,18 +101,26 @@ h2, h3 {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 16px;
-  padding: 22px 18px;
+  padding: 18px 18px 14px;
   box-shadow: 0 4px 14px rgba(15, 23, 42, 0.05);
   color: inherit;
+}
+.land-card h3 { margin: 0 0 4px; color: var(--brand-ink); font-size: 18px; }
+.land-card p { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
+
+/* 模块卡内的子页链接（2026-10-13）：一个模块含多页，卡片本身不再是链接，
+   改由卡内链接列表承载（块级大热区，桌面与移动端都够点）。 */
+.land-links { list-style: none; margin: 0; padding: 0; }
+.land-links li + li { margin-top: 2px; }
+.land-links a {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 10px;
+  color: var(--brand-ink);
   text-decoration: none;
-  transition: transform 0.1s ease, box-shadow 0.1s ease;
+  font-size: 14px;
 }
-.land-card:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.10);
-}
-.land-card h3 { margin: 0 0 6px; color: var(--brand-ink); font-size: 18px; }
-.land-card p { margin: 0; color: var(--muted); font-size: 13px; }
+.land-links a:hover { background: rgba(15, 118, 110, 0.08); }
 
 .table-scroll {
   overflow-x: auto;
