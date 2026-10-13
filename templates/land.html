@@ -7,23 +7,35 @@
 <p class="muted">当前仓库：<strong>{{ g.warehouse['name'] }}</strong></p>
 {% endif %}
 
+{# 模块化卡片（2026-10-13）：与侧边栏同一套 7 模块，按角色过滤；
+   卡片 href 指向该角色下模块的第一个可见页面。 #}
 <div class="land-grid">
+  <a class="land-card" href="{{ url_for('core.dashboard') }}">
+    <h3>总览</h3>
+    <p>库存概况 / 当日动态 / 最近变动</p>
+  </a>
+  {% if is_admin or is_storefront %}
   <a class="land-card" href="{{ url_for('items.inventory_view') }}">
-    <h3>库存查阅</h3>
-    <p>盘点 / 入库 / 出库 / 库存查阅</p>
+    <h3>库存管理</h3>
+    <p>库存查阅 / 盘点 / 入库 / 出库</p>
   </a>
-  <a class="land-card" href="{{ url_for('production.products_list') }}">
-    <h3>生产录入</h3>
-    <p>产品配方 / 按产出量自动领料</p>
+  {% endif %}
+  {% if is_admin or is_storefront or is_rd %}
+  <a class="land-card" href="{% if is_rd %}{{ url_for('recipe_cost.landing') }}{% else %}{{ url_for('production.products_list') }}{% endif %}">
+    <h3>生产管理</h3>
+    <p>{% if is_rd and not is_admin %}配方成本 / 产品配方{% else %}产品配方 / 生产录入 / 生产记录{% endif %}</p>
   </a>
-  {% if g.user and g.user['is_admin'] %}
+  {% endif %}
+  {% if is_admin or is_storefront or is_distribution_center %}
+  <a class="land-card" href="{{ url_for('store_ordering.catalog') }}">
+    <h3>门店订货</h3>
+    <p>{% if is_admin %}订货目录 / 我的订单 / 审单 / 品项管理{% elif is_storefront %}订货目录 / 我的订单{% else %}订货目录 / 品项管理{% endif %}</p>
+  </a>
+  {% endif %}
+  {% if is_admin %}
   <a class="land-card" href="{{ url_for('procurement.procurement_store') }}">
-    <h3>采购建议</h3>
-    <p>基于预测 + 安全库存 + 在途，缺什么补什么</p>
-  </a>
-  <a class="land-card" href="{{ url_for('forecast.forecast_index') }}">
-    <h3>预测看板</h3>
-    <p>加权日均 + 未来 14 天预测量，可手动重算</p>
+    <h3>采购</h3>
+    <p>采购建议 / 预测看板，缺什么补什么</p>
   </a>
   {% endif %}
   <a class="land-card" href="{{ url_for('notifications.notifications_feed') }}">
@@ -34,5 +46,11 @@
     </h3>
     <p>查看全站通知，标记已读</p>
   </a>
+  {% if is_admin or is_rd %}
+  <a class="land-card" href="{% if is_admin %}{{ url_for('users.list_users') }}{% else %}{{ url_for('canonical.canonical_list') }}{% endif %}">
+    <h3>管理员</h3>
+    <p>{% if is_admin %}账号 / Token / 品项数据{% else %}品项数据{% endif %}</p>
+  </a>
+  {% endif %}
 </div>
 {% endblock %}

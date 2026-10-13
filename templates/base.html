@@ -10,71 +10,99 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=14" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=15" />
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
-  {% set wh_type = g.warehouse.warehouse_type if g.warehouse else None %}
-  {% set is_rd = (wh_type == 'rd') %}
-  {% set is_storefront = (wh_type == 'storefront') %}
+  {# 导航模块化（2026-10-13）：按「总览 / 库存管理 / 生产管理 / 门店订货 / 采购 /
+     通知 / 管理员」7 模块分组；模块内无可见子项时整块不渲染。
+     角色口径：is_admin / is_rd / is_storefront / is_distribution_center 均由
+     blueprints/_helpers.py:register_template_context 注入（勿在本 block 里 set）。 #}
   <aside class="sidebar desktop-only">
     <h1>库存管理</h1>
     {% if g.user %}
-      {% if g.user['is_admin'] %}
+    <nav class="nav-group">
+      <p class="nav-group-title">总览</p>
+      <a href="{{ url_for('core.dashboard') }}">总览</a>
+      <a href="{{ url_for('core.summary') }}">汇总</a>
+    </nav>
+
+    {% if is_admin or is_storefront %}
+    <nav class="nav-group">
+      <p class="nav-group-title">库存管理</p>
+      <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
+      <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>
+      <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
+      <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
+    </nav>
+    {% endif %}
+
+    {% if is_admin or is_storefront or is_rd %}
+    <nav class="nav-group">
+      <p class="nav-group-title">生产管理</p>
+      {% if is_admin or is_storefront %}
+      <a href="{{ url_for('production.products_list') }}">生产录入</a>
+      <a href="{{ url_for('production.runs_list') }}">生产记录</a>
+      {% endif %}
+      {% if is_rd %}
+      <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
+      {% endif %}
+    </nav>
+    {% endif %}
+
+    {% if is_admin or is_storefront or is_distribution_center %}
+    <nav class="nav-group">
+      <p class="nav-group-title">门店订货</p>
+      <a href="{{ url_for('store_ordering.catalog') }}">门店订货</a>
+      {% if is_admin or is_storefront %}
+      <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
+      {% endif %}
+      {% if (is_admin or is_distribution_center) and (is_admin or (g.role and g.role['role'] in ('manager', 'admin'))) %}
+      <a href="{{ url_for('store_ordering.manage_dc_items') }}">品项管理</a>
+      {% endif %}
+      {% if is_admin %}
+      <a href="{{ url_for('store_ordering.admin_report') }}">订货报表</a>
+      <a href="{{ url_for('store_ordering.admin_orders') }}">订单管理</a>
+      <a href="{{ url_for('store_ordering.manage_shipping_rule') }}">运费规则</a>
+      {% endif %}
+    </nav>
+    {% endif %}
+
+    {% if is_admin %}
+    <nav class="nav-group">
+      <p class="nav-group-title">采购</p>
+      <a href="{{ url_for('procurement.procurement_store') }}">采购建议</a>
+      <a href="{{ url_for('forecast.forecast_index') }}">预测看板</a>
+    </nav>
+    {% endif %}
+
+    <nav class="nav-group">
+      <p class="nav-group-title">通知</p>
+      <a href="{{ url_for('notifications.notifications_feed') }}">
+        通知中心
+        {% if unread_notifications_count and unread_notifications_count > 0 %}
+        <span class="nav-badge">{{ unread_notifications_count }}</span>
+        {% endif %}
+      </a>
+    </nav>
+
+    {# 管理员模块置底：账号/Token/品项数据/主数据；权限管理页由权限项目落地后补入。 #}
+    {% if is_admin or is_rd or (g.role and g.role['role'] == 'admin') %}
+    <nav class="nav-group">
+      <p class="nav-group-title">管理员</p>
+      {% if is_admin %}
       <a href="{{ url_for('users.list_users') }}">账号管理</a>
       <a href="{{ url_for('agent_tokens.list_tokens') }}">Agent Token</a>
-      {# 品类与品项仅门店可见;研发中心没有实体库存。管理员 (is_admin) 不受仓库类型限制。 #}
-      {% if is_admin or is_storefront %}
       <a href="{{ url_for('items.items_list') }}">品类与品项</a>
       {% endif %}
+      {% if is_admin or is_rd %}
+      <a href="{{ url_for('canonical.canonical_list') }}">品项主数据</a>
       {% endif %}
-    {% endif %}
-    {# 总览 / 汇总 / 通知: 所有仓库类型可见。 #}
-    <a href="{{ url_for('core.dashboard') }}">总览</a>
-    <a href="{{ url_for('core.summary') }}">汇总</a>
-    {# 品项主数据 — 仅 admin / 研发中心可见(T10a) #}
-    {% if g.user and g.user['is_admin'] or is_rd %}
-    <a href="{{ url_for('canonical.canonical_list') }}">品项主数据</a>
-    {% endif %}
-    {% if is_admin or is_storefront %}
-    <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
-    <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>
-    <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
-    <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
-    <a href="{{ url_for('production.products_list') }}">生产录入</a>
-    {% endif %}
-    {% if is_admin or is_storefront or is_distribution_center %}
-    <a href="{{ url_for('store_ordering.catalog') }}">门店订货</a>
-    {% if is_admin or is_storefront %}
-    <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
-    {% endif %}
-    {% if g.user and g.user['is_admin'] or (g.role and g.role['role'] in ('manager', 'admin')) %}
-    {% if is_admin or is_distribution_center %}
-    <a href="{{ url_for('store_ordering.manage_dc_items') }}">品项管理</a>
-    {% endif %}
-    {% endif %}
-    {% endif %}
-    {% if is_rd %}
-    <a href="{{ url_for('recipe_cost.landing') }}">配方成本</a>
-    {% endif %}
-    {# /forecast: admin only #}
-    {% if g.user and g.user['is_admin'] %}
-    <a href="{{ url_for('forecast.forecast_index') }}">预测</a>
-    {% endif %}
-    {# /procurement/store: admin only #}
-    {% if g.user and g.user['is_admin'] %}
-    <a href="{{ url_for('procurement.procurement_store') }}">采购建议</a>
-    <a href="{{ url_for('store_ordering.admin_report') }}">订货报表</a>
-    <a href="{{ url_for('store_ordering.manage_shipping_rule') }}">运费规则</a>
-    {% endif %}
-    {# /notifications: everyone logged in, with unread badge (PRD §1.1 A6) #}
-    {% if g.user %}
-    <a href="{{ url_for('notifications.notifications_feed') }}">
-      通知
-      {% if unread_notifications_count and unread_notifications_count > 0 %}
-      <span class="nav-badge">{{ unread_notifications_count }}</span>
+      {% if is_admin or (g.role and g.role['role'] == 'admin') %}
+      <a href="{{ url_for('import_items.upload_form') }}">品项批量导入</a>
       {% endif %}
-    </a>
+    </nav>
+    {% endif %}
     {% endif %}
   </aside>
   {% endblock %}
@@ -111,38 +139,20 @@
       {% block content %}{% endblock %}
     </main>
 
+    {# 移动底栏（2026-10-13）：收敛为 ≤5 个高频模块入口 + 「更多」→ /land 全模块页。
+       原 15 项平铺已超载；其余模块从「更多」进入。 #}
     <nav class="mobile-nav mobile-only">
-      {% if g.user and g.user['is_admin'] %}
-      <a href="{{ url_for('users.list_users') }}">账号</a>
-      {% if is_admin or is_storefront %}
-      <a href="{{ url_for('items.items_list') }}">品项</a>
-      {% endif %}
-      {% endif %}
       <a href="{{ url_for('core.dashboard') }}">总览</a>
-      <a href="{{ url_for('core.summary') }}">汇总</a>
       {% if is_admin or is_storefront %}
-      <a href="{{ url_for('items.inventory_view') }}">库存</a>
-      <a href="{{ url_for('stocktake.stocktake_list') }}">盘点</a>
-      <a href="{{ url_for('restock.restock_list') }}">入库</a>
-      <a href="{{ url_for('outbound.outbound_list') }}">出库</a>
-      <a href="{{ url_for('production.products_list') }}">生产</a>
+      <a href="{{ url_for('items.inventory_view') }}">库存管理</a>
       {% endif %}
       {% if is_admin or is_storefront or is_distribution_center %}
-      <a href="{{ url_for('store_ordering.catalog') }}">订货</a>
+      <a href="{{ url_for('store_ordering.catalog') }}">门店订货</a>
+      {% endif %}
       {% if is_admin or is_storefront %}
-      <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
+      <a href="{{ url_for('production.products_list') }}">生产管理</a>
       {% endif %}
-      {% endif %}
-      {% if g.user and g.user['is_admin'] %}
-      <a href="{{ url_for('store_ordering.admin_report') }}">报表</a>
-      <a href="{{ url_for('store_ordering.manage_shipping_rule') }}">运费</a>
-      {% endif %}
-      {% if is_admin or is_distribution_center %}
-      <a href="{{ url_for('store_ordering.manage_dc_items') }}">品项</a>
-      {% endif %}
-      {% if is_admin or is_rd %}
-      <a href="{{ url_for('recipe_cost.landing') }}">配方</a>
-      {% endif %}
+      <a href="{{ url_for('core.land') }}">更多</a>
     </nav>
   </div>
   <script src="{{ url_for('static', filename='ajax-form.js') }}?v=1" defer></script>

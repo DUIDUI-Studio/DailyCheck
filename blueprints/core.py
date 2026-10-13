@@ -9,8 +9,8 @@ from flask import Blueprint, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_role
-from ._helpers import render
 
+from ._helpers import render
 
 bp = Blueprint("core", __name__)
 
@@ -301,7 +301,13 @@ def dashboard():
 @bp.route("/land")
 @require_login
 def land():
-    """Post-warehouse-pick landing page: choose between 库存管理 and 生产录入."""
+    """Post-warehouse-pick landing page: module cards.
+
+    Since the 2026-10-13 nav modularization this shows one card per module
+    (总览 / 库存管理 / 生产管理 / 门店订货 / 采购 / 通知 / 管理员), filtered
+    per role in the template. Card hrefs point at the first page of the
+    module that the current role can see.
+    """
     return render("land.html", no_sidebar=True)
 
 

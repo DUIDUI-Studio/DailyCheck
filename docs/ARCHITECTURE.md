@@ -392,6 +392,11 @@ flowchart TB
 
 **约定**：`xxx.py`（蓝图，含 Flask 视图）和 `xxx_pure.py`（纯函数/类，便于测试和复用）成对出现。改业务规则时**优先改 pure**，再让蓝图调它。
 
+**UI 导航结构（2026-10-13 导航模块化起）**：面向用户的信息架构收敛为 **7 模块** —
+总览 / 库存管理 / 生产管理 / 门店订货 / 采购 / 通知 / 管理员，三个载体（桌面侧边栏 /
+移动底栏 / `/land` 模块卡片）共用同一套模块归属与角色口径。归属决策与载体规则见
+[`docs/2026-10-13-nav-modules.md`](2026-10-13-nav-modules.md)。
+
 ---
 
 ## 6. 蓝图依赖关系
@@ -789,6 +794,16 @@ flowchart LR
 - ❌ **无 background sync**（离线写不能排队）
 - ❌ iOS Safari PWA 有已知限制（storage quota、push）
 
+**导航三载体（2026-10-13 导航模块化）**：
+- 桌面侧边栏（`base.html:aside.sidebar`）：7 个 `.nav-group` 模块分组（`nav-group-title` + 链接）；
+  模块内无可见子项则整块不渲染；管理员模块置底。
+- 移动底栏（`base.html:nav.mobile-nav`）：≤5 个高频模块入口 + 「更多」→ `/land`；
+  flex 布局（角色不同条目数 3~5 动态），不再固定 5 列 grid。
+- 模块选择页（`land.html`，`/land`，no_sidebar）：每模块一张卡，按角色过滤；
+  卡片描述按角色出文案（不列出该角色不可见的页）。
+- ⚠️ 角色口径一律取 `_helpers.register_template_context` 注入变量，禁止 block 内 `{% set %}`（§13.2）。
+- 改 `static/*` 后按约定 bump 模板里的 `?v=`（本次 `style.css?v=15`）。
+
 ---
 
 ## 12. 测试架构
@@ -800,7 +815,7 @@ flowchart TB
         Route["test_*_route.py<br/>视图集成测试<br/>~30% 用例"]
         E2E["test_*_e2e.py<br/>端到端 ~5%"]
         Acceptance["test_acceptance_*.py<br/>验收脚本 39 用例全绿"]
-        Aux["test_aux_unit.py /<br/>test_master_db_migrate.py /<br/>test_nav_integration.py<br/>pre-existing 18 failed 来源"]
+        Aux["test_aux_unit.py /<br/>test_master_db_migrate.py<br/>pre-existing 失败来源"]
         Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>6 用例"]
     end
 
@@ -829,6 +844,8 @@ flowchart TB
 
 **基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。`feat/user-admin-v2`（PR #17，2026-10-12）新增 `test_users_admin_v2.py` 40 用例，基线升至 **18 failed / 796 passed**，零新增失败。
 
+**基线更新（2026-10-13，`feat/nav-modules`，rebase 至 `f00e490` 后）**：16 failed / 801 passed — `test_nav_integration.py` 旧断言（staff 应见采购）随导航模块化修正并扩充为 12 用例（796→801），失败集 18→16；`tests/known_failures.txt` 同步删 2 行（清单收缩为 16，与实际失败集逐条一致）。零新增。⚠️ 复用旧 basetemp（`/tmp/pytest-dc`）会因沙箱清理不完全随机出现 1~3 条 `sqlite3.OperationalError` ERROR；换全新 basetemp 即消失，与代码无关。
+
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
 - `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
@@ -836,8 +853,9 @@ flowchart TB
 - `deploy` job `needs: test`：CI 不过不部署（PR 触发不部署）。
 - **生产部署触发（2026-10-11 起）**：仅 `workflow_dispatch` 手动执行，push main **不**自动部署。启用自动部署的前置条件：VPS 安装备份 cron + 异地副本 + 一次真实部署演练。
 
-**Pre-existing 18 failed 分布**：
-- `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / nav_integration×2 / procurement_route×1 / recipe_cost_route×1`
+**Pre-existing 16 failed 分布**（2026-10-13 起）：
+- `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
+- （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
 
 ---
 
@@ -918,7 +936,7 @@ with app.test_client() as c, c.session_transaction() as s:
 
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
-| 18 failed 测试（本地 16） | 中 | pre-existing | 商业化前必须归零 |
+| 16 failed 测试（本地，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
 | 时区不一致 | **高** | pre-existing | 多租户改造前必修 |
 | 配方成本 qty 语义不一致 | **高** | pre-existing (2026-09-02 起) | 财务对账会出错，待 owner 拍板 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
@@ -945,6 +963,10 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/2026-10-03-canonical-item-prd.md`](2026-10-03-canonical-item-prd.md) — 主数据 PRD
 - `docs/2026-10-04-store-ordering-*` — 订货流程 5 篇文档 + 4 张 mermaid
 - `docs/2026-10-05-store-ordering-*` — v2/v3 迭代
+
+### UI / 导航
+
+- [`docs/2026-10-13-nav-modules.md`](2026-10-13-nav-modules.md) — 导航模块化 7 模块 IA（归属决策 + 三载体规则）
 
 ### 评估 / 计划
 
@@ -981,7 +1003,8 @@ with app.test_client() as c, c.session_transaction() as s:
 | `blueprints/production.py` / `stocktake.py` / `restock.py` / `outbound.py` / `adjustment.py` / `consumption.py` / `reports.py` | §5 §6 |
 | `blueprints/users.py` / `import_items.py` / `agent_tokens.py` | §5 §6 §8 |
 | `mcp_server/*.py` | §9 |
-| `templates/**` / `static/**` | §11 |
+| `templates/**` | §5 §11 |
+| `static/**` | §11 |
 | `tests/**` | §12 |
 | `.github/workflows/*` / `deploy/**` / `scripts/**` | §3 §12 §附 |
 | `docs/ARCHITECTURE.md`（本文件） | 自更新 |
