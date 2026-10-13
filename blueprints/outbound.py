@@ -6,7 +6,7 @@ from decimal import Decimal
 from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
-from permissions import require_login, require_role
+from permissions import require_login, require_permission, require_role
 
 from . import canonical_pure as cp
 from ._helpers import now, parse_qty
@@ -68,7 +68,7 @@ def outbound_session():
 
 
 @bp.route("/outbound/submit", methods=["POST"])
-@require_login
+@require_permission("stock.outbound")
 def outbound_submit():
     db = get_warehouse_db()
     reason = request.form.get("reason", "").strip()
@@ -124,7 +124,7 @@ def outbound_submit():
 
 
 @bp.route("/outbound/<int:req_id>/rollback", methods=["POST"])
-@require_role("staff")
+@require_permission("stock.outbound.rollback")
 def rollback(req_id: int):
     db = get_warehouse_db()
     req = db.execute(

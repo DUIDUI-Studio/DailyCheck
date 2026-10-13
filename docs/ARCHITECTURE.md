@@ -179,6 +179,10 @@ erDiagram
     RECIPE_VERSIONS ||--o{ RECIPE_PUBLISH_EVENTS : "rd → storefront"
     ITEM_PUBLISH_EVENTS ||--o{ ITEM_PUBLISH_EVENT_ITEMS : "rd → storefront"
     AGENT_TOKENS ||--o{ ACCESS_LOG : "MCP access"
+    ROLES ||--o{ WAREHOUSE_USERS : "role code"
+    ROLES ||--o{ ROLE_PERMISSIONS : "角色 = 权限点集合"
+    PERMISSIONS ||--o{ ROLE_PERMISSIONS : "permission_code"
+    PERMISSIONS ||--o{ PERMISSION_ROUTES : "点 → HTTP 路由（Phase B）"
 
     USERS {
         int id PK
@@ -187,6 +191,27 @@ erDiagram
         int is_admin "平台管理员"
         string created_at
         string last_login_at
+    }
+    ROLES {
+        int id PK
+        string code "staff|manager|admin|viewer|finance"
+        int tenant_id
+        int is_builtin "内置包=1"
+        int rank "阶梯 1/2/3；旁支 NULL"
+    }
+    PERMISSIONS {
+        string code PK "order.approve / report.cost.view"
+        string category
+        string risk "normal|sensitive|critical"
+    }
+    ROLE_PERMISSIONS {
+        int role_id FK
+        string permission_code FK
+    }
+    PERMISSION_ROUTES {
+        string permission_code FK
+        string method
+        string path_pattern "Web / MCP 共用词汇表"
     }
     WAREHOUSES {
         int id PK
@@ -198,7 +223,7 @@ erDiagram
     WAREHOUSE_USERS {
         int user_id FK
         int warehouse_id FK
-        string role "staff|manager|admin"
+        string role "staff|manager|admin|viewer|finance（code，非 FK）"
     }
     CANONICAL_ITEMS {
         int id PK
@@ -235,6 +260,8 @@ erDiagram
         real shipping_fee "v3.1 锁定"
     }
 ```
+
+> **权限精细化新增表（2026-10-13 起）**：`permissions` / `roles` / `role_permissions` / `permission_routes` / `approval_policies`（5 张，均 `CREATE TABLE IF NOT EXISTS`，对存量 master.db 为 no-op 追加；由 `init_master_db()` 幂等播种）。角色包与权限点目录的**单一事实来源**是 `permissions_manifest.py`（守卫 / 管理 UI / 测试四方共用）。详 §8.7。
 
 ### 4.3 warehouse.db 核心表（ER 简图）
 
@@ -523,6 +550,8 @@ sequenceDiagram
 | `@require_platform_admin` | 同上 | 必须 `g.user.is_admin=1`（不绕过） |
 | `@require_warehouse_type(*types)` | 同上 | 当前仓库类型必须在白名单（rd/storefront/dc） |
 | `storefront_only` / `distribution_center_only` | 同上 | 上述的白名单语义糖 |
+| `@require_permission(*codes)` | 同上 | **权限点（RBAC）**：当前用户须持有全部 codes（AND）；语义与 `require_role` 对齐（登录→超管 bypass→选仓→权限） |
+| `@require_any_permission(*codes)` | 同上 | 任一 code 命中即放行（OR），用于「owner 或提权」场景 |
 
 ### 8.3 鉴权关键路径
 
@@ -568,6 +597,18 @@ flowchart TB
 - **登录锁定**：master.db `login_throttle` 表（跨 worker），(ip, username) 维度，15 分钟窗内连错 5 次 → 锁 30 分钟；成功登录清零。**时间一律 UTC naive**（`datetime.utcnow()`），与进程时区无关，规避生产 CST/UTC 坑。
 - **MCP per-token 配额**：`agent_tokens.rate_limit` 列（NULL=`MCP_DEFAULT_RATE_LIMIT`=120/分钟），`AuthMiddleware` 内存滑动窗口按 token_id 限速，超限 429；单进程内共享、重启清零。
 - 回归：`tests/test_rate_limit.py`（15 用例）。
+
+### 8.7 权限点（RBAC）精细化管理（2026-10-13 起）
+
+**模型**：角色 = **权限点集合**。25 个权限点目录（order 5 / stock 6 / item 6 / report 3 / admin 5）定义于 `permissions_manifest.py::PERMISSION_CATALOG`；5 个内置角色包（`ROLE_PACKAGES`）——阶梯包 `staff(10) ⊆ manager(17) ⊆ admin(18)`，旁支包 `viewer(3)` / `finance(4)`（`rank=NULL`，不参与阶梯）。**单一事实来源** `permissions_manifest.py` 被守卫 / 管理 UI / 测试四方共用（守卫用 `@require_permission`，测试用 `tests/test_route_permission_matrix.py` 校验覆盖与不变式）。
+
+**解析（`permissions.py::current_permissions()`）**：每请求一次 JOIN 查 master.db（`warehouse_users → roles → role_permissions`），结果缓存到 `g.perm_set`——**禁进程级缓存**（gunicorn 多 worker 会各自漂移）；**fail-closed**：任何异常 → 空集 → 403 + 日志；`is_admin=1` 返回全目录哨兵（超管直通）。未知角色 code（JOIN 空集）→ 403。
+
+**存储**（master.db，`init_master_db()` 幂等播种）：`permissions` / `roles` / `role_permissions` / `permission_routes`（Web 与 MCP 共用词汇表，Phase B 填充）/ `approval_policies`（Phase 3 扩展点，空表）。启动断言 `_verify_builtin_packages()`（空包 / 阶梯破坏 / 权限数契约 / 越界点 / 孤儿点）**告警不 raise**（防单点数据问题拒绝启动）。改包后须 `flask reseed-builtin-roles` 显式重播种（`INSERT OR IGNORE` 不更新已存在行）。
+
+**成本脱敏**（服务端，`blueprints/cost_redaction_pure.py`）：`export_consumption` / `export_summary` 对无 `report.cost.view` 者把成本列留空（列结构不变）；`/summary`、`/inventory` 页**不脱敏**（Eric 终裁④，口径例外）。
+
+**兼容层**：`require_role` 阶梯与权限点**并存**——本期未迁移的路由（canonical 管理、import_items、stocktake CSV、forecast 非 index、procurement、store_ordering DC list/ship、reports 营业额写）保持 `require_role`/`require_platform_admin`，语义零变化。回归：`tests/test_route_permission_matrix.py`（36 用例）+ `tests/test_master_db_migrate.py`（RBAC 7 用例）。设计见 `docs/2026-10-12-permission-spec.md` / `-architecture.md` / `-implementation-plan.md`。
 
 ---
 

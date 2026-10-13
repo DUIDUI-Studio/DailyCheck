@@ -21,6 +21,7 @@ from werkzeug.datastructures import FileStorage
 from db import get_warehouse_db
 from permissions import (
     require_login,
+    require_permission,
     require_role,
 )
 
@@ -298,7 +299,7 @@ def stocktake_session():
 
 
 @bp.route("/stocktake/submit", methods=["POST"])
-@require_login
+@require_permission("stock.stocktake")
 def stocktake_submit():
     db = get_warehouse_db()
     note = request.form.get("note", "").strip()
@@ -347,7 +348,7 @@ def stocktake_submit():
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/rollback", methods=["POST"])
-@require_role("staff")
+@require_permission("stock.stocktake")
 def rollback(batch_id: int):
     db = get_warehouse_db()
     batch = db.execute(
@@ -405,7 +406,7 @@ def rollback(batch_id: int):
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/edit", methods=["GET"])
-@require_role("staff")
+@require_permission("stock.stocktake")
 def edit(batch_id: int):
     db = get_warehouse_db()
     batch = db.execute(
@@ -428,7 +429,7 @@ def edit(batch_id: int):
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/edit", methods=["POST"])
-@require_role("staff")
+@require_permission("stock.stocktake")
 def submit_edit(batch_id: int):
     db = get_warehouse_db()
     batch = db.execute(
@@ -474,7 +475,7 @@ def submit_edit(batch_id: int):
 
 
 @bp.route("/stocktake/batch/<int:batch_id>/approve", methods=["POST"])
-@require_role("staff")
+@require_permission("stock.stocktake.approve")
 def approve(batch_id: int):
     """Approval semantics (口径 B):
     - 盘亏 (diff < 0): real consumption. We write a synthetic

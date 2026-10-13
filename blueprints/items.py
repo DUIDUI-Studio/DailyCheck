@@ -9,7 +9,7 @@ from __future__ import annotations
 from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
-from permissions import require_login, require_platform_admin, require_role
+from permissions import require_login, require_permission, require_platform_admin
 
 from . import canonical_pure as cp
 from ._helpers import now, parse_qty, warehouse_categories_in_clause
@@ -42,7 +42,6 @@ def _require_storefront():
 
 @bp.route("/items", methods=["GET", "POST"])
 @require_platform_admin
-@require_role("manager")
 def items_list():
     db = get_warehouse_db()
     if request.method == "POST":
@@ -83,7 +82,6 @@ def items_list():
 
 @bp.route("/items/<int:item_id>/edit", methods=["GET", "POST"])
 @require_platform_admin
-@require_role("manager")
 def edit_item(item_id: int):
     db = get_warehouse_db()
     old = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
@@ -361,7 +359,7 @@ def items_publish_history(event_id: int | None = None):
 
 
 @bp.route("/items/new-item-redirect")
-@require_role("manager")
+@require_permission("item.create")
 def new_item_redirect():
     """【已停用，2026-10-10】Q1 三条出路页。
 
@@ -378,7 +376,7 @@ def new_item_redirect():
 
 
 @bp.route("/items/new-item-redirect/submit", methods=["POST"])
-@require_role("manager")
+@require_permission("item.create")
 def new_item_redirect_submit():
     """三条出路的提交分支。
 

@@ -204,7 +204,6 @@ def canonical_detail(canonical_id: int):
 @bp.route("/edit", methods=["GET", "POST"])
 @bp.route("/edit/<int:canonical_id>", methods=["GET", "POST"])
 @require_platform_admin
-@require_role("manager")
 def canonical_edit(canonical_id: int | None = None):
     m = get_master_db()
     if request.method == "POST":

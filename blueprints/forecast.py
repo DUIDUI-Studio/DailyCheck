@@ -169,7 +169,6 @@ def forecast_product(product_id: int):
 
 @bp.route("/forecast", methods=["GET"])
 @require_platform_admin
-@require_role("manager")
 def forecast_index():
     """Render the forecast dashboard for the current warehouse.
 

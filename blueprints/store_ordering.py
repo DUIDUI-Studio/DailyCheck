@@ -25,7 +25,13 @@ from flask import (
 from blueprints import store_ordering_pure as sop
 from blueprints._helpers import parse_qty
 from db import get_master_db
-from permissions import require_login, require_role, require_warehouse_type
+from permissions import (
+    require_any_permission,
+    require_login,
+    require_permission,
+    require_role,
+    require_warehouse_type,
+)
 
 bp = Blueprint("store_ordering", __name__, url_prefix="/store-ordering")
 
@@ -216,7 +222,7 @@ def catalog() -> str:
 
 
 @bp.route("/cart/add", methods=["POST"])
-@require_login
+@require_permission("order.create")
 @_storefront_or_admin
 def add_to_cart() -> str:
     """DEPRECATED single-item form submit; catalog.html uses /cart/add-batch now.
@@ -250,7 +256,7 @@ def add_to_cart() -> str:
 
 
 @bp.route("/cart/add-batch", methods=["POST"])
-@require_login
+@require_permission("order.create")
 @_storefront_or_admin
 def cart_add_batch() -> str:
     """Batch add items from the catalog modal.
@@ -337,7 +343,7 @@ def _assert_cart_item_owner(master: sqlite3.Connection, cart_item_id: int) -> No
 
 
 @bp.route("/cart/update/<int:cart_item_id>", methods=["POST"])
-@require_login
+@require_permission("order.create")
 @_storefront_or_admin
 def update_cart_item(cart_item_id: int) -> str:
     """Update cart item quantity."""
@@ -353,7 +359,7 @@ def update_cart_item(cart_item_id: int) -> str:
 
 
 @bp.route("/cart/remove/<int:cart_item_id>", methods=["POST"])
-@require_login
+@require_permission("order.create")
 @_storefront_or_admin
 def remove_cart_item_route(cart_item_id: int) -> str:
     """Remove item from cart."""
@@ -365,7 +371,7 @@ def remove_cart_item_route(cart_item_id: int) -> str:
 
 
 @bp.route("/cart/clear", methods=["POST"])
-@require_login
+@require_permission("order.create")
 @_storefront_or_admin
 def clear_cart_route() -> str:
     """Clear cart."""
@@ -380,7 +386,7 @@ def clear_cart_route() -> str:
 
 
 @bp.route("/cart/submit", methods=["GET", "POST"])
-@require_login
+@require_permission("order.create")
 @_storefront_or_admin
 def submit_order_route() -> str:
     """Submit cart as order."""
@@ -623,7 +629,7 @@ def review_list() -> str:
 @bp.route("/orders/<int:order_id>/review", methods=["POST"])
 @require_login
 @require_warehouse_type("distribution_center")
-@require_role("manager")
+@require_permission("order.approve")
 def review_order_route(order_id: int) -> str:
     """Approve or reject an order."""
     decision = request.form.get("decision", "").strip()
@@ -713,7 +719,7 @@ def manage_dc_items() -> str:
 
 
 @bp.route("/orders/<int:order_id>/cancel", methods=["POST"])
-@require_login
+@require_any_permission("order.create", "order.cancel.any")
 def cancel_order_route(order_id: int) -> str:
     """Cancel a pending or approved order (P1-4).
 
@@ -773,6 +779,11 @@ def cancel_order_route(order_id: int) -> str:
 @require_role("staff")
 def ship_order_route(order_id: int) -> str:
     """DC 部分/全部发货（v3）。
+
+    守卫说明（兼容层，保持 require_role）：DC staff 发货是既有行为。`order.ship`
+    权限点归 manager 包，若改走 @require_permission("order.ship") 会让 DC staff
+    失去发货能力（非白名单行为变化）——故本路由维持 require_role("staff")，
+    仅保留 DC 类型守卫。见施工图 §1.2-E 修正说明。
 
     表单字段约定：
       - ``shipped_items[N]=qty``：多值，每行一个明细的本批发货数。N 是
@@ -875,7 +886,7 @@ def ship_order_route(order_id: int) -> str:
 
 
 @bp.route("/orders/<int:order_id>/deliver", methods=["POST"])
-@require_login
+@require_permission("order.ship")
 def deliver_order_route(order_id: int) -> str:
     """Mark order as delivered (store manager/admin)."""
     master = get_master_db()
@@ -902,7 +913,7 @@ def deliver_order_route(order_id: int) -> str:
 
 
 @bp.route("/orders/<int:order_id>/receive", methods=["POST"])
-@require_login
+@require_permission("order.receive")
 @_storefront_or_admin
 def receive_order_route(order_id: int) -> str:
     """Receive (partial or full) a single order_item into the storefront warehouse.

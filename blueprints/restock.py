@@ -5,7 +5,7 @@ from __future__ import annotations
 from flask import Blueprint, flash, g, redirect, render_template, request, url_for
 
 from db import get_warehouse_db
-from permissions import require_login, require_role
+from permissions import require_login, require_permission
 
 from . import canonical_pure as cp
 from ._helpers import now, parse_qty
@@ -90,7 +90,7 @@ def restock_session():
 
 
 @bp.route("/restock/submit", methods=["POST"])
-@require_login
+@require_permission("stock.restock")
 def restock_submit():
     db = get_warehouse_db()
     reason = request.form.get("reason", "").strip()
@@ -144,7 +144,7 @@ def restock_submit():
 
 
 @bp.route("/restock/<int:req_id>/status", methods=["POST"])
-@require_login
+@require_permission("stock.restock")
 def update_status(req_id: int):
     status = request.form.get("status", "").strip()
     if status not in {"提交", "入库"}:
@@ -182,7 +182,7 @@ def update_status(req_id: int):
 
 
 @bp.route("/restock/<int:req_id>/delete", methods=["POST"])
-@require_role("staff")
+@require_permission("stock.restock")
 def delete(req_id: int):
     db = get_warehouse_db()
     req = db.execute(

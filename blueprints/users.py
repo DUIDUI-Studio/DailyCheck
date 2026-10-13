@@ -20,18 +20,12 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import BASE_DIR, MASTER_DB, ROLE_RANK, WAREHOUSE_DB_DIR
 from db import get_master_db, init_warehouse_db
-from permissions import require_login
+from permissions import require_login, require_platform_admin
 
 
 bp = Blueprint("users", __name__)
 
 VALID_ROLES = set(ROLE_RANK.keys())  # staff / manager / admin
-
-
-def _require_admin():
-    from flask import g
-    if not g.user or not g.user["is_admin"]:
-        abort(403)
 
 
 def _bindings_for(user_id: int) -> dict[int, str]:
@@ -46,8 +40,8 @@ def _bindings_for(user_id: int) -> dict[int, str]:
 
 @bp.route("/users", methods=["GET"])
 @require_login
+@require_platform_admin
 def list_users():
-    _require_admin()
     from flask import g
     db = get_master_db()
     users = db.execute(
@@ -75,8 +69,8 @@ def list_users():
 
 @bp.route("/users/create", methods=["POST"])
 @require_login
+@require_platform_admin
 def create_user():
-    _require_admin()
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
     is_admin = request.form.get("is_admin") == "1"
@@ -106,9 +100,9 @@ def create_user():
 
 @bp.route("/users/<int:user_id>/bind", methods=["POST"])
 @require_login
+@require_platform_admin
 def bind_role(user_id: int):
     """Add a binding (warehouse_id + role) for an existing user."""
-    _require_admin()
     db = get_master_db()
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         abort(404)
@@ -132,9 +126,9 @@ def bind_role(user_id: int):
 
 @bp.route("/users/<int:user_id>/unbind", methods=["POST"])
 @require_login
+@require_platform_admin
 def unbind_role(user_id: int):
     """Remove a binding for an existing user."""
-    _require_admin()
     db = get_master_db()
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         abort(404)
@@ -155,9 +149,9 @@ def unbind_role(user_id: int):
 
 @bp.route("/users/<int:user_id>/change-role", methods=["POST"])
 @require_login
+@require_platform_admin
 def change_role(user_id: int):
     """Change the role on an existing binding."""
-    _require_admin()
     db = get_master_db()
     if db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
         abort(404)
@@ -184,8 +178,8 @@ def change_role(user_id: int):
 
 @bp.route("/users/<int:user_id>/reset-password", methods=["POST"])
 @require_login
+@require_platform_admin
 def reset_password(user_id: int):
-    _require_admin()
     password = request.form.get("password", "")
     if not password:
         flash("新密码必填")
@@ -206,8 +200,8 @@ def reset_password(user_id: int):
 
 @bp.route("/users/<int:user_id>/toggle-admin", methods=["POST"])
 @require_login
+@require_platform_admin
 def toggle_admin(user_id: int):
-    _require_admin()
     from flask import g
     if g.user["id"] == user_id:
         flash("不能修改自己的平台管理员状态")
@@ -232,6 +226,7 @@ def toggle_admin(user_id: int):
 
 @bp.route("/users/<int:user_id>/delete", methods=["POST"])
 @require_login
+@require_platform_admin
 def delete_user(user_id: int):
     """Permanently delete a user.
 
@@ -240,7 +235,6 @@ def delete_user(user_id: int):
     - Cannot delete the last platform admin (must keep ≥1 admin).
     - warehouse_users bindings cascade-delete with the user.
     """
-    _require_admin()
     from flask import g
     if g.user["id"] == user_id:
         flash("不能删除自己的账号")
@@ -268,6 +262,7 @@ def delete_user(user_id: int):
 
 @bp.route("/warehouses/create", methods=["POST"])
 @require_login
+@require_platform_admin
 def create_warehouse():
     """Create a new warehouse. Supports two types:
 
@@ -277,7 +272,6 @@ def create_warehouse():
       warehouse starts empty and gets recipes/items populated manually
       (or via the rd seed script).
     """
-    _require_admin()
 
     code = request.form.get("code", "").strip().lower()
     name = request.form.get("name", "").strip()
@@ -353,6 +347,7 @@ def create_warehouse():
 
 @bp.route("/warehouses/<int:warehouse_id>/init", methods=["POST"])
 @require_login
+@require_platform_admin
 def init_warehouse(warehouse_id: int):
     """Wipe business data for one warehouse, preserving the catalog.
 
@@ -371,7 +366,6 @@ def init_warehouse(warehouse_id: int):
     must equal the warehouse's code. Plain-text confirmation in the
     button label.
     """
-    _require_admin()
     from flask import g
     from config import BASE_DIR
 
@@ -467,18 +461,16 @@ def _bindings_summary(user_id: int, db) -> str:
 
 
 def _log_admin_action(detail: str) -> None:
-    """Append an admin action line to a simple flat file. Master.db has no
-    audit_log table; the per-warehouse audit_log only covers business writes."""
-    import json
-    from pathlib import Path
+    """Append an admin action line via the single shared implementation.
+
+    Kept as a thin wrapper so the ~10 call sites read unchanged; the actual
+    writer lives in blueprints/audit_pure.py (AC-02 single implementation).
+    """
     from flask import g
-    log = Path(__file__).resolve().parent.parent / "admin_audit.log"
-    with log.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "actor": g.user["username"] if g.user else None,
-            "detail": detail,
-        }, ensure_ascii=False) + "\n")
+
+    from blueprints.audit_pure import append_admin_audit
+
+    append_admin_audit(g.user["username"] if g.user else None, detail)
 
 
 def _clone_catalog_from(src_path: Path, dst_path: Path) -> dict[str, int]:

@@ -332,7 +332,6 @@ def _store_procurement_json(wh_code: str) -> dict:
 
 @bp.route("/procurement/store", methods=["GET"])
 @require_platform_admin
-@require_role("staff")
 def procurement_store():
     wh_code = request.args.get("warehouse_code") or (
         g.warehouse["code"] if g.warehouse else None
