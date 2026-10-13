@@ -771,11 +771,16 @@ def test_users_service_worker_does_not_cache_dynamic_get():
     这条是静态断言（JS 侧没有 pytest 覆盖的替代品）：把 sw.js 里"只缓存
     /static/"的那道判断钉住，防止有人把它改回"所有非导航 GET 都缓存"。
 
-    两类断言必须**并存**，各守一半：
-    - **字面量断言**守「比较方向」：`indexOf("/static/") !== 0` 一旦被改成 `=== 0`
-      就变成"只缓存非 /static/"，等于把越权缓存原样放回来；顺序断言拦不住它。
-    - **顺序断言**守「位置」：把范围判断挪到 `cache.put` 之后、或把 put 挪出
-      `res.ok` 守卫，字符串都还在，只有顺序能发现。
+    分两类，各守一半：
+    - **语义**（下面这条正则）守整条早退条件：路径侧取反 `!== 0`→`=== 0` 会变成
+      "只缓存非 /static/"、来源侧取反会让跨源响应落盘、**把 `return;` 删掉**
+      会让条件形同虚设 —— 三种都让越权缓存放回来。正则同时容忍引号/空白的
+      等价写法，避免把格式化提交误判为回归。
+    - **位置**（三条顺序断言）守调用次序：把范围判断挪到 `cache.put` 之后、
+      或把 put 挪出 `res.ok` 守卫，字符串都还在，只有顺序能发现。
+
+    已知限制：剥注释只处理 `//` 行注释（`sw.js` 目前没有块注释）；若将来引入
+    `/* */`，这里要同步剥掉，否则块注释里复述表达式会造成假 PASS。
     """
     import re
     from pathlib import Path
@@ -786,12 +791,22 @@ def test_users_service_worker_does_not_cache_dynamic_get():
     # 先剥行注释再定位：注释里复述同样的表达式会让 index() 命中注释、造成假 PASS。
     sw = re.sub(r"//[^\n]*", "", raw)
 
-    # ① 范围判断的语义（比较方向）—— 防"取反即放行"
-    assert 'url.pathname.indexOf("/static/") !== 0' in sw, (
-        "sw.js 的 /static/ 范围判断被改动：比较方向反了会把越权缓存放回来"
+    # ① 语义：整条早退条件（来源判据 + 路径判据 + `return;`）必须完整存在。
+    scope_re = re.search(
+        r"url\.origin\s*!==\s*self\.location\.origin\s*\|\|"
+        r"\s*url\.pathname\.indexOf\(\s*[\"']/static/[\"']\s*\)\s*!==\s*0\s*\)\s*\{"
+        r"[^}]*?\breturn\s*;",
+        sw,
     )
-    # ② 位置：范围早退必须在 cache.put 之前，写入必须受 res.ok 守卫
-    scope_idx = sw.index("url.pathname.indexOf")
+    assert scope_re, (
+        "sw.js 的 /static/ 范围判断不完整：比较方向被取反、来源判据被改、"
+        "或早退 return 被删掉 —— 任一种都会让非 /static/ 的动态响应进 Cache API"
+    )
+    scope_idx = scope_re.start()
+
+    # ② 位置：范围早退必须在 cache.put 之前，写入必须受 res.ok 守卫。
+    assert "cache.put(req, copy)" in sw, "cache.put 不见了：/static/ 缓存写入被移除"
+    assert "if (res.ok)" in sw, "res.ok 守卫被删除：cache.put 变成无条件写入"
     put_idx = sw.index("cache.put(req, copy)")
     ok_idx = sw.index("if (res.ok)")
     last_respondwith = sw.rindex("event.respondWith")
