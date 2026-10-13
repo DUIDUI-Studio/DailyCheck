@@ -1,0 +1,63 @@
+/* static/role-tags.css — 角色标签系统（权限精细化 · 阶段 1）
+ *
+ * 语义规则：实心 = 可写；描边 = 只读。色相仅 3 族 + 琥珀保留给平台管理员。
+ * 不靠颜色单独表意（实心/描边/虚线构成形态冗余，色盲可辨）。
+ * 零新依赖；无 emoji；颜色全部经 token（--role-tag-*）引用。
+ * 依据：docs/2026-10-12-permission-spec.md 附录 A + permissions_manifest.ROLE_META。
+ */
+
+:root {
+  /* B-slot：角色标签 token（6 类） */
+  --role-tag-staff-bg: #f3f4f6;
+  --role-tag-staff-fg: #374151;
+  --role-tag-manager-bg: #eef2ff;
+  --role-tag-manager-fg: #3730a3;
+  --role-tag-admin-bg: #ecfdf5;
+  --role-tag-admin-fg: #0b4f4a;
+  --role-tag-viewer-bg: transparent;
+  --role-tag-viewer-fg: #6b7280;
+  --role-tag-viewer-border: #d1d5db;
+  --role-tag-finance-bg: transparent;
+  --role-tag-finance-fg: #0b4f4a;
+  --role-tag-finance-border: #0f766e;
+  --role-tag-super-bg: #fef3c7;
+  --role-tag-super-fg: #92400e;
+}
+
+.role-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* 实心 = 可写 */
+.role-tag--staff   { background: var(--role-tag-staff-bg);   color: var(--role-tag-staff-fg); }
+.role-tag--manager { background: var(--role-tag-manager-bg); color: var(--role-tag-manager-fg); }
+.role-tag--admin   { background: var(--role-tag-admin-bg);   color: var(--role-tag-admin-fg); }
+
+/* 描边 = 只读（viewer 虚线强化「无写权限」语义） */
+.role-tag--viewer  {
+  background: var(--role-tag-viewer-bg);
+  color: var(--role-tag-viewer-fg);
+  border-color: var(--role-tag-viewer-border);
+  border-style: dashed;
+}
+.role-tag--finance {
+  background: var(--role-tag-finance-bg);
+  color: var(--role-tag-finance-fg);
+  border-color: var(--role-tag-finance-border);
+}
+
+/* 平台管理员（系统保留，实心琥珀） */
+.role-tag--super { background: var(--role-tag-super-bg); color: var(--role-tag-super-fg); font-weight: 600; }
+
+/* 无障碍：高对比模式用轮廓兜底 */
+@media (forced-colors: active) {
+  .role-tag { border: 1px solid CanvasText; }
+}

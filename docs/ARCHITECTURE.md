@@ -610,6 +610,8 @@ flowchart TB
 
 **兼容层**：`require_role` 阶梯与权限点**并存**——本期未迁移的路由（canonical 管理、import_items、stocktake CSV、forecast 非 index、procurement、store_ordering DC list/ship、reports 营业额写）保持 `require_role`/`require_platform_admin`，语义零变化。回归：`tests/test_route_permission_matrix.py`（36 用例）+ `tests/test_master_db_migrate.py`（RBAC 7 用例）。设计见 `docs/2026-10-12-permission-spec.md` / `-architecture.md` / `-implementation-plan.md`。
 
+**管理 UI（阶段 1）**：`templates/users.html` 的角色选项与标签**从视图注入的 `role_options`（`[{code,label}]`，顺序 staff→manager→admin→viewer→finance，`label` 取自 `ROLE_META`）渲染**——模板不硬编码角色名单/中文名。角色标签样式见 `static/role-tags.css`（语义：实心=可写 / 描边=只读；`viewer` 虚线、`finance` teal 描边、平台管理员琥珀）。阶段 2 的 `/admin/permissions` 权限矩阵视图见 Spec §7。
+
 ---
 
 ## 9. MCP 架构

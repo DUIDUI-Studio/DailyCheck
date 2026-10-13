@@ -1,6 +1,14 @@
 {% extends "base.html" %}
 {% block title %}账号管理{% endblock %}
 {% block content %}
+<link rel="stylesheet" href="{{ url_for('static', filename='role-tags.css') }}?v=1" />
+{# 角色选项单一来源：后端注入 role_options = [{"code","label"}, ...]
+   （顺序 staff→manager→admin→viewer→finance，label 取自 permissions_manifest.ROLE_META）。
+   禁止硬编码角色名单/中文名 —— 全部从此变量渲染。 #}
+{% set role_options = role_options | default([], true) %}
+{% set role_labels = {} %}
+{% for opt in role_options %}{% set _ = role_labels.update({opt['code']: opt['label']}) %}{% endfor %}
+
 <h2>账号管理</h2>
 
 <details class="card" style="margin-bottom:16px" open>
@@ -25,15 +33,16 @@
       <legend style="padding:0 6px;color:#374151">仓库权限(可选,创建时直接绑定)</legend>
       <table class="role-matrix">
         <tr>
-          <th>仓库</th><th>无权限</th><th>staff</th><th>manager</th><th>admin</th>
+          <th>仓库</th><th>无权限</th>
+          {% for opt in role_options %}<th>{{ opt['label'] }}</th>{% endfor %}
         </tr>
         {% for w in warehouses %}
         <tr>
           <td><strong>{{ w['name'] }}</strong> <small class="muted">({{ w['code'] }})</small></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="" checked /></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="staff" /></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="manager" /></td>
-          <td><input type="radio" name="wh_{{ w['id'] }}" value="admin" /></td>
+          <td><input type="radio" name="wh_{{ w['id'] }}" value="" checked aria-label="无权限" /></td>
+          {% for opt in role_options %}
+          <td><input type="radio" name="wh_{{ w['id'] }}" value="{{ opt['code'] }}" aria-label="{{ opt['label'] }}" /></td>
+          {% endfor %}
         </tr>
         {% endfor %}
       </table>
@@ -119,7 +128,7 @@
       <div>
         <strong>{{ u['username'] }}</strong>
         {% if u['id'] == current_user_id %}<span class="muted">(我)</span>{% endif %}
-        {% if u['is_admin'] %}<span class="tag admin">平台管理员</span>
+        {% if u['is_admin'] %}<span class="role-tag role-tag--super">平台管理员</span>
         {% else %}<span class="tag user">普通用户</span>{% endif %}
       </div>
       <div class="user-card-meta muted">
@@ -134,7 +143,8 @@
       {% if bindings %}
         {% for w in warehouses %}
           {% if bindings.get(w['id']) %}
-            <span class="tag">{{ w['name'] }}:{{ bindings[w['id']] }}</span>
+            {% set _role = bindings[w['id']] %}
+            <span class="role-tag role-tag--{{ _role }}" title="{{ _role }}">{{ w['name'] }}·{{ role_labels.get(_role, _role) }}</span>
           {% endif %}
         {% endfor %}
       {% else %}
@@ -156,10 +166,10 @@
               <form method="post" action="{{ url_for('users.change_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                <select name="role">
-                  <option value="staff" {% if bindings[w['id']] == 'staff' %}selected{% endif %}>staff</option>
-                  <option value="manager" {% if bindings[w['id']] == 'manager' %}selected{% endif %}>manager</option>
-                  <option value="admin" {% if bindings[w['id']] == 'admin' %}selected{% endif %}>admin</option>
+                <select name="role" aria-label="{{ w['name'] }} 角色">
+                  {% for opt in role_options %}
+                  <option value="{{ opt['code'] }}" {% if bindings[w['id']] == opt['code'] %}selected{% endif %}>{{ opt['label'] }}</option>
+                  {% endfor %}
                 </select>
                 <button type="submit" class="btn-sm btn-edit">保存</button>
               </form>
@@ -172,10 +182,10 @@
               <form method="post" action="{{ url_for('users.bind_role', user_id=u['id']) }}" class="role-row-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="warehouse_id" value="{{ w['id'] }}" />
-                <select name="role">
-                  <option value="staff">staff</option>
-                  <option value="manager" selected>manager</option>
-                  <option value="admin">admin</option>
+                <select name="role" aria-label="{{ w['name'] }} 角色">
+                  {% for opt in role_options %}
+                  <option value="{{ opt['code'] }}" {% if opt['code'] == 'manager' %}selected{% endif %}>{{ opt['label'] }}</option>
+                  {% endfor %}
                 </select>
                 <button type="submit" class="btn-sm btn-edit">绑定</button>
               </form>
@@ -246,6 +256,7 @@
 
 <p class="muted" style="margin-top:16px;font-size:13px">
   平台管理员(is_admin=1)不受仓库级权限检查约束。<br>
-  仓库级 admin 等价于"该仓全权";manager 可审批/删除单据;staff 仅录入。
+  内置角色包(5 个):基础作业(录入/出库/盘点)、管理审批(含审批/发货/成本可见)、
+  仓管理(该仓全权)、只读/审计(无写权限)、财务(只读且可见成本)。
 </p>
 {% endblock %}
