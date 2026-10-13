@@ -119,7 +119,7 @@ PYTHONPATH=.venv/lib/python3.12/site-packages /opt/homebrew/bin/python3.12 <scri
 | `production.rollback` | POST | `require_role("staff")` | 兼容层（保持） | 无对应点 |
 | `production.delete_run` | POST | `require_role("staff")` | 兼容层（保持） | 无对应点 |
 | `store_ordering.review_order_route` | POST | `login > DC > require_role("manager")` | `PERM:order.approve` + 保留 DC | 等价（AC 示例） |
-| `store_ordering.ship_order_route` | POST | `login > DC > require_role("staff")` | `PERM:order.ship` + 保留 DC | 等价 |
+| `store_ordering.ship_order_route` | POST | `login > DC > require_role("staff")` | **兼容层（保持 `require_role("staff")`）+ 保留 DC** | ⚠ **施工修正**：原判"等价"有误——`order.ship ∈ manager` 包，迁移会让 **DC staff 失去发货能力**（非白名单回归）。故维持兼容层；见 §6 修正记录 |
 
 > 说明：`E` 组中标记"兼容层（保持）"者（`core.delete_category` / `production.*`）**无对应权限点**，本期不动，避免为凑点而造点。
 
@@ -486,3 +486,26 @@ def mask_cost_csv_row(values: list, indices: set[int], allow: bool) -> list:
 - [ ] `failed == 18` 零新增；ruff 零新增；`docs/ARCHITECTURE.md` 同步
 
 **终裁结论（已锁定，非阻塞）**：① `stocktake.approve`→manager+；② `items.delete_item`→维持平台级；③ `/items`→维持平台级；④ `/summary`、`/inventory`→不脱敏（口径例外）；⑤ `production.submit`→维持 LOGIN + OPEN；⑥ `order.cancel.any`→暂不并入包，用 `require_any_permission` 兜 owner 自撤。
+
+---
+
+## 7. 施工修正记录（Phase 3 实施期间）
+
+> 实施中发现施工图与权限包契约不一致处，按"零非白名单行为变化"红线修正，并回写本文件。
+
+| # | 位置 | 原施工图 | 施工修正 | 依据 |
+|---|---|---|---|---|
+| M1 | §1.2-E `store_ordering.ship_order_route` | 迁移为 `PERM:order.ship`（判"等价"） | **维持兼容层 `login > DC > require_role("staff")`** | `order.ship ∈ manager` 包；迁移会使 **DC staff 失去发货**（`store_ordering_*` 回归 20 用例）。发货是 DC 一线作业，非白名单行为变化 → 维持 |
+| M2 | §1.3 #16 `store_ordering.deliver_order_route` | `PERM:order.ship` | 保持 `PERM:order.ship`（不变） | 原守卫为 `@require_login`；门店"整单送达"快捷入口为 manager 动作（docstring: store manager/admin），现由 `order.ship`（manager+）把闸；现有测试以 store_mgr 调用，零回归。**advisory**：若需 staff 亦可整单送达，请下轮复核 |
+| M3 | 路由总数 | 施工图 §1.0 记 153 | 本 worktree（`main @ 75af9c6`）实际 **147**（`blueprints/users.py` 无 `bulk_bind`/`toggle_active`，属 `user-admin-v2` 分支） | manifest 以实际 `app.url_map` 为准，147/147 覆盖 |
+
+## 8. 规范化交付校验清单（本 worktree 实测）
+
+- [x] `permissions_manifest.py` 覆盖 worktree 全部 endpoint；Test A 未登记即红
+- [x] `permissions.py`：fail-closed + `g.perm_set` 请求内缓存 + `is_admin` sentinel + 未知 code 空集 403
+- [x] `agent_tokens` 内联 `_require_admin` 归零；`users.py` 内联 `_require_admin` 归零（改 `@require_login + @require_platform_admin`）
+- [x] 审计日志单一实现（`blueprints/audit_pure.py::append_admin_audit`）
+- [x] 死装饰器 5 处清零（`items_list`/`edit_item`/`canonical_edit`/`forecast_index`/`procurement_store`）
+- [x] DB：4 表 + `approval_policies` + `agent_tokens.permission_codes_json`；播种幂等；包权限数 {staff:10,manager:17,admin:18,viewer:3,finance:4}
+- [x] 存量测试 `failed == 18` 零新增（与 `main @ 75af9c6` 基线**同一失败集**）
+
