@@ -27,7 +27,7 @@ def get_master_db() -> sqlite3.Connection:
         conn = sqlite3.connect(MASTER_DB)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        g.master_db = conn
+        g.master_db = _wrap_dry_run(conn)
     return g.master_db
 
 
@@ -47,8 +47,22 @@ def get_warehouse_db() -> sqlite3.Connection:
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        g.wh_db = conn
+        g.wh_db = _wrap_dry_run(conn)
     return g.wh_db
+
+
+def _wrap_dry_run(conn):
+    """If app.config["DRY_RUN"]=True, wrap conn in DryRunConnection.
+
+    单独抽函数（而非 inline 在 get_*_db 里）便于：
+    - 单元测试 mock current_app
+    - 后续 dryrun 模块演化时只改这一处
+
+    DB 模块不依赖 flask.current_app 的运行时值——在没 app context 时
+    （CLI 脚本）正常返回原 conn。
+    """
+    from db.dryrun import wrap_if_dry_run
+    return wrap_if_dry_run(conn)
 
 
 def close_dbs(_: Any) -> None:

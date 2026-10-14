@@ -24,6 +24,15 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION
     app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB uploads
 
+    # DRY_RUN 模式（Phase 1 蓝绿 PoC）：绿环境启动时设 DRY_RUN=true，
+    # db.get_master_db / get_warehouse_db 返 DryRunConnection，
+    # 写操作 log-only 不真落库。读、commit/rollback、PRAGMA 等透明。
+    # 与 config.CANONICAL_POLICY["allow_real_db_write"] 是两套独立开关：
+    # - allow_real_db_write: 控制 canonical 扇出是否能写真实库
+    # - DRY_RUN: 控制整个 g.*_db 连接是否走 wrapper
+    import os as _os
+    app.config["DRY_RUN"] = _os.environ.get("DRY_RUN", "false").lower() == "true"
+
     # CSRF 保护（P0-3）。必须在注册 CSRFProtect **之前**注册本 gate：
     # Flask 的 before_request 按注册顺序执行，gate 先跑并按 TESTING 翻开关，
     # 随后 CSRFProtect.protect() 读到 WTF_CSRF_ENABLED=False 即放行。
