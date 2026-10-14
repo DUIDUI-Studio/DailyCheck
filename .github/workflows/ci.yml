@@ -56,6 +56,62 @@ jobs:
       - name: Zero-new-failure gate
         run: python scripts/check_known_failures.py /tmp/pytest-output.txt
 
+  agent-framework-reports:
+    # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
+    # 详见 docs/agent-framework/v0.1.md §三
+    # 上游 test 失败则跳过（test 失败即阻断，无需跑 reports）
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -q
+          pip install pytest "ruff==0.16.10" radon bandit -q
+
+      - name: Generate reports 02 + 03
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
+          bash scripts/agent_framework/generate_reports.sh || echo "[warn] generate_reports exit non-zero"
+
+      - name: Generate report 04 (local deploy preview)
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          bash scripts/agent_framework/preview.sh "${PR_NUM}" || echo "[warn] preview exit non-zero"
+
+      - name: Check four reports gate
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          mkdir -p /tmp/pr
+          echo "$PR_BODY" > /tmp/pr/body.md
+          PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" python scripts/agent_framework/check_reports.py
+
+      - name: Upload reports as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-framework-reports
+          path: reports/
+          retention-days: 14
+
   deploy:
     needs: test
     # 生产部署暂禁自动触发（2026-10-11 Eric 拍板）：仅允许 workflow_dispatch 手动执行。

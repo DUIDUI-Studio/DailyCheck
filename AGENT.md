@@ -105,3 +105,9 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 - 增加审计日志与操作人追踪
 - 增加导出（CSV/Excel）
 - 给盘点批次增加“查看明细”页面
+
+## Agent 自治框架
+- 框架文档：[`docs/agent-framework/v0.1.md`](docs/agent-framework/v0.1.md)
+- 报告模板：`docs/agent-framework/templates/`（01 需求对齐 / 02 测试 / 03 代码质量 / 04 本地部署预演 / 05 生产验证）
+- 蓝绿脚本骨架：`scripts/blue_green/`（up / verify / switch / rollback / down）
+- 状态：v0.1 骨架，Phase 1 落地验证待启动
