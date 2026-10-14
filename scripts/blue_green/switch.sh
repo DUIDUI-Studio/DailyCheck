@@ -57,6 +57,10 @@ done
 # 配置
 # ============================================================
 NGINX_CONF="${NGINX_DAILYCHECK_CONF:-/etc/nginx/sites-enabled/dailycheck}"
+# Issue #24 Bug A: 备份绝不能写进 sites-enabled/ —— nginx 主配置
+# `include sites-enabled/*` 会把 *.bak 当配置加载，duplicate upstream 永久 fail。
+# 统一落到独立备份目录（可用 BACKUP_DIR 覆盖）。
+BACKUP_DIR="${BACKUP_DIR:-/var/lib/dailycheck-blue-green-backups}"
 BLUE_PORT="${BLUE_PORT:-8090}"
 GREEN_PORT="${GREEN_PORT:-8091}"
 BLUE_MCP_PORT="${BLUE_MCP_PORT:-5100}"
@@ -72,6 +76,16 @@ _run() {
     "$@"
   fi
 }
+
+# 保证 backup 目录存在（不依赖 nginx 任何行为；dry-run 只回显）
+_ensure_backup_dir() {
+  if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+    mkdir -p "${BACKUP_DIR}"
+  else
+    echo "[DRY-RUN] would mkdir -p ${BACKUP_DIR}"
+  fi
+}
+_ensure_backup_dir
 
 # ============================================================
 # 计算 weight + 边界转换（weight=0 → down）
@@ -108,7 +122,7 @@ echo "[switch] green-mcp:    ${GREEN_MCP_LINE}"
 # ============================================================
 # 备份 + sed 替换（覆盖 weight=N 和 down 两种状态）
 # ============================================================
-BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+BACKUP="${BACKUP_DIR}/dailycheck.$(date +%Y%m%d-%H%M%S).bak"
 _run cp "${NGINX_CONF}" "${BACKUP}"
 echo "[switch] backup: ${BACKUP}"
 

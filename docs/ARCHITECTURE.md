@@ -139,6 +139,16 @@ flowchart LR
 | **备份/DR** | 无 | `scripts/backup_all.sh`（cron 每日，integrity_check + tar + 可选异地）+ `scripts/verify_restore.sh`（每周还原演练）+ `docs/runbook-dr.md`（RPO=24h/RTO=1h） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
+### 3.4 蓝绿部署（Phase 1 实装，2026-10-13 起）
+
+Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起绿：DB `cp -a` + systemd 启动 + 30×2s 健康检查）→ `verify.sh`（六项生产验证，报告落 `backups/prod-verifications/`）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。
+
+**铁律**：
+- **nginx 备份绝不写 `sites-enabled/`** —— 主配置 `include sites-enabled/*` 会把 `.bak` 当配置加载 → duplicate upstream 永久 fail（Issue #24 Bug A）。统一落 `BACKUP_DIR`（默认 `/var/lib/dailycheck-blue-green-backups/`）。
+- **`verify.sh` 禁用 `set -e`** —— check 失败由 `OVERALL_PASS` 跟踪，`trap _write_report EXIT` 兜底保证任何失败路径都写报告（Issue #24 Bug B）。
+- 端口 0 权重不被 nginx 1.24 接受，用 `down` 关键字标记不参与负载。
+- 单测：`tests/test_blue_green_implementation.py`（42 用例，bash -n / dry-run 回显 / 参数解析 / 关键不变量；关键断言经变异验证）。
+
 ---
 
 ## 4. 数据架构
@@ -802,6 +812,7 @@ flowchart TB
         Acceptance["test_acceptance_*.py<br/>验收脚本 39 用例全绿"]
         Aux["test_aux_unit.py /<br/>test_master_db_migrate.py /<br/>test_nav_integration.py<br/>pre-existing 18 failed 来源"]
         Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>6 用例"]
+        BlueGreen["test_blue_green_implementation.py<br/>蓝绿 5 脚本 42 用例<br/>bash -n / dry-run / 不变量"]
     end
 
     subgraph Conftest["tests/conftest.py"]
