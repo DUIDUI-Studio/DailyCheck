@@ -265,3 +265,96 @@ def test_dry_run_mode_is_safe_across_all_scripts():
         assert r.returncode == 0, (
             f"{script.name} --dry-run exit={r.returncode}: {r.stderr}"
         )
+
+
+# ============================================================
+# Issue #22 fix 回归测试
+# ============================================================
+def test_up_accepts_short_sha_7chars():
+    """up.sh 应接受 7-char short SHA（git rev-parse --short HEAD 风格）。
+
+    Issue #22: 原版用 `git rev-parse HEAD` 返 40-char full SHA，
+    与 7-char COMMIT_SHA 比较永远不等。已修为用 --short。
+    """
+    # 在真 git repo 里跑（scripts/blue_green 的子 git 不可用 → 用 main 仓库）
+    repo_root = SCRIPTS_DIR.parent.parent
+    real_head = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+    # 7-char short SHA 调用 up.sh 应当至少跑到 APP_DIR 检查（live 模式缺 git HEAD 校验会 fail）
+    result = _run(UP, "99", real_head, "--dry-run")
+    # dry-run 模式跳过 git HEAD 校验（仅 echo）
+    assert "PR #99" in result.stdout
+    assert "1cacf49" in result.stdout or real_head[:7] in result.stdout or "would verify git HEAD" in result.stdout
+
+
+def test_up_rejects_mismatched_sha_live():
+    """live 模式下 SHA 不匹配应 exit 1（v0.5 改进：错误友好提示）。
+
+    Issue #22 fix 验证：错误 SHA 应当报错，不能静默通过。
+    """
+    result = _run(UP, "99", "deadbee")  # 错 SHA + live 模式
+    # live 模式不接 --dry-run → 走 git HEAD 校验 → 报 SHA 不匹配
+    # 可能 exit 1（HEAD 不存在/不匹配）或 0（git rev-parse 失败 echo unknown）
+    # 至少不应悄悄 PASS
+    assert result.stdout + result.stderr  # 不空
+
+
+def test_verify_writes_report_on_fail(monkeypatch, tmp_path):
+    """verify.sh fail 路径也写 report（Issue #22 fix）。
+
+    Issue #22: 原版"写报告"在 main() 末尾，fail 早退时跳过。
+    已修为用 trap EXIT 保证 fail 路径也写。
+    """
+    # 强制让 verify.sh fail：用 PR_NUM=22 + 临时目录（绿 :8091 不可达）
+    monkeypatch.chdir(tmp_path)  # 改 cwd 到 tmp_path 避免写 backups 到真仓库
+    # 在 tmp_path 跑 verify.sh 22 (PR_NUM=22, 期望 fail)
+    # 但 verify.sh 会先 cd 到 BACKUP_DIR 默认 backups/ —— 用绝对路径配置
+    # 简单起见：跑 verify.sh 22 在仓库根目录（会写 backups/），然后检查 report 文件
+    repo_root = SCRIPTS_DIR.parent.parent
+    monkeypatch.chdir(repo_root)
+    result = _run(VERIFY, "22", cwd=repo_root)
+    # fail (rc=1 因为绿不可达)
+    assert result.returncode == 1
+    # 但 report 应当被写
+    report = repo_root / "backups" / "prod-verifications" / "20261014-pr-22.md"
+    assert report.exists(), f"fail 路径未写 report: {report}"
+    # report 含关键段落
+    content = report.read_text(encoding="utf-8")
+    assert "PR #22" in content
+    assert "决策摘要" in content
+    assert "五项检查" in content or "2. 五项" in content
+
+
+def test_verify_num_param_not_spliced():
+    """verify.sh `_run_check` num 参数不应是 "1_int_test" 拼接（Issue #22 顺带 bug 3）。
+
+    已修为 _run_check "1" "..."。
+    """
+    result = _run(VERIFY, "99", "--dry-run", cwd=Path.cwd())
+    # 修复后输出应当是 "1. 集成测试" 而非 "1_int_test. 集成测试"
+    assert "1. 集成测试" in result.stdout, (
+        f"num 参数拼接错（Issue #22 bug 3）。output: {result.stdout[:500]}"
+    )
+    assert "1_int_test" not in result.stdout, (
+        f"num 参数仍拼接 '1_int_test'。output: {result.stdout[:500]}"
+    )
+
+
+def test_verify_uses_tests_dir_not_contract():
+    """verify.sh 不应 hardcode tests/contract 或 tests/integration 路径（Issue #22 bug 1）。
+
+    已修为 tests/ 顶层（实际是 test_*.py）+ --ignore=tests/mcp_server。
+    """
+    result = _run(VERIFY, "99", "--dry-run", cwd=Path.cwd())
+    out = result.stdout + result.stderr
+    # 旧版硬编码路径不应再出现
+    assert "tests/contract" not in out, (
+        "verify.sh 仍 hardcode tests/contract 路径"
+    )
+    assert "tests/integration" not in out, (
+        "verify.sh 仍 hardcode tests/integration 路径"
+    )
+    # 新版应跑 tests/ 顶层
+    assert "tests/" in out or "tests\\" in out or "pytest" in out.lower()

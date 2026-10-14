@@ -102,11 +102,16 @@ else
 fi
 
 # 2. 验证 git HEAD 一致（live 模式必查；dry-run 跳过）
+#
+# 注意：COMMIT_SHA 是短 SHA (7 chars)，git rev-parse HEAD 返 full SHA (40 chars)
+# 直接比较永远不等。统一用 --short 让两边都 7 chars。
+# 接受 full SHA 输入：--short 会截断到 7 chars 比较（SHA 唯一性保证安全）。
 if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   cd "${APP_DIR}"
-  ACTUAL_HEAD="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-  if [[ "${ACTUAL_HEAD}" != "${COMMIT_SHA}" ]]; then
-    echo "[up] ERROR: APP_DIR HEAD (${ACTUAL_HEAD:0:7}) != COMMIT_SHA (${COMMIT_SHA:0:7})" >&2
+  ACTUAL_HEAD="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  COMMIT_SHA_SHORT="${COMMIT_SHA:0:7}"
+  if [[ "${ACTUAL_HEAD}" != "${COMMIT_SHA_SHORT}" ]]; then
+    echo "[up] ERROR: APP_DIR HEAD (${ACTUAL_HEAD}) != COMMIT_SHA (${COMMIT_SHA_SHORT})" >&2
     echo "[up]   Eric 需要先 git pull + checkout ${COMMIT_SHA}" >&2
     exit 1
   fi
