@@ -696,6 +696,8 @@ flowchart TB
 | Q6 价格归属 | `canonical_managed` | 售价/采购价收归主数据 + 扇出下发 |
 | Q7 库存零丢失 | `strict` | 扇出前自动备份；写库前 `shutil.copy2`；禁止真库写测试 |
 
+> **Q7 `guard_real_db` 软链穿透防护（2026-10-15）**：prod 部署把 `db/warehouses/*.db` 做成指向 `/var/lib/dailycheck/warehouses/` 的软链，`resolve()` 会穿透使路径比较失配、guard 放行（verify.sh check1 在 prod 首演实测抓到）。guard 现对**未 resolve 的 absolute parent** 再比一次，任一命中即拒——改部署布局（换数据目录/软链形态）时必须保持此语义。
+
 ### 10.3 Store Ordering 状态机
 
 ```mermaid
