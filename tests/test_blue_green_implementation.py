@@ -14,9 +14,12 @@
 """
 from __future__ import annotations
 
+import http.server
 import os
 import socket
 import subprocess
+import threading
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -479,3 +482,137 @@ def test_rollback_delegates_backup_to_switch():
     )[0], "rollback.sh 不应在调 switch.sh 之前自写 nginx backup"
     # 它确实委托 switch.sh blue 100（backup 逻辑收敛在 switch.sh 单点）
     assert "switch.sh\" blue 100" in content or "switch.sh blue 100" in content
+
+
+# ============================================================
+# verify.sh check 1：零新增失败门禁（不再用 || true 兜底）
+# ============================================================
+def test_verify_check1_runs_known_failures_gate():
+    """check 1 必须复用 CI 门禁语义：失败集 ⊆ known_failures.txt。
+
+    prod 首演发现 `|| true` 把 known failure 兜成 PASS——集成测试挂了
+    verify 也不红。修复后：真跑 pytest + check_known_failures.py 判定。
+    """
+    content = VERIFY.read_text(encoding="utf-8")
+    assert "|| true" not in content, "verify.sh 仍有 || true 兜底（会掩盖真实失败）"
+    assert "check_known_failures.py" in content, "check 1 未接零新增失败门禁"
+    assert "_verify_check1_pytest" in content, "check 1 未走门禁函数"
+    # -rf 保证输出含 FAILED 行（check_known_failures.py 的解析依赖）
+    assert "-rf" in content, "pytest 缺 -rf（门禁解析不到 FAILED 行会假绿）"
+
+
+# ============================================================
+# verify.sh check 2：sim_user.py 实装（不再静默跳过）
+# ============================================================
+def test_verify_check2_no_silent_skip():
+    """check 2 不许「未实装 → echo 跳过 → PASS」；必须真跑 sim_user.py。"""
+    content = VERIFY.read_text(encoding="utf-8")
+    assert "未实装，跳过 (Phase 2 补)" not in content, "check 2 仍是静默跳过"
+    assert "sim_user.py" in content, "check 2 未调用 sim_user.py"
+    assert "_verify_check2_sim_user" in content, "check 2 未走实装函数"
+
+
+SIM_USER = SCRIPTS_DIR.parent / "playwright" / "sim_user.py"
+
+
+class _FakeDC(http.server.BaseHTTPRequestHandler):
+    """最小 DailyCheck 行为：登录 → 选仓 → /land → /inventory（带 CSRF）。"""
+
+    def log_message(self, *args):  # 静默
+        pass
+
+    def _page(self, body: str, status: int = 200) -> None:
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _form(self) -> dict[str, str]:
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length).decode() if length else ""
+        return dict(urllib.parse.parse_qsl(raw))
+
+    def do_GET(self):
+        if self.path == "/login":
+            self._page('<form><input type="hidden" name="csrf_token" value="T1"></form>')
+        elif self.path == "/select-warehouse":
+            self._page(
+                '<form action="/select-warehouse/1" method="post">'
+                '<input type="hidden" name="csrf_token" value="T1"></form>'
+            )
+        elif self.path == "/land":
+            self._page("<html>land</html>")
+        elif self.path == "/inventory":
+            self._page("<html>inventory</html>")
+        else:
+            self._page("not found", 404)
+
+    def do_POST(self):
+        form = self._form()
+        if self.path == "/login":
+            if form.get("csrf_token") != "T1":
+                self._page("csrf", 400)
+            elif form.get("username") == "tester" and form.get("password") == "pw":
+                self._redirect("/select-warehouse")
+            else:
+                self._page("bad login", 401)
+        elif self.path == "/select-warehouse/1":
+            if form.get("csrf_token") != "T1":
+                self._page("csrf", 400)
+            else:
+                self._redirect("/land")
+        else:
+            self._page("not found", 404)
+
+
+@pytest.fixture()
+def fake_dc_server():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeDC)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+    srv.server_close()
+
+
+def _run_sim_user(base_url: str, env_extra: dict[str, str]) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env.pop("SIM_USER_USER", None)
+    env.pop("SIM_USER_PASSWORD", None)
+    env.update(env_extra)
+    return subprocess.run(
+        ["/usr/bin/env", "python3", str(SIM_USER), "--base-url", base_url],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+
+
+def test_sim_user_full_flow_passes(fake_dc_server):
+    """4 路径全通应 exit 0（登录→选仓→/land→/inventory，含 CSRF 回填）。"""
+    r = _run_sim_user(fake_dc_server, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "4 关键路径全通" in r.stdout
+    for path_name in ("登录页可达", "登录成功", "选仓进入总览", "库存页可达"):
+        assert path_name in r.stdout
+
+
+def test_sim_user_bad_credentials_fails(fake_dc_server):
+    """错误密码应 exit 1（401 → 不允许把登录失败当通过）。"""
+    r = _run_sim_user(fake_dc_server, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "wrong"})
+    assert r.returncode == 1
+    assert "登录成功" in r.stdout  # 失败路径被记录
+    assert r.returncode != 0
+
+
+def test_sim_user_missing_credentials_exit_64():
+    """缺凭据应 exit 64 + 明确提示（绝不静默跳过）。"""
+    r = _run_sim_user("http://127.0.0.1:1", {})
+    assert r.returncode == 64
+    assert "SIM_USER_USER" in (r.stdout + r.stderr)

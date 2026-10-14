@@ -10,8 +10,9 @@
 #   1  验证失败（任一项不达标）
 #
 # 五项检查（v0.1.md §四.2 报告 05）：
-#   1. 集成测试（pytest tests/contract tests/integration）
-#   2. 模拟用户操作（Playwright 跑 4 关键路径 × 蓝绿截图 diff）
+#   1. 集成测试（pytest tests/ 顶层 + check_known_failures.py 零新增门禁）
+#   2. 模拟用户操作（sim_user.py 走 登录→选仓→总览→库存 4 关键路径；
+#      凭据走 SIM_USER_USER / SIM_USER_PASSWORD 环境变量）
 #   3. 绿 vs 蓝比对（ab -n 100 -c 10 响应/P95 截图）
 #   4. 回滚演练（switch.sh blue 100 → health → switch.sh green 0）
 #   5. 资源与依赖（systemctl status + journalctl + ss -tn）
@@ -63,6 +64,7 @@ GREEN_PORT="${GREEN_PORT:-8091}"
 REPO_ROOT="${DAILYCHECK_APP_DIR:-/root/DailyCheck}"
 REPORT_PATH="${REPORT_DIR}/$(date +%Y%m%d)-pr-${PR_NUM}.md"
 NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+DC_PYTHON_BIN="${DC_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 
 # ============================================================
 # 辅助
@@ -101,8 +103,8 @@ _write_report() {
 
 | # | 检查项 | 状态 | 备注 |
 |---|--------|------|------|
-| 1 | 集成测试 (pytest tests/ 顶层) | ${R1} | ${N1:-} |
-| 2 | 模拟用户操作 (Playwright 4 路径) | ${R2} | ${N2:-} |
+| 1 | 集成测试 (pytest + 零新增门禁) | ${R1} | ${N1:-} |
+| 2 | 模拟用户操作 (sim_user.py 4 路径) | ${R2} | ${N2:-} |
 | 3 | 绿 vs 蓝 性能比对 (ab -n 100 -c 10) | ${R3} | ${N3:-} |
 | 4 | 回滚演练 (switch.sh blue 100 → green 0) | ${R4} | ${N4:-} |
 | 5 | 资源与依赖 (systemctl + journalctl + ss) | ${R5} | ${N5:-} |
@@ -137,6 +139,36 @@ EOF
 # trap 兜底：任何退出路径（含 check 中途失败 / 前置检查失败）都保证写报告。
 # set -uo pipefail（无 -e）下 trap 可靠；主路径仍显式调，双保险（同内容幂等覆盖）。
 trap _write_report EXIT
+
+# ============================================================
+# check 1 实现：真跑 pytest + 零新增失败门禁（复用 CI 脚本语义）
+# prod 首演发现 check1 曾把任何失败兜成 PASS——失败集必须
+# ⊆ tests/known_failures.txt，否则 FAIL。
+# ============================================================
+_verify_check1_pytest() {
+  cd "${REPO_ROOT}" || return 1
+  "${DC_PYTHON_BIN}" -m pytest tests/ -q --tb=line -rf --ignore=tests/mcp_server \
+    > /tmp/verify-1-pytest.log 2>&1
+  local rc=$?
+  echo "pytest exit=${rc}（rc 非零不代表挂，以下列门禁为准）"
+  tail -2 /tmp/verify-1-pytest.log
+  "${DC_PYTHON_BIN}" "${REPO_ROOT}/scripts/check_known_failures.py" \
+    /tmp/verify-1-pytest.log
+}
+
+# ============================================================
+# check 2 实现：sim_user.py 模拟用户 4 关键路径
+# 凭据从环境变量读（SIM_USER_USER / SIM_USER_PASSWORD），缺省直接 FAIL
+# 并提示设置方法——绝不允许静默跳过。
+# ============================================================
+_verify_check2_sim_user() {
+  if [[ -z "${SIM_USER_USER:-}" || -z "${SIM_USER_PASSWORD:-}" ]]; then
+    echo "❌ 缺凭据：请 export SIM_USER_USER=<用户名> SIM_USER_PASSWORD=<密码> 后重跑" >&2
+    return 1
+  fi
+  "${DC_PYTHON_BIN}" "${REPO_ROOT}/scripts/playwright/sim_user.py" \
+    --base-url "${GREEN_URL}"
+}
 
 _run_check() {
   local num="$1" name="$2" cmd="$3"
@@ -197,22 +229,16 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
 fi
 
 # ============================================================
-# 1. 集成测试
-#
-# Issue #22: main @ 1cacf49 的 tests/ 顶层没有 contract/ 或 integration/
-# 子目录；test_*.py 全部在顶层 + mcp_server/ 一个子目录。
-# 改：跑 tests/ 顶层（用 -k 关键字筛或全跑）；具体改用 tests/ 顶层
-# + 排除 mcp_server（容器化跑）。16 failed / 718 passed 已知基线
-# 在 dry-run 模式无影响。
+# 1. 集成测试（真跑 + 零新增门禁；known failure 不再被兜成 PASS）
 # ============================================================
-_run_check "1" "集成测试 (pytest tests/ 顶层，exclude mcp_server)" \
-  "cd '${REPO_ROOT}' && .venv/bin/python -m pytest tests/ -q --tb=line --ignore=tests/mcp_server -k 'not known_failures' || true"
+_run_check "1" "集成测试 (pytest tests/ 顶层 + check_known_failures 零新增门禁)" \
+  "_verify_check1_pytest"
 
 # ============================================================
-# 2. 模拟用户操作（Playwright）
+# 2. 模拟用户操作（sim_user.py 4 关键路径；凭据 SIM_USER_USER/PASSWORD）
 # ============================================================
-_run_check "2" "模拟用户操作 (Playwright 4 关键路径)" \
-  "test -f '${REPO_ROOT}/scripts/playwright/sim_user.py' && cd '${REPO_ROOT}' && python3 scripts/playwright/sim_user.py --env green --pr ${PR_NUM} || echo 'Playwright 未实装，跳过 (Phase 2 补)'"
+_run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存)" \
+  "_verify_check2_sim_user"
 
 # ============================================================
 # 3. 绿 vs 蓝比对（ab / wrk）
