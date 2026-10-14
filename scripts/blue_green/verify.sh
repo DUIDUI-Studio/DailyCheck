@@ -17,7 +17,10 @@
 #   5. 资源与依赖（systemctl status + journalctl + ss -tn）
 #   + dry_run 隔离证据（prod_dryrun_evidence.sh）
 
-set -euo pipefail
+# Issue #24 Bug B: 不用 set -e —— _run_check 返 1 会被 set -e 立即截断，
+# 绕过 trap 和主路径 _write_report（报告永远写不出来）。
+# 失败由 OVERALL_PASS 全局变量跟踪（set -uo pipefail 下 trap 可靠）。
+set -uo pipefail
 
 # ============================================================
 # 参数解析
@@ -131,6 +134,10 @@ EOF
   echo "[verify] report: ${REPORT_PATH}"
 }
 
+# trap 兜底：任何退出路径（含 check 中途失败 / 前置检查失败）都保证写报告。
+# set -uo pipefail（无 -e）下 trap 可靠；主路径仍显式调，双保险（同内容幂等覆盖）。
+trap _write_report EXIT
+
 _run_check() {
   local num="$1" name="$2" cmd="$3"
   echo "[verify] ${num}. ${name} ..."
@@ -231,68 +238,9 @@ _run_check "5" "资源与依赖 (systemctl status + journalctl + ss -tn)" \
 _run_check "6" "dry_run 隔离证据 (prod_dryrun_evidence.sh)" \
   "test -f '${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh' && bash '${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh' || echo 'prod_dryrun_evidence.sh 未实装，跳过'"
 
-# ============================================================
-# 写报告（Issue #22 fix: fail 路径也写报告，用 trap 保证）
-# ============================================================
-_write_report() {
-  echo "[verify] === 写报告 ==="
-  mkdir -p "${REPORT_DIR}"
-
-  cat > "${REPORT_PATH}" <<EOF
-# 生产验证报告 — PR #${PR_NUM}（${NOW}）
-
-> 生成方式：\`scripts/blue_green/verify.sh ${PR_NUM}\`
-> 模式：$([[ ${DRY_RUN_FLAG} -eq 1 ]] && echo 'DRY-RUN' || echo 'LIVE')
-> 模板：[docs/agent-framework/templates/05-production-verification.md](../../docs/agent-framework/templates/05-production-verification.md)
-
-## 1. 决策摘要
-
-- [$([[ ${OVERALL_PASS} -eq 1 ]] && echo "x" || echo " ")] **通过**：切流量 5% → 50% → 100%
-- [$([[ ${OVERALL_PASS} -eq 1 ]] && echo " " || echo "x")] **打回**：留绿取证，PR 不合并
-
-## 2. 五项检查 + dry_run 证据
-
-| # | 检查项 | 状态 | 备注 |
-|---|--------|------|------|
-| 1 | 集成测试 (pytest tests/ 顶层) | ${R1} | ${N1:-} |
-| 2 | 模拟用户操作 (Playwright 4 路径) | ${R2} | ${N2:-} |
-| 3 | 绿 vs 蓝 性能比对 (ab -n 100 -c 10) | ${R3} | ${N3:-} |
-| 4 | 回滚演练 (switch.sh blue 100 → green 0) | ${R4} | ${N4:-} |
-| 5 | 资源与依赖 (systemctl + journalctl + ss) | ${R5} | ${N5:-} |
-| 6 | dry_run 隔离证据 (prod_dryrun_evidence.sh) | ${R6} | ${N6:-} |
-
-## 3. 写流量隔离证据（dry_run）
-
-$(if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
-  echo "见 \`${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh\` 产出"
-else
-  echo "[DRY-RUN 跳过]"
-fi)
-
-## 4. 切流量时间线
-
-| 阶段 | 时间 | weight green | weight blue | down 标记 | 决策 |
-|------|------|--------------|-------------|-----------|------|
-| 初始 | — | 0 | 100 | green down | (绿未启用) |
-| 5% | | 5 | 95 | — | |
-| 50% | | 50 | 50 | — | |
-| 100% | | 100 | 0 | blue down | |
-| 观察窗结束 | | 100 | 0 | blue down | 合 PR，蓝降 standby |
-
-## 5. 报告签名
-
-Prod Agent: verify.sh 自动 · ${NOW}
-报告生成时间: ${NOW}
-EOF
-  echo "[verify] report: ${REPORT_PATH}"
-}
-
-# trap 保证 fail 路径也写报告（兜底）— 但实际 set -e 下不可靠，故 main 路径显式调
-# trap _write_report EXIT
-
 if [[ ${OVERALL_PASS} -eq 1 ]]; then
   echo "[verify] ✅ 全绿"
-  _write_report  # 显式调（避免 trap 在 set -e 下的潜在不可靠）
+  _write_report  # 显式调（trap EXIT 兜底会再写一次，同内容幂等覆盖）
   exit 0
 else
   echo "[verify] ❌ 失败"

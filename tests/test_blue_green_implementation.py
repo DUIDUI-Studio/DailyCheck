@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -301,30 +302,98 @@ def test_up_rejects_mismatched_sha_live():
     assert result.stdout + result.stderr  # 不空
 
 
-def test_verify_writes_report_on_fail(monkeypatch, tmp_path):
-    """verify.sh fail 路径也写 report（Issue #22 fix）。
+def test_verify_writes_report_on_fail(tmp_path):
+    """verify.sh fail 路径也写 report（Issue #22 fix + #24 Bug B 回归）。
 
-    Issue #22: 原版"写报告"在 main() 末尾，fail 早退时跳过。
-    已修为用 trap EXIT 保证 fail 路径也写。
+    场景：绿 :8091 不可达 → 前置检查失败 → 必须写报告再 exit 1。
+    用 REPORT_DIR 重定向到 tmp，避免污染真仓库；日期用 glob 匹配
+    （旧版硬编码 20261014 换天即假失败）。
     """
-    # 强制让 verify.sh fail：用 PR_NUM=22 + 临时目录（绿 :8091 不可达）
-    monkeypatch.chdir(tmp_path)  # 改 cwd 到 tmp_path 避免写 backups 到真仓库
-    # 在 tmp_path 跑 verify.sh 22 (PR_NUM=22, 期望 fail)
-    # 但 verify.sh 会先 cd 到 BACKUP_DIR 默认 backups/ —— 用绝对路径配置
-    # 简单起见：跑 verify.sh 22 在仓库根目录（会写 backups/），然后检查 report 文件
     repo_root = SCRIPTS_DIR.parent.parent
-    monkeypatch.chdir(repo_root)
-    result = _run(VERIFY, "22", cwd=repo_root)
-    # fail (rc=1 因为绿不可达)
-    assert result.returncode == 1
-    # 但 report 应当被写
-    report = repo_root / "backups" / "prod-verifications" / "20261014-pr-22.md"
-    assert report.exists(), f"fail 路径未写 report: {report}"
-    # report 含关键段落
-    content = report.read_text(encoding="utf-8")
+    env = os.environ.copy()
+    env["REPORT_DIR"] = str(tmp_path)
+    env["DAILYCHECK_APP_DIR"] = str(tmp_path / "no-repo")  # check 1 不真跑 pytest
+    result = subprocess.run(
+        ["bash", str(VERIFY), "22"],
+        capture_output=True, text=True, env=env, timeout=30, cwd=repo_root,
+    )
+    assert result.returncode == 1, f"stdout={result.stdout!r}"
+    reports = list(tmp_path.glob("*-pr-22.md"))
+    assert reports, f"fail 路径未写 report，stderr={result.stderr!r}"
+    content = reports[0].read_text(encoding="utf-8")
     assert "PR #22" in content
     assert "决策摘要" in content
     assert "五项检查" in content or "2. 五项" in content
+
+
+def test_verify_continues_after_check_fail_and_writes_report(tmp_path):
+    """Issue #24 Bug B 核心：check 中途失败不得截断主流程，报告必须落盘。
+
+    旧版 `set -euo pipefail` 下 _run_check 返 1 会立即 exit，
+    绕过 trap 与主路径 _write_report → 报告文件永远不生成
+    （prod 首演 20261014 现场：rc=1 且无报告）。
+    修复后：set -uo pipefail + trap EXIT 兜底，失败由 OVERALL_PASS 跟踪。
+
+    用本地 fake HTTP server 扮演绿 /health（让前置检查通过），
+    使流程走到 check 4/5（dev/CI 上必失败），验证：
+    - rc == 1（有失败项）
+    - 报告文件存在且「打回」被勾选
+    """
+    import glob as _glob
+    import threading
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    port = srv.getsockname()[1]
+
+    def _serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(4096)
+                conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            finally:
+                conn.close()
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    try:
+        env = os.environ.copy()
+        env["REPORT_DIR"] = str(tmp_path)
+        env["GREEN_URL"] = f"http://127.0.0.1:{port}"
+        env["DAILYCHECK_APP_DIR"] = str(tmp_path / "no-repo")
+        result = subprocess.run(
+            ["bash", str(VERIFY), "24"],
+            capture_output=True, text=True, env=env,
+            timeout=120, cwd=SCRIPTS_DIR.parent.parent,
+        )
+    finally:
+        srv.close()
+
+    assert result.returncode == 1, f"应有失败项。stdout={result.stdout[-500:]!r}"
+    reports = sorted(_glob.glob(str(tmp_path / "*-pr-24.md")))
+    assert reports, f"check 中途失败后报告未生成，stderr={result.stderr!r}"
+    content = Path(reports[-1]).read_text(encoding="utf-8")
+    assert "[x] **打回**" in content, "有失败项时决策摘要应勾「打回」"
+    assert "❌ FAIL" in content, "报告应记录具体失败项"
+
+
+def test_verify_no_set_e_and_has_exit_trap():
+    """静态检查：verify.sh 不应再用 set -e，且 trap EXIT 已启用（Issue #24 Bug B）。
+
+    set -e 与「check 失败继续 + 兜底写报告」语义互斥；trap 是兜底关键。
+    """
+    content = VERIFY.read_text(encoding="utf-8")
+    assert "set -euo" not in content, "verify.sh 仍用 set -euo（会截断 fail 路径）"
+    assert "trap _write_report EXIT" in content, "trap 兜底未启用"
+    assert content.count("_write_report()") == 1, (
+        "_write_report 应只定义一次（PR #23 遗留的重复定义已清）"
+    )
 
 
 def test_verify_num_param_not_spliced():
@@ -358,3 +427,55 @@ def test_verify_uses_tests_dir_not_contract():
     )
     # 新版应跑 tests/ 顶层
     assert "tests/" in out or "tests\\" in out or "pytest" in out.lower()
+
+
+# ============================================================
+# Issue #24 Bug A 回归：switch.sh backup 不得写进 sites-enabled/
+# ============================================================
+def test_switch_writes_backup_outside_sites_enabled(tmp_path):
+    """Issue #24 Bug A: nginx 备份必须落 BACKUP_DIR，绝不能在 sites-enabled/。
+
+    prod 现场：`BACKUP="${NGINX_CONF}.bak.<ts>"` 写进 sites-enabled/ 后，
+    nginx 主配置 `include sites-enabled/*` 把 .bak 当配置加载 →
+    duplicate upstream "dailycheck-blue" → nginx -t 永久 fail。
+    修复后：BACKUP="${BACKUP_DIR}/dailycheck.<ts>.bak"，BACKUP_DIR 可覆盖。
+    """
+    backup_dir = tmp_path / "nginx-backups"
+    env = os.environ.copy()
+    env["BACKUP_DIR"] = str(backup_dir)
+    result = subprocess.run(
+        ["bash", str(SWITCH), "green", "5", "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    out = result.stdout + result.stderr
+    # backup 路径 = BACKUP_DIR/dailycheck.<ts>.bak
+    assert f"[switch] backup: {backup_dir}/dailycheck." in out, (
+        f"backup 未落 BACKUP_DIR。output: {out[-400:]}"
+    )
+    assert ".bak" in out
+    # 旧 pattern（sites-enabled 下的 .bak）不应再出现
+    assert "sites-enabled/dailycheck.bak" not in out
+    # dry-run 应回显 mkdir BACKUP_DIR 动作
+    assert f"would mkdir -p {backup_dir}" in out
+
+
+def test_switch_default_backup_dir_not_sites_enabled():
+    """默认 BACKUP_DIR 不应是 nginx 配置目录（防 include 通配误加载）。"""
+    content = SWITCH.read_text(encoding="utf-8")
+    assert "BACKUP_DIR=" in content
+    assert '${NGINX_CONF}.bak' not in content, (
+        "switch.sh 仍在 NGINX_CONF 同目录拼 .bak（Issue #24 Bug A 未修干净）"
+    )
+    default_dir = "BACKUP_DIR=\"${BACKUP_DIR:-/var/lib/dailycheck-blue-green-backups}\""
+    assert default_dir in content, "BACKUP_DIR 默认值应为 /var/lib/dailycheck-blue-green-backups"
+
+
+def test_rollback_delegates_backup_to_switch():
+    """rollback.sh 自身不写 nginx backup（调 switch.sh），无 Bug A 同类风险。"""
+    content = ROLLBACK.read_text(encoding="utf-8")
+    assert ".bak" not in content or "sites-enabled" not in content.split(
+        "switch.sh"
+    )[0], "rollback.sh 不应在调 switch.sh 之前自写 nginx backup"
+    # 它确实委托 switch.sh blue 100（backup 逻辑收敛在 switch.sh 单点）
+    assert "switch.sh\" blue 100" in content or "switch.sh blue 100" in content
