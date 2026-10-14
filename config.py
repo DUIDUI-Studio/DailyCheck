@@ -9,7 +9,15 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_DIR = BASE_DIR / "db"
+
+# DB 根目录覆盖（Issue #28 蓝绿 DB 隔离）：
+# 绿进程的 systemd unit 设 Environment=DAILYCHECK_DB_DIR=<绿库目录> 后，
+# 绿读写的是 up.sh cp -aL 出来的独立副本，蓝绿不再共享同一物理库。
+# 必须在 import 期读取（db/__init__.py 与 mcp_server/config.py 都是
+# `from config import MASTER_DB` 的 import 期值绑定）。
+# 未设置时保持原行为（repo 内 db/）——蓝进程与所有现有部署不受影响。
+_DB_DIR_ENV = os.environ.get("DAILYCHECK_DB_DIR")
+DB_DIR = Path(_DB_DIR_ENV) if _DB_DIR_ENV else BASE_DIR / "db"
 MASTER_DB = DB_DIR / "master.db"
 WAREHOUSE_DB_DIR = DB_DIR / "warehouses"
 

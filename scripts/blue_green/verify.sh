@@ -16,7 +16,8 @@
 #   3. 绿 vs 蓝比对（ab -n 100 -c 10 响应/P95 截图）
 #   4. 回滚演练（switch.sh blue 100 → health → switch.sh green 0）
 #   5. 资源与依赖（systemctl status + journalctl + ss -tn）
-#   + dry_run 隔离证据（prod_dryrun_evidence.sh）
+#   6. dry_run 隔离证据（prod_dryrun_evidence.sh）
+#   7. DB 隔离证据（绿进程 DAILYCHECK_DB_DIR + master.db 独立副本，Issue #28）
 
 # Issue #24 Bug B: 不用 set -e —— _run_check 返 1 会被 set -e 立即截断，
 # 绕过 trap 和主路径 _write_report（报告永远写不出来）。
@@ -65,6 +66,9 @@ REPO_ROOT="${DAILYCHECK_APP_DIR:-/root/DailyCheck}"
 REPORT_PATH="${REPORT_DIR}/$(date +%Y%m%d)-pr-${PR_NUM}.md"
 NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 DC_PYTHON_BIN="${DC_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+# Issue #28 DB 隔离（与 up.sh 默认值保持一致）
+GREEN_DB="${GREEN_DB:-/var/lib/dailycheck-green/db}"
+GREEN_UNIT="${GREEN_SERVICE_UNIT:-dailycheck-green.service}"
 
 # ============================================================
 # 辅助
@@ -78,8 +82,8 @@ _run() {
 }
 
 # 状态跟踪（Mac mini bash 3.x 不支持关联数组，用普通变量）
-R1="⏳"; R2="⏳"; R3="⏳"; R4="⏳"; R5="⏳"; R6="⏳"
-N1=""; N2=""; N3=""; N4=""; N5=""; N6=""
+R1="⏳"; R2="⏳"; R3="⏳"; R4="⏳"; R5="⏳"; R6="⏳"; R7="⏳"
+N1=""; N2=""; N3=""; N4=""; N5=""; N6=""; N7=""
 OVERALL_PASS=1
 
 # 写报告函数（Issue #22 fix: 提前到主流程前定义，fail 路径也可调）
@@ -109,6 +113,7 @@ _write_report() {
 | 4 | 回滚演练 (switch.sh blue 100 → green 0) | ${R4} | ${N4:-} |
 | 5 | 资源与依赖 (systemctl + journalctl + ss) | ${R5} | ${N5:-} |
 | 6 | dry_run 隔离证据 (prod_dryrun_evidence.sh) | ${R6} | ${N6:-} |
+| 7 | DB 隔离证据 (DAILYCHECK_DB_DIR + 独立副本) | ${R7} | ${N7:-} |
 
 ## 3. 写流量隔离证据（dry_run）
 
@@ -182,6 +187,7 @@ _run_check() {
       4) R4="🔵 DRY-RUN" ;;
       5) R5="🔵 DRY-RUN" ;;
       6) R6="🔵 DRY-RUN" ;;
+      7) R7="🔵 DRY-RUN" ;;
     esac
     return 0
   fi
@@ -193,6 +199,7 @@ _run_check() {
       4) R4="✅ PASS" ; N4="$(tail -3 /tmp/verify-4.log | head -1)" ;;
       5) R5="✅ PASS" ; N5="$(tail -3 /tmp/verify-5.log | head -1)" ;;
       6) R6="✅ PASS" ; N6="$(tail -3 /tmp/verify-6.log | head -1)" ;;
+      7) R7="✅ PASS" ; N7="$(tail -3 /tmp/verify-7.log | head -1)" ;;
     esac
     return 0
   else
@@ -203,6 +210,7 @@ _run_check() {
       4) R4="❌ FAIL" ; N4="$(tail -5 /tmp/verify-4.log)" ;;
       5) R5="❌ FAIL" ; N5="$(tail -5 /tmp/verify-5.log)" ;;
       6) R6="❌ FAIL" ; N6="$(tail -5 /tmp/verify-6.log)" ;;
+      7) R7="❌ FAIL" ; N7="$(tail -5 /tmp/verify-7.log)" ;;
     esac
     OVERALL_PASS=0
     return 1
@@ -263,6 +271,56 @@ _run_check "5" "资源与依赖 (systemctl status + journalctl + ss -tn)" \
 # ============================================================
 _run_check "6" "dry_run 隔离证据 (prod_dryrun_evidence.sh)" \
   "test -f '${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh' && bash '${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh' || echo 'prod_dryrun_evidence.sh 未实装，跳过'"
+
+# ============================================================
+# check 7 实现：DB 隔离证据（Issue #28）
+#
+# 三重证据，任一不满足即 FAIL：
+#   a) 绿进程 environ 声明 DAILYCHECK_DB_DIR == GREEN_DB
+#      （gunicorn worker fork 自 master，environ 一致；比扫 /proc/*/fd
+#      可靠——sqlite 连接是每请求开关，fd 扫描会撞空窗）
+#   b) ${GREEN_DB}/master.db 存在且不是软链
+#   c) 绿 master.db 与蓝 master.db inode 不同（同一物理文件的铁证排除）
+# ============================================================
+_verify_check7_db_isolation() {
+  local main_pid env_dir master_green master_blue ino_g ino_b
+  main_pid="$(systemctl show -p MainPID --value "${GREEN_UNIT}" 2>/dev/null)"
+  if [[ -z "${main_pid}" || "${main_pid}" == "0" ]]; then
+    echo "FAIL: ${GREEN_UNIT} 未运行（MainPID=${main_pid:-无}）"
+    return 1
+  fi
+  env_dir="$(tr '\0' '\n' < "/proc/${main_pid}/environ" 2>/dev/null \
+    | grep '^DAILYCHECK_DB_DIR=' | cut -d= -f2-)"
+  if [[ "${env_dir}" != "${GREEN_DB}" ]]; then
+    echo "FAIL: 绿进程 DAILYCHECK_DB_DIR='${env_dir:-未设置}' != ${GREEN_DB}"
+    echo "  修复: ${GREEN_UNIT} [Service] 加 Environment=DAILYCHECK_DB_DIR=${GREEN_DB} 后 daemon-reload + restart 绿"
+    return 1
+  fi
+  master_green="${GREEN_DB}/master.db"
+  if [[ -L "${master_green}" ]]; then
+    echo "FAIL: ${master_green} 是软链（隔离失效，应 cp -aL 实体副本）"
+    return 1
+  fi
+  if [[ ! -f "${master_green}" ]]; then
+    echo "FAIL: ${master_green} 不存在（up.sh db-copy 未跑或目标不符）"
+    return 1
+  fi
+  master_blue="${REPO_ROOT}/db/master.db"
+  ino_g="$(stat -c %i "${master_green}" 2>/dev/null || echo na)"
+  ino_b="$(stat -c %i "${master_blue}" 2>/dev/null || echo na)"
+  if [[ "${ino_g}" != "na" && "${ino_g}" == "${ino_b}" ]]; then
+    echo "FAIL: 绿蓝 master.db inode 相同（${ino_g}）— 同一物理文件"
+    return 1
+  fi
+  echo "OK: DAILYCHECK_DB_DIR=${env_dir}；master.db 独立副本（inode ${ino_g} ≠ 蓝 ${ino_b}）"
+  return 0
+}
+
+# ============================================================
+# 7. DB 隔离证据（Issue #28）
+# ============================================================
+_run_check "7" "DB 隔离证据 (DAILYCHECK_DB_DIR + master.db 独立副本)" \
+  "_verify_check7_db_isolation"
 
 if [[ ${OVERALL_PASS} -eq 1 ]]; then
   echo "[verify] ✅ 全绿"

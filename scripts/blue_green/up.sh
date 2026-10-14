@@ -8,7 +8,8 @@
 #   - DRY_RUN 中间件（db/dryrun.py，PR #20 已 merge）
 #   - systemd 复用（dailycheck-green.service，Prod Agent 步骤 8 已建）
 #   - Nginx upstream :8091 + :5101（down 标记，Prod Agent 步骤 9 已配）
-#   - 数据库：cp -a /var/lib/dailycheck → /var/lib/dailycheck-green
+#   - 数据库：cp -aL ${APP_DIR}/db → ${GREEN_DB}（解引用软链，
+#     Issue #28：绿 unit 须声明 DAILYCHECK_DB_DIR 指向同一目录）
 #
 # 设计原则：
 #   - 蓝 :8090 不 kill（0 中断）
@@ -63,10 +64,11 @@ done
 # 配置（与 deploy_vps.sh 模板化约定对齐：DAILYCHECK_* env 变量可覆盖）
 # ============================================================
 APP_DIR="${DAILYCHECK_APP_DIR:-/root/DailyCheck}"             # 实测 host 路径
-BLUE_DB="${DAILYCHECK_DB_ROOT:-/var/lib/dailycheck}"         # 蓝 DB 根
+SRC_DB_DIR="${DAILYCHECK_SRC_DB_DIR:-${APP_DIR}/db}"          # 真库源（master.db + warehouses/）
 GREEN_PORT="${GREEN_PORT:-8091}"                              # 绿 gunicorn 端口
 GREEN_MCP_PORT="${GREEN_MCP_PORT:-5101}"                      # 绿 MCP 端口
-GREEN_DB="${GREEN_DB:-/var/lib/dailycheck-green}"             # 绿 DB 根
+# Issue #28: 绿 DB 根 = 独立副本目录（绿 unit 的 DAILYCHECK_DB_DIR 必须指向它）
+GREEN_DB="${GREEN_DB:-/var/lib/dailycheck-green/db}"
 GREEN_UNIT="${GREEN_SERVICE_UNIT:-dailycheck-green.service}"
 GREEN_MCP_UNIT="${GREEN_MCP_SERVICE_UNIT:-dailycheck-green-mcp.service}"
 GREEN_HEALTH_URL="${GREEN_HEALTH_URL:-http://127.0.0.1:${GREEN_PORT}/health}"
@@ -119,11 +121,16 @@ else
   echo "[up] [DRY-RUN] would cd ${APP_DIR} && verify git HEAD == ${COMMIT_SHA:0:7}"
 fi
 
-# 3. cp 蓝 DB → 绿 DB
+# 3. cp 真库 → 绿独立副本（Issue #28）
+#
+# 旧版 `cp -a /var/lib/dailycheck → /var/lib/dailycheck-green` 是无效动作：
+# 两边都是遗留目录，cp 把源拷进了目标内部，蓝绿实际共享同一物理库。
+# 新版从真库 ${APP_DIR}/db 拷（-L 解引用 warehouses/*.db 软链），
+# 且要求绿 unit 用 DAILYCHECK_DB_DIR 指向该副本（下方步骤 3.5 守卫）。
 if [[ ${SKIP_DB_COPY} -eq 0 ]]; then
-  echo "[up] copying ${BLUE_DB} -> ${GREEN_DB} ..."
+  echo "[up] copying real db tree ${SRC_DB_DIR} -> ${GREEN_DB} (dereference symlinks) ..."
   _run rm -rf "${GREEN_DB}"
-  _run cp -a "${BLUE_DB}" "${GREEN_DB}"
+  _run cp -aL "${SRC_DB_DIR}" "${GREEN_DB}"
   _run chmod -R u+rw "${GREEN_DB}"
 else
   echo "[up] --skip-db-copy: using existing ${GREEN_DB}"
@@ -131,6 +138,25 @@ else
     echo "[up] ERROR: --skip-db-copy 但 ${GREEN_DB} 不存在" >&2
     exit 1
   fi
+fi
+
+# 3.5 隔离前置守卫（Issue #28）：绿 unit 必须声明 DAILYCHECK_DB_DIR
+# 且等于本次拷贝目标——否则绿会共享蓝的物理库，隔离从未生效。
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  UNIT_DB_DIR="$(systemctl cat "${GREEN_UNIT}" 2>/dev/null \
+    | grep -o 'DAILYCHECK_DB_DIR=[^ "]*' | head -1 | cut -d= -f2- || true)"
+  if [[ -z "${UNIT_DB_DIR}" ]]; then
+    echo "[up] ERROR: ${GREEN_UNIT} 未声明 DAILYCHECK_DB_DIR — 绿将共享蓝的物理库（Issue #28 隔离失效）" >&2
+    echo "[up]   修复: unit [Service] 段加 Environment=DAILYCHECK_DB_DIR=${GREEN_DB}，然后 systemctl daemon-reload" >&2
+    exit 1
+  fi
+  if [[ "${UNIT_DB_DIR}" != "${GREEN_DB}" ]]; then
+    echo "[up] ERROR: unit DAILYCHECK_DB_DIR=${UNIT_DB_DIR} != 本次拷贝目标 ${GREEN_DB} — 绿会读到旧副本" >&2
+    exit 1
+  fi
+  echo "[up] ✅ 绿 unit DB 隔离声明确认: DAILYCHECK_DB_DIR=${UNIT_DB_DIR}"
+else
+  echo "[up] [DRY-RUN] would verify ${GREEN_UNIT} declares DAILYCHECK_DB_DIR=${GREEN_DB}"
 fi
 
 # 4. 起绿 systemd unit
