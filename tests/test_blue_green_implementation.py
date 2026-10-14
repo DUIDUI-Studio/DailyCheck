@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import http.server
 import os
+import re
 import socket
 import subprocess
+import sys
 import threading
 import urllib.parse
 from pathlib import Path
@@ -122,9 +124,11 @@ def test_up_dry_run_exit_zero():
 def test_up_dry_run_key_actions():
     result = _run(UP, "99", "abc1234", "--dry-run")
     out = result.stdout + result.stderr
-    # 关键动作回显
+    # 关键动作回显（Issue #28: 拷真库 + cp -aL 解软链，不再是蓝根目录 cp）
     assert "[DRY-RUN] would execute:" in out
-    assert "cp -a /var/lib/dailycheck /var/lib/dailycheck-green" in out
+    assert (
+        "cp -aL /root/DailyCheck/db /var/lib/dailycheck-green/db" in out
+    ), "dry-run 应回显 cp -aL 真库拷贝"
     assert "systemctl start dailycheck-green.service" in out
     assert "systemctl start dailycheck-green-mcp.service" in out
     assert "loop 30 × 2s curl http://127.0.0.1:8091/health" in out
@@ -134,8 +138,8 @@ def test_up_dry_run_skip_db_copy():
     result = _run(UP, "99", "abc1234", "--dry-run", "--skip-db-copy")
     out = result.stdout + result.stderr
     assert "skip" in out.lower()
-    # --skip-db-copy 不应触发 cp -a
-    assert "cp -a /var/lib/dailycheck /var/lib/dailycheck-green" not in out
+    # --skip-db-copy 不应触发真库拷贝
+    assert "cp -aL /root/DailyCheck/db" not in out
 
 
 def test_switch_green_5_dry_run():
@@ -616,3 +620,96 @@ def test_sim_user_missing_credentials_exit_64():
     r = _run_sim_user("http://127.0.0.1:1", {})
     assert r.returncode == 64
     assert "SIM_USER_USER" in (r.stdout + r.stderr)
+
+
+# ============================================================
+# Issue #28: 蓝绿 DB 隔离（DAILYCHECK_DB_DIR + 真库拷贝 + check7 证据）
+# ============================================================
+
+def _import_config_with(env: dict[str, str]) -> str:
+    """子进程里 import config，回传关键路径（避免污染测试进程的 config）。"""
+    code = (
+        "import json, config;"
+        "print(json.dumps({'DB_DIR': str(config.DB_DIR),"
+        " 'MASTER_DB': str(config.MASTER_DB),"
+        " 'WAREHOUSE_DB_DIR': str(config.WAREHOUSE_DB_DIR)}))"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ, **env},
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def test_config_db_dir_env_override(tmp_path):
+    """DAILYCHECK_DB_DIR 设置时三路径整体迁移；未设置时保持 repo 内 db/。"""
+    import json
+
+    green_db = tmp_path / "green-db"
+    got = json.loads(_import_config_with({"DAILYCHECK_DB_DIR": str(green_db)}))
+    assert got["DB_DIR"] == str(green_db)
+    assert got["MASTER_DB"] == str(green_db / "master.db")
+    assert got["WAREHOUSE_DB_DIR"] == str(green_db / "warehouses")
+
+    default = json.loads(_import_config_with({}))
+    repo_db = Path(__file__).resolve().parent.parent / "db"
+    assert default["DB_DIR"] == str(repo_db)
+    assert default["MASTER_DB"] == str(repo_db / "master.db")
+
+
+def test_mcp_config_reexports_follow_root_config():
+    """mcp_server/config.py 必须从根 config re-export MASTER_DB——
+    这样 DAILYCHECK_DB_DIR 才能同时覆盖 Flask 与 MCP 两类进程。"""
+    mcp_cfg = Path(__file__).resolve().parent.parent / "mcp_server" / "config.py"
+    content = mcp_cfg.read_text(encoding="utf-8")
+    assert re.search(r"from config import", content), (
+        "mcp_server/config.py 不再从根 config 导入——DB 隔离覆盖会漏掉 MCP 进程"
+    )
+    assert "MASTER_DB" in content
+
+
+def test_up_sh_copies_real_db_tree_dereferenced():
+    """up.sh 必须从真库 ${APP_DIR}/db 拷（cp -aL 解软链），不再 cp 蓝根目录。
+
+    Issue #28: 旧版 `cp -a /var/lib/dailycheck → /var/lib/dailycheck-green`
+    两边都是遗留目录，cp 把源拷进目标内部——拷了个寂寞，蓝绿共享同一物理库。
+    """
+    content = UP.read_text(encoding="utf-8")
+    assert 'cp -aL "${SRC_DB_DIR}" "${GREEN_DB}"' in content, "未用 cp -aL 拷真库"
+    assert 'SRC_DB_DIR="${DAILYCHECK_SRC_DB_DIR:-${APP_DIR}/db}"' in content
+    assert "cp -a \"${BLUE_DB}\"" not in content, "还在拷蓝根目录（Issue #28 未修）"
+
+
+def test_up_sh_requires_unit_db_dir_declaration():
+    """up.sh 必须守卫：绿 unit 未声明 DAILYCHECK_DB_DIR 或与拷贝目标不一致时拒启。"""
+    content = UP.read_text(encoding="utf-8")
+    assert "DAILYCHECK_DB_DIR" in content
+    assert "未声明 DAILYCHECK_DB_DIR" in content
+    # 两处失败路径都必须 exit 1（不匹配 / 缺声明）
+    assert content.count("exit 1") >= 2
+    assert "daemon-reload" in content  # 错误信息给出修复方法
+
+
+def test_up_sh_green_db_default_is_isolated_copy_dir():
+    """GREEN_DB 默认值 = /var/lib/dailycheck-green/db（unit env 同值）。"""
+    content = UP.read_text(encoding="utf-8")
+    assert 'GREEN_DB="${GREEN_DB:-/var/lib/dailycheck-green/db}"' in content
+
+
+def test_verify_check7_isolation_evidence():
+    """verify.sh check 7：三重证据（environ 声明 + 非软链 + inode 相异）。"""
+    content = VERIFY.read_text(encoding="utf-8")
+    assert "_verify_check7_db_isolation()" in content
+    assert '_run_check "7"' in content
+    # a) 进程 environ 证据（比 /proc/*/fd 可靠：sqlite 连接每请求开关会撞空窗）
+    assert "DAILYCHECK_DB_DIR=" in content
+    assert "/proc/${main_pid}/environ" in content
+    # b) 绿 master.db 不许是软链
+    assert '[[ -L "${master_green}" ]]' in content
+    # c) inode 相异性（同一物理文件铁证排除）
+    assert "stat -c %i" in content
+    # 报告表格要有第 7 行
+    assert "| 7 | DB 隔离证据" in content
