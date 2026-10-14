@@ -13,7 +13,7 @@
   reports/pr-<num>/04-local-deploy-preview.md（Dev Agent 半自动）
 
 判断规则：
-  报告 01：PR body 含 "## 报告 1/4" + "## Checklist" + 状态全 ✅
+  报告 01：PR body 含 "## 报告 1/4" + "## Checklist" + "## 生产侧事项" + 状态全 ✅
   报告 02：ci-summary.json pytest.failed == 0 && gate_exit == 0
   报告 03：ci-summary.json ruff.warnings == 0 && bandit.high_vuln == 0
   报告 04：reports/pr-<num>/04-*.md 存在 + 含 "## 4. 启动日志摘要" + "## 7. 报告签名"
@@ -105,6 +105,12 @@ def check_report_01_present() -> bool:
 
     if "## Checklist" not in pr_body:
         print("[check_reports] 报告 01: ❌ PR body 缺 '## Checklist' 段落")
+        return False
+
+    # 生产侧事项（2026-10-15 merge 政策改版新增）：Prod Agent merge 判定的输入，
+    # 缺失 = Prod 拿到的 PR 没有部署参考。段落内容不查 ❌（写法铁律见 workflow.md §三′）。
+    if "## 生产侧事项" not in pr_body:
+        print("[check_reports] 报告 01: ❌ PR body 缺 '## 生产侧事项' 段落")
         return False
 
     # 检查状态：必须没有 ❌
