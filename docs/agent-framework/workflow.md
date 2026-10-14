@@ -58,15 +58,19 @@
 - 仍需 owner 单独确认的操作：`--force` / `--force-with-lease`、删除远程分支、改分支保护规则。
 - pre-push hook（`core.hooksPath` 指向的脚本）恒 `exit 1`，推分支用 `git push --no-verify`——这不属于绕过，是既定姿势。
 
-## 四、Merge 政策
+## 四、Merge 政策（2026-10-15 Eric 拍板：候选 A）
 
-**状态：Eric 拍板中（2026-10-15 提出两候选）。** 当前候选：
+**Dev Agent 在 CI 全绿后常规 merge**（`gh pr merge <num> --merge`），无需 owner 逐个确认。
 
-- **候选 A（Dev Agent 推荐）**：Dev Agent 在 CI 全绿后常规 merge；红线清单内的 PR 仍上报 owner——红线 = 改 `known_failures.txt`（本就禁止扩张）/ 改 CI workflow / 改分支保护 / 删 ARCHITECTURE 铁律 / owner 标注「需拍板」的需求。
-  理由：merge ≠ 部署。生产风险已被 Prod Agent 的 verify 七项 + 灰度 + rollback 兜住，main 只是集成分支；质量权威是 CI 门禁而非人审；Prod Agent merge 会混淆「仓库治理」与「生产操作」的角色边界。
-- **候选 B**：Prod Agent merge——merge 与部署窗口绑定，Prod 控节奏；代价是 VPS 侧 agent 获得仓库写权限，角色边界变模糊。
+红线清单——以下 PR 仍须上报 owner 拍板，Dev 不得自行 merge：
 
-拍板后更新本节并删除「状态」行。
+1. 扩张 `tests/known_failures.txt`（清单本身只许收缩，出现扩张即流程违规）
+2. 改 `.github/workflows/*`（CI/部署流水线自身）
+3. 改分支保护规则 / ruleset
+4. 删除或弱化 `docs/ARCHITECTURE.md` 铁律
+5. owner 在需求中标注「需拍板」的变更
+
+设计依据：merge ≠ 部署。main 只是集成分支，生产风险由 Prod Agent 的 verify 七项 + 灰度 + rollback 兜住；质量权威是 CI 门禁而非人审；Prod merge 会混淆「仓库治理」与「生产操作」的角色边界，故不采用（候选 B 已否决）。
 
 ## 五、部署机制（Prod Agent，蓝绿）
 
