@@ -39,7 +39,8 @@
 
 - 新建 PR 自动带出 `.github/PULL_REQUEST_TEMPLATE.md`
 - body 必含 h2 级「**## 报告 1/4：需求对齐**」+「**## Checklist**」+「**## 生产侧事项**」；R 表占位为「❌ 待填」，**全部消解为 ✅ 门禁才绿**
-- ⚠️ 已知坑：CI 用**事件时刻的 body 快照**（`github.event.pull_request.body`）。事后 `gh pr edit` 补内容后，必须**推空 commit 触发新事件**，rerun 无效
+- ⚠️ 已知坑一：CI 用**事件时刻的 body 快照**（`github.event.pull_request.body`）。事后 `gh pr edit` 补内容后，必须**推空 commit 触发新事件**，rerun 无效
+- ⚠️ 已知坑二：「报告 1/4」段之后（直到「报告 2/4」标题，实践中 = 全文）**不许出现字面 ❌ 字符**——门禁靠它识别未消解状态，正文叙述里写 ❌（哪怕只是举例）也会被判定未消解。写「红叉」「未消解状态」等文字替代
 - 本地自检捷径：`PR_BODY_FILE=/tmp/body.md python scripts/agent_framework/check_reports.py`
 
 ### ③′ 「生产侧事项」段落的写法铁律
