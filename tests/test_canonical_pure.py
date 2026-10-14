@@ -10,12 +10,11 @@ Test conventions (aligned with tests/conftest.py):
 """
 from __future__ import annotations
 
+import shutil
 import sqlite3
-import sys
 from pathlib import Path
 
 import pytest
-
 
 # ─────────────────────────────────────────────────────────────────────
 #  Per-test fixture: build a minimal items table with the 6 dirty
@@ -666,7 +665,6 @@ class TestBackupAndGuardRealDb:
         self, warehouse_db_with_dirty_floats, monkeypatch, tmp_path,
     ):
         from blueprints import canonical_pure as cp
-        from config import BACKUP_WAREHOUSE_DIR
 
         monkeypatch.setattr(cp, "BACKUP_WAREHOUSE_DIR", tmp_path / "backups")
 
@@ -682,39 +680,73 @@ class TestBackupAndGuardRealDb:
     def test_backup_propagates_failure_does_not_swallow(
         self, warehouse_db_with_dirty_floats, monkeypatch, tmp_path,
     ):
-        """§7.7.2 措施① 第1条硬要求：失败即中止。"""
+        """§7.7.2 措施① 第1条硬要求：失败即中止。
+
+        prod（euid=0）首演实测：chmod 0o555 拦不住 copy2——root 无视权限位，
+        copy2 成功 → DID NOT RAISE（2026-10-15 verify.sh check1 抓到）。
+        改为 monkeypatch shutil.copy2 直接抛 OSError，与 uid 无关地验证
+        「失败即中止」语义。
+        """
         from blueprints import canonical_pure as cp
 
-        # 把 BACKUP_WAREHOUSE_DIR 改成只读目录 → copy2 抛 PermissionError
-        ro_dir = tmp_path / "ro"
-        ro_dir.mkdir()
-        ro_dir.chmod(0o555)
-        monkeypatch.setattr(cp, "BACKUP_WAREHOUSE_DIR", ro_dir)
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+        monkeypatch.setattr(cp, "BACKUP_WAREHOUSE_DIR", backup_dir)
+
+        def _boom(src, dst, **kw):
+            raise PermissionError(f"simulated copy failure: {src} -> {dst}")
+
+        monkeypatch.setattr(shutil, "copy2", _boom)
 
         with pytest.raises(cp.BackupFailed):
             cp.backup_warehouse_db(warehouse_db_with_dirty_floats, tag="x")
 
-        ro_dir.chmod(0o755)  # 还原,便于 tmp_path 清理
-
     def test_guard_real_db_blocks_path_under_db_warehouses(self, tmp_path, monkeypatch):
-        from blueprints import canonical_pure as cp
-        from config import BASE_DIR, CANONICAL_POLICY
+        """默认 allow_real_db_write=False → 应拒绝真实路径。
 
-        # 默认 allow_real_db_write=False → 应拒绝真实路径
-        monkeypatch.setattr(cp, "BASE_DIR", BASE_DIR)
+        hermetic 化（2026-10-15）：不再依赖真实 BASE_DIR 布局——prod 的
+        db/warehouses/*.db 是指向 /var/lib/dailycheck 的软链，resolve()
+        穿透曾致本测试在 prod 误报（DID NOT RAISE）。改用 tmp BASE_DIR
+        构造普通文件，语义不变：db/warehouses 下的路径必须被拦。
+        """
+        from blueprints import canonical_pure as cp
+        from config import CANONICAL_POLICY
+
+        monkeypatch.setattr(cp, "BASE_DIR", tmp_path)
         monkeypatch.setitem(CANONICAL_POLICY, "allow_real_db_write", False)
-        # 选 wh_002 真实库路径作为目标
-        real_path = BASE_DIR / "db" / "warehouses" / "wh_002.db"
-        if not real_path.exists():
-            real_path.parent.mkdir(parents=True, exist_ok=True)
-            real_path.touch()
-        try:
-            with pytest.raises(cp.RealDatabaseForbidden) as ei:
-                cp.guard_real_db(real_path)
-            assert "真实仓库" in str(ei.value) or "dc_dryrun" in str(ei.value)
-        finally:
-            if real_path.exists() and real_path.stat().st_size == 0:
-                real_path.unlink()
+        real_dir = tmp_path / "db" / "warehouses"
+        real_dir.mkdir(parents=True)
+        target = real_dir / "wh_002.db"
+        target.touch()
+        with pytest.raises(cp.RealDatabaseForbidden) as ei:
+            cp.guard_real_db(target)
+        assert "真实仓库" in str(ei.value) or "dc_dryrun" in str(ei.value)
+
+    def test_guard_real_db_blocks_symlink_into_db_warehouses(
+        self, tmp_path, monkeypatch,
+    ):
+        """软链穿透防护：db/warehouses 下的软链入口同样必须拦截。
+
+        prod 部署形态（2026-10-15 实测）：code 目录 db/warehouses/*.db 是
+        指向 /var/lib/dailycheck/warehouses 的软链，guard 的 resolve 比较
+        被穿透 → DID NOT RAISE。这是 guard 的真实缺陷（已修：对未 resolve
+        的 absolute parent 再比一次），本测试防回归。
+        """
+        from blueprints import canonical_pure as cp
+        from config import CANONICAL_POLICY
+
+        monkeypatch.setattr(cp, "BASE_DIR", tmp_path)
+        monkeypatch.setitem(CANONICAL_POLICY, "allow_real_db_write", False)
+        outside = tmp_path / "data" / "warehouses"
+        outside.mkdir(parents=True)
+        real_file = outside / "wh_002.db"
+        real_file.touch()
+        link_dir = tmp_path / "db" / "warehouses"
+        link_dir.mkdir(parents=True)
+        link = link_dir / "wh_002.db"
+        link.symlink_to(real_file)  # prod 部署形态
+        with pytest.raises(cp.RealDatabaseForbidden):
+            cp.guard_real_db(link)
 
     def test_guard_real_db_allows_path_under_dryrun(self, tmp_path):
         from blueprints import canonical_pure as cp

@@ -753,8 +753,14 @@ def guard_real_db(path: str | Path) -> None:
     p = Path(path).resolve()
     real = (BASE_DIR / "db" / "warehouses").resolve()
 
+    # 软链穿透防护（2026-10-15 prod 实测）：部署布局常把 db/warehouses/*.db
+    # 做成指向数据目录的软链，resolve() 穿透后 parent 比较失配 → guard 放行。
+    # 对未穿透的 absolute 路径再比一次，任一命中即拒。
+    p_abs = Path(path).absolute()
+    real_abs = BASE_DIR / "db" / "warehouses"
+
     # 注意：用 parent 比较而不是完整路径，确保不论传入相对/绝对都能拦截
-    if p.parent == real:
+    if p.parent == real or p_abs.parent == real_abs:
         raise RealDatabaseForbidden(
             f"禁止对真实仓库 {p} 写入。预演请先复制副本到 "
             f"{DRYRUN_COPY_DIR}/{{ts}}/（每个 dry-run 用独立 ts 子目录隔离）。"
