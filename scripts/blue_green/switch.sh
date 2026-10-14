@@ -1,35 +1,41 @@
 #!/usr/bin/env bash
-# blue_green/switch.sh —— 切流量（nginx upstream weight）
+# blue_green/switch.sh —— 切流量（nginx upstream weight / down 互转）
 #
-# 用法: ./scripts/blue_green/switch.sh <green|blue> [percent]
+# 用法: ./scripts/blue_green/switch.sh <green|blue> [percent] [--dry-run]
 #
-# 状态: v0.2 骨架（systemd 路径，2026-10-13 修订）
-# 行为：改 /etc/nginx/sites-enabled/dailycheck 的 upstream weight，
-#       然后 nginx -t && systemctl reload nginx（流式重载，0 中断）。
+# 行为：
+#   switch.sh green 5    → 绿 weight=5,   蓝 weight=95
+#   switch.sh green 50   → 绿 weight=50,  蓝 weight=50
+#   switch.sh green 100  → 绿 weight=100, 蓝 down
+#   switch.sh blue  100  → 蓝 weight=100, 绿 down（回滚语义）
 #
-# 示例：
-#   switch.sh green 5     # 绿 5% / 蓝 95%
-#   switch.sh green 50    # 绿 50% / 蓝 50%
-#   switch.sh green 100   # 绿 100% / 蓝 0%
-#   switch.sh blue  100   # 蓝 100% / 绿 0%（回滚）
-#
-# 前置条件：
-#   1. nginx dailycheck 配置已加 upstream block（见 README §待补）
-#   2. weight 范围 0-100，初始蓝 100 / 绿 0
-#
-# 设计：每次切换 nginx reload（流式），不丢请求。
-#
-# v0.3 修订（2026-10-13 Eric 拍板）：
-#   - nginx 配置路径走 env 变量 + 默认值（NGINX_DAILYCHECK_CONF）
+# 关键设计（2026-10-14 Eric 拍板）：
+#   - 用 nginx "down" 关键字标记"不参与负载"（weight=0 nginx 1.24 拒绝）
+#   - sed 替换 server 行的 weight= 字段
+#   - nginx -t 验证语法（防 sed 错配）
+#   - 失败时 cp 备份回滚（蓝仍 100% 在线）
 
 set -euo pipefail
 
+# ============================================================
+# 参数解析
+# ============================================================
+# 先扫 --help / -h
+for arg in "$@"; do
+  if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+    echo "usage: $0 <green|blue> [percent] [--dry-run]"
+    echo "  --dry-run   只 echo 不真跑 nginx -t / reload"
+    exit 0
+  fi
+done
+
 TARGET="${1:-}"
 PERCENT="${2:-100}"
+DRY_RUN_FLAG=0
 
 case "${TARGET}" in
   green|blue) ;;
-  *) echo "usage: $0 <green|blue> [percent]" >&2; exit 64 ;;
+  *) echo "usage: $0 <green|blue> [percent] [--dry-run]" >&2; exit 64 ;;
 esac
 
 if ! [[ "${PERCENT}" =~ ^[0-9]+$ ]] || [[ "${PERCENT}" -lt 0 || "${PERCENT}" -gt 100 ]]; then
@@ -37,51 +43,105 @@ if ! [[ "${PERCENT}" =~ ^[0-9]+$ ]] || [[ "${PERCENT}" -lt 0 || "${PERCENT}" -gt
   exit 64
 fi
 
-# 配置（与 deploy_vps.sh 模板化约定对齐）
+# 剩余参数解析
+shift 2
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN_FLAG=1 ;;
+    *) echo "unknown arg: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+# ============================================================
+# 配置
+# ============================================================
 NGINX_CONF="${NGINX_DAILYCHECK_CONF:-/etc/nginx/sites-enabled/dailycheck}"
-NGINX_BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+BLUE_PORT="${BLUE_PORT:-8090}"
+GREEN_PORT="${GREEN_PORT:-8091}"
+BLUE_MCP_PORT="${BLUE_MCP_PORT:-5100}"
+GREEN_MCP_PORT="${GREEN_MCP_PORT:-5101}"
 
 # ============================================================
-# 骨架阶段：禁止执行
+# 辅助：dry-run 模式
 # ============================================================
-echo "[switch] NOT YET IMPLEMENTED — nginx upstream 配置补完后才能触发" >&2
-echo "[switch] 前置条件：" >&2
-echo "[switch]   1. ${NGINX_CONF} 加 :8091 upstream block" >&2
-echo "[switch]   2. weight 字段格式：\`server 127.0.0.1:8091 weight=N;\`" >&2
-echo "[switch] 详见 scripts/blue_green/README.md" >&2
-exit 78
+_run() {
+  if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
+    echo "[DRY-RUN] would execute: $*"
+  else
+    "$@"
+  fi
+}
 
 # ============================================================
-# 实现阶段（前置条件满足后取消上面 exit 78）
+# 计算 weight + 边界转换（weight=0 → down）
 # ============================================================
-#
-# GREEN_WEIGHT="${PERCENT}"
-# BLUE_WEIGHT=$((100 - PERCENT))
-#
-# echo "[switch] target=${TARGET} (green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%)"
-#
-# # 备份当前配置（防 sed 出错）
-# cp "${NGINX_CONF}" "${NGINX_BACKUP}"
-#
-# # 改 weight（sed 替换两行）
-# sed -i.bak \
-#   -e "s|server 127.0.0.1:8090 weight=[0-9]*;|server 127.0.0.1:8090 weight=${BLUE_WEIGHT};|" \
-#   -e "s|server 127.0.0.1:8091 weight=[0-9]*;|server 127.0.0.1:8091 weight=${GREEN_WEIGHT};|" \
-#   "${NGINX_CONF}"
-#
-# # 测试 + reload（流式，0 中断）
-# if nginx -t; then
-#   systemctl reload nginx
-#   echo "[switch] ✅ nginx reloaded, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
-# else
-#   echo "[switch] ❌ nginx -t fail, rolling back ..." >&2
-#   cp "${NGINX_BACKUP}" "${NGINX_CONF}"
-#   nginx -t && systemctl reload nginx
-#   exit 1
-# fi
-#
-# # 验证：curl 看看是不是按 weight 走
-# sleep 2
-# for i in {1..5}; do
-#   curl -fsS -o /dev/null -w "  green_resp=%{http_code}\n" "http://localhost:8080/?_probe=$i" || true
-# done
+if [[ "${TARGET}" == "green" ]]; then
+  GREEN_WEIGHT="${PERCENT}"
+  BLUE_WEIGHT=$((100 - PERCENT))
+else
+  BLUE_WEIGHT="${PERCENT}"
+  GREEN_WEIGHT=$((100 - PERCENT))
+fi
+
+_render_line() {
+  local port="$1" weight="$2"
+  if [[ ${weight} -eq 0 ]]; then
+    echo "server 127.0.0.1:${port} down;"
+  else
+    echo "server 127.0.0.1:${port} weight=${weight};"
+  fi
+}
+
+BLUE_LINE="$(         _render_line ${BLUE_PORT}      ${BLUE_WEIGHT})"
+GREEN_LINE="$(        _render_line ${GREEN_PORT}     ${GREEN_WEIGHT})"
+BLUE_MCP_LINE="$(     _render_line ${BLUE_MCP_PORT}  ${BLUE_WEIGHT})"
+GREEN_MCP_LINE="$(    _render_line ${GREEN_MCP_PORT} ${GREEN_WEIGHT})"
+
+echo "[switch] target=${TARGET} (green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%)"
+echo "[switch] nginx_conf: ${NGINX_CONF}"
+echo "[switch] blue line:    ${BLUE_LINE}"
+echo "[switch] green line:   ${GREEN_LINE}"
+echo "[switch] blue-mcp:     ${BLUE_MCP_LINE}"
+echo "[switch] green-mcp:    ${GREEN_MCP_LINE}"
+
+# ============================================================
+# 备份 + sed 替换（覆盖 weight=N 和 down 两种状态）
+# ============================================================
+BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+_run cp "${NGINX_CONF}" "${BACKUP}"
+echo "[switch] backup: ${BACKUP}"
+
+_run sed -i \
+  -e "s|server 127.0.0.1:${BLUE_PORT} weight=[0-9]*;|${BLUE_LINE}|" \
+  -e "s|server 127.0.0.1:${BLUE_PORT} down;|${BLUE_LINE}|" \
+  -e "s|server 127.0.0.1:${GREEN_PORT} weight=[0-9]*;|${GREEN_LINE}|" \
+  -e "s|server 127.0.0.1:${GREEN_PORT} down;|${GREEN_LINE}|" \
+  -e "s|server 127.0.0.1:${BLUE_MCP_PORT} weight=[0-9]*;|${BLUE_MCP_LINE}|" \
+  -e "s|server 127.0.0.1:${BLUE_MCP_PORT} down;|${BLUE_MCP_LINE}|" \
+  -e "s|server 127.0.0.1:${GREEN_MCP_PORT} weight=[0-9]*;|${GREEN_MCP_LINE}|" \
+  -e "s|server 127.0.0.1:${GREEN_MCP_PORT} down;|${GREEN_MCP_LINE}|" \
+  "${NGINX_CONF}"
+
+# ============================================================
+# nginx -t 验证（防 sed 错配）
+# ============================================================
+echo "[switch] nginx -t ..."
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  if ! nginx -t; then
+    echo "[switch] nginx -t failed, rolling back ..." >&2
+    cp "${BACKUP}" "${NGINX_CONF}"
+    exit 1
+  fi
+else
+  echo "[DRY-RUN] would nginx -t; on failure cp backup & exit 1"
+fi
+
+# ============================================================
+# reload（流式，0 中断）
+# ============================================================
+echo "[switch] nginx reload ..."
+_run systemctl reload nginx
+
+echo "[switch] ✅ nginx reloaded, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
+exit 0

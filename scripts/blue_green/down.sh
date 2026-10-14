@@ -1,65 +1,125 @@
 #!/usr/bin/env bash
 # blue_green/down.sh —— 清理绿环境
 #
-# 用法: ./scripts/blue_green/down.sh [--keep-blue]
+# 用法: ./scripts/blue_green/down.sh [--keep-blue] [--dry-run]
 #
-# 状态: v0.2 骨架（systemd 路径，2026-10-13 修订）
+# 默认行为：停绿 systemd + 删绿 DB + 删绿 unit + Nginx 切回 100% 蓝
+# --keep-blue：仅停绿 systemd（蓝降 standby 7 天，保留绿 DB/取证）
+#             Nginx 不动（绿仍 down，不接流量）
+# --dry-run：只 echo 不真跑
 #
-# 默认行为：停绿 + 删绿 DB + 删绿 unit
-# --keep-blue：仅停绿 systemd（PR 合入后蓝降 standby 7 天，保留绿取证）
-#
-# 触发：
-#   - 验证失败后清理（取证已导出）
-#   - PR 合入 + 7 天 standby 期到期（需 cron 触发，见 §cron）
-#   - 人工取消（Eric 主动）
-#
-# cron 示例（7 天 standby 到期）：
-#   0 0 * * * /root/DailyCheck/scripts/blue_green/cron_standby_expire.sh  # 待补
-#
-# v0.3 修订（2026-10-13 Eric 拍板）：
-#   - 所有路径走 env 变量 + 默认值（GREEN_SERVICE_UNIT / GREEN_DB）
-#   - cron 路径 /opt → /root（实测 host 路径）
+# 状态: v0.4 实现（2026-10-14 Eric 拍板）
+# 设计依据：v0.1.md §四.2 + v0.3 env 变量约定
 
 set -euo pipefail
 
-KEEP_BLUE=0
+# ============================================================
+# 参数解析
+# ============================================================
+# 先扫 --help
 for arg in "$@"; do
-  case "${arg}" in
-    --keep-blue) KEEP_BLUE=1 ;;
-    *) echo "unknown arg: ${arg}" >&2; exit 64 ;;
-  esac
+  if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+    echo "usage: $0 [--keep-blue] [--dry-run]"
+    echo "  --keep-blue  仅停绿 systemd，保留 DB 取证 7d"
+    echo "  --dry-run    只 echo 不真跑"
+    exit 0
+  fi
 done
 
-# 配置（与 deploy_vps.sh 模板化约定对齐）
+KEEP_BLUE=0
+DRY_RUN_FLAG=0
+
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+    --keep-blue) KEEP_BLUE=1 ;;
+    --dry-run) DRY_RUN_FLAG=1 ;;
+    *) echo "unknown arg: ${1}" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+# ============================================================
+# 配置
+# ============================================================
 GREEN_UNIT="${GREEN_SERVICE_UNIT:-dailycheck-green.service}"
+GREEN_MCP_UNIT="${GREEN_MCP_SERVICE_UNIT:-dailycheck-green-mcp.service}"
 GREEN_DB="${GREEN_DB:-/var/lib/dailycheck-green}"
+EVIDENCE_DIR="${EVIDENCE_BASE:-/var/log/dailycheck}"
 
 # ============================================================
-# 骨架阶段：禁止执行
+# 辅助：dry-run 模式
 # ============================================================
-echo "[down] NOT YET IMPLEMENTED — 手工 systemctl stop 仍可用" >&2
-echo "[down] 实际行为（实装后）：" >&2
-echo "[down]   1. systemctl stop ${GREEN_UNIT}" >&2
-if [[ "${KEEP_BLUE}" -eq 1 ]]; then
-  echo "[down]   2. 保留 ${GREEN_DB} 取证（7 天 standby 期到期才删）"
-else
-  echo "[down]   2. rm -rf ${GREEN_DB}"
+_run() {
+  if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
+    echo "[DRY-RUN] would execute: $*"
+  else
+    "$@"
+  fi
+}
+
+echo "[down] === 清理绿环境 ==="
+echo "[down] mode: $([[ ${DRY_RUN_FLAG} -eq 1 ]] && echo 'dry-run' || echo 'live')"
+echo "[down] keep-blue: ${KEEP_BLUE}"
+
+# 1. 停绿 systemd（保留取证）
+echo "[down] stopping ${GREEN_UNIT} ..."
+_run systemctl stop "${GREEN_UNIT}" || echo "[down] ${GREEN_UNIT} 未运行，跳过 stop"
+echo "[down] stopping ${GREEN_MCP_UNIT} ..."
+_run systemctl stop "${GREEN_MCP_UNIT}" || echo "[down] ${GREEN_MCP_UNIT} 未运行，跳过 stop"
+
+# 2. 取证：journalctl → evidence dir
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  _run mkdir -p "${EVIDENCE_DIR}"
+  TS="$(date +%Y%m%d-%H%M%S)"
+  _run journalctl -u "${GREEN_UNIT}" --since "24 hours ago" > "${EVIDENCE_DIR}/green-down-${TS}-flask.log" 2>/dev/null || true
+  _run journalctl -u "${GREEN_MCP_UNIT}" --since "24 hours ago" > "${EVIDENCE_DIR}/green-down-${TS}-mcp.log" 2>/dev/null || true
+  echo "[down] 取证：${EVIDENCE_DIR}/green-down-${TS}-*.log"
 fi
-echo "[down] 详见 scripts/blue_green/README.md" >&2
-exit 78
 
-# ============================================================
-# 实现阶段（up.sh 实装后取消上面 exit 78）
-# ============================================================
-#
-# echo "[down] stopping ${GREEN_UNIT} ..."
-# systemctl stop "${GREEN_UNIT}" 2>&1 | head -10 || true
-#
-# if [[ "${KEEP_BLUE}" -eq 1 ]]; then
-#   echo "[down] --keep-blue: ${GREEN_DB} 保留 7 天 standby"
-# else
-#   echo "[down] removing ${GREEN_DB} ..."
-#   rm -rf "${GREEN_DB}"
-# fi
-#
-# echo "[down] ✅ done (keep_blue=${KEEP_BLUE})"
+# 3. 备份 systemd unit（以备重建）
+if [[ ${DRY_RUN_FLAG} -eq 0 && -f "/etc/systemd/system/${GREEN_UNIT}" ]]; then
+  _run cp "/etc/systemd/system/${GREEN_UNIT}" "${EVIDENCE_DIR}/${GREEN_UNIT}.down-${TS}.bak" || true
+  _run cp "/etc/systemd/system/${GREEN_MCP_UNIT}" "${EVIDENCE_DIR}/${GREEN_MCP_UNIT}.down-${TS}.bak" 2>/dev/null || true
+fi
+
+# 4. Nginx 切回 100% 蓝（保险起见——绿停止后流量也应 100% 蓝）
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  NGINX_CONF="${NGINX_DAILYCHECK_CONF:-/etc/nginx/sites-enabled/dailycheck}"
+  if [[ -f "${NGINX_CONF}" ]]; then
+    if grep -q "server 127.0.0.1:8091 down" "${NGINX_CONF}" || \
+       grep -q "server 127.0.0.1:8091 weight=" "${NGINX_CONF}"; then
+      echo "[down] Nginx 切回 100% 蓝（保险）..."
+      "$(dirname "$0")/switch.sh" blue 100 || echo "[down] ⚠️ switch.sh failed, manual nginx 调整"
+    else
+      echo "[down] Nginx 已不含绿配置，跳过"
+    fi
+  fi
+else
+  echo "[DRY-RUN] would check Nginx and call switch.sh blue 100 if needed"
+fi
+
+# 5. 删 systemd unit（幂等：unit 删了不影响 dailycheck.service）
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  echo "[down] removing systemd unit files ..."
+  _run rm -f "/etc/systemd/system/${GREEN_UNIT}"
+  _run rm -f "/etc/systemd/system/${GREEN_MCP_UNIT}"
+  _run systemctl daemon-reload
+else
+  echo "[DRY-RUN] would rm /etc/systemd/system/${GREEN_UNIT}"
+  echo "[DRY-RUN] would rm /etc/systemd/system/${GREEN_MCP_UNIT}"
+  echo "[DRY-RUN] would systemctl daemon-reload"
+fi
+
+# 6. 删 / 留 DB
+if [[ ${KEEP_BLUE} -eq 0 ]]; then
+  echo "[down] removing ${GREEN_DB} ..."
+  _run rm -rf "${GREEN_DB}"
+else
+  echo "[down] --keep-blue: 保留 ${GREEN_DB}（7d standby 由 cron 清理）"
+  if [[ ${DRY_RUN_FLAG} -eq 0 && ! -d "${GREEN_DB}" ]]; then
+    echo "[down] ⚠️ --keep-blue 但 ${GREEN_DB} 不存在（noop）" >&2
+  fi
+fi
+
+echo "[down] ✅ done (keep_blue=${KEEP_BLUE})"
+exit 0
