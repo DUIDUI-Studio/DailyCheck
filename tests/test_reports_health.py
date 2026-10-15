@@ -8,7 +8,8 @@
 - ABC 累计较性（80/95% 边界归属）；
 - SKU 表排序白名单（非法 sort 回退默认）；
 - 路由权限（staff 403 / manager 200）、range 白名单、CSV BOM；
-- 导航三载体：manager 侧栏与 /land 均含新链接，staff 两侧均不含。
+- 导航三载体：manager 侧栏与 /land 均含新链接，staff 两侧均不含；
+- Issue #38：时间戳容错（生产无秒形态「YYYY-MM-DD HH:MM」不再 500）。
 """
 from __future__ import annotations
 
@@ -463,3 +464,170 @@ class TestNavCarriers:
         sidebar_links = set(_re.findall(r'href="([^"]+)"', sidebar))
         land_links = set(_re.findall(r'href="([^"]+)"', land))
         assert sidebar_links == land_links
+
+
+# ---------------------------------------------------------------------------
+# Issue #38：时间戳容错（生产存量含无秒形态）
+# ---------------------------------------------------------------------------
+# 证据（2026-10-15 全 6 仓 + master 普查）：只有 wh_000.db 的
+# stock_movements.created_at 与 restock_requests.created_at 各 54 行是
+# 16 字符无秒形态「YYYY-MM-DD HH:MM」，跨度 2025-11-28 → 2026-10-13（仍在产生，
+# 应用层全部走 _helpers.now() 的 19 字符格式，故源头是人工 / ops SQL）。
+# 严格 "%Y-%m-%d %H:%M:%S" 撞上它 → ValueError → /report/health 500。
+SHORT_TS = "%Y-%m-%d %H:%M"
+
+
+def ts_short(days_ago: int, hour: int = 8) -> str:
+    """生产存量形态：无秒（16 字符）。"""
+    return (NOW - timedelta(days=days_ago)).replace(hour=hour).strftime(SHORT_TS)
+
+
+def add_mv_raw(pdb, item_id, action, delta, raw_ts):
+    """按原始字符串写流水（add_mv 只产带秒形态，够不到本 issue 的边界）。"""
+    pdb.execute(
+        "INSERT INTO stock_movements (item_id, action, delta, created_at)"
+        " VALUES (?, ?, ?, ?)", (item_id, action, delta, raw_ts))
+    pdb.commit()
+
+
+class TestTimestampTolerance:
+    def test_parse_event_ts_accepts_both_production_forms(self):
+        """带秒（19 字符）与无秒（16 字符）解析为同一时刻。"""
+        assert hp.parse_event_ts("2026-08-12 14:00:00") == datetime(2026, 8, 12, 14, 0)
+        assert hp.parse_event_ts("2026-08-12 14:00") == datetime(2026, 8, 12, 14, 0)
+
+    def test_parse_event_ts_strips_and_handles_precision(self):
+        """首尾空白 / 微秒 / 纯日期都兼容，且不引入 aware datetime。"""
+        assert hp.parse_event_ts("  2026-08-12 14:00  ") == datetime(2026, 8, 12, 14, 0)
+        assert hp.parse_event_ts("2026-08-12 14:00:00.123") == \
+            datetime(2026, 8, 12, 14, 0, 0, 123000)
+        assert hp.parse_event_ts("2026-08-12") == datetime(2026, 8, 12)
+        assert hp.parse_event_ts("2026-08-12 14:00").tzinfo is None
+
+    @pytest.mark.parametrize(
+        "bad", [None, "", "   ", "not-a-ts", 12345, "2026/08/12 14:00"])
+    def test_parse_event_ts_raises_with_raw_value(self, bad):
+        """未知形态抛 ValueError（不吞异常），消息带原始值便于 prod 定位。"""
+        with pytest.raises(ValueError) as ei:
+            hp.parse_event_ts(bad)
+        assert repr(bad) in str(ei.value)
+
+    def test_replay_handles_short_timestamp(self, pdb):
+        """Issue #38 复现用例：无秒流水不再抛 ValueError，且账龄正确。"""
+        iid = add_item(pdb, qty=15.0)
+        add_mv_raw(pdb, iid, "补货入库", 10, ts_short(20))  # 老层（呆滞）
+        add_mv_raw(pdb, iid, "补货入库", 10, ts_short(2))   # 新层
+        add_mv_raw(pdb, iid, "出库", -5, ts_short(1))       # 消老层 5
+        rows = pdb.execute(
+            "SELECT created_at, action, delta FROM stock_movements"
+            " ORDER BY created_at, id").fetchall()
+        r = hp.replay_item_layers(rows, 15.0, NOW)
+        assert r["ok"] is True
+        assert r["stale_qty"] == pytest.approx(5)
+        assert r["oldest_date"] == ts_short(20)[:10]
+
+    def test_replay_mixed_width_equivalent_to_all_long(self):
+        """同一批事件：无秒形态与带秒形态的重放结果必须逐字段一致。
+
+        反向保证：若 helper 把无秒形态误解析成别的时刻（例如兜底成固定日期 /
+        当日零点），层账龄会错位、呆滞量对不上 → 本用例失败。
+        """
+        long_mv = [("2026-09-25 08:00:00", "补货入库", 10.0),
+                   ("2026-10-13 08:00:00", "补货入库", 10.0),
+                   ("2026-10-14 08:00:00", "出库", -5.0)]
+        short_mv = [(t[:16], a, d) for t, a, d in long_mv]
+        assert hp.replay_item_layers(short_mv, 15.0, NOW) == \
+            hp.replay_item_layers(long_mv, 15.0, NOW)
+
+    def test_replay_propagates_unknown_timestamp(self, pdb):
+        """未知形态必须冒泡 ValueError（原始值带上），不许静默跳过该事件。
+
+        这是「宁可 500 也不要静默算错」的契约：跳过一条事件会让层账龄整体
+        错位，呆滞金额错得无声无息。变异验证：把 replay 里的解析改成
+        `except ValueError: continue` → 本用例变红。
+        """
+        with pytest.raises(ValueError) as ei:
+            hp.replay_item_layers([("not-a-ts", "补货入库", 10.0)], 10.0, NOW)
+        assert "not-a-ts" in str(ei.value)
+
+    def test_compute_stale_and_dos_short_timestamps(self, pdb):
+        """整条链路不再 500，且分档 / 金额正确。"""
+        iid = add_item(pdb, qty=50.0, cost=2.0)
+        add_mv_raw(pdb, iid, "补货入库", 100, ts_short(30))
+        add_mv_raw(pdb, iid, "出库", -50, ts_short(1))
+        result = hp.compute_stale_and_dos(pdb, NOW)
+        assert result[iid]["tier"] == "stale"
+        assert result[iid]["stale_qty"] == pytest.approx(50.0)
+        assert result[iid]["stale_value"] == pytest.approx(100.0)
+
+    def test_stocktake_quality_short_timestamp(self, pdb):
+        """同缺陷类另一站点：stocktakes.created_at 无秒也不再抛错。"""
+        iid = add_item(pdb)
+        pdb.execute("INSERT INTO stocktakes (item_id, previous_quantity,"
+                    " actual_quantity, diff, created_at) VALUES (?, 10, 12, 2, ?)",
+                    (iid, ts_short(5)))
+        pdb.commit()
+        q = hp.compute_stocktake_quality(pdb, NOW)
+        assert q["last_stocktake_days"] == 5
+        assert q["diff_rate"] == 100.0
+
+    def test_fulfillment_mixed_width_counts_both(self):
+        """带秒与无秒的订单都要计入均值。
+
+        旧实现（try/except 吞 ValueError）会把无秒行静默丢弃 → 均值失真。
+        构造 2 天（带秒）+ 10 天（无秒）两单，正确均值 = 6.0，丢一单则 = 2.0。
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE store_orders (
+                id INTEGER PRIMARY KEY, status TEXT, created_at TEXT,
+                delivered_at TEXT, dc_warehouse_code TEXT,
+                store_warehouse_code TEXT);
+        """)
+        conn.execute("INSERT INTO store_orders (status, created_at, delivered_at,"
+                     " dc_warehouse_code) VALUES ('delivered', ?, ?, 'wh_x')",
+                     ("2026-10-01 08:00:00", "2026-10-03 08:00:00"))
+        conn.execute("INSERT INTO store_orders (status, created_at, delivered_at,"
+                     " dc_warehouse_code) VALUES ('delivered', ?, ?, 'wh_x')",
+                     ("2026-10-01 08:00", "2026-10-11 08:00"))
+        conn.commit()
+        f = hp.compute_fulfillment(conn, "wh_x", NOW)
+        conn.close()
+        assert f["avg_cycle_days"] == pytest.approx(6.0)
+
+
+class TestHealthRouteTimestampRegression:
+    """端到端回归：库里真有无秒流水时 /report/health 仍须 200（Issue #38 现场）。"""
+
+    def _seed_short_ts_rows(self, wh_path):
+        conn = sqlite3.connect(wh_path)
+        cat_id = conn.execute(
+            "SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()[0]
+        iid = conn.execute(
+            "INSERT INTO items (sku, name, category_id, quantity, safety_stock,"
+            " unit_cost, unit, updated_at) VALUES ('T-SHORT', '无秒流水品', ?,"
+            " 5, 0, 10, '件', '2026-10-15 08:00:00')", (cat_id,)).lastrowid
+        for action, delta, raw in (("补货入库", 10.0, "2026-08-12 14:00"),
+                                   ("出库", -5.0, "2026-10-14 09:00")):
+            conn.execute(
+                "INSERT INTO stock_movements (item_id, action, delta, created_at)"
+                " VALUES (?, ?, ?, ?)", (iid, action, delta, raw))
+        conn.commit()
+        conn.close()
+        return iid
+
+    def test_health_route_returns_200(self, logged_client):
+        client, wh_path = logged_client
+        self._seed_short_ts_rows(wh_path)
+        resp = client.get("/report/health")
+        assert resp.status_code == 200
+        assert "库存健康".encode() in resp.data
+
+    def test_health_export_returns_200(self, logged_client):
+        """CSV 导出与页面共用 _build_health_context，同样不能 500。"""
+        client, wh_path = logged_client
+        self._seed_short_ts_rows(wh_path)
+        resp = client.get("/report/health/export")
+        assert resp.status_code == 200
+        assert resp.headers["Content-Type"].startswith("text/csv")

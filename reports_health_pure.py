@@ -7,6 +7,8 @@
 口径铁律：
 - 时间过滤一律用 Python 侧 datetime 绑定参数，禁止 SQL datetime('now')——
   生产 CST / SQLite UTC 时区坑（生产 unit 未设 TZ），dev 不可复现、生产必现。
+- 时间列一律走 `parse_event_ts()`，禁止裸 `datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")`——
+  生产存在无秒形态（Issue #38），严格匹配即 500。
 - 所有阈值集中在模块级常量，改口径只动一处。
 - 呆滞 = FIFO 账龄重放（补货入库压层 / 负 delta 先进先出消层 / 其余事件按比例
   缩放层总和对齐 running）；重放终值 ≠ items.quantity 时该 SKU 回退
@@ -42,6 +44,50 @@ RESTOCK_PENDING_STATUS = "提交"
 
 REPLAY_MISMATCH_TOL = 0.01  # 重放终值 vs items.quantity 容差（浮点累计误差）
 
+# ---------------------------------------------------------------------------
+# 时间戳解析（Issue #38）
+# ---------------------------------------------------------------------------
+# 生产实测（2026-10-15 全 6 仓 + master 普查）：**只有 wh_000.db 的
+# stock_movements.created_at 与 restock_requests.created_at 各有 54 行**是
+# 16 字符形态「YYYY-MM-DD HH:MM」（无秒），跨度 2025-11-28 → 2026-10-13，
+# 即仍在产生（应用层全部走 _helpers.now() 的 19 字符格式，故源头是人工/ops SQL）。
+# 严格 "%Y-%m-%d %H:%M:%S" 撞上它即 ValueError → /report/health 500。
+#
+# 顺序即优先级：先试覆盖生产已知形态的格式，全部失败才抛错。
+_TS_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",      # 规范形态（应用层 now()，19 字符）
+    "%Y-%m-%d %H:%M",         # 生产存量：人工/ops SQL 无秒形态（16 字符，Issue #38）
+    "%Y-%m-%d %H:%M:%S.%f",   # 微秒（ISO-8601 子集）
+    "%Y-%m-%d",               # 纯日期 → 当日 00:00
+)
+
+
+def parse_event_ts(s: str) -> datetime:
+    """容错解析时间列，兼容带秒 / 无秒两种生产形态（Issue #38）。
+
+    只容忍上表列出的形态；其余一律抛 ValueError 且**消息带原始值**——原始值
+    进 traceback 正是本次事故能在 prod 一眼定位的原因。
+
+    **刻意不在调用点大面积 try/except 吞异常**：FIFO 账龄重放的正确性依赖
+    每一条流水的时间，静默跳过一条事件会把呆滞金额算错（错得无声无息，
+    比 500 更难发现）。未知形态应当响亮失败，由 DataQuality 层面单独处置。
+
+    另：不使用 `datetime.fromisoformat` 兜底——3.11+ 它会接受带时区偏移的
+    字符串并返回 aware datetime，与调用方的 naive `now` 相减会 TypeError；
+    本模块的时间语义是「本地 naive 字符串字典序」，不引入 aware 值。
+    """
+    if isinstance(s, str):
+        raw = s.strip()
+        if raw:
+            for fmt in _TS_FORMATS:
+                try:
+                    return datetime.strptime(raw, fmt)
+                except ValueError:
+                    continue
+    raise ValueError(
+        f"无法解析时间戳: {s!r}（支持 {' / '.join(_TS_FORMATS)}）"
+    )
+
 
 def fmt_date(ts: str | None) -> str | None:
     """取 created_at 的日期部分（YYYY-MM-DD）。"""
@@ -67,7 +113,7 @@ def replay_item_layers(movements: list[tuple[str, str, float]], final_qty: float
     running = 0.0
     for ts, action, delta in movements:
         delta = float(delta)
-        event_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        event_dt = parse_event_ts(ts)
         if delta > 0 and action in INBOUND_ACTIONS:
             layers.append([event_dt, delta])
             running += delta
@@ -308,10 +354,12 @@ def compute_fulfillment(master, wh_code: str | None, now: datetime) -> dict:
              AND status = 'delivered' AND delivered_at IS NOT NULL""",
         (wh_code, wh_code)).fetchall():
         try:
-            c = datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
-            d = datetime.strptime(r["delivered_at"], "%Y-%m-%d %H:%M:%S")
+            c = parse_event_ts(r["created_at"])
+            d = parse_event_ts(r["delivered_at"])
             cycle.append(max((d - c).total_seconds(), 0) / 86400.0)
         except (ValueError, TypeError):
+            # 形态未知的行按「不计入均值」处理（平均履约周期允许部分样本）；
+            # 已知的 19/16 字符形态都能解析，此处只兜真正陌生的数据。
             continue
     avg = round(sum(cycle) / len(cycle), 1) if cycle else None
     return {"backlog": row["backlog"] or 0, "in_transit": row["in_transit"] or 0,
@@ -346,7 +394,7 @@ def compute_stocktake_quality(db, now: datetime) -> dict:
     last_all = db.execute("SELECT MAX(created_at) AS d FROM stocktakes").fetchone()["d"]
     last_days = None
     if last_all:
-        last_days = (now - datetime.strptime(last_all, "%Y-%m-%d %H:%M:%S")).days
+        last_days = (now - parse_event_ts(last_all)).days
     total = row["total"] or 0
     diff_rate = round((row["diff_rows"] or 0) / total * 100, 1) if total else None
     return {"diff_rate": diff_rate, "unstale_count": len(unstale_items),

@@ -13,7 +13,8 @@
 #
 # 设计原则：
 #   - 蓝 :8090 不 kill（0 中断）
-#   - 绿 :8091 起 gunicorn 2 workers + DRY_RUN=true
+#   - 绿 :8091 起 gunicorn 2 workers + DRY_RUN=true；**用 restart 而非 start**
+#     （Issue #38：start 对在跑的 unit 是 no-op → 新 DB + 旧代码）
 #   - 健康检查：30 次 × 2s = 60s 超时；/health 期望 200 + JSON
 #   - 失败时取证：journalctl → /var/log/dailycheck/green-up-fail-${PR_NUM}.log
 #
@@ -160,10 +161,26 @@ else
 fi
 
 # 4. 起绿 systemd unit
-echo "[up] starting ${GREEN_UNIT} on :${GREEN_PORT} ..."
-_run systemctl start "${GREEN_UNIT}"
-echo "[up] starting ${GREEN_MCP_UNIT} on :${GREEN_MCP_PORT} ..."
-_run systemctl start "${GREEN_MCP_UNIT}"
+#
+# Issue #38 框架 gap：原来只 `start`，而 `systemctl start` 对**已在运行**的 unit
+# 是 no-op —— 绿进程继续跑旧代码，却已经把新 DB 拷进来了（「新库 + 旧码」），
+# 之后 verify / switch 全在一半新的环境上做判定。`restart` 语义 = 未跑则起、
+# 在跑则重启，正是本步骤要的。
+#
+# 刻意 `|| true` 而不让 `set -e` 直退：restart 失败（unit 不存在 / 启动即崩）
+# 交给步骤 5/6 健康检查判失败，再由步骤 7 落 journalctl + DB 取证——`set -e`
+# 当场退出会跳过取证，而「没有现场的失败」正是本次事故排查时最缺的东西。
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  PRE_GREEN_STATE="$(systemctl is-active "${GREEN_UNIT}" 2>/dev/null || true)"
+  echo "[up] ${GREEN_UNIT} pre-state: ${PRE_GREEN_STATE:-unknown}（在跑 → 必须 restart，否则留旧代码）"
+else
+  PRE_GREEN_STATE="unknown"
+  echo "[up] [DRY-RUN] would query systemctl is-active ${GREEN_UNIT}"
+fi
+echo "[up] restarting ${GREEN_UNIT} on :${GREEN_PORT} ..."
+_run systemctl restart "${GREEN_UNIT}" || true
+echo "[up] restarting ${GREEN_MCP_UNIT} on :${GREEN_MCP_PORT} ..."
+_run systemctl restart "${GREEN_MCP_UNIT}" || true
 
 # 5. 健康检查（30 × 2s = 60s 超时）
 HEALTH_OK=0
