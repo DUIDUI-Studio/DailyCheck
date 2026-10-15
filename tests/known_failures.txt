@@ -1,5 +1,9 @@
 # 已知 pre-existing 失败清单（CI 零新增门禁基线）
-# 基线日期：2026-10-10（18 failed / 711 passed）
+# 基线：2026-10-10 起 18 条失败；2026-10-13 起 16 条（nav_integration×2 修复后移除）。
+# 口径：清单按「失败集逐行」维护，与 passed 总数无关。passed 随环境而变
+#      （CI 忽略 tests/mcp_server；本地可跑该目录，实测 2 failed / 78 passed），
+#      引用 passed 数时必须写明口径，否则跨环境对比会误判。
+# 2026-10-13：nav_integration×2 随导航模块化修复并移除（失败集 18→16）。
 # 规则：清单只许收缩不许扩张；修复一个就删一行；新增失败不允许加进来。
 tests/mcp_server/test_data/test_warehouse.py::test_create_restock_increases_quantity
 tests/mcp_server/test_service/test_inbound.py::TestCreateRestock::test_create_restock_success
@@ -15,7 +19,5 @@ tests/test_forecast_pure.py::test_compute_daily_avg_quantize_2dp
 tests/test_forecast_pure.py::test_compute_daily_avg_filters_outside_30d
 tests/test_items_route.py::test_manager_can_view_items
 tests/test_items_route.py::test_negative_gram_per_unit_rejected
-tests/test_nav_integration.py::test_sidebar_includes_procurement_for_staff
-tests/test_nav_integration.py::test_land_page_staff_sees_procurement_and_notifications_not_forecast
 tests/test_procurement_route.py::test_procurement_store_staff_can_access_own_warehouse
 tests/test_recipe_cost_route.py::test_create_item_stores_selling_price
