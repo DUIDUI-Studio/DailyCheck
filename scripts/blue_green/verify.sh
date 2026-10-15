@@ -18,6 +18,8 @@
 #   5. 资源与依赖（systemctl status + journalctl + ss -tn）
 #   6. dry_run 隔离证据（prod_dryrun_evidence.sh）
 #   7. DB 隔离证据（绿进程 DAILYCHECK_DB_DIR + master.db 独立副本，Issue #28）
+#   8. nginx 入口探活（Issue #32）：过 :8080 真实打主站 + MCP，非 502；
+#      旧 bug 是「upstream 切了但 location 还在指旧池」→ 用户 502。
 
 # Issue #24 Bug B: 不用 set -e —— _run_check 返 1 会被 set -e 立即截断，
 # 绕过 trap 和主路径 _write_report（报告永远写不出来）。
@@ -82,8 +84,8 @@ _run() {
 }
 
 # 状态跟踪（Mac mini bash 3.x 不支持关联数组，用普通变量）
-R1="⏳"; R2="⏳"; R3="⏳"; R4="⏳"; R5="⏳"; R6="⏳"; R7="⏳"
-N1=""; N2=""; N3=""; N4=""; N5=""; N6=""; N7=""
+R1="⏳"; R2="⏳"; R3="⏳"; R4="⏳"; R5="⏳"; R6="⏳"; R7="⏳"; R8="⏳"
+N1=""; N2=""; N3=""; N4=""; N5=""; N6=""; N7=""; N8=""
 OVERALL_PASS=1
 
 # 写报告函数（Issue #22 fix: 提前到主流程前定义，fail 路径也可调）
@@ -114,6 +116,7 @@ _write_report() {
 | 5 | 资源与依赖 (systemctl + journalctl + ss) | ${R5} | ${N5:-} |
 | 6 | dry_run 隔离证据 (prod_dryrun_evidence.sh) | ${R6} | ${N6:-} |
 | 7 | DB 隔离证据 (DAILYCHECK_DB_DIR + 独立副本) | ${R7} | ${N7:-} |
+| 8 | nginx 入口探活 (:8080 主站 + MCP, 非 502) | ${R8} | ${N8:-} |
 
 ## 3. 写流量隔离证据（dry_run）
 
@@ -188,6 +191,7 @@ _run_check() {
       5) R5="🔵 DRY-RUN" ;;
       6) R6="🔵 DRY-RUN" ;;
       7) R7="🔵 DRY-RUN" ;;
+      8) R8="🔵 DRY-RUN" ;;
     esac
     return 0
   fi
@@ -200,6 +204,7 @@ _run_check() {
       5) R5="✅ PASS" ; N5="$(tail -3 /tmp/verify-5.log | head -1)" ;;
       6) R6="✅ PASS" ; N6="$(tail -3 /tmp/verify-6.log | head -1)" ;;
       7) R7="✅ PASS" ; N7="$(tail -3 /tmp/verify-7.log | head -1)" ;;
+      8) R8="✅ PASS" ; N8="$(tail -3 /tmp/verify-8.log | head -1)" ;;
     esac
     return 0
   else
@@ -211,6 +216,7 @@ _run_check() {
       5) R5="❌ FAIL" ; N5="$(tail -5 /tmp/verify-5.log)" ;;
       6) R6="❌ FAIL" ; N6="$(tail -5 /tmp/verify-6.log)" ;;
       7) R7="❌ FAIL" ; N7="$(tail -5 /tmp/verify-7.log)" ;;
+      8) R8="❌ FAIL" ; N8="$(tail -5 /tmp/verify-8.log)" ;;
     esac
     OVERALL_PASS=0
     return 1
@@ -321,6 +327,42 @@ _verify_check7_db_isolation() {
 # ============================================================
 _run_check "7" "DB 隔离证据 (DAILYCHECK_DB_DIR + master.db 独立副本)" \
   "_verify_check7_db_isolation"
+
+# ============================================================
+# check 8 实现：nginx 入口探活（Issue #32）
+#
+# 过 nginx :8080 真实打主站 + MCP（不绕开 nginx 探 upstream 端口——
+# 旧 bug 是 upstream 切了但 location 还在指旧池，绕过 nginx 探不到）。
+# 5xx / 000 = 入口不可用 = layout 漏改 / reload 未生效 / 后端 down。
+# 必须搭配 switch.sh 自己的 post-switch 探活（防御 reload 后立刻 502）；
+# 本 check 是 verify 终态保险，间隔几秒，捕获 reload → observe window 的
+# 任何状态漂移。
+# ============================================================
+NGINX_ENTRY="${NGINX_ENTRY:-http://127.0.0.1:8080}"
+_verify_check8_nginx_entry() {
+  local url_main="${NGINX_ENTRY}/" \
+        url_mcp="${NGINX_ENTRY}/api/mcp/" \
+        code_main code_mcp
+  code_main="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${url_main}" 2>/dev/null || echo 000)"
+  code_mcp="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${url_mcp}" 2>/dev/null || echo 000)"
+  echo "  ${url_main} → HTTP ${code_main}"
+  echo "  ${url_mcp} → HTTP ${code_mcp}"
+  local bad=""
+  if [[ "${code_main}" =~ ^5 ]] || [[ "${code_main}" == "000" ]]; then bad="${bad} 主站(${code_main})"; fi
+  if [[ "${code_mcp}" =~ ^5 ]] || [[ "${code_mcp}" == "000" ]]; then bad="${bad} MCP(${code_mcp})"; fi
+  if [[ -n "${bad}" ]]; then
+    echo "FAIL: nginx 入口 5xx/不可达:${bad}（Issue #32 防线：layout 必须单 upstream）"
+    return 1
+  fi
+  echo "OK: nginx 入口主站 + MCP 均非 5xx（main=${code_main} mcp=${code_mcp}）"
+  return 0
+}
+
+# ============================================================
+# 8. nginx 入口探活（Issue #32）
+# ============================================================
+_run_check "8" "nginx 入口探活 (:8080 主站 + MCP, 非 502)" \
+  "_verify_check8_nginx_entry"
 
 if [[ ${OVERALL_PASS} -eq 1 ]]; then
   echo "[verify] ✅ 全绿"

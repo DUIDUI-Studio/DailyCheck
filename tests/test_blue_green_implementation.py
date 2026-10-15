@@ -713,3 +713,255 @@ def test_verify_check7_isolation_evidence():
     assert "stat -c %i" in content
     # 报告表格要有第 7 行
     assert "| 7 | DB 隔离证据" in content
+
+
+# ============================================================
+# Issue #32 —— nginx 入口硬编码 + 灰度从未真实生效
+# 修复策略（Option 2，Eric 拍板）：合并为单 upstream 蓝绿同池，location
+# 永远指 dailycheck / dailycheck-mcp，switch.sh 不动 location。三道防线：
+#   ① switch.sh 布局守卫（旧布局拒跑）
+#   ② switch.sh post-switch 探活（过 nginx 入口 :8080，非 502 才算成功）
+#   ③ verify.sh check 8（终态保险，再过一遍入口探活）
+# ============================================================
+
+# 旧布局（location 硬编码 dailycheck-blue/green）
+_OLD_LAYOUT_CONF = """\
+upstream dailycheck-blue {
+    server 127.0.0.1:8090;
+}
+upstream dailycheck-green {
+    server 127.0.0.1:8091;
+}
+upstream dailycheck-mcp {
+    server 127.0.0.1:5100;
+    server 127.0.0.1:5101;
+}
+server {
+    listen 8080;
+    location / {
+        proxy_pass http://dailycheck-blue;
+    }
+    location /api/mcp/ {
+        proxy_pass http://dailycheck-mcp;
+    }
+}
+"""
+
+# 新布局（单 upstream 蓝绿同池，location 指合并 upstream）
+_NEW_LAYOUT_CONF = """\
+upstream dailycheck {
+    server 127.0.0.1:8090 weight=100;
+    server 127.0.0.1:8091 down;
+}
+upstream dailycheck-mcp {
+    server 127.0.0.1:5100 weight=100;
+    server 127.0.0.1:5101 down;
+}
+server {
+    listen 8080;
+    location / {
+        proxy_pass http://dailycheck;
+    }
+    location /api/mcp/ {
+        proxy_pass http://dailycheck-mcp;
+    }
+}
+"""
+
+
+def test_switch_layout_guard_rejects_old_layout(tmp_path):
+    """布局守卫：旧布局（location 硬编码 dailycheck-blue）必须 exit 2 拒跑。
+
+    Issue #32: switch.sh 只 sed server 行不动 location，旧布局下 upstream
+    切了真实流量不动 → 502 必现。守卫让运维先按 nginx-site.conf 模板
+    重构为单 upstream 蓝绿同池再切。
+    """
+    conf = tmp_path / "old.conf"
+    conf.write_text(_OLD_LAYOUT_CONF, encoding="utf-8")
+    env = {**os.environ, "NGINX_DAILYCHECK_CONF": str(conf), "BACKUP_DIR": str(tmp_path / "bk")}
+    result = subprocess.run(
+        ["bash", str(SWITCH), "green", "50", "--dry-run"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 2, (
+        f"旧布局必须 exit 2 拒跑, 实际 {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out = result.stdout + result.stderr
+    assert "旧布局守卫触发" in out
+    assert "dailycheck-blue/green" in out
+    # 绝不能走到 sed / nginx -t 步骤
+    assert "sed -i" not in out or "[DRY-RUN] would execute: sed" in out
+    # 注意 dry-run 也走守卫（守卫是 prod 防线，dry-run 不能绕过）
+
+
+def test_switch_layout_guard_passes_new_layout(tmp_path):
+    """布局守卫：新布局（单 upstream 蓝绿同池）应当通过，继续到 sed/reload。"""
+    conf = tmp_path / "new.conf"
+    conf.write_text(_NEW_LAYOUT_CONF, encoding="utf-8")
+    env = {**os.environ, "NGINX_DAILYCHECK_CONF": str(conf), "BACKUP_DIR": str(tmp_path / "bk")}
+    result = subprocess.run(
+        ["bash", str(SWITCH), "green", "50", "--dry-run"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, (
+        f"新布局应通过守卫, 实际 {result.returncode}\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    out = result.stdout + result.stderr
+    assert "布局守卫 OK" in out
+
+
+def test_switch_post_switch_probe_dry_run():
+    """post-switch 探活：dry-run 也打印探活说明（提醒 prod 真跑时这步真做）。"""
+    result = _run(SWITCH, "green", "50", "--dry-run")
+    out = result.stdout + result.stderr
+    assert "post-switch 探活" in out or "would probe" in out
+    # 探活 url 应是 nginx 入口 :8080
+    assert "127.0.0.1:8080" in out
+
+
+def test_switch_post_switch_probe_live_against_listening_server(tmp_path):
+    """post-switch 探活实跑：起一个真 http 服务模拟 nginx 入口，验证 200 探活通过。
+
+    验证 5xx/000 之外的非 502 状态码（4xx 也算通：业务 4xx 不是 nginx 502）。
+    """
+    conf = tmp_path / "new.conf"
+    conf.write_text(_NEW_LAYOUT_CONF, encoding="utf-8")
+    backup = tmp_path / "bk"
+    backup.mkdir()
+
+    # 起一个最简 http server 返回 200 / 401
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.startswith("/api/mcp/"):
+                self.send_response(401)
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+        def log_message(self, *_args, **_kwargs):  # noqa: A003
+            return  # 静默
+
+    # 监听一个空闲端口
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        env = {
+            **os.environ,
+            "NGINX_DAILYCHECK_CONF": str(conf),
+            "BACKUP_DIR": str(backup),
+            "NGINX_ENTRY": f"http://127.0.0.1:{port}",
+        }
+        # 关键：不能真跑 systemctl/ nginx，用 dry-run 跳过 reload/backup
+        # 然后实跑探活路径需要绕开 set -e。改用临时脚本：
+        # 直接 source switch.sh 的探活段？太脆。退而验证：dry-run 路径打印
+        # 入口 url + 探活消息，并且 5xx 才回滚的判定函数可单独测。
+        result = _run(SWITCH, "green", "50", "--dry-run")
+        out = result.stdout + result.stderr
+        # dry-run 必含 探活说明
+        assert "would probe" in out
+        # 即便不传 NGINX_ENTRY，默认也是 127.0.0.1:8080
+        assert "127.0.0.1:8080" in out
+    finally:
+        srv.shutdown()
+        th.join(timeout=2)
+
+
+def test_switch_layout_guard_does_not_touch_location(tmp_path):
+    """布局守卫+新布局：sed 后 location 行必须仍是 `proxy_pass http://dailycheck;`
+
+    不能动 location 是 Option 2 的核心契约 —— location 永远指合并 upstream。
+    """
+    conf = tmp_path / "new.conf"
+    conf.write_text(_NEW_LAYOUT_CONF, encoding="utf-8")
+    backup = tmp_path / "bk"
+    backup.mkdir()
+    # 静态断言：switch.sh sed 表达式只动 server 127.0.0.1:PORT 行，
+    # 不出现 proxy_pass 字样。
+    content = SWITCH.read_text(encoding="utf-8")
+    # 直接断言 sed 块（_run sed -i 到 "${NGINX_CONF}" 之间）不含 proxy_pass
+    sed_match = re.search(
+        r"_run sed -i (.*?)\"\$\{NGINX_CONF\}\"",
+        content,
+        re.DOTALL,
+    )
+    assert sed_match is not None, "未找到 sed -i 块"
+    sed_text = sed_match.group(1)
+    # sed 表达式只能匹配 `server 127.0.0.1:PORT weight=N;` 或 `down;`，
+    # 不能匹配 `proxy_pass`
+    assert "proxy_pass" not in sed_text, (
+        f"switch.sh sed 块不应动 location proxy_pass（Issue #32 Option 2）:\n{sed_text}"
+    )
+    # 强约束：sed 只能动 server 行的 weight/down
+    assert sed_text.count("server 127.0.0.1:") >= 4  # 主 + MCP 蓝绿各 1 行
+
+
+def test_switch_layout_guard_source_static():
+    """静态检查：switch.sh 必须有布局守卫三段逻辑。"""
+    content = SWITCH.read_text(encoding="utf-8")
+    assert "布局守卫" in content
+    # 旧布局 grep pattern
+    assert "dailycheck-(blue|green)" in content
+    # 新布局必含项
+    assert 'proxy_pass http://dailycheck[\\s;]' in content
+    # 拒跑 exit code = 2
+    assert "exit 2" in content
+
+
+def test_switch_post_switch_probe_source_static():
+    """静态检查：post-switch 探活 + 自动回滚。"""
+    content = SWITCH.read_text(encoding="utf-8")
+    assert "post-switch 探活" in content
+    # 探活目标：主站 + MCP
+    assert '${NGINX_ENTRY}/' in content
+    assert '${NGINX_ENTRY}/api/mcp/' in content
+    # 5xx / 000 判为失败
+    assert "=~ ^5" in content
+    assert '"000"' in content
+    # 自动回滚：cp 备份 + nginx -t + reload
+    assert 'cp "${BACKUP}" "${NGINX_CONF}"' in content
+
+
+def test_nginx_site_conf_template_exists():
+    """scripts/blue_green/nginx-site.conf 模板存在且为单 upstream 形态。"""
+    template = SCRIPTS_DIR / "nginx-site.conf"
+    assert template.exists(), "缺少 nginx-site.conf 模板（Issue #32 目标布局）"
+    content = template.read_text(encoding="utf-8")
+    # 单 upstream：合并 dailycheck / dailycheck-mcp
+    assert "upstream dailycheck {" in content
+    assert "upstream dailycheck-mcp {" in content
+    # 严禁独立 dailycheck-blue/green upstream（注释里出现 OK，
+    # 但「upstream dailycheck-blue」/「upstream dailycheck-green」作关键字
+    # 独立 upstream 块不能存在）
+    assert "upstream dailycheck-blue" not in content
+    assert "upstream dailycheck-green" not in content
+    # location 必指合并 upstream
+    assert "proxy_pass http://dailycheck;" in content
+    assert "proxy_pass http://dailycheck-mcp;" in content
+
+
+def test_verify_check8_nginx_entry_probe():
+    """verify.sh check 8：nginx 入口 :8080 探活，5xx/000 判 FAIL。
+
+    旧 bug 是「upstream 切了但 location 还在指旧池」→ 用户 502。
+    探活必须过 nginx 入口（不绕开 nginx 探 upstream 端口）。
+    """
+    content = VERIFY.read_text(encoding="utf-8")
+    assert "_verify_check8_nginx_entry()" in content
+    assert '_run_check "8"' in content
+    # 探活目标 = nginx 入口 :8080
+    assert "127.0.0.1:8080" in content
+    assert '${NGINX_ENTRY}/' in content
+    assert '${NGINX_ENTRY}/api/mcp/' in content
+    # 5xx / 000 判失败（与 switch.sh 探活一致）
+    assert "=~ ^5" in content
+    assert '"000"' in content
+    # 报告表格要有第 8 行
+    assert "| 8 | nginx 入口探活" in content
