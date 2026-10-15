@@ -195,14 +195,23 @@ def test_up_restart_failure_does_not_skip_evidence():
 
 
 def test_up_logs_pre_state_for_old_code_diagnosis():
-    """live 模式必须回显 restart 前的 unit 状态。
+    """live 模式必须**真的查**并回显 restart 前的 unit 状态。
 
     「新 DB + 旧代码」的症状只有对照 pre-state 才看得出（在跑 → 必须 restart），
     这也是 Issue #38 排查时人工补的一步。
+
+    断言刻意绑到 live 分支的**命令本体**而非「文件里出现过这个字符串」：
+    `systemctl is-active` 这半句也会被 dry-run 分支的 echo
+    （`would query systemctl is-active ...`）命中——只做子串存在性断言时，
+    把查询掏空成 `PRE_GREEN_STATE="unknown"` 仍会全绿（审核轮 1 实测存活）。
     """
     content = UP.read_text(encoding="utf-8")
-    assert "systemctl is-active" in content, "up.sh 未查 restart 前状态"
-    assert "pre-state" in content, "up.sh 未回显 pre-state"
+    assert re.search(
+        r'PRE_GREEN_STATE="\$\(systemctl is-active "\$\{GREEN_UNIT\}"', content
+    ), "live 模式未真正查询 restart 前状态（只留了 dry-run 的 echo 文案）"
+    assert re.search(
+        r'pre-state: \$\{PRE_GREEN_STATE', content
+    ), "pre-state 未回显查询变量本体"
 
 
 def test_up_dry_run_skip_db_copy():
@@ -401,7 +410,14 @@ def test_verify_writes_report_on_fail(tmp_path):
     content = reports[0].read_text(encoding="utf-8")
     assert "PR #22" in content
     assert "决策摘要" in content
-    assert "八项检查" in content
+    # 报告章节标题的项数必须与 verify.sh 实际跑到的检查数一致（PR #33 把 check
+    # 加到 8 项后标题一度仍写「五项」；Issue #38 收尾时对齐到八项）。
+    # 断言刻意绑**行首标题行**而不是子串存在性：`八项检查` 这样的词在报告正文
+    # 别处出现也能满足 `assert "八项检查" in content`，标题写错却照样全绿——
+    # 本仓库已发生过一次同类「假绿断言」（见 ARCHITECTURE §11 测试资产条），
+    # 故这里连行首位置一起钉住。
+    assert re.search(r"^## 2\. 八项检查", content, re.M), \
+        f"报告章节标题与实际检查项数不一致：{[ln for ln in content.splitlines() if ln.startswith('## 2.')]}"
 
 
 def test_verify_continues_after_check_fail_and_writes_report(tmp_path):

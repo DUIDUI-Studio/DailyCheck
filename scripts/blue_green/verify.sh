@@ -9,7 +9,7 @@
 #   0  全绿可切流量
 #   1  验证失败（任一项不达标）
 #
-# 八项检查（v0.1.md §四.2 报告 05）：
+# 八项检查（v0.1.md §四.2 报告 05 + PR #33 补 check 7/8）：
 #   1. 集成测试（pytest tests/ 顶层 + check_known_failures.py 零新增门禁）
 #   2. 模拟用户操作（sim_user.py 走 登录→选仓→总览→库存→健康报表 5 关键路径；
 #      凭据走 SIM_USER_USER / SIM_USER_PASSWORD 环境变量；末条 /report/health

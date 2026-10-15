@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -559,6 +560,27 @@ class TestTimestampTolerance:
         assert result[iid]["tier"] == "stale"
         assert result[iid]["stale_qty"] == pytest.approx(50.0)
         assert result[iid]["stale_value"] == pytest.approx(100.0)
+
+    def test_fulfillment_logs_warning_on_unknown_timestamp(self, caplog):
+        """丢样本必须留 WARNING（不静默）——变异：把 except 改成裸 pass 即变红。"""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE store_orders (
+                id INTEGER PRIMARY KEY, status TEXT, created_at TEXT,
+                delivered_at TEXT, dc_warehouse_code TEXT,
+                store_warehouse_code TEXT);
+        """)
+        conn.execute("INSERT INTO store_orders (status, created_at, delivered_at,"
+                     " dc_warehouse_code) VALUES ('delivered', ?, ?, 'wh_x')",
+                     ("not-a-ts", "2026-10-03 08:00:00"))
+        conn.commit()
+        with caplog.at_level(logging.WARNING, logger="reports_health_pure"):
+            f = hp.compute_fulfillment(conn, "wh_x", NOW)
+        conn.close()
+        assert f["avg_cycle_days"] is None      # 唯一样本被丢 → 无均值
+        assert any("履约周期样本跳过" in r.getMessage() for r in caplog.records), \
+            "丢样本必须在 WARNING 里留痕（静默丢数据不可接受）"
 
     def test_stocktake_quality_short_timestamp(self, pdb):
         """同缺陷类另一站点：stocktakes.created_at 无秒也不再抛错。"""

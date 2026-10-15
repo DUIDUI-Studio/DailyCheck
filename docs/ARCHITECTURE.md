@@ -141,7 +141,7 @@ flowchart LR
 
 ### 3.4 蓝绿部署（Phase 1 实装，2026-10-13 起）
 
-Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起绿：DB `cp -a` + systemd 启动 + 30×2s 健康检查）→ `verify.sh`（八项生产验证，报告落 `backups/prod-verifications/`）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。
+Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起绿：DB `cp -a` + systemd **restart** + 30×2s 健康检查）→ `verify.sh`（八项生产验证，报告落 `backups/prod-verifications/`）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。
 
 **铁律**：
 - **nginx 备份绝不写 `sites-enabled/`** —— 主配置 `include sites-enabled/*` 会把 `.bak` 当配置加载 → duplicate upstream 永久 fail（Issue #24 Bug A）。统一落 `BACKUP_DIR`（默认 `/var/lib/dailycheck-blue-green-backups/`）。
@@ -884,7 +884,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Pytest["pytest (59 个测试文件, 976 用例；2026-10-15 实测)"]
+    subgraph Pytest["pytest (59 个测试文件, 977 用例；2026-10-15 实测)"]
         Pure["test_*_pure.py<br/>纯逻辑单测<br/>~60% 用例"]
         Route["test_*_route.py<br/>视图集成测试<br/>~30% 用例"]
         E2E["test_*_e2e.py<br/>端到端 ~5%"]
@@ -1022,6 +1022,8 @@ with app.test_client() as c, c.session_transaction() as s:
 - **生产存量存在无秒形态**：2026-10-15 全 6 仓 + master 普查，只有 `wh_000.db` 的 `stock_movements.created_at` 与 `restock_requests.created_at` 各有 **54 行** 是 16 字符 `YYYY-MM-DD HH:MM`（跨度 2025-11-28 → 2026-10-13，**仍在产生**）。应用层所有写入点都走 `_helpers.now()` 的 19 字符格式，故来源是人工 / ops SQL。
 - **读侧一律用 `reports_health_pure.parse_event_ts()`**，禁止裸 `datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")`——严格匹配撞上无秒数据即 `ValueError` → `/report/health` 500（`replay_item_layers` 与 `compute_stocktake_quality` 两个站点都会炸）。
 - **未知形态必须响亮失败**：`parse_event_ts` 抛 `ValueError` 且消息带原始值（原始值进 traceback 是本次事故能在 prod 一眼定位的原因）。**不许在调用点大面积 `try/except` 吞掉**——FIFO 账龄重放依赖每条流水的时间，静默跳过一条事件会把呆滞金额算错（错得无声无息，比 500 更难发现）。
+- **唯一豁免：聚类型指标**。均值 / 占比类（如 `compute_fulfillment` 的平均履约周期）丢一个样本只让分母变小，**不会**像 FIFO 重放那样让整体结果错位，故允许 `except ValueError: continue`——但**必须留 WARNING 日志**（`logger.warning` 带原始异常消息），保持「不静默丢数据」这条线。
+- **混排形态下 SQL 侧字典序比较在分钟粒度内非严格时序**：`created_at >= ?` / `>= recent_start`（`reports_health_pure.py` 的窗口过滤）是**字符串**比较，16 字符值在同一分钟内字典序排在 19 字符值之前。影响仅限 cutoff 前后 1 分钟内的行被不对称算入，量级可忽略，但别据此做严格时序推断。
 - **不用 `datetime.fromisoformat` 兜底**：3.11+ 它会接受带时区偏移的字符串并返回 aware datetime，与调用方的 naive `now` 相减会 `TypeError`。本模块的时间语义是「本地 naive 字符串字典序」，不引入 aware 值。
 
 ---
@@ -1033,7 +1035,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 16 failed 测试（本地全量口径，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
 | 时区不一致 | **高** | pre-existing | 多租户改造前必修 |
 | 配方成本 qty 语义不一致 | **高** | pre-existing (2026-09-02 起) | 财务对账会出错，待 owner 拍板 |
-| 全仓 13 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `consumption.py`×2 / `forecast.py`×2 / `procurement.py`×1 / `app.py`×1 / `rate_limit_pure.py`×2 / `mcp_server/data/warehouse.py`×2 等。**当前无生产数据触发**（普查显示它们读的 `outbound_requests` / `production_runs` / `recipe_cost` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 4 处；后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
+| 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:77,97` / `blueprints/procurement.py:179` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:85` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 4 处；后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | **2026-10-15 实测在产** | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。待 Prod Agent / owner 处置：立即 `switch.sh blue 100` 或去掉绿 unit 的 `DRY_RUN=true` 并重启；根治需给 `switch.sh` 加「目标绿 unit 声明 DRY_RUN 时拒切」的前置守卫（建议独立 PR） |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |

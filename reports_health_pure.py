@@ -16,7 +16,10 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 口径常量（Eric 2026-10-15 拍板）
@@ -62,7 +65,7 @@ _TS_FORMATS = (
 )
 
 
-def parse_event_ts(s: str) -> datetime:
+def parse_event_ts(s: object) -> datetime:
     """容错解析时间列，兼容带秒 / 无秒两种生产形态（Issue #38）。
 
     只容忍上表列出的形态；其余一律抛 ValueError 且**消息带原始值**——原始值
@@ -71,6 +74,12 @@ def parse_event_ts(s: str) -> datetime:
     **刻意不在调用点大面积 try/except 吞异常**：FIFO 账龄重放的正确性依赖
     每一条流水的时间，静默跳过一条事件会把呆滞金额算错（错得无声无息，
     比 500 更难发现）。未知形态应当响亮失败，由 DataQuality 层面单独处置。
+    唯一豁免是**聚类型指标**（均值 / 占比，丢样本只会让分母变小而不会让
+    结果错位）——见 `compute_fulfillment`，那里丢样本时留 WARNING 不静默。
+
+    入参标注为 `object` 而非 `str`：值直接来自 SQLite 列（可能为 NULL /
+    数字），实现主动把非 str、空白串一律归一成 ValueError，而不是让
+    `strptime` 抛 TypeError。
 
     另：不使用 `datetime.fromisoformat` 兜底——3.11+ 它会接受带时区偏移的
     字符串并返回 aware datetime，与调用方的 naive `now` 相减会 TypeError；
@@ -337,7 +346,9 @@ def compute_fulfillment(master, wh_code: str | None, now: datetime) -> dict:
     口径：本仓参与（dc_warehouse_code 或 store_warehouse_code 命中）的
     store_orders——DC 是履约方、门店是下单方，两视角都看自己的单。
     积压 = status IN (pending, approved)；在途 = shipped；
-    平均履约周期 = delivered 且 delivered_at/created_at 齐全订单的均值（天，1 位小数）。
+    平均履约周期 = delivered 且 delivered_at/created_at 齐全订单的均值（天，1 位小数）；
+    时间戳形态无法解析的行不计入均值（丢样本）并留 WARNING——聚类型指标豁免
+    见 `parse_event_ts` docstring。
     """
     if wh_code is None:
         return {"backlog": None, "in_transit": None, "avg_cycle_days": None}
@@ -357,9 +368,12 @@ def compute_fulfillment(master, wh_code: str | None, now: datetime) -> dict:
             c = parse_event_ts(r["created_at"])
             d = parse_event_ts(r["delivered_at"])
             cycle.append(max((d - c).total_seconds(), 0) / 86400.0)
-        except (ValueError, TypeError):
-            # 形态未知的行按「不计入均值」处理（平均履约周期允许部分样本）；
-            # 已知的 19/16 字符形态都能解析，此处只兜真正陌生的数据。
+        except ValueError as exc:
+            # 口径豁免（与 §13.8「账龄重放不许静默跳过」相区分）：平均履约
+            # 周期是**聚类型**指标——丢一个样本只让分母变小，不会像 FIFO 重放
+            # 那样让整体结果错位。已知的 19/16 字符形态都能解析，此处只兜真正
+            # 陌生的数据；不静默，留 WARNING 供排查（logger 名即模块名）。
+            logger.warning("履约周期样本跳过（时间戳无法解析）: %s", exc)
             continue
     avg = round(sum(cycle) / len(cycle), 1) if cycle else None
     return {"backlog": row["backlog"] or 0, "in_transit": row["in_transit"] or 0,
