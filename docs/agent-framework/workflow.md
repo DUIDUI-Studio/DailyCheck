@@ -1,6 +1,7 @@
 # DailyCheck Agent 协作工作流
 
 > 版本：2026-10-15 定稿（Eric 口述对齐 + 实况核对；同日二次修订——push 政策放开、merge 政策改为 Prod 判定）。
+> 新/旧 agent session 接入本机制的提示词见 [`session-bootstrap.md`](session-bootstrap.md)。
 > 本文档是 Dev / Prod / Owner 三方协作的权威口径；与本文冲突的口头约定以本文为准。
 > 机制细节的演进史见 `docs/agent-framework/v0.1.md`。
 

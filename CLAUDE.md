@@ -3,6 +3,14 @@
 > **每次 session 启动按顺序先读**：
 > 1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — **项目技术架构图（系统拓扑/数据/模块/请求生命周期/鉴权/MCP/业务领域/部署/PWA/测试/约定）**。改动任何子系统前必须先读。
 > 2. [`docs/DEV_ENV.md`](docs/DEV_ENV.md) — 记录了当前 dev 环境的部署方式(wdg-systemd 容器)、入口、调试命令和已知坑。错误的部署模型会导致走错方向(例如以为有独立 Dockerfile)。
+> 3. [`docs/agent-framework/workflow.md`](docs/agent-framework/workflow.md) — **Dev/Prod/Owner 三方协作工作流（权威口径）**：角色分工、push/merge 政策、PR 模板与门禁、蓝绿部署、应急。任何提交代码 / 提 PR / 部署动作前必须对齐。
+
+## 协作工作流速记（细节以 workflow.md 为准）
+
+- **角色**：Dev Agent = 开发/测试/提 PR（**不 merge**）；Prod Agent = merge 判定 + 蓝绿部署；Eric = 需求拍板 + 红线。
+- **push 已放开**（2026-10-15）：普通 push 不需 Eric 事先确认（hook 恒 exit 1，用 `git push --no-verify` 是既定姿势）；`--force`/删远程分支/改保护规则仍需确认。
+- **提 PR 必含三段**（`check_reports.py` 门禁强制）：`## 报告 1/4`（R 表 ❌ 待填全消解）+ `## Checklist` + `## 生产侧事项`（只写规范流程粒度，不写操作脚本）；body 全文禁字面「❌」字符。
+- **红线**（须 Eric 拍板）：扩张 `tests/known_failures.txt`、改 CI workflow、改分支保护、删 ARCHITECTURE 铁律、改 workflow.md 自身。
 
 ## 技术栈
 - **后端**: Flask 3.1.1 + Python 3.10+
@@ -12,7 +20,7 @@
 - **MCP 服务器**: Python MCP SDK + Starlette + Uvicorn（支持 stdio 和 HTTP/SSE 两种模式）
 - **测试**: pytest
 - **Lint**: Ruff（target Python 3.10, line_length=100, 规则 E/F/W/I/B/UP）
-- **部署**: GitHub Actions（push to main 触发，通过 SSH 推送至 VPS）
+- **部署**: 生产 = Prod Agent 蓝绿部署（VPS 蓝绿双机 + nginx 切流）；CI 只做门禁（自动部署已禁用）
 
 ## Dev 环境（在 wdg-systemd 容器里）
 
@@ -200,8 +208,8 @@ pytest tests/mcp_server/ -v
 | `flask create-agent-token <name>` | 创建 Agent 令牌（支持 `--read-paths`、`--write-paths`、`--warehouses`） |
 
 ## 部署
-- GitHub Actions（`.github/workflows/deploy.yml`）：push 到 main 时自动部署
-- 部署流程：tar 项目 → SSH 到 VPS → kill gunicorn → 解压 → 创建 venv → pip install → 重启 gunicorn（2 workers, port 8080）
+- ⚠️ **自动部署已禁用**（2026-10-11 Eric 拍板）：push 到 main **不**触发部署，deploy job 仅 `workflow_dispatch`。生产发版走 Prod Agent 蓝绿流程（见 `docs/agent-framework/workflow.md` §五）。
+- 旧的手动部署流程（tar → SSH → 重启 gunicorn）已被蓝绿部署取代，仅作应急参考
 - 数据库文件（`master.db`、`db/warehouses/*.db`）保留在服务端，不随部署推送
 
 ## 环境变量
