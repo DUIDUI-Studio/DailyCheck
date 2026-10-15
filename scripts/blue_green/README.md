@@ -106,7 +106,8 @@ if current_app.config.get("DRY_RUN"):
 # 2. 跑八项生产验证（出 templates/05 报告）
 #    check 2 需要一次性模拟账号凭据；verify.sh 会在**绿库**内幂等建号
 #    （`--admin`，蓝库零写入）——无需事先手工 create-user。
-export SIM_USER_USER=sim_user_v1 SIM_USER_PASSWORD='<一次性口令>'
+export SIM_USER_USER=sim_user_v1
+read -rsp 'SIM_USER_PASSWORD: ' SIM_USER_PASSWORD; export SIM_USER_PASSWORD  # 值现场输入，不入仓库
 ./scripts/blue_green/verify.sh pr-123
 #    ⚠️ 该账号随绿库存在，切流量后会进生产；切完按 down.sh / 账号停用流程处置。
 

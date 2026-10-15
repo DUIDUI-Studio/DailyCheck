@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.server
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -37,6 +38,14 @@ from werkzeug.security import generate_password_hash
 # 脚本路径
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
 REPO_ROOT = SCRIPTS_DIR.parent.parent
+
+# 探针口令：**故意不写成字面量**。GitGuardian 会把 `password="<字面量>"` 这类
+# 赋值当 Generic Password 判为泄露，直接把 PR 检查打红；而断言从不依赖口令
+# 取值，随机化反而更能证明「密码匹配」那条复核真在工作（写死值可能被
+# create-user 的幂等分支掩盖）。每个测试会话一组新值，互不相等。
+_SIM_PW = f"sim-{secrets.token_hex(8)}"
+# 「绿库里那个同名账号用的是别的口令」场景要用一组**不同**的值。
+_OTHER_PW = f"other-{secrets.token_hex(8)}"
 UP = SCRIPTS_DIR / "up.sh"
 VERIFY = SCRIPTS_DIR / "verify.sh"
 SWITCH = SCRIPTS_DIR / "switch.sh"
@@ -718,7 +727,7 @@ def _user_row(db_dir: Path, user: str) -> tuple[int, int] | None:
 def _run_ensure_fn(
     green_db: Path, *,
     user: str = "sim_user_t",
-    password: str = "sim-pw",
+    password: str = _SIM_PW,
     inherited_db_dir: Path | None = None,
     omit_creds: bool = False,
     repo_root: Path | None = None,
@@ -848,7 +857,7 @@ def test_ensure_sim_user_rejects_disabled_account(tmp_path):
     green = tmp_path / "green"
     green.mkdir()
     _init_master(green)
-    _seed_user(green, "sim_user_t", "sim-pw", is_admin=1, is_active=0)
+    _seed_user(green, "sim_user_t", _SIM_PW, is_admin=1, is_active=0)
 
     r = _run_ensure_fn(green)
     assert r.returncode != 0, "已停用账号却通过了（探针只会拿到含糊 403）"
@@ -925,9 +934,9 @@ def test_ensure_sim_user_fails_on_password_mismatch(tmp_path):
     green = tmp_path / "green"
     green.mkdir()
     _init_master(green)
-    _seed_user(green, "sim_user_t", "another-pw", is_admin=1)
+    _seed_user(green, "sim_user_t", _OTHER_PW, is_admin=1)
 
-    r = _run_ensure_fn(green, password="sim-pw")
+    r = _run_ensure_fn(green, password=_SIM_PW)
     assert r.returncode != 0, "密码不匹配却通过了"
     assert "密码 != SIM_USER_PASSWORD" in (r.stdout + r.stderr)
 
@@ -937,7 +946,7 @@ def test_ensure_sim_user_rejects_unbound_non_admin(tmp_path):
     green = tmp_path / "green"
     green.mkdir()
     _init_master(green)
-    _seed_user(green, "sim_user_t", "sim-pw", is_admin=0)
+    _seed_user(green, "sim_user_t", _SIM_PW, is_admin=0)
 
     r = _run_ensure_fn(green)
     assert r.returncode != 0, "无可见仓的账号却通过了（路径 3 会含糊失败）"
@@ -949,7 +958,7 @@ def test_ensure_sim_user_accepts_bound_non_admin(tmp_path):
     green = tmp_path / "green"
     green.mkdir()
     _init_master(green)
-    _seed_user(green, "sim_user_t", "sim-pw", is_admin=0, bind_to_warehouse=1)
+    _seed_user(green, "sim_user_t", _SIM_PW, is_admin=0, bind_to_warehouse=1)
 
     r = _run_ensure_fn(green)
     assert r.returncode == 0, f"有绑定的非 admin 被误拒: {r.stdout}{r.stderr}"
