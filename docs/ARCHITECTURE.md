@@ -157,6 +157,31 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起�
 - 单测：`tests/test_blue_green_implementation.py`（80 用例，bash -n / dry-run 回显 / 参数解析 / 关键不变量 / sim_user 假服务器全流程（含 Issue #38 路径 5：500 拦截 / 403 提示 / 落点校验防假绿）/ 绿库账号 provision（Issue #34：env pin 覆盖语义 + `--admin` + 可见仓/停用/密码三条复核 + 写库前「拒绝写蓝库」双闸（路径形态 + inode），函数按标记抽取真跑）/ config env 覆盖；关键断言逐条经变异验证）。**夹具凭据一律不写字面量**：口令用 `secrets.token_hex()` 运行期生成（`_SIM_PW` / `_OTHER_PW`）——`password="<字面量>"` 会被 GitGuardian 的 Generic Password 规则判为泄露、直接把 PR 检查打红，而断言从不依赖取值。另有 `tests/test_blue_green_dryrun_guard.py`（10 用例：DRY_RUN 守卫拦截/放行/无法判定三态、conf 应用核验、落点核验（命中/对侧回滚/不可读告警）、灰度跳过；live 全流程跑 switch.sh，PATH 前置 fake systemctl/nginx + 本地假入口服务器；关键断言逐条经变异验证）。两文件合计 90 用例（80 + 10）。
 - **协作流程与门禁**：Dev 提 PR 必含「生产侧事项」段（`check_reports.py` 强制，缺失即红），只写规范流程粒度不写操作脚本；**merge 由 Prod Agent 判定执行**（CI 全绿 + 独立审查，异议打回），红线清单见 `docs/agent-framework/workflow.md` §四。
 
+### 3.5 PR Webhook 接收器（2026-10-15 实装）
+
+Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver` → `inbox.jsonl` → Prod Agent 订阅 inbox 跑 merge 决策**。秒级通知，替代 30 分钟轮询。
+
+**组件**（`scripts/blue_green/webhook_receiver.py`，Flask 127.0.0.1:8443）：
+- **HMAC-SHA256 验签**（`X-Hub-Signature-256` + `WEBHOOK_SECRET` env）—— 拒伪 + 拒重放，constant-time 防时序攻击
+- **事件过滤**：仅 `pull_request`，action 仅 `{opened, synchronize, reopened}`（`closed` / `edited` / `labeled` 等跳过）
+- **幂等**：按 `X-GitHub-Delivery` 去重（GitHub 会重试 6 次，receiver 必须幂等否则 inbox 写脏）
+- **反压**：`inbox_size ≥ MAX_INBOX_LINES`（默认 1000）返回 503，GitHub 暂停重试（指数退避 1s/2s/.../1h）
+- **inbox 落盘**：每行 JSON，append-only，含 `delivery_id / event / action / pr_number / pr_title / pr_head_sha / pr_base_ref / pr_author / repo_full_name / received_at_ms`
+
+**部署**（owner / Prod Agent 手动，不进 Dev 自动化）：
+- DNS：`hook.kjtang.cn` A 记录 → 112.124.18.246（与主站同 IP）
+- 证书：阿里云 DV 重签加 SAN `hook.kjtang.cn`（替换 `/etc/nginx/ssl/kjtang.cn.{pem,key}`）
+- systemd：`deploy/systemd/dc-webhook-receiver.service`（监听 127.0.0.1:8443，单 worker，gunicorn，Restart=always 5s）
+- nginx：`deploy/nginx/hook.kjtang.cn.snippet.conf` 追加到 `/etc/nginx/sites-enabled/dailycheck` 末尾（443 TLS 终结 + proxy_pass，limit_req 30r/s 防滥刷）
+- WEBHOOK_SECRET：32 字节强密码，写 `/etc/dailycheck/webhook-secret`（600 root），**不出现 git 仓库 / 文档 / prompt**（仅 systemd unit `EnvironmentFile=` 引用 + GitHub repo webhook 设置）
+- GitHub repo：Settings → Webhooks → Add，URL `https://hook.kjtang.cn/webhook`，Secret 同上，Events **只勾 "Pull requests"**
+
+**生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（30-45 分钟手动部署；DNS / 证书重签 / systemd / nginx reload / GitHub 配 webhook 五步 + 端到端验证）。
+
+**测试**：`tests/test_webhook_receiver.py`（13 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 各自对应测试 FAIL）。
+
+**Prod Agent 集成**：Prod Agent 需改造为「订阅 `inbox.jsonl`（inotify 或 `tail -F`）→ 收到新条目立即跑 merge 决策 + 30 分钟兜底轮询 `gh pr list`（防 webhook 漏）」。这是 Prod Agent 端改造，不在 Dev 自动化范围。
+
 ---
 
 ## 4. 数据架构
