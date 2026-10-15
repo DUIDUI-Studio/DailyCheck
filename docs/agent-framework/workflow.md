@@ -102,12 +102,16 @@ Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 git pull → up.sh <pr> <sha>
              ├─ 守卫：绿 unit 必须声明 DAILYCHECK_DB_DIR 且 = 拷贝目标，否则拒启
              ├─ cp -aL 真库 ${APP_DIR}/db → /var/lib/dailycheck-green/db（独立副本）
-             └─ 起绿 :8091/:5101 + 健康检查
-         → verify.sh <pr> 七项（任一 ❌ 即 FAIL 并自动写报告）
-             1 pytest 零新增门禁   2 sim_user 四路径   3 ab 性能比对
+             └─ 起绿 :8091/:5101 + 健康检查（绿 unit 声明 DRY_RUN=true = 验证期写隔离）
+         → verify.sh <pr> 八项（任一 ❌ 即 FAIL 并自动写报告）
+             1 pytest 零新增门禁   2 sim_user 五路径   3 ab 性能比对
              4 回滚演练            5 资源与依赖        6 dry_run 隔离证据
              7 DB 隔离证据（environ + 非软链 + inode 相异）
-         → switch.sh 灰度 5% → 50% → 100%（每档观察）
+             8 nginx 入口终态探活（主站 + MCP，非 502）
+         → 【绿转正】承接流量前必做（Issue #41）：关 DRY_RUN + DAILYCHECK_DB_DIR 指回
+             ${APP_DIR}/db + restart 绿两个 unit + 复验；标准 5 步见 scripts/blue_green/README.md
+             ⚠️ 未转正时 switch.sh 的 DRY_RUN 守卫会拒跑（exit 3）——这是预期拦截，不是故障
+         → switch.sh 灰度 5% → 50% → 100%（每档观察；100%/0% 边界自动做落点核验）
          → 观察窗 ≥30min → 收官（绿=生产，蓝 standby）
 ```
 
