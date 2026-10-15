@@ -7,17 +7,25 @@
 - 参数解析（缺参/错参 exit 64）
 - 跨脚本调用（rollback.sh → switch.sh）
 - 关键变量替换正确（weight=0 → down 标记）
+- Issue #22/#24/#28/#32/#34 专项回归：
+  * verify.sh check 2 的绿库账号 provision（按标记抽取函数真跑）
+  * check 7 DB 隔离证据（environ / 非软链 / inode）
+  * check 8 nginx 入口探活 + switch.sh 单 upstream 布局
+
+真跑但受控：check 2 的 provision 用例会起 flask CLI（init-master /
+create-user）并落 tmp_path 的临时库，不碰仓库真库。
 
 不测：
-- 实跑（systemctl / nginx）— 在 VPS 沙箱由 Prod Agent 测
-- Playwright / ab — 工具未装时优雅跳过
+- 真实生产动作（systemctl / nginx / ab / Playwright 浏览器）— 在 VPS 由 Prod Agent 测
 """
 from __future__ import annotations
 
 import http.server
 import os
 import re
+import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -25,9 +33,19 @@ import urllib.parse
 from pathlib import Path
 
 import pytest
+from werkzeug.security import generate_password_hash
 
 # 脚本路径
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
+REPO_ROOT = SCRIPTS_DIR.parent.parent
+
+# 探针口令：**故意不写成字面量**。GitGuardian 会把 `password="<字面量>"` 这类
+# 赋值当 Generic Password 判为泄露，直接把 PR 检查打红；而断言从不依赖口令
+# 取值，随机化反而更能证明「密码匹配」那条复核真在工作（写死值可能被
+# create-user 的幂等分支掩盖）。每个测试会话一组新值，互不相等。
+_SIM_PW = f"sim-{secrets.token_hex(8)}"
+# 「绿库里那个同名账号用的是别的口令」场景要用一组**不同**的值。
+_OTHER_PW = f"other-{secrets.token_hex(8)}"
 UP = SCRIPTS_DIR / "up.sh"
 VERIFY = SCRIPTS_DIR / "verify.sh"
 SWITCH = SCRIPTS_DIR / "switch.sh"
@@ -330,7 +348,7 @@ def test_verify_writes_report_on_fail(tmp_path):
     content = reports[0].read_text(encoding="utf-8")
     assert "PR #22" in content
     assert "决策摘要" in content
-    assert "五项检查" in content or "2. 五项" in content
+    assert "八项检查" in content
 
 
 def test_verify_continues_after_check_fail_and_writes_report(tmp_path):
@@ -620,6 +638,330 @@ def test_sim_user_missing_credentials_exit_64():
     r = _run_sim_user("http://127.0.0.1:1", {})
     assert r.returncode == 64
     assert "SIM_USER_USER" in (r.stdout + r.stderr)
+
+
+# ============================================================
+# Issue #34：check 2 的 sim 凭据必须 provision 进「绿」库
+#
+# 症状（2026-10-15 verify-18b 实测）：verify.sh 由 wrapper shell 调用，不在绿
+# unit 环境里、通常没有 DAILYCHECK_DB_DIR —— 此时 create-user 写**蓝库
+# （production 真库）**，而探针打的是绿 :8091（绿进程读 GREEN_DB）→
+# 绿库查无此人 → 路径 2 恒 401。
+# 修法：_ensure_sim_user_in_green_db() 用**显式覆盖语义**的
+# DAILYCHECK_DB_DIR 在绿库内幂等 ensure 账号（且必须 --admin：非 admin
+# 用户的选仓页只列 warehouse_users 绑定的仓 → 空 → 路径 3 必失败），
+# 并在探针前复核「密码匹配 + 有可见仓」。
+# 下列用例把该函数从 verify.sh 里抽出来真跑（受控 env + 临时库），
+# 关键断言均已变异验证（去掉 env pin / 去掉复核 / 去掉 --admin → 必 FAIL）。
+# ============================================================
+_ENSURE_START = "# <<< ensure-sim-user:start >>>"
+_ENSURE_END = "# <<< ensure-sim-user:end >>>"
+
+
+def _extract_ensure_fn() -> str:
+    """从 verify.sh 抽出 _ensure_sim_user_in_green_db（行为用例真跑它）。
+
+    用显式标记定界（不靠花括号配平猜）——verify.sh 删标记即测试失败。
+    """
+    content = VERIFY.read_text(encoding="utf-8")
+    assert _ENSURE_START in content and _ENSURE_END in content, (
+        "verify.sh 缺 ensure-sim-user 标记（tests 抽取函数体的锚点）"
+    )
+    body = content.split(_ENSURE_START, 1)[1].split(_ENSURE_END, 1)[0].strip()
+    assert "_ensure_sim_user_in_green_db() {" in body, "标记之间不是该函数"
+    return body
+
+
+def _init_master(db_dir: Path) -> None:
+    """在指定 DB 目录建一个真的 master.db（走项目自己的 CLI）。"""
+    r = subprocess.run(
+        [sys.executable, "-m", "flask", "--app", "app", "init-master"],
+        capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+        env={**os.environ, "DAILYCHECK_DB_DIR": str(db_dir)},
+    )
+    assert r.returncode == 0, f"init-master 失败: {r.stdout}{r.stderr}"
+    assert (db_dir / "master.db").is_file(), "init-master 未产出 master.db"
+
+
+def _seed_user(
+    db_dir: Path, user: str, password: str,
+    *, is_admin: int = 0, is_active: int = 1, bind_to_warehouse: int | None = None,
+) -> None:
+    """直接在绿库里塞一个凭据（模拟 up.sh 快照里已有的账号）。
+
+    bind_to_warehouse 非 None 时补一行 warehouse_users 绑定——
+    守卫只判「有没有绑定行」，故无需真造 warehouse 记录。
+    """
+    with sqlite3.connect(db_dir / "master.db") as conn:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, is_admin, is_active,"
+            " created_at) VALUES (?, ?, ?, ?, '2026-01-01 00:00:00')",
+            (user, generate_password_hash(password), is_admin, is_active),
+        )
+        if bind_to_warehouse is not None:
+            uid = conn.execute(
+                "SELECT id FROM users WHERE username=?", (user,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO warehouse_users (user_id, warehouse_id, role)"
+                " VALUES (?, ?, 'staff')",
+                (uid, bind_to_warehouse),
+            )
+        conn.commit()
+
+
+def _user_row(db_dir: Path, user: str) -> tuple[int, int] | None:
+    """回读 (is_admin, 绑定数)；账号不存在返回 None。"""
+    with sqlite3.connect(db_dir / "master.db") as conn:
+        row = conn.execute(
+            "SELECT id, is_admin FROM users WHERE username=?", (user,)
+        ).fetchone()
+        if row is None:
+            return None
+        bound = conn.execute(
+            "SELECT count(*) FROM warehouse_users WHERE user_id=?", (row[0],)
+        ).fetchone()[0]
+    return row[1], bound
+
+
+def _run_ensure_fn(
+    green_db: Path, *,
+    user: str = "sim_user_t",
+    password: str = _SIM_PW,
+    inherited_db_dir: Path | None = None,
+    omit_creds: bool = False,
+    repo_root: Path | None = None,
+    blue_master: Path | None = None,
+    python_bin: str | None = None,
+) -> subprocess.CompletedProcess:
+    """在受控环境里真跑 verify.sh 的 ensure 函数。
+
+    inherited_db_dir 非 None 时模拟「wrapper shell 自带 DAILYCHECK_DB_DIR」
+    （生产里这是蓝库）——函数必须用覆盖语义顶掉它。
+    omit_creds=True 时不注入凭据（验证函数自身的非空前置门禁）。
+    repo_root / blue_master 可覆盖「蓝库」位置，让「拒绝写蓝库」两个闸
+    能在**完全不碰仓库真库**的前提下被验证。
+    """
+    lines = [
+        "set -uo pipefail",
+        f'REPO_ROOT="{repo_root or REPO_ROOT}"',
+        f'DC_PYTHON_BIN="{python_bin or sys.executable}"',
+        f'GREEN_DB="{green_db}"',
+    ]
+    if not omit_creds:
+        lines += [
+            f'export SIM_USER_USER="{user}"',
+            f'export SIM_USER_PASSWORD="{password}"',
+        ]
+    if blue_master is not None:
+        lines.append(f'export BLUE_MASTER="{blue_master}"')
+    lines += [_extract_ensure_fn(), "_ensure_sim_user_in_green_db", ""]
+    env = os.environ.copy()
+    for key in ("DAILYCHECK_DB_DIR", "SIM_USER_USER", "SIM_USER_PASSWORD",
+                "BLUE_MASTER"):
+        env.pop(key, None)
+    if inherited_db_dir is not None:
+        env["DAILYCHECK_DB_DIR"] = str(inherited_db_dir)
+    return subprocess.run(
+        ["bash", "-c", "\n".join(lines)], capture_output=True, text=True,
+        env=env, timeout=120, cwd=str(REPO_ROOT),
+    )
+
+
+def test_verify_check2_ensures_account_in_green_db_statically():
+    """静态：check 2 把 ensure 当硬门禁，env pin 用「覆盖」语义且带 --admin。"""
+    content = VERIFY.read_text(encoding="utf-8")
+    fn = _extract_ensure_fn()
+    assert "if ! _ensure_sim_user_in_green_db; then" in content, (
+        "check 2 未把 ensure 当硬门禁（失败必须 return 1）"
+    )
+    # 子 shell 内显式赋值 = 覆盖语义；`:-` 继承写法会漏回蓝库
+    assert 'DAILYCHECK_DB_DIR="${GREEN_DB}" "${DC_PYTHON_BIN}" -m flask' in fn
+    assert 'DAILYCHECK_DB_DIR="${GREEN_DB}" "${DC_PYTHON_BIN}" - <<' in fn
+    assert 'DAILYCHECK_DB_DIR="${DAILYCHECK_DB_DIR:-' not in fn, (
+        "env 用了继承写法——wrapper 自带蓝库路径时会把账号写进蓝库"
+    )
+    # 绑定命令行形状，不绑裸字符串：函数体注释/提示里也出现 "admin" 字样，
+    # 裸 `assert "--admin" in fn` 会被文案命中而成恒真断言（轮 2 审核实测）。
+    assert re.search(
+        r"create-user\s+\"\$\{SIM_USER_USER\}\"\s+\"\$\{SIM_USER_PASSWORD\}\"\s+--admin",
+        fn,
+    ), (
+        "create-user 未带 --admin——非 admin 选仓页为空 → sim_user 路径 3 必失败"
+    )
+    # 写库前必须自证不是蓝库（路径形态 + inode），否则 GREEN_DB 误配会先把
+    # 已知口令的 admin 写进 production 真库（check 7 排在 check 2 之后）
+    assert '"${GREEN_DB}" == "${REPO_ROOT}/db"' in fn, "缺「GREEN_DB 指向仓库真库」拒绝闸"
+    assert '"${ino_g}" == "${ino_b}"' in fn, "缺「绿蓝 inode 相同」拒绝闸"
+    assert "${BLUE_MASTER:-" in fn, "蓝库路径丢了 BLUE_MASTER 覆盖点（测试无法安全验证 inode 闸）"
+    # ensure 必须排在探针之前
+    gate_pos = content.find("_ensure_sim_user_in_green_db; then")
+    probe_pos = content.find('sim_user.py" \\')
+    assert gate_pos != -1 and probe_pos != -1, "verify.sh 缺少门禁或探针调用"
+    assert gate_pos < probe_pos, "ensure 未排在 sim_user 探针之前"
+
+
+def test_ensure_sim_user_writes_admin_account_into_green_db(tmp_path):
+    """账号建在绿库里，且是 admin（选仓页才会列出仓）。"""
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+
+    r = _run_ensure_fn(green)
+    assert r.returncode == 0, f"ensure 失败: {r.stdout}{r.stderr}"
+    assert "OK: 绿库账号" in r.stdout
+    assert _user_row(green, "sim_user_t") == (1, 0), (
+        "账号没落绿库 or 不是 admin（非 admin 选仓页为空 → 路径 3 必失败）"
+    )
+
+
+def test_ensure_sim_user_overrides_inherited_db_dir(tmp_path):
+    """wrapper 自带 DAILYCHECK_DB_DIR（=蓝库）时仍写绿库，蓝库零写入。
+
+    这是 Issue #34 的原始症状：账号被写进蓝库（production 真库）。
+    """
+    green = tmp_path / "green"
+    blue = tmp_path / "blue"
+    green.mkdir()
+    blue.mkdir()
+    _init_master(green)
+    _init_master(blue)
+
+    r = _run_ensure_fn(green, inherited_db_dir=blue)
+    assert r.returncode == 0, f"ensure 失败: {r.stdout}{r.stderr}"
+    assert _user_row(green, "sim_user_t") is not None, "账号没落绿库"
+    assert _user_row(blue, "sim_user_t") is None, (
+        "账号被写进了 wrapper 继承的库（蓝库/生产真库）——env pin 未生效"
+    )
+
+
+def test_ensure_sim_user_fails_without_credentials(tmp_path):
+    """函数自带非空前置门禁（不依赖调用方，也不靠 set -u 的 unbound 报错）。"""
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+
+    r = _run_ensure_fn(green, omit_creds=True)
+    assert r.returncode != 0, "缺凭据却通过了"
+    assert "缺 SIM_USER_USER" in (r.stdout + r.stderr), (
+        "缺凭据时未给出自身门禁消息（说明退化成 set -u 的 unbound 报错）"
+    )
+
+
+def test_ensure_sim_user_rejects_disabled_account(tmp_path):
+    """绿库同名账号密码对但是 is_active=0（已停用）→ FAIL + 说明。
+
+    真实登录对停用账号直接 403（blueprints/auth.py:login），与 #34 的
+    「含糊失败」同类；create-user 不会覆盖 is_active。
+    """
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+    _seed_user(green, "sim_user_t", _SIM_PW, is_admin=1, is_active=0)
+
+    r = _run_ensure_fn(green)
+    assert r.returncode != 0, "已停用账号却通过了（探针只会拿到含糊 403）"
+    assert "已停用" in (r.stdout + r.stderr)
+
+
+def test_ensure_sim_user_reports_create_user_failure(tmp_path):
+    """create-user 自身非零退出（解释器配错 / 绿库被锁）要立刻报出来。
+
+    否则只能靠复核阶段的间接结论「无账号（create-user 没落到绿库？）」猜。
+    """
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+
+    r = _run_ensure_fn(green, python_bin="/usr/bin/false")
+    assert r.returncode != 0, "create-user 失败却整体通过"
+    assert "create-user rc=" in (r.stdout + r.stderr), (
+        "没有把 create-user 的退出码报出来（诊断退化成间接猜测）"
+    )
+
+
+def test_ensure_sim_user_refuses_repo_db_as_green_db(tmp_path):
+    """GREEN_DB 被误配成仓库真库路径 → 拒绝写入（check 7 排在 check 2 之后）。
+
+    REPO_ROOT 用假仓（含 db/master.db），保证这道闸即使被改坏也写不到
+    仓库真库；同时按消息断言，避免「假仓没有 app.py → create-user 失败」
+    造成与闸无关的假绿。
+    """
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "db").mkdir(parents=True)
+    _init_master(fake_repo / "db")
+
+    r = _run_ensure_fn(fake_repo / "db", repo_root=fake_repo)
+    assert r.returncode != 0, "GREEN_DB 指向蓝库却照写"
+    assert "指向仓库内真库" in (r.stdout + r.stderr)
+    assert _user_row(fake_repo / "db", "sim_user_t") is None, "闸没拦住实写"
+
+
+def test_ensure_sim_user_refuses_same_inode_as_blue(tmp_path):
+    """绿库 master.db 与蓝库同一物理文件（inode 相同）→ 拒绝写入。
+
+    BLUE_MASTER 把「蓝库」指到临时文件 → 即使这道闸被改坏，也只会写到
+    这个临时文件，绝不动仓库真库（这条硬链指向 tmp，不指向 repo）。
+    """
+    blue = tmp_path / "blue"
+    green = tmp_path / "green"
+    blue.mkdir()
+    green.mkdir()
+    _init_master(blue)
+    os.link(blue / "master.db", green / "master.db")  # 硬链 → 同 inode
+
+    r = _run_ensure_fn(green, blue_master=blue / "master.db")
+    assert r.returncode != 0, "绿蓝同物理文件却照写"
+    assert "inode 相同" in (r.stdout + r.stderr)
+    assert _user_row(blue, "sim_user_t") is None, "闸没拦住实写（蓝库被污染）"
+
+
+def test_ensure_sim_user_fails_when_green_db_absent(tmp_path):
+    """绿库不存在（up.sh db-copy 未跑）必须 FAIL，不许静默继续。"""
+    green = tmp_path / "gone"
+    green.mkdir()  # 目录在、master.db 不在
+
+    r = _run_ensure_fn(green)
+    assert r.returncode != 0, "绿库缺失却通过了"
+    assert "不存在" in (r.stdout + r.stderr)
+
+
+def test_ensure_sim_user_fails_on_password_mismatch(tmp_path):
+    """绿库已有同名账号但密码不同 → 精确 FAIL（否则探针只会报含糊 401）。
+
+    up.sh 拷的是蓝库快照，绿库里完全可能存在同名不同密码的账号。
+    """
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+    _seed_user(green, "sim_user_t", _OTHER_PW, is_admin=1)
+
+    r = _run_ensure_fn(green, password=_SIM_PW)
+    assert r.returncode != 0, "密码不匹配却通过了"
+    assert "密码 != SIM_USER_PASSWORD" in (r.stdout + r.stderr)
+
+
+def test_ensure_sim_user_rejects_unbound_non_admin(tmp_path):
+    """绿库同名账号密码对但不是 admin 且无仓绑定 → FAIL + 说明（路径 3 根因）。"""
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+    _seed_user(green, "sim_user_t", _SIM_PW, is_admin=0)
+
+    r = _run_ensure_fn(green)
+    assert r.returncode != 0, "无可见仓的账号却通过了（路径 3 会含糊失败）"
+    assert "无仓绑定" in (r.stdout + r.stderr)
+
+
+def test_ensure_sim_user_accepts_bound_non_admin(tmp_path):
+    """非 admin 但有仓绑定 → 选仓页非空，守卫不该过严（边界）。"""
+    green = tmp_path / "green"
+    green.mkdir()
+    _init_master(green)
+    _seed_user(green, "sim_user_t", _SIM_PW, is_admin=0, bind_to_warehouse=1)
+
+    r = _run_ensure_fn(green)
+    assert r.returncode == 0, f"有绑定的非 admin 被误拒: {r.stdout}{r.stderr}"
 
 
 # ============================================================
