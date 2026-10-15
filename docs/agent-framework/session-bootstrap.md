@@ -50,8 +50,10 @@
 2. merge 判定（workflow.md §四）：读 PR 的「报告 1/4」与「生产侧事项」，
    用你的生产视角独立评估。有异议 → 不 merge，PR 评论打回 + 开 Issue 转 Dev；
    无异议 → gh pr merge <n> --merge。
-3. merge 后按 workflow.md §五 蓝绿流程部署（up → verify 七项 → 灰度 →
+3. merge 后按 workflow.md §五 蓝绿流程部署（up → verify 八项 → **绿转正** → 灰度 →
    观察窗）；「生产侧事项」声明无需蓝绿部署的（如纯文档）可跳过。
+   注意：绿实例的 `DRY_RUN=true` 只允许存在于验证期，承接流量前必须按
+   `scripts/blue_green/README.md`「绿转正」关闭，否则 `switch.sh` 会拒跑（exit 3，预期拦截）。
 4. 红线（不得自行 merge，报 owner）：扩张 known_failures.txt / 改 CI
    workflow / 改分支保护 / 删 ARCHITECTURE 铁律 / 改 workflow.md 自身或
    merge 政策 / owner 标注需拍板。

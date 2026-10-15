@@ -102,7 +102,7 @@ Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 git pull → up.sh <pr> <sha>
              ├─ 守卫：绿 unit 必须声明 DAILYCHECK_DB_DIR 且 = 拷贝目标，否则拒启
              ├─ cp -aL 真库 ${APP_DIR}/db → /var/lib/dailycheck-green/db（独立副本）
-             └─ 起绿 :8091/:5101 + 健康检查（unit 常设 DRY_RUN=true = 验证期写隔离）
+             └─ 起绿 :8091/:5101 + 健康检查（绿 unit 声明 DRY_RUN=true = 验证期写隔离）
          → verify.sh <pr> 八项（任一 ❌ 即 FAIL 并自动写报告）
              1 pytest 零新增门禁   2 sim_user 五路径   3 ab 性能比对
              4 回滚演练            5 资源与依赖        6 dry_run 隔离证据

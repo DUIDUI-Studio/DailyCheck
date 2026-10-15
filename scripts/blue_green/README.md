@@ -117,6 +117,10 @@ if current_app.config.get("DRY_RUN"):
   接管生产写流量；
 - **conf 应用核验**（sed 未命中 → 回滚拒跑）、**reload 失败显式回滚**、
   **落点核验**（100%/0% 边界用 nonce 探针核对流量真实落到目标实例 access log）。
+  ⚠️ **前置耦合**：`BLUE_ACCESS_LOG` / `GREEN_ACCESS_LOG` 必须与 nginx 实况一致（默认蓝
+  `/root/DailyCheck/access.log`、绿 `/var/log/dailycheck/green-access.log`）；**改 nginx 布局
+  或 access_log 路径后必须同步这两个变量**。日志读不到时行为是「无法判定 → 仅告警不阻断」，
+  属**显式降级**（不会假绿，但也不会拦下切换），出现该告警请人工核对落点。
 
 回退：`switch.sh blue 100`（绿降 standby，不影响蓝）。
 
