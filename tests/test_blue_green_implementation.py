@@ -147,9 +147,71 @@ def test_up_dry_run_key_actions():
     assert (
         "cp -aL /root/DailyCheck/db /var/lib/dailycheck-green/db" in out
     ), "dry-run 应回显 cp -aL 真库拷贝"
-    assert "systemctl start dailycheck-green.service" in out
-    assert "systemctl start dailycheck-green-mcp.service" in out
+    # Issue #38：必须是 restart —— start 对在跑的 unit 是 no-op（新 DB + 旧代码）
+    assert "systemctl restart dailycheck-green.service" in out
+    assert "systemctl restart dailycheck-green-mcp.service" in out
     assert "loop 30 × 2s curl http://127.0.0.1:8091/health" in out
+
+
+# ============================================================
+# Issue #38 框架 gap：up.sh 起绿必须 restart（不是 start）
+# ============================================================
+def test_up_restarts_green_units_not_start():
+    """静态不变量：起绿两处都不得再出现 `systemctl start <green unit>`。
+
+    行为差异在 prod 首演暴露：绿 unit 已在运行时 `start` 是 no-op，
+    进程继续跑旧代码，而 DB 已在步骤 3 换成新副本 → verify/switch 判定
+    的对象一半新一半旧。
+    """
+    content = UP.read_text(encoding="utf-8")
+    assert re.search(
+        r'_run systemctl restart "\$\{GREEN_UNIT\}"', content
+    ), "up.sh 未 restart Flask 绿 unit"
+    assert re.search(
+        r'_run systemctl restart "\$\{GREEN_MCP_UNIT\}"', content
+    ), "up.sh 未 restart MCP 绿 unit"
+    assert not re.search(
+        r'_run systemctl start "\$\{(GREEN_UNIT|GREEN_MCP_UNIT)\}"', content
+    ), "up.sh 仍在 start 绿 unit（在跑时是 no-op，留旧代码）"
+    # 常量化：不许把 unit 名写死（dry-run 断言/Prod 覆盖都依赖 GREEN_* 变量）
+    assert 'GREEN_UNIT="' in content and 'GREEN_MCP_UNIT="' in content
+
+
+def test_up_restart_failure_does_not_skip_evidence():
+    """restart 失败不许被 set -e 当场截断：必须走到健康检查 + 取证。
+
+    `set -euo pipefail` 下裸跑失败的 restart 会立即退出，跳过步骤 5/6/7，
+    现场（journalctl + DB 快照）就丢了——本次事故排查最缺的正是现场。
+    """
+    content = UP.read_text(encoding="utf-8")
+    assert re.search(
+        r'_run systemctl restart "\$\{GREEN_UNIT\}" \|\| true', content
+    ), "Flask restart 未 `|| true`（set -e 会跳过取证）"
+    assert re.search(
+        r'_run systemctl restart "\$\{GREEN_MCP_UNIT\}" \|\| true', content
+    ), "MCP restart 未 `|| true`（set -e 会跳过取证）"
+    # 取证分支仍在（restart 失败要能落到这里）
+    assert "green-up-fail-${PR_NUM}-flask.log" in content
+
+
+def test_up_logs_pre_state_for_old_code_diagnosis():
+    """live 模式必须**真的查**并回显 restart 前的 unit 状态。
+
+    「新 DB + 旧代码」的症状只有对照 pre-state 才看得出（在跑 → 必须 restart），
+    这也是 Issue #38 排查时人工补的一步。
+
+    断言刻意绑到 live 分支的**命令本体**而非「文件里出现过这个字符串」：
+    `systemctl is-active` 这半句也会被 dry-run 分支的 echo
+    （`would query systemctl is-active ...`）命中——只做子串存在性断言时，
+    把查询掏空成 `PRE_GREEN_STATE="unknown"` 仍会全绿（审核轮 1 实测存活）。
+    """
+    content = UP.read_text(encoding="utf-8")
+    assert re.search(
+        r'PRE_GREEN_STATE="\$\(systemctl is-active "\$\{GREEN_UNIT\}"', content
+    ), "live 模式未真正查询 restart 前状态（只留了 dry-run 的 echo 文案）"
+    assert re.search(
+        r'pre-state: \$\{PRE_GREEN_STATE', content
+    ), "pre-state 未回显查询变量本体"
 
 
 def test_up_dry_run_skip_db_copy():
@@ -348,7 +410,14 @@ def test_verify_writes_report_on_fail(tmp_path):
     content = reports[0].read_text(encoding="utf-8")
     assert "PR #22" in content
     assert "决策摘要" in content
-    assert "八项检查" in content
+    # 报告章节标题的项数必须与 verify.sh 实际跑到的检查数一致（PR #33 把 check
+    # 加到 8 项后标题一度仍写「五项」；Issue #38 收尾时对齐到八项）。
+    # 断言刻意绑**行首标题行**而不是子串存在性：`八项检查` 这样的词在报告正文
+    # 别处出现也能满足 `assert "八项检查" in content`，标题写错却照样全绿——
+    # 本仓库已发生过一次同类「假绿断言」（见 ARCHITECTURE §12 测试架构），
+    # 故这里连行首位置一起钉住。
+    assert re.search(r"^## 2\. 八项检查", content, re.M), \
+        f"报告章节标题与实际检查项数不一致：{[ln for ln in content.splitlines() if ln.startswith('## 2.')]}"
 
 
 def test_verify_continues_after_check_fail_and_writes_report(tmp_path):
@@ -538,7 +607,14 @@ SIM_USER = SCRIPTS_DIR.parent / "playwright" / "sim_user.py"
 
 
 class _FakeDC(http.server.BaseHTTPRequestHandler):
-    """最小 DailyCheck 行为：登录 → 选仓 → /land → /inventory（带 CSRF）。"""
+    """最小 DailyCheck 行为：登录 → 选仓 → /land → /inventory → /report/health。
+
+    `HEALTH_STATUS` / `HEALTH_REDIRECT` 供子类覆写，用来验证 Issue #38 补的
+    路径 5 回归网真的能拦住 500 / 会话丢失（否则这层网只是装饰）。
+    """
+
+    HEALTH_STATUS = 200
+    HEALTH_REDIRECT = ""
 
     def log_message(self, *args):  # 静默
         pass
@@ -574,6 +650,11 @@ class _FakeDC(http.server.BaseHTTPRequestHandler):
             self._page("<html>land</html>")
         elif self.path == "/inventory":
             self._page("<html>inventory</html>")
+        elif self.path == "/report/health":
+            if self.HEALTH_REDIRECT:
+                self._redirect(self.HEALTH_REDIRECT)
+            else:
+                self._page("<html>health</html>", self.HEALTH_STATUS)
         else:
             self._page("not found", 404)
 
@@ -605,6 +686,28 @@ def fake_dc_server():
     srv.server_close()
 
 
+@pytest.fixture()
+def fake_dc_factory():
+    """按需造变体假服务（覆写 HEALTH_STATUS / HEALTH_REDIRECT）。
+
+    Issue #38 的路径 5 回归网必须自证有效：把 /report/health 改成 500 或
+    302→/login 时探针要真红，否则「补了一条路径」只是装饰。
+    """
+    servers: list[http.server.ThreadingHTTPServer] = []
+
+    def _make(**attrs) -> str:
+        handler = type("_FakeDCVariant", (_FakeDC,), attrs)
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        servers.append(srv)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    yield _make
+    for srv in servers:
+        srv.shutdown()
+        srv.server_close()
+
+
 def _run_sim_user(base_url: str, env_extra: dict[str, str]) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.pop("SIM_USER_USER", None)
@@ -617,12 +720,44 @@ def _run_sim_user(base_url: str, env_extra: dict[str, str]) -> subprocess.Comple
 
 
 def test_sim_user_full_flow_passes(fake_dc_server):
-    """4 路径全通应 exit 0（登录→选仓→/land→/inventory，含 CSRF 回填）。"""
+    """5 路径全通应 exit 0（登录→选仓→/land→/inventory→/report/health，含 CSRF 回填）。"""
     r = _run_sim_user(fake_dc_server, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-    assert "4 关键路径全通" in r.stdout
-    for path_name in ("登录页可达", "登录成功", "选仓进入总览", "库存页可达"):
+    assert "5 关键路径全通" in r.stdout
+    for path_name in ("登录页可达", "登录成功", "选仓进入总览", "库存页可达",
+                      "库存健康报表可达"):
         assert path_name in r.stdout
+
+
+def test_sim_user_health_path_catches_500(fake_dc_factory):
+    """Issue #38 回归网自证：/report/health 500 必须让 check 2 真红。
+
+    这正是 prod 上的故障形态（无秒时间戳 → ValueError → 500），
+    旧探针没有这条路径，所以绿环境 8 项里 7 项 PASS 也拦不住它。
+    """
+    base = fake_dc_factory(HEALTH_STATUS=500)
+    r = _run_sim_user(base, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "库存健康报表可达" in r.stdout
+    assert "500" in r.stdout
+    assert "5 关键路径全通" not in r.stdout
+
+
+def test_sim_user_health_path_403_is_failure_with_hint(fake_dc_factory):
+    """角色门 403 按失败处理（不静默降级），但提示需 manager+。"""
+    base = fake_dc_factory(HEALTH_STATUS=403)
+    r = _run_sim_user(base, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
+    assert r.returncode == 1
+    assert "库存健康报表可达" in r.stdout
+    assert "manager+" in r.stdout
+
+
+def test_sim_user_health_path_no_false_pass_on_login_redirect(fake_dc_factory):
+    """会话丢失时 /report/health 会 302 到 /login 并被跟随后 200——不许算通过。"""
+    base = fake_dc_factory(HEALTH_REDIRECT="/login")
+    r = _run_sim_user(base, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "/login" in r.stdout
 
 
 def test_sim_user_bad_credentials_fails(fake_dc_server):
