@@ -16,6 +16,10 @@ app.config["DRY_RUN"]=True 时把 INSERT/UPDATE/DELETE/REPLACE/DDL
    不保证 id 在生产里真存在。
 3. **取证计数**：每次拦截的写操作累加到 `writes_blocked`，供
    `prod_dryrun_evidence.sh` 取证脚本比对"绿环境写的次数 = 0"。
+   拦截日志为 **WARNING** 级、带 `[dry_run] BLOCKED` 前缀——曾因 INFO 级被
+   生产日志配置吞掉，导致 2026-10-15 事故（DRY_RUN 实例接管流量 44 分钟）
+   的取证只能靠实例 access log 反推被吞写操作清单。拦截属于必须留痕的
+   写安全事件：不得降级为 INFO/DEBUG。
 
 不在范围
 ---------
@@ -104,9 +108,15 @@ class DryRunConnection:
         if _WRITE_RE.match(sql):
             self._writes_blocked += 1
             self._next_fake_id -= 1
-            logger.info(
-                f"[dry_run] skip write #{self._writes_blocked}: "
-                f"sql={sql[:120]!r} params={parameters!r}"
+            # WARNING 级（非 INFO）：app 未配置 logging → 生产 root logger 默认
+            # 只放行 WARNING+；INFO 级拦截日志会被静默吞掉（2026-10-15 事故
+            # 取证困难根因之一）。前缀 [dry_run] BLOCKED 供日志检索。
+            logger.warning(
+                "[dry_run] BLOCKED write #%d (log-only, DB not written): "
+                "sql=%r params=%r",
+                self._writes_blocked,
+                sql[:120],
+                parameters,
             )
             return _FakeCursor(fake_id=self._next_fake_id)
         # 读 / 事务控制语句：透传
@@ -116,9 +126,12 @@ class DryRunConnection:
         if _WRITE_RE.match(sql):
             self._writes_blocked += 1
             self._next_fake_id -= 1
-            logger.info(
-                f"[dry_run] skip executemany #{self._writes_blocked}: "
-                f"sql={sql[:120]!r} count={len(seq_of_parameters)}"
+            logger.warning(
+                "[dry_run] BLOCKED executemany #%d (log-only, DB not written): "
+                "sql=%r count=%d",
+                self._writes_blocked,
+                sql[:120],
+                len(seq_of_parameters),
             )
             return _FakeCursor(fake_id=self._next_fake_id)
         return self._real.executemany(sql, seq_of_parameters)

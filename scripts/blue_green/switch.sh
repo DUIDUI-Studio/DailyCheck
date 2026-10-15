@@ -18,6 +18,21 @@
 #     成功；失败自动回滚备份再 reload
 #   - 用 nginx "down" 关键字标记"不参与负载"（weight=0 nginx 1.24 拒绝）
 #   - nginx -t 验证语法（防 sed 错配）；失败时 cp 备份回滚
+#
+# 2026-10-15 P0 事故加固（绿实例以 DRY_RUN=true 承接生产流量 44 分钟：
+# 窗口期写操作全部「假成功」——HTTP 200 / 审计照记 / DB 不落盘）：
+#   - DRY_RUN 守卫：凡切换后承接流量（weight>0）的实例，若处于 DRY_RUN=true
+#     直接拒跑（exit 3）——先「绿转正」（关写隔离），标准步骤见 README。
+#     检测优先级：进程真实环境（/proc/<pid>/environ）→ unit 配置
+#     （systemctl show Environment）→ 无法判定（无 systemctl / unit 不存在）仅告警。
+#   - conf 应用核验：sed 后逐行核对 4 条 server 行与期望一致（sed 未命中时
+#     nginx -t 仍通过、reload 仍「成功」，但权重根本没变 —— 静默失败）。
+#   - reload 失败显式回滚（旧版 set -e 直退，会留下 conf/运行态分歧）。
+#   - 落点核验：100%/0% 边界用带 nonce 的探针核对流量真实落到目标实例的
+#     access log（防「文件写了但 reload 没生效」的静默漂移）。
+#
+# 退出码：0 成功 / 1 运行期核验失败（已自动回滚）/ 2 布局守卫拒绝 /
+#         3 DRY_RUN 守卫拒绝 / 64 参数错误
 
 set -euo pipefail
 
@@ -29,6 +44,7 @@ for arg in "$@"; do
   if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
     echo "usage: $0 <green|blue> [percent] [--dry-run]"
     echo "  --dry-run   只 echo 不真跑 nginx -t / reload"
+    echo "  exit: 2=布局守卫拒绝 / 3=目标实例仍 DRY_RUN（先「绿转正」，见 README）"
     exit 0
   fi
 done
@@ -69,6 +85,11 @@ BLUE_PORT="${BLUE_PORT:-8090}"
 GREEN_PORT="${GREEN_PORT:-8091}"
 BLUE_MCP_PORT="${BLUE_MCP_PORT:-5100}"
 GREEN_MCP_PORT="${GREEN_MCP_PORT:-5101}"
+# 2026-10-15 事故加固：DRY_RUN 守卫检查的 systemd unit + 落点核验读的 access log
+BLUE_SERVICE_UNIT="${BLUE_SERVICE_UNIT:-dailycheck.service}"
+GREEN_SERVICE_UNIT="${GREEN_SERVICE_UNIT:-dailycheck-green.service}"
+BLUE_ACCESS_LOG="${BLUE_ACCESS_LOG:-/root/DailyCheck/access.log}"
+GREEN_ACCESS_LOG="${GREEN_ACCESS_LOG:-/var/log/dailycheck/green-access.log}"
 
 # ============================================================
 # 辅助：dry-run 模式
@@ -90,6 +111,21 @@ _ensure_backup_dir() {
   fi
 }
 _ensure_backup_dir
+
+# ============================================================
+# 辅助：回滚 conf + reload（reload / 探活 / 落点核验失败路径共用）
+# ============================================================
+_rollback_conf_and_reload() {
+  if cp "${BACKUP}" "${NGINX_CONF}"; then
+    if nginx -t && systemctl reload nginx; then
+      echo "[switch] 回滚 reload OK，conf 恢复到切换前状态" >&2
+    else
+      echo "[switch] 回滚后 nginx -t / reload 仍失败，需人工介入" >&2
+    fi
+  else
+    echo "[switch] 回滚 cp 失败，conf 未恢复，需人工介入" >&2
+  fi
+}
 
 # ============================================================
 # 计算 weight + 边界转换（weight=0 → down）
@@ -153,6 +189,67 @@ else
 fi
 
 # ============================================================
+# DRY_RUN 守卫（2026-10-15 P0 事故）：切换后承接流量（weight>0）的任何
+# 实例都必须具备真实写能力。DRY_RUN 下写操作被 db/dryrun.py 拦成
+# log-only（HTTP 200 / 审计照记 / DB 不落盘 =「假成功」）——先例：绿实例
+# 以此状态接管生产流量 44 分钟，全站写失效。命中直接拒跑（exit 3）。
+#
+# 检测优先级（取证强度从高到低）：
+#   ① 进程真实环境 /proc/<pid>/environ（systemctl show MainPID 定位进程）
+#   ② unit 配置 systemctl show Environment（进程不在时的配置实况）
+#   ③ 无法判定（无 systemctl / unit 不存在）→ 仅告警放行（有探活兜底）
+# ============================================================
+_detect_dry_run() {
+  local unit="$1" pid envs
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "unknown"
+    return 0
+  fi
+  pid="$(systemctl show -p MainPID --value "${unit}" 2>/dev/null || true)"
+  if [[ -n "${pid}" && "${pid}" != "0" && -r "/proc/${pid}/environ" ]]; then
+    envs="$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || true)"
+  else
+    envs="$(systemctl show -p Environment --value "${unit}" 2>/dev/null || true)"
+  fi
+  if printf '%s\n' "${envs}" | grep -qiE '(^|[[:space:]])DRY_RUN=(true|1|yes)([[:space:]]|$)'; then
+    echo "dry_run"
+  elif [[ -n "${envs}" ]]; then
+    echo "not_dry_run"
+  else
+    echo "unknown"
+  fi
+}
+
+DRY_RUN_GUARD_BLOCKED_LIST=""
+DRY_RUN_GUARD_UNKNOWN_LIST=""
+if [[ "${BLUE_WEIGHT}" -gt 0 ]]; then
+  case "$(_detect_dry_run "${BLUE_SERVICE_UNIT}")" in
+    dry_run) DRY_RUN_GUARD_BLOCKED_LIST="${DRY_RUN_GUARD_BLOCKED_LIST}${DRY_RUN_GUARD_BLOCKED_LIST:+, }蓝 ${BLUE_SERVICE_UNIT}" ;;
+    unknown) DRY_RUN_GUARD_UNKNOWN_LIST="${DRY_RUN_GUARD_UNKNOWN_LIST}${DRY_RUN_GUARD_UNKNOWN_LIST:+, }蓝 ${BLUE_SERVICE_UNIT}" ;;
+  esac
+fi
+if [[ "${GREEN_WEIGHT}" -gt 0 ]]; then
+  case "$(_detect_dry_run "${GREEN_SERVICE_UNIT}")" in
+    dry_run) DRY_RUN_GUARD_BLOCKED_LIST="${DRY_RUN_GUARD_BLOCKED_LIST}${DRY_RUN_GUARD_BLOCKED_LIST:+, }绿 ${GREEN_SERVICE_UNIT}" ;;
+    unknown) DRY_RUN_GUARD_UNKNOWN_LIST="${DRY_RUN_GUARD_UNKNOWN_LIST}${DRY_RUN_GUARD_UNKNOWN_LIST:+, }绿 ${GREEN_SERVICE_UNIT}" ;;
+  esac
+fi
+
+if [[ -n "${DRY_RUN_GUARD_BLOCKED_LIST}" ]]; then
+  echo "[switch] ⛔ DRY_RUN 守卫触发：以下承接流量的实例处于 DRY_RUN（写操作会被吞成「假成功」）：" >&2
+  echo "[switch]   ${DRY_RUN_GUARD_BLOCKED_LIST}" >&2
+  echo "[switch]   —— 2026-10-15 生产事故（44 分钟全站写失效）即由此造成" >&2
+  echo "[switch]   —— 处置：先「绿转正」（关 DRY_RUN + DB 指向真库 + restart），" >&2
+  echo "[switch]      标准步骤见 scripts/blue_green/README.md「绿转正」" >&2
+  exit 3
+fi
+if [[ -n "${DRY_RUN_GUARD_UNKNOWN_LIST}" ]]; then
+  echo "[switch] DRY_RUN 守卫：无法判定以下实例的 DRY_RUN 状态（仅告警放行）：${DRY_RUN_GUARD_UNKNOWN_LIST}" >&2
+else
+  echo "[switch] DRY_RUN 守卫 OK：承接流量的实例均非 DRY_RUN（具备真实写能力）"
+fi
+
+# ============================================================
 # 备份 + sed 替换（覆盖 weight=N 和 down 两种状态）
 # ============================================================
 BACKUP="${BACKUP_DIR}/dailycheck.$(date +%Y%m%d-%H%M%S).bak"
@@ -171,6 +268,22 @@ _run sed -i \
   "${NGINX_CONF}"
 
 # ============================================================
+# conf 应用核验（2026-10-15 事故加固）：sed 未命中/部分命中时
+# nginx -t 仍然通过、reload 仍然「成功」，但权重根本没变 ——
+# 逐行核对 4 条 server 行与期望完全一致，不一致立即回滚拒跑。
+# ============================================================
+_verify_conf_applied() {
+  local line
+  for line in "${BLUE_LINE}" "${GREEN_LINE}" "${BLUE_MCP_LINE}" "${GREEN_MCP_LINE}"; do
+    if ! grep -qF "${line}" "${NGINX_CONF}"; then
+      echo "[switch] conf 应用核验失败：未找到期望行「${line}」（sed 未命中）" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+# ============================================================
 # nginx -t 验证（防 sed 错配）
 # ============================================================
 echo "[switch] nginx -t ..."
@@ -180,15 +293,29 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
     cp "${BACKUP}" "${NGINX_CONF}"
     exit 1
   fi
+  if ! _verify_conf_applied; then
+    echo "[switch] conf 应用核验失败，rolling back ..." >&2
+    cp "${BACKUP}" "${NGINX_CONF}"
+    exit 1
+  fi
+  echo "[switch] conf 应用核验 OK：4 条 server 行与期望一致"
 else
-  echo "[DRY-RUN] would nginx -t; on failure cp backup & exit 1"
+  echo "[DRY-RUN] would nginx -t + conf 应用核验（4 条 server 行）"
 fi
 
 # ============================================================
 # reload（流式，0 中断）
 # ============================================================
 echo "[switch] nginx reload ..."
-_run systemctl reload nginx
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  if ! systemctl reload nginx; then
+    echo "[switch] nginx reload 失败，自动回滚备份 + reload ..." >&2
+    _rollback_conf_and_reload
+    exit 1
+  fi
+else
+  echo "[DRY-RUN] would systemctl reload nginx（失败自动回滚）"
+fi
 
 # ============================================================
 # post-switch 探活（Issue #32）：过 nginx 入口 :8080 真实打主站 + MCP。
@@ -199,6 +326,7 @@ _run systemctl reload nginx
 NGINX_ENTRY="${NGINX_ENTRY:-http://127.0.0.1:8080}"
 if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
   echo "[DRY-RUN] would probe ${NGINX_ENTRY}/ 与 ${NGINX_ENTRY}/api/mcp/（非 502 才算成功）"
+  echo "[DRY-RUN] would 落点核验（仅 100%/0% 边界：带 nonce 探针核对目标实例 access log）"
   echo "[switch] ✅ nginx reloaded, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
   exit 0
 fi
@@ -224,17 +352,59 @@ _probe "${NGINX_ENTRY}/api/mcp/" || PROBE_FAIL=1
 
 if [[ ${PROBE_FAIL} -ne 0 ]]; then
   echo "[switch] 探活失败，自动回滚备份 + reload ..." >&2
-  if cp "${BACKUP}" "${NGINX_CONF}"; then
-    if nginx -t && systemctl reload nginx; then
-      echo "[switch] 回滚 reload OK，conf 恢复到切换前状态" >&2
-    else
-      echo "[switch] 回滚后 nginx -t / reload 仍失败，需人工介入" >&2
-    fi
-  else
-    echo "[switch] 回滚 cp 失败，conf 未恢复，需人工介入" >&2
-  fi
+  _rollback_conf_and_reload
   exit 1
 fi
 
-echo "[switch] ✅ nginx reloaded + 探活通过, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
+# ============================================================
+# 落点核验（2026-10-15 事故加固）：仅 100%/0% 边界做确定性断言 ——
+# 带唯一 nonce 探一次 /health，核对 nonce 出现在「应承接实例」的 access
+# log、且不出现在对侧（防「文件写了但 reload 没生效 / 流量没真切」）。
+# 灰度中（1-99%）路由随机，跳过；access log 不可读时仅告警不回滚。
+# ============================================================
+if [[ ${GREEN_WEIGHT} -eq 100 || ${BLUE_WEIGHT} -eq 100 ]]; then
+  if [[ ${GREEN_WEIGHT} -eq 100 ]]; then
+    LAND_LOG="${GREEN_ACCESS_LOG}"; LAND_OTHER_LOG="${BLUE_ACCESS_LOG}"; LAND_DESC="绿 :${GREEN_PORT}"
+  else
+    LAND_LOG="${BLUE_ACCESS_LOG}"; LAND_OTHER_LOG="${GREEN_ACCESS_LOG}"; LAND_DESC="蓝 :${BLUE_PORT}"
+  fi
+  PROBE_NONCE="dc_probe_$(date +%s)_$$_${RANDOM}"
+  echo "[switch] 落点核验：nonce=${PROBE_NONCE}（期望命中 ${LAND_DESC} access log）..."
+  PROBE_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${NGINX_ENTRY}/health?${PROBE_NONCE}=1" 2>/dev/null || echo 000)"
+  echo "  ${NGINX_ENTRY}/health?${PROBE_NONCE}=1 → HTTP ${PROBE_CODE}"
+  if [[ "${PROBE_CODE}" =~ ^5 || "${PROBE_CODE}" == "000" ]]; then
+    echo "[switch] 落点核验：探针请求异常（HTTP ${PROBE_CODE}），无法核验——仅告警" >&2
+  else
+    HIT_TARGET=0; HIT_OTHER=0; SAME_LOG=0
+    if [[ -f "${LAND_LOG}" && -f "${LAND_OTHER_LOG}" && "${LAND_LOG}" -ef "${LAND_OTHER_LOG}" ]]; then
+      SAME_LOG=1
+    fi
+    for _probe_try in 1 2 3; do
+      sleep 1
+      if [[ -f "${LAND_LOG}" ]] && grep -qF "${PROBE_NONCE}" "${LAND_LOG}"; then
+        HIT_TARGET=1
+        break
+      fi
+    done
+    if [[ ${SAME_LOG} -eq 0 && -f "${LAND_OTHER_LOG}" ]] && grep -qF "${PROBE_NONCE}" "${LAND_OTHER_LOG}"; then
+      HIT_OTHER=1
+    fi
+    if [[ ${HIT_TARGET} -eq 1 && ${HIT_OTHER} -eq 0 ]]; then
+      echo "[switch] 落点核验 OK：流量真实落在 ${LAND_DESC}（nonce 命中其 access log）"
+    elif [[ ${HIT_TARGET} -eq 0 && ${HIT_OTHER} -eq 1 ]]; then
+      echo "[switch] 落点核验失败：nonce 出现在对侧实例 access log（reload 未生效 / 流量未按权重路由）" >&2
+      echo "[switch] 自动回滚备份 + reload ..." >&2
+      _rollback_conf_and_reload
+      exit 1
+    else
+      echo "[switch] 落点核验：无法判定（access log 不可读或 nonce 未见于两侧）——仅告警" >&2
+      echo "[switch]   目标 log=${LAND_LOG}" >&2
+      echo "[switch]   对侧 log=${LAND_OTHER_LOG}" >&2
+    fi
+  fi
+else
+  echo "[switch] 落点核验跳过：灰度 ${GREEN_WEIGHT}%/${BLUE_WEIGHT}%（路由随机，无法做确定性落点断言）"
+fi
+
+echo "[switch] ✅ nginx reloaded + 探活/核验通过, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
 exit 0

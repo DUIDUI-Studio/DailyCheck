@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 import pytest
@@ -134,6 +135,34 @@ def test_dry_run_independent_per_connection(app_with_dry_run, master_db_path):
         )
         assert master_db.writes_blocked == 1
         # warehouse 取不到（没选仓），跳过
+
+
+def test_dry_run_block_logs_are_warning_visible(app_with_dry_run, caplog):
+    """拦截日志必须是 WARNING 级且可检索（2026-10-15 生产事故取证要求）。
+
+    背景：app 未配置 logging → 生产 root logger 默认只放行 WARNING+（INFO
+    被丢）→ 事故窗口期的写拦截日志全部不可见，只能靠 access log 反推被吞
+    写操作清单。caplog 以 WARNING 为门槛：实现若回退到 INFO 本测试变红。
+    """
+    with caplog.at_level(logging.WARNING):
+        with app_with_dry_run.test_request_context():
+            from db import get_master_db
+
+            db = get_master_db()
+            db.execute(
+                "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (99998, "log_visible", "x", 0, "2026-10-13 12:00:00"),
+            )
+
+    records = [r for r in caplog.records if r.name == "dryrun"]
+    assert records, "dryrun 拦截未产生任何日志记录（级别被降回 INFO 会被吞）"
+    assert any(r.levelno >= logging.WARNING for r in records), (
+        "拦截日志级别必须 >= WARNING（INFO 会被生产日志配置吞掉）"
+    )
+    assert any("BLOCKED" in r.getMessage() for r in records), (
+        "拦截日志需带 [dry_run] BLOCKED 可检索前缀"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────

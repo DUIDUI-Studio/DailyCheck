@@ -66,6 +66,9 @@
 | `EVIDENCE_BASE` | `/var/log/dailycheck` | rollback.sh 取证目录 |
 | `BLUE_URL` | `http://127.0.0.1:8090` | verify.sh 蓝基准 URL |
 | `GREEN_URL` | `http://127.0.0.1:8091` | verify.sh 绿候选 URL |
+| `BLUE_SERVICE_UNIT` | `dailycheck.service` | switch.sh DRY_RUN 守卫检查的蓝 unit |
+| `BLUE_ACCESS_LOG` | `/root/DailyCheck/access.log` | switch.sh 落点核验读蓝 access log |
+| `GREEN_ACCESS_LOG` | `/var/log/dailycheck/green-access.log` | switch.sh 落点核验读绿 access log |
 
 ## 写隔离（决策 1：方案 B）
 
@@ -73,7 +76,7 @@
 
 ```python
 if current_app.config.get("DRY_RUN"):
-    log.info(f"[dry_run] skip write: {sql}")
+    log.warning(f"[dry_run] BLOCKED write: {sql}")  # WARNING 级：生产 root logger 默认吞 INFO
     return []  # 或 raise DryRunError
 ```
 
@@ -83,6 +86,41 @@ if current_app.config.get("DRY_RUN"):
 3. PoC：加 1 个 blueprint 验证后跑全量 pytest（必须仍 16 failed / 718+ passed，零新增）
 
 中间件完成后用 [`prod_dryrun_evidence.sh`](../agent_framework/prod_dryrun_evidence.sh) 验证端到端隔离。
+
+> ⚠️ **写隔离 ≠ 可承接流量**：拦截日志必须保持 **WARNING** 级（`[dry_run] BLOCKED`
+> 前缀）——INFO 会被生产日志配置吞掉（2026-10-15 事故取证困难根因）。切流量
+> 的 `switch.sh` 已内置 **DRY_RUN 守卫**：承接侧未「转正」会拒跑（exit 3），
+> 标准步骤见下方「绿转正」。
+
+## 绿转正（承接生产流量前必做）
+
+绿实例以 `DRY_RUN=true` 启动（写隔离：`db/dryrun.py` 把 INSERT/UPDATE/DELETE
+拦成 log-only——HTTP 200、审计照记、DB 不落盘），该状态**只用于验证期**，绝不能
+承接生产流量。2026-10-15 生产事故（绿实例接管流量 44 分钟、全站写操作「假成功」）
+即由此造成。
+
+标准步骤（`verify.sh` 全绿之后、切流量之前执行）：
+
+1. **关写隔离**：`dailycheck-green.service` 删除 `DRY_RUN=true`（或改 `false`）；
+2. **DB 指回生产真库**：绿两个 unit 的 env 文件（`GREEN_ENV_FILE` /
+   `GREEN_MCP_ENV_FILE`）删除或改写 `DAILYCHECK_DB_DIR` → `${APP_DIR}/db`
+   （验证期独立副本 `/var/lib/dailycheck-green/db` 不再使用）。
+   ⚠️ 此步后绿具备真实写能力，其后任何流量都会直接写入生产库；
+3. `systemctl daemon-reload && systemctl restart dailycheck-green dailycheck-green-mcp`；
+4. 复验：`systemctl show dailycheck-green -p Environment --value` 不含 `DRY_RUN=true`；
+5. 灰度切流量：`switch.sh green 5 → 50 → 100`（每步观察窗；100%/0% 边界自动做落点核验）。
+
+**防线（switch.sh 内置，2026-10-15 事故后加固）**：
+
+- **DRY_RUN 守卫**：切换后凡承接流量（weight>0）的实例仍处于 `DRY_RUN=true`
+  → 直接拒跑（**exit 3**）并提示先完成绿转正——不会再有 DRY_RUN 实例静默
+  接管生产写流量；
+- **conf 应用核验**（sed 未命中 → 回滚拒跑）、**reload 失败显式回滚**、
+  **落点核验**（100%/0% 边界用 nonce 探针核对流量真实落到目标实例 access log）。
+
+回退：`switch.sh blue 100`（绿降 standby，不影响蓝）。
+
+> 若不打算续用蓝绿路径：`down.sh` 清理绿实例即可，无需走转正。
 
 ## 待补（v0.3 阶段）
 
