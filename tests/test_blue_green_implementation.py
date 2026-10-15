@@ -414,7 +414,7 @@ def test_verify_writes_report_on_fail(tmp_path):
     # 加到 8 项后标题一度仍写「五项」；Issue #38 收尾时对齐到八项）。
     # 断言刻意绑**行首标题行**而不是子串存在性：`八项检查` 这样的词在报告正文
     # 别处出现也能满足 `assert "八项检查" in content`，标题写错却照样全绿——
-    # 本仓库已发生过一次同类「假绿断言」（见 ARCHITECTURE §11 测试资产条），
+    # 本仓库已发生过一次同类「假绿断言」（见 ARCHITECTURE §12 测试架构），
     # 故这里连行首位置一起钉住。
     assert re.search(r"^## 2\. 八项检查", content, re.M), \
         f"报告章节标题与实际检查项数不一致：{[ln for ln in content.splitlines() if ln.startswith('## 2.')]}"
