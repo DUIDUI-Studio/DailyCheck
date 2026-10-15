@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# blue_green/verify.sh —— 跑五项生产验证
+# blue_green/verify.sh —— 跑八项生产验证
 #
 # 用法: ./scripts/blue_green/verify.sh <pr-num> [--dry-run]
 #
@@ -9,10 +9,11 @@
 #   0  全绿可切流量
 #   1  验证失败（任一项不达标）
 #
-# 五项检查（v0.1.md §四.2 报告 05）：
+# 八项检查（v0.1.md §四.2 报告 05）：
 #   1. 集成测试（pytest tests/ 顶层 + check_known_failures.py 零新增门禁）
 #   2. 模拟用户操作（sim_user.py 走 登录→选仓→总览→库存 4 关键路径；
-#      凭据走 SIM_USER_USER / SIM_USER_PASSWORD 环境变量）
+#      凭据走 SIM_USER_USER / SIM_USER_PASSWORD 环境变量；
+#      探针前先用显式 DAILYCHECK_DB_DIR 把账号 ensure 进「绿」库，见 Issue #34）
 #   3. 绿 vs 蓝比对（ab -n 100 -c 10 响应/P95 截图）
 #   4. 回滚演练（switch.sh blue 100 → health → switch.sh green 0）
 #   5. 资源与依赖（systemctl status + journalctl + ss -tn）
@@ -105,7 +106,7 @@ _write_report() {
 - [$([[ ${OVERALL_PASS} -eq 1 ]] && echo "x" || echo " ")] **通过**：切流量 5% → 50% → 100%
 - [$([[ ${OVERALL_PASS} -eq 1 ]] && echo " " || echo "x")] **打回**：留绿取证，PR 不合并
 
-## 2. 五项检查 + dry_run 证据
+## 2. 八项检查 + dry_run 证据
 
 | # | 检查项 | 状态 | 备注 |
 |---|--------|------|------|
@@ -169,9 +170,139 @@ _verify_check1_pytest() {
 # 凭据从环境变量读（SIM_USER_USER / SIM_USER_PASSWORD），缺省直接 FAIL
 # 并提示设置方法——绝不允许静默跳过。
 # ============================================================
+
+# ------------------------------------------------------------
+# check 2 前置：把模拟账号 ensure 到「绿」库（Issue #34）
+#
+# sim_user.py 走 HTTP 打绿 :8091，凭据校验发生在**绿进程持有的库**上
+# （绿 unit 声明 DAILYCHECK_DB_DIR=${GREEN_DB}）。而 verify.sh 由 wrapper
+# shell 调用，不在绿 unit 环境里、通常没有 DAILYCHECK_DB_DIR —— 此时直接跑
+# `flask create-user` 会写**蓝库（production 真库）**，绿库查无此人 →
+# 路径 2 恒 401（2026-10-15 verify-18b 实测）。
+#
+# 故：本函数用**显式 env pin**在绿库内幂等 ensure 账号（子 shell 内赋值，
+# 既不继承调用者的 DAILYCHECK_DB_DIR，也不污染 verify.sh 自身环境），
+# 再独立复核「账号在绿库 + 密码就是本次凭据 + 有可见仓」——蓝库全程零写入。
+#
+# 两个必须做对的细节：
+#   * `--admin`：探针账号必须是平台管理员。非 admin 用户在选仓页只看到
+#     `warehouse_users` 绑定的仓（blueprints/auth.py:warehouse_picker），而
+#     create-user 不写绑定 → 选仓页空 → sim_user 路径 3（选仓→/land）必失败。
+#     本项目既有运维约定也是 `create-user ... --admin`（Issue #34 正文复现步骤）。
+#     ⚠️ 取舍：该账号随绿库存在，切流量后会一起进生产。请用一次性口令，
+#     并在切完流量后按 `down.sh --keep-blue` / 账号停用流程处置。
+#   * 密码会短暂出现在子进程 argv（`ps aux` / `/proc/*/cmdline` 同机可见）。
+#     这是 create-user CLI 的既有形态（Issue #34 正文同样用法），且仅限
+#     root-only 单机运维场景；密码不会进 /tmp/verify-2.log 或报告（CLI 只
+#     echo 用户名）。
+# ------------------------------------------------------------
+# 以下 start/end 标记供 tests/test_blue_green_implementation.py 抽取函数体
+# 真跑（改结构时勿删标记；标记行保持纯标记，尾注会被抽进切片当命令执行）。
+# <<< ensure-sim-user:start >>>
+_ensure_sim_user_in_green_db() {
+  if [[ -z "${SIM_USER_USER:-}" || -z "${SIM_USER_PASSWORD:-}" ]]; then
+    echo "FAIL: 缺 SIM_USER_USER / SIM_USER_PASSWORD（ensure 前置门禁）"
+    return 1
+  fi
+  local green_master="${GREEN_DB}/master.db"
+  if [[ ! -f "${green_master}" ]]; then
+    echo "FAIL: 绿库 ${green_master} 不存在（up.sh db-copy 未跑或 GREEN_DB 不符）"
+    return 1
+  fi
+
+  # 写库前先自证「这确实不是蓝库」：本函数是全流程第一个写 DB 的动作，而
+  # 证明隔离的 check 7 排在 check 2 **之后** —— GREEN_DB 被误配成
+  # ${REPO_ROOT}/db（蓝库 = production 真库）时会先把一个已知口令的 admin
+  # 写进生产库，等 check 7 报红时蓝库已经脏了。两道闸（路径形态 + inode）。
+  # BLUE_MASTER 只为测试留覆盖点（默认即生产蓝库），别在生产覆盖它。
+  if [[ "${GREEN_DB}" == "${REPO_ROOT}/db" \
+        || "${GREEN_DB}" == "${REPO_ROOT}/db/" ]]; then
+    echo "FAIL: GREEN_DB=${GREEN_DB} 指向仓库内真库（蓝库）——拒绝写入"
+    return 1
+  fi
+  local blue_master="${BLUE_MASTER:-${REPO_ROOT}/db/master.db}" ino_g ino_b
+  if [[ -f "${blue_master}" ]]; then
+    # stat -c 是 GNU 形态（生产 Ubuntu 可用）；-f %i 是 BSD 回退，
+    # 让 dev/macOS 上跑 tests 抽函数用例时这道闸也真实生效。
+    ino_g="$(stat -c %i "${green_master}" 2>/dev/null \
+      || stat -f %i "${green_master}" 2>/dev/null || echo na)"
+    ino_b="$(stat -c %i "${blue_master}" 2>/dev/null \
+      || stat -f %i "${blue_master}" 2>/dev/null || echo na)"
+    if [[ "${ino_g}" != "na" && "${ino_g}" == "${ino_b}" ]]; then
+      echo "FAIL: 绿蓝 master.db inode 相同（${ino_g}）——同一物理文件，拒绝写入"
+      return 1
+    fi
+  fi
+
+  # 幂等创建：账号已存在时 create-user 只 echo「already exists」不报错。
+  # 注意 env pin 是「覆盖」语义——wrapper 若自带 DAILYCHECK_DB_DIR（可能指蓝
+  # 库）也必须被顶掉，否则又写错库。
+  (
+    cd "${REPO_ROOT}" || exit 1
+    DAILYCHECK_DB_DIR="${GREEN_DB}" "${DC_PYTHON_BIN}" -m flask \
+      --app app create-user "${SIM_USER_USER}" "${SIM_USER_PASSWORD}" --admin
+  ) 2>&1 | sed 's/^/[verify]   /'
+  local rc="${PIPESTATUS[0]}"
+  if [[ ${rc} -ne 0 ]]; then
+    echo "FAIL: create-user rc=${rc}（REPO_ROOT/DC_PYTHON_BIN 配错？绿库被锁？见上方输出）"
+    return 1
+  fi
+
+  # 复核：绿库真的能拿这对凭据走完 4 路径（登录 + 选仓都靠这几条）。
+  # 必要性：up.sh 拷的是蓝库快照，绿库里可能**已有同名账号**但密码不同 /
+  # 已停用 / 不是 admin（create-user 三者都不会覆盖）→ 探针会以含糊的
+  # 401 / 403 / 空选仓页收场。这里给出精确诊断，别让人再去库里翻。
+  DAILYCHECK_DB_DIR="${GREEN_DB}" "${DC_PYTHON_BIN}" - <<'PY'
+import os
+import pathlib
+import sqlite3
+import sys
+
+from werkzeug.security import check_password_hash
+
+db_file = pathlib.Path(os.environ["DAILYCHECK_DB_DIR"]) / "master.db"
+user = os.environ["SIM_USER_USER"]
+with sqlite3.connect(f"{db_file.as_uri()}?mode=ro", uri=True) as conn:
+    row = conn.execute(
+        "SELECT id, password_hash, is_admin, is_active FROM users WHERE username=?",
+        (user,),
+    ).fetchone()
+    if row is None:
+        sys.exit(f"FAIL: 绿库 {db_file} 无账号 {user}（create-user 没落到绿库？）")
+    if not check_password_hash(row[1], os.environ["SIM_USER_PASSWORD"]):
+        sys.exit(
+            f"FAIL: 绿库账号 {user} 密码 != SIM_USER_PASSWORD。"
+            "修复：换一个 SIM_USER_USER（绿库同名账号密码不会被覆盖），"
+            "或删掉绿库该账号后重跑（绿库是副本，蓝库不受影响）"
+        )
+    if not row[3]:
+        sys.exit(
+            f"FAIL: 绿库账号 {user} 已停用（is_active=0）→ /login 直接 403。"
+            "修复：删掉绿库该账号后重跑（本函数会以管理员身份重建）"
+        )
+    if not row[2]:
+        bound = conn.execute(
+            "SELECT 1 FROM warehouse_users WHERE user_id=? LIMIT 1", (row[0],)
+        ).fetchone()
+        if bound is None:
+            sys.exit(
+                f"FAIL: 绿库账号 {user} 既非 admin 也无仓绑定 → 选仓页为空，"
+                "sim_user 路径 3 必失败。修复：删掉绿库该账号后重跑"
+                "（本函数会以管理员身份重建）"
+            )
+print(f"OK: 绿库账号 {user} 就位（密码匹配 + 已启用 + 可见仓）（{db_file}）")
+PY
+}
+# <<< ensure-sim-user:end >>>
+
 _verify_check2_sim_user() {
   if [[ -z "${SIM_USER_USER:-}" || -z "${SIM_USER_PASSWORD:-}" ]]; then
     echo "❌ 缺凭据：请 export SIM_USER_USER=<用户名> SIM_USER_PASSWORD=<密码> 后重跑" >&2
+    return 1
+  fi
+  # Issue #34：凭据必须落在绿库，否则路径 2 恒 401
+  if ! _ensure_sim_user_in_green_db; then
+    echo "❌ 绿库账号未就位 —— check 2 前置失败（见上方 FAIL 行，Issue #34）" >&2
     return 1
   fi
   "${DC_PYTHON_BIN}" "${REPO_ROOT}/scripts/playwright/sim_user.py" \
@@ -227,7 +358,7 @@ _run_check() {
 # 0. 前置：绿环境必须已起（up.sh 跑过）
 # ============================================================
 mkdir -p "${REPORT_DIR}"
-echo "[verify] === 五项生产验证 (PR #${PR_NUM}) ==="
+echo "[verify] === 八项生产验证 (PR #${PR_NUM}) ==="
 echo "[verify] mode: $([[ ${DRY_RUN_FLAG} -eq 1 ]] && echo 'dry-run' || echo 'live')"
 echo "[verify] report: ${REPORT_PATH}"
 
@@ -249,7 +380,8 @@ _run_check "1" "集成测试 (pytest tests/ 顶层 + check_known_failures 零新
   "_verify_check1_pytest"
 
 # ============================================================
-# 2. 模拟用户操作（sim_user.py 4 关键路径；凭据 SIM_USER_USER/PASSWORD）
+# 2. 模拟用户操作（sim_user.py 4 关键路径；凭据 SIM_USER_USER/PASSWORD；
+#    先用 DAILYCHECK_DB_DIR=绿库 ensure 账号，Issue #34）
 # ============================================================
 _run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存)" \
   "_verify_check2_sim_user"

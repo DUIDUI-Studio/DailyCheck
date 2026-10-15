@@ -30,7 +30,7 @@
 | 文件 | 用途 | 状态 |
 |------|------|------|
 | `up.sh` | 起绿环境（cp DB + systemctl start dailycheck-green.service + 健康检查） | 骨架 + systemd TODO |
-| `verify.sh` | 跑五项生产验证 | 骨架（占位报告，exit 0 警告） |
+| `verify.sh` | 跑八项生产验证 | 骨架（占位报告，exit 0 警告） |
 | `switch.sh` | 切流量（nginx upstream weight + reload） | 骨架 + systemd TODO |
 | `rollback.sh` | 秒级切回蓝（weight=0 + 不停绿进程） | 骨架 + systemd TODO |
 | `down.sh` | 清理绿（systemctl stop + 可选 rm DB） | 骨架 + systemd TODO |
@@ -92,7 +92,7 @@ if current_app.config.get("DRY_RUN"):
 - [ ] `/var/lib/dailycheck-green/` 目录（cp 自蓝）
 - [ ] `app.py` DRY_RUN 中间件 + blueprints 接入（方案 B PoC，1-2d）
 - [ ] Nginx `/etc/nginx/sites-enabled/dailycheck` 加 :8091 + :5101 upstream blocks
-- [ ] `verify.sh` 五项实装（集成 + 模拟用户 + 绿蓝比对 + 回滚演练 + 资源基线）
+- [x] `verify.sh` 八项实装（集成 + 模拟用户 + 绿蓝比对 + 回滚演练 + 资源基线 + dry_run 隔离 + DB 隔离 + nginx 入口探活）
 - [ ] `scripts/agent_framework/prod_dryrun_evidence.sh` 实装（取消 exit 78）
 - [ ] 蓝环境 standby 7 天自动清理 cron
 - [ ] `vps_self_heal.py` 监控清单补 `dailycheck-green.service`（Phase 2）
@@ -103,8 +103,12 @@ if current_app.config.get("DRY_RUN"):
 # 1. 起绿环境
 ./scripts/blue_green/up.sh pr-123 abc1234
 
-# 2. 跑五项生产验证（出 templates/05 报告）
+# 2. 跑八项生产验证（出 templates/05 报告）
+#    check 2 需要一次性模拟账号凭据；verify.sh 会在**绿库**内幂等建号
+#    （`--admin`，蓝库零写入）——无需事先手工 create-user。
+export SIM_USER_USER=sim_user_v1 SIM_USER_PASSWORD='<一次性口令>'
 ./scripts/blue_green/verify.sh pr-123
+#    ⚠️ 该账号随绿库存在，切流量后会进生产；切完按 down.sh / 账号停用流程处置。
 
 # 3. dry_run 隔离证据采集
 ./scripts/agent_framework/prod_dryrun_evidence.sh
