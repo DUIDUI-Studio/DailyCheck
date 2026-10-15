@@ -8,20 +8,21 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
-from contextlib import closing
 from datetime import datetime
 
 from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
 from werkzeug.security import generate_password_hash
 
-from config import AGENT_TOKEN_PREFIX_LEN, MASTER_DB, SECRET_KEY
+from config import AGENT_TOKEN_PREFIX_LEN, SECRET_KEY
 from db import get_master_db
-from permissions import require_login
+from permissions import require_platform_admin
 
 
 def _fernet():
+    import base64
+    import hashlib
+
     from cryptography.fernet import Fernet
-    import hashlib, base64
     # Derive a stable Fernet key from the app SECRET_KEY
     key = base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest())
     return Fernet(key)
@@ -48,11 +49,6 @@ def _ensure_encrypted_token_col(db):
 bp = Blueprint("agent_tokens", __name__)
 
 
-def _require_admin():
-    if not g.user or not g.user["is_admin"]:
-        abort(403)
-
-
 def _parse_paths(s: str) -> str:
     s = s.strip()
     if not s:
@@ -70,9 +66,8 @@ def _parse_warehouses(s: str) -> str:
 
 
 @bp.route("/admin/agent-tokens", methods=["GET"])
-@require_login
+@require_platform_admin
 def list_tokens():
-    _require_admin()
     db = get_master_db()
     _ensure_encrypted_token_col(db)
     rows = db.execute(
@@ -106,10 +101,8 @@ def list_tokens():
 
 
 @bp.route("/admin/agent-tokens/create", methods=["POST"])
-@require_login
+@require_platform_admin
 def create_token():
-    _require_admin()
-
     name = request.form.get("name", "").strip()
     read_paths = request.form.get("read_paths", "*").strip()
     write_paths = request.form.get("write_paths", "").strip()
@@ -157,9 +150,8 @@ def create_token():
 
 
 @bp.route("/admin/agent-tokens/<int:token_id>/revoke", methods=["POST"])
-@require_login
+@require_platform_admin
 def revoke_token(token_id: int):
-    _require_admin()
     db = get_master_db()
     row = db.execute(
         "SELECT id, name, revoked_at FROM agent_tokens WHERE id=?", (token_id,)
@@ -182,13 +174,7 @@ def revoke_token(token_id: int):
 
 
 def _log_admin_action(detail: str) -> None:
-    """Append an admin action line to admin_audit.log."""
-    import json
-    from pathlib import Path
-    log = Path(__file__).resolve().parent.parent / "admin_audit.log"
-    with log.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "actor": g.user["username"] if g.user else None,
-            "detail": detail,
-        }, ensure_ascii=False) + "\n")
+    """Append an admin action line via the single shared implementation."""
+    from blueprints.audit_pure import append_admin_audit
+
+    append_admin_audit(g.user["username"] if g.user else None, detail)

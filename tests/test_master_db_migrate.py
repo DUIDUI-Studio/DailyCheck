@@ -325,3 +325,127 @@ def test_init_master_db_shipped_quantity_idempotent(tmp_path, monkeypatch):
     ).fetchall()}
     assert sum(1 for c in soi_cols if c == "shipped_quantity") == 1
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 权限精细化（Phase 3）：RBAC 5 表 + 播种 + 启动断言
+# ---------------------------------------------------------------------------
+
+def _init_empty(tmp_path, monkeypatch):
+    """空路径 init_master_db，返回 master 路径。"""
+    import config as config_module
+    import db as db_module
+    master = tmp_path / "master.db"
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", tmp_path)
+    from db import init_master_db
+    init_master_db()
+    return master
+
+
+def test_rbac_tables_created_on_empty_db(tmp_path, monkeypatch):
+    """空库 init 后 5 张权限表存在。"""
+    import sqlite3
+    master = _init_empty(tmp_path, monkeypatch)
+    conn = sqlite3.connect(master)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    need = {"permissions", "roles", "role_permissions",
+            "permission_routes", "approval_policies"}
+    assert need <= tables, f"缺失表：{need - tables}"
+    conn.close()
+
+
+def test_rbac_seed_row_counts(tmp_path, monkeypatch):
+    """播种：permissions==25；内置 roles==5；各包权限数精确等于契约。"""
+    import sqlite3
+
+    from permissions_manifest import BUILTIN_PACKAGE_SIZES
+    master = _init_empty(tmp_path, monkeypatch)
+    conn = sqlite3.connect(master)
+    assert conn.execute("SELECT COUNT(*) FROM permissions").fetchone()[0] == 25
+    assert conn.execute(
+        "SELECT COUNT(*) FROM roles WHERE is_builtin=1").fetchone()[0] == 5
+    sizes = {r[0]: r[1] for r in conn.execute(
+        """SELECT r.code, COUNT(rp.permission_code)
+             FROM roles r LEFT JOIN role_permissions rp ON rp.role_id=r.id
+            WHERE r.is_builtin=1 GROUP BY r.code""").fetchall()}
+    assert sizes == BUILTIN_PACKAGE_SIZES, sizes
+    conn.close()
+
+
+def test_rbac_seed_idempotent(tmp_path, monkeypatch):
+    """连续两次 init → 行数不变（无重复播种）。"""
+    import sqlite3
+    master = _init_empty(tmp_path, monkeypatch)
+    import config as config_module
+    import db as db_module
+    from db import init_master_db
+    monkeypatch.setattr(db_module, "MASTER_DB", master)
+    monkeypatch.setattr(config_module, "MASTER_DB", master)
+    init_master_db()
+    conn = sqlite3.connect(master)
+    perms = conn.execute("SELECT COUNT(*) FROM permissions").fetchone()[0]
+    rp = conn.execute("SELECT COUNT(*) FROM role_permissions").fetchone()[0]
+    roles = conn.execute("SELECT COUNT(*) FROM roles WHERE is_builtin=1").fetchone()[0]
+    conn.close()
+    assert perms == 25 and roles == 5 and rp == 52, (perms, roles, rp)
+
+
+def test_agent_tokens_permission_codes_json_column_added(tmp_path, monkeypatch):
+    """旧 master.db（agent_tokens 无该列）→ init 后 PRAGMA 含 permission_codes_json。"""
+    import sqlite3
+    master = _init_empty(tmp_path, monkeypatch)
+    conn = sqlite3.connect(master)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(agent_tokens)").fetchall()}
+    assert "permission_codes_json" in cols
+    conn.close()
+
+
+def test_verify_builtin_packages_detects_empty(tmp_path, monkeypatch):
+    """清空任一包（含旁支 viewer）→ 返回「空包」告警。"""
+    import sqlite3
+
+    from db import _verify_builtin_packages
+    master = _init_empty(tmp_path, monkeypatch)
+    conn = sqlite3.connect(master)
+    rid = conn.execute("SELECT id FROM roles WHERE code='viewer'").fetchone()[0]
+    conn.execute("DELETE FROM role_permissions WHERE role_id=?", (rid,))
+    warnings = _verify_builtin_packages(conn)
+    assert any("空权限包" in w and "viewer" in w for w in warnings), warnings
+    conn.close()
+
+
+def test_verify_builtin_packages_detects_broken_ladder(tmp_path, monkeypatch):
+    """破坏 staff⊆manager → 返回「阶梯破坏」告警。"""
+    import sqlite3
+
+    from db import _verify_builtin_packages
+    master = _init_empty(tmp_path, monkeypatch)
+    conn = sqlite3.connect(master)
+    rid = conn.execute("SELECT id FROM roles WHERE code='manager'").fetchone()[0]
+    conn.execute(
+        "DELETE FROM role_permissions WHERE role_id=? AND permission_code='order.create'",
+        (rid,))
+    warnings = _verify_builtin_packages(conn)
+    assert any("阶梯破坏" in w for w in warnings), warnings
+    conn.close()
+
+
+def test_verify_builtin_packages_detects_size_drift(tmp_path, monkeypatch):
+    """某包权限数 ≠ 契约 → 返回「权限数漂移」告警。"""
+    import sqlite3
+
+    from db import _verify_builtin_packages
+    master = _init_empty(tmp_path, monkeypatch)
+    conn = sqlite3.connect(master)
+    rid = conn.execute("SELECT id FROM roles WHERE code='staff'").fetchone()[0]
+    conn.execute(
+        "INSERT OR IGNORE INTO role_permissions (role_id, permission_code) "
+        "VALUES (?, 'order.approve')", (rid,))
+    warnings = _verify_builtin_packages(conn)
+    assert any("权限数漂移" in w and "staff" in w for w in warnings), warnings
+    conn.close()
+

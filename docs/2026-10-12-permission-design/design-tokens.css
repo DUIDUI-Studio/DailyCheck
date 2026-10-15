@@ -1,0 +1,167 @@
+/* design-tokens.css — DailyCheck 权限管理 UI（Phase 2，teal 体系）
+ * 设计师：颜好看 ｜ 依据：Spec v1.0 + UIUX v0.1 §3.2
+ * 原则：组件只引用语义/组件 token；禁止组件内裸写 hex；零新依赖。
+ * 分层：A1-identity / A1-structure / A2-semantic / B-slot(component) / C-extension
+ */
+
+:root {
+  /* ══════════ A1-identity（品牌核心，沿用 style.css:1-11）══════════ */
+  --bg: #eef2f6;            /* style.css:2 */
+  --panel: #ffffff;         /* style.css:3 */
+  --text: #1f2d3d;          /* style.css:4 */
+  --muted: #6b7280;         /* style.css:5 */
+  --brand: #0f766e;         /* style.css:6 —— teal，非靛蓝 */
+  --brand-ink: #0b4f4a;     /* style.css:7 */
+  --border: #d9e1ea;        /* style.css:9 */
+
+  /* 语义别名（B-slot） */
+  --surface: var(--panel);
+  --fg: var(--text);
+  --fg-2: #374151;
+  --meta: #9ca3af;
+  --border-soft: #f3f4f6;
+  --accent: var(--brand);
+  --accent-ink: var(--brand-ink);
+  --accent-soft: #ecfdf5;
+  --accent-on: #ffffff;
+  --warn: #c2410c;          /* style.css:8 */
+  --danger: #dc2626;
+  --info: #2563eb;
+
+  /* ══════════ A1-structure（布局与结构）══════════ */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 16px;
+  --radius-pill: 9999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-raised: 0 10px 26px rgba(15, 23, 42, 0.08);  /* style.css:10 */
+  --shadow-drawer: -4px 0 16px rgba(0, 0, 0, 0.08);
+
+  --font-ui: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+
+  --leading-body: 1.5;
+  --leading-tight: 1.25;
+  --tracking-caps: 0.06em;
+  --tracking-display: -0.02em;
+
+  --container-max: 1200px;
+  --touch-target-min: 44px;
+
+  --motion-instant: 80ms;
+  --motion-fast: 150ms;
+  --motion-base: 220ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-drawer: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  --focus-ring: 0 0 0 2px var(--brand);
+}
+
+/* ══════════ A2-semantic：权限矩阵三态 + 锁定（新增）══════════
+   把「继承」折叠进「授予」是矩阵可用性第一大坑 → 三态必须视觉可辨 */
+:root {
+  --perm-cell-on: var(--brand);
+  --perm-cell-on-bg: var(--accent-soft);
+  --perm-cell-on-fg: var(--brand-ink);
+  --perm-cell-inherited: var(--muted);
+  --perm-cell-off: #d1d5db;
+  --perm-cell-locked-bg: #f3f4f6;
+  --perm-cell-locked-fg: #9ca3af;
+}
+
+/* A2-semantic：变更预演（Phase 2 编辑态预留，本期只读不实现） */
+:root {
+  --diff-added: #2563eb;
+  --diff-removed: #dc2626;
+  --diff-unchanged: var(--brand);
+}
+
+/* A2-semantic：权限域分组 chip（中性化，区分度交给域图标） */
+:root {
+  --domain-chip-bg: #f3f4f6;
+  --domain-chip-fg: #374151;
+  --domain-chip-on-bg: var(--accent-soft);
+  --domain-chip-on-fg: var(--brand-ink);
+}
+
+/* A2-semantic：矩阵结构尺寸 */
+:root {
+  --matrix-cell-size: 28px;
+  --matrix-row-h: 36px;
+  --matrix-sticky-col-w: 160px;
+  --drawer-w: 360px;
+  --drawer-w-wide: 480px;
+}
+
+/* ══════════ B-slot：角色标签语义系统（新增，6 类）
+   语义规则：实心 = 可写；描边 = 只读。色相仅 3 族 + 琥珀保留给平台管理员。 */
+:root {
+  --role-tag-staff-bg: #f3f4f6;
+  --role-tag-staff-fg: #374151;
+  --role-tag-manager-bg: #eef2ff;
+  --role-tag-manager-fg: #3730a3;
+  --role-tag-admin-bg: #ecfdf5;
+  --role-tag-admin-fg: #0b4f4a;
+  --role-tag-viewer-bg: transparent;
+  --role-tag-viewer-fg: #6b7280;
+  --role-tag-viewer-border: #d1d5db;
+  --role-tag-finance-bg: transparent;
+  --role-tag-finance-fg: #0b4f4a;
+  --role-tag-finance-border: #0f766e;
+  --role-tag-super-bg: #fef3c7;
+  --role-tag-super-fg: #92400e;
+}
+
+/* ══════════ B-slot：角色标签基础组件 ══════════ */
+.role-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.role-tag--staff   { background: var(--role-tag-staff-bg);   color: var(--role-tag-staff-fg); }
+.role-tag--manager { background: var(--role-tag-manager-bg); color: var(--role-tag-manager-fg); }
+.role-tag--admin   { background: var(--role-tag-admin-bg);   color: var(--role-tag-admin-fg); }
+.role-tag--viewer  { background: var(--role-tag-viewer-bg);  color: var(--role-tag-viewer-fg);
+                     border-color: var(--role-tag-viewer-border); border-style: dashed; }
+.role-tag--finance { background: var(--role-tag-finance-bg); color: var(--role-tag-finance-fg);
+                     border-color: var(--role-tag-finance-border); }
+.role-tag--super   { background: var(--role-tag-super-bg);   color: var(--role-tag-super-fg); }
+
+/* 无障碍降级：高对比模式下用轮廓而非色块区分 */
+@media (forced-colors: active) {
+  .role-tag { border: 1px solid CanvasText; }
+}
+
+/* ══════════ 无障碍：动效降级 ══════════ */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-instant: 0ms;
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+  }
+}

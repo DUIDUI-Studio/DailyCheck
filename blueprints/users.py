@@ -36,13 +36,16 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash
 
-from config import BASE_DIR, ROLE_RANK, WAREHOUSE_DB_DIR
+from config import BASE_DIR, WAREHOUSE_DB_DIR
 from db import get_master_db, init_warehouse_db
 from permissions import require_platform_admin
+from permissions_manifest import BUILTIN_ROLE_CODES, ROLE_META
 
 bp = Blueprint("users", __name__)
 
-VALID_ROLES = set(ROLE_RANK.keys())  # staff / manager / admin
+# 绑定 / 展示必须接纳**全部内置角色包**（含旁支 viewer / finance），
+# 单一来源 = permissions_manifest；不再从 ROLE_RANK（仅阶梯三包）推导。
+VALID_ROLES = set(BUILTIN_ROLE_CODES)  # staff / manager / admin / viewer / finance
 
 # v2 list page — default page size for paginated listings.
 DEFAULT_PAGE_SIZE = 20
@@ -317,6 +320,10 @@ def list_users():
         tenants=tenants,
         bindings_by_user=bindings_by_user,
         current_user_id=g.user["id"],
+        # 角色下拉的单一来源：manifest 顺序即显示顺序；模板不得硬编码角色集。
+        role_options=[
+            {"code": c, "label": ROLE_META[c][0]} for c in BUILTIN_ROLE_CODES
+        ],
         # Echo filter state so the toolbar can rehydrate after reload.
         filter_state={
             "q": q or "",
@@ -824,7 +831,8 @@ def _parse_binding(form, db) -> tuple[int | None, str | None, str | None]:
         return None, None, "仓库 id 必填"
     wh_id = int(wh_id_raw)
     if role not in VALID_ROLES:
-        return None, None, f"角色必须是 {sorted(VALID_ROLES)} 之一"
+        allowed = "/".join(f"{c}({ROLE_META[c][0]})" for c in BUILTIN_ROLE_CODES)
+        return None, None, f"角色必须是 {allowed} 之一"
     if db.execute("SELECT 1 FROM warehouses WHERE id=?", (wh_id,)).fetchone() is None:
         return None, None, "仓库不存在"
     return wh_id, role, None
@@ -859,17 +867,14 @@ def _bindings_summary(user_id: int, db) -> str:
 
 
 def _log_admin_action(detail: str) -> None:
-    """Append an admin action line to a simple flat file. Master.db has no
-    audit_log table; the per-warehouse audit_log only covers business writes."""
-    import json
-    from pathlib import Path
-    log = Path(__file__).resolve().parent.parent / "admin_audit.log"
-    with log.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "actor": g.user["username"] if g.user else None,
-            "detail": detail,
-        }, ensure_ascii=False) + "\n")
+    """Append an admin action line via the single shared implementation.
+
+    Kept as a thin wrapper so the ~10 call sites read unchanged; the actual
+    writer lives in blueprints/audit_pure.py (AC-02 single implementation).
+    """
+    from blueprints.audit_pure import append_admin_audit
+
+    append_admin_audit(g.user["username"] if g.user else None, detail)
 
 
 def _clone_catalog_from(src_path: Path, dst_path: Path) -> dict[str, int]:

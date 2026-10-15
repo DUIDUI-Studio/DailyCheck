@@ -5,7 +5,8 @@
    行内表单（重置密码 / 切换平台管理员 / 解绑 / 启停）保留 ajax-form.js 的 reload-stay 模式。 #}
 {% block content %}
 <link rel="stylesheet" href="{{ url_for('static', filename='users-admin.css') }}?v=2" />
-<script defer src="{{ url_for('static', filename='users-admin.js') }}?v=3"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='role-tags.css') }}?v=1" />
+<script defer src="{{ url_for('static', filename='users-admin.js') }}?v=4"></script>
 
 {# v2 账号管理：抽屉需要的隐藏数据 + CSRF meta + 当前用户/租户 token。
    把数据放进 #warehouses-data / #tenants-data JSON script 块，users-admin.js
@@ -19,6 +20,17 @@
 </script>
 <script id="current-user-id" type="application/json">{{ current_user_id }}</script>
 <script id="current-tenant-id" type="application/json">{{ current_tenant_id or 1 }}</script>
+
+{# 角色选项单一来源：后端注入 role_options = [{"code","label"}, ...]
+   （顺序 = BUILTIN_ROLE_CODES：staff→manager→admin→viewer→finance，
+   label 取自 permissions_manifest.ROLE_META）。服务端渲染（筛选/标签）
+   与 users-admin.js（抽屉）都从此变量取数，禁止硬编码角色名单/中文名。 #}
+{% set role_options = role_options | default([], true) %}
+{% set role_labels = {} %}
+{% for opt in role_options %}{% set _ = role_labels.update({opt['code']: opt['label']}) %}{% endfor %}
+<script id="role-options-data" type="application/json">
+  {{ role_options | tojson }}
+</script>
 
 <h2>账号管理</h2>
 
@@ -38,9 +50,9 @@
 
     <select name="role" aria-label="角色筛选">
       <option value="">所有角色</option>
-      <option value="staff" {% if filter_state.role == 'staff' %}selected{% endif %}>staff</option>
-      <option value="manager" {% if filter_state.role == 'manager' %}selected{% endif %}>manager</option>
-      <option value="admin" {% if filter_state.role == 'admin' %}selected{% endif %}>admin</option>
+      {% for opt in role_options %}
+      <option value="{{ opt['code'] }}" {% if filter_state.role == opt['code'] %}selected{% endif %}>{{ opt['label'] }}</option>
+      {% endfor %}
     </select>
 
     <select name="tenant_id" aria-label="租户筛选">
@@ -105,7 +117,11 @@
           {% set bindings = bindings_by_user.get(u['id'], {}) %}
           {% if bindings %}
             {% for wid, info in bindings.items() %}
-              <span class="tag" title="{{ info['warehouse_code'] }}">{{ info['warehouse_code'] }}:{{ info['role'] }}</span>
+              {# data-* 是 users-admin.js 重建工位绑定的唯一来源（不再解析显示文本） #}
+              <span class="role-tag role-tag--{{ info['role'] }}"
+                    data-warehouse-code="{{ info['warehouse_code'] }}"
+                    data-role="{{ info['role'] }}"
+                    title="{{ info['warehouse_name'] }} · {{ info['role'] }}">{{ info['warehouse_code'] }}·{{ role_labels.get(info['role'], info['role']) }}</span>
             {% endfor %}
           {% else %}
             <span class="muted">— 无 —</span>
@@ -262,7 +278,8 @@
 
 <p class="muted" style="margin-top:16px;font-size:13px">
   平台管理员(is_admin=1)不受仓库级权限检查约束。<br>
-  仓库级 admin 等价于"该仓全权";manager 可审批/删除单据;staff 仅录入。<br>
+  内置角色包(5 个):基础作业(录入/出库/盘点)、管理审批(含审批/发货/成本可见)、
+  仓管理(该仓全权，品项删除除外)、只读/审计(无写权限)、财务(只读且可见成本)。<br>
   v2 新增：账号可停用（保留历史）、批量绑定、租户筛选。
 </p>
 {% endblock %}

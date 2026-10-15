@@ -15,16 +15,19 @@ introducing a heavyweight dependency.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Blueprint, abort, flash, g, jsonify, redirect, render_template, request, url_for
+from flask import Blueprint, g, jsonify, render_template, request
 
-from db import get_warehouse_db
+from db import get_warehouse_db, init_master_db
 from permissions import require_platform_admin, require_role
+
 from .forecast_pure import (
     classify_confidence,
     compute_daily_avg,
@@ -169,7 +172,6 @@ def forecast_product(product_id: int):
 
 @bp.route("/forecast", methods=["GET"])
 @require_platform_admin
-@require_role("manager")
 def forecast_index():
     """Render the forecast dashboard for the current warehouse.
 
@@ -248,11 +250,6 @@ def forecast_recompute():
 # Scheduler (TASK 8)
 # ---------------------------------------------------------------------------
 
-import logging
-import time
-
-from db import init_master_db
-
 _logger = logging.getLogger(__name__)
 
 _scheduler_lock = threading.Lock()
@@ -297,8 +294,9 @@ def _recover_orphaned_runs() -> None:
     because this runs before/outside the Flask app context, where 'g'
     is unbound. Calls init_master_db() first so a fresh db is a no-op.
     """
-    from config import MASTER_DB
     from datetime import datetime as _dt
+
+    from config import MASTER_DB
     now = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
     init_master_db()  # no-op if already initialized
     with closing(sqlite3.connect(MASTER_DB)) as conn:
@@ -320,8 +318,9 @@ def _run_daily_forecast() -> int:
     values are computed on demand by GET routes, so this count is
     best-effort metadata for /admin/health operators.
     """
-    from config import MASTER_DB, WAREHOUSE_DB_DIR
     from datetime import datetime as _dt
+
+    from config import MASTER_DB, WAREHOUSE_DB_DIR
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
     minute_start = now_str[:17] + "00"
 

@@ -1,0 +1,180 @@
+{
+  "$schema": "design-tokens.dailycheck/v1",
+  "$meta": {
+    "project": "DailyCheck 权限精细化管理",
+    "phase": "Phase 2 — 设计细化",
+    "designer": "颜好看",
+    "date": "2026-10-13",
+    "basedOn": "Spec v1.0 (docs/2026-10-12-permission-spec.md) + UIUX v0.1 §3.2",
+    "register": "product",
+    "axes": { "variance": 2, "motion": 2, "density": 7 },
+    "brandPrimaryEvidence": "static/style.css:6 --brand:#0f766e (teal) — 简报「靛蓝系」已校正",
+    "iconSet": "inline-svg-stroke (Lucide geometry), sizes 16/20/24, no emoji",
+    "notes": "所有组件只可引用 semantic / component token；禁止在组件内裸写 hex（本文件为 token 定义处，允许多值的原始值在此声明）。"
+  },
+
+  "color": {
+    "primitive": {
+      "teal-50":  { "value": "#ecfdf5", "type": "color" },
+      "teal-600": { "value": "#0f766e", "type": "color" },
+      "teal-800": { "value": "#0b4f4a", "type": "color" },
+      "gray-50":  { "value": "#f9fafb", "type": "color" },
+      "gray-100": { "value": "#f3f4f6", "type": "color" },
+      "gray-200": { "value": "#e5e7eb", "type": "color" },
+      "gray-300": { "value": "#d1d5db", "type": "color" },
+      "gray-400": { "value": "#9ca3af", "type": "color" },
+      "gray-500": { "value": "#6b7280", "type": "color" },
+      "gray-700": { "value": "#374151", "type": "color" },
+      "gray-900": { "value": "#111827", "type": "color" },
+      "indigo-50":  { "value": "#eef2ff", "type": "color" },
+      "indigo-800": { "value": "#3730a3", "type": "color" },
+      "amber-100": { "value": "#fef3c7", "type": "color" },
+      "amber-800": { "value": "#92400e", "type": "color" },
+      "blue-600":  { "value": "#2563eb", "type": "color" },
+      "red-600":   { "value": "#dc2626", "type": "color" },
+      "orange-700":{ "value": "#c2410c", "type": "color" },
+      "white":     { "value": "#ffffff", "type": "color" }
+    },
+
+    "semantic": {
+      "bg":      { "value": "{color.primitive.gray-50}", "type": "color", "$desc": "页面底色；项目改用 style.css --bg #eef2f6 时以继承为准" },
+      "surface": { "value": "{color.primitive.white}",    "type": "color", "$desc": "面板/卡片" },
+      "fg":      { "value": "#1f2d3d",                    "type": "color", "$desc": "主文本（沿用 style.css --text）" },
+      "fg-2":    { "value": "{color.primitive.gray-700}", "type": "color", "$desc": "次级文本（表头/标签）" },
+      "muted":   { "value": "{color.primitive.gray-500}", "type": "color", "$desc": "三级文本/元数据" },
+      "meta":    { "value": "{color.primitive.gray-400}", "type": "color", "$desc": "最弱文本（占位/禁用）" },
+      "border":  { "value": "#d9e1ea",                    "type": "color", "$desc": "默认边框（沿用 style.css --border）" },
+      "border-soft": { "value": "{color.primitive.gray-100}", "type": "color", "$desc": "内部分隔线" },
+      "accent":        { "value": "{color.primitive.teal-600}", "type": "color", "$desc": "品牌主色（每屏 ≤2 处可见强调）" },
+      "accent-ink":    { "value": "{color.primitive.teal-800}", "type": "color" },
+      "accent-on":     { "value": "{color.primitive.white}",    "type": "color", "$desc": "accent 背景上的前景" },
+      "accent-soft":   { "value": "{color.primitive.teal-50}",  "type": "color" },
+      "warn":   { "value": "{color.primitive.orange-700}", "type": "color" },
+      "danger": { "value": "{color.primitive.red-600}",    "type": "color" },
+      "info":   { "value": "{color.primitive.blue-600}",   "type": "color" }
+    },
+
+    "matrix": {
+      "$desc": "权限矩阵三态 + 锁定（核心新增）。三态必须视觉可辨——把「继承」折叠进「授予」是矩阵可用性第一大坑。",
+      "cell-on":        { "value": "{color.primitive.teal-600}", "type": "color", "$desc": "已授予（实心，源头，可点）" },
+      "cell-on-bg":     { "value": "{color.primitive.teal-50}",  "type": "color", "$desc": "已授予底色" },
+      "cell-on-fg":     { "value": "{color.primitive.teal-800}", "type": "color" },
+      "cell-inherited": { "value": "{color.primitive.gray-500}", "type": "color", "$desc": "继承态（虚线边框，不可点）" },
+      "cell-off":       { "value": "{color.primitive.gray-300}", "type": "color", "$desc": "未授予（空描边）" },
+      "cell-locked-bg": { "value": "{color.primitive.gray-100}", "type": "color", "$desc": "系统锁定（不可配置）" },
+      "cell-locked-fg": { "value": "{color.primitive.gray-400}", "type": "color" }
+    },
+
+    "diff": {
+      "$desc": "变更预演（Phase 2 编辑态预留，本期只读不实现）",
+      "added":     { "value": "{color.primitive.blue-600}", "type": "color", "$desc": "本次新增（蓝）" },
+      "removed":   { "value": "{color.primitive.red-600}",  "type": "color", "$desc": "本次移除（红斜线）" },
+      "unchanged": { "value": "{color.primitive.teal-600}", "type": "color", "$desc": "已有不变（teal）" }
+    },
+
+    "domain": {
+      "$desc": "权限域分组 chip（订货/库存/品项/报表/管理）——中性化，避免彩虹矩阵；区分度由域图标承担",
+      "chip-bg":      { "value": "{color.primitive.gray-100}", "type": "color" },
+      "chip-fg":      { "value": "{color.primitive.gray-700}", "type": "color" },
+      "chip-on-bg":   { "value": "{color.primitive.teal-50}",  "type": "color" },
+      "chip-on-fg":   { "value": "{color.primitive.teal-800}", "type": "color" }
+    },
+
+    "role-tag": {
+      "$desc": "角色标签语义系统：实心=可写；描边=只读。色相仅 3 族 + 琥珀保留给平台管理员。不靠颜色单独表意（a11y）。",
+      "staff-bg":     { "value": "{color.primitive.gray-100}",  "type": "color", "$desc": "基础作业（实心·中性）" },
+      "staff-fg":     { "value": "{color.primitive.gray-700}",  "type": "color" },
+      "manager-bg":   { "value": "{color.primitive.indigo-50}", "type": "color", "$desc": "管理审批（实心·靛蓝=既有 .tag 默认色）" },
+      "manager-fg":   { "value": "{color.primitive.indigo-800}","type": "color" },
+      "admin-bg":     { "value": "{color.primitive.teal-50}",   "type": "color", "$desc": "仓管理（实心·teal=品牌邻色，仓级最高）" },
+      "admin-fg":     { "value": "{color.primitive.teal-800}",  "type": "color" },
+      "viewer-bg":    { "value": "transparent",                 "type": "color", "$desc": "只读/审计（描边·虚线，中性）" },
+      "viewer-fg":    { "value": "{color.primitive.gray-500}",  "type": "color" },
+      "viewer-border":{ "value": "{color.primitive.gray-300}",  "type": "color" },
+      "finance-bg":   { "value": "transparent",                 "type": "color", "$desc": "财务（描边·teal，只读但可见成本）" },
+      "finance-fg":   { "value": "{color.primitive.teal-800}",  "type": "color" },
+      "finance-border":{ "value": "{color.primitive.teal-600}", "type": "color" },
+      "super-bg":     { "value": "{color.primitive.amber-100}", "type": "color", "$desc": "平台管理员（实心·琥珀，系统保留，单数）" },
+      "super-fg":     { "value": "{color.primitive.amber-800}", "type": "color" }
+    }
+  },
+
+  "font": {
+    "family": {
+      "ui":   { "value": "\"PingFang SC\", \"Microsoft YaHei\", \"Noto Sans SC\", system-ui, sans-serif", "type": "fontFamily" },
+      "mono": { "value": "\"JetBrains Mono\", \"Fira Code\", ui-monospace, monospace", "type": "fontFamily", "$desc": "权限点 dot-notation 代码" }
+    },
+    "size": {
+      "xs":   { "value": "0.75rem",  "type": "dimension", "$desc": "12px 标签/辅助" },
+      "sm":   { "value": "0.8125rem","type": "dimension", "$desc": "13px 紧凑" },
+      "base": { "value": "0.875rem","type": "dimension", "$desc": "14px 正文/表格" },
+      "md":   { "value": "1rem",     "type": "dimension", "$desc": "16px 小标题/抽屉标题" },
+      "lg":   { "value": "1.125rem", "type": "dimension", "$desc": "18px 区块标题" },
+      "xl":   { "value": "1.25rem",  "type": "dimension", "$desc": "20px 页面标题" }
+    },
+    "weight": {
+      "read":      { "value": 400, "type": "fontWeight" },
+      "emphasize": { "value": 510, "type": "fontWeight" },
+      "announce":  { "value": 590, "type": "fontWeight" }
+    },
+    "leading": {
+      "body":  { "value": 1.5, "type": "number" },
+      "tight": { "value": 1.25, "type": "number" }
+    },
+    "tracking": {
+      "body":    { "value": "0", "type": "dimension" },
+      "caps":    { "value": "0.06em", "type": "dimension", "$desc": "ALL CAPS 表头" },
+      "display": { "value": "-0.02em", "type": "dimension", "$desc": "大标题负字距" }
+    }
+  },
+
+  "space": {
+    "1":  { "value": "4px",  "type": "dimension" },
+    "2":  { "value": "8px",  "type": "dimension" },
+    "3":  { "value": "12px", "type": "dimension" },
+    "4":  { "value": "16px", "type": "dimension" },
+    "5":  { "value": "20px", "type": "dimension" },
+    "6":  { "value": "24px", "type": "dimension" },
+    "8":  { "value": "32px", "type": "dimension" },
+    "10": { "value": "40px", "type": "dimension" },
+    "12": { "value": "48px", "type": "dimension" },
+    "$desc": "4px 基准网格；仅允许 4/8/12/16/20/24/32/40/48"
+  },
+
+  "radius": {
+    "sm":   { "value": "4px",    "type": "dimension", "$desc": "标签/徽章" },
+    "md":   { "value": "6px",    "type": "dimension", "$desc": "按钮/输入框/分页" },
+    "lg":   { "value": "10px",   "type": "dimension", "$desc": "卡片/工具栏/表格容器" },
+    "xl":   { "value": "16px",   "type": "dimension", "$desc": "弹窗（上限）" },
+    "pill": { "value": "9999px", "type": "dimension", "$desc": "角色标签" }
+  },
+
+  "shadow": {
+    "flat":   { "value": "none", "type": "boxShadow" },
+    "xs":     { "value": "0 1px 2px rgba(0,0,0,0.04)", "type": "boxShadow", "$desc": "工具栏/卡片默认" },
+    "raised": { "value": "0 10px 26px rgba(15,23,42,0.08)", "type": "boxShadow", "$desc": "沿用 style.css --shadow" },
+    "drawer": { "value": "-4px 0 16px rgba(0,0,0,0.08)", "type": "boxShadow", "$desc": "右侧抽屉" }
+  },
+
+  "structure": {
+    "matrix-cell-size":     { "value": "28px", "type": "dimension", "$desc": "桌面矩阵单元格" },
+    "matrix-row-h":         { "value": "36px", "type": "dimension", "$desc": "桌面矩阵行高" },
+    "matrix-sticky-col-w":  { "value": "160px","type": "dimension", "$desc": "左侧权限点名冻结列" },
+    "drawer-w":             { "value": "360px","type": "dimension", "$desc": "既有抽屉宽" },
+    "drawer-w-wide":        { "value": "480px","type": "dimension", "$desc": "权限清单抽屉" },
+    "container-max":        { "value": "1200px","type": "dimension" },
+    "touch-target-min":     { "value": "44px", "type": "dimension", "$desc": "WCAG 2.5.5" }
+  },
+
+  "motion": {
+    "instant":  { "value": "80ms",  "type": "duration", "$desc": "按下/勾选" },
+    "fast":     { "value": "150ms", "type": "duration", "$desc": "悬停/焦点（收敛值）" },
+    "base":     { "value": "220ms", "type": "duration", "$desc": "抽屉/浮层进入" },
+    "ease-standard": { "value": "cubic-bezier(0.2, 0, 0, 1)", "type": "cubicBezier" },
+    "ease-drawer":   { "value": "cubic-bezier(0.22, 0.61, 0.36, 1)", "type": "cubicBezier", "$desc": "沿用 users-admin.css" }
+  },
+
+  "focus": {
+    "ring": { "value": "0 0 0 2px #0f766e", "type": "boxShadow", "$desc": "focus-visible outline，offset 1px" }
+  }
+}

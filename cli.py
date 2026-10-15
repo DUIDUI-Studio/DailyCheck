@@ -2,6 +2,7 @@
 
 Run via:
     flask --app app init-master
+    flask --app app reseed-builtin-roles
     flask --app app migrate-legacy
     flask --app app create-warehouse <code> <name> [--type {storefront,distribution_center,rd}]
     flask --app app set-warehouse-type <code> <type>
@@ -62,6 +63,7 @@ def register_cli(app: Flask) -> None:
     app.cli.add_command(recompute_safety_stock_cmd)
     app.cli.add_command(backfill_prices_cmd)
     app.cli.add_command(migrate_cmd)
+    app.cli.add_command(reseed_builtin_roles_cmd)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -134,6 +136,25 @@ def init_master_cmd() -> None:
     """Create master.db schema (idempotent)."""
     init_master_db()
     click.echo(f"Initialized {MASTER_DB}")
+
+
+@click.command("reseed-builtin-roles")
+def reseed_builtin_roles_cmd() -> None:
+    """重建 5 个内置角色包的权限映射（不动 is_builtin=0 的自定义角色）。
+
+    改了 `permissions_manifest.ROLE_PACKAGES` 常量后必须跑一次：
+    `INSERT OR IGNORE` 不会更新已存在行，否则新旧权限点会混杂。
+    """
+    from db import _verify_builtin_packages, reseed_builtin_roles
+
+    init_master_db()  # 确保 5 表 + 内置角色已存在
+    with closing(sqlite3.connect(MASTER_DB)) as conn:
+        reseed_builtin_roles(conn)
+        warnings = _verify_builtin_packages(conn)
+        conn.commit()
+    click.echo("内置角色包已重播种")
+    for w in warnings:
+        click.echo(f"  [warn] {w}", err=True)
 
 
 @click.command("migrate-legacy")

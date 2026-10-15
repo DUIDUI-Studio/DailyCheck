@@ -12,16 +12,28 @@ import datetime as _dt
 import io
 from datetime import datetime
 
-from flask import Blueprint, render_template, request
+from flask import Blueprint, g, render_template, request
 
 import reports_health_pure as hp
 from db import get_master_db, get_warehouse_db
-from permissions import require_login, require_role
+from permissions import current_permissions, require_login, require_permission, require_role
 
 from .auth import audit
 from .core import _compute_category_stats, _compute_summary_metrics
+from .cost_redaction_pure import mask_cost_csv_row
 
 bp = Blueprint("reports", __name__)
+
+# 成本列索引（0 基）。无 report.cost.view 时这些列在 CSV 里留空。
+_CONSUMPTION_COST_COLS = {4, 5}          # 单价 / 消耗金额
+_SUMMARY_TOTAL_COST_COLS = {1, 2, 3, 4}  # 进货/消耗/库存金额 + 周转率
+_SUMMARY_CAT_COST_COLS = {1, 2, 3, 4, 5}  # 品类段：全部金额列 + 周转率
+_SUMMARY_TOP_COST_COLS = {4}             # 消耗 Top 段：消耗金额
+
+
+def _cost_visible() -> bool:
+    """调用者是否可见成本金额：平台超管 或 持 report.cost.view。"""
+    return bool(g.user["is_admin"] or "report.cost.view" in current_permissions())
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +41,7 @@ bp = Blueprint("reports", __name__)
 # ---------------------------------------------------------------------------
 
 @bp.route("/report/outbound")
-@require_login
+@require_permission("report.view")
 def outbound():
     """scope=today (default): 出库 today's totals per item.
     scope=all: 出库 daily grid per item across all dates.
@@ -84,7 +96,7 @@ def outbound():
 # ---------------------------------------------------------------------------
 
 @bp.route("/report/inbound")
-@require_login
+@require_permission("report.view")
 def inbound():
     """scope=today: 补货入库 today's totals per item.
     scope=all: daily grid including initial stock (0 by default since
@@ -143,7 +155,7 @@ def inbound():
 # ---------------------------------------------------------------------------
 
 @bp.route("/export/consumption")
-@require_login
+@require_permission("report.export")
 def export_consumption():
     """CSV download of consumption report.
 
@@ -164,14 +176,16 @@ def export_consumption():
     ).fetchall()
     audit("report.consumption_export", "report", None, {"rows": len(rows)})
 
+    # 成本脱敏：无 report.cost.view 者，单价 / 消耗金额两列留空（列结构不变）。
+    allow_cost = _cost_visible()
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["品类", "品项", "消耗数量", "单位", "单价", "消耗金额"])
     for r in rows:
-        writer.writerow([
+        writer.writerow(mask_cost_csv_row([
             r["category_name"], r["item_name"], r["consumed_qty"],
             r["unit"], r["unit_cost"], r["consumed_value"],
-        ])
+        ], _CONSUMPTION_COST_COLS, allow_cost))
 
     from flask import current_app
     response = current_app.response_class(
@@ -231,7 +245,7 @@ def api_upload_revenue():
 # ---------------------------------------------------------------------------
 
 @bp.route("/summary/export")
-@require_login
+@require_permission("report.export")
 def export_summary():
     """CSV 三段导出:总体 / 按品类 / 消耗 Top。
 
@@ -278,13 +292,18 @@ def export_summary():
            ORDER BY o.total_qty DESC LIMIT 10"""
     ).fetchall()
 
-    # 写 CSV(三段以空行分隔)
+    # 写 CSV(三段以空行分隔)。成本脱敏：无 report.cost.view 者，全部金额列与
+    # 成本派生的周转率留空（可售天数=天数，非成本，保留）。
+    allow_cost = _cost_visible()
+
     output = io.StringIO()
     w = csv.writer(output)
 
     w.writerow(["范围", "进货金额", "消耗金额", "当前库存金额", "周转率", "可售天数"])
-    w.writerow([range_label, f"{total_inbound:.2f}", f"{total_consumed:.2f}",
-                f"{total_stock:.2f}", turnover_str, days_str])
+    w.writerow(mask_cost_csv_row(
+        [range_label, f"{total_inbound:.2f}", f"{total_consumed:.2f}",
+         f"{total_stock:.2f}", turnover_str, days_str],
+        _SUMMARY_TOTAL_COST_COLS, allow_cost))
     w.writerow([])
 
     # 品类段:周转率与 /summary 同源(avg(start+end) 反推),
@@ -292,23 +311,23 @@ def export_summary():
     w.writerow(["品类", "进货金额", "消耗金额", "库存金额", "平均库存金额", "周转率"])
     for cat in cat_stats:
         cat_turnover = f"{cat['turnover']:.2f}" if cat["turnover"] is not None else "—"
-        w.writerow([
+        w.writerow(mask_cost_csv_row([
             cat["category_name"],
             f"{cat['inbound_value']:.2f}",
             f"{cat['consumed_value']:.2f}",
             f"{cat['stock_value']:.2f}",
             f"{cat['avg_stock_value']:.2f}",
             cat_turnover,
-        ])
+        ], _SUMMARY_CAT_COST_COLS, allow_cost))
     w.writerow([])
 
     w.writerow(["品类", "品项", "消耗数量", "单位", "消耗金额"])
     for r in top_rows:
-        w.writerow([
+        w.writerow(mask_cost_csv_row([
             r["category_name"], r["item_name"],
             fmt_qty(r["consumed_qty"]), r["unit"],
             f"{float(r['consumed_value']):.2f}",
-        ])
+        ], _SUMMARY_TOP_COST_COLS, allow_cost))
 
     filename = f"summary-{_dt.datetime.now().strftime('%Y-%m-%d')}-{range_param}.csv"
     from flask import current_app

@@ -10,6 +10,7 @@ is set by the before_request hook in auth.py based on session.
 from __future__ import annotations
 
 import fcntl
+import logging
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -19,6 +20,15 @@ from typing import Any
 from flask import g
 
 from config import MASTER_DB, WAREHOUSE_DB_DIR
+from permissions_manifest import (
+    BUILTIN_PACKAGE_SIZES,
+    BUILTIN_ROLE_CODES,
+    LADDER_ROLE_CODES,
+    PERMISSION_CATALOG,
+    PLATFORM_ONLY_PERMS,
+    ROLE_META,
+    ROLE_PACKAGES,
+)
 
 
 def get_master_db() -> sqlite3.Connection:
@@ -560,6 +570,72 @@ CREATE INDEX IF NOT EXISTS idx_store_order_receipts_order
 
 CREATE INDEX IF NOT EXISTS idx_store_order_receipts_item
     ON store_order_receipts(order_item_id, created_at DESC);
+
+-- ============================================================
+-- 权限精细化（Permission Granularity）—— Phase 3
+-- 5 张表：permissions / roles / role_permissions / permission_routes /
+--         approval_policies。全部 CREATE TABLE IF NOT EXISTS：对存量
+-- master.db 是 no-op 追加（不触发旧列迁移分支）。
+-- 播种（幂等）由 init_master_db()::_seed_permissions_and_roles 完成。
+-- 依据：docs/2026-10-12-permission-architecture.md §3.2（ADR-002/004/005）。
+-- ============================================================
+
+-- 权限点词汇表。code 是跨 Web/MCP 的稳定键；risk 供 UI 分级高亮与测试断言。
+CREATE TABLE IF NOT EXISTS permissions (
+    code        TEXT PRIMARY KEY,                -- 'order.approve' / 'report.cost.view'
+    category    TEXT NOT NULL,                   -- order|stock|item|report|admin
+    description TEXT NOT NULL,                   -- 中文可读（UI 矩阵展示）
+    risk        TEXT NOT NULL DEFAULT 'normal',  -- normal|sensitive|critical
+    created_at  TEXT NOT NULL
+);
+
+-- 角色。内置 5 个（staff/manager/admin/viewer/finance）is_builtin=1；
+-- 未来自定义角色 is_builtin=0 且 tenant 级。rank 仅为 require_role 兼容层
+-- 服务（映射 config.ROLE_RANK）；旁支角色（viewer/finance）rank 为 NULL。
+CREATE TABLE IF NOT EXISTS roles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    code       TEXT NOT NULL,                -- 'staff'|'manager'|'admin'|'viewer'|'finance'
+    tenant_id  INTEGER NOT NULL DEFAULT 1,
+    name       TEXT NOT NULL,                -- 中文显示名
+    is_builtin INTEGER NOT NULL DEFAULT 0,
+    rank       INTEGER,                      -- 1/2/3（仅阶梯三包）；旁支为 NULL
+    created_at TEXT NOT NULL,
+    UNIQUE(tenant_id, code)
+);
+
+-- 角色 = 权限点集合。内置包由 permissions_manifest.ROLE_PACKAGES 幂等播种。
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id         INTEGER NOT NULL,
+    permission_code TEXT NOT NULL,
+    PRIMARY KEY (role_id, permission_code),
+    FOREIGN KEY (role_id) REFERENCES roles(id),
+    FOREIGN KEY (permission_code) REFERENCES permissions(code)
+);
+
+-- 权限点 → HTTP 路由映射（Web 守卫与 MCP path ACL 共用词汇表）。见 ADR-004。
+-- Phase 3 仅建表，Phase B 由路由覆盖测试驱动填充（避免在此凭空造 pattern 漂移）。
+CREATE TABLE IF NOT EXISTS permission_routes (
+    permission_code TEXT NOT NULL,
+    method          TEXT NOT NULL,           -- 'GET'|'POST'|'PATCH'|'DELETE'|'*'
+    path_pattern    TEXT NOT NULL,           -- '/store-ordering/orders/*'（glob，复用 path_matches）
+    PRIMARY KEY (permission_code, method, path_pattern)
+);
+
+-- Phase 3 扩展点（本期空表，未接线 —— 见 ADR-005）。
+CREATE TABLE IF NOT EXISTS approval_policies (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id             INTEGER NOT NULL DEFAULT 1,
+    scope                 TEXT NOT NULL,      -- 动作标识，如 'order.submit'
+    warehouse_code        TEXT,               -- NULL = 全租户
+    min_amount            REAL,               -- 区间下界（含），NULL = 无下界
+    max_amount            REAL,               -- 区间上界，NULL = 无上界
+    required_permission   TEXT NOT NULL,      -- 命中后所需权限点
+    step                  INTEGER NOT NULL DEFAULT 1,  -- 多级审批次序
+    segregation_of_duties INTEGER NOT NULL DEFAULT 0,  -- 1 = 提交人≠审批人
+    created_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_policies_lookup
+    ON approval_policies(tenant_id, scope, warehouse_code);
 """
 
 # v3 P0 增量：ALTER 必须在 MASTER_SCHEMA 之外，否则 executescript 在已迁移的
@@ -851,6 +927,19 @@ def init_master_db() -> None:
                         "ALTER TABLE agent_tokens ADD COLUMN rate_limit INTEGER"
                     )
 
+                # Phase 3: agent_tokens.permission_codes_json（Bearer token 的
+                # 权限点绑定，Phase B 让 MCP 校验与 Web 共用词汇表）。
+                # 可空：NULL = legacy 路径 ACL（allowed_*_paths_json 老行为）。
+                at_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(agent_tokens)"
+                    ).fetchall()
+                }
+                if "permission_codes_json" not in at_cols:
+                    conn.execute(
+                        "ALTER TABLE agent_tokens ADD COLUMN permission_codes_json TEXT"
+                    )
+
                 # P0-4: login_throttle 表（登录爆破锁定，见 MASTER_SCHEMA 注释）。
                 conn.execute(
                     """CREATE TABLE IF NOT EXISTS login_throttle (
@@ -964,9 +1053,156 @@ def init_master_db() -> None:
                     conn.execute(
                         "INSERT INTO procurement_config (id, cover_days, min_absolute) VALUES (1, 14, 0)"
                     )
+
+                # Phase 3: 权限点目录 + 5 内置角色 + 角色-权限包（幂等播种）。
+                # 必须在 flock 块内——gunicorn 多 worker 并发启动时防重复播种竞态。
+                _seed_permissions_and_roles(conn)
+
+                # 启动断言（防空包全站 403 的沉默失败）：告警而非 raise，
+                # 避免单点数据问题让 gunicorn 拒绝启动、放大故障面。
+                for w in _verify_builtin_packages(conn):
+                    logging.getLogger("db").warning("[permissions] %s", w)
+
                 conn.commit()
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _seed_permissions_and_roles(conn: sqlite3.Connection) -> None:
+    """幂等播种：权限点目录 + 5 内置角色 + 角色-权限包。
+
+    - permissions:      INSERT OR IGNORE（来源 PERMISSION_CATALOG，25 点）
+    - roles:            INSERT OR IGNORE（5 内置，is_builtin=1，tenant_id=1）
+    - role_permissions: INSERT OR IGNORE（来源 ROLE_PACKAGES）
+    - permission_routes: Phase 3 不播种（Phase B 由路由覆盖测试填充，见 ADR-004）
+
+    重复调用无副作用；不删除、不更新既有行（改包需 `reseed_builtin_roles`）。
+    """
+    from datetime import datetime
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for code, meta in PERMISSION_CATALOG.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO permissions "
+            "(code, category, description, risk, created_at) VALUES (?, ?, ?, ?, ?)",
+            (code, meta["category"], meta["description"], meta["risk"], now),
+        )
+
+    for code in BUILTIN_ROLE_CODES:
+        name, rank = ROLE_META[code]
+        conn.execute(
+            "INSERT OR IGNORE INTO roles "
+            "(code, tenant_id, name, is_builtin, rank, created_at) "
+            "VALUES (?, 1, ?, 1, ?, ?)",
+            (code, name, rank, now),
+        )
+
+    role_ids = {
+        r[1]: r[0]
+        for r in conn.execute(
+            "SELECT id, code FROM roles WHERE is_builtin = 1"
+        ).fetchall()
+    }
+    for code, perms in ROLE_PACKAGES.items():
+        rid = role_ids.get(code)
+        if rid is None:
+            continue
+        for permission_code in sorted(perms):
+            conn.execute(
+                "INSERT OR IGNORE INTO role_permissions "
+                "(role_id, permission_code) VALUES (?, ?)",
+                (rid, permission_code),
+            )
+
+
+def reseed_builtin_roles(conn: sqlite3.Connection) -> None:
+    """显式重播种内置角色包（`INSERT OR IGNORE` 不会更新已存在行）。
+
+    步骤：① 删内置角色（is_builtin=1）的 role_permissions；
+          ② 重新 INSERT 全部内置包；③ **不动** is_builtin=0 的自定义角色。
+    由 CLI `flask reseed-builtin-roles` 调用（改了 ROLE_PACKAGES 常量后必跑）。
+    """
+    role_ids = {
+        r[1]: r[0]
+        for r in conn.execute(
+            "SELECT id, code FROM roles WHERE is_builtin = 1"
+        ).fetchall()
+    }
+    for code in BUILTIN_ROLE_CODES:
+        rid = role_ids.get(code)
+        if rid is None:
+            continue
+        conn.execute("DELETE FROM role_permissions WHERE role_id = ?", (rid,))
+        for permission_code in sorted(ROLE_PACKAGES[code]):
+            conn.execute(
+                "INSERT OR IGNORE INTO role_permissions "
+                "(role_id, permission_code) VALUES (?, ?)",
+                (rid, permission_code),
+            )
+
+
+def _verify_builtin_packages(conn: sqlite3.Connection) -> list[str]:
+    """启动断言，返回告警文本列表（空 = 正常）；**不 raise**（调用方写日志）。
+
+    检查项：
+      - 角色缺失 / 空包（覆盖全部 5 包）
+      - 阶梯破坏（**仅阶梯三包** staff ⊆ manager ⊆ admin）
+      - 旁支角色（viewer/finance）的 rank 必须为 NULL
+      - 权限数契约（== BUILTIN_PACKAGE_SIZES）
+      - 平台级点（PLATFORM_ONLY_PERMS）不得出现在任何内置包
+      - 孤儿权限点（包内 code 不在 PERMISSION_CATALOG）
+    """
+    rows = conn.execute(
+        "SELECT r.code, r.rank, rp.permission_code "
+        "FROM roles r LEFT JOIN role_permissions rp ON rp.role_id = r.id "
+        "WHERE r.is_builtin = 1"
+    ).fetchall()
+
+    packages: dict[str, set[str]] = {}
+    ranks: dict[str, int | None] = {}
+    for code, rank, permission_code in rows:
+        packages.setdefault(code, set())
+        ranks[code] = rank
+        if permission_code is not None:
+            packages[code].add(permission_code)
+
+    warnings: list[str] = []
+
+    for code in BUILTIN_ROLE_CODES:
+        if code not in ranks:
+            warnings.append(f"内置角色缺失：{code}")
+        elif len(packages[code]) == 0:
+            warnings.append(f"空权限包：{code} 权限点数为 0，该角色将全站 403")
+
+    ladder = [c for c in LADDER_ROLE_CODES if c in packages]
+    for lower, upper in zip(ladder, ladder[1:], strict=False):
+        if not packages[lower] <= packages[upper]:
+            missing = sorted(packages[lower] - packages[upper])
+            warnings.append(f"阶梯破坏：{lower} ⊄ {upper}（缺 {missing}）")
+
+    for code in BUILTIN_ROLE_CODES:
+        if code in LADDER_ROLE_CODES or code not in ranks:
+            continue
+        if ranks[code] is not None:
+            warnings.append(f"旁支角色 {code} 的 rank 应为 NULL，实为 {ranks[code]}")
+
+    for code, expected in BUILTIN_PACKAGE_SIZES.items():
+        actual = len(packages.get(code, ()))
+        if actual != expected:
+            warnings.append(f"权限数漂移：{code} 期望 {expected} 实为 {actual}")
+
+    catalog = set(PERMISSION_CATALOG)
+    for code in BUILTIN_ROLE_CODES:
+        held = packages.get(code, set())
+        leaked = sorted(held & PLATFORM_ONLY_PERMS)
+        if leaked:
+            warnings.append(f"越界点：{code} 含平台级权限 {leaked}")
+        orphan = sorted(held - catalog)
+        if orphan:
+            warnings.append(f"孤儿权限点：{code} 含未登记 code {orphan}")
+
+    return warnings
 
 
 def init_warehouse_db(db_path: Path, seed_categories=None) -> None:

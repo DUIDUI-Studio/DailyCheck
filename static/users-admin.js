@@ -211,8 +211,13 @@
     html += '</select></label>';
 
     if (warehousesData.length > 0) {
+      var roles = roleOptions();
       html += '<fieldset class="users-drawer-fieldset"><legend>仓库权限（可选）</legend>';
-      html += '<table class="role-matrix"><tr><th>仓库</th><th>无</th><th>staff</th><th>manager</th><th>admin</th></tr>';
+      html += '<table class="role-matrix"><tr><th>仓库</th><th>无</th>';
+      roles.forEach(function (r) {
+        html += '<th>' + escapeHtml(r.label) + '</th>';
+      });
+      html += '</tr>';
       warehousesData.forEach(function (w) {
         html += '<tr><td><strong>' + escapeHtml(w.name) + '</strong> <small class="muted">(' + escapeHtml(w.code) + ')</small></td>';
         // 新账号默认「无权限」（与 v1 矩阵一致）。同一个 radio group 里
@@ -220,8 +225,8 @@
         // 浏览器取文档序靠后的那个，于是"不动矩阵直接创建"会给新账号
         // 静默授上**每个仓库**的 manager。
         html += '<td><input type="radio" name="wh_' + w.id + '" value="" checked /></td>';
-        ['staff', 'manager', 'admin'].forEach(function (role) {
-          html += '<td><input type="radio" name="wh_' + w.id + '" value="' + role + '" /></td>';
+        roles.forEach(function (r) {
+          html += '<td><input type="radio" name="wh_' + w.id + '" value="' + escapeHtml(r.code) + '" aria-label="' + escapeHtml(r.label) + '" /></td>';
         });
         html += '</tr>';
       });
@@ -315,16 +320,16 @@
     // Pull from the row's data-* attributes (bindings data was injected
     // into the table server-side). For simplicity we re-query the DOM
     // here — keeps the JS self-contained without a second JSON call.
+    // 从标签的 data-* 取数（模板渲染），不解析显示文本 —— 显示文本是
+    // 中文角色名，且改文案不应破坏抽屉逻辑。
     var row = document.querySelector('tr.users-row[data-user-id="' + uid + '"]');
-    var tags = row ? row.querySelectorAll('.users-roles .tag') : [];
+    var tags = row ? row.querySelectorAll('.users-roles [data-role]') : [];
     var bindings = [];
     tags.forEach(function (t) {
-      var title = t.getAttribute('title') || '';
-      var txt = t.textContent || '';
-      // txt 形如 "wh_001:manager"
-      var parts = txt.split(':');
-      if (parts.length === 2) {
-        bindings.push({ code: parts[0], role: parts[1], title: title });
+      var code = t.getAttribute('data-warehouse-code') || '';
+      var role = t.getAttribute('data-role') || '';
+      if (code && role) {
+        bindings.push({ code: code, role: role });
       }
     });
     var warehousesData = [];
@@ -347,8 +352,8 @@
         html += '<input type="hidden" name="csrf_token" value="' + csrfToken() + '">';
         html += '<input type="hidden" name="warehouse_id" value="' + w.id + '" />';
         html += '<select name="role">';
-        ['staff', 'manager', 'admin'].forEach(function (r) {
-          html += '<option value="' + r + '"' + (r === current ? ' selected' : '') + '>' + r + '</option>';
+        roleOptions().forEach(function (r) {
+          html += '<option value="' + escapeHtml(r.code) + '"' + (r.code === current ? ' selected' : '') + '>' + escapeHtml(r.label) + '</option>';
         });
         html += '</select>';
         html += '<button type="submit" class="btn-sm btn-edit">保存</button></form>';
@@ -361,8 +366,8 @@
         html += '<input type="hidden" name="csrf_token" value="' + csrfToken() + '">';
         html += '<input type="hidden" name="warehouse_id" value="' + w.id + '" />';
         html += '<select name="role">';
-        ['staff', 'manager', 'admin'].forEach(function (r) {
-          html += '<option value="' + r + '"' + (r === 'manager' ? ' selected' : '') + '>' + r + '</option>';
+        roleOptions().forEach(function (r) {
+          html += '<option value="' + escapeHtml(r.code) + '"' + (r.code === 'manager' ? ' selected' : '') + '>' + escapeHtml(r.label) + '</option>';
         });
         html += '</select>';
         html += '<button type="submit" class="btn-sm btn-edit">绑定</button></form>';
@@ -397,8 +402,8 @@
     });
     html += '</select>';
     html += '<select name="role">';
-    ['staff', 'manager', 'admin'].forEach(function (r) {
-      html += '<option value="' + r + '"' + (r === 'manager' ? ' selected' : '') + '>' + r + '</option>';
+    roleOptions().forEach(function (r) {
+      html += '<option value="' + escapeHtml(r.code) + '"' + (r.code === 'manager' ? ' selected' : '') + '>' + escapeHtml(r.label) + '</option>';
     });
     html += '</select>';
     html += '<button type="submit" class="btn-sm btn-edit">绑定</button>';
@@ -450,6 +455,18 @@
   function currentTenantId() {
     var el = document.getElementById('current-tenant-id');
     return el ? parseInt(el.textContent, 10) : 0;
+  }
+  // 角色选项单一来源：模板注入 #role-options-data（后端 role_options，
+  // 顺序 staff→manager→admin→viewer→finance；label 为中文显示名）。
+  // 禁止在本文件硬编码角色名单 —— 与模板/后端同源，五包扩到六包时零改动。
+  function roleOptions() {
+    try {
+      return JSON.parse(
+        document.getElementById('role-options-data').textContent
+      );
+    } catch (_) {
+      return [];
+    }
   }
   // Escape a value before interpolating it into an innerHTML string.
   // The entity table MUST contain real entities ("&amp;" etc.) — writing

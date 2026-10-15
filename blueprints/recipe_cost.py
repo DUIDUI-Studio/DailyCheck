@@ -12,7 +12,7 @@ from flask import Blueprint, Response, abort, flash, g, redirect, render_templat
 from blueprints._helpers import now, parse_qty
 from blueprints.auth import audit
 from db import get_warehouse_db
-from permissions import require_login, require_platform_admin
+from permissions import require_login, require_permission, require_platform_admin
 
 bp = Blueprint("recipe_cost", __name__)
 
@@ -405,13 +405,14 @@ def _upsert_recipe_draft(recipe_type: str, recipe_id: int, user_id: int | None) 
     version row in master.db. Returns version_id. No-op on failure (so
     save flow isn't blocked by cross-db issues).
     """
-    from contextlib import closing
-    from config import MASTER_DB
     import sqlite3 as _sq
-    import json as _json
+    from contextlib import closing
+
+    from config import MASTER_DB
     try:
         from blueprints.publish_recipe_pure import (
-            snapshot_recipe, upsert_draft_version,
+            snapshot_recipe,
+            upsert_draft_version,
         )
         wh_conn = get_warehouse_db()
         snap = snapshot_recipe(wh_conn, recipe_type, recipe_id)
@@ -713,7 +714,7 @@ def update_selling_price(item_id: int):
 
 
 @bp.route("/recipe-cost/api/cost/<kind>/<int:rid>", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def api_cost(kind: str, rid: int):
     """只读 JSON：当前 ic_recipe / recipe 的成本与毛利率（前端 sanity check 用）。"""
     db = get_warehouse_db()
@@ -741,7 +742,7 @@ def api_cost(kind: str, rid: int):
 # ---------------------------------------------------------------------------
 
 @bp.route("/recipe-cost/ic-recipes/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def ic_recipes_export_csv():
     """Flat list of every ic_recipe with computed cost / margin columns."""
     db = get_warehouse_db()
@@ -780,7 +781,7 @@ def ic_recipes_export_csv():
 
 
 @bp.route("/recipe-cost/recipes/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def recipes_export_csv():
     """Flat list of every serving recipe (出品配方) with computed columns."""
     db = get_warehouse_db()
@@ -819,7 +820,7 @@ def recipes_export_csv():
 
 
 @bp.route("/recipe-cost/ic-recipes/<int:ic_recipe_id>/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def ic_recipe_bom_export_csv(ic_recipe_id: int):
     """BOM rows (one per ingredient line) for a single ic_recipe."""
     db = get_warehouse_db()
@@ -872,7 +873,7 @@ def ic_recipe_bom_export_csv(ic_recipe_id: int):
 
 
 @bp.route("/recipe-cost/recipes/<int:recipe_id>/export.csv", methods=["GET"])
-@require_login
+@require_permission("report.cost.view")
 def recipe_bom_export_csv(recipe_id: int):
     """BOM rows for a single recipe (出品配方), polymorphic (item or ic_recipe)."""
     db = get_warehouse_db()
@@ -994,8 +995,9 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
     Each insert is in its own transaction; the whole apply is wrapped
     in `with sqlite3.connect(...)` so it's atomic per warehouse.
     """
-    from contextlib import closing
     import sqlite3 as _sq
+    from contextlib import closing
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse
 
     master_conn.row_factory = _sq.Row
@@ -1104,12 +1106,13 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
 
 def _handle_recipe_publish(recipe_type: str, recipe_id: int):
     """POST handler shared by ic_recipe and recipe publish endpoints."""
-    from contextlib import closing
-    from config import MASTER_DB
     import sqlite3 as _sq
+    from contextlib import closing
+
     from blueprints.publish_recipe_pure import (
-        publish_version, list_versions, get_published_version_for_recipe,
+        publish_version,
     )
+    from config import MASTER_DB
 
     # 1. Confirm source recipe still exists in current warehouse.
     try:
@@ -1247,12 +1250,15 @@ def recipe_publish(recipe_id: int):
 @require_login
 def recipe_versions_history(recipe_type: str, recipe_id: int):
     """Show version history + publish events for a recipe."""
-    from contextlib import closing
-    from config import MASTER_DB
     import sqlite3 as _sq
+    from contextlib import closing
+
     from blueprints.publish_recipe_pure import (
-        list_versions, list_publish_events_for_recipe, get_event_warehouses,
+        get_event_warehouses,
+        list_publish_events_for_recipe,
+        list_versions,
     )
+    from config import MASTER_DB
 
     if recipe_type not in ("ic_recipe", "recipe"):
         abort(404)
@@ -1280,7 +1286,6 @@ def recipe_versions_history(recipe_type: str, recipe_id: int):
         for ev in events:
             ev["warehouses"] = get_event_warehouses(master_conn, int(ev["id"]))
 
-    target_codes = request.args.getlist("warehouse_codes")
     return render_template(
         "recipe_cost/recipe_versions.html",
         recipe_type=recipe_type,
@@ -1293,9 +1298,10 @@ def recipe_versions_history(recipe_type: str, recipe_id: int):
 
 def _list_storefront_warehouses() -> list[dict]:
     """All storefront warehouses (excludes rd_*) — for the publish UI picker."""
-    from contextlib import closing
-    from config import MASTER_DB
     import sqlite3 as _sq
+    from contextlib import closing
+
+    from config import MASTER_DB
     with closing(_sq.connect(MASTER_DB)) as master_conn:
         master_conn.row_factory = _sq.Row
         rows = master_conn.execute(
