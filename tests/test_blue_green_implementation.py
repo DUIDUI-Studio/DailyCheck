@@ -16,7 +16,11 @@
 create-user）并落 tmp_path 的临时库，不碰仓库真库。
 
 不测：
-- 真实生产动作（systemctl / nginx / ab / Playwright 浏览器）— 在 VPS 由 Prod Agent 测
+- 真实生产动作（systemctl / nginx / ab / Playwright 浏览器）— 在 VPS 由 Prod Agent 测。
+  ⚠️ 这条契约由模块级 autouse fixture `_fake_systemctl` **强制兑现**（Issue #44）：
+  否则 switch.sh 的 DRY_RUN 守卫（PR #42 事故加固）会去问宿主 systemd，
+  生产 VPS 上 unit 固定 DRY_RUN=true → 守卫按设计 exit 3 → 同一批用例
+  在 prod 全红、在 dev/CI（无 systemctl）全绿。
 """
 from __future__ import annotations
 
@@ -60,6 +64,55 @@ def _run(script: Path, *args: str, cwd: Path | None = None) -> subprocess.Comple
         ["bash", str(script), *args],
         capture_output=True, text=True, timeout=30, cwd=cwd,
     )
+
+
+# ============================================================
+# 测试基建：屏蔽宿主 systemd（Issue #44）
+# ============================================================
+# 本模块的契约是「不测真实生产动作（systemctl / nginx / ab）」，但 switch.sh
+# 的 DRY_RUN 守卫（2026-10-15 P0 事故加固，PR #42）会去问宿主 systemd：
+#     systemctl show -p MainPID    --value <unit>   （进程真实环境，优先）
+#     systemctl show -p Environment --value <unit>   （unit 配置层，兜底）
+#   * dev / CI 无 systemctl → 守卫判「无法判定」→ 仅告警放行 → 用例通过；
+#   * 生产 VPS 上 dailycheck-green.service 固定 Environment=DRY_RUN=true
+#     （绿未「转正」）→ 守卫按设计 exit 3 拒跑 → 同一批用例在 prod 全红
+#     （Issue #44 现场：PR #42 merge 后 verify.sh check 1 报 5 个 fail）。
+# 用例结果因此取决于「在哪台机器上跑」——是测试缺陷，不是产品缺陷；守卫
+# 行为本身由 tests/test_blue_green_dryrun_guard.py 专项覆盖（那里自建 fake）。
+#
+# 修法：本模块统一 PATH 前置 fake systemctl，把宿主态**显式钉成**
+# 「绿转正后的合法生产态」（Environment=DRY_RUN=false：非空 → 守卫判
+# not_dry_run → 放行），让用例回到「验证切流量动作本身」的原始意图，
+# 且在 dev / CI / 生产 VPS 上结果一致。
+# 注：fake 只接管 `show`（MainPID 恒空 → 守卫走第②层 unit 配置取证；与「绿已
+# 转正」的 prod 态判定等价 —— 但**不等价于**「绿进程在跑」的 prod 态，那走的是
+# 第①层 /proc/<pid>/environ；若 unit 已改而 daemon-reload 未 restart，两层会分歧，
+# 这正是①层存在的意义。本文件不测守卫，故只固定②层），其余子命令一律 exit 0；
+# `journalctl` 等仍走真命令，verify.sh 的失败路径用例语义不变。
+@pytest.fixture(autouse=True)
+def _fake_systemctl(monkeypatch, tmp_path):
+    """PATH 前置 fake systemctl（Environment 恒 DRY_RUN=false）。"""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    fake = bindir / "systemctl"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        "# switch.sh 测试用 fake：只服务 show -p <prop> --value <unit>\n"
+        "prop=''\n"
+        'for a in "$@"; do\n'
+        '  case "$a" in MainPID|Environment) prop="$a" ;; esac\n'
+        "done\n"
+        'if [[ "${1:-}" == "show" ]]; then\n'
+        '  case "$prop" in\n'
+        '    MainPID) echo "" ;;\n'
+        '    Environment) echo "DRY_RUN=false" ;;\n'
+        "  esac\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
 
 
 # ============================================================
