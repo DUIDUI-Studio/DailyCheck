@@ -20,6 +20,9 @@
     <ul class="land-links">
       <li><a href="{{ url_for('core.dashboard') }}">总览</a></li>
       <li><a href="{{ url_for('core.summary') }}">汇总</a></li>
+      {% if is_admin or (g.role and g.role['role'] in ('manager', 'admin')) %}
+      <li><a href="{{ url_for('reports.health') }}">库存健康</a></li>
+      {% endif %}
     </ul>
   </section>
 

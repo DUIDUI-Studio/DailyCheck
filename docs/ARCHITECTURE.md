@@ -382,7 +382,7 @@ flowchart TB
         Production["production.py<br/>生产录入 + CSV"]
         Adjustment["adjustment.py<br/>库存调整 (⚠️ 未注册到 app.py)"]
         Consumption["consumption.py<br/>消耗分析"]
-        Reports["reports.py<br/>入库/出库报表"]
+        Reports["reports.py<br/>入库/出库报表 + 库存健康仪表盘"]
         Users["users.py<br/>用户管理"]
         ImportItems["import_items.py<br/>CSV 导入库存品"]
         AgentTokens["agent_tokens.py<br/>平台管理员令牌管理"]
@@ -397,6 +397,7 @@ flowchart TB
         ProcurementPure["procurement_pure.py"]
         NotificationsPure["notifications_pure.py"]
         PublishRecipePure["publish_recipe_pure.py"]
+        ReportsHealthPure["reports_health_pure.py<br/>FIFO 账龄重放 / DOS / ABC / BOM 超耗"]
     end
 
     Entry --> Shared
@@ -446,7 +447,10 @@ flowchart LR
     Notifications --> NotificationsPure
     Users[users.py]:::bp --> Shared
     AgentTokens[agent_tokens.py]:::bp --> Shared
-    Others["stocktake/restock/outbound/production/<br/>adjustment/consumption/reports/<br/>core/import_items"]:::bp --> Shared
+    Reports[reports.py]:::bp --> Shared
+    Reports --> ReportsHealthPure[reports_health_pure.py]:::pure
+    Reports -->|master.db 只读| StoreOrders["store_orders（门店履约）"]
+    Others["stocktake/restock/outbound/production/<br/>adjustment/consumption/<br/>core/import_items"]:::bp --> Shared
 ```
 
 **依赖原则**：
@@ -824,6 +828,10 @@ flowchart LR
   守卫用例：`tests/test_nav_integration.py`（模块集行列式 + 移动端可达性）。
 - ⚠️ 角色口径一律取 `_helpers.register_template_context` 注入变量，禁止 block 内 `{% set %}`（§13.2）。
 - 改 `static/*` 后按约定 bump 模板里的 `?v=`（本次 `style.css?v=16` / `login.html?v=12`）。
+- **总览模块单链接级角色门（2026-10-15 起）**：总览组内「库存健康」链接单独包
+  `{% if is_admin or g.role.role in ('manager','admin') %}`——同一 nav-group 内
+  按链接级可见性过滤的既有先例（同「门店订货」组内 `品项管理` 的写法），
+  侧栏与 `/land` 两载体条件逐字一致，双向不变量由 `tests/test_reports_health.py::TestNavCarriers` 钉住。
 
 ---
 

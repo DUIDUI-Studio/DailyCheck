@@ -29,6 +29,14 @@ def _time_clauses(range_param):
             "created_at >= datetime('now','-7 days')",
             7,
         )
+    if range_param == "30d":
+        # 库存健康报表（/report/health）新增档位；/summary 白名单不含 30d，不受影响
+        return (
+            "created_at >= datetime('now','-30 days')",
+            "created_at >= datetime('now','-30 days')",
+            "created_at >= datetime('now','-30 days')",
+            30,
+        )
     if range_param == "month":
         ym = _dt.datetime.now().strftime("%Y-%m")
         days = calendar.monthrange(_dt.datetime.now().year, _dt.datetime.now().month)[1]
@@ -93,6 +101,8 @@ def _compute_summary_metrics(db, range_param):
     # 反推窗口起始库存金额
     if range_param == "7d":
         start_filter = "m.created_at >= datetime('now','-7 days')"
+    elif range_param == "30d":
+        start_filter = "m.created_at >= datetime('now','-30 days')"
     elif range_param == "month":
         ym = _dt.datetime.now().strftime("%Y-%m")
         start_filter = f"m.created_at LIKE '{ym}%'"
