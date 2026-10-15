@@ -4,7 +4,7 @@
 > 基于：PRD v0.1 + 架构 v0.1（含 §3.7 成本类字段边界清单）+ UIUX v0.1（均为 `docs/2026-10-12-permission-*.md`）
 > 上游确认：Eric 2026-10-13 确认三文档并拍板三项（见 §2.1）
 > 状态：**已确认，锁定** —— 团队契约：此后设计细化、开发、测试均以本文件为唯一依据；变更须走 §13 变更流程
-> 流程：自动推进设计细化 → 开发 → 测试交付；`git push` 前单独向 Eric 请示（既有铁律）
+> 流程：自动推进设计细化 → 开发 → 测试交付；推送与合并流程以 `docs/agent-framework/workflow.md` 为准（2026-10-15 改版：普通 push 放开；merge 由 Prod Agent 独立判定）
 
 ---
 
@@ -77,7 +77,7 @@
 ## 5. 权限点目录与端点映射（锁定）
 
 - **权限点目录**：25 个点全量见架构文档 §3.3（`order.*` 5 / `stock.*` 6 / `item.*` 6 / `report.*` 3 / `admin.*` 5），以 `PERMISSION_CATALOG` 常量落库。
-- **端点映射**：`ROUTE_MATRIX`（manifest）覆盖全部 **147** 条已注册路由（main 基线实测；PR #17 合并后按实际 `url_map` 复核）（阶段 1 无新增 HTTP 端点；现有端点守卫等价收敛 + 逐条定级）。
+- **端点映射**：`ROUTE_MATRIX`（manifest）覆盖全部 **151** 条已注册 endpoint（含 `static`；并流 main `9bb9d99`（PR #17/#18 + 库存健康报表）后按实际 `url_map` 复核实测，Test A 双向断言无遗漏 / 无残留）（阶段 1 无新增 HTTP 端点；现有端点守卫等价收敛 + 逐条定级）。
 - 关键端点示例（全量以 manifest 为准）：
 
 | 端点（示例） | 权限点 | 迁移方式 |
@@ -198,6 +198,7 @@ ruff check <改动文件>                                # 零新增
 | 2026-10-13 | v1.0 生成 | 三文档确认 + Eric 拍板回填 | 全量（阶段 1 锁定） |
 | 2026-10-13 | v1.1 终裁回填 | Eric Phase 3 五项终裁（①-⑤）落库；附录 A 角色包修订（manager 16→17 / admin 19→18）；附录 B 拆分 LOCKED 裁定 + 口径例外登记 | 阶段 1 实施锁定 |
 | 2026-10-13 | v1.2 R1 收口 | `recipe_cost` 配方成本读接口（`api_cost` + 4 CSV 导出）收紧至 `report.cost.view`（Eric 终裁，验证报告 R1）；§5 路由数 156→147 校正（R4；PR #17 合并后复核）；§10 白名单追加 ④ | 阶段 1 实施（配方成本读收紧） |
+| 2026-10-15 | v1.3 并流对账 | 推送 / 合并流程语句对齐新版 agent 工作流（workflow.md 2026-10-15 改版）；§5 端点映射 147→151 并流后复核、ROUTE_MATRIX 补登 4 条（users.bulk_bind / users.toggle_active / reports.health / reports.health_export） | 文档；无代码影响 |
 
 ---
 

@@ -882,7 +882,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Pytest["pytest (59 个文件, ~830 用例)"]
+    subgraph Pytest["pytest (59 个文件, ~940 用例)"]
         Pure["test_*_pure.py<br/>纯逻辑单测<br/>~60% 用例"]
         Route["test_*_route.py<br/>视图集成测试<br/>~30% 用例"]
         E2E["test_*_e2e.py<br/>端到端 ~5%"]
@@ -923,9 +923,11 @@ flowchart TB
 
 **整改基线（2026-10-14，`fix/pr-18-nav-modules-defects`）**：14 failed / 768 passed（CI 口径 `--ignore=tests/mcp_server`）。导航用例 12→57（`nav_client_factory` 角色矩阵 + 三载体链接集相等 + 全链接可达性 + 移动端可达性守卫），门禁 exit 0。
 
+**权限精细化基线（2026-10-15，`feat/permission-granularity`，并流 main `9bb9d99` 后）**：14 failed / 928 passed（CI 口径；本地全量 16 failed / 1006 passed）。新增 `test_route_permission_matrix.py` 49 用例（A 覆盖 / B deny-allow / C 不变式）、`test_master_db_migrate.py` RBAC 迁移 +7 用例、`tests/conftest.py` 角色夹具（`manager_client` / `viewer_client` / `finance_client`）；并流后 `url_map` 实测 151 endpoint，Test A 双向断言无遗漏 / 无残留。失败集与 `known_failures.txt` 逐行一致，零新增，门禁 exit 0。
+
 ⚠️ **基线数字必须写明口径**（两套数字不能混用）：
-- **CI 口径** = `pytest tests/ --ignore=tests/mcp_server`：14 failed / 768 passed。CI 以此为准，`known_failures.txt` 的 `mcp_server` 两行在 CI 里永不触发（属超集）。
-- **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：16 failed / 846 passed。
+- **CI 口径** = `pytest tests/ --ignore=tests/mcp_server`：14 failed / 928 passed。CI 以此为准，`known_failures.txt` 的 `mcp_server` 两行在 CI 里永不触发（属超集）。
+- **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：16 failed / 1006 passed。
 - 「零新增对比法」比对的是**失败集逐行**，不是 passed 总数；引用总数时必须带口径，否则跨环境对比会误判。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：

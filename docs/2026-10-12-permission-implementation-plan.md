@@ -509,7 +509,9 @@ def mask_cost_csv_row(values: list, indices: set[int], allow: bool) -> list:
 ### 7.2 合并对账清单（Phase 3 → 阶段 2 / 合并回 main 时核对）
 
 1. **PR #17（`user-admin-v2`）合并 main 后**：`ROUTE_MATRIX` 需补其新增路由（`users.bulk_bind`、`users.toggle_active` 等）——否则 Test A 覆盖校验会失败（本 worktree 基于 main，仅 147 路由）。
+   → ✅ **2026-10-15 已执行（并流 main `9bb9d99`）**：补登 4 条——`users.bulk_bind` / `users.toggle_active`（PR #17）+ `reports.health` / `reports.health_export`（库存健康报表，同为并流新增）；实测 `url_map` = 151 endpoint（含 `static`），Test A 双向断言通过（无遗漏 / 无残留）。
 2. **`users.html` v2 与本期 v1 前端改动对账**：本期后端已注入 `role_options=[{code,label}×5]`（manifest 顺序）；v2 模板的角色下拉/toolbar 筛选/tag 渲染须以该变量为来源，不得硬编码角色集（设计师并行改 `templates/users.html`，架构侧不碰该文件）。
+   → ✅ **2026-10-15 已执行（并流 main）**：`templates/users.html` 取 v2 结构并把 `role_options` 合约整体移植（`#role-options-data` JSON + 角色单元格 `data-warehouse-code`/`data-role` 属性 + 筛选器/下拉渲染 `role_options`）；`static/users-admin.js` 4 处硬编码三包列表清零（新增 `roleOptions()` 读取 JSON 源），绑定表单改读 `data-*` 属性（不再解析展示文本）；资源版本 `users-admin.js?v=4`。
 3. **`order.ship` 语义**与"发货是否收紧 manager+"决议，留**阶段 2**连同自定义角色一起评审（当前 ship 走 DC 兼容层；`order.ship` 描述已核准为"DC 发货 / 门店整单交付确认"）。
 
 ### 7.3 R2 备注（receive 守卫层 vs 函数体）
