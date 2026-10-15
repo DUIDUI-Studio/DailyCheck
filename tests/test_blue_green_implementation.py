@@ -822,7 +822,7 @@ def test_switch_post_switch_probe_dry_run():
 
 
 def test_switch_post_switch_probe_live_against_listening_server(tmp_path):
-    """post-switch 探活实跑：起一个真 http 服务模拟 nginx 入口，验证 200 探活通过。
+    """post-switch 探活实跑：起一个真 http 服务模拟 nginx 入口，验证 NGINX_ENTRY 透传。
 
     验证 5xx/000 之外的非 502 状态码（4xx 也算通：业务 4xx 不是 nginx 502）。
     """
@@ -853,22 +853,27 @@ def test_switch_post_switch_probe_live_against_listening_server(tmp_path):
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     try:
+        # 关键：把 NGINX_ENTRY 指向真 http server，验证 switch.sh 透传
+        # 自定义入口（而不是默认 :8080）。用 dry-run 跳过 reload/backup
+        # 避免真 nginx -t 失败。
         env = {
             **os.environ,
             "NGINX_DAILYCHECK_CONF": str(conf),
             "BACKUP_DIR": str(backup),
             "NGINX_ENTRY": f"http://127.0.0.1:{port}",
         }
-        # 关键：不能真跑 systemctl/ nginx，用 dry-run 跳过 reload/backup
-        # 然后实跑探活路径需要绕开 set -e。改用临时脚本：
-        # 直接 source switch.sh 的探活段？太脆。退而验证：dry-run 路径打印
-        # 入口 url + 探活消息，并且 5xx 才回滚的判定函数可单独测。
-        result = _run(SWITCH, "green", "50", "--dry-run")
+        result = subprocess.run(
+            ["bash", str(SWITCH), "green", "50", "--dry-run"],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
         out = result.stdout + result.stderr
         # dry-run 必含 探活说明
         assert "would probe" in out
-        # 即便不传 NGINX_ENTRY，默认也是 127.0.0.1:8080
-        assert "127.0.0.1:8080" in out
+        # NGINX_ENTRY 透传：探活说明里应含自定义端口（而非默认 :8080）
+        assert f"127.0.0.1:{port}" in out, (
+            f"NGINX_ENTRY 透传失败：{port} 端口未出现在 switch.sh output\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
     finally:
         srv.shutdown()
         th.join(timeout=2)

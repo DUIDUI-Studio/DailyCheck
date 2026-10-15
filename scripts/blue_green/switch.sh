@@ -196,13 +196,13 @@ _run systemctl reload nginx
 # 探活非 502 才算成功；任一 5xx/超时自动 cp 备份回滚 + reload 恢复
 # （失败也 exit 非零，让 verify.sh check 8 知道）。
 # ============================================================
+NGINX_ENTRY="${NGINX_ENTRY:-http://127.0.0.1:8080}"
 if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
-  echo "[DRY-RUN] would probe http://127.0.0.1:8080/ 与 /api/mcp/（非 502 才算成功）"
+  echo "[DRY-RUN] would probe ${NGINX_ENTRY}/ 与 ${NGINX_ENTRY}/api/mcp/（非 502 才算成功）"
   echo "[switch] ✅ nginx reloaded, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
   exit 0
 fi
 
-NGINX_ENTRY="${NGINX_ENTRY:-http://127.0.0.1:8080}"
 echo "[switch] post-switch 探活：${NGINX_ENTRY}/ 与 ${NGINX_ENTRY}/api/mcp/ ..."
 
 # 取 http_code（--max-time 5；HEAD 也可，这里 GET 是因为 MCP 端不一定支持 HEAD）
