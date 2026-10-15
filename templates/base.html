@@ -25,6 +25,9 @@
       <p class="nav-group-title">总览</p>
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       <a href="{{ url_for('core.summary') }}">汇总</a>
+      {% if is_admin or (g.role and g.role['role'] in ('manager', 'admin')) %}
+      <a href="{{ url_for('reports.health') }}">库存健康</a>
+      {% endif %}
     </nav>
 
     {% if is_admin or is_storefront %}
