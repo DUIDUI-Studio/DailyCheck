@@ -1,0 +1,279 @@
+{% extends 'base.html' %}
+{% block content %}
+<style>
+  .health-duo { display: grid; gap: 10px; grid-template-columns: 3fr 2fr; }
+  @media (max-width: 720px) { .health-duo { grid-template-columns: 1fr; } }
+  .health-biz { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .risk-red { color: var(--warn); font-weight: 700; }
+  .risk-yellow { color: #92400e; }
+  .risk-muted { color: var(--muted); }
+  .abc-bar { display: flex; height: 18px; border-radius: 9px; overflow: hidden; margin: 8px 0 6px; }
+  .abc-bar .abc-a { background: var(--brand); }
+  .abc-bar .abc-b { background: #5eead4; }
+  .abc-bar .abc-c { background: #e2e8f0; }
+  th.sortable a { color: inherit; text-decoration: none; }
+  th.sortable a.is-active { color: var(--brand-ink); font-weight: 700; }
+</style>
+
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+  <h2 style="margin:0">库存健康{% if warehouse %} · {{ warehouse['name'] }}{% endif %}</h2>
+  <a class="btn" href="{{ url_for('reports.health_export', range=range) }}">导出 CSV</a>
+</div>
+<p class="muted" style="margin:4px 0 10px">{{ range_label }} · 生成于 {{ generated_at }}（数据实时计算，切仓即切数据）</p>
+
+<div class="cat-bar" role="tablist" aria-label="统计窗口">
+  {% for r, label in [('7d', '7 日'), ('30d', '30 日'), ('all', '全部')] %}
+  <a href="{{ url_for('reports.health', range=r, sort=sort) }}" class="cat-chip {% if range == r %}is-active{% endif %}" role="tab" aria-selected="{{ 'true' if range == r else 'false' }}">{{ label }}</a>
+  {% endfor %}
+</div>
+
+<div class="kpi-row">
+  <div class="kpi-card">
+    <div class="kpi-label">库存金额</div>
+    <div class="kpi-value"><small>¥</small>{{ "{:,.2f}".format(metrics.total_stock_value) }}</div>
+    <div class="kpi-sub">活跃 SKU {{ levels.active_skus }}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">可售天数</div>
+    <div class="kpi-value">{{ metrics.turnover_days if metrics.turnover_days is not none else '—' }}</div>
+    <div class="kpi-sub">周转率 {{ "{:.2f}".format(metrics.turnover) }}</div>
+  </div>
+  <div class="kpi-card {% if levels.below_safety or levels.out_of_stock %}kpi-warn{% endif %}">
+    <div class="kpi-label">低于安全库存</div>
+    <div class="kpi-value">{{ levels.below_safety | length }}</div>
+    <div class="kpi-sub">其中断货 {{ levels.out_of_stock | length }}</div>
+  </div>
+  <div class="kpi-card {% if stale_rows %}kpi-warn{% endif %}">
+    <div class="kpi-label">呆滞金额（账龄 &gt; {{ constants.stale }} 天）</div>
+    <div class="kpi-value"><small>¥</small>{{ "{:,.2f}".format(stale_value) }}</div>
+    <div class="kpi-sub">呆滞 SKU {{ stale_rows | length }}</div>
+  </div>
+  <div class="kpi-card {% if overstock_rows %}kpi-warn{% endif %}">
+    <div class="kpi-label">超储金额（DOS &gt; {{ constants.dos }} 天）</div>
+    <div class="kpi-value"><small>¥</small>{{ "{:,.2f}".format(overstock_value) }}</div>
+    <div class="kpi-sub">超储 SKU {{ overstock_rows | length }}</div>
+  </div>
+</div>
+
+<div class="health-duo" style="margin-bottom:10px">
+  <section class="card">
+    <p>消耗趋势（近 14 天）</p>
+    {% if trend_empty %}
+    <strong style="font-size:15px;color:var(--muted)">暂无数据</strong>
+    {% else %}
+    <svg viewBox="0 0 280 70" style="width:100%;margin-top:8px" role="img" aria-label="近14天消耗趋势折线图">
+      <polyline points="{{ trend_points }}" fill="none" stroke="var(--brand)" stroke-width="1.5"/>
+    </svg>
+    <small class="muted">日均 ¥{{ "{:,.2f}".format(trend_daily_avg) }} · 窗口合计 ¥{{ "{:,.2f}".format(trend_total) }}（出库 + 生产消耗）</small>
+    {% endif %}
+  </section>
+  <section class="card">
+    <p>ABC 分类（按消耗金额累计）</p>
+    {% set abc_total = (abc_counts['A'] + abc_counts['B'] + abc_counts['C']) %}
+    {% if abc_total == 0 %}
+    <strong style="font-size:15px;color:var(--muted)">暂无数据</strong>
+    {% else %}
+    <div class="abc-bar">
+      <div class="abc-a" style="width:{{ (abc_counts['A'] / abc_total * 100) | round(1) }}%"></div>
+      <div class="abc-b" style="width:{{ (abc_counts['B'] / abc_total * 100) | round(1) }}%"></div>
+      <div class="abc-c" style="width:{{ (abc_counts['C'] / abc_total * 100) | round(1) }}%"></div>
+    </div>
+    <small class="muted">A {{ abc_counts['A'] }} · B {{ abc_counts['B'] }} · C {{ abc_counts['C'] }}（SKU 数）</small>
+    {% endif %}
+  </section>
+</div>
+
+<div class="health-biz" style="margin-bottom:10px">
+  <section class="card">
+    <p>补货健康</p>
+    <strong style="font-size:17px">待入库 {{ restock_h.pending }}</strong>
+    <small class="muted">窗口补货单 {{ restock_h.window_count }} · 已入库 {{ restock_h.stocked_in }}</small>
+  </section>
+  <section class="card">
+    <p>门店履约</p>
+    <strong style="font-size:17px">{% if fulfill.backlog is not none %}积压 {{ fulfill.backlog }} · 在途 {{ fulfill.in_transit }}{% else %}—{% endif %}</strong>
+    <small class="muted">平均履约 {{ fulfill.avg_cycle_days if fulfill.avg_cycle_days is not none else '—' }} 天</small>
+  </section>
+  <section class="card">
+    <p>盘点质量</p>
+    <strong style="font-size:17px">{{ stocktake.diff_rate if stocktake.diff_rate is not none else '—' }}{% if stocktake.diff_rate is not none %}%{% endif %}</strong>
+    <small class="muted">差异率 · 超 {{ constants.st_gap }} 天未盘 {{ stocktake.unstale_count }} · 上次盘点 {{ stocktake.last_stocktake_days if stocktake.last_stocktake_days is not none else '—' }} 天前</small>
+  </section>
+  <section class="card">
+    <p>生产分析</p>
+    {% if production %}
+    <strong style="font-size:17px">批次 {{ production.run_count }} · 产出 {{ production.output_qty | fmt_qty }}</strong>
+    <small class="muted">超耗率 <span class="{{ 'risk-red' if production.overuse_pct and production.overuse_pct > constants.bom_pct else '' }}">{{ production.overuse_pct if production.overuse_pct is not none else '—' }}%</span> · 单位产出成本 {{ '¥' ~ production.unit_cost if production.unit_cost is not none else '—' }}</small>
+    {% else %}
+    <strong style="font-size:17px">—</strong>
+    <small class="muted">窗口内无生产批次</small>
+    {% endif %}
+  </section>
+</div>
+
+{# ⑧ 风险明细 5 段：无风险的段整段隐藏 #}
+{% set risk_rows = levels.out_of_stock + levels.below_safety %}
+{% if risk_rows %}
+<h3>风险明细 · 断货 / 低于安全库存（{{ risk_rows | length }}）</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>品项</th><th>品类</th><th>库存量</th><th>安全库存</th><th>库存金额</th><th>状态</th><th></th></tr>
+  {% for r in risk_rows %}
+  <tr>
+    <td><a href="{{ url_for('items.inventory_view') }}">{{ r.name }}</a></td>
+    <td>{{ r.category }}</td>
+    <td>{{ r.qty | fmt_qty }} {{ r.unit }}</td>
+    <td>{{ r.safety | fmt_qty }}</td>
+    <td>¥{{ "{:,.2f}".format(r.value) }}</td>
+    <td class="{{ 'risk-red' if r.qty <= 0 else 'risk-yellow' }}">{{ '断货' if r.qty <= 0 else '低于安全' }}</td>
+    <td><a href="{{ url_for('restock.restock_list') }}">去补货 →</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+{% if stale_rows %}
+<h3>风险明细 · 呆滞（{{ stale_rows | length }}）</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>品项</th><th>品类</th><th>库存量</th><th>呆滞量</th><th>呆滞金额</th><th>最老层入库日</th></tr>
+  {% for r in stale_rows %}
+  <tr>
+    <td><a href="{{ url_for('items.inventory_view') }}">{{ r.name }}</a></td>
+    <td>{{ r.category }}</td>
+    <td>{{ r.qty | fmt_qty }} {{ r.unit }}</td>
+    <td class="risk-red">{{ r.stale_qty | fmt_qty }}</td>
+    <td class="risk-red">¥{{ "{:,.2f}".format(r.stale_value) }}</td>
+    <td>{{ r.oldest_date or '—' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+{% if overstock_rows %}
+<h3>风险明细 · 超储（{{ overstock_rows | length }}）</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>品项</th><th>品类</th><th>库存量</th><th>DOS（天）</th><th>占用金额</th></tr>
+  {% for r in overstock_rows %}
+  <tr>
+    <td><a href="{{ url_for('items.inventory_view') }}">{{ r.name }}</a></td>
+    <td>{{ r.category }}</td>
+    <td>{{ r.qty | fmt_qty }} {{ r.unit }}</td>
+    <td class="risk-yellow">{{ "{:.1f}".format(r.dos) }}</td>
+    <td>¥{{ "{:,.2f}".format(r.stock_value) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+{% if production and production.overuse_rows %}
+<h3>风险明细 · 生产超耗 TOP（{{ production.overuse_rows | length }}）</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>批次日期</th><th>产品</th><th>品项</th><th>计划量</th><th>实际量</th><th>超耗%</th><th>超耗金额</th></tr>
+  {% for r in production.overuse_rows %}
+  <tr>
+    <td>{{ r.run_date }}</td>
+    <td><a href="{{ url_for('production.runs_list') }}">{{ r.product }}</a></td>
+    <td>{{ r.item }}</td>
+    <td>{{ r.planned | fmt_qty }}</td>
+    <td>{{ r.actual | fmt_qty }}</td>
+    <td class="risk-red">{{ r.pct }}%</td>
+    <td>¥{{ "{:,.2f}".format(r.over_value) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+{% if stocktake.unstale_items %}
+<h3>风险明细 · 超 {{ constants.st_gap }} 天未盘（{{ stocktake.unstale_items | length }}）</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>品项</th><th>最后盘点日</th><th></th></tr>
+  {% for r in stocktake.unstale_items %}
+  <tr>
+    <td>{{ r.name }}</td>
+    <td class="risk-muted">{{ r.last_date or '从未盘点' }}</td>
+    <td><a href="{{ url_for('stocktake.stocktake_list') }}">去盘点 →</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+<h3>SKU 明细总表（点列头排序）</h3>
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>品项</th><th>品类</th><th>库存量</th>
+    {% for key, label in [('stock_value', '库存金额'), ('stale', '呆滞量'), ('dos', 'DOS（天）'), ('consumed', '窗口消耗金额')] %}
+    <th class="sortable"><a href="{{ url_for('reports.health', range=range, sort=key) }}" class="{{ 'is-active' if sort == key else '' }}">{{ label }}{% if sort == key %} ↓{% endif %}</a></th>
+    {% endfor %}
+    <th>ABC</th><th>最后出库</th><th>最后入库</th><th>最后盘点</th>
+  </tr>
+  {% for r in sku_rows %}
+  <tr>
+    <td><a href="{{ url_for('items.inventory_view') }}">{{ r.name }}</a></td>
+    <td>{{ r.category }}</td>
+    <td>{{ r.qty | fmt_qty }} {{ r.unit }}</td>
+    <td>¥{{ "{:,.2f}".format(r.stock_value) }}</td>
+    <td class="{{ 'risk-red' if r.stale_qty > 0 else '' }}">{{ r.stale_qty | fmt_qty if r.stale_qty > 0 else '—' }}</td>
+    <td class="{{ 'risk-yellow' if r.dos is not none and r.dos > constants.dos else '' }}">{{ "{:.1f}".format(r.dos) if r.dos is not none else '—' }}</td>
+    <td>¥{{ "{:,.2f}".format(r.consumed_value) }}</td>
+    <td>{{ r.abc or '—' }}</td>
+    <td>{{ r.last_outbound or '—' }}</td>
+    <td>{{ r.last_inbound or '—' }}</td>
+    <td>{{ r.last_stocktake or '—' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="11" style="text-align:center;color:var(--muted)">暂无活跃品项</td></tr>
+  {% endfor %}
+</table>
+</div>
+
+{% if production %}
+<h3>生产明细 · 产品维度</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>产品</th><th>批次数</th><th>产出量</th><th>消耗金额</th><th>单位产出成本</th><th>超耗%</th></tr>
+  {% for r in production.products %}
+  <tr>
+    <td>{{ r.name }}</td>
+    <td>{{ r.runs }}</td>
+    <td>{{ r.output | fmt_qty }}</td>
+    <td>¥{{ "{:,.2f}".format(r.consumed) }}</td>
+    <td>{{ '¥' ~ r.unit_cost if r.unit_cost is not none else '—' }}</td>
+    <td class="{{ 'risk-red' if r.overuse_pct and r.overuse_pct > constants.bom_pct else '' }}">{{ r.overuse_pct if r.overuse_pct is not none else '—' }}{% if r.overuse_pct is not none %}%{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+
+<h3>生产明细 · 原料品类维度</h3>
+<div class="table-scroll">
+<table>
+  <tr><th>原料品类</th><th>生产消耗金额</th><th>消耗占比%</th><th>品类超耗%</th></tr>
+  {% for r in production.categories %}
+  <tr>
+    <td>{{ r.name }}</td>
+    <td>¥{{ "{:,.2f}".format(r.consumed) }}</td>
+    <td>{{ r.share }}%</td>
+    <td class="{{ 'risk-red' if r.overuse_pct and r.overuse_pct > constants.bom_pct else '' }}">{{ r.overuse_pct if r.overuse_pct is not none else '—' }}{% if r.overuse_pct is not none %}%{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+<p class="muted" style="margin-top:14px;font-size:12px">
+口径备注：呆滞 = FIFO 流水重放账龄 &gt; {{ constants.stale }} 天的部分 ·
+超储 = 近 {{ constants.dos }} 天有消耗且可售天数（{{ constants.dos_win }} 天窗口日均）&gt; {{ constants.dos }} 天 ·
+超耗 = 实际领料超 BOM 计划 {{ constants.bom_pct }}% ·
+ABC 按窗口消耗金额累计 80/95% 分档 · 呆滞/超储不受页面时间窗口影响
+</p>
+{% endblock %}

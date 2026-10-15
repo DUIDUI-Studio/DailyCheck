@@ -5,7 +5,6 @@
 """
 import sqlite3
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
@@ -114,6 +113,105 @@ def staff_client(tmp_path, monkeypatch):
         s["warehouse_id"] = 1
 
     return client, wh_path
+
+
+@pytest.fixture
+def nav_client_factory(tmp_path, monkeypatch):
+    """按「仓库类型 × 角色 × 是否平台管理员」批量构造登录客户端。
+
+    导航三载体（侧边栏 / 移动底栏 / `/land` 模块卡）的角色矩阵断言需要
+    storefront / distribution_center / rd 三类仓库 × staff / manager / admin
+    三类角色 × 平台管理员开关的组合，而 `logged_client` / `staff_client` 只覆盖
+    「单仓 + 平台管理员」「单仓 + staff」。这里提供工厂：同一夹具实例内每个
+    (warehouse_type, role, is_admin) 组合建独立用户 + 独立仓库 db，重复调用
+    同一组合返回同一客户端。
+
+    用法：
+        client, _ = nav_client_factory("storefront", "admin")
+        client, _ = nav_client_factory(warehouse_type="rd")
+    """
+    import config as config_module
+    import db as db_module
+    from db import init_master_db, init_warehouse_db
+
+    master_path = tmp_path / "master.db"
+    wh_dir = tmp_path / "warehouses"
+    wh_dir.mkdir(exist_ok=True)
+
+    monkeypatch.setattr(db_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
+
+    init_master_db()
+
+    # 惰性建 app：不调用 _build 的用例（以及只用 fixture 做别的事的用例）不必付
+    # create_app() 的代价。
+    _app_cache: list = []
+
+    def _app():
+        if not _app_cache:
+            from app import create_app
+            application = create_app()
+            application.config["TESTING"] = True
+            _app_cache.append(application)
+        return _app_cache[0]
+
+    built: dict[str, tuple] = {}
+
+    def _build(warehouse_type="storefront", role="staff", is_admin=False):
+        key = f"{warehouse_type}-{role}-{'admin' if is_admin else 'normal'}"
+        if key in built:
+            return built[key]
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 文件名必须等于 f"{code}.db"：store_ordering_pure.open_warehouse_db(code)
+        # 是按 code 拼路径的，与 master.db_path 必须是同一个文件。
+        wh_path = wh_dir / f"{key}.db"
+        init_warehouse_db(wh_path)
+
+        m = sqlite3.connect(master_path)
+
+        # id 取 max+1 而非 len(built)+1：本夹具与 logged_client / staff_client 若在同一
+        # 用例里共用 tmp_path，后者的 user 1 / warehouse 1 已存在，硬编码从 1 递增会撞
+        # UNIQUE 约束。
+        uid = m.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM users").fetchone()[0]
+        wh_id = m.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM warehouses").fetchone()[0]
+
+        # 首次构建时补一个配送中心：订货目录 / 订货报表 / 订单管理等页面会按
+        # master 里的 DC 列表解析仓库（无 DC 时会落到空 code 的库上 → 500）。
+        # 与生产环境一致（门店订货必然有 DC），故属于夹具最小必要数据。
+        if not built:
+            dc_path = wh_dir / "dc_test.db"
+            init_warehouse_db(dc_path)
+            m.execute(
+                "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+                "VALUES (?, 'dc_test', '测试配送中心', ?, 'distribution_center', ?)",
+                (wh_id, str(dc_path), ts))
+            wh_id += 1
+
+        m.execute(
+            "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+            "VALUES (?, ?, 'x', ?, ?)", (uid, key, 1 if is_admin else 0, ts))
+        m.execute(
+            "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (wh_id, key, key, str(wh_path), warehouse_type, ts))
+        m.execute(
+            "INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (?, ?, ?)",
+            (uid, wh_id, role))
+        m.commit()
+        m.close()
+
+        client = _app().test_client()
+        with client.session_transaction() as s:
+            s["user_id"] = uid
+            s["warehouse_id"] = wh_id
+        built[key] = (client, wh_path)
+        return client, wh_path
+
+    return _build
 
 
 def _wh(wh_path):

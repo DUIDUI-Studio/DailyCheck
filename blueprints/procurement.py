@@ -10,18 +10,24 @@ from __future__ import annotations
 import csv
 import sqlite3
 import tempfile
-from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import (
-    Blueprint, abort, g, jsonify, render_template, request, send_from_directory,
+    Blueprint,
+    abort,
+    g,
+    jsonify,
+    render_template,
+    request,
+    send_from_directory,
 )
 
 import config  # use config.MASTER_DB at call time so monkeypatch works
-from db import get_master_db, get_warehouse_db, init_master_db
+from db import init_master_db
 from permissions import require_platform_admin, require_role
+
 from .procurement_pure import (
     aggregate_hub,
     compute_safety_stock,

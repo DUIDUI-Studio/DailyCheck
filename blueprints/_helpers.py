@@ -268,6 +268,18 @@ def register_template_context(app) -> None:
                 # failure — fall back to 0 (no badge).
                 unread = 0
         wh_type = g.warehouse["warehouse_type"] if g.get("warehouse") is not None else None
+        # v2 账号管理（feat/user-admin-v2）：把当前用户的 tenant_id 注入模板，
+        # 让账号管理 UI 显示「当前租户」并在筛选器里默认选中。
+        # 兼容两种 user 来源：sqlite3.Row from master.db（有 tenant_id 列），
+        # 以及测试 fixture 手搓的 dict（可能没 tenant_id）—— 后者用 try/except
+        # 兜底而不是 KeyError，避免破坏已有测试。
+        current_tenant_id = None
+        user = g.get("user")
+        if user is not None:
+            try:
+                current_tenant_id = user["tenant_id"]
+            except (KeyError, IndexError):
+                current_tenant_id = None
         return {
             "current_role": role["role"] if role else None,
             "unread_notifications_count": unread,
@@ -286,6 +298,7 @@ def register_template_context(app) -> None:
             "is_rd": wh_type == "rd",
             "is_storefront": wh_type == "storefront",
             "is_distribution_center": wh_type == "distribution_center",
+            "current_tenant_id": current_tenant_id,
         }
 
 

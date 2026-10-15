@@ -340,12 +340,14 @@ def items_publish():
 @require_login
 def items_publish_history(event_id: int | None = None):
     """List recent item publish events + drill-down detail."""
-    from contextlib import closing
-    from config import MASTER_DB
     import sqlite3 as _sq
+    from contextlib import closing
+
     from blueprints.publish_recipe_pure import (
-        list_item_publish_events, get_item_event_details,
+        get_item_event_details,
+        list_item_publish_events,
     )
+    from config import MASTER_DB
     with closing(_sq.connect(MASTER_DB)) as master_conn:
         master_conn.row_factory = _sq.Row
         events = list_item_publish_events(master_conn)
@@ -385,8 +387,9 @@ def new_item_redirect_submit():
       request_new  → 写一条 canonical_claim_requests,跳转申请单列表
     """
     from flask import session
-    from db import get_master_db
+
     import blueprints.canonical_pure as cp
+    from db import get_master_db
     m = get_master_db()
     pending = session.pop("pending_new_item", None)
     if not pending:

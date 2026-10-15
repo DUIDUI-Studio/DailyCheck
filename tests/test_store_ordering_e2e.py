@@ -338,7 +338,6 @@ def test_catalog_renders_suggested_qty_pill(e2e_env):
     client = e2e_env["client"]
     _login_as(client, 1, 3)  # store_staff 在 store_test
     store_path = e2e_env["store_path"]
-    import db as db_module
     store = sqlite3.connect(str(store_path))
     store.row_factory = sqlite3.Row
     # 找到 canonical_id=101 的 items.id
@@ -707,7 +706,7 @@ def test_cancel_pending_order_blocks_non_requester(e2e_env):
     # 切到 store_mgr（user 2）
     _login_as(client, 2, 3)
 
-    resp = client.post(
+    client.post(
         f"/store-ordering/orders/{oid}/cancel",
         data={"reason": "越权取消"},
         follow_redirects=True,
@@ -725,7 +724,7 @@ def test_cancel_requires_reason(e2e_env):
     _login_as(client, 1, 3)
     oid = _create_pending_order(e2e_env["master_path"], 1, 3, 1)
 
-    resp = client.post(
+    client.post(
         f"/store-ordering/orders/{oid}/cancel",
         data={"reason": ""},
         follow_redirects=True,
@@ -758,7 +757,7 @@ def test_cancel_approved_order_by_dc_manager(e2e_env):
 
     # dc_mgr (user 3) 在 dc1_test
     _login_as(client, 3, 1)
-    resp = client.post(
+    client.post(
         f"/store-ordering/orders/{oid}/cancel",
         data={"reason": "库存调整"},
         follow_redirects=True,
@@ -841,10 +840,11 @@ def test_admin_report_filter_by_store(e2e_env):
 
 
 def test_admin_nav_includes_report(e2e_env):
-    """admin 导航应包含「订货报表」入口。"""
+    """admin 侧边栏（模块化后）应包含「订货报表」入口。"""
     client = e2e_env["client"]
     _login_as(client, 4, 3)
-    resp = client.get("/")
+    # 2026-10-13 导航模块化：land(/) 只保留模块卡片；侧边栏链接改在 /dashboard 验证。
+    resp = client.get("/dashboard")
     assert resp.status_code == 200
     body = resp.data.decode()
     assert "订货报表" in body or "报表" in body
@@ -871,9 +871,21 @@ def test_dc_manager_can_access_dc_items_page(e2e_env):
 def test_dc_staff_blocked_from_dc_items(e2e_env):
     """A8: DC staff 403（@require_role("manager")）。"""
     client = e2e_env["client"]
-    # 注：e2e_env 里没有 dc_staff，跳过此用例（权限逻辑由装饰器保证，route 测已覆盖）
-    # 改为测 store_user 403（A9）
-    pass
+    # e2e_env 的 4 个用户里 DC 侧只有 dc_mgr；本用例就地补一个 dc_staff
+    # （id=5，绑 dc1 role=staff），避免为一个断言改动共享夹具。
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(str(e2e_env["master_path"]))
+    m.execute(
+        "INSERT INTO users (id, username, password_hash, is_admin, created_at) "
+        "VALUES (5, 'dc_staff', 'x', 0, ?)",
+        (ts,),
+    )
+    m.execute("INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (5, 1, 'staff')")
+    m.commit()
+    m.close()
+
+    _login_as(client, 5, 1)
+    assert client.get("/store-ordering/dc/items").status_code == 403
 
 
 def test_store_user_blocked_from_dc_items(e2e_env):
@@ -1010,10 +1022,11 @@ def test_catalog_filters_unorderable_item(e2e_env):
 
 
 def test_nav_includes_dc_items_for_dc(e2e_env):
-    """A11: DC 区 nav 加「品项管理」（desktop + mobile 任一即可）。"""
+    """A11: DC 区 nav 加「品项管理」（模块化后由侧边栏承载）。"""
     client = e2e_env["client"]
     _login_as(client, 3, 1)  # dc_mgr
-    resp = client.get("/")
+    # 2026-10-13 导航模块化：land(/) 只保留模块卡片；侧边栏链接改在 /dashboard 验证。
+    resp = client.get("/dashboard")
     assert resp.status_code == 200
     body = resp.data.decode()
     # nav 文字可能为「品项管理」或 mobile 简写「品项」
@@ -1151,10 +1164,11 @@ def test_admin_report_includes_shipping_fee(e2e_env):
 
 
 def test_admin_nav_includes_shipping(e2e_env):
-    """B15: admin nav 含「运费规则」。"""
+    """B15: admin 侧边栏含「运费规则」。"""
     client = e2e_env["client"]
     _login_as(client, 4, 3)
-    resp = client.get("/")
+    # 2026-10-13 导航模块化：land(/) 只保留模块卡片；侧边栏链接改在 /dashboard 验证。
+    resp = client.get("/dashboard")
     assert resp.status_code == 200
     body = resp.data.decode()
     # desktop 或 mobile 任一即可

@@ -155,6 +155,11 @@ def login():
         row = master.execute(
             "SELECT * FROM users WHERE username=?", (username,)
         ).fetchone()
+        # v2 账号管理：停用账号禁止登录（feat/user-admin-v2）。
+        # 顺序：密码校验之前先查 is_active，避免已停用账号仍触发失败计数。
+        if row is not None and row["is_active"] == 0:
+            flash("账号已停用，请联系平台管理员")
+            return render_template("login.html"), 403
         if row is None or not check_password_hash(row["password_hash"], password):
             new_count, new_lock = next_failure_state(
                 throttle["failed_count"] if throttle else 0,

@@ -26,23 +26,26 @@ T10a/T10b 共用此蓝图。
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
-
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from flask import (
-    Blueprint, abort, flash, g, redirect, render_template, request, url_for,
+    Blueprint,
+    abort,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    url_for,
 )
 from werkzeug.exceptions import BadRequest
 
-from permissions import require_login, require_platform_admin, require_role
-from db import get_master_db
-from config import BASE_DIR
-
 import blueprints.canonical_pure as cp
-
+from config import BASE_DIR
+from db import get_master_db
+from permissions import require_login, require_platform_admin, require_role
 
 bp = Blueprint("canonical", __name__, url_prefix="/canonical")
 
@@ -416,8 +419,7 @@ def canonical_backfill_prices():
 @require_login
 def canonical_diff():
     m = get_master_db()
-    summary = cp.diff_summary(m)
-    bindings = cp.collect_bindings(m)
+    summary = cp.diff_summary(m)  # 内部已含 collect_bindings（含各仓 migrate 侧效）
     by_canonical_render = []
     for cid, slot in summary["by_canonical"].items():
         canon_row = m.execute(
@@ -629,7 +631,6 @@ def canonical_review_claim_request(request_id: int):
 @require_role("admin")
 def canonical_bulk_import():
     if request.method == "POST":
-        from flask import current_app
         from werkzeug.utils import secure_filename
         f = request.files.get("csv")
         if f is None or f.filename == "":

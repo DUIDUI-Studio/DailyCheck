@@ -8,17 +8,19 @@ against the bug-fix commits (be67465, ecbf509, 2b39862).
 from __future__ import annotations
 
 import csv
+import datetime as _dt
 import io
 from datetime import datetime
 
 from flask import Blueprint, g, render_template, request
 
-from db import get_warehouse_db
+import reports_health_pure as hp
+from db import get_master_db, get_warehouse_db
 from permissions import current_permissions, require_login, require_permission, require_role
-from .auth import audit
-from .cost_redaction_pure import mask_cost_csv_row
-from .core import _compute_summary_metrics, _compute_category_stats
 
+from .auth import audit
+from .core import _compute_category_stats, _compute_summary_metrics
+from .cost_redaction_pure import mask_cost_csv_row
 
 bp = Blueprint("reports", __name__)
 
@@ -344,3 +346,219 @@ def fmt_qty(value):
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s or "0"
+
+
+# ---------------------------------------------------------------------------
+# Inventory health dashboard (/report/health)
+# ---------------------------------------------------------------------------
+
+HEALTH_RANGES = {"7d": 7, "30d": 30, "all": None}
+
+
+def _health_cutoff(now: datetime, range_param: str) -> tuple[str, int]:
+    """range → (cutoff 时间串, 窗口天数)。all 的 cutoff 取远古，窗口按首条流水。
+
+    口径铁律：Python 侧 now() 绑定参数，不用 SQL datetime('now')（时区坑）。
+    """
+    days = HEALTH_RANGES[range_param]
+    if days is None:
+        return "1970-01-01 00:00:00", None
+    return (now - _dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"), days
+
+
+def _trend_polyline(trend: list[dict], width: int = 280, height: int = 70):
+    """趋势点 → (polyline points 串, 是否全零)。服务端算好，模板零 JS。"""
+    values = [t["value"] for t in trend]
+    vmax = max(values) if values else 0
+    if vmax <= 0:
+        return "", True
+    n = len(values)
+    pts = []
+    for i, v in enumerate(values):
+        x = round(i * width / (n - 1), 1) if n > 1 else 0
+        y = round(height - 6 - (v / vmax) * (height - 14), 1)
+        pts.append(f"{x},{y}")
+    return " ".join(pts), False
+
+
+def _build_health_context(range_param: str, sort_key: str) -> dict:
+    """汇总健康报表全部上下文（页面与 CSV 共用，保证两出口口径零漂移）。"""
+    from flask import g
+
+    now = datetime.now()
+    if range_param not in HEALTH_RANGES:
+        range_param = "7d"
+    cutoff, window_days = _health_cutoff(now, range_param)
+
+    db = get_warehouse_db()
+    master = get_master_db()
+    wh = g.get("warehouse")
+    wh_code = wh["code"] if wh else None
+
+    # KPI 周转/可售天数：复用 /summary 同源函数，零新口径
+    metrics = _compute_summary_metrics(db, range_param)
+
+    levels = hp.compute_inventory_levels(db)
+    stale_dos = hp.compute_stale_and_dos(db, now)
+    abc = hp.compute_abc(db, cutoff)
+    trend = hp.compute_trend(db, now)
+    restock_h = hp.compute_restock_health(db, cutoff)
+    fulfill = hp.compute_fulfillment(master, wh_code, now)
+    stocktake = hp.compute_stocktake_quality(db, now)
+    production = hp.compute_production(db, cutoff)
+    sku_rows = hp.build_sku_table(db, stale_dos, abc, cutoff, sort_key)
+
+    stale_rows = [r for r in sku_rows if r["stale_qty"] > 1e-9]
+    overstock_rows = [r for r in sku_rows
+                      if r["stale_qty"] <= 1e-9 and r["dos"] is not None
+                      and r["dos"] > hp.DOS_THRESHOLD_DAYS]
+    stale_value = round(sum(r["stale_value"] for r in stale_rows), 2)
+    overstock_value = round(sum(r["stock_value"] for r in overstock_rows), 2)
+    abc_counts = {"A": 0, "B": 0, "C": 0}
+    for info in abc.values():
+        abc_counts[info["cls"]] += 1
+
+    points, trend_empty = _trend_polyline(trend)
+    trend_daily_avg = (round(sum(t["value"] for t in trend) / len(trend), 2)
+                       if trend else None)
+    trend_total = round(sum(t["value"] for t in trend), 2) if trend else None
+
+    range_days = HEALTH_RANGES[range_param] or metrics["window_days"]
+    return {
+        "range": range_param,
+        "range_label": {"7d": "近 7 日", "30d": "近 30 日", "all": "全部"}[range_param],
+        "sort": sort_key,
+        "metrics": metrics,
+        "levels": levels,
+        "abc": abc,
+        "abc_counts": abc_counts,
+        "trend": trend,
+        "trend_points": points,
+        "trend_empty": trend_empty,
+        "trend_daily_avg": trend_daily_avg,
+        "trend_total": trend_total,
+        "restock_h": restock_h,
+        "fulfill": fulfill,
+        "stocktake": stocktake,
+        "production": production,
+        "stale_rows": stale_rows,
+        "overstock_rows": overstock_rows,
+        "stale_value": stale_value,
+        "overstock_value": overstock_value,
+        "sku_rows": sku_rows,
+        "constants": {"stale": hp.STALE_DAYS, "dos": hp.DOS_THRESHOLD_DAYS,
+                      "dos_win": hp.DOS_WINDOW_DAYS,
+                      "st_gap": hp.STOCKTAKE_MAX_GAP,
+                      "bom_pct": hp.BOM_OVERUSE_PCT},
+        "window_days": range_days,
+        "generated_at": now.strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+@bp.route("/report/health")
+@require_login
+@require_role("manager")
+def health():
+    """库存健康仪表盘（manager+，单仓视角，纯只读）。
+
+    口径见 docs/2026-10-15-inventory-health-report-plan.md；
+    呆滞=FIFO 账龄>7 天，超储=DOS>7 天，超耗=BOM 超 10%。
+    """
+    range_param = request.args.get("range", "7d")
+    sort_key = request.args.get("sort", "stock_value")
+    ctx = _build_health_context(range_param, sort_key)
+    audit("report.health_view", "report", None,
+          {"range": ctx["range"], "sort": ctx["sort"]})
+    return render_template("report_health.html", **ctx)
+
+
+@bp.route("/report/health/export")
+@require_login
+@require_role("manager")
+def health_export():
+    """健康报表 CSV（5 段：总体 / 风险 / 盘点 / SKU 全表 / 生产明细）。
+
+    与 /report/health 共用 _build_health_context，口径零漂移。
+    UTF-8 BOM 兼容 Excel 中文。
+    """
+    import datetime as _dtmod
+
+    from flask import current_app
+
+    range_param = request.args.get("range", "7d")
+    ctx = _build_health_context(range_param, "stock_value")
+    audit("report.health_export", "report", None, {"range": ctx["range"]})
+
+    output = io.StringIO()
+    w = csv.writer(output)
+
+    # 段 1:总体 KPI
+    m = ctx["metrics"]
+    w.writerow(["库存健康报表", ctx["range_label"], f"生成时间 {ctx['generated_at']}"])
+    w.writerow(["库存金额", f"{m['total_stock_value']:.2f}"])
+    w.writerow(["活跃 SKU 数", ctx["levels"]["active_skus"]])
+    w.writerow(["周转率", f"{m['turnover']:.2f}" if m["turnover"] else "0.00"])
+    w.writerow(["可售天数", m["turnover_days"] if m["turnover_days"] is not None else "—"])
+    w.writerow(["低于安全库存 SKU 数", len(ctx["levels"]["below_safety"])])
+    w.writerow(["断货 SKU 数", len(ctx["levels"]["out_of_stock"])])
+    w.writerow([f"呆滞金额(账龄>{ctx['constants']['stale']}天)", ctx["stale_value"]])
+    w.writerow([f"超储金额(DOS>{ctx['constants']['dos']}天)", ctx["overstock_value"]])
+    w.writerow([])
+
+    # 段 2:风险明细（断货/低安全 + 呆滞 + 超储 + 生产超耗）
+    w.writerow(["断货/低于安全库存", "品类", "库存量", "安全库存", "库存金额"])
+    for r in ctx["levels"]["out_of_stock"] + ctx["levels"]["below_safety"]:
+        w.writerow([r["name"], r["category"], r["qty"], r["safety"], r["value"]])
+    w.writerow([])
+    w.writerow(["呆滞品项", "呆滞量", "呆滞金额", "最老层入库日"])
+    for r in ctx["stale_rows"]:
+        w.writerow([r["name"], r["stale_qty"], r["stale_value"], r["oldest_date"] or "—"])
+    w.writerow([])
+    w.writerow(["超储品项", "库存量", "DOS(天)", "占用金额"])
+    for r in ctx["overstock_rows"]:
+        w.writerow([r["name"], r["qty"], round(r["dos"], 1), r["stock_value"]])
+    w.writerow([])
+    w.writerow(["生产超耗明细", "批次日期", "产品", "品项", "计划量", "实际量", "超耗%", "超耗金额"])
+    for r in (ctx["production"] or {}).get("overuse_rows", []):
+        w.writerow([r["run_id"], r["run_date"], r["product"], r["item"],
+                    r["planned"], r["actual"], r["pct"], r["over_value"]])
+    w.writerow([])
+
+    # 段 3:盘点质量
+    st = ctx["stocktake"]
+    w.writerow(["盘点差异率(%)", st["diff_rate"] if st["diff_rate"] is not None else "—"])
+    w.writerow([f"超{ctx['constants']['st_gap']}天未盘 SKU 数", st["unstale_count"]])
+    w.writerow(["上次盘点距今天数", st["last_stocktake_days"] if st["last_stocktake_days"] is not None else "—"])
+    w.writerow([])
+
+    # 段 4:SKU 明细全表
+    w.writerow(["品项", "品类", "库存量", "单位", "库存金额", "呆滞量", "呆滞金额",
+                "最老层入库日", "DOS(天)", "ABC", "窗口消耗金额", "最后出库", "最后入库", "最后盘点"])
+    for r in ctx["sku_rows"]:
+        w.writerow([r["name"], r["category"], r["qty"], r["unit"], r["stock_value"],
+                    r["stale_qty"], r["stale_value"], r["oldest_date"] or "—",
+                    round(r["dos"], 1) if r["dos"] is not None else "—",
+                    r["abc"] or "—", r["consumed_value"], r["last_outbound"] or "—",
+                    r["last_inbound"] or "—", r["last_stocktake"] or "—"])
+    w.writerow([])
+
+    # 段 5:生产明细（产品维度 + 原料品类维度）
+    prod = ctx["production"]
+    if prod:
+        w.writerow(["产品", "批次数", "产出量", "消耗金额", "单位产出成本", "超耗%"])
+        for r in prod["products"]:
+            w.writerow([r["name"], r["runs"], r["output"], r["consumed"],
+                        r["unit_cost"] if r["unit_cost"] is not None else "—",
+                        r["overuse_pct"] if r["overuse_pct"] is not None else "—"])
+        w.writerow([])
+        w.writerow(["原料品类", "生产消耗金额", "消耗占比%", "品类超耗%"])
+        for r in prod["categories"]:
+            w.writerow([r["name"], r["consumed"], r["share"],
+                        r["overuse_pct"] if r["overuse_pct"] is not None else "—"])
+
+    filename = f"health-{_dtmod.datetime.now().strftime('%Y-%m-%d')}-{ctx['range']}.csv"
+    return current_app.response_class(
+        output.getvalue().encode("utf-8-sig"),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment;filename={filename}"},
+    )

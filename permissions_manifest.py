@@ -246,6 +246,10 @@ ROUTE_MATRIX: dict[str, str] = {
     "reports.export_consumption": perm("report.export"),
     "reports.export_summary": perm("report.export"),
     "reports.api_upload_revenue": f"{ROLE_PREFIX}manager",
+    # 库存健康仪表盘（PR #35 并入）：manager+ 单仓只读，兼容层保留
+    # require_role 守卫（比 report.view 严 —— staff 无份，不迁移到权限点）。
+    "reports.health": f"{ROLE_PREFIX}manager",
+    "reports.health_export": f"{ROLE_PREFIX}manager",
     # ---- restock ----
     "restock.restock_list": LOGIN,
     "restock.restock_start": LOGIN,
@@ -302,6 +306,9 @@ ROUTE_MATRIX: dict[str, str] = {
     "users.change_role": PLATFORM,
     "users.reset_password": PLATFORM,
     "users.toggle_admin": PLATFORM,
+    # v2 并入的路由（PR #17）：停用/启用 + 批量绑定，均 @require_platform_admin。
+    "users.toggle_active": PLATFORM,
+    "users.bulk_bind": PLATFORM,
     "users.delete_user": PLATFORM,
     "users.create_warehouse": PLATFORM,
     "users.init_warehouse": PLATFORM,
