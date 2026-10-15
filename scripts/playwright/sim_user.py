@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""模拟用户操作 —— verify.sh check 2 的 4 关键路径探针（纯 stdlib，无浏览器依赖）.
+"""模拟用户操作 —— verify.sh check 2 的 5 关键路径探针（纯 stdlib，无浏览器依赖）.
 
 路径（对绿环境 --base-url 依次验证）：
   1. 登录页可达          GET  /login                       → 200
   2. 登录成功            POST /login（含 CSRF 回填）        → 302 → 选仓页 200
   3. 选仓进入总览        POST /select-warehouse/<id>       → 302 → /land 200
   4. 库存页              GET  /inventory                   → 200
+  5. 库存健康报表        GET  /report/health               → 200
+
+路径 5 是 Issue #38 补的回归网：该页曾因生产存量时间戳无秒（「YYYY-MM-DD HH:MM」）
+在 manager+ 视角直接 500，而 check 2 只走 4 条路径、单测又全用带秒样例，
+没有任何一层拦得住它。它要求**凭据账号为 manager+**（平台 admin 直接放行）：
+403 会按失败处理而非跳过——静默降级等于没覆盖。
 
 凭据：环境变量 SIM_USER_USER / SIM_USER_PASSWORD（缺失退出码 64 并提示，
 绝不允许静默跳过——check 2 的意义就是把绿环境当真实用户走一遍）。
@@ -64,7 +70,7 @@ class Probe:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="模拟用户 4 关键路径探针")
+    ap = argparse.ArgumentParser(description="模拟用户 5 关键路径探针")
     ap.add_argument("--base-url", required=True, help="绿环境根 URL，如 http://127.0.0.1:8091")
     args = ap.parse_args()
 
@@ -143,10 +149,25 @@ def main() -> int:
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
         record(4, "库存页可达", False, str(e))
 
+    # ---- 路径 5：库存健康报表（Issue #38 回归网，需 manager+）----
+    try:
+        status, final_url, _ = probe.get("/report/health")
+        # 同时校验落点：会话一旦丢失会 302 到 /login 并被跟随后返回 200，
+        # 只看 status 会把「已掉登录」误判成通过。
+        ok = status == 200 and final_url.endswith("/report/health")
+        record(5, "库存健康报表可达", ok, f"status={status} final={final_url}")
+    except urllib.error.HTTPError as e:
+        # 5xx 是本次要拦的故障；403 则是角色门（凭据账号非 manager+）——
+        # 两者都算失败（不静默降级），但提示不同，便于一眼定性。
+        hint = "（凭据账号需 manager+ 角色）" if e.code == 403 else ""
+        record(5, "库存健康报表可达", False, f"status={e.code}{hint} {e.reason}")
+    except urllib.error.URLError as e:
+        record(5, "库存健康报表可达", False, str(e))
+
     if failures:
         print(f"[sim-user] ❌ 失败路径：{'、'.join(failures)}")
         return 1
-    print("[sim-user] ✅ 4 关键路径全通")
+    print("[sim-user] ✅ 5 关键路径全通")
     return 0
 
 

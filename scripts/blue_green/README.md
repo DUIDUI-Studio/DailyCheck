@@ -29,7 +29,7 @@
 
 | 文件 | 用途 | 状态 |
 |------|------|------|
-| `up.sh` | 起绿环境（cp DB + systemctl start dailycheck-green.service + 健康检查） | 骨架 + systemd TODO |
+| `up.sh` | 起绿环境（cp DB + systemctl **restart** dailycheck-green.service + 健康检查） | 骨架 + systemd TODO |
 | `verify.sh` | 跑八项生产验证 | 骨架（占位报告，exit 0 警告） |
 | `switch.sh` | 切流量（nginx upstream weight + reload） | 骨架 + systemd TODO |
 | `rollback.sh` | 秒级切回蓝（weight=0 + 不停绿进程） | 骨架 + systemd TODO |

@@ -9,11 +9,12 @@
 #   0  全绿可切流量
 #   1  验证失败（任一项不达标）
 #
-# 八项检查（v0.1.md §四.2 报告 05）：
+# 八项检查（v0.1.md §四.2 报告 05 + PR #33 补 check 7/8）：
 #   1. 集成测试（pytest tests/ 顶层 + check_known_failures.py 零新增门禁）
-#   2. 模拟用户操作（sim_user.py 走 登录→选仓→总览→库存 4 关键路径；
-#      凭据走 SIM_USER_USER / SIM_USER_PASSWORD 环境变量；
-#      探针前先用显式 DAILYCHECK_DB_DIR 把账号 ensure 进「绿」库，见 Issue #34）
+#   2. 模拟用户操作（sim_user.py 走 登录→选仓→总览→库存→健康报表 5 关键路径；
+#      凭据走 SIM_USER_USER / SIM_USER_PASSWORD 环境变量；末条 /report/health
+#      是 Issue #38 补的回归网，需 manager+ 账号；探针前先用显式 DAILYCHECK_DB_DIR
+#      把账号 ensure 进「绿」库，见 Issue #34）
 #   3. 绿 vs 蓝比对（ab -n 100 -c 10 响应/P95 截图）
 #   4. 回滚演练（switch.sh blue 100 → health → switch.sh green 0）
 #   5. 资源与依赖（systemctl status + journalctl + ss -tn）
@@ -111,7 +112,7 @@ _write_report() {
 | # | 检查项 | 状态 | 备注 |
 |---|--------|------|------|
 | 1 | 集成测试 (pytest + 零新增门禁) | ${R1} | ${N1:-} |
-| 2 | 模拟用户操作 (sim_user.py 4 路径) | ${R2} | ${N2:-} |
+| 2 | 模拟用户操作 (sim_user.py 5 路径) | ${R2} | ${N2:-} |
 | 3 | 绿 vs 蓝 性能比对 (ab -n 100 -c 10) | ${R3} | ${N3:-} |
 | 4 | 回滚演练 (switch.sh blue 100 → green 0) | ${R4} | ${N4:-} |
 | 5 | 资源与依赖 (systemctl + journalctl + ss) | ${R5} | ${N5:-} |
@@ -166,7 +167,7 @@ _verify_check1_pytest() {
 }
 
 # ============================================================
-# check 2 实现：sim_user.py 模拟用户 4 关键路径
+# check 2 实现：sim_user.py 模拟用户 5 关键路径
 # 凭据从环境变量读（SIM_USER_USER / SIM_USER_PASSWORD），缺省直接 FAIL
 # 并提示设置方法——绝不允许静默跳过。
 # ============================================================
@@ -248,7 +249,7 @@ _ensure_sim_user_in_green_db() {
     return 1
   fi
 
-  # 复核：绿库真的能拿这对凭据走完 4 路径（登录 + 选仓都靠这几条）。
+  # 复核：绿库真的能拿这对凭据走完 5 路径（登录 + 选仓都靠这几条）。
   # 必要性：up.sh 拷的是蓝库快照，绿库里可能**已有同名账号**但密码不同 /
   # 已停用 / 不是 admin（create-user 三者都不会覆盖）→ 探针会以含糊的
   # 401 / 403 / 空选仓页收场。这里给出精确诊断，别让人再去库里翻。
@@ -380,10 +381,10 @@ _run_check "1" "集成测试 (pytest tests/ 顶层 + check_known_failures 零新
   "_verify_check1_pytest"
 
 # ============================================================
-# 2. 模拟用户操作（sim_user.py 4 关键路径；凭据 SIM_USER_USER/PASSWORD；
+# 2. 模拟用户操作（sim_user.py 5 关键路径；凭据 SIM_USER_USER/PASSWORD；
 #    先用 DAILYCHECK_DB_DIR=绿库 ensure 账号，Issue #34）
 # ============================================================
-_run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存)" \
+_run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存→健康报表)" \
   "_verify_check2_sim_user"
 
 # ============================================================
