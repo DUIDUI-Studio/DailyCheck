@@ -329,7 +329,7 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 
 - **首次部署 watcher 时，inbox 里已存在的历史条目会被立即触发一遍**（无状态文件 = 全部视为待触发；保守设计宁多勿漏）。不想打搅就先跑步骤 5 的 rotate 清旧行，或接受首次补触发（merge 判定幂等，无副作用）。
 - inbox 是接收器反压闸门（≥1000 行时 receiver 返 503 拒新通知）；rotate 每日归档 >7 天旧行，让行数回落。归档文件 `inbox.archive.jsonl` 只增不删（低频，人工按需清理）。
-- watcher 的触发失败会 WARNING + 指数退避重试（journal 可见）。⚠️ **已知限制（Issue #51）**：重试由主循环的「inbox 文件签名变化」gating —— inbox 无新行时退避条目**不会自行重试**（2026-10-16 实测延迟 1h：11:38 部署后失败，14:29 新事件写入才连带补发）。webhook 整体故障时由 **§3.9 兜底轮询**保底（≤30 分钟发现新 PR）。
+- watcher 的触发失败会 WARNING + 指数退避重试（journal 可见）。退避到期自身即驱动一轮处理（**Issue #51 已修复**：主循环触发条件 =「inbox 文件签名变化 **或** 退避条目到期」；修复前只看签名，inbox 无新行时退避条目不会自行重试 —— 2026-10-16 实测延迟 1h：11:38 部署后失败，14:29 新事件写入才连带补发）。webhook 整体故障时仍由 **§3.9 兜底轮询**保底（≤30 分钟发现新 PR）。
 - watcher 的 systemd 沙箱默认只放行 `/var/lib/dailycheck-prod-agent` + `/root/.hermes` 写权限；若替换触发命令且需要别的写路径，在 unit 的 `ReadWritePaths` 追加。
 
 ### 3.9 部署兜底轮询（10 分钟，Issue #47 / #51）
@@ -498,7 +498,7 @@ grep -E "cross-session" /root/.hermes/logs/agent.log   # 发生过跨会话解�
 | inbox 写满 1000 | 反压返回 503，GitHub 暂停重试 | 手动 rotate inbox → 移到 `processed.jsonl` |
 | HMAC secret 泄漏 | secret 写 `/etc/dailycheck/webhook-secret`（600 root），不出现 prompt/git/log | GitHub repo webhook 设置里点「Redeliver」+ 重新生成 secret + 更新 systemd EnvironmentFile + 重启 receiver |
 | 旧 webhook 重投同一 delivery | 幂等按 delivery_id（receiver 200 duplicate） | 不需处理，receiver 自动忽略 |
-| **watcher 触发失败后无新事件 → 退避重试不发动**（Issue #51，实测延迟 1h） | §3.9 兜底轮询 30 分钟保底；journal WARNING 可见 | 修复见 Issue #51（主循环加 pending-retry 条件，pending-retry PR） |
+| **watcher 触发失败后无新事件 → 退避重试不发动**（Issue #51，实测延迟 1h） | 已修复：主循环触发条件加退避到期判定（`retry_due`）；§3.9 兜底轮询仍保底 | 修复前版本建议立即升级 watcher（升级前 journal WARNING 需人工关注） |
 | **Hermes gateway 重启窗口**（订阅热加载前）事件落 inbox 但未触发 | watcher 状态文件保留未处理条目（重启后补触发）+ §3.9 兜底轮询 | 无需处理；确认 `ss -tlnp \| grep 8644` 恢复 LISTEN |
 | **[SILENT] 补丁被 Hermes 升级/重装冲掉**（症状：中间态判定开始往飞书发字面 `[SILENT]` / `[SILENT` 消息） | §3.8 步骤 2c 重打两处补丁；`grep -n '_silent_check' /root/hermes-agent/gateway/platforms/webhook.py /root/hermes-agent/cron/scheduler.py` 核对 | 无需回滚；补丁缺失只影响静默语义，事件不丢（兜底轮询照常） |
 | **审批跨会话补丁被 Hermes 升级/重装冲掉**（症状：Prod Agent 危险命令重新死锁——每次超时 `BLOCKED: Command timed out`） | §3.11 重打：`python3 /root/hermes-agent/local-patches/2026-10-16-crosssession-approval/apply.py`；判据 `grep -c oldest_blocking_session /root/hermes-agent/tools/approval.py`（应 ≥1） | 无需回滚；补丁缺失只影响 webhook 会话审批（飞书原生会话审批按钮不受影响） |
@@ -507,7 +507,7 @@ grep -E "cross-session" /root/.hermes/logs/agent.log   # 发生过跨会话解�
 
 - **证书轮换（90 天周期，两份独立证书）**：hook 独立证书 2026-10-16 签发 → **2027-01-13 到期**；主站证书 → **2027-01-03 到期**。到期前重签（hook 走 §3.2）。远程查看到期时间：`echo | openssl s_client -connect hook.kjtang.cn:443 -servername hook.kjtang.cn 2>/dev/null | openssl x509 -noout -dates`
 - **inbox rotate（已实装，#47）**：`dc-inbox-rotate.timer` 每日 00:30 归档 >7 天条目到 `inbox.archive.jsonl`
-- **watcher 触发失败**：`journalctl -u dc-inbox-watcher | grep WARNING` 非空即链路告警（脚本内退避重试中；注意 Issue #51 gating 限制——inbox 无新行时不自行重试，由 §3.9 兜底轮询 ≤30 分钟保底）
+- **watcher 触发失败**：`journalctl -u dc-inbox-watcher | grep WARNING` 非空即链路告警。退避重试已不依赖 inbox 新行（Issue #51 已修复）——同一 delivery_id 的 WARNING 应能观察到 attempt 递增，若长时间停在同一 attempt 说明 watcher 未升级到修复版；若出现连续 `cannot read inbox` 则属另一类降级态（inbox 不可读，见 `docs/ARCHITECTURE.md` §3.5 已知限制）；§3.9 兜底轮询仍保底
 - **兜底轮询健康（§3.9）**：`hermes cron list` 看「DailyCheck PR 兜底轮询」last run `ok`；`cron/output/<id>/*.md` 连续出现 ⚠️ 输出 = 轮询通道故障（gh/token/网络）需排查
 - **Hermes webhook adapter 健康**：`ss -tlnp | grep 8644` 有 LISTEN；`agent.log` 中 `[webhook] POST` 出现频率 = 快通道实际投递频率
 - **inbox size 观察**：`curl -sS http://127.0.0.1:8443/health` 的 `inbox_size`（持续逼近 1000 = rotate 失效需排查）

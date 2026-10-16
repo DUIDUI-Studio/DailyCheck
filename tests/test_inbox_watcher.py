@@ -9,6 +9,8 @@
 - 重启不重复：state 持久化后重新加载不重触发
 - 停机补触发：state 已有 id 时，文件新 id 仍触发
 - 失败重试 + 退避（retry-base=0 立即重试 / retry-base 大值跳过）
+- 退避到期自身驱动重试：inbox 无新行也能补发（Issue #51 端到端）+ 主循环 gating 覆盖（空闲不空跑）
+- 损坏失败条目（next/n 非数值 / 非有限值 / 溢出）不崩且一轮自愈；超大 attempts 退避不崩不挂死
 - rotate 换 inode 后旧行不重触发、新行触发
 - handled_ids 随文件内容 prune
 - draft 事件照触发（业务语义交 Prod Agent，本脚本只做机械过滤）
@@ -31,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -310,6 +313,231 @@ def test_failure_backoff_skips_until_next(tmp_path: Path):
     # 第二轮：仍在退避期 → 不再尝试（marker 无变化可证：命令恒败，若重试会累加 n）
     inbox_watcher.process_once(cfg, state)
     assert next(iter(state.failures.values()))["n"] == 1
+
+
+def test_retry_due_condition(tmp_path: Path):
+    """Issue #51：退避到期的判定（主循环解除签名 gating 的依据）。"""
+    now = 1000.0
+    # 无失败条目 → 不驱动额外轮次（保住「无变化不空转」的原设计）
+    assert inbox_watcher.retry_due(inbox_watcher.WatcherState(), now) is False
+    # 退避未到期 → False
+    s = inbox_watcher.WatcherState()
+    s.failures["d-future"] = {"n": 1, "next": now + 60}
+    assert inbox_watcher.retry_due(s, now) is False
+    # 退避到期（含恰好等于 now 的边界）→ True
+    s.failures["d-due"] = {"n": 2, "next": now}
+    assert inbox_watcher.retry_due(s, now) is True
+    s.failures["d-due"]["next"] = now - 1
+    assert inbox_watcher.retry_due(s, now) is True
+    # 多条里只要有一条到期 → True
+    s.failures["d-later"] = {"n": 1, "next": now + 3600}
+    assert inbox_watcher.retry_due(s, now) is True
+    # 状态损坏（缺 key / 非数值 / 非 dict）→ 保守视作到期，不崩
+    bad = inbox_watcher.WatcherState()
+    bad.failures["d-nokey"] = {"n": 1}
+    assert inbox_watcher.retry_due(bad, now) is True
+    bad2 = inbox_watcher.WatcherState()
+    bad2.failures["d-nan"] = {"n": 1, "next": "not-a-number"}
+    assert inbox_watcher.retry_due(bad2, now) is True
+    bad3 = inbox_watcher.WatcherState()
+    bad3.failures["d-notdict"] = "garbage"  # type: ignore[assignment]
+    assert inbox_watcher.retry_due(bad3, now) is True
+
+
+def test_failure_retries_after_backoff_with_no_new_inbox_lines(tmp_path: Path):
+    """Issue #51 回归：触发失败 + inbox **无任何新行** → 退避到期后必须自动重试。
+
+    修复前主循环只在文件签名变化时 process_once，而重试不写 inbox（签名不变）
+    → 退避条目永不重试，本用例会一直等到 deadline 后失败。
+    """
+    inbox = tmp_path / "inbox.jsonl"
+    inbox.write_text("", encoding="utf-8")
+    marker = tmp_path / "marker.txt"
+    counter = tmp_path / "attempts.txt"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "prod_agent" / "inbox_watcher.py"
+    # 第 1 次触发 exit 1（不写 marker）；第 2 次起成功（把 stdin 追加进 marker）
+    trigger = (
+        f"payload=$(cat); n=$(cat {counter!s} 2>/dev/null || echo 0); "
+        f"n=$((n+1)); echo $n > {counter!s}; "
+        f'if [ "$n" -lt 2 ]; then exit 1; fi; '
+        f"printf '%s\\n' \"$payload\" >> {marker!s}"
+    )
+    rec = _event()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "--inbox",
+            str(inbox),
+            "--state-file",
+            str(tmp_path / "state.json"),
+            "--trigger-cmd",
+            f"/bin/sh -c {shlex.quote(trigger)}",
+            "--poll-interval",
+            "0.05",
+            "--retry-base",
+            "0.3",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        time.sleep(0.5)  # 首扫（空 inbox）
+        t0 = time.monotonic()
+        with inbox.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        deadline = t0 + 5.0
+        while time.monotonic() < deadline and not _read_marker(marker):
+            time.sleep(0.05)
+        elapsed = time.monotonic() - t0
+        # 关键：这 5 秒内 inbox 未再追加任何行，重试只能由 retry_due() 驱动
+        assert len(inbox.read_text(encoding="utf-8").splitlines()) == 1
+        assert _read_marker(marker), "退避后的重试未发生（Issue #51 回归）"
+        assert elapsed >= 0.25, f"未走退避（elapsed={elapsed:.2f}s）"
+        assert json.loads(_read_marker(marker)[0])["delivery_id"] == rec["delivery_id"]
+        assert counter.read_text(encoding="utf-8").strip() == "2"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"n": "not-a-number", "next": "not-a-number"},
+        {"n": "bad", "next": None},
+        {"n": 0, "next": float("nan")},  # JSON 非标但 json.loads 默认接受
+        {"n": 1, "next": float("inf")},  # 非有限值（+inf）同样须视作到期
+        {"n": 1, "next": 10**309},  # 溢出形态：309 位整数 → float() 抛 OverflowError
+        "garbage",  # 非 dict（load() 会过滤，但内存态/未来变更下仍须不崩）
+    ],
+)
+def test_corrupted_failure_entry_self_heals_without_crash(tmp_path: Path, bad: object):
+    """Issue #51 审核整改：状态里 next/n 损坏（但 JSON 合法）→ 不崩 + 一轮自愈。
+
+    修复前 `process_once` 对同一损坏值 `float(fail["next"])` 无兜底 → ValueError
+    直穿 main()（只捕 KeyboardInterrupt）→ systemd Restart=always 崩溃循环。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    state = inbox_watcher.WatcherState()
+    state.failures[rec["delivery_id"]] = bad  # type: ignore[assignment]
+
+    assert inbox_watcher.retry_due(state) is True
+    failed = inbox_watcher.process_once(cfg, state)  # 修复前此处抛 ValueError
+    assert failed == 0
+    # 自愈：触发成功 → handled + failures 清空
+    assert rec["delivery_id"] in state.handled_ids
+    assert rec["delivery_id"] not in state.failures
+    assert len(_read_marker(marker)) == 1
+
+
+@pytest.mark.parametrize("bad_n", ["bad", -5, None, float("inf"), float("-inf"), float("nan")])
+def test_corrupted_failure_entry_rewritten_on_repeat_failure(tmp_path: Path, bad_n: object):
+    """损坏条目 + 触发仍失败 → next/n 被重写成合法值（不永久损坏）。
+
+    `n` 含负数（-5）与 ±inf 形态：损坏计数一律归零重算（首次失败），不得出现
+    负次退避；±inf 曾是未捕获的 OverflowError 崩溃点（`int(inf)` 抛的是
+    OverflowError，不是 ValueError）。
+    """
+    cfg = _cfg(tmp_path, ["/bin/sh", "-c", "exit 1"], retry_base=3600.0)
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    state = inbox_watcher.WatcherState()
+    state.failures[rec["delivery_id"]] = {"n": bad_n, "next": None}
+
+    assert inbox_watcher.process_once(cfg, state) == 1
+    entry = state.failures[rec["delivery_id"]]
+    assert entry["n"] == 1, f"损坏计数未归零重算：{entry!r}"
+    assert isinstance(entry["next"], float)
+    # 重写后回到正常退避语义：下一个 now 不再到期
+    assert inbox_watcher.retry_due(state, now=time.time()) is False
+
+
+def test_retry_delay_survives_huge_attempts(tmp_path: Path):
+    """异常大的 attempts（损坏 state 可达）不得崩溃或挂死 —— 一律封顶到 retry_max。"""
+    cfg = _cfg(tmp_path, ["/bin/sh", "-c", "true"], retry_base=1.0, retry_max=60.0)
+    assert inbox_watcher._retry_delay(cfg, 1) == 1.0
+    assert inbox_watcher._retry_delay(cfg, 3) == 4.0  # 与 base*2^(n-1) 等价
+    assert inbox_watcher._retry_delay(cfg, 7) == 60.0  # 已封顶
+    assert inbox_watcher._retry_delay(cfg, 1000) == 60.0
+    started = time.monotonic()
+    assert inbox_watcher._retry_delay(cfg, 10**6) == 60.0  # 旧式 2**(n-1) 在此抛 OverflowError
+    assert inbox_watcher._retry_delay(cfg, int(1e300)) == 60.0  # 旧式在此挂死 25s+
+    assert time.monotonic() - started < 1.0, "退避计算不得退化成长时间挂死"
+    # retry_base=0（测试常用）仍返回 0 → 立即重试
+    zero = _cfg(tmp_path, ["/bin/sh", "-c", "true"], retry_base=0.0)
+    assert inbox_watcher._retry_delay(zero, 5) == 0.0
+
+
+def test_prune_failures_for_handled_ids(tmp_path: Path):
+    """Issue #51 审核整改：handled ∩ failures 的残留条目被 prune 掉。
+
+    否则该类条目永不被重试（process_once 开头 handled 短路），却让
+    retry_due() 恒 True → 主循环每轮空跑。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    state = inbox_watcher.WatcherState()
+    # 模拟「已 handled 同时残留 failures」的矛盾状态（手工改状态 / 版本错位）
+    state.handled_ids.add(rec["delivery_id"])
+    state.failures[rec["delivery_id"]] = {"n": 1, "next": 0.0}
+
+    assert inbox_watcher.retry_due(state) is True
+    inbox_watcher.process_once(cfg, state)  # 被 handled 短路，不触发
+    assert _read_marker(marker) == []
+    assert state.failures == {}
+    assert inbox_watcher.retry_due(state) is False
+
+
+def test_main_loop_does_not_reprocess_when_idle(tmp_path: Path):
+    """主循环 gating 覆盖（Issue #51 审核整改）：无变化、无退避到期 → 不空跑。
+
+    可观测面：把 inbox 造成「stat 成功但读失败」的目录 → 每次 process_once 都会
+    打一条 `cannot read inbox` WARNING。正确 gating 下首轮之后不再有 WARNING；
+    若 gating 被改成无条件处理（`if True:`），0.6s 内会刷出十余条。
+    """
+    inbox = tmp_path / "inbox.jsonl"
+    inbox.mkdir()  # 目录：stat OK（签名稳定），read_bytes 抛 IsADirectoryError
+    script = Path(__file__).resolve().parent.parent / "scripts" / "prod_agent" / "inbox_watcher.py"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "--inbox",
+            str(inbox),
+            "--state-file",
+            str(tmp_path / "state.json"),
+            "--trigger-cmd",
+            "/bin/true",
+            "--poll-interval",
+            "0.05",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        time.sleep(0.9)
+    finally:
+        proc.terminate()
+        try:
+            out = proc.stdout.read() if proc.stdout else ""
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out = proc.stdout.read() if proc.stdout else ""
+    warns = out.count("cannot read inbox")
+    assert warns <= 2, f"主循环空跑：0.6s 内 {warns} 条 WARNING（gating 失效）\n{out}"
+    assert warns >= 1, f"首轮未处理（用例失效）\n{out}"
 
 
 def test_prune_handled_after_file_shrink(tmp_path: Path):

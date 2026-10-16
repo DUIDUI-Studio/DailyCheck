@@ -278,7 +278,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
             <span class="b info">已部署</span>
         </div>
         <div class="tm">cron <code>02ee9e01cb13</code> · <code>*/30</code> · 脚本 <code>dailycheck_pr_poll.py</code></div>
-        <div class="tl">≤30 分钟保底；Issue #51（watcher retry-gating）待修</div>
+        <div class="tl">≤30 分钟保底；watcher retry-gating（Issue #51）已修复</div>
     </div>
 </div>
 
