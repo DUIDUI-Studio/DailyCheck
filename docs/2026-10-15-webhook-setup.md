@@ -1,12 +1,14 @@
 # DailyCheck Webhook 部署操作手册
 
-> **目的**：Dev Agent 提完 PR 后，GitHub repo 自动通过 webhook 通知 VPS 上的 receiver，receiver 写入 `inbox.jsonl`，Prod Agent 订阅 inbox 跑 merge 决策。
+> **目的**：Dev Agent 提完 PR 后，GitHub repo 自动通过 webhook 通知 VPS 上的 receiver，receiver 写入 `inbox.jsonl`，`dc-inbox-watcher` 订阅 inbox **≤5s** 触发 Prod Agent 入口跑 merge 决策。
 >
 > **目标读者**：owner / Prod Agent 手动部署。脚本走不走通不在 Dev 自动化范围（基础设施变更需 owner 拍板）。
 >
 > **设计文档**：`docs/agent-framework/case-studies/2026-10-15-self-contained-dev-loop.md` 第 6 章"蓝绿部署" + 第 10 章"复盘"。
 >
-> **预计耗时**：30-45 分钟（DNS / 证书重签 / systemd / nginx reload / GitHub 配 webhook）。
+> **预计耗时**：40-60 分钟（DNS / 证书重签 / systemd / nginx reload / GitHub 配 webhook / §3.8 watcher+rotate）。
+>
+> **更新**：2026-10-16 增补 §3.8（inbox watcher + rotate，Issue #47）—— 链路「inbox.jsonl → Prod Agent」从「Prod 侧自行实现」变为本手册可部署的实装。
 
 ## 1. 架构
 
@@ -33,8 +35,12 @@ hook.kjtang.cn:443 (新子域名)               │                      ▼  �
                                             │  prod-agent/inbox.jsonl  │
                                             │           │              │
                                             │           ▼              │
-                                            │  Prod Agent 订阅          │
-                                            │  (inotify / tail -F)     │
+                                            │  dc-inbox-watcher        │
+                                            │  （≤5s 触发，§3.8）       │
+                                            │           │              │
+                                            │           ▼              │
+                                            │  dc-notify-prod-agent    │
+                                            │  → Prod Agent 入口        │
                                             │  → 跑 merge 决策          │
                                             └────────────────────────┘
 ```
@@ -171,7 +177,66 @@ curl -I https://hook.kjtang.cn/health
    tail -1 /var/lib/dailycheck-prod-agent/inbox.jsonl | python3 -m json.tool
    # 期望：含 pr_number / pr_title / pr_head_sha / pr_author 等字段
    ```
-6. 验证 Prod Agent 订阅：等下次 Prod Agent 跑 → 应读 inbox → 跑 merge 决策
+6. 验证 Prod Agent 订阅：见 §3.8（watcher 部署后 inbox 新行 ≤5s 触发）
+
+### 3.8 部署 inbox watcher + rotate（10 分钟，Issue #47）
+
+receiver 只负责「把事件落进 inbox」；本步部署「inbox → Prod Agent」的唤醒桥：
+`dc-inbox-watcher`（常驻，≤5s 触发触发命令）+ `dc-inbox-rotate`（每日归档 >7 天旧行）。
+
+```bash
+# 1. 触发命令适配器（把事件投递给 Prod Agent 入口）
+cp deploy/scripts/dc-notify-prod-agent.sh /usr/local/bin/dc-notify-prod-agent
+chmod 755 /usr/local/bin/dc-notify-prod-agent
+#    默认实现 = Hermes webhook 订阅（见步骤 2）；若 Prod Agent 入口不同，
+#    按脚本头部注释替换 exec 那一行即可，watcher 不需要改动。
+
+# 2. （Hermes 侧，一次性）启用 webhook platform + 建订阅
+#    在 /root/.hermes/config.yaml 加：
+#      platforms:
+#        webhook:
+#          enabled: true
+#          extra:
+#            host: "127.0.0.1"        # 仅本地（投递者是本机 watcher），勿暴露公网
+#            port: 8644
+#            secret: "<随机强密码>"
+#    重启 gateway 生效，然后建订阅：
+cd /root/hermes-agent
+./hermes webhook subscribe dailycheck-pr \
+  --prompt 'DailyCheck PR 通知: PR #{pr_number} {action} by {pr_author} ({pr_head_sha}) —— 走 dailycheck-prod-agent skill 判定 merge' \
+  --skills dailycheck-prod-agent
+./hermes webhook list          # 确认 dailycheck-pr 在列
+
+# 3. watcher + rotate units
+cp deploy/systemd/dc-inbox-watcher.service \
+   deploy/systemd/dc-inbox-rotate.service \
+   deploy/systemd/dc-inbox-rotate.timer \
+   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now dc-inbox-watcher.service
+systemctl enable --now dc-inbox-rotate.timer
+
+# 4. 链路验证（秒级）
+systemctl status dc-inbox-watcher --no-pager
+journalctl -u dc-inbox-watcher -n 20 --no-pager   # 期望 [inbox_watcher] started: ...
+echo '{"delivery_id":"test-1","event":"pull_request","action":"opened","repo_full_name":"ericmr1981/DailyCheck","pr_number":1,"pr_title":"test","pr_head_sha":"deadbeef","received_at_ms":0}' \
+  >> /var/lib/dailycheck-prod-agent/inbox.jsonl
+sleep 3
+journalctl -u dc-inbox-watcher -n 5 --no-pager     # 期望出现 triggered: delivery=test-1
+# Prod Agent 侧（Hermes）应同时收到 dailycheck-pr 订阅的会话
+
+# 5. 手工跑一次 rotate（验证归档链路）
+systemctl start dc-inbox-rotate.service
+journalctl -u dc-inbox-rotate -n 5 --no-pager      # 期望 done: archived=N kept=M ...
+systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
+```
+
+**注意**：
+
+- **首次部署 watcher 时，inbox 里已存在的历史条目会被立即触发一遍**（无状态文件 = 全部视为待触发；保守设计宁多勿漏）。不想打搅就先跑步骤 5 的 rotate 清旧行，或接受首次补触发（merge 判定幂等，无副作用）。
+- inbox 是接收器反压闸门（≥1000 行时 receiver 返 503 拒新通知）；rotate 每日归档 >7 天旧行，让行数回落。归档文件 `inbox.archive.jsonl` 只增不删（低频，人工按需清理）。
+- watcher 的触发失败会 WARNING + 指数退避重试（journal 可见）；**30 分钟兜底轮询不变**——webhook 链路整体故障时仍按原节奏发现新 PR。
+- watcher 的 systemd 沙箱默认只放行 `/var/lib/dailycheck-prod-agent` + `/root/.hermes` 写权限；若替换触发命令且需要别的写路径，在 unit 的 `ReadWritePaths` 追加。
 
 ## 4. 验收 checklist
 
@@ -185,8 +250,12 @@ curl -I https://hook.kjtang.cn/health
 | 6 | 外部 443 探活 | `curl -I https://hook.kjtang.cn/health` |
 | 7 | inbox 落盘 | `cat /var/lib/dailycheck-prod-agent/inbox.jsonl`（dev 测 PR 后应至少 1 行） |
 | 8 | 限速规则生效 | `head /var/log/nginx/hook.kjtang.cn.error.log`（看有无 503 限速日志） |
-| 9 | 单元测试通过 | `pytest tests/test_webhook_receiver.py -q`（CI 自动跑） |
+| 9 | 单元测试通过 | `pytest tests/test_webhook_receiver.py tests/test_inbox_watcher.py -q`（CI 自动跑） |
 | 10 | GitGuardian pass | PR CI GitGuardian check pass |
+| 11 | watcher unit active | `systemctl status dc-inbox-watcher` |
+| 12 | inbox 新行 ≤5s 触发 | §3.8 步骤 4：手工投递 → journal 出现 `triggered: delivery=test-1`（≤5s） |
+| 13 | rotate timer 已启用 | `systemctl list-timers dc-inbox-rotate.timer`（下次 00:30） |
+| 14 | 端到端：PR → webhook → inbox → watcher → Prod Agent | 提一个测试 PR → GitHub Delivery 202 → watcher journal `triggered:` → Prod Agent 侧收到事件
 
 ## 5. 风险与回滚
 
@@ -199,9 +268,11 @@ curl -I https://hook.kjtang.cn/health
 | HMAC secret 泄漏 | secret 写 `/etc/dailycheck/webhook-secret`（600 root），不出现 prompt/git/log | GitHub repo webhook 设置里点「Redeliver」+ 重新生成 secret + 更新 systemd EnvironmentFile + 重启 receiver |
 | 旧 webhook 重投同一 delivery | 幂等按 delivery_id（receiver 200 duplicate） | 不需处理，receiver 自动忽略 |
 
-## 6. 监控（后续可加）
+## 6. 监控
 
-- Prometheus 暴露 `/metrics`：inbox size / 处理延迟 / 5xx 计数
-- systemd `WatchdogSec`：receiver 30s 内必须发一次心跳，超时重启
-- logrotate：`/var/log/dailycheck/webhook-receiver-*.log` 按天 rotate，保留 30 天
-- inbox rotate：cron 每天 0:00 把 processed > 7 天的 entry 移到 archive
+- **inbox rotate（已实装，#47）**：`dc-inbox-rotate.timer` 每日 00:30 归档 >7 天条目到 `inbox.archive.jsonl`
+- **watcher 触发失败**：`journalctl -u dc-inbox-watcher | grep WARNING` 非空即链路告警（脚本内退避重试中；30 分钟兜底轮询不变）
+- **inbox size 观察**：`curl -sS http://127.0.0.1:8443/health` 的 `inbox_size`（持续逼近 1000 = rotate 失效需排查）
+- 后续可加：Prometheus 暴露 `/metrics`：inbox size / 处理延迟 / 5xx 计数
+- 后续可加：systemd `WatchdogSec`：receiver 30s 内必须发一次心跳，超时重启
+- 后续可加：logrotate：`/var/log/dailycheck/webhook-receiver-*.log` 按天 rotate，保留 30 天

@@ -1,0 +1,43 @@
+# deploy/systemd/dc-inbox-rotate.service
+#
+# DailyCheck inbox 归档（Issue #47）：把 inbox.jsonl 中超过 7 天的旧行移到
+# inbox.archive.jsonl，让 inbox 行数回落（inbox 是反压闸门：行数 ≥ 1000 时
+# receiver 对 GitHub 返回 503，新 PR 通知会被拒）。
+#
+# 安装（owner / Prod Agent 手动）：
+#   1. cp deploy/systemd/dc-inbox-rotate.{service,timer} /etc/systemd/system/
+#   2. systemctl daemon-reload
+#   3. systemctl enable --now dc-inbox-rotate.timer
+#   4. 手动跑一次：systemctl start dc-inbox-rotate.service && journalctl -u dc-inbox-rotate
+#
+# 设计：oneshot + timer（每日 00:30，Persistent=true 补跑错过的窗口）；
+# 与 watcher / receiver 并发安全（rename+重建+收敛回填，见脚本 docstring）。
+
+[Unit]
+Description=DailyCheck inbox rotate (archive >7d entries, Issue #47)
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+WorkingDirectory=/root/DailyCheck
+Environment="PATH=/root/DailyCheck/.venv/bin:/usr/bin:/bin"
+
+ExecStart=/root/DailyCheck/.venv/bin/python \
+    /root/DailyCheck/scripts/prod_agent/inbox_rotate.py \
+    --inbox /var/lib/dailycheck-prod-agent/inbox.jsonl
+
+# 安全沙箱（与 dc-webhook-receiver.service 同规）
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dailycheck-prod-agent
+PrivateTmp=true
+ProtectHome=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

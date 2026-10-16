@@ -159,7 +159,7 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起�
 
 ### 3.5 PR Webhook 接收器（2026-10-15 实装）
 
-Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver` → `inbox.jsonl` → Prod Agent 订阅 inbox 跑 merge 决策**。秒级通知，替代 30 分钟轮询。
+Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver` → `inbox.jsonl` → `dc-inbox-watcher`（≤5s 触发）→ Prod Agent 入口 → 跑 merge 决策**。秒级通知，替代 30 分钟轮询。
 
 **组件**（`scripts/blue_green/webhook_receiver.py`，Flask 127.0.0.1:8443）：
 - **HMAC-SHA256 验签**（`X-Hub-Signature-256` + `WEBHOOK_SECRET` env）—— 拒伪 + 拒重放，constant-time 防时序攻击
@@ -180,7 +180,15 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 
 **测试**：`tests/test_webhook_receiver.py`（13 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 各自对应测试 FAIL）。
 
-**Prod Agent 集成**：Prod Agent 需改造为「订阅 `inbox.jsonl`（inotify 或 `tail -F`）→ 收到新条目立即跑 merge 决策 + 30 分钟兜底轮询 `gh pr list`（防 webhook 漏）」。这是 Prod Agent 端改造，不在 Dev 自动化范围。
+**Prod Agent 集成（2026-10-16 实装，Issue #47）**：`scripts/prod_agent/inbox_watcher.py` 常驻订阅 `inbox.jsonl`，新条目 **≤5s** 内触发 `--trigger-cmd`（事件 JSON 原样走 stdin；样例 `deploy/scripts/dc-notify-prod-agent.sh` 把事件投给 Prod Agent 入口，默认指向 Hermes webhook 订阅）。要点：
+
+- **tail 语义**（纯 stdlib、跨平台）：轮询 `stat(inode, size, mtime)` 检测变更（默认 0.5s 间隔），只处理以 `\n` 结尾的完整行（半行留待下轮）——不用 inotify（Linux-only）、不引三方库
+- **去重语义**：全文件扫描 + `handled_ids` 状态集合（原子写 `inbox_watcher_state.json`）—— 重启 / rotate 换 inode / 停机期间新增等任何时序下，每条 `delivery_id` 至多触发一次、未触发过的必然补触发
+- **机械过滤**（纵深防御）：仅 `repo_full_name == ericmr1981/DailyCheck` 且 action 属白名单的条目触发；draft 等业务语义交 Prod Agent 判定，本脚本不预判
+- **失败重试**：触发非 0 退出 / 超时 → 指数退避（1s→60s 封顶）+ WARNING 留痕，绝不静默丢弃；**30 分钟兜底轮询 `gh pr list` 仍保留**（防 webhook 漏投 / watcher 停机窗口）
+- **归档（防反压挂死）**：`scripts/prod_agent/inbox_rotate.py` + 每日 timer 把 >7 天旧行迁到 `inbox.archive.jsonl`（rename+重建+收敛回填，与 receiver 并发不丢行）—— inbox 是反压闸门（≥1000 行 receiver 返 503），只增不减会挂死新通知
+- **部署**：`deploy/systemd/dc-inbox-watcher.service`（Restart=always / 5s）+ `dc-inbox-rotate.{service,timer}`（每日 00:30）；手册见 `docs/2026-10-15-webhook-setup.md` §3.8
+- **测试**：`tests/test_inbox_watcher.py`（30 用例：完整行/半行/U+2028 不误切 / 过滤 / 去重（重启不重复、停机补触发）/ 失败退避 / rotate 七态 / 真实子进程 ≤5s 端到端 / 确定性「旧 fd 窗口」收敛回填；关键断言经变异验证真 FAIL —— 删去重 / 删半行等待 / 失败走成功分支 / 删尾部回填 / 边界反转各自对应测试 FAIL）
 
 ---
 

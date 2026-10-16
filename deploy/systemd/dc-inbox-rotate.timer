@@ -1,0 +1,15 @@
+# deploy/systemd/dc-inbox-rotate.timer
+#
+# DailyCheck inbox 归档定时器（Issue #47）：每日 00:30 触发一次 rotate。
+# Persistent=true：机器错过窗口（宕机/暂停）恢复后补跑一次。
+
+[Unit]
+Description=Daily inbox rotate timer (00:30, Issue #47)
+
+[Timer]
+OnCalendar=*-*-* 00:30:00
+Persistent=true
+Unit=dc-inbox-rotate.service
+
+[Install]
+WantedBy=timers.target
