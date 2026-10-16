@@ -13,6 +13,8 @@
 > **更新**：2026-10-16 首次部署完成后修正 —— ① 证书改**独立申请**（阿里云免费证书=单域名，不能给主证书加 SAN）；② 新增 **443 防火墙放行**前置与外部 vantage 复验；③ nginx 改**独立文件**部署；④ systemd `ProtectHome` 203/EXEC 踩坑记录。
 >
 > **更新**：2026-10-16 增补 **§3.10（CI 完成快通道）** —— webhook 补勾 "Check suites" 事件；`check_suite`（全绿）经同一 receiver → inbox → watcher 链路秒级唤醒 Prod Agent；新增 `dailycheck-ci` 订阅 + `webhook.py` / `scheduler.py` 两处 [SILENT] 抑制补丁（含「截断标记」容错，§3.8 步骤 2c）。
+>
+> **更新**：2026-10-16 深夜增补 **§3.11（审批跨会话修复）** —— 危险命令审批对 webhook 会话死锁的根治补丁（`gateway/run.py` + `tools/approval.py` 本地补丁）；修复后 Eric 在飞书回复 `/approve` 即可放行 Prod Agent 的危险命令。
 
 ## 1. 架构
 
@@ -398,6 +400,37 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 - `conclusion=failure` 的 suite **不转发**（无 merge 动作可做；失败由 Dev 侧修复，兜底轮询照常看板）。
 - [SILENT] 抑制依赖两处本地补丁（§3.8 步骤 2c：gateway `webhook.py` + cron `scheduler.py`，均含「标记丢右括号」截断容错）；补丁缺失时会往飞书发字面 "[SILENT]" 消息——见 §5 风险表。
 
+### 3.11 审批跨会话修复（2026-10-16 深夜，本地补丁）
+
+> **背景**：Prod Agent 由 webhook 会话驱动。危险命令（如 `git reset --hard`）触发 Hermes 审批门后，审批请求虽投递到飞书，但 `/approve` 按「发起会话」解析 → **webhook 会话的待审批永远无人可批** → 每次等满 5 分钟超时 BLOCKED（skill Pitfall 17 的根因，表现为「永久 block」）。
+>
+> **修复**：为 `/approve` / `/deny` 增加**跨会话 fallback** —— 自身会话无待审批时，自动解析**其它会话中最老的待审批**（自身会话优先，正常会话原语义不变）→ Eric 在飞书直接回复 `/approve` 即可放行 webhook 会话的危险命令。
+
+**改动文件**（均本地补丁，Hermes 重装/升级后需重打；旧版备份后缀 `*.bak-20261016-crosssession`）：
+
+| 文件 | 改动 |
+|------|------|
+| `tools/approval.py` | `_ApprovalEntry` 增 `created` 时间戳（最老优先排序用）；新增 `oldest_blocking_session()` |
+| `gateway/run.py` | `_handle_approve_command` / `_handle_deny_command` 增跨会话 fallback + 提示文案（含 `cross-session:` 日志行） |
+
+**重打方式**（升级后）：
+
+```
+python3 /root/hermes-agent/local-patches/2026-10-16-crosssession-approval/apply.py
+# 幂等保护：已打过会直接报错退出，不重复修改
+```
+
+**验证判据**：
+
+```
+grep -E "cross-session" /root/.hermes/logs/agent.log   # 发生过跨会话解析时出现（User approved/denied ... (cross-session: ...)）
+```
+
+**注意**：
+
+- 跨会话 fallback 仅在本会话无待审批时生效——正常飞书会话（含飞书审批按钮）行为完全不变。
+- 无人值守窗口（5 分钟无人回复）仍会 BLOCKED；此时按 skill Pitfall 17 的 `git stash`（不带 `-u`）+ `git pull --ff-only` 绕行。
+
 ## 4. 验收 checklist
 
 | # | 项 | 命令 / 验证 |
@@ -422,6 +455,7 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 | 18 | check_suite 快通道落盘 | 真 PR CI 全绿后 inbox 出现 `"event":"check_suite"` 行 / GitHub delivery 202（§3.10） |
 | 19 | CI 快通道秒级 merge | 全绿 suite 完成 → merge 时间差 < 1 分钟（§3.10 验证第 4 条） |
 | 20 | [SILENT] 抑制生效 | 中间态判定不产生飞书消息；`grep 'Suppressed delivery' /path/agent.log` 或日志无声即成功 |
+| 21 | 审批跨会话放行（§3.11） | webhook 会话触发危险命令 → 飞书回复 `/approve` → `agent.log` 出现 `cross-session` 行 + 该命令解冻执行 |
 
 **2026-10-16 首次部署实测结果**（全链路已通，供下次部署对照）：
 
@@ -444,6 +478,14 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 - 修复 [SILENT] 字面泄漏（16:30–19:01 兜底轮询 5 次静默 tick 泄漏到飞书）：根因 = 模型间歇输出**截断标记** `[SILENT`（丢右括号）→ 严格子串匹配漏过；按步骤 2c 打两处截断容错补丁后复测通过
 - GitHub hook Events 已含 `check_suite`；真 PR 的 CI 全绿触发即首验（见 §4 第 18/19 项）
 
+**2026-10-16 深夜 §3.11 部署实测（第四批次：审批跨会话修复）**：
+
+- 复现（补丁前）：webhook 会话触发 `git reset --hard` 进审批 → 另一会话发 `/approve` → `No pending command to approve.`（22:56 复现死锁，待审批等满 5 分钟超时）
+- 补丁后（approve）：审批请求 23:00:42 发出 → 另一会话 `/approve` 23:00:43 跨会话命中（`cross-session:` 日志行）→ 命令 23:00:48 解冻执行成功（实测约 1.6s 解冻）
+- 补丁后（deny）：`/deny` 跨会话命中 → agent 收到拦截、命令未执行（23:01）
+- 负例（回归）：无待审批时 `/approve` → `No pending command to approve.`（文案不变）
+- 附带：skill `dailycheck-prod-agent` Pitfall 17 已同步更新（不再描述为「永久 block」）
+
 ## 5. 风险与回滚
 
 | 风险 | 缓解 | 回滚 |
@@ -459,6 +501,7 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 | **watcher 触发失败后无新事件 → 退避重试不发动**（Issue #51，实测延迟 1h） | §3.9 兜底轮询 30 分钟保底；journal WARNING 可见 | 修复见 Issue #51（主循环加 pending-retry 条件，pending-retry PR） |
 | **Hermes gateway 重启窗口**（订阅热加载前）事件落 inbox 但未触发 | watcher 状态文件保留未处理条目（重启后补触发）+ §3.9 兜底轮询 | 无需处理；确认 `ss -tlnp \| grep 8644` 恢复 LISTEN |
 | **[SILENT] 补丁被 Hermes 升级/重装冲掉**（症状：中间态判定开始往飞书发字面 `[SILENT]` / `[SILENT` 消息） | §3.8 步骤 2c 重打两处补丁；`grep -n '_silent_check' /root/hermes-agent/gateway/platforms/webhook.py /root/hermes-agent/cron/scheduler.py` 核对 | 无需回滚；补丁缺失只影响静默语义，事件不丢（兜底轮询照常） |
+| **审批跨会话补丁被 Hermes 升级/重装冲掉**（症状：Prod Agent 危险命令重新死锁——每次超时 `BLOCKED: Command timed out`） | §3.11 重打：`python3 /root/hermes-agent/local-patches/2026-10-16-crosssession-approval/apply.py`；判据 `grep -c oldest_blocking_session /root/hermes-agent/tools/approval.py`（应 ≥1） | 无需回滚；补丁缺失只影响 webhook 会话审批（飞书原生会话审批按钮不受影响） |
 
 ## 6. 监控
 
