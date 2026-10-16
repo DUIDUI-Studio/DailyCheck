@@ -1,0 +1,73 @@
+# deploy/systemd/dc-inbox-watcher.service
+#
+# DailyCheck inbox watcher（Issue #47）：订阅 inbox.jsonl，新条目 ≤5s 触发
+# Prod Agent 的 merge 决策入口。与 dc-webhook-receiver.service 配对：
+# receiver 写 inbox（GitHub webhook → inbox.jsonl），watcher 读 inbox（唤醒）。
+#
+# 安装（owner / Prod Agent 手动）：
+#   1. cp deploy/scripts/dc-notify-prod-agent.sh /usr/local/bin/dc-notify-prod-agent
+#      chmod 755 /usr/local/bin/dc-notify-prod-agent
+#      （按 Prod Agent 侧入口改脚本实现；默认指向 Hermes webhook 订阅）
+#   2. cp deploy/systemd/dc-inbox-watcher.service /etc/systemd/system/
+#   3. systemctl daemon-reload
+#   4. systemctl enable --now dc-inbox-watcher.service
+#   5. journalctl -u dc-inbox-watcher -f        # 跟日志
+#   6. 手工验证触发链路：
+#      echo '{"delivery_id":"t1","action":"opened","repo_full_name":"ericmr1981/DailyCheck","pr_number":1,"pr_head_sha":"deadbeef","received_at_ms":0}' \
+#        >> /var/lib/dailycheck-prod-agent/inbox.jsonl
+#      # journal 应出现 [inbox_watcher] triggered: ... ；Prod Agent 侧应收到事件
+#
+# 设计：
+#   - 单实例（inbox append-only，无需并发）
+#   - Restart=always + RestartSec=5 是「watcher 挂 → 5s 拉起」验收的兜底
+#   - 触发失败由脚本内指数退避重试（不依赖 systemd 重启搬救兵）
+#   - 触发命令是子进程，同样受本 unit 沙箱约束：若 Prod Agent 入口需要
+#     额外写路径，在 ReadWritePaths 追加（默认为 /root/.hermes）
+
+[Unit]
+Description=DailyCheck inbox watcher (prod-agent 秒级 PR 通知, Issue #47)
+After=network.target dc-webhook-receiver.service
+Wants=dc-webhook-receiver.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+WorkingDirectory=/root/DailyCheck
+Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/DailyCheck/.venv/bin/python \
+    /root/DailyCheck/scripts/prod_agent/inbox_watcher.py \
+    --inbox /var/lib/dailycheck-prod-agent/inbox.jsonl \
+    --state-file /var/lib/dailycheck-prod-agent/inbox_watcher_state.json \
+    --trigger-cmd /usr/local/bin/dc-notify-prod-agent
+
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+KillSignal=SIGTERM
+
+# 资源限制（watcher 极轻量；触发命令子进程也在配额内）
+MemoryMax=256M
+TasksMax=64
+
+# 安全沙箱（与 dc-webhook-receiver.service 同规）
+NoNewPrivileges=true
+ProtectSystem=strict
+# /var/lib/dailycheck-prod-agent: inbox + state 读写
+# /root/.hermes: 默认触发命令（Hermes webhook test）的 home 写路径
+ReadWritePaths=/var/lib/dailycheck-prod-agent /root/.hermes
+PrivateTmp=true
+ProtectHome=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
