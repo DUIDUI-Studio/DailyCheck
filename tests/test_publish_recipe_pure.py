@@ -399,13 +399,13 @@ def test_snapshot_recipe_picks_up_source_type_for_polymorphic(tmp_path, monkeypa
     conn.close()
 
 
-def test_apply_polymorphic_skips_ic_recipe_lines(tmp_path, monkeypatch):
-    """_apply_recipe_snapshot_to_warehouse must skip polymorphic ic_recipe
-    lines in the items loop (the recipe head still gets inserted).
+def test_apply_polymorphic_recreates_referenced_ic_recipe(tmp_path, monkeypatch):
+    """D2（2026-10-16）：_apply_recipe_snapshot_to_warehouse 对多态
+    ic_recipe 行不再 skip —— 用 snapshot 里挂的 referenced_ic_snapshots
+    在目标仓递归重建被引用基料，并写入完整引用行。
 
-    Regression: previously, polymorphic lines crashed with
-    'NOT NULL constraint failed: categories.name' because the
-    all-NULL item snapshot was passed to apply_item_to_warehouse.
+    历史：更早版本直接崩（NOT NULL categories.name）；上一版 skip 行
+    导致门店出品配方缺基料、成本全错。
     """
     import db as db_module
     import config as config_module
@@ -461,17 +461,26 @@ def test_apply_polymorphic_skips_ic_recipe_lines(tmp_path, monkeypatch):
     snap = snapshot_recipe(rd_conn, "recipe", outer)
     rd_conn.close()
 
-    # Apply should not raise (would have raised NOT NULL constraint failed
-    # before the fix). Recipe head inserts, BOM insert skipped for ic_recipe.
+    # Apply：多态行递归重建被引用 ic_recipe + 写入引用行。
     _apply_recipe_snapshot_to_warehouse(m, "wh_001", snap)
 
     wh_conn = sqlite3.connect(wh)
     wh_conn.row_factory = sqlite3.Row
     head = wh_conn.execute("SELECT name FROM recipes WHERE name='polymorphic'").fetchone()
     assert head is not None, "recipe head should be inserted"
-    # BOM row should NOT be inserted (polymorphic line skipped).
+    # 目标仓递归重建了被引用的「inner」基料（1 条 BOM 行）
+    inner_row = wh_conn.execute(
+        "SELECT id FROM ic_recipes WHERE name='inner'").fetchone()
+    assert inner_row is not None, "referenced ic_recipe should be recreated"
+    inner_lines = wh_conn.execute(
+        "SELECT COUNT(*) AS c FROM ic_recipe_items WHERE ic_recipe_id=?",
+        (inner_row["id"],)).fetchone()["c"]
+    assert inner_lines == 1
+    # 引用行完整写入，指向重建的基料
     lines = wh_conn.execute("SELECT * FROM recipe_items").fetchall()
-    assert len(lines) == 0, f"expected 0 recipe_items, got {len(lines)}"
+    assert len(lines) == 1, f"expected 1 recipe_items, got {len(lines)}"
+    assert lines[0]["source_type"] == "ic_recipe"
+    assert int(lines[0]["ic_recipe_id"]) == int(inner_row["id"])
     wh_conn.close()
     m.close()
 
@@ -496,8 +505,9 @@ def test_list_unmanaged_bom_items_flags_null_canonical(tmp_path):
     rd.close()
 
 
-def test_list_unmanaged_bom_items_skips_polymorphic_ic_recipe(tmp_path):
-    """recipe 类型里 source_type='ic_recipe' 的行引用的是别的配方，不参与校验。"""
+def test_list_unmanaged_bom_items_recurses_into_referenced_ic_recipe(tmp_path):
+    """D2：source_type='ic_recipe' 的行本身不参与品项校验，但其引用的
+    冰激凌配方的 BOM 品项会被递归校验（发布时需要在目标仓重建基料）。"""
     from blueprints.publish_recipe_pure import list_unmanaged_bom_items
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     ts = "2026-10-09 12:00:00"
@@ -511,13 +521,20 @@ def test_list_unmanaged_bom_items_skips_polymorphic_ic_recipe(tmp_path):
         "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
         "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)", (outer, ic))
     rd.commit()
-    # 纯多态行 → 无需纳管
+    # 被引用 ic 的 BOM（SKU-MILK/SKU-SUGAR）未纳管 → 递归报出
+    rows = list_unmanaged_bom_items(rd, "recipe", outer)
+    assert {r["sku"] for r in rows} == {"SKU-MILK", "SKU-SUGAR"}
+
+    # ic BOM 纳管后 → 纯多态行不再报
+    rd.execute("UPDATE items SET canonical_id = id WHERE id IN (?, ?)", (milk, sugar))
+    rd.commit()
     assert list_unmanaged_bom_items(rd, "recipe", outer) == []
 
     # 混一条未纳管的 item 行 → 只报这条
     rd.execute(
         "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
         "qty_per_unit) VALUES (?, 'item', ?, NULL, 1.0)", (outer, milk))
+    rd.execute("UPDATE items SET canonical_id = NULL WHERE id = ?", (milk,))
     rd.commit()
     rows = list_unmanaged_bom_items(rd, "recipe", outer)
     assert [r["sku"] for r in rows] == ["SKU-MILK"]

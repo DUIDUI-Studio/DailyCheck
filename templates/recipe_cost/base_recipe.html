@@ -1,4 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
+<nav class="recipe-tabs">
+  <a href="{{ url_for('recipe_cost.overview') }}"
+     class="{% if request.endpoint == 'recipe_cost.overview' %}is-active{% endif %}">成本总览</a>
+  <a href="{{ url_for('recipe_cost.ic_recipes_list') }}"
+     class="{% if request.endpoint in ('recipe_cost.ic_recipes_list', 'recipe_cost.ic_recipe_new', 'recipe_cost.ic_recipe_edit') %}is-active{% endif %}">冰激凌配方</a>
+  <a href="{{ url_for('recipe_cost.recipes_list') }}"
+     class="{% if request.endpoint in ('recipe_cost.recipes_list', 'recipe_cost.recipe_new', 'recipe_cost.recipe_edit') %}is-active{% endif %}">出品配方</a>
+  {% if g.user and g.user['is_admin'] %}
+  <a href="{{ url_for('recipe_cost.import_index') }}"
+     class="{% if request.endpoint and request.endpoint.startswith('recipe_cost.import') %}is-active{% endif %}">门店配方导入</a>
+  {% endif %}
+</nav>
 {% block recipe_content %}{% endblock %}
 {% endblock %}

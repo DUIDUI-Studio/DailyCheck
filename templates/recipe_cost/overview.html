@@ -1,0 +1,84 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>全品牌产品成本总览</h2>
+  <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
+  <a class="btn" href="{{ url_for('recipe_cost.overview_export_csv', kind=kind, sort=sort, dir=dir) }}">导出 CSV</a>
+</div>
+
+<div class="ov-kpis">
+  <div class="kpi-card"><span>产品总数</span><strong>{{ summary['total'] }}</strong>
+    <p>冰激凌 {{ summary['ic_count'] }} · 出品 {{ summary['recipe_count'] }}</p></div>
+  <div class="kpi-card {% if summary['unpriced'] %}is-warn{% endif %}"><span>未定价</span><strong>{{ summary['unpriced'] }}</strong>
+    <p>售价为 0，无法算零售毛利</p></div>
+  <div class="kpi-card {% if summary['neg_profit'] %}is-bad{% endif %}"><span>供货负利润</span><strong>{{ summary['neg_profit'] }}</strong>
+    <p>销售成本 &lt; 采购成本（倒挂）</p></div>
+</div>
+
+<form method="get" class="ov-filter">
+  <label><span>类型</span>
+    <select name="kind" onchange="this.form.submit()">
+      <option value="all" {% if kind=='all' %}selected{% endif %}>全部</option>
+      <option value="ic_recipe" {% if kind=='ic_recipe' %}selected{% endif %}>冰激凌配方（基料）</option>
+      <option value="recipe" {% if kind=='recipe' %}selected{% endif %}>出品配方（售卖分量）</option>
+    </select>
+  </label>
+  <input type="hidden" name="sort" value="{{ sort }}" />
+  <input type="hidden" name="dir" value="{{ dir }}" />
+</form>
+
+{% macro sort_link(col, label) -%}
+  {%- set new_dir = 'asc' if (sort == col and dir == 'desc') else 'desc' -%}
+  <a href="{{ url_for('recipe_cost.overview', kind=kind, sort=col, dir=new_dir) }}"
+     class="{% if sort == col %}is-sorted{% endif %}">{{ label }}{% if sort == col %}{{ ' ↑' if dir == 'asc' else ' ↓' }}{% endif %}</a>
+{%- endmacro %}
+
+<div class="table-scroll">
+<table class="ov-table">
+  <thead>
+    <tr>
+      <th>类型</th>
+      <th>{{ sort_link('name', '名称') }}</th>
+      <th class="num">{{ sort_link('output_qty', '出品量(g)') }}</th>
+      <th class="num">{{ sort_link('cost_purchase', '采购成本') }}</th>
+      <th class="num">{{ sort_link('cost_selling', '销售成本') }}</th>
+      <th class="num">{{ sort_link('sale_price', '售价') }}</th>
+      <th class="num">{{ sort_link('margin_purchase', '零售毛利率') }}</th>
+      <th class="num">{{ sort_link('margin_supply', '供货毛利率') }}</th>
+      <th class="num">{{ sort_link('profit', '供货利润') }}</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr class="{% if r['profit'] < 0 %}ov-row-neg{% elif not r['priced'] %}ov-row-unpriced{% endif %}">
+      <td><span class="ov-kind ov-kind--{{ r['kind'] }}">{{ '基料' if r['kind']=='ic_recipe' else '出品' }}</span></td>
+      <td>
+        {% if r['kind'] == 'ic_recipe' %}
+        <a href="{{ url_for('recipe_cost.ic_recipe_edit', ic_recipe_id=r['id']) }}">{{ r['name'] }}</a>
+        {% else %}
+        <a href="{{ url_for('recipe_cost.recipe_edit', recipe_id=r['id']) }}">{{ r['name'] }}</a>
+        {% endif %}
+      </td>
+      <td class="num">{{ r['output_qty'] | fmt_qty }}</td>
+      <td class="num">¥{{ r['cost_purchase'] | fmt_money }}</td>
+      <td class="num">¥{{ r['cost_selling'] | fmt_money }}</td>
+      <td class="num">{% if r['priced'] %}¥{{ r['sale_price'] | fmt_money }}{% else %}<span class="ov-tag-unpriced">未定价</span>{% endif %}</td>
+      <td class="num {% if r['margin_purchase'] is not none and r['margin_purchase'] < 0 %}is-neg{% endif %}">
+        {{ ('%.1f%%' | format(r['margin_purchase'] * 100)) if r['margin_purchase'] is not none else '—' }}</td>
+      <td class="num {% if r['margin_supply'] is not none and r['margin_supply'] < 0 %}is-neg{% endif %}">
+        {{ ('%.1f%%' | format(r['margin_supply'] * 100)) if r['margin_supply'] is not none else '—' }}</td>
+      <td class="num {% if r['profit'] < 0 %}is-neg{% endif %}">¥{{ r['profit'] | fmt_money }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted">暂无配方数据。可先新建冰激凌配方，或用「门店配方导入」把门店存量配方同步进来。</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<p class="muted ov-legend">
+  口径说明：<strong>采购成本</strong> = Σ 原料按采购单价；<strong>销售成本</strong> = Σ 原料按销售单价（供货给门店的结算口径）；
+  <strong>零售毛利率</strong> = (售价 − 采购成本) / 售价；<strong>供货毛利率</strong> = (销售成本 − 采购成本) / 销售成本；
+  <strong>供货利润</strong> = 销售成本 − 采购成本。
+</p>
+{% endblock %}

@@ -73,9 +73,16 @@ def snapshot_recipe(conn, recipe_type: str, recipe_id: int) -> dict:
     # source_type column for ic_recipe so the SQL is valid against either
     # table schema.
     if recipe_type == "recipe":
-        select_cols = "t.id AS line_id, t.qty_per_unit, t.source_type, t.item_id, t.ic_recipe_id"
+        select_cols = (
+            "t.id AS line_id, t.qty_per_unit, t.source_type, t.item_id, "
+            "t.ic_recipe_id, ic.name AS ic_recipe_name"
+        )
     else:
         select_cols = "t.id AS line_id, t.qty_per_unit, t.item_id"
+    ic_join = (
+        "LEFT JOIN ic_recipes ic ON ic.id = t.ic_recipe_id"
+        if recipe_type == "recipe" else ""
+    )
     lines = conn.execute(
         f"""
         SELECT {select_cols},
@@ -86,11 +93,23 @@ def snapshot_recipe(conn, recipe_type: str, recipe_id: int) -> dict:
         FROM {bom_table} t
         LEFT JOIN items i ON i.id = t.item_id
         LEFT JOIN categories c ON c.id = i.category_id
+        {ic_join}
         WHERE t.{bom_id_col} = ?
         ORDER BY t.id
         """,
         (recipe_id,),
     ).fetchall()
+
+    # D2（2026-10-16）：多态 recipe 引用了冰激凌配方时，把被引用
+    # ic_recipe 的完整快照挂进来，发布到目标仓时可递归重建
+    # （目标仓已有同名配方则复用，不覆盖）。
+    referenced: dict[str, dict] = {}
+    if recipe_type == "recipe":
+        for r in lines:
+            if r["source_type"] == "ic_recipe" and r["ic_recipe_id"] is not None:
+                sub = snapshot_recipe(conn, "ic_recipe", int(r["ic_recipe_id"]))
+                if sub is not None:
+                    referenced[str(int(r["ic_recipe_id"]))] = sub
 
     return _serialise({
         "recipe_type": recipe_type,
@@ -100,6 +119,7 @@ def snapshot_recipe(conn, recipe_type: str, recipe_id: int) -> dict:
         # Only meaningful for polymorphic 'recipe' type; 'ic_recipe'
         # always uses source_type='item' implicitly.
         "has_polymorphic_lines": any("source_type" in r.keys() for r in lines),
+        "referenced_ic_snapshots": referenced,
     })
 
 
@@ -130,7 +150,33 @@ def list_unmanaged_bom_items(conn, recipe_type: str, recipe_id: int) -> list[dic
             ORDER BY t.id""",
         (recipe_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+
+    # D2：多态出品配方引用的冰激凌配方，其 BOM 品项同样必须已纳管，
+    # 否则发布到目标仓时 _resolve_target_item_id 会失败。递归校验一层
+    # （ic_recipe 的 BOM 只可能是 item，不会无限递归）。
+    # 按 (sku, name) 去重 —— 同一原料可能同时出现在多态行本身和
+    # 被引用基料的 BOM 里，报两遍没有意义。
+    if recipe_type == "recipe":
+        seen = {
+            (r.get("sku"), r.get("name")) for r in out
+        }
+        ic_rows = conn.execute(
+            """SELECT DISTINCT t.ic_recipe_id
+               FROM recipe_items t
+               WHERE t.recipe_id = ? AND t.source_type = 'ic_recipe'
+                 AND t.ic_recipe_id IS NOT NULL""",
+            (recipe_id,),
+        ).fetchall()
+        for ic_row in ic_rows:
+            for sub in list_unmanaged_bom_items(
+                conn, "ic_recipe", int(ic_row["ic_recipe_id"])
+            ):
+                key = (sub.get("sku"), sub.get("name"))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(sub)
+    return out
 
 
 def _next_version(conn, recipe_type: str, recipe_id: int) -> int:
