@@ -1,0 +1,88 @@
+# deploy/systemd/dc-dashboard-generator.service
+#
+# DailyCheck dashboard 触发器：订阅 inbox.jsonl，新条目 ≤5s 触发
+# `python -m scripts.dailycheck_dashboard render`，与 dc-inbox-watcher
+# 完全独立、互不干扰（各自一份 handled_ids state）。
+#
+# 与 dc-inbox-watcher 关键差异：
+#   - 触发命令指向 `python -m scripts.dailycheck_dashboard render`（不是 Prod Agent）
+#   - 写路径多一项：/var/lib/dailycheck-dashboard（db + HTML 落点）
+#   - 触发超时 60s（dashboard 渲染 + gh 拉数据要 5-10s，留余量）
+#   - 退避 2s→120s（render 偶尔慢，宽容一点；dc-inbox-watcher 是 1s→60s）
+#
+# 安装（owner 手动）：
+#   1. mkdir -p /var/lib/dailycheck-dashboard/{snapshots}
+#      chown -R root:root /var/lib/dailycheck-dashboard
+#   2. cp deploy/scripts/dailycheck_dashboard_on_pr.py /usr/local/bin/dc-dashboard-trigger
+#      chmod 755 /usr/local/bin/dc-dashboard-trigger
+#   3. cp deploy/systemd/dc-dashboard-generator.service /etc/systemd/system/
+#   4. systemctl daemon-reload
+#   5. systemctl enable --now dc-dashboard-generator.service
+#   6. journalctl -u dc-dashboard-generator -f        # 跟日志
+#   7. 手工验证触发链路：
+#      echo '{"delivery_id":"t-dash-1","action":"opened","repo_full_name":"ericmr1981/DailyCheck","pr_number":1,"pr_head_sha":"deadbeef","received_at_ms":0}' \
+#        >> /var/lib/dailycheck-prod-agent/inbox.jsonl
+#      # journal 应出现 [dashboard_trigger] triggered: ... ;
+#      # /var/lib/dailycheck-dashboard/latest.html 与 snapshots/<id>.html 应被刷新
+#
+# 设计：
+#   - 单实例（inbox append-only，无需并发）
+#   - Restart=always + RestartSec=5 是「trigger 挂 → 5s 拉起」验收的兜底
+#   - 触发失败由脚本内指数退避重试（不依赖 systemd 重启搬救兵）
+#   - 触发命令是子进程，同样受本 unit 沙箱约束：脚本/venv 在 /root/DailyCheck 下，
+#     ProtectHome 必须 ≤ read-only（true → 203/EXEC）
+
+[Unit]
+Description=DailyCheck dashboard generator (PR webhook 触发, 渲染 HTML + 落 SQLite 快照)
+After=network.target dc-webhook-receiver.service
+Wants=dc-webhook-receiver.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+WorkingDirectory=/root/DailyCheck
+Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/DailyCheck/.venv/bin/python \
+    /usr/local/bin/dc-dashboard-trigger \
+    --inbox /var/lib/dailycheck-prod-agent/inbox.jsonl \
+    --state-file /var/lib/dailycheck-dashboard/dashboard_trigger_state.json \
+    --repo-dir /root/DailyCheck \
+    --db /var/lib/dailycheck-dashboard/dashboard.db \
+    --html-dir /var/lib/dailycheck-dashboard/snapshots \
+    --html-latest /var/lib/dailycheck-dashboard/latest.html \
+    --trigger-cmd '/root/DailyCheck/.venv/bin/python -m scripts.dailycheck_dashboard render'
+
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+KillSignal=SIGTERM
+
+# 资源限制（trigger 极轻量；dashboard render 子进程也在配额内）
+MemoryMax=512M
+TasksMax=64
+
+# 安全沙箱（与 dc-inbox-watcher.service 同规）
+# ⚠️ 脚本/venv 在 /root/DailyCheck 下：ProtectHome 必须 ≤ read-only（true → 203/EXEC）
+#    /var/lib/dailycheck-dashboard + /var/lib/dailycheck-prod-agent 的写权限
+#    由 ReadWritePaths 在只读 home 上重新授予
+NoNewPrivileges=true
+ProtectSystem=strict
+# /var/lib/dailycheck-prod-agent: inbox 读
+# /var/lib/dailycheck-dashboard: db + HTML 快照 + trigger state 写
+ReadWritePaths=/var/lib/dailycheck-dashboard /var/lib/dailycheck-prod-agent
+PrivateTmp=true
+ProtectHome=read-only
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

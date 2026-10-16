@@ -56,3 +56,9 @@ forecast_lock_failures.txt
 
 # Claude/agent worktrees 含嵌套 .git，绝不能入索引（gitlink 会让 Actions checkout fatal）
 .claude/worktrees/
+
+# Dashboard 产物（scripts/dailycheck_dashboard/ 出活文件，详见 ARCHITECTURE.md §3.6）
+reports/dashboard.html
+reports/.dashboard/*.db
+reports/.dashboard/*.db-shm
+reports/.dashboard/*.db-wal
