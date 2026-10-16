@@ -59,6 +59,8 @@ forecast_lock_failures.txt
 
 # Dashboard 产物（scripts/dailycheck_dashboard/ 出活文件，详见 ARCHITECTURE.md §3.6）
 reports/dashboard.html
+# 报告 HTML 视图产物（由 scripts/agent_framework/report_html.py 生成；md 原件为准）
+reports/**/*.html
 reports/.dashboard/*.db
 reports/.dashboard/*.db-shm
 reports/.dashboard/*.db-wal
