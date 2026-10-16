@@ -5,33 +5,49 @@ import json
 import logging
 
 from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.types import TextContent, Tool
+
+from mcp_server.infra.errors import McpError
 from mcp_server.protocol.tools import get_tools
-from mcp_server.protocol.tools.inventory import (
-    items_list_impl,
-    items_detail_impl,
-    movements_list_impl,
-    warehouse_list_impl,
+from mcp_server.protocol.tools.canonical import (
+    canonical_categories_impl,
+    canonical_claim_impl,
+    canonical_conflicts_impl,
+    canonical_create_impl,
+    canonical_detail_impl,
+    canonical_fanout_event_impl,
+    canonical_fanout_impl,
+    canonical_fanout_targets_impl,
+    canonical_list_impl,
+    canonical_resolve_conflict_impl,
+    canonical_set_binding_active_impl,
+    canonical_unclaim_impl,
+    canonical_update_impl,
 )
+from mcp_server.protocol.tools.consumption import (
+    item_consumption_impl,
+    warehouse_consumption_impl,
+)
+from mcp_server.protocol.tools.forecast import item_forecast_impl
 from mcp_server.protocol.tools.inbound import (
     restock_create_impl,
     restock_list_impl,
 )
-from mcp_server.protocol.tools.forecast import item_forecast_impl
-from mcp_server.protocol.tools.procurement import (
-    procurement_store_impl,
-    procurement_hub_impl,
+from mcp_server.protocol.tools.inventory import (
+    items_detail_impl,
+    items_list_impl,
+    movements_list_impl,
+    warehouse_list_impl,
 )
 from mcp_server.protocol.tools.outbound import (
     outbound_create_impl,
     outbound_list_impl,
     outbound_rollback_impl,
 )
-from mcp_server.protocol.tools.consumption import (
-    warehouse_consumption_impl,
-    item_consumption_impl,
+from mcp_server.protocol.tools.procurement import (
+    procurement_hub_impl,
+    procurement_store_impl,
 )
-from mcp_server.infra.errors import McpError
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +66,19 @@ _tool_map = {
     "outbound_rollback": outbound_rollback_impl,
     "warehouse_consumption": warehouse_consumption_impl,
     "item_consumption": item_consumption_impl,
+    "canonical_list": canonical_list_impl,
+    "canonical_detail": canonical_detail_impl,
+    "canonical_categories": canonical_categories_impl,
+    "canonical_fanout_targets": canonical_fanout_targets_impl,
+    "canonical_conflicts": canonical_conflicts_impl,
+    "canonical_fanout_event": canonical_fanout_event_impl,
+    "canonical_create": canonical_create_impl,
+    "canonical_update": canonical_update_impl,
+    "canonical_claim": canonical_claim_impl,
+    "canonical_unclaim": canonical_unclaim_impl,
+    "canonical_fanout": canonical_fanout_impl,
+    "canonical_resolve_conflict": canonical_resolve_conflict_impl,
+    "canonical_set_binding_active": canonical_set_binding_active_impl,
 }
 
 
