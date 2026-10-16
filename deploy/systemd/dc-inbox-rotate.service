@@ -29,11 +29,12 @@ ExecStart=/root/DailyCheck/.venv/bin/python \
     --inbox /var/lib/dailycheck-prod-agent/inbox.jsonl
 
 # 安全沙箱（与 dc-webhook-receiver.service 同规）
+# ⚠️ 脚本/venv 在 /root/DailyCheck 下：ProtectHome 必须 ≤ read-only（true → 203/EXEC）
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/dailycheck-prod-agent
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 RestrictRealtime=true

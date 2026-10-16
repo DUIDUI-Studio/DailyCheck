@@ -169,14 +169,15 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 - **inbox 落盘**：每行 JSON，append-only，含 `delivery_id / event / action / pr_number / pr_title / pr_head_sha / pr_base_ref / pr_author / repo_full_name / received_at_ms`
 
 **部署**（owner / Prod Agent 手动，不进 Dev 自动化）：
+- **前置：443 入站必须放行**（2026-10-16 实测踩坑）——残留 ufw 链 + `INPUT` policy DROP 布局下，`ufw-user-input` 须含 `tcp dpt:443 ACCEPT` 且 `/etc/iptables/rules.v4` 同步补行；**本机 `curl` 走 `lo` 接口被直通——200 不能证明外网可达**，必须外部 vantage 复验（详见手册 §2/§4）
 - DNS：`hook.kjtang.cn` A 记录 → 112.124.18.246（与主站同 IP）
-- 证书：阿里云 DV 重签加 SAN `hook.kjtang.cn`（替换 `/etc/nginx/ssl/kjtang.cn.{pem,key}`）
+- 证书：hook **独立**阿里云免费 DV 证书（单域名，`/etc/nginx/ssl/hook.kjtang.cn.{pem,key}`，90 天轮换）——免费证书不能给主证书加 SAN，主站证书不动
 - systemd：`deploy/systemd/dc-webhook-receiver.service`（监听 127.0.0.1:8443，单 worker，gunicorn，Restart=always 5s）
-- nginx：`deploy/nginx/hook.kjtang.cn.snippet.conf` 追加到 `/etc/nginx/sites-enabled/dailycheck` 末尾（443 TLS 终结 + proxy_pass，limit_req 30r/s 防滥刷）
+- nginx：`deploy/nginx/hook.kjtang.cn.conf` 部署为**独立文件** `/etc/nginx/sites-enabled/hook.kjtang.cn`（与蓝绿 `switch.sh` 解耦：布局守卫只检查 dailycheck 文件；443 TLS 终结 + proxy_pass，limit_req 30r/s 防滥刷；`limit_req_zone` 只能放 http 上下文，勿放 `server{}` 内）
 - WEBHOOK_SECRET：32 字节强密码，写 `/etc/dailycheck/webhook-secret`（600 root），**不出现 git 仓库 / 文档 / prompt**（仅 systemd unit `EnvironmentFile=` 引用 + GitHub repo webhook 设置）
 - GitHub repo：Settings → Webhooks → Add，URL `https://hook.kjtang.cn/webhook`，Secret 同上，Events **只勾 "Pull requests"**
 
-**生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（30-45 分钟手动部署；DNS / 证书重签 / systemd / nginx reload / GitHub 配 webhook 五步 + 端到端验证）。
+**生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（50-70 分钟手动部署；DNS / **443 放行核验** / 申请 hook 独立证书 / systemd / nginx reload / GitHub 配 webhook + 端到端验证）。
 
 **测试**：`tests/test_webhook_receiver.py`（13 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 各自对应测试 FAIL）。
 

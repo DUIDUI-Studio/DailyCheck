@@ -17,9 +17,10 @@
 #
 # 部署（详见 docs/2026-10-15-webhook-setup.md）：
 #   - systemd: deploy/systemd/dc-webhook-receiver.service
-#   - nginx 片段: deploy/nginx/hook.kjtang.cn.snippet.conf
+#   - nginx: deploy/nginx/hook.kjtang.cn.conf（独立文件部署到 sites-enabled/hook.kjtang.cn）
 #   - DNS: 阿里云加 hook.kjtang.cn A 记录 → VPS 公网 IP
-#   - 证书: 重新签 DV 证书加 SAN hook.kjtang.cn
+#   - 证书: hook 独立 DV 证书 /etc/nginx/ssl/hook.kjtang.cn.{pem,key}
+#     （阿里云免费"个人测试证书"= 单域名产品，无法给主站证书加 SAN，须单独申请）
 #   - GitHub repo: Settings → Webhooks → Add
 #     URL: https://hook.kjtang.cn/webhook
 #     Secret: WEBHOOK_SECRET（32 字节强密码）
