@@ -12,7 +12,7 @@
 >
 > **更新**：2026-10-16 首次部署完成后修正 —— ① 证书改**独立申请**（阿里云免费证书=单域名，不能给主证书加 SAN）；② 新增 **443 防火墙放行**前置与外部 vantage 复验；③ nginx 改**独立文件**部署；④ systemd `ProtectHome` 203/EXEC 踩坑记录。
 >
-> **更新**：2026-10-16 增补 **§3.10（CI 完成快通道）** —— webhook 补勾 "Check suites" 事件；`check_suite`（全绿）经同一 receiver → inbox → watcher 链路秒级唤醒 Prod Agent；新增 `dailycheck-ci` 订阅 + gateway `webhook.py` [SILENT] 抑制补丁（§3.8 步骤 2c）。
+> **更新**：2026-10-16 增补 **§3.10（CI 完成快通道）** —— webhook 补勾 "Check suites" 事件；`check_suite`（全绿）经同一 receiver → inbox → watcher 链路秒级唤醒 Prod Agent；新增 `dailycheck-ci` 订阅 + `webhook.py` / `scheduler.py` 两处 [SILENT] 抑制补丁（含「截断标记」容错，§3.8 步骤 2c）。
 
 ## 1. 架构
 
@@ -271,16 +271,30 @@ cd /root/hermes-agent
 /root/hermes-agent/.venv/bin/hermes webhook list            # 确认 dailycheck-pr + dailycheck-ci 都在列
 #    （prompt 文案可按需调整；⚠️ [SILENT] 中间态静默依赖下一步 2c 的补丁）
 
-#    c) （2026-10-16 增，CI 快通道静默必需）gateway [SILENT] 抑制补丁：
-#       上游 Hermes 仅 cron 投递支持 [SILENT]；webhook 跨平台投递会把它当普通
-#       文本原样发出。在 gateway/platforms/webhook.py 的 send() 中、
-#       「Cross-platform delivery」分支之前插入：
-#         if content.strip().upper().startswith("[SILENT]"):
-#             logger.info("[webhook] Suppressed delivery for %s ([SILENT])", chat_id)
-#             return SendResult(success=True)
+#    c) （2026-10-16 增，CI 快通道静默必需）[SILENT] 抑制补丁 ×2（均本地补丁）：
+#       ① webhook 跨平台投递抑制（上游无此能力 —— 上游仅 cron 投递支持 [SILENT]，
+#          webhook 会把它当普通文本原样发出）。在 gateway/platforms/webhook.py 的
+#          send() 中、「Cross-platform delivery」分支之前插入：
+#             _silent_check = content.strip().upper()
+#             if "[SILENT]" in _silent_check or _silent_check.endswith("[SILENT"):
+#                 logger.info("[webhook] Suppressed delivery for %s ([SILENT])", chat_id)
+#                 return SendResult(success=True)
+#       ② cron 投递抑制加截断容错（上游已有检查、但仅匹配完整标记）：cron/scheduler.py
+#          tick() 投递判定改为：
+#             _silent_check = deliver_content.strip().upper()
+#             if should_deliver and success and (
+#                 SILENT_MARKER in _silent_check or _silent_check.endswith("[SILENT")
+#             ):
+#          （兜底轮询的静默 tick 依赖此检查；scheduler 运行在 gateway 进程内，重启同生效）
+#       ⚠️ 为何额外容忍 endswith("[SILENT")：模型（MiniMax-M3）会**间歇把标记输出成
+#          "[SILENT"（丢右括号，finish_reason=stop）**——2026-10-16 实测，严格子串匹配
+#          漏过 → 字面标记直接投给用户。两处统一静默判据 =「含完整 [SILENT] 或以其
+#          截断形态结尾」。
 #       改完重启 gateway 生效（同 a/b 的 restart 命令）。
-#       ⚠️ 本地补丁（非上游能力）：Hermes 重装/升级后需重打——
-#          核对：grep -n 'SILENT' /root/hermes-agent/gateway/platforms/webhook.py
+#       ⚠️ 两处均为本地补丁，Hermes 重装/升级后需重打（旧版备份 *.bak-20261016-*）——
+#          核对：grep -n "_silent_check" \
+#                /root/hermes-agent/gateway/platforms/webhook.py \
+#                /root/hermes-agent/cron/scheduler.py
 
 # 3. watcher + rotate units
 cp deploy/systemd/dc-inbox-watcher.service \
@@ -348,6 +362,7 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 - 脚本必须在 `HERMES_HOME/scripts/` 内（scheduler 强制校验，防任意路径执行）。
 - `DCPOLL_REPO` 环境变量仅用于测试输出格式；生产 cron 不设置（默认 `ericmr1981/DailyCheck`）。
 - 该 job 是 webhook 快通道的**冗余保底**，不是替代——两条通道独立，都指向同一 `dailycheck-prod-agent` skill 判定流程（merge 判定幂等）。
+- **轻提醒（2026-10-16 增）**：prod 的该 job 与 `dailycheck-pr` / `dailycheck-ci` 两订阅的 deliver 均为 `feishu:<chat_id>`（有实质动作时直推 ≤3 行轻提醒；静默 tick 仍被 [SILENT] 抑制，依赖 §3.8 步骤 2c 两补丁）；配 Hermes `config.yaml` `cron.wrap_response: false` 去掉 cron 包装头。⚠️ 本文档第 3 步命令里的 `--deliver local` 是最初创建参数，prod 现状已改为 feishu（以本条为准）。
 
 ### 3.10 CI 完成快通道（2026-10-16 增，check_suite）
 
@@ -381,7 +396,7 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 
 - 一个 PR 的 CI 过程通常产生**多个 check_suite**（每个 workflow 一个 + 第三方 App 如 GitGuardian），每个 success 的 suite 完成都会触发一次判定——前面 suite 完成时两必需 check 未齐 → Prod Agent 回 `[SILENT]`（**不产生飞书消息**）；最后一个凑齐全绿的 suite 才触发 merge + 一行轻提醒。多跑几次判定是幂等且静默的，属预期。
 - `conclusion=failure` 的 suite **不转发**（无 merge 动作可做；失败由 Dev 侧修复，兜底轮询照常看板）。
-- [SILENT] 抑制依赖 gateway 本地补丁（§3.8 步骤 2c）；补丁缺失时会往飞书发字面 "[SILENT]" 消息——见 §5 风险表。
+- [SILENT] 抑制依赖两处本地补丁（§3.8 步骤 2c：gateway `webhook.py` + cron `scheduler.py`，均含「标记丢右括号」截断容错）；补丁缺失时会往飞书发字面 "[SILENT]" 消息——见 §5 风险表。
 
 ## 4. 验收 checklist
 
@@ -423,6 +438,12 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 - 端到端（真实补发 + 测试）：inbox 3 事件（PR #49/#50 真实通知 + 测试事件）→ journal 全部 `triggered:` → Prod Agent 3 会话全部正确判定（#49 已关闭→静默；#50 已 merge→确认；测试事件→识破不动作）✅
 - 兜底轮询 job `02ee9e01cb13` 首跑静默 `[SILENT]` ✅；**实测暴露 watcher retry-gating 缺陷 → Issue #51**（PR #49/#50 通知延迟 1h 才补发，根因见 §3.8 注意第 3 条）
 
+**2026-10-16 §3.10 部署实测（第三批次：check_suite 快通道 + [SILENT] 泄漏修复）**：
+
+- 合成 check_suite（completed/success/PR #997）e2e：receiver **202**（19:40:56）→ watcher `triggered:` **≤1s** → Prod Agent 会话 10.3s → gateway `Suppressed delivery ... ([SILENT])` → 飞书**零消息** ✅
+- 修复 [SILENT] 字面泄漏（16:30–19:01 兜底轮询 5 次静默 tick 泄漏到飞书）：根因 = 模型间歇输出**截断标记** `[SILENT`（丢右括号）→ 严格子串匹配漏过；按步骤 2c 打两处截断容错补丁后复测通过
+- GitHub hook Events 已含 `check_suite`；真 PR 的 CI 全绿触发即首验（见 §4 第 18/19 项）
+
 ## 5. 风险与回滚
 
 | 风险 | 缓解 | 回滚 |
@@ -437,7 +458,7 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 | 旧 webhook 重投同一 delivery | 幂等按 delivery_id（receiver 200 duplicate） | 不需处理，receiver 自动忽略 |
 | **watcher 触发失败后无新事件 → 退避重试不发动**（Issue #51，实测延迟 1h） | §3.9 兜底轮询 30 分钟保底；journal WARNING 可见 | 修复见 Issue #51（主循环加 pending-retry 条件，pending-retry PR） |
 | **Hermes gateway 重启窗口**（订阅热加载前）事件落 inbox 但未触发 | watcher 状态文件保留未处理条目（重启后补触发）+ §3.9 兜底轮询 | 无需处理；确认 `ss -tlnp \| grep 8644` 恢复 LISTEN |
-| **[SILENT] 补丁被 Hermes 升级/重装冲掉**（症状：中间态判定开始往飞书发字面 `[SILENT]` 消息） | §3.8 步骤 2c 重打补丁（5 行）；`grep -n 'SILENT' /root/hermes-agent/gateway/platforms/webhook.py` 核对 | 无需回滚；补丁缺失只影响静默语义，事件不丢（兜底轮询照常） |
+| **[SILENT] 补丁被 Hermes 升级/重装冲掉**（症状：中间态判定开始往飞书发字面 `[SILENT]` / `[SILENT` 消息） | §3.8 步骤 2c 重打两处补丁；`grep -n '_silent_check' /root/hermes-agent/gateway/platforms/webhook.py /root/hermes-agent/cron/scheduler.py` 核对 | 无需回滚；补丁缺失只影响静默语义，事件不丢（兜底轮询照常） |
 
 ## 6. 监控
 
