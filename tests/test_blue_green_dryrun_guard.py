@@ -7,6 +7,9 @@
      条 server 行与期望一致，不一致回滚（exit 1）；
   ③ 落点核验：100%/0% 边界用带 nonce 的探针核对流量真实落进目标实例的
      access log（对侧命中 = reload 未生效 → 回滚；读不到日志 = 仅告警）。
+     **Issue #55**：探针必须重发 —— reload 后 nginx worker 需 1-3 秒刷新
+     in-memory upstream，只发一次探针必然落旧配置；旧实现只反复 grep 同一个
+     nonce → 必然误判「reload 未生效」→ 误回滚（生产 2026-10-16 实测）。
 
 测试方式：PATH 前置 fake systemctl / fake nginx（dev/CI 不碰真 systemd/nginx），
 switch.sh 以 **live 模式** 跑全流程；探针打本地 HTTP 服务，「实例 access log」
@@ -16,6 +19,7 @@ from __future__ import annotations
 
 import http.server
 import os
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -103,17 +107,38 @@ def _switch_env(
 
 
 class _ProbeSink:
-    """记录探针请求；带 nonce 的探针请求「落进」指定假 access log。"""
+    """记录探针请求；带 nonce 的探针请求「落进」指定假 access log。
 
-    def __init__(self, log_to: Path | None = None):
+    `log_to` 固定一个落点（每次探针都落该侧）；`log_seq` 按**探针次数**依次
+    取（用完取最后一个）——用来模拟 reload 后 nginx worker 刷新的 race：
+    第 1 次探针落在旧配置（对侧），第 2 次起落在新配置（目标侧）。
+    """
+
+    def __init__(
+        self,
+        log_to: Path | None = None,
+        log_seq: list[Path | None] | None = None,
+    ):
         self.log_to = log_to
+        self.log_seq = list(log_seq) if log_seq else None
         self.paths: list[str] = []
+        self.probe_count = 0
 
     def record(self, path: str) -> None:
         self.paths.append(path)
-        if self.log_to is not None and "dc_probe_" in path:
-            with self.log_to.open("a", encoding="utf-8") as fh:
+        if "dc_probe_" not in path:
+            return
+        self.probe_count += 1
+        target = self.log_to
+        if self.log_seq is not None:
+            target = self.log_seq[min(self.probe_count - 1, len(self.log_seq) - 1)]
+        if target is not None:
+            with target.open("a", encoding="utf-8") as fh:
                 fh.write(f'127.0.0.1 - - [probe] "GET {path} HTTP/1.1" 200\n')
+
+    def probe_paths(self) -> list[str]:
+        """只取探针请求 path（诊断用：可看出探针是否被重发、nonce 是否各异）。"""
+        return [p for p in self.paths if "dc_probe_" in p]
 
 
 def _start_server(sink: _ProbeSink) -> http.server.ThreadingHTTPServer:
@@ -331,6 +356,148 @@ def test_landing_probe_wrong_side_rolls_back(tmp_path):
     assert conf.read_text(encoding="utf-8") == original  # conf 恢复切换前
 
 
+def _fast_landing_env(**extra: str) -> dict[str, str]:
+    """把落点核验的重试节奏压到 0 秒 —— 断言的是**行为**（是否重发），不是等待时长。
+
+    真实默认值（每次尝试轮询 4×0.25s、尝试间等 1s）由
+    `test_landing_verify_defaults_cover_worker_refresh` 静态钉死，
+    并仍由 `test_landing_probe_wrong_side_rolls_back` /
+    `test_landing_probe_unreadable_logs_only_warns` 走真默认值跑一遍。
+    """
+    return {
+        "LAND_POLL_STEP": "0",
+        "LAND_RETRY_SLEEP": "0",
+        **extra,
+    }
+
+
+def test_landing_probe_race_first_probe_wrong_side_then_ok(tmp_path):
+    """Issue #55 回归：reload 后第 1 次探针落旧配置（对侧）→ 必须重发重试，不误回滚。
+
+    生产实测：`switch.sh green 100` 在 nginx worker 刷新窗口内（reload 后
+    1-3 秒）被误判「落点核验失败」并自动回滚，只能人工 sleep 3 绕过。
+    这里把第 1 次探针钉到对侧（蓝）、第 2 次起钉到目标侧（绿）——旧实现
+    （只发一次探针 + 反复 grep 同一 nonce）必然 exit 1，新实现必须 exit 0。
+    """
+    conf = _write_conf(tmp_path)
+    green_log = tmp_path / "green-access.log"
+    blue_log = tmp_path / "blue-access.log"
+    green_log.write_text("", encoding="utf-8")
+    blue_log.write_text("", encoding="utf-8")
+    sink = _ProbeSink(log_seq=[blue_log, green_log])  # 第 1 次落蓝，第 2 次起落绿
+    srv = _start_server(sink)
+    try:
+        env = _switch_env(
+            tmp_path,
+            {"dailycheck-green.service": "FOO=bar"},
+            NGINX_DAILYCHECK_CONF=str(conf),
+            BACKUP_DIR=str(tmp_path / "bk"),
+            GREEN_ACCESS_LOG=str(green_log),
+            BLUE_ACCESS_LOG=str(blue_log),
+            NGINX_ENTRY=f"http://127.0.0.1:{srv.server_address[1]}",
+            **_fast_landing_env(),
+        )
+        r = _run_switch(env, "green", "100")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    out = r.stdout + r.stderr
+    assert "落点核验 OK" in out
+    assert "落点核验失败" not in out
+    # 不变量 1：探针被**重发**（Issue #55 的 bug 本体 = 只发一次再反复 grep）
+    probes = sink.probe_paths()
+    assert len(probes) >= 2, f"探针只发了 {len(probes)} 次（未重发）：{sink.paths}"
+    # 不变量 2：每次尝试用**新 nonce**（同一 nonce 重发等于没重发）。
+    # 断言由 `_${probe_try}` 后缀结构性保证 —— 保留为防重构的护栏：一旦有人
+    # 把 nonce 提成循环外常量，重发就退化成「原地重 grep」（#55 的 bug 本体）。
+    nonces = [p.split("=")[0] for p in probes]
+    assert len(set(nonces)) == len(nonces), f"nonce 未更新：{nonces}"
+    # 未回滚：conf 仍是 green 100 / blue down
+    content = conf.read_text(encoding="utf-8")
+    assert "server 127.0.0.1:8090 down;" in content
+    assert "server 127.0.0.1:8091 weight=100;" in content
+
+
+def test_landing_probe_race_blue_direction(tmp_path):
+    """对称覆盖：`switch blue 100`（回滚方向）同样重发重试，不误回滚到绿。
+
+    LAND_LOG / LAND_OTHER_LOG 的选边在目标方向上是两套分支，只测 green
+    方向会漏掉「目标=蓝」分支的同类 race。
+    """
+    conf = _write_conf(tmp_path)
+    green_log = tmp_path / "green-access.log"
+    blue_log = tmp_path / "blue-access.log"
+    green_log.write_text("", encoding="utf-8")
+    blue_log.write_text("", encoding="utf-8")
+    sink = _ProbeSink(log_seq=[green_log, blue_log])  # 第 1 次落绿（旧配置），之后落蓝
+    srv = _start_server(sink)
+    try:
+        env = _switch_env(
+            tmp_path,
+            {"dailycheck.service": "FOO=bar"},
+            NGINX_DAILYCHECK_CONF=str(conf),
+            BACKUP_DIR=str(tmp_path / "bk"),
+            GREEN_ACCESS_LOG=str(green_log),
+            BLUE_ACCESS_LOG=str(blue_log),
+            NGINX_ENTRY=f"http://127.0.0.1:{srv.server_address[1]}",
+            **_fast_landing_env(),
+        )
+        r = _run_switch(env, "blue", "100")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
+    out = r.stdout + r.stderr
+    assert "落点核验 OK" in out
+    assert "落点核验失败" not in out
+    assert len(sink.probe_paths()) >= 2
+    nonces = [p.split("=")[0] for p in sink.probe_paths()]
+    assert len(set(nonces)) == len(nonces), f"nonce 未更新：{nonces}"
+    content = conf.read_text(encoding="utf-8")
+    assert "server 127.0.0.1:8090 weight=100;" in content
+    assert "server 127.0.0.1:8091 down;" in content
+
+
+def _landing_verify_body() -> str:
+    """取 `_landing_verify()` 的函数体源码。
+
+    默认值**必须**在这里解析：`LAND_TRY_MAX` 在 dry-run 回显文案里也出现一次，
+    用全文正则（`re.search(..., content)`）会命中文案那处 —— 把函数内默认值
+    变异成 `1`（即 #55 的原始行为：只发一次探针）时断言仍会通过（第 1 轮审核
+    实测的假绿）。函数体切片 + 「只出现一次」双重约束把它钉死。
+    """
+    content = SWITCH.read_text(encoding="utf-8")
+    start = content.index("_landing_verify() {")
+    end = content.index("\n}\n", start)
+    return content[start:end]
+
+
+def test_landing_verify_defaults_cover_worker_refresh():
+    """默认重试预算必须覆盖 nginx worker 刷新窗口（Issue #55）：重发次数 ≥3、
+    总等待 ≥3 秒、单次等待 >0 —— 防止后续重构把等待悄悄改成 0（race 复发）。"""
+    body = _landing_verify_body()
+
+    def _num(name: str) -> float:
+        assert body.count(f"{name}:-") == 1, (
+            f"{name} 的默认值应只在 _landing_verify 函数体内出现一次"
+        )
+        m = re.search(rf'{name}:-([0-9.]+)', body)
+        assert m is not None, f"switch.sh 的 _landing_verify 缺 {name} 默认值"
+        return float(m.group(1))
+
+    try_max = _num("LAND_TRY_MAX")
+    poll_max = _num("LAND_POLL_MAX")
+    poll_step = _num("LAND_POLL_STEP")
+    retry_sleep = _num("LAND_RETRY_SLEEP")
+    assert try_max >= 3, f"探针重发次数过少（{try_max}）"
+    assert poll_step > 0 and retry_sleep > 0, "轮询/重发间隔不得为 0（worker 无刷新窗口）"
+    budget = try_max * (poll_max * poll_step + retry_sleep)
+    assert budget >= 3.0, f"默认重试总预算 {budget}s 不足以覆盖 1-3 秒的 worker 刷新"
+
+
 def test_gray_switch_skips_landing_probe(tmp_path):
     """灰度 50% 路由随机 → 跳过落点断言（只走探活），exit 0。"""
     conf = _write_conf(tmp_path)
@@ -390,8 +557,10 @@ def test_switch_guard_source_static():
     assert "/proc/${pid}/environ" in content
     assert "systemctl show -p Environment --value" in content
     assert "exit 3" in content
-    # 落点核验 nonce
+    # 落点核验 nonce（Issue #55：核验走 _landing_verify，探针可重发）
     assert "dc_probe_" in content
     assert "落点核验" in content
+    assert "_landing_verify" in content
+    assert "LAND_TRY_MAX" in content
     # conf 应用核验
     assert "_verify_conf_applied" in content

@@ -31,6 +31,18 @@
 #   - 落点核验：100%/0% 边界用带 nonce 的探针核对流量真实落到目标实例的
 #     access log（防「文件写了但 reload 没生效」的静默漂移）。
 #
+# 2026-10-16 Issue #55 修正（落点核验的 reload race）：
+#   - nginx worker 在 reload 后需 1-3 秒才刷新 in-memory upstream，而旧实现
+#     只发**一次**探针——这一次几乎必然落在旧配置（对侧），随后的 for 循环
+#     只是反复 grep 同一个 nonce：已经打到对侧的请求不可能再改路由，于是
+#     必然判「reload 未生效」→ 误回滚（生产实测：`switch.sh green 100` 被
+#     误判失败自动回滚，部署只能人工 sleep 3 绕过）。
+#   - 修法：每次尝试用**新 nonce 重发**探针，命中目标实例 access log 即成功；
+#     单次尝试的轮询窗口内没命中就等 LAND_RETRY_SLEEP 秒（worker 刷新）再试，
+#     最多 LAND_TRY_MAX 次。对侧命中不再一票判死（那是 race 的正常表现）——
+#     只有「所有尝试都没命中目标 log，且至少一次落在对侧」才认定 reload 真的
+#     没生效（回滚）；探针全异常 / 日志不可读仍只告警。
+#
 # 退出码：0 成功 / 1 运行期核验失败（已自动回滚）/ 2 布局守卫拒绝 /
 #         3 DRY_RUN 守卫拒绝 / 64 参数错误
 
@@ -326,7 +338,7 @@ fi
 NGINX_ENTRY="${NGINX_ENTRY:-http://127.0.0.1:8080}"
 if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
   echo "[DRY-RUN] would probe ${NGINX_ENTRY}/ 与 ${NGINX_ENTRY}/api/mcp/（非 502 才算成功）"
-  echo "[DRY-RUN] would 落点核验（仅 100%/0% 边界：带 nonce 探针核对目标实例 access log）"
+  echo "[DRY-RUN] would 落点核验（仅 100%/0% 边界：带 nonce 探针重发核对目标实例 access log，最多 ${LAND_TRY_MAX:-5} 次）"
   echo "[switch] ✅ nginx reloaded, green=${GREEN_WEIGHT}% blue=${BLUE_WEIGHT}%"
   exit 0
 fi
@@ -357,51 +369,102 @@ if [[ ${PROBE_FAIL} -ne 0 ]]; then
 fi
 
 # ============================================================
-# 落点核验（2026-10-15 事故加固）：仅 100%/0% 边界做确定性断言 ——
-# 带唯一 nonce 探一次 /health，核对 nonce 出现在「应承接实例」的 access
-# log、且不出现在对侧（防「文件写了但 reload 没生效 / 流量没真切」）。
-# 灰度中（1-99%）路由随机，跳过；access log 不可读时仅告警不回滚。
+# 落点核验（2026-10-15 事故加固 + 2026-10-16 Issue #55 修正）：仅 100%/0%
+# 边界做确定性断言 —— 核对带 nonce 的探针真实落进「应承接实例」的 access
+# log（防「conf 写了但 reload 没生效 / 流量没真切」的静默漂移）。灰度中
+# （1-99%）路由随机，跳过；access log 不可读时仅告警不回滚。
+#
+# Issue #55：探针必须**重发**。旧实现只发一次探针再反复 grep 同一 nonce，
+# 撞上 nginx worker 刷新窗口（1-3 秒）时必然误判失败并回滚。详见文件头。
+#
+# 返回值：0=命中目标实例 / 1=只落对侧（reload 未生效，调用方回滚）/
+#         2=无法判定（探针异常 / 日志不可读，调用方仅告警）
+#
+# 注：本函数经调用方 `... || LAND_RC=$?` 调用 —— bash 在该上下文内会**临时忽略
+# errexit**，函数体内单条命令失败不会中断脚本。所有分支都显式 `return`，判定
+# 语义完全由返回码承载，不要依赖函数内的 set -e 行为。
 # ============================================================
+_landing_verify() {
+  local land_log="$1" other_log="$2" land_desc="$3" entry="$4"
+  local try_max="${LAND_TRY_MAX:-5}"          # 探针重发次数上限
+  local poll_max="${LAND_POLL_MAX:-4}"        # 单次探针的日志轮询次数
+  local poll_step="${LAND_POLL_STEP:-0.25}"   # 每次轮询间隔（秒）
+  local retry_sleep="${LAND_RETRY_SLEEP:-1}"  # 两次探针之间等 worker 刷新的秒数
+  local same_log=0
+  local hit_target=0 hit_other=0 probe_ok=0
+  local probe_try probe_poll nonce code
+
+  if [[ ${try_max} -lt 2 ]]; then
+    echo "[switch] 落点核验警告：LAND_TRY_MAX=${try_max}（<2）= 只发一次探针，reload 后 worker 刷新窗口内会重现 Issue #55 的误回滚（仅调试用，勿用于生产）" >&2
+  fi
+
+  if [[ -f "${land_log}" && -f "${other_log}" && "${land_log}" -ef "${other_log}" ]]; then
+    same_log=1
+  fi
+
+  echo "[switch] 落点核验：期望命中 ${land_desc} access log（log=${land_log}）..."
+  for ((probe_try = 1; probe_try <= try_max; probe_try++)); do
+    nonce="dc_probe_$(date +%s)_$$_${RANDOM}_${probe_try}"
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${entry}/health?${nonce}=1" 2>/dev/null || echo 000)"
+    echo "  [落点核验] 第 ${probe_try}/${try_max} 次探针 nonce=${nonce} → HTTP ${code}"
+    if [[ "${code}" =~ ^5 || "${code}" == "000" ]]; then
+      # 入口还没起来 / 5xx：本轮探针无效，等下一轮（不据此回滚——前置探活已管 5xx）
+      if [[ ${probe_try} -lt ${try_max} ]]; then sleep "${retry_sleep}"; fi
+      continue
+    fi
+    probe_ok=1
+    for ((probe_poll = 1; probe_poll <= poll_max; probe_poll++)); do
+      sleep "${poll_step}"
+      if [[ -f "${land_log}" ]] && grep -qF "${nonce}" "${land_log}"; then
+        hit_target=1
+        break
+      fi
+      if [[ ${same_log} -eq 0 && -f "${other_log}" ]] && grep -qF "${nonce}" "${other_log}"; then
+        hit_other=1
+        break  # 本次探针已判明走向对侧 → 换新 nonce 再试（race 的正常表现）
+      fi
+    done
+    if [[ ${hit_target} -eq 1 ]]; then break; fi
+    echo "    [落点核验] 本次探针未命中目标 log（worker 可能尚未刷新），重发..."
+    if [[ ${probe_try} -lt ${try_max} ]]; then sleep "${retry_sleep}"; fi
+  done
+
+  if [[ ${hit_target} -eq 1 ]]; then
+    echo "[switch] 落点核验 OK：流量真实落在 ${land_desc}（nonce 命中其 access log，第 ${probe_try} 次探针）"
+    if [[ ${hit_other} -eq 1 ]]; then
+      echo "[switch]   注：此前有探针落在对侧实例 access log —— reload 后 nginx worker 刷新窗口内的正常现象（已重发并命中目标，非故障）"
+    fi
+    return 0
+  fi
+  if [[ ${hit_other} -eq 1 ]]; then
+    echo "[switch] 落点核验失败：${try_max} 次探针均未命中目标实例 access log，且探针出现在对侧实例 access log（reload 未生效 / 流量未按权重路由）" >&2
+    return 1
+  fi
+  if [[ ${probe_ok} -eq 1 ]]; then
+    echo "[switch] 落点核验：无法判定（access log 不可读或 nonce 未见于两侧）——仅告警" >&2
+  else
+    echo "[switch] 落点核验：探针请求异常（HTTP 5xx / 000，${try_max} 次均未拿到响应），无法核验——仅告警" >&2
+  fi
+  echo "[switch]   目标 log=${land_log}" >&2
+  echo "[switch]   对侧 log=${other_log}" >&2
+  return 2
+}
+
 if [[ ${GREEN_WEIGHT} -eq 100 || ${BLUE_WEIGHT} -eq 100 ]]; then
   if [[ ${GREEN_WEIGHT} -eq 100 ]]; then
     LAND_LOG="${GREEN_ACCESS_LOG}"; LAND_OTHER_LOG="${BLUE_ACCESS_LOG}"; LAND_DESC="绿 :${GREEN_PORT}"
   else
     LAND_LOG="${BLUE_ACCESS_LOG}"; LAND_OTHER_LOG="${GREEN_ACCESS_LOG}"; LAND_DESC="蓝 :${BLUE_PORT}"
   fi
-  PROBE_NONCE="dc_probe_$(date +%s)_$$_${RANDOM}"
-  echo "[switch] 落点核验：nonce=${PROBE_NONCE}（期望命中 ${LAND_DESC} access log）..."
-  PROBE_CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${NGINX_ENTRY}/health?${PROBE_NONCE}=1" 2>/dev/null || echo 000)"
-  echo "  ${NGINX_ENTRY}/health?${PROBE_NONCE}=1 → HTTP ${PROBE_CODE}"
-  if [[ "${PROBE_CODE}" =~ ^5 || "${PROBE_CODE}" == "000" ]]; then
-    echo "[switch] 落点核验：探针请求异常（HTTP ${PROBE_CODE}），无法核验——仅告警" >&2
-  else
-    HIT_TARGET=0; HIT_OTHER=0; SAME_LOG=0
-    if [[ -f "${LAND_LOG}" && -f "${LAND_OTHER_LOG}" && "${LAND_LOG}" -ef "${LAND_OTHER_LOG}" ]]; then
-      SAME_LOG=1
-    fi
-    for _probe_try in 1 2 3; do
-      sleep 1
-      if [[ -f "${LAND_LOG}" ]] && grep -qF "${PROBE_NONCE}" "${LAND_LOG}"; then
-        HIT_TARGET=1
-        break
-      fi
-    done
-    if [[ ${SAME_LOG} -eq 0 && -f "${LAND_OTHER_LOG}" ]] && grep -qF "${PROBE_NONCE}" "${LAND_OTHER_LOG}"; then
-      HIT_OTHER=1
-    fi
-    if [[ ${HIT_TARGET} -eq 1 && ${HIT_OTHER} -eq 0 ]]; then
-      echo "[switch] 落点核验 OK：流量真实落在 ${LAND_DESC}（nonce 命中其 access log）"
-    elif [[ ${HIT_TARGET} -eq 0 && ${HIT_OTHER} -eq 1 ]]; then
-      echo "[switch] 落点核验失败：nonce 出现在对侧实例 access log（reload 未生效 / 流量未按权重路由）" >&2
-      echo "[switch] 自动回滚备份 + reload ..." >&2
-      _rollback_conf_and_reload
-      exit 1
-    else
-      echo "[switch] 落点核验：无法判定（access log 不可读或 nonce 未见于两侧）——仅告警" >&2
-      echo "[switch]   目标 log=${LAND_LOG}" >&2
-      echo "[switch]   对侧 log=${LAND_OTHER_LOG}" >&2
-    fi
-  fi
+  LAND_RC=0
+  _landing_verify "${LAND_LOG}" "${LAND_OTHER_LOG}" "${LAND_DESC}" "${NGINX_ENTRY}" || LAND_RC=$?
+  case ${LAND_RC} in
+    0) ;;  # 落点核验 OK（函数内已回显）
+    1) echo "[switch] 自动回滚备份 + reload ..." >&2
+       _rollback_conf_and_reload
+       exit 1 ;;
+    *) ;;  # 2 = 无法判定：仅告警，不阻断（日志盲区不该挡住部署）
+  esac
 else
   echo "[switch] 落点核验跳过：灰度 ${GREEN_WEIGHT}%/${BLUE_WEIGHT}%（路由随机，无法做确定性落点断言）"
 fi
