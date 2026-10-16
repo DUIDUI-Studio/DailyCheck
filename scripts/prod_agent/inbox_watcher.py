@@ -163,9 +163,17 @@ def _line_hash(line: str) -> str:
 
 
 def _parse_record(line: str) -> dict | None:
+    """解析 inbox 行；返回 None = 坏行（调用方按既有指纹去重路径处理）。
+
+    异常网必须覆盖 `ValueError`（含 `JSONDecodeError`，以及 `json.loads` 对 **>4300
+    位整数字面量**抛的 ValueError）与 `RecursionError`（超深嵌套）—— 只捕
+    `JSONDecodeError` 时，这样一行会让 `process_once` 抛出 → `main()`（只捕
+    KeyboardInterrupt）直接退出 → `Restart=always` 反复崩在同一行（该行永远不会被
+    记入 `bad_hashes`，故永不跳过）。与孪生副本 `dailycheck_dashboard_on_pr.py` 同口径。
+    """
     try:
         rec = json.loads(line)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     return rec if isinstance(rec, dict) else None
 

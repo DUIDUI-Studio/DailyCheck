@@ -572,22 +572,122 @@ def test_load_rejects_next_beyond_configured_cap(tmp_path: Path, capsys):
 
 
 def test_load_warns_on_normalization_and_silent_on_legit(tmp_path: Path, capsys):
-    """归一化必须留痕（M-1 ①：只修「永久锁死」不修「无 WARNING」= 静默丢弃缩量保留）。"""
+    """归一化必须留痕（M-1 ①：只修「永久锁死」不修「无 WARNING」= 静默丢弃缩量保留）。
+
+    断言按**形态计数**（不是「出现即可」）：把任一条留痕降级为 info 都必须被抓 ——
+    「有一条就算过」会让只改一处 `_warn` 的变异漏过。
+    """
     state_file = tmp_path / "state.json"
     now = time.time()
     _write_state(
         state_file,
         {
-            "d-huge": {"n": 1, "next": 1e308},
-            "d-notdict": "garbage",
-            "d-ok": {"n": 3, "next": now + 30},
+            "d-huge": {"n": 1, "next": 1e308},  # 钳制形态
+            "d-notdict": "garbage",  # 丢弃形态
+            "d-ok": {"n": 3, "next": now + 30},  # 合法：不得打扰
         },
     )
     st = trigger.TriggerState.load(state_file)
     out = capsys.readouterr().out
-    assert "[dashboard_trigger] WARNING: state 损坏" in out
+    warn_lines = [ln for ln in out.splitlines() if ln.startswith("[dashboard_trigger]")]
+    assert len(warn_lines) == 2, f"留痕条数不符（应恰为 2 条钳制/丢弃）：\n{out}"
+    assert all("WARNING: state 损坏" in ln for ln in warn_lines), out
     assert "d-huge" in out and "d-notdict" in out and "d-ok" not in out
     assert st.failures["d-ok"] == {"n": 3, "next": now + 30}
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("failures", [{"n": 1, "next": 0.0}]),
+        ("failures", "oops"),
+        ("handled_ids", "d1"),
+        ("handled_ids", {"d1": True}),
+        ("bad_hashes", {"h": 1}),
+    ],
+)
+def test_load_warns_on_container_level_damage(tmp_path: Path, field: str, bad_value: object, capsys):
+    """容器级损坏（`failures`/`handled_ids`/`bad_hashes` 形状不对）也必须留痕（第 2 轮 M-1）。
+
+    静默降级有真实副作用：`handled_ids` 形状损坏 → 去重集无声清空 → 同一 delivery
+    被**重复触发**（违反「每条 delivery_id 至多触发一次」）；`failures` 形状损坏 →
+    整张退避表无声丢失（全部立即重试）。运维却看不到任何痕。
+    """
+    state_file = tmp_path / "state.json"
+    payload: dict = {"failures": {}, "handled_ids": ["h1"], "bad_hashes": ["b1"]}
+    payload[field] = bad_value
+    state_file.write_text(json.dumps(payload), encoding="utf-8")
+    st = trigger.TriggerState.load(state_file)
+    out = capsys.readouterr().out
+    assert "[dashboard_trigger] WARNING: state 损坏" in out, f"容器级损坏静默：{field}={bad_value!r}"
+    assert field in out, out
+    # 其余字段仍按合法路径载入（损坏不扩散）
+    assert st.failures == {} or field == "failures"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"failures": {}, "handled_ids": ["d1", 7, None]},
+        {"failures": {}, "bad_hashes": ["h1", {"x": 1}]},
+    ],
+)
+def test_load_warns_on_non_string_items_in_sets(tmp_path: Path, payload: dict, capsys):
+    """集合内混入非字符串元素 → 丢弃并留痕（`handled_ids` 静默丢弃 = 重复触发）。"""
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(payload), encoding="utf-8")
+    st = trigger.TriggerState.load(state_file)
+    out = capsys.readouterr().out
+    assert "[dashboard_trigger] WARNING: state 损坏" in out
+    assert "非字符串元素" in out
+    assert st.handled_ids == {"d1"} or st.bad_hashes == {"h1"}
+
+
+@pytest.mark.parametrize("entry", ['{"n":1}', '"garbage"', "5", "[1]"])
+def test_load_survives_surrogate_key(tmp_path: Path, capsys, entry: str):
+    """第 2 轮 H-1：状态里**键**是孤立代理字符时，归一化留痕本身不得崩溃。
+
+    `{"failures": {"\\ud800": <任意>}}` 是合法 JSON（对象键必为字符串，转义允许
+    孤立代理）。修复前留痕把该键原样插进 f-string → `print` 抛 UnicodeEncodeError
+    直穿 `main()` → `Restart=always` 永久崩溃循环（每次启动都崩在同一状态文件）。
+    条目值必须参数化覆盖**两条留痕分支**（归一化分支 / 非 dict 丢弃分支）—— 只测一条
+    会让另一条的未转义键逃过回归网。
+    ⚠️ 本用例**必须**用 `capsys`：pytest 默认 fd 捕获用 `errors="replace"`，会把
+    `UnicodeEncodeError` 吞掉从而假绿。
+    """
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        '{"failures":{"\\ud800":' + entry + "}}", encoding="utf-8"
+    )
+    st = trigger.TriggerState.load(state_file)  # 修复前此处抛 UnicodeEncodeError
+    out = capsys.readouterr().out  # capsys 走真实 strict 编码
+    assert "[dashboard_trigger] WARNING: state 损坏" in out
+    # dict 条目 → 归一化后保留；非 dict 条目 → 丢弃（两种分支的留痕都不得崩）
+    assert list(st.failures) == (["\ud800"] if entry == '{"n":1}' else [])
+
+
+@pytest.mark.parametrize(
+    ("label", "line"),
+    [
+        ("4301 位整数", '{"delivery_id":"d1","n":' + "9" * 4301 + "}"),
+        ("超深嵌套", "[" * 200000 + "]" * 200000),
+        ("非法 JSON", "{not json"),
+    ],
+)
+def test_parse_record_never_raises(tmp_path: Path, label: str, line: str):
+    """第 2 轮 M-3：inbox 行解析的异常网必须覆盖 ValueError / RecursionError。
+
+    只捕 `JSONDecodeError` 时，这样一行会让 `process_once` 抛出 → `main()` 退出 →
+    `Restart=always` 反复崩在同一行（该行永远进不了 `bad_hashes`，故永不跳过）。
+    """
+    assert trigger._parse_record(line) is None
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _touch_cmd(marker))
+    cfg.inbox.write_text(line + "\n", encoding="utf-8")
+    state = trigger.TriggerState()
+    assert trigger.process_once(cfg, state) == 0  # 修复前此处抛异常
+    assert _read_marker(marker) == []
+    assert len(state.bad_hashes) == 1  # 计入坏行指纹 → 不会重复告警
 
 
 @pytest.mark.parametrize(
@@ -634,14 +734,26 @@ def test_normalize_failure_attempts_boundary(tmp_path: Path, raw_n: int, expect:
 
 
 def test_build_config_rejects_bad_retry_params(tmp_path: Path):
-    """L-4：`--retry-max <= 0` / `--retry-base < 0` 在启动期即拒（否则可写出 `next: Infinity`）。"""
+    """L-4：`--retry-max <= 0` / 非有限值、`--retry-base < 0` / 非有限值启动期即拒。
+
+    `nan <= 0` 为 False、`inf > 0` 为 True —— 只看 `> 0` 会放过二者，封顶失效后可
+    写出 `{"next": Infinity}`（非标 JSON）并让 `sane_ahead` 失去依据。
+    """
     base_argv = [
         "--inbox",
         str(tmp_path / "inbox.jsonl"),
         "--trigger-cmd",
         "/bin/sh -c 'exit 0'",
     ]
-    for extra in (["--retry-max", "0"], ["--retry-max", "-5"], ["--retry-base", "-1"]):
+    for extra in (
+        ["--retry-max", "0"],
+        ["--retry-max", "-5"],
+        ["--retry-max", "nan"],
+        ["--retry-max", "inf"],
+        ["--retry-base", "-1"],
+        ["--retry-base", "nan"],
+        ["--retry-base", "inf"],
+    ):
         with pytest.raises(SystemExit):
             trigger.build_config(trigger.parse_args(base_argv + extra))
     cfg = trigger.build_config(trigger.parse_args(base_argv + ["--retry-base", "0"]))

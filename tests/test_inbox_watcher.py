@@ -685,5 +685,45 @@ def test_delivery_id_lone_surrogate_is_bad_line(tmp_path: Path, capsys):
     assert "malformed inbox line" in capsys.readouterr().out
 
 
+def test_state_load_survives_surrogate_key(tmp_path: Path, capsys):
+    """第 2 轮 H-1（孪生侧防守）：状态里的**键**是孤立代理字符时不得崩溃。
+
+    inbox_watcher 侧目前不做归一化留痕（规则 7 由 Issue #51 承接，见
+    docs/ARCHITECTURE.md §3.5），故本用例只钉住「不抛异常」这一底线；一旦该侧
+    补上留痕，必须同时保证留痕值经 `!r` / `repr` 转义（否则 print 抛
+    UnicodeEncodeError 直穿 main()）。
+    ⚠️ 必须用 `capsys`：pytest 默认 fd 捕获 `errors="replace"` 会吞掉该异常。
+    """
+    state_file = tmp_path / "state.json"
+    state_file.write_text('{"failures":{"\\ud800":{"n":1}}}', encoding="utf-8")
+    st = inbox_watcher.WatcherState.load(state_file)
+    capsys.readouterr()
+    assert "\ud800" in st.failures
+
+
+@pytest.mark.parametrize(
+    ("label", "line"),
+    [
+        ("4301 位整数", '{"delivery_id":"d1","n":' + "9" * 4301 + "}"),
+        ("超深嵌套", "[" * 200000 + "]" * 200000),
+        ("非法 JSON", "{not json"),
+    ],
+)
+def test_parse_record_never_raises(tmp_path: Path, label: str, line: str):
+    """第 2 轮 M-3：inbox 行解析的异常网必须覆盖 ValueError / RecursionError。
+
+    只捕 `JSONDecodeError` 时，这样一行会让 `process_once` 抛出 → `main()` 退出 →
+    `Restart=always` 反复崩在**同一行**（该行永远进不了 `bad_hashes`，故永不跳过）。
+    """
+    assert inbox_watcher._parse_record(line) is None
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    cfg.inbox.write_text(line + "\n", encoding="utf-8")
+    state = inbox_watcher.WatcherState()
+    assert inbox_watcher.process_once(cfg, state) == 0  # 修复前此处抛异常
+    assert _read_marker(marker) == []
+    assert len(state.bad_hashes) == 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

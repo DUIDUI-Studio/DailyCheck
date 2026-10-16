@@ -30,15 +30,20 @@
 #      永不被重试却让 retry_due() 恒 True → 主循环每轮空跑）
 #   7. 状态里的失败条目在 **load() 边界一次性归一化**（`next` 非数值 / 非有限 /
 #      溢出 / 负数 / 超出「配置封顶 + 时钟余量」（`sane_ahead_for`），`n` 非数值 /
-#      非正整数 / 越界 → 一律钳制为合法值；非 dict 的值丢弃），**且每次实际钳制 /
-#      丢弃都打 WARNING 留痕**（不静默）。两个「绝不允许」：
+#      非正整数 / 越界 → 一律钳制为合法值；非 dict 的值丢弃；`failures` /
+#      `handled_ids` / `bad_hashes` 的**容器级**损坏（不是 dict / list、含非字符串
+#      元素）同样归一为合法形态），**且每次实际钳制 / 丢弃都打 WARNING 留痕**
+#      （不静默 —— 否则运维无法从 journal 区分「状态正常」与「损坏但被静默降级」）。
+#      两个「绝不允许」：
 #        · 损坏的 state 绝不能让 listener 崩溃（systemd Restart=always 会把崩溃
 #          掩盖成「重启」）—— 异常网须覆盖 OSError + ValueError（含
-#          JSONDecodeError / UnicodeDecodeError / json 对 >4300 位整数的
-#          ValueError）+ RecursionError（超深嵌套）
+#          JSONDecodeError / UnicodeDecodeError / json 对 >4300 位整数与 inbox 行
+#          解析的 ValueError）+ RecursionError（超深嵌套）；日志里一切来自状态文件
+#          或 inbox 的键值都必须过 `_short()`（孤立代理字符原样 print 会抛
+#          UnicodeEncodeError，那又是同一条崩溃路径）
 #        · 损坏的条目绝不能被静默锁死 —— 归一化后只剩「立即重试」或「合法等待」
 #          两种归宿，两者都在 journal 有痕
-#      归一化只用 _sane_next / _normalize_failure，上界存在状态对象上
+#      归一化只用 _sane_next / _normalize_failure / _str_set，上界存在状态对象上
 #      （`state.sane_ahead`），使用点（retry_due / process_once）与归一化点共用
 #      同一口径 —— 不存在「一处判损坏、另一处照采信」（Issue #51 第 5 轮 M-1 教训）
 #
@@ -158,6 +163,25 @@ def _normalize_failure(
     return {"n": n, "next": 0.0 if nxt is None else nxt}
 
 
+def _str_set(value: object, field: str) -> set[str]:
+    """把状态里的字符串集合字段（`handled_ids` / `bad_hashes`）归一为 `set[str]`。
+
+    字段缺失（`None`）= 首次写入前的正常态，不告警；**形状损坏**（不是 list）或
+    列表内混入非字符串元素一律留痕 —— 前者静默丢弃会让去重集无声清空（后果是
+    同一 delivery 被重复触发），后者静默丢弃会让坏行指纹去重失效。
+    """
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        _warn(f"state 损坏: {field} 不是列表（{_short(value)}）→ 该集合按空处理")
+        return set()
+    items = {x for x in value if isinstance(x, str)}
+    dropped = len(value) - len(items)
+    if dropped:
+        _warn(f"state 损坏: {field} 含 {dropped} 个非字符串元素 → 丢弃（保留 {len(items)} 条）")
+    return items
+
+
 def _next_at(
     entry: object, now: float, sane_ahead: float = DEFAULT_SANE_AHEAD
 ) -> float | None:
@@ -255,37 +279,45 @@ class TriggerState:
         now = time.time()
 
         # 归一化 + **留痕**（Issue #51 上游审核 M-1：只修「永久锁死」不修「无 WARNING」
-        # 等于把静默丢弃缩量保留）。只有「实际发生变化」的条目才打 WARNING，合法条目
-        # 走快速路径不打扰；`!r` 转义保证孤立代理字符等也能安全打印。
+        # 等于把静默丢弃缩量保留）。留痕覆盖**条目级与容器级**两类损坏：任一形态的
+        # 钳制 / 丢弃都必须有痕，否则运维无法从 journal 区分「状态正常」与「状态
+        # 已损坏但被静默降级」。合法条目走快速路径不打扰。
+        # ⚠️ 日志里一切来自状态文件的**键与值**都必须过 `_short()`（= `repr` 截断）：
+        # 孤立代理字符键（JSON `"\ud800"` 可作对象键）原样插进 f-string 会让 `print`
+        # 抛 UnicodeEncodeError —— 那就是又一条「损坏 state 直穿 main()」的崩溃路径。
         failures: dict[str, dict] = {}
-        if isinstance(raw_failures, dict):
+        if raw_failures is None:
+            pass  # 键缺失 = 首次写入前的正常态
+        elif not isinstance(raw_failures, dict):
+            _warn(
+                f"state 损坏: failures 不是对象（{_short(raw_failures)}）→ "
+                "整张退避表按空处理（所有条目下一轮重试一次）"
+            )
+        else:
             for key, entry in raw_failures.items():
+                shown = _short(key)
                 if not isinstance(key, str):
-                    _warn(f"state 损坏: failures 的键 {_short(key)} 不是字符串 → 丢弃")
+                    _warn(f"state 损坏: failures 的键 {shown} 不是字符串 → 丢弃")
                     continue
                 if not isinstance(entry, dict):
                     _warn(
-                        f"state 损坏: failures[{key}] = {_short(entry)} 不是对象 → 丢弃"
-                        "该条目（下一轮按「未失败」重试一次）"
+                        f"state 损坏: failures[{shown}] = {_short(entry)} 不是对象 → "
+                        "丢弃该条目（下一轮按「未失败」重试一次）"
                     )
                     continue
                 fixed = _normalize_failure(entry, now, sane_ahead)
                 if fixed != entry:
                     _warn(
-                        f"state 损坏: failures[{key}] = {_short(entry)} → "
+                        f"state 损坏: failures[{shown}] = {_short(entry)} → "
                         f"归一为 {_short(fixed)}（next 归 0 = 立即可重试）；"
                         "重试一轮后自动重写为合法值"
                     )
                 failures[key] = fixed
 
         return cls(
-            handled_ids={x for x in handled if isinstance(x, str)}
-            if isinstance(handled, list)
-            else set(),
+            handled_ids=_str_set(handled, "handled_ids"),
             failures=failures,
-            bad_hashes={x for x in bad if isinstance(x, str)}
-            if isinstance(bad, list)
-            else set(),
+            bad_hashes=_str_set(bad, "bad_hashes"),
             sane_ahead=sane_ahead,
         )
 
@@ -335,9 +367,17 @@ def _line_hash(line: str) -> str:
 
 
 def _parse_record(line: str) -> dict | None:
+    """解析 inbox 行；返回 None = 坏行（调用方按既有指纹去重路径处理）。
+
+    异常网必须覆盖 `ValueError`（含 `JSONDecodeError`，以及 `json.loads` 对 **>4300
+    位整数字面量**抛的 ValueError）与 `RecursionError`（超深嵌套）—— 只捕
+    `JSONDecodeError` 时，这样一行会让 `process_once` 抛出 → `main()`（只捕
+    KeyboardInterrupt）直接退出 → `Restart=always` 反复崩在同一行（该行永远不会被
+    记入 `bad_hashes`，故永不跳过）。
+    """
     try:
         rec = json.loads(line)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     return rec if isinstance(rec, dict) else None
 
@@ -540,13 +580,14 @@ def build_config(args: argparse.Namespace) -> TriggerConfig:
         raise SystemExit("--poll-interval must be > 0")
     if args.trigger_timeout <= 0:
         raise SystemExit("--trigger-timeout must be > 0")
-    # 退避封顶必须 > 0：`retry_max <= 0` 会让 _retry_delay 走「不封顶」分支，配合
-    # 大 attempts 可写出 `{"next": Infinity}`（非标 JSON）并让 sane_ahead 失去依据。
+    # 退避封顶必须 > 0 且有限：`retry_max <= 0` 会让 _retry_delay 走「不封顶」分支，
+    # `inf` / `nan`（`nan <= 0` 为 False，故能骗过 `<= 0` 判定）会让封顶失效 ——
+    # 两者都会写出 `{"next": Infinity}`（非标 JSON）并让 sane_ahead 失去依据。
     # 这与 --poll-interval / --trigger-timeout 的既有校验同一风格。
-    if args.retry_max <= 0:
-        raise SystemExit("--retry-max must be > 0")
-    if args.retry_base < 0:
-        raise SystemExit("--retry-base must be >= 0 (0 = 立即重试，供调试)")
+    if not (args.retry_max > 0) or not math.isfinite(args.retry_max):
+        raise SystemExit("--retry-max must be a finite value > 0")
+    if args.retry_base < 0 or not math.isfinite(args.retry_base):
+        raise SystemExit("--retry-base must be finite and >= 0 (0 = 立即重试，供调试)")
     trigger_argv = shlex.split(args.trigger_cmd) + [
         "--db", args.db,
         "--html-dir", args.html_dir,
