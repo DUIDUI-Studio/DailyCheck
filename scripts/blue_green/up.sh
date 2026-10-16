@@ -77,6 +77,60 @@ GREEN_MCP_HEALTH_URL="${GREEN_MCP_HEALTH_URL:-http://127.0.0.1:${GREEN_MCP_PORT}
 EVIDENCE_DIR="${EVIDENCE_BASE:-/var/log/dailycheck}"
 
 # ============================================================
+# 部署单飞守卫 + 进程级互斥（deploy-singleflight，2026-10-16）
+# ============================================================
+# A. 会话级锁校验（仅 live；dry-run 完全跳过，保持演练/CI 行为不变）：
+#    - 状态目录不存在          -> 单飞机制未激活，放行（向后兼容窗口）
+#    - DAILYCHECK_DEPLOY_UNLOCKED=1 -> 人工逃生舱（警告放行）
+#    - 有活跃锁且 PR 匹配       -> 放行（记审计行）
+#    - 无活跃锁 / 锁属他 PR     -> 拒绝（exit 10）
+# B. 进程级 flock（纵深防御；父脚本已持锁时经 DAILYCHECK_BG_LOCK_HELD 继承跳过）。
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  _DS_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-/var/lib/dailycheck-deploy}"
+  _DS_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  if [[ "${DAILYCHECK_DEPLOY_UNLOCKED:-0}" == "1" ]]; then
+    echo "[up] WARN: DAILYCHECK_DEPLOY_UNLOCKED=1 —— 跳过部署锁校验（人工操作）" >&2
+  elif [[ ! -d "${_DS_DIR}" ]]; then
+    echo "[up] [deploy-lock] 状态目录 ${_DS_DIR} 不存在（单飞机制未激活）—— 跳过校验"
+  elif [[ ! -f "${_DS_SCRIPT_DIR}/deploy_state.py" ]] || ! command -v python3 >/dev/null 2>&1; then
+    echo "[up] WARN: deploy_state.py / python3 不可用 —— 跳过部署锁校验" >&2
+  else
+    _ds_rc=0
+    _ds_out="$(python3 "${_DS_SCRIPT_DIR}/deploy_state.py" check --pr "${PR_NUM}" 2>&1)" || _ds_rc=$?
+    if [[ ${_ds_rc} -eq 10 ]]; then
+      { printf '%s up.sh pr=%s %s\n' "$(date -u +%FT%TZ)" "${PR_NUM}" "${_ds_out}"; } \
+        >> "${_DS_DIR}/audit.log" 2>/dev/null || true
+    elif [[ ${_ds_rc} -eq 12 ]]; then
+      echo "[up] ERROR: 部署锁属于另一个 PR（${_ds_out}）—— 拒绝并发部署" >&2
+      exit 10
+    elif [[ ${_ds_rc} -eq 0 ]]; then
+      echo "[up] ERROR: 单飞机制已激活但无活跃部署锁（PR #${PR_NUM}）。" >&2
+      echo "[up] 请先执行: python3 scripts/blue_green/deploy_state.py acquire --pr ${PR_NUM} --sha ${COMMIT_SHA}" >&2
+      echo "[up] 人工受控操作可设 DAILYCHECK_DEPLOY_UNLOCKED=1 跳过。" >&2
+      exit 10
+    else
+      echo "[up] WARN: 部署锁检查异常 rc=${_ds_rc}（${_ds_out}）—— 跳过校验" >&2
+    fi
+  fi
+
+  if [[ "${DAILYCHECK_BG_LOCK_HELD:-0}" != "1" ]]; then
+    _BG_LOCK_FILE="${DAILYCHECK_BG_LOCK_FILE:-/var/lock/dailycheck-bluegreen.lock}"
+    if ! command -v flock >/dev/null 2>&1; then
+      echo "[up] WARN: flock 不可用 —— 进程级互斥跳过（会话级锁仍生效）" >&2
+    elif ! mkdir -p "$(dirname "${_BG_LOCK_FILE}")" 2>/dev/null || ! : >>"${_BG_LOCK_FILE}" 2>/dev/null; then
+      echo "[up] WARN: 锁文件不可写（${_BG_LOCK_FILE}）—— 进程级互斥跳过" >&2
+    else
+      exec 9>"${_BG_LOCK_FILE}"
+      if ! flock -n 9; then
+        echo "[up] ERROR: 另一蓝绿操作正在进行（${_BG_LOCK_FILE} 被占）—— 拒绝并发" >&2
+        exit 10
+      fi
+      export DAILYCHECK_BG_LOCK_HELD=1
+    fi
+  fi
+fi
+
+# ============================================================
 # 辅助：dry-run 模式
 # ============================================================
 _run() {

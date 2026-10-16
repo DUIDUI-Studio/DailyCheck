@@ -90,6 +90,68 @@ R1="⏳"; R2="⏳"; R3="⏳"; R4="⏳"; R5="⏳"; R6="⏳"; R7="⏳"; R8="⏳"
 N1=""; N2=""; N3=""; N4=""; N5=""; N6=""; N7=""; N8=""
 OVERALL_PASS=1
 
+# ============================================================
+# 部署单飞守卫 + 进程级互斥（deploy-singleflight，2026-10-16）
+# ============================================================
+# 位置说明：必须放在 trap _write_report EXIT 注册（下方）之前 —— 锁守卫拒绝
+# 时不应产出「生产验证报告」（八项从未运行，报告会误导判读）。
+# A. 会话级锁校验（仅 live；dry-run 完全跳过）：
+#    - 状态目录不存在          -> 单飞机制未激活，放行（向后兼容窗口）
+#    - DAILYCHECK_DEPLOY_UNLOCKED=1 -> 人工逃生舱（警告放行；独立演练场景
+#      如无部署会话持锁跑 verify，可用它连同其内嵌 switch 调用一并放行）
+#    - 有活跃锁且 PR 匹配       -> 放行（记审计行）
+#    - 无活跃锁 / 锁属他 PR     -> 拒绝（exit 10）
+# B. 进程级 flock（纵深防御；父脚本已持锁时经环境变量继承跳过）。
+if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
+  _DS_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-/var/lib/dailycheck-deploy}"
+  _DS_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  if [[ "${DAILYCHECK_DEPLOY_UNLOCKED:-0}" == "1" ]]; then
+    echo "[verify] WARN: DAILYCHECK_DEPLOY_UNLOCKED=1 —— 跳过部署锁校验（人工操作）" >&2
+  elif [[ ! -d "${_DS_DIR}" ]]; then
+    echo "[verify] [deploy-lock] 状态目录 ${_DS_DIR} 不存在（单飞机制未激活）—— 跳过校验"
+  elif [[ ! -f "${_DS_SCRIPT_DIR}/deploy_state.py" ]] || ! command -v python3 >/dev/null 2>&1; then
+    echo "[verify] WARN: deploy_state.py / python3 不可用 —— 跳过部署锁校验" >&2
+  else
+    _ds_rc=0
+    _ds_out="$(python3 "${_DS_SCRIPT_DIR}/deploy_state.py" check --pr "${PR_NUM}" 2>&1)" || _ds_rc=$?
+    if [[ ${_ds_rc} -eq 10 ]]; then
+      # 审计属 best-effort 边车能力：写失败只告警、不中断流程。
+      # ⚠️ 本文件禁用恒真兜底后缀（历史事故：兜底把 pytest 失败吞成 PASS，
+      # 见 test_verify_check1_runs_known_failures_gate）——故这里用 if 显式分支。
+      if ! { printf '%s verify.sh pr=%s %s\n' "$(date -u +%FT%TZ)" "${PR_NUM}" "${_ds_out}"; } \
+             >> "${_DS_DIR}/audit.log" 2>/dev/null; then
+        echo "[verify] WARN: audit.log 写入失败（不影响验证流程）" >&2
+      fi
+    elif [[ ${_ds_rc} -eq 12 ]]; then
+      echo "[verify] ERROR: 部署锁属于另一个 PR（${_ds_out}）—— 拒绝并发部署" >&2
+      exit 10
+    elif [[ ${_ds_rc} -eq 0 ]]; then
+      echo "[verify] ERROR: 单飞机制已激活但无活跃部署锁（PR #${PR_NUM}）。" >&2
+      echo "[verify] 请先执行: python3 scripts/blue_green/deploy_state.py acquire --pr ${PR_NUM}" >&2
+      echo "[verify] 人工受控操作可设 DAILYCHECK_DEPLOY_UNLOCKED=1 跳过。" >&2
+      exit 10
+    else
+      echo "[verify] WARN: 部署锁检查异常 rc=${_ds_rc}（${_ds_out}）—— 跳过校验" >&2
+    fi
+  fi
+
+  if [[ "${DAILYCHECK_BG_LOCK_HELD:-0}" != "1" ]]; then
+    _BG_LOCK_FILE="${DAILYCHECK_BG_LOCK_FILE:-/var/lock/dailycheck-bluegreen.lock}"
+    if ! command -v flock >/dev/null 2>&1; then
+      echo "[verify] WARN: flock 不可用 —— 进程级互斥跳过（会话级锁仍生效）" >&2
+    elif ! mkdir -p "$(dirname "${_BG_LOCK_FILE}")" 2>/dev/null || ! : >>"${_BG_LOCK_FILE}" 2>/dev/null; then
+      echo "[verify] WARN: 锁文件不可写（${_BG_LOCK_FILE}）—— 进程级互斥跳过" >&2
+    else
+      exec 9>"${_BG_LOCK_FILE}"
+      if ! flock -n 9; then
+        echo "[verify] ERROR: 另一蓝绿操作正在进行（${_BG_LOCK_FILE} 被占）—— 拒绝并发" >&2
+        exit 10
+      fi
+      export DAILYCHECK_BG_LOCK_HELD=1
+    fi
+  fi
+fi
+
 # 写报告函数（Issue #22 fix: 提前到主流程前定义，fail 路径也可调）
 _write_report() {
   echo "[verify] === 写报告 ==="

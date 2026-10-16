@@ -98,7 +98,12 @@ Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 
 前置一次性（已就位）：绿 systemd unit 声明 `Environment=DAILYCHECK_DB_DIR=/var/lib/dailycheck-green/db`（Issue #28）。
 
+**部署单飞（2026-10-16 起，机制细节见 `docs/ARCHITECTURE.md` §3.8）**：部署是 40-60 分钟长流程，而 webhook 事件天生并发——同一时刻全系统至多一个部署会话在动蓝绿设施；「欠账」由状态事实（`deployed.sha` vs `origin/main`）判定，不靠会话排队。
+
 ```
+deploy_state.py acquire --pr <N> --sha <merge sha>
+             ├─ rc 10（他人在部署）→ 不排队、直接结束，欠账留待下一次 catchup（兜底轮询 ≤30min 保底）
+             └─ rc 0 → 持锁进入部署（长步骤间 deploy_state.py heartbeat --token <t> --phase <阶段>）
 git pull → up.sh <pr> <sha>
              ├─ 守卫：绿 unit 必须声明 DAILYCHECK_DB_DIR 且 = 拷贝目标，否则拒启
              ├─ cp -aL 真库 ${APP_DIR}/db → /var/lib/dailycheck-green/db（独立副本）
@@ -113,8 +118,12 @@ git pull → up.sh <pr> <sha>
              ⚠️ 未转正时 switch.sh 的 DRY_RUN 守卫会拒跑（exit 3）——这是预期拦截，不是故障
          → switch.sh 灰度 5% → 50% → 100%（每档观察；100%/0% 边界自动做落点核验）
          → 观察窗 ≥30min → 收官（绿=生产，蓝 standby）
+         → deploy_state.py release --token <t> --result success（推进 deployed 锚点）
+             失败：release --result failed —— 同 sha 不自动重试（防坏 main 死循环），留 last_attempt 供追查
 ```
 
+- **守卫语义**（up/verify/switch 拒并发时 exit 10）：up / verify 需活跃锁且 PR 匹配；switch 仅 `green` 目标需活跃锁（`blue` 方向豁免——回滚演练内嵌 switch 不被锁阻塞）；**rollback / down 免锁校验**（应急止损永不被部署锁阻塞）。`--dry-run` 全部跳过；人工受控操作可设 `DAILYCHECK_DEPLOY_UNLOCKED=1`（警告放行）
+- **激活顺序（一次性）**：先更新 Prod Agent skill（会话侧协议）→ 再 `init` 建状态目录激活。反序会出现「机制已激活、旧 skill 不握锁 → up.sh 拒跑」
 - **任何异常 → `rollback.sh` 秒回蓝**（Issue #28 修复生效后为代码+数据双回；此前仅回代码）
 - 铁律四条 + DB 隔离铁律见 `docs/ARCHITECTURE.md` §3.4
 - 已知注意：蓝 standby 进程内存里是旧代码，**重新启用蓝前必须 restart**

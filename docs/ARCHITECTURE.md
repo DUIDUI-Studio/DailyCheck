@@ -290,6 +290,34 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 - 标题提取：**跳过代码块**（防 `# shell 注释` 误判为一级标题），级联 `# ` → `## ` → 文件名
 - 跨目录链接用 `os.path.relpath` 相对索引页计算（`reports/index.html` → `../issue-reports/2026-10-16.html` 可跳转）
 
+### 3.8 部署单飞（single-flight deploy，2026-10-16 起）
+
+**问题**：Prod Agent 的一个「merge → 部署」会话是 40-60 分钟长流程（up → verify → 绿转正 → switch → 观察窗），而 webhook 事件天生并发（两个 PR 同时全绿 / 同一 PR 多个 check_suite / 兜底轮询补刀）——两个部署会话在同一套蓝绿设施上重叠 = up/switch/rollback 交错互踩。**单飞 = 同一时刻全系统至多一个部署会话在动蓝绿设施**，且「谁欠谁一次部署」由状态事实判定，不靠会话记忆。
+
+**① 状态原语** `scripts/blue_green/deploy_state.py`（stdlib only；状态目录 `DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy/`）：
+
+- **会话级部署锁**（心跳式，TTL 900s，`DAILYCHECK_DEPLOY_HEARTBEAT_TTL` 可调）：`acquire --pr N --sha <sha>`（返回 token）→ 长步骤间 `heartbeat --token <t> [--phase <阶段>]` → 收官 `release --token <t> --result success|failed`。持有者崩溃 → 心跳过期 → 锁自动失效可被后来者抢占（`last_evicted` 留证据），**无死锁**；`clear-lock --yes` = break-glass 人工清锁。
+- **事实锚点 + 追平检测**：`release success` 把 `deployed.sha` 推进到已部署 sha；`catchup` 对比 `origin/main` vs `deployed.sha` → `rc 0` 已追平 / `rc 1` 有欠账（该部署）/ `rc 2` 同 sha 上次失败（**不自动重试**，防坏 main 死循环）/ `rc 3` 未初始化（先 `init`）/ `rc 65` 取不到 main。**正确性不依赖任何会话「记得排队」**：任何后来者（含兜底轮询）都能从事实独立算出「要不要部署」。
+- 退出码：0=正常 / 1=欠账 / 2=失败待决 / 3=未初始化 / 10=锁被占用 / 11=token 不匹配 / 12=锁属另一 PR / 64=用法错 / 65=无法确定 main。除 `status` 外输出均为单行 JSON。
+- **激活**：`init --sha <sha>` 一次性建目录 + 设 deployed 基线；**状态目录存在 = 机制激活**（不存在 = 全部守卫放行，向后兼容窗口；删状态目录 = 卸载机制）。
+
+**② 五脚本守卫**（仅 live；`--dry-run` 完全跳过，CI / 演练行为不变）：
+
+| 脚本 | 会话级锁校验 | 进程级 flock | 角色 |
+|------|-------------|--------------|------|
+| `up.sh` | 需活跃锁且 PR 匹配（`check --pr`；无锁 / 锁属他 PR → exit 10） | `-n` 立即拒 | 部署方向 |
+| `verify.sh` | 同上（**守卫必须放在 `trap _write_report EXIT` 注册之前** —— 被拒时不产出「八项从未运行」的误导报告） | `-n` 立即拒 | 部署方向 |
+| `switch.sh` | 仅 `green` 目标需活跃锁（不校验 PR 归属——switch 无 PR 参数）；`blue` 目标**豁免** | `-n` 立即拒 | green=承接流量方向；blue=安全方向（rollback 演练内嵌 switch 不被锁阻塞） |
+| `rollback.sh` | **免校验**（应急止损不被部署锁阻塞） | `-w 30` 等待 | 应急方向 |
+| `down.sh` | **免校验**（清理不被部署锁阻塞） | `-w 30` 等待 | 清理方向 |
+
+- 进程级锁文件 `/var/lock/dailycheck-bluegreen.lock`（`DAILYCHECK_BG_LOCK_FILE` 可覆盖）；**嵌套调用经 `DAILYCHECK_BG_LOCK_HELD=1` 环境变量继承跳过**（verify.sh check 4 内嵌调 switch.sh —— 父已持锁时子脚本不得对自己的锁自锁死）。
+- 放行路径记 `audit.log` 审计行（`up.sh pr=N {...}`）；`DAILYCHECK_DEPLOY_UNLOCKED=1` = 人工逃生舱（警告放行）；`deploy_state.py` / `python3` / `flock` 不可用时降级为警告跳过（不打断应急路径）。
+- **会话侧协议**（Prod Agent skill，merge 后）：先 `acquire`；`rc 10`（他人在部署）→ **不排队、直接结束** —— 欠账由任何人下一次 `catchup` 从事实发现并补上（兜底轮询 ≤30 分钟保底）；部署失败则 `release --result failed`（记 `last_attempt`）。长步骤间必须 heartbeat，否则 15 分钟 TTL 到期会被下一会话合法抢占。
+- **激活顺序（一次性，防自锁）**：先更新 Prod Agent skill 到「会话侧协议」→ 再 `init` 建状态目录。反序（机制先激活、旧 skill 不握锁）会让下一次 up.sh 在守卫处拒跑（exit 10）。
+
+**测试**：`tests/test_deploy_state.py`（31 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（16 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx。
+
 ---
 
 ## 4. 数据架构
