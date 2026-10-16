@@ -14,13 +14,15 @@ def _bootstrap_two_warehouses(tmp_path: Path):
     ic_recipe + 1 item with overlapping sku.
     """
     import sqlite3
+
     from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
 
     master = tmp_path / "master.db"
     rd_db = tmp_path / "rd_001.db"
     wh_db = tmp_path / "wh_001.db"
 
-    import db as db_mod, config as cfg
+    import config as cfg
+    import db as db_mod
     db_mod.MASTER_DB = master
     db_mod.WAREHOUSE_DB_DIR = tmp_path
     cfg.MASTER_DB = master
@@ -91,8 +93,9 @@ def _bootstrap_two_warehouses(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_snapshot_recipe_captures_head_and_lines(tmp_path):
-    from blueprints.publish_recipe_pure import snapshot_recipe
     import sqlite3
+
+    from blueprints.publish_recipe_pure import snapshot_recipe
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
     rd.row_factory = sqlite3.Row
@@ -110,8 +113,11 @@ def test_snapshot_recipe_captures_head_and_lines(tmp_path):
 
 def test_upsert_draft_version_creates_then_updates(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import (
-        snapshot_recipe, upsert_draft_version, list_versions,
+        list_versions,
+        snapshot_recipe,
+        upsert_draft_version,
     )
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -140,14 +146,18 @@ def test_upsert_draft_version_creates_then_updates(tmp_path):
     stored_snap = json.loads(versions[0]["snapshot_json"])
     assert stored_snap["head"]["sale_price"] == 280.0
 
-    m.close(); rd.close()
+    m.close()
+    rd.close()
 
 
 def test_publish_then_new_draft_increments_version(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import (
-        snapshot_recipe, upsert_draft_version, publish_version,
         list_versions,
+        publish_version,
+        snapshot_recipe,
+        upsert_draft_version,
     )
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -228,8 +238,11 @@ def test_publish_then_new_draft_increments_version(tmp_path):
 
 def test_publish_to_invalid_warehouse_returns_partial(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import (
-        snapshot_recipe, upsert_draft_version, publish_version,
+        publish_version,
+        snapshot_recipe,
+        upsert_draft_version,
     )
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -256,6 +269,7 @@ def test_publish_to_invalid_warehouse_returns_partial(tmp_path):
 
 def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -277,7 +291,8 @@ def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
     # （走 items 默认 0），价格由 canonical 扇出统一下发。
     assert float(row["unit_cost"]) == 0.0
     assert float(row["selling_price"]) == 0.0
-    wh.commit(); wh.close()
+    wh.commit()
+    wh.close()
 
 
 def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
@@ -286,6 +301,7 @@ def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
     P0-9（2026-10-09）后价格收归主数据，由 canonical 扇出下发，配方发布
     仍不是价格通道；本测试锁定「发布不覆盖门店价」这一不变式。"""
     import sqlite3
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -306,6 +322,7 @@ def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
 
 def test_apply_item_to_warehouse_keep_doesnt_touch_existing(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -325,7 +342,8 @@ def test_apply_item_to_warehouse_keep_doesnt_touch_existing(tmp_path):
 
 def test_publish_items_partial_when_one_warehouse_missing(tmp_path):
     import sqlite3
-    from blueprints.publish_recipe_pure import publish_items, snapshot_item
+
+    from blueprints.publish_recipe_pure import publish_items
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
     rd.row_factory = sqlite3.Row
@@ -355,8 +373,8 @@ def test_snapshot_recipe_picks_up_source_type_for_polymorphic(tmp_path, monkeypa
     apply_item_to_warehouse with all-NULL fields and crashed on
     INSERT INTO categories (NOT NULL constraint on name).
     """
-    import db as db_module
     import config as config_module
+    import db as db_module
     from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
     master = tmp_path / "master.db"
     rd = tmp_path / "rd.db"
@@ -407,10 +425,10 @@ def test_apply_polymorphic_recreates_referenced_ic_recipe(tmp_path, monkeypatch)
     历史：更早版本直接崩（NOT NULL categories.name）；上一版 skip 行
     导致门店出品配方缺基料、成本全错。
     """
-    import db as db_module
     import config as config_module
-    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    import db as db_module
     from blueprints.recipe_cost import _apply_recipe_snapshot_to_warehouse
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
     master = tmp_path / "master.db"
     rd = tmp_path / "rd.db"
     wh = tmp_path / "wh.db"
