@@ -1654,3 +1654,84 @@ table.bom-table td .bom-temp-price {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
+
+/* ===== recipe_cost 模块升级（2026-10-16）：tab 导航 + 成本总览 ===== */
+.recipe-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 2px solid var(--border);
+  margin-bottom: 14px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.recipe-tabs a {
+  padding: 9px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  white-space: nowrap;
+}
+.recipe-tabs a:hover { color: var(--brand-ink); }
+.recipe-tabs a.is-active {
+  color: var(--brand-ink);
+  border-bottom-color: var(--brand);
+}
+
+.ov-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.ov-kpis .kpi-card span { font-size: 12px; color: var(--muted); }
+.ov-kpis .kpi-card.is-warn { border-color: #f59e0b; }
+.ov-kpis .kpi-card.is-warn strong { color: #b45309; }
+.ov-kpis .kpi-card.is-bad { border-color: #ef4444; }
+.ov-kpis .kpi-card.is-bad strong { color: #b91c1c; }
+
+.ov-filter { display: flex; gap: 10px; margin-bottom: 12px; }
+
+.ov-table th a { color: inherit; text-decoration: none; }
+.ov-table th a.is-sorted { color: var(--brand); }
+.ov-table td.num, .ov-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.ov-table td.is-neg { color: #b91c1c; font-weight: 700; }
+.ov-row-neg { background: #fef2f2; }
+.ov-row-unpriced { background: #fffbeb; }
+
+.ov-kind {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.ov-kind--ic_recipe { background: #e0f2fe; color: #075985; }
+.ov-kind--recipe { background: #dcfce7; color: #166534; }
+
+.ov-tag-unpriced {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 11px;
+}
+
+.ov-legend { margin-top: 10px; font-size: 12px; line-height: 1.7; }
+
+/* 门店配方导入 */
+.ov-import-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.ov-import-card { padding: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+.ov-import-card h3 { margin: 0 0 6px; font-size: 15px; }
+.ov-import-card .muted { font-size: 12px; }
+.imp-unmatched { color: #b91c1c; font-weight: 600; }
+.imp-matched { color: #166534; }
+.imp-conflict { background: #fffbeb; }
+
+.imp-toolbar { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
+.imp-bom { margin: 6px 0 10px; border: none; box-shadow: none; }
+.imp-bom th, .imp-bom td { border-bottom: 1px dashed var(--border); font-size: 11px; padding: 4px 8px; }
+.imp-bom td.num, .imp-bom th.num { text-align: right; }

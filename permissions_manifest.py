@@ -240,6 +240,13 @@ ROUTE_MATRIX: dict[str, str] = {
     "recipe_cost.ic_recipe_publish": PLATFORM,
     "recipe_cost.recipe_publish": PLATFORM,
     "recipe_cost.recipe_versions_history": LOGIN,
+    # F1 全品牌成本总览（2026-10-16）：读挂 report.cost.view（与 CSV 导出同口径）
+    "recipe_cost.overview": perm("report.cost.view"),
+    "recipe_cost.overview_export_csv": perm("report.cost.view"),
+    # F2 门店存量配方导入（2026-10-16）：写操作，与配方编辑同权限
+    "recipe_cost.import_index": PLATFORM,
+    "recipe_cost.import_preview": PLATFORM,
+    "recipe_cost.import_execute": PLATFORM,
     # ---- reports ----
     "reports.outbound": perm("report.view"),
     "reports.inbound": perm("report.view"),

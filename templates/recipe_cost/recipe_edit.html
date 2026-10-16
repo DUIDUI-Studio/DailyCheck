@@ -26,7 +26,7 @@
 
 <hr/>
 <h3>原料配方</h3>
-<p class="muted">可引用 品项（item）或 冰激凌配方（ic_recipe）。启用「临时售价」可针对每行覆盖原料销售单价来评估影响。</p>
+<p class="muted">可引用 品项（item）或 冰激凌配方（ic_recipe），用量单位统一为<strong>克</strong>（如：小杯 120g = 冰激凌基料 100g + 果酱 20g）。启用「临时售价」可针对每行覆盖原料销售单价来评估影响。</p>
 
 <form method="post" id="bom-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -171,5 +171,5 @@
     {% endfor %}
   };
 </script>
-<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=9"></script>
+<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=10"></script>
 {% endblock %}

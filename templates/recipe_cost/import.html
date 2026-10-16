@@ -1,0 +1,32 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>门店配方导入 — 选择源门店</h2>
+</div>
+
+<p class="muted">把门店生产模块的存量产品配方（products / product_bom）同步为研发中心的冰激凌配方。
+导入前会按品项主数据（canonical_id 优先、SKU 兜底）逐行匹配研发中心品项；未匹配的产品会被拒绝导入。
+导入后的配方售价为 0，请在总览页逐个补价。</p>
+
+{% if warehouses %}
+<div class="ov-import-cards">
+  {% for w in warehouses %}
+  <div class="ov-import-card">
+    <h3>{{ w['name'] }} <span class="muted">({{ w['code'] }})</span></h3>
+    {% if w['error'] %}
+      <p class="imp-unmatched">{{ w['error'] }}</p>
+    {% else %}
+      <p class="muted">
+        产品 {{ w['product_count'] }} 个 ·
+        可直接导入 <strong>{{ w['importable'] }}</strong> ·
+        同名冲突 {{ w['conflicts'] }}
+      </p>
+      <a class="btn btn-primary" href="{{ url_for('recipe_cost.import_preview', warehouse=w['code']) }}">预览并导入 →</a>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="muted">没有可导入的门店仓库。</p>
+{% endif %}
+{% endblock %}

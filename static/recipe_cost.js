@@ -65,13 +65,15 @@
     var icId = parseInt(sel.value);
     var ic = icRecipes[icId];
     if (!ic) return {purchase: 0, selling: 0, sellingOrig: 0, grams: 0};
-    var grams = qty * (parseFloat(ic.output_qty) || 0);
-    var cost = round2(qty * ic.cost_selling_per_unit);
+    // D1：ic_recipe 行 qty 语义 = 克（与后端成本计算口径一致）。
+    // cost_*_per_unit 为「每克成本」（后端 = 总成本 / output_qty）。
+    var purchase = round2(qty * ic.cost_purchase_per_unit);
+    var selling = round2(qty * ic.cost_selling_per_unit);
     return {
-      purchase: round2(qty * ic.cost_purchase_per_unit),
-      selling: cost,
-      sellingOrig: cost,
-      grams: grams,
+      purchase: purchase,
+      selling: selling,
+      sellingOrig: selling,
+      grams: qty,
     };
   }
 

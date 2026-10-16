@@ -254,3 +254,84 @@ def recipe_cost(
         "profit": _profit(cost_selling, cost_purchase),
         "lines": lines,
     }
+
+
+# ---------------------------------------------------------------------------
+# 全品牌成本总览（F1, 2026-10-16）
+# ---------------------------------------------------------------------------
+
+# 允许的服务端排序列（白名单 —— sort 参数只能取这里的值）
+OVERVIEW_SORTABLE = {
+    "name", "kind", "output_qty", "sale_price",
+    "cost_purchase", "cost_selling",
+    "margin_purchase", "margin_supply", "profit",
+}
+
+
+def overview_rows(conn, kind_filter: str = "all") -> list[dict]:
+    """全品牌产品成本总览：ic_recipes + recipes 统一行结构。
+
+    每行：kind('ic_recipe'|'recipe') / id / name / output_qty /
+    cost_purchase / cost_selling / sale_price /
+    margin_purchase（零售口径：(售价−采购成本)/售价，售价≤0 → None）/
+    margin_supply（供货口径：(销售成本−采购成本)/销售成本，销售成本≤0 → None）/
+    profit（供货利润：销售成本−采购成本）/ priced（是否已定价）
+
+    kind_filter: 'all' | 'ic_recipe' | 'recipe'
+    """
+    conn.row_factory = sqlite3.Row
+    out: list[dict] = []
+
+    def _row(kind: str, rid: int, name: str, output_qty, sale_price, c: dict) -> dict:
+        cp = float(c["cost_purchase"])
+        cs = float(c["cost_selling"])
+        sp = float(sale_price or 0)
+        return {
+            "kind": kind,
+            "id": rid,
+            "name": name,
+            "output_qty": float(output_qty or 0),
+            "cost_purchase": cp,
+            "cost_selling": cs,
+            "sale_price": sp,
+            "margin_purchase": _margin(sp, cp),
+            "margin_supply": _margin_selling(cs, cp),
+            "profit": round(cs - cp, 2),
+            "priced": sp > 0,
+        }
+
+    if kind_filter in ("all", "ic_recipe"):
+        for r in conn.execute(
+            "SELECT id, name, output_qty, sale_price FROM ic_recipes ORDER BY id"
+        ).fetchall():
+            c = ic_recipe_cost(conn, int(r["id"]))
+            if c is not None:
+                out.append(_row("ic_recipe", int(r["id"]), r["name"],
+                                r["output_qty"], r["sale_price"], c))
+
+    if kind_filter in ("all", "recipe"):
+        for r in conn.execute(
+            "SELECT id, name, output_qty, sale_price FROM recipes ORDER BY id"
+        ).fetchall():
+            c = recipe_cost(conn, int(r["id"]))
+            if c is not None:
+                out.append(_row("recipe", int(r["id"]), r["name"],
+                                r["output_qty"], r["sale_price"], c))
+
+    return out
+
+
+def sort_overview_rows(rows: list[dict], sort: str, desc: bool = True) -> list[dict]:
+    """服务端排序（白名单列）。None 值恒排最后（无论升降序）。"""
+    key = sort if sort in OVERVIEW_SORTABLE else "name"
+    present = [r for r in rows if r.get(key) is not None]
+    missing = [r for r in rows if r.get(key) is None]
+
+    def _k(row: dict):
+        v = row.get(key)
+        if isinstance(v, str):
+            return (0, 0.0, v)
+        return (1, float(v), "")
+
+    present.sort(key=_k, reverse=desc)
+    return present + missing

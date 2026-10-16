@@ -1,0 +1,105 @@
+{% extends "recipe_cost/base_recipe.html" %}
+{% block recipe_content %}
+<div class="list-head">
+  <h2>门店配方导入 — 预览 <span class="muted">({{ warehouse_code }})</span></h2>
+  <a class="btn" href="{{ url_for('recipe_cost.import_index') }}">← 重选门店</a>
+</div>
+
+<p class="muted">勾选要导入的产品。标红行含未匹配到研发中心品项的原料，无法导入（需先在「品项主数据」把该原料扇出到研发中心）。
+标黄行与研发中心已有配方同名，导入时按下方冲突策略处理。</p>
+
+<form method="post" action="{{ url_for('recipe_cost.import_execute') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+  <input type="hidden" name="warehouse" value="{{ warehouse_code }}" />
+
+  <div class="form-block" style="margin: 0.6em 0;">
+    <label><span>同名冲突处理</span>
+      <select name="conflict_mode">
+        <option value="skip">跳过（保留研发中心现有配方）</option>
+        <option value="overwrite">覆盖（用门店配方替换；被出品配方引用的不可覆盖）</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="imp-toolbar">
+    <button type="button" class="btn-sm" id="imp-check-all">全选可导入项</button>
+    <button type="button" class="btn-sm" id="imp-check-none">取消全选</button>
+    <span class="muted" id="imp-count"></span>
+  </div>
+
+  <div class="table-scroll">
+  <table class="ov-table">
+    <thead>
+      <tr>
+        <th>导入</th><th>产品名</th><th class="num">原料数</th>
+        <th class="num">总克数</th><th>状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in products %}
+      <tr class="{% if p['conflict'] %}imp-conflict{% endif %}">
+        <td>
+          <input type="checkbox" name="product_ids" value="{{ p['product_id'] }}"
+                 class="imp-cb" {% if not p['importable'] %}disabled{% elif p['importable'] %}checked{% endif %} />
+        </td>
+        <td>
+          <details>
+            <summary>{{ p['name'] }}</summary>
+            <table class="imp-bom">
+              <thead><tr><th>源原料</th><th class="num">用量</th><th>研发中心品项</th></tr></thead>
+              <tbody>
+                {% for ln in p['lines'] %}
+                <tr>
+                  <td>{{ ln['item_name'] }}{% if ln['sku'] %} <span class="muted">({{ ln['sku'] }})</span>{% endif %}</td>
+                  <td class="num">{{ ln['qty_per_unit'] }}{{ 'g' if ln['gram_per_unit'] > 0 else '' }}</td>
+                  <td>
+                    {% if ln['matched_item_id'] %}
+                      <span class="imp-matched">{{ ln['matched_item_name'] }}</span>
+                    {% else %}
+                      <span class="imp-unmatched">未匹配</span>
+                    {% endif %}
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </details>
+        </td>
+        <td class="num">{{ p['bom_count'] }}</td>
+        <td class="num">{{ p['total_grams'] }}</td>
+        <td>
+          {% if not p['lines'] %}<span class="imp-unmatched">无 BOM</span>
+          {% elif not p['importable'] %}<span class="imp-unmatched">含未匹配原料</span>
+          {% elif p['conflict'] %}<span class="ov-tag-unpriced">同名冲突</span>
+          {% else %}<span class="imp-matched">可导入</span>{% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">该门店没有产品配方。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+
+  <button type="submit" class="btn-primary" id="imp-submit">导入勾选的产品到研发中心</button>
+</form>
+
+<script>
+(function () {
+  var cbs = Array.prototype.slice.call(document.querySelectorAll('.imp-cb:not([disabled])'));
+  var countEl = document.getElementById('imp-count');
+  function refresh() {
+    var n = cbs.filter(function (c) { return c.checked; }).length;
+    countEl.textContent = '已选 ' + n + ' / ' + cbs.length + ' 个可导入产品';
+  }
+  cbs.forEach(function (c) { c.addEventListener('change', refresh); });
+  document.getElementById('imp-check-all').addEventListener('click', function () {
+    cbs.forEach(function (c) { c.checked = true; }); refresh();
+  });
+  document.getElementById('imp-check-none').addEventListener('click', function () {
+    cbs.forEach(function (c) { c.checked = false; }); refresh();
+  });
+  refresh();
+})();
+</script>
+{% endblock %}

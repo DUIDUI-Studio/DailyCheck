@@ -82,8 +82,81 @@ def _require_rd():
 @bp.route("/recipe-cost/")
 @require_login
 def landing():
-    """入口：跳到冰激凌配方列表。"""
-    return redirect(url_for("recipe_cost.ic_recipes_list"))
+    """入口：跳到全品牌成本总览（F1 驾驶舱优先）。"""
+    return redirect(url_for("recipe_cost.overview"))
+
+
+# ---------------------------------------------------------------------------
+# 全品牌成本总览 (F1)
+# ---------------------------------------------------------------------------
+
+@bp.route("/recipe-cost/overview", methods=["GET"])
+@require_permission("report.cost.view")
+def overview():
+    """全品牌产品成本总览：ic_recipes + recipes 统一表格。
+
+    Query: kind=all|ic_recipe|recipe, sort=白名单列, dir=asc|desc
+    """
+    from blueprints.recipe_cost_pure import overview_rows, sort_overview_rows
+
+    db = get_warehouse_db()
+    kind = request.args.get("kind", "all")
+    if kind not in ("all", "ic_recipe", "recipe"):
+        kind = "all"
+    sort = request.args.get("sort", "name")
+    desc = request.args.get("dir", "desc") != "asc"
+
+    rows = sort_overview_rows(overview_rows(db, kind_filter=kind), sort, desc)
+    summary = {
+        "total": len(rows),
+        "ic_count": sum(1 for r in rows if r["kind"] == "ic_recipe"),
+        "recipe_count": sum(1 for r in rows if r["kind"] == "recipe"),
+        "unpriced": sum(1 for r in rows if not r["priced"]),
+        "neg_profit": sum(1 for r in rows if r["profit"] < 0),
+    }
+    return render_template(
+        "recipe_cost/overview.html",
+        rows=rows,
+        summary=summary,
+        kind=kind,
+        sort=sort,
+        dir="desc" if desc else "asc",
+    )
+
+
+@bp.route("/recipe-cost/overview/export.csv", methods=["GET"])
+@require_permission("report.cost.view")
+def overview_export_csv():
+    """总览 CSV：与页面同一数据源（overview_rows），支持 kind/sort/dir。"""
+    from blueprints.recipe_cost_pure import overview_rows, sort_overview_rows
+
+    db = get_warehouse_db()
+    kind = request.args.get("kind", "all")
+    if kind not in ("all", "ic_recipe", "recipe"):
+        kind = "all"
+    sort = request.args.get("sort", "name")
+    desc = request.args.get("dir", "desc") != "asc"
+    rows = sort_overview_rows(overview_rows(db, kind_filter=kind), sort, desc)
+
+    kind_label = {"ic_recipe": "冰激凌配方", "recipe": "出品配方"}
+    out = [{
+        "类型": kind_label[r["kind"]],
+        "名称": r["name"],
+        "出品量(g)": r["output_qty"],
+        "采购成本": round(r["cost_purchase"], 2),
+        "销售成本": round(r["cost_selling"], 2),
+        "售价": round(r["sale_price"], 2),
+        "采购毛利率%": (
+            round(r["margin_purchase"] * 100, 2)
+            if r["margin_purchase"] is not None else ""
+        ),
+        "供货毛利率%": (
+            round(r["margin_supply"] * 100, 2)
+            if r["margin_supply"] is not None else ""
+        ),
+        "供货利润": r["profit"],
+    } for r in rows]
+    return _csv_response(out, f"recipe_overview_{_stamp()}.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +229,8 @@ def _build_recipe_card_lines(db, lines):
             out.append({
                 "name": name,
                 "qty": float(ln.get("qty_per_unit", 0)),
-                "unit": "份",
+                # D1：ic_recipe 引用行 qty 语义 = 克（与成本计算口径一致）
+                "unit": "克",
                 "cost_purchase": float(ln["cost_purchase"]),
                 "cost_selling": float(ln["cost_selling"]),
             })
@@ -652,14 +726,12 @@ def _save_recipe(recipe_id):
                     (target_id, int(ic_id), qty),
                 )
                 added += 1
-            # For ic_recipe rows: qty is "servings" of that ic recipe,
-            # and each ic recipe is output_qty grams. So total_grams = qty * ic.output_qty.
-            ic_row = db.execute(
-                "SELECT output_qty FROM ic_recipes WHERE id=?", (int(ic_id),)
-            ).fetchone()
-            if ic_row:
-                ic_grams = float(ic_row["output_qty"] or 0)
-                total_grams += qty * ic_grams
+            # D1（2026-10-16）：ic_recipe 行的 qty 语义 = 克（与 item 行一致，
+            # 与 recipe_cost_pure.recipe_cost 的成本折算口径对齐）。
+            # 旧实现按「份」× ic.output_qty 累计，和成本层（按克）互相矛盾；
+            # 出品配方的心智模型是「小杯 120g = 基料 100g + 酱 20g」，
+            # 用户按克配料，因此统一为克。
+            total_grams += qty
 
     # Update output_qty (auto = total grams)
     db.execute(
@@ -923,11 +995,11 @@ def recipe_bom_export_csv(recipe_id: int):
                 "cost_selling": round(qty_stock * selling, 4),
             })
         elif r["source_type"] == "ic_recipe":
-            ic_grams = float(r["ic_output_qty"] or 0)
-            qty_stock = round(qty * ic_grams, 4) if ic_grams > 0 else 0.0
-            # Cost basis: pull ic_recipe totals and divide by ic.output_qty.
+            # D1：ic_recipe 行 qty 语义 = 克。qty_stock_units 即克数本身；
+            # 成本 = 每克成本 × 克数（与 recipe_cost_pure 口径一致）。
             from blueprints.recipe_cost_pure import ic_recipe_cost
             ic_cost = ic_recipe_cost(db, int(r["ic_recipe_id"]))
+            ic_grams = float(r["ic_output_qty"] or 0)
             if ic_cost and ic_grams > 0:
                 per_unit_cp = float(ic_cost["cost_purchase"]) / ic_grams
                 per_unit_cs = float(ic_cost["cost_selling"]) / ic_grams
@@ -940,8 +1012,8 @@ def recipe_bom_export_csv(recipe_id: int):
                 "source_type": "ic_recipe",
                 "ingredient": r["ic_recipe_name"],
                 "qty_per_unit": qty,
-                "unit": "份",
-                "qty_stock_units": qty_stock,
+                "unit": "克",
+                "qty_stock_units": round(qty, 4),
                 "unit_cost": round(per_unit_cp, 4),
                 "selling_price": round(per_unit_cs, 4),
                 "cost_purchase": round(per_unit_cp * qty, 4),
@@ -977,6 +1049,64 @@ def _resolve_target_item_id(target_conn, line: dict) -> int:
             f"在目标仓未能定位"
         )
     return int(row["id"])
+
+
+def _ensure_ic_recipe_in_target(tc, ic_snap: dict) -> int:
+    """D2：确保目标仓存在被引用的冰激凌配方，返回目标仓 ic_recipe id。
+
+    匹配键 = name（ic_recipes.name UNIQUE）。已存在 → 复用（门店价格/
+    BOM 自治，不覆盖）；不存在 → 用快照递归重建（先 ensure items，
+    再插 ic_recipe + BOM 行）。
+    """
+    from blueprints.publish_recipe_pure import apply_item_to_warehouse
+
+    head = ic_snap["head"]
+    name = head["name"]
+    row = tc.execute(
+        "SELECT id FROM ic_recipes WHERE name = ?", (name,)
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+
+    ts = now()
+    # 1. 确保 BOM 品项存在（与出品配方发布同一套身份键规则）。
+    sku_to_id: dict[str, int] = {}
+    for ln in ic_snap["lines"]:
+        snap_item = {
+            "sku": ln["sku"],
+            "name": ln["item_name"],
+            "category_name": ln["category_name"],
+            "unit": ln["item_unit"],
+            "gram_per_unit": ln["gram_per_unit"],
+            "unit_cost": ln["unit_cost"],
+            "selling_price": ln["selling_price"],
+            "aux_unit": None,
+            "aux_rate": 0,
+            "safety_stock": 0,
+            "canonical_id": ln.get("canonical_id"),
+        }
+        apply_item_to_warehouse(tc, snap_item, action="keep")
+        sku_to_id[ln["sku"]] = _resolve_target_item_id(tc, ln)
+
+    # 2. 建 ic_recipe 头 + BOM 行。
+    tc.execute(
+        """INSERT INTO ic_recipes
+           (name, note, output_unit, output_qty, sale_price,
+            created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (name, head.get("note") or "",
+         head.get("output_unit") or "g",
+         float(head.get("output_qty") or 0),
+         float(head.get("sale_price") or 0), ts, ts),
+    )
+    new_id = int(tc.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+    for ln in ic_snap["lines"]:
+        tc.execute(
+            "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit)"
+            " VALUES (?, ?, ?)",
+            (new_id, sku_to_id[ln["sku"]], float(ln["qty_per_unit"])),
+        )
+    return new_id
 
 
 def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot: dict) -> None:
@@ -1090,9 +1220,35 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
                 # polymorphic recipe — respect the source's source_type
                 st = ln.get("source_type") or "item"
                 if st == "ic_recipe":
-                    # Need to also publish the referenced ic_recipe
-                    # recursively. Defer to a follow-up TODO; for now
-                    # skip polymorphic ic_recipe lines.
+                    # D2：递归确保目标仓存在被引用的冰激凌配方，
+                    # 然后写入引用行（旧实现直接 skip，门店配方缺基料行）。
+                    ic_id = ln.get("ic_recipe_id")
+                    ref_snap = (
+                        snapshot.get("referenced_ic_snapshots") or {}
+                    ).get(str(int(ic_id)))
+                    if ref_snap is None:
+                        # 旧 draft 快照没有挂 referenced_ic_snapshots：
+                        # 目标仓若有同名配方仍可复用，否则明确失败。
+                        by_name = tc.execute(
+                            "SELECT id FROM ic_recipes WHERE name = ?",
+                            (ln.get("ic_recipe_name") or "",),
+                        ).fetchone()
+                        if by_name is None:
+                            raise ValueError(
+                                f"被引用冰激凌配方「{ln.get('ic_recipe_name') or ic_id}」"
+                                f"缺少快照且目标仓不存在同名配方；"
+                                f"请在研发中心重新保存该出品配方后再发布"
+                            )
+                        target_ic_id = int(by_name["id"])
+                    else:
+                        target_ic_id = _ensure_ic_recipe_in_target(tc, ref_snap)
+                    tc.execute(
+                        f"""INSERT INTO {bom_table} ({bom_id_col}, source_type,
+                           item_id, ic_recipe_id, qty_per_unit)
+                           VALUES (?, 'ic_recipe', NULL, ?, ?)""",
+                        (new_recipe_id, target_ic_id,
+                         float(ln["qty_per_unit"])),
+                    )
                     continue
                 tc.execute(
                     f"""INSERT INTO {bom_table} ({bom_id_col}, source_type,
@@ -1185,6 +1341,25 @@ def _handle_recipe_publish(recipe_type: str, recipe_id: int):
             return redirect(request.referrer)
     else:
         version_id = int(draft["id"])
+        # D2 兼容：改动前保存的旧 draft 快照缺 referenced_ic_snapshots，
+        # 多态行无法在目标仓重建 —— 用当前仓状态重新快照刷新 draft。
+        if recipe_type == "recipe":
+            import json as _json
+            try:
+                old_snap = _json.loads(draft["snapshot_json"] or "{}")
+            except ValueError:
+                old_snap = {}
+            has_ic_lines = any(
+                ln.get("source_type") == "ic_recipe"
+                for ln in old_snap.get("lines", [])
+            )
+            if has_ic_lines and not old_snap.get("referenced_ic_snapshots"):
+                refreshed = _upsert_recipe_draft(
+                    recipe_type, recipe_id,
+                    user_id=g.user["id"] if g.user else None,
+                )
+                if refreshed is not None:
+                    version_id = int(refreshed)
 
     # 4. Publish.
     with closing(_sq.connect(MASTER_DB)) as master_conn:
@@ -1238,6 +1413,161 @@ def _handle_recipe_publish(recipe_type: str, recipe_id: int):
 @require_platform_admin
 def ic_recipe_publish(ic_recipe_id: int):
     return _handle_recipe_publish("ic_recipe", ic_recipe_id)
+
+
+# ---------------------------------------------------------------------------
+# F2: 门店存量配方导入（products/product_bom → RD ic_recipes）
+# ---------------------------------------------------------------------------
+
+def _open_source_warehouse(master_conn, code: str):
+    """打开源门店 db（只读用途），返回 conn 或 None。"""
+    import sqlite3 as _sq
+
+    from blueprints.publish_recipe_pure import _resolve_warehouse_db_path
+    path = _resolve_warehouse_db_path(master_conn, code)
+    if path is None or not Path(path).exists():
+        return None
+    conn = _sq.connect(path)
+    conn.row_factory = _sq.Row
+    return conn
+
+
+@bp.route("/recipe-cost/import", methods=["GET"])
+@require_platform_admin
+def import_index():
+    """第一步：选择源门店。列出各 storefront 仓的产品数与冲突概况。"""
+    import sqlite3 as _sq
+    from contextlib import closing
+
+    from blueprints.recipe_import_pure import list_source_warehouses, scan_source_products
+    from config import MASTER_DB
+
+    rd_db = get_warehouse_db()
+    warehouses = []
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        for w in list_source_warehouses(master_conn):
+            entry = {**w, "product_count": 0, "importable": 0,
+                     "conflicts": 0, "error": None}
+            src = _open_source_warehouse(master_conn, w["code"])
+            if src is None:
+                entry["error"] = "门店数据库不可用"
+                warehouses.append(entry)
+                continue
+            try:
+                prods = scan_source_products(src, rd_db)
+                entry["product_count"] = len(prods)
+                entry["importable"] = sum(1 for p in prods if p["importable"])
+                entry["conflicts"] = sum(1 for p in prods if p["conflict"])
+            except Exception as exc:  # noqa: BLE001 — 单仓不可达不阻断整页
+                entry["error"] = str(exc)
+            finally:
+                src.close()
+            warehouses.append(entry)
+    return render_template("recipe_cost/import.html", warehouses=warehouses)
+
+
+@bp.route("/recipe-cost/import/preview", methods=["GET"])
+@require_platform_admin
+def import_preview():
+    """第二步：预览某门店全部产品的匹配情况。"""
+    import sqlite3 as _sq
+    from contextlib import closing
+
+    from blueprints.recipe_import_pure import scan_source_products
+    from config import MASTER_DB
+
+    code = request.args.get("warehouse", "").strip()
+    if not code:
+        flash("请先选择源门店")
+        return redirect(url_for("recipe_cost.import_index"))
+
+    rd_db = get_warehouse_db()
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        src = _open_source_warehouse(master_conn, code)
+    if src is None:
+        flash(f"门店 {code} 数据库不可用")
+        return redirect(url_for("recipe_cost.import_index"))
+    try:
+        products = scan_source_products(src, rd_db)
+    finally:
+        src.close()
+    return render_template(
+        "recipe_cost/import_preview.html",
+        warehouse_code=code,
+        products=products,
+    )
+
+
+@bp.route("/recipe-cost/import", methods=["POST"])
+@require_platform_admin
+def import_execute():
+    """第三步：勾选导入。事务性写入 RD ic_recipes + 草稿版本 + audit。"""
+    import sqlite3 as _sq
+    from contextlib import closing
+
+    from blueprints.recipe_import_pure import import_products, scan_source_products
+    from config import MASTER_DB
+
+    code = request.form.get("warehouse", "").strip()
+    conflict_mode = request.form.get("conflict_mode", "skip")
+    if conflict_mode not in ("skip", "overwrite"):
+        conflict_mode = "skip"
+    selected = {int(x) for x in request.form.getlist("product_ids") if x.strip().isdigit()}
+    if not code or not selected:
+        flash("请选择源门店并至少勾选一个产品")
+        return redirect(url_for("recipe_cost.import_index"))
+
+    rd_db = get_warehouse_db()
+    with closing(_sq.connect(MASTER_DB)) as master_conn:
+        master_conn.row_factory = _sq.Row
+        src = _open_source_warehouse(master_conn, code)
+    if src is None:
+        flash(f"门店 {code} 数据库不可用")
+        return redirect(url_for("recipe_cost.import_index"))
+
+    try:
+        all_products = scan_source_products(src, rd_db)
+    finally:
+        src.close()
+    picked = [p for p in all_products if p["product_id"] in selected]
+    if not picked:
+        flash("勾选的产品在源门店不存在")
+        return redirect(url_for("recipe_cost.import_preview", warehouse=code))
+
+    result = import_products(
+        target_conn=rd_db,
+        products=picked,
+        conflict_mode=conflict_mode,
+        source_warehouse_code=code,
+    )
+
+    # 每个导入成功的 ic_recipe 建草稿版本（进入发布链路）
+    user_id = g.user["id"] if g.user else None
+    for _pid, new_recipe_id, _name in result["imported"]:
+        _upsert_recipe_draft("ic_recipe", new_recipe_id, user_id=user_id)
+
+    audit("recipe_cost.import", "warehouse", None, {
+        "source": code,
+        "conflict_mode": conflict_mode,
+        "imported": [
+            {"product_id": pid, "ic_recipe_id": rid, "name": n}
+            for pid, rid, n in result["imported"]
+        ],
+        "skipped_count": len(result["skipped"]),
+        "rejected_count": len(result["rejected"]),
+    })
+
+    n_imp = len(result["imported"])
+    n_skip = len(result["skipped"])
+    n_rej = len(result["rejected"])
+    flash(f"导入完成：成功 {n_imp} / 跳过 {n_skip} / 拒绝 {n_rej}")
+    for pid, name, reason in result["rejected"][:5]:
+        flash(f"拒绝 #{pid} {name}：{reason}")
+    if n_imp:
+        return redirect(url_for("recipe_cost.overview"))
+    return redirect(url_for("recipe_cost.import_preview", warehouse=code))
 
 
 @bp.route("/recipe-cost/recipes/<int:recipe_id>/publish", methods=["POST"])

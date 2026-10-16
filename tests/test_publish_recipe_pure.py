@@ -14,13 +14,15 @@ def _bootstrap_two_warehouses(tmp_path: Path):
     ic_recipe + 1 item with overlapping sku.
     """
     import sqlite3
+
     from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
 
     master = tmp_path / "master.db"
     rd_db = tmp_path / "rd_001.db"
     wh_db = tmp_path / "wh_001.db"
 
-    import db as db_mod, config as cfg
+    import config as cfg
+    import db as db_mod
     db_mod.MASTER_DB = master
     db_mod.WAREHOUSE_DB_DIR = tmp_path
     cfg.MASTER_DB = master
@@ -91,8 +93,9 @@ def _bootstrap_two_warehouses(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def test_snapshot_recipe_captures_head_and_lines(tmp_path):
-    from blueprints.publish_recipe_pure import snapshot_recipe
     import sqlite3
+
+    from blueprints.publish_recipe_pure import snapshot_recipe
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
     rd.row_factory = sqlite3.Row
@@ -110,8 +113,11 @@ def test_snapshot_recipe_captures_head_and_lines(tmp_path):
 
 def test_upsert_draft_version_creates_then_updates(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import (
-        snapshot_recipe, upsert_draft_version, list_versions,
+        list_versions,
+        snapshot_recipe,
+        upsert_draft_version,
     )
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -140,14 +146,18 @@ def test_upsert_draft_version_creates_then_updates(tmp_path):
     stored_snap = json.loads(versions[0]["snapshot_json"])
     assert stored_snap["head"]["sale_price"] == 280.0
 
-    m.close(); rd.close()
+    m.close()
+    rd.close()
 
 
 def test_publish_then_new_draft_increments_version(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import (
-        snapshot_recipe, upsert_draft_version, publish_version,
         list_versions,
+        publish_version,
+        snapshot_recipe,
+        upsert_draft_version,
     )
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -228,8 +238,11 @@ def test_publish_then_new_draft_increments_version(tmp_path):
 
 def test_publish_to_invalid_warehouse_returns_partial(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import (
-        snapshot_recipe, upsert_draft_version, publish_version,
+        publish_version,
+        snapshot_recipe,
+        upsert_draft_version,
     )
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -256,6 +269,7 @@ def test_publish_to_invalid_warehouse_returns_partial(tmp_path):
 
 def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -277,7 +291,8 @@ def test_apply_item_to_warehouse_inserts_when_missing(tmp_path):
     # （走 items 默认 0），价格由 canonical 扇出统一下发。
     assert float(row["unit_cost"]) == 0.0
     assert float(row["selling_price"]) == 0.0
-    wh.commit(); wh.close()
+    wh.commit()
+    wh.close()
 
 
 def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
@@ -286,6 +301,7 @@ def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
     P0-9（2026-10-09）后价格收归主数据，由 canonical 扇出下发，配方发布
     仍不是价格通道；本测试锁定「发布不覆盖门店价」这一不变式。"""
     import sqlite3
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -306,6 +322,7 @@ def test_apply_item_to_warehouse_overwrite_replaces_prices(tmp_path):
 
 def test_apply_item_to_warehouse_keep_doesnt_touch_existing(tmp_path):
     import sqlite3
+
     from blueprints.publish_recipe_pure import apply_item_to_warehouse, snapshot_item
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
@@ -325,7 +342,8 @@ def test_apply_item_to_warehouse_keep_doesnt_touch_existing(tmp_path):
 
 def test_publish_items_partial_when_one_warehouse_missing(tmp_path):
     import sqlite3
-    from blueprints.publish_recipe_pure import publish_items, snapshot_item
+
+    from blueprints.publish_recipe_pure import publish_items
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     rd = sqlite3.connect(rd_db)
     rd.row_factory = sqlite3.Row
@@ -355,8 +373,8 @@ def test_snapshot_recipe_picks_up_source_type_for_polymorphic(tmp_path, monkeypa
     apply_item_to_warehouse with all-NULL fields and crashed on
     INSERT INTO categories (NOT NULL constraint on name).
     """
-    import db as db_module
     import config as config_module
+    import db as db_module
     from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
     master = tmp_path / "master.db"
     rd = tmp_path / "rd.db"
@@ -399,18 +417,18 @@ def test_snapshot_recipe_picks_up_source_type_for_polymorphic(tmp_path, monkeypa
     conn.close()
 
 
-def test_apply_polymorphic_skips_ic_recipe_lines(tmp_path, monkeypatch):
-    """_apply_recipe_snapshot_to_warehouse must skip polymorphic ic_recipe
-    lines in the items loop (the recipe head still gets inserted).
+def test_apply_polymorphic_recreates_referenced_ic_recipe(tmp_path, monkeypatch):
+    """D2（2026-10-16）：_apply_recipe_snapshot_to_warehouse 对多态
+    ic_recipe 行不再 skip —— 用 snapshot 里挂的 referenced_ic_snapshots
+    在目标仓递归重建被引用基料，并写入完整引用行。
 
-    Regression: previously, polymorphic lines crashed with
-    'NOT NULL constraint failed: categories.name' because the
-    all-NULL item snapshot was passed to apply_item_to_warehouse.
+    历史：更早版本直接崩（NOT NULL categories.name）；上一版 skip 行
+    导致门店出品配方缺基料、成本全错。
     """
-    import db as db_module
     import config as config_module
-    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
+    import db as db_module
     from blueprints.recipe_cost import _apply_recipe_snapshot_to_warehouse
+    from db import init_master_db, init_warehouse_db, migrate_warehouse_db_columns
     master = tmp_path / "master.db"
     rd = tmp_path / "rd.db"
     wh = tmp_path / "wh.db"
@@ -461,17 +479,26 @@ def test_apply_polymorphic_skips_ic_recipe_lines(tmp_path, monkeypatch):
     snap = snapshot_recipe(rd_conn, "recipe", outer)
     rd_conn.close()
 
-    # Apply should not raise (would have raised NOT NULL constraint failed
-    # before the fix). Recipe head inserts, BOM insert skipped for ic_recipe.
+    # Apply：多态行递归重建被引用 ic_recipe + 写入引用行。
     _apply_recipe_snapshot_to_warehouse(m, "wh_001", snap)
 
     wh_conn = sqlite3.connect(wh)
     wh_conn.row_factory = sqlite3.Row
     head = wh_conn.execute("SELECT name FROM recipes WHERE name='polymorphic'").fetchone()
     assert head is not None, "recipe head should be inserted"
-    # BOM row should NOT be inserted (polymorphic line skipped).
+    # 目标仓递归重建了被引用的「inner」基料（1 条 BOM 行）
+    inner_row = wh_conn.execute(
+        "SELECT id FROM ic_recipes WHERE name='inner'").fetchone()
+    assert inner_row is not None, "referenced ic_recipe should be recreated"
+    inner_lines = wh_conn.execute(
+        "SELECT COUNT(*) AS c FROM ic_recipe_items WHERE ic_recipe_id=?",
+        (inner_row["id"],)).fetchone()["c"]
+    assert inner_lines == 1
+    # 引用行完整写入，指向重建的基料
     lines = wh_conn.execute("SELECT * FROM recipe_items").fetchall()
-    assert len(lines) == 0, f"expected 0 recipe_items, got {len(lines)}"
+    assert len(lines) == 1, f"expected 1 recipe_items, got {len(lines)}"
+    assert lines[0]["source_type"] == "ic_recipe"
+    assert int(lines[0]["ic_recipe_id"]) == int(inner_row["id"])
     wh_conn.close()
     m.close()
 
@@ -496,8 +523,9 @@ def test_list_unmanaged_bom_items_flags_null_canonical(tmp_path):
     rd.close()
 
 
-def test_list_unmanaged_bom_items_skips_polymorphic_ic_recipe(tmp_path):
-    """recipe 类型里 source_type='ic_recipe' 的行引用的是别的配方，不参与校验。"""
+def test_list_unmanaged_bom_items_recurses_into_referenced_ic_recipe(tmp_path):
+    """D2：source_type='ic_recipe' 的行本身不参与品项校验，但其引用的
+    冰激凌配方的 BOM 品项会被递归校验（发布时需要在目标仓重建基料）。"""
     from blueprints.publish_recipe_pure import list_unmanaged_bom_items
     master, rd_db, wh_db, milk, sugar, ic = _bootstrap_two_warehouses(tmp_path)
     ts = "2026-10-09 12:00:00"
@@ -511,13 +539,20 @@ def test_list_unmanaged_bom_items_skips_polymorphic_ic_recipe(tmp_path):
         "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
         "qty_per_unit) VALUES (?, 'ic_recipe', NULL, ?, 2.0)", (outer, ic))
     rd.commit()
-    # 纯多态行 → 无需纳管
+    # 被引用 ic 的 BOM（SKU-MILK/SKU-SUGAR）未纳管 → 递归报出
+    rows = list_unmanaged_bom_items(rd, "recipe", outer)
+    assert {r["sku"] for r in rows} == {"SKU-MILK", "SKU-SUGAR"}
+
+    # ic BOM 纳管后 → 纯多态行不再报
+    rd.execute("UPDATE items SET canonical_id = id WHERE id IN (?, ?)", (milk, sugar))
+    rd.commit()
     assert list_unmanaged_bom_items(rd, "recipe", outer) == []
 
     # 混一条未纳管的 item 行 → 只报这条
     rd.execute(
         "INSERT INTO recipe_items (recipe_id, source_type, item_id, ic_recipe_id, "
         "qty_per_unit) VALUES (?, 'item', ?, NULL, 1.0)", (outer, milk))
+    rd.execute("UPDATE items SET canonical_id = NULL WHERE id = ?", (milk,))
     rd.commit()
     rows = list_unmanaged_bom_items(rd, "recipe", outer)
     assert [r["sku"] for r in rows] == ["SKU-MILK"]
