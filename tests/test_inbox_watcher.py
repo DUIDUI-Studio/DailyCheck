@@ -632,5 +632,58 @@ def test_rotate_cli_runs(tmp_path: Path):
     assert not (tmp_path / "inbox.jsonl.rotating").exists()
 
 
+# ============================================================
+# 输入层损坏：listener 不得崩溃（Issue #66 审核 H-1 / L-6）
+# ============================================================
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        # json.loads 对 >4300 位整数字面量抛 ValueError（不是 JSONDecodeError）
+        ("4301 位整数", b'{"failures":{"d":{"n":' + b"9" * 4301 + b',"next":0}}}'),
+        # 非 UTF-8 字节 → UnicodeDecodeError（ValueError 子类，不是 OSError）
+        ("非 UTF-8 字节", b'{"failures":{},"x":"\xff\xfe\x80"}'),
+        # 超深嵌套 → RecursionError（既非 OSError 也非 ValueError）
+        ("超深嵌套", b"[" * 200000 + b"]" * 200000),
+    ],
+)
+def test_state_load_survives_json_layer_damage(
+    tmp_path: Path, label: str, payload: bytes, capsys
+):
+    """损坏发生在 `json.loads` / `read_text` 层时也必须只告警、不崩溃。
+
+    修复前异常网只捕 `(OSError, json.JSONDecodeError)` → 上述三种形态（均为损坏
+    state，非攻击）直穿 `main()`（只捕 KeyboardInterrupt）→ systemd
+    `Restart=always` 把崩溃掩盖成静默重启循环。本用例只断言「不抛异常 + 状态自洽」，
+    不锁死具体解析结果，故对不同 CPython 的 `int_max_str_digits` 设置也稳定。
+    """
+    state_file = tmp_path / "state.json"
+    state_file.write_bytes(payload)
+    st = inbox_watcher.WatcherState.load(state_file)  # 修复前此处抛异常
+    assert isinstance(st.handled_ids, set)
+    assert isinstance(st.failures, dict)
+    assert "WARNING" in capsys.readouterr().out or not st.failures, label
+
+
+def test_delivery_id_lone_surrogate_is_bad_line(tmp_path: Path, capsys):
+    """`"\\ud800"` 这类孤立代理字符的 delivery_id 不得让 listener 崩溃（L-6）。
+
+    它既不能 `print`（`UnicodeEncodeError`），也不能作为 state 文件的键写盘 ——
+    修复前 `_log` / `save()` 处抛 UnicodeEncodeError 直穿 main()。现按坏行处理
+    （指纹去重 + `!r` 转义打印），与孪生副本 `dailycheck_dashboard_on_pr.py` 同口径。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    cfg.inbox.write_text(
+        '{"delivery_id":"\\ud800","action":"opened","repo_full_name":"' + REPO + '"}\n',
+        encoding="utf-8",
+    )
+    state = inbox_watcher.WatcherState()
+    assert inbox_watcher.process_once(cfg, state) == 0  # 修复前此处抛 UnicodeEncodeError
+    assert _read_marker(marker) == []
+    assert state.handled_ids == set()
+    assert len(state.bad_hashes) == 1
+    assert "malformed inbox line" in capsys.readouterr().out
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

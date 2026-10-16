@@ -29,11 +29,18 @@
 #      prune，防状态无限膨胀；failures 额外排除已 handled 的 id（否则该类条目
 #      永不被重试却让 retry_due() 恒 True → 主循环每轮空跑）
 #   7. 状态里的失败条目在 **load() 边界一次性归一化**（`next` 非数值 / 非有限 /
-#      溢出 / 负数 / 越界，`n` 非数值 / 非正整数 / 越界 → 一律钳制为合法值；
-#      非 dict 的值丢弃）：损坏的 state 绝不能让 listener 崩溃（systemd
-#      Restart=always 会把崩溃掩盖成「重启」），也绝不能让条目永久锁死。
-#      归一化后全模块只有 _sane_next / _normalize_failure 一种口径 —— 不存在
-#      「一处判损坏、另一处照采信」的不一致（Issue #51 第 5 轮审核 M-1 教训）
+#      溢出 / 负数 / 超出「配置封顶 + 时钟余量」（`sane_ahead_for`），`n` 非数值 /
+#      非正整数 / 越界 → 一律钳制为合法值；非 dict 的值丢弃），**且每次实际钳制 /
+#      丢弃都打 WARNING 留痕**（不静默）。两个「绝不允许」：
+#        · 损坏的 state 绝不能让 listener 崩溃（systemd Restart=always 会把崩溃
+#          掩盖成「重启」）—— 异常网须覆盖 OSError + ValueError（含
+#          JSONDecodeError / UnicodeDecodeError / json 对 >4300 位整数的
+#          ValueError）+ RecursionError（超深嵌套）
+#        · 损坏的条目绝不能被静默锁死 —— 归一化后只剩「立即重试」或「合法等待」
+#          两种归宿，两者都在 journal 有痕
+#      归一化只用 _sane_next / _normalize_failure，上界存在状态对象上
+#      （`state.sane_ahead`），使用点（retry_due / process_once）与归一化点共用
+#      同一口径 —— 不存在「一处判损坏、另一处照采信」（Issue #51 第 5 轮 M-1 教训）
 #
 # 部署（详见 deploy/systemd/dc-dashboard-generator.service）：
 #   - systemd user unit: deploy/systemd/dc-dashboard-generator.service
@@ -74,12 +81,21 @@ DEFAULT_RETRY_MAX = 120.0  # 秒；退避封顶（render 偶尔慢，给宽一�
 STATE_VERSION = 1
 
 # 退避表合理性上界（load() 边界归一化 / 纵深防御共用）：
-#   默认退避封顶仅 120s，因此任何落在「现在 + 7 天」之后的 next 只可能来自损坏
-#   state（时钟被回拨 / 手改 / 版本错位）；7 天这个界故意放宽，即使运维把
-#   --retry-max 调到 7 天也仍在界内。同理 n 的位数上界远超真实需要（120s 封顶下
-#   10 次即到顶），只为挡住天文位数 / inf 造成的崩溃与挂死。
-RETRY_NEXT_SANE_AHEAD_S = 7 * 24 * 3600.0
-MAX_SANE_ATTEMPTS = 1024
+#   程序自身**只可能**写出 `next ≤ now + retry_max`（写点唯一，见 process_once），
+#   因此「比配置封顶还晚」的 next 只可能来自损坏 state（时钟被回拨 / 手改 / 版本
+#   错位）。上界 = 配置封顶 + 时钟余量，余量用于容忍宿主时钟小幅回拨 —— 判错的
+#   代价只是「提前重试一次 + 一条 WARNING」，无副作用，故宁可收紧不放松。
+RETRY_NEXT_CLOCK_SLACK_S = 300.0
+MAX_SANE_ATTEMPTS = 1024  # n 的位数上界：远超真实需要（120s 封顶下 10 次即到顶）
+
+
+def sane_ahead_for(retry_max: float) -> float:
+    """由配置的退避封顶推出「next 的合理性上界」（秒）。"""
+    base = retry_max if retry_max > 0 else DEFAULT_RETRY_MAX
+    return base + RETRY_NEXT_CLOCK_SLACK_S
+
+
+DEFAULT_SANE_AHEAD = DEFAULT_RETRY_MAX + RETRY_NEXT_CLOCK_SLACK_S
 
 
 def _log(msg: str) -> None:
@@ -91,13 +107,20 @@ def _warn(msg: str) -> None:
     print(f"[dashboard_trigger] WARNING: {msg}", flush=True)
 
 
+def _short(value: object, limit: int = 160) -> str:
+    """把任意值 repr 成可安全打印的短串（截断 + repr 自身转义代理字符）。"""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 # ============================================================
 # 损坏状态归一化（全模块唯一口径）
 # ============================================================
-def _sane_next(value: object, now: float) -> float | None:
+def _sane_next(value: object, now: float, sane_ahead: float = DEFAULT_SANE_AHEAD) -> float | None:
     """把任意 `next` 值归一为合法的「下次可重试时刻」（unix 秒）；None = 损坏。
 
-    合法 = 有限、非负、且不超过 `now + RETRY_NEXT_SANE_AHEAD_S` 的实数。
+    合法 = 有限、非负、且不超过 `now + sane_ahead` 的实数（上界由配置封顶推出，
+    见 `sane_ahead_for`）。
 
     ⚠️ `float()` 对 ≥309 位整数抛的是 **OverflowError**（ArithmeticError 子类，
     **不是** ValueError），必须显式列入 except —— 否则损坏 state 会直穿 main()
@@ -109,10 +132,12 @@ def _sane_next(value: object, now: float) -> float | None:
         return None
     if not math.isfinite(value_f) or value_f < 0:
         return None
-    return value_f if value_f <= now + RETRY_NEXT_SANE_AHEAD_S else None
+    return value_f if value_f <= now + sane_ahead else None
 
 
-def _normalize_failure(entry: dict, now: float) -> dict:
+def _normalize_failure(
+    entry: dict, now: float, sane_ahead: float = DEFAULT_SANE_AHEAD
+) -> dict:
     """把一条失败条目归一为合法形态 `{"n": int ∈ [0, MAX_SANE_ATTEMPTS], "next": float ≥ 0}`。
 
     损坏值一律按下述**保守**语义钳制（绝不丢弃整条 = 绝不静默放弃重试）：
@@ -129,11 +154,13 @@ def _normalize_failure(entry: dict, now: float) -> dict:
         n = 0
     if n < 0 or n > MAX_SANE_ATTEMPTS:
         n = 0
-    nxt = _sane_next(entry.get("next", 0), now)
+    nxt = _sane_next(entry.get("next", 0), now, sane_ahead)
     return {"n": n, "next": 0.0 if nxt is None else nxt}
 
 
-def _next_at(entry: object, now: float) -> float | None:
+def _next_at(
+    entry: object, now: float, sane_ahead: float = DEFAULT_SANE_AHEAD
+) -> float | None:
     """取失败条目的「下次可重试时刻」；None = 损坏（调用方一律按「已到期」处理）。
 
     与 load() 共用 `_sane_next` 的同一口径（纵深防御：覆盖内存态与未来新增写入点，
@@ -142,7 +169,7 @@ def _next_at(entry: object, now: float) -> float | None:
     """
     if not isinstance(entry, dict):
         return None
-    return _sane_next(entry.get("next", 0), now)
+    return _sane_next(entry.get("next", 0), now, sane_ahead)
 
 
 def _attempts(entry: object) -> int:
@@ -170,12 +197,13 @@ def retry_due(state: TriggerState, now: float | None = None) -> bool:
 
     故主循环必须把本条件与签名变化**并列**作为 process_once 的触发条件。
     损坏条目（`_next_at` 返回 None）同样返回 True：宁可多跑一轮触发自愈，也不
-    让一个无法解释的状态把条目永久锁死。
+    让一个无法解释的状态把条目永久锁死。上界取 `state.sane_ahead`（= load() 时由
+    配置封顶推出），保证与归一化点**同一口径**。
     """
     if now is None:
         now = time.time()
     for entry in state.failures.values():
-        next_at = _next_at(entry, now)
+        next_at = _next_at(entry, now, state.sane_ahead)
         if next_at is None or now >= next_at:
             return True
     return False
@@ -191,39 +219,74 @@ class TriggerState:
     failures: dict[str, dict] = field(default_factory=dict)
     # 坏行内容指纹（sha256 前 16 位）——同一坏行只 WARNING 一次，防日志刷屏
     bad_hashes: set[str] = field(default_factory=set)
+    # `next` 的合理性上界（秒，相对 now）——由配置退避封顶推出（sane_ahead_for），
+    # 运行期不变式，**不落盘**（save() 的 payload 是显式构造的）。放在状态对象上
+    # 是为了让归一化点（load）与所有使用点（retry_due / process_once）共用同一口径。
+    sane_ahead: float = DEFAULT_SANE_AHEAD
 
     @classmethod
-    def load(cls, path: Path) -> TriggerState:
+    def load(
+        cls, path: Path, *, sane_ahead: float = DEFAULT_SANE_AHEAD
+    ) -> TriggerState:
+        """读状态文件并把**全部**损坏形态在边界归一化（本模块唯一的归一化点）。
+
+        异常网必须覆盖三种「损坏 state 不崩」的形态，否则直穿 main() → systemd
+        `Restart=always` 崩溃循环（正是本 PR 要修的缺陷同型）：
+        - `OSError`：文件不可读
+        - `ValueError`：`json.JSONDecodeError`（语法），`UnicodeDecodeError`（非 UTF-8
+          字节），以及 `json.loads` 对 **> 4300 位整数字面量**抛的 ValueError
+          （CPython `sys.get_int_max_str_digits()` 默认 4300 —— 该形态比
+          `float()` 的 309 位溢出阈值更早触发，且异常类型不同）
+        - `RecursionError`：超深嵌套的 JSON（C 扫描器对 `[[[…]]]` 递归过深）
+        """
         if not path.exists():
-            return cls()
+            return cls(sane_ahead=sane_ahead)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            _warn(f"state file unreadable ({exc}); starting with empty state")
-            return cls()
+        except (OSError, ValueError, RecursionError) as exc:
+            _warn(f"state file unreadable ({_short(exc)}); starting with empty state")
+            return cls(sane_ahead=sane_ahead)
         if not isinstance(raw, dict):
             _warn("state file malformed (not an object); starting with empty state")
-            return cls()
+            return cls(sane_ahead=sane_ahead)
         handled = raw.get("handled_ids")
-        failures = raw.get("failures")
         bad = raw.get("bad_hashes")
+        raw_failures = raw.get("failures")
         now = time.time()
+
+        # 归一化 + **留痕**（Issue #51 上游审核 M-1：只修「永久锁死」不修「无 WARNING」
+        # 等于把静默丢弃缩量保留）。只有「实际发生变化」的条目才打 WARNING，合法条目
+        # 走快速路径不打扰；`!r` 转义保证孤立代理字符等也能安全打印。
+        failures: dict[str, dict] = {}
+        if isinstance(raw_failures, dict):
+            for key, entry in raw_failures.items():
+                if not isinstance(key, str):
+                    _warn(f"state 损坏: failures 的键 {_short(key)} 不是字符串 → 丢弃")
+                    continue
+                if not isinstance(entry, dict):
+                    _warn(
+                        f"state 损坏: failures[{key}] = {_short(entry)} 不是对象 → 丢弃"
+                        "该条目（下一轮按「未失败」重试一次）"
+                    )
+                    continue
+                fixed = _normalize_failure(entry, now, sane_ahead)
+                if fixed != entry:
+                    _warn(
+                        f"state 损坏: failures[{key}] = {_short(entry)} → "
+                        f"归一为 {_short(fixed)}（next 归 0 = 立即可重试）；"
+                        "重试一轮后自动重写为合法值"
+                    )
+                failures[key] = fixed
+
         return cls(
             handled_ids={x for x in handled if isinstance(x, str)}
             if isinstance(handled, list)
             else set(),
-            # 归一化在边界一次做完（见 _normalize_failure）：非 dict 的值丢弃
-            #（等价「不记得失败过」→ 下一轮重试一次），其余一律钳制为合法形态。
-            failures={
-                k: _normalize_failure(v, now)
-                for k, v in failures.items()
-                if isinstance(k, str) and isinstance(v, dict)
-            }
-            if isinstance(failures, dict)
-            else {},
+            failures=failures,
             bad_hashes={x for x in bad if isinstance(x, str)}
             if isinstance(bad, list)
             else set(),
+            sane_ahead=sane_ahead,
         )
 
     def save(self, path: Path) -> None:
@@ -280,8 +343,20 @@ def _parse_record(line: str) -> dict | None:
 
 
 def _delivery_id(rec: dict) -> str | None:
+    """取 delivery_id；不可用（非字符串 / 空 / **无法 UTF-8 编码**）返回 None。
+
+    孤立代理字符（inbox 行里写 `"\\ud800"` 这类 JSON 转义）能被 `json.loads` 解出，
+    但既无法用 `print` 打印（`UnicodeEncodeError`），也无法作为 argv 传给子进程 ——
+    故在此一律按「坏行」处理（坏行路径走指纹去重 + `!r` 转义打印，不崩）。
+    """
     did = rec.get("delivery_id")
-    return did if isinstance(did, str) and did else None
+    if not isinstance(did, str) or not did:
+        return None
+    try:
+        did.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return did
 
 
 # ============================================================
@@ -398,7 +473,7 @@ def process_once(cfg: TriggerConfig, state: TriggerState) -> int:
         # 重写成合法值（自愈）。load() 已在边界归一化过一次，此处是纵深防御，
         # 与 load() 共用同一口径。
         fail = state.failures.get(did)
-        next_at = _next_at(fail, now)
+        next_at = _next_at(fail, now, state.sane_ahead)
         if next_at is not None and now < next_at:
             continue
 
@@ -432,7 +507,7 @@ def process_once(cfg: TriggerConfig, state: TriggerState) -> int:
     new_handled = state.handled_ids & file_ids
     new_bad = state.bad_hashes & file_bad
     # failures 额外排除已 handled 的 id：process_once 开头的 handled 短路使这类条目
-    # 永不重试，留在表里只会让 retry_due() 恒 True（每轮空跑 + 日志放大）
+    # 永不重试（且**无任何日志**），留在表里只会让 retry_due() 恒 True → 主循环空转
     new_failures = {
         k: v for k, v in state.failures.items() if k in file_ids and k not in new_handled
     }
@@ -465,6 +540,13 @@ def build_config(args: argparse.Namespace) -> TriggerConfig:
         raise SystemExit("--poll-interval must be > 0")
     if args.trigger_timeout <= 0:
         raise SystemExit("--trigger-timeout must be > 0")
+    # 退避封顶必须 > 0：`retry_max <= 0` 会让 _retry_delay 走「不封顶」分支，配合
+    # 大 attempts 可写出 `{"next": Infinity}`（非标 JSON）并让 sane_ahead 失去依据。
+    # 这与 --poll-interval / --trigger-timeout 的既有校验同一风格。
+    if args.retry_max <= 0:
+        raise SystemExit("--retry-max must be > 0")
+    if args.retry_base < 0:
+        raise SystemExit("--retry-base must be >= 0 (0 = 立即重试，供调试)")
     trigger_argv = shlex.split(args.trigger_cmd) + [
         "--db", args.db,
         "--html-dir", args.html_dir,
@@ -537,12 +619,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = build_config(args)
-    state = TriggerState.load(cfg.state_file)
+    sane_ahead = sane_ahead_for(cfg.retry_max)
+    state = TriggerState.load(cfg.state_file, sane_ahead=sane_ahead)
     _log(
         f"started: inbox={cfg.inbox} state={cfg.state_file} "
         f"repo={cfg.repo} trigger={' '.join(cfg.trigger_argv[:3])}… "
-        f"handled={len(state.handled_ids)}"
+        f"handled={len(state.handled_ids)} retry_sane_ahead={sane_ahead:g}s"
     )
+    # 「inbox 不存在 + 退避表有到期条目」= 每轮都驱动 process_once（因为只等签名就
+    # 永不重试），但读不到 inbox 就零进度、零日志。启动时留一条痕，避免运维面对
+    # 「服务在跑、没有任何输出、重试也没发生」的静默态。只在进程启动时打一次，
+    # 不随轮询刷屏（正常时序里 receiver 很快创建 inbox）。
+    if not cfg.inbox.exists():
+        _warn(
+            f"inbox {cfg.inbox} 不存在 —— 等待 receiver 创建；"
+            "期间无条目可处理、退避重试也不会产生进度"
+        )
 
     if args.once:
         return 1 if process_once(cfg, state) else 0

@@ -85,7 +85,14 @@ class WatcherState:
             return cls()
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
+            # 异常网必须覆盖三类「损坏 state 不崩」（Issue #66 审核 H-1：只捕
+            # json.JSONDecodeError 会漏掉后两类，直穿 main() → systemd
+            # Restart=always 崩溃循环）：
+            #   ValueError —— JSONDecodeError（语法）/ UnicodeDecodeError（非 UTF-8
+            #     字节）/ json.loads 对 >4300 位整数字面量抛的 ValueError
+            #     （CPython sys.get_int_max_str_digits() 默认 4300）
+            #   RecursionError —— 超深嵌套 JSON（C 扫描器递归过深）
             _warn(f"state file unreadable ({exc}); starting with empty state")
             return cls()
         if not isinstance(raw, dict):
@@ -164,8 +171,22 @@ def _parse_record(line: str) -> dict | None:
 
 
 def _delivery_id(rec: dict) -> str | None:
+    """取 delivery_id；不可用（非字符串 / 空 / **无法 UTF-8 编码**）返回 None。
+
+    孤立代理字符（inbox 行里写 `"\\ud800"` 这类 JSON 转义）能被 `json.loads` 解出，
+    但既无法用 `print` 打印（`UnicodeEncodeError`），也无法作为 state 文件的键写盘
+    —— 故在此一律按「坏行」处理（坏行路径走指纹去重 + `!r` 转义打印，不崩）。
+    Issue #66 审核 L-6：与孪生副本 `deploy/scripts/dailycheck_dashboard_on_pr.py`
+    保持同一口径。
+    """
     did = rec.get("delivery_id")
-    return did if isinstance(did, str) and did else None
+    if not isinstance(did, str) or not did:
+        return None
+    try:
+        did.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return did
 
 
 # ============================================================

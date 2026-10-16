@@ -522,19 +522,184 @@ def test_huge_next_no_longer_locks_entry(tmp_path: Path):
 
 
 def test_sane_next_boundaries(tmp_path: Path):
-    """`_sane_next` 的边界语义钉死（下界含 0、上界含 now + 7 天，越界/非有限 → None）。
+    """`_sane_next` 的边界语义钉死（下界含 0、上界含 now + sane_ahead，越界/非有限 → None）。
 
-    直接钉住「合法 = 有限、非负、≤ now + RETRY_NEXT_SANE_AHEAD_S」这条唯一口径，
-    防止日后有人把范围检查改写成 NaN 会漏过的形式（如先把 NaN 混进 min/max）。
+    直接钉住「合法 = 有限、非负、≤ now + sane_ahead」这条唯一口径，防止日后有人把
+    范围检查改写成 NaN 会漏过的形式（如先把 NaN 混进 min/max）。
     """
     now = 1000.0
-    bound = now + trigger.RETRY_NEXT_SANE_AHEAD_S
+    ahead = trigger.DEFAULT_SANE_AHEAD
+    assert ahead == trigger.DEFAULT_RETRY_MAX + trigger.RETRY_NEXT_CLOCK_SLACK_S
+    bound = now + ahead
     assert trigger._sane_next(0, now) == 0.0  # 下界含 0（已到期）
     assert trigger._sane_next(now - 1, now) == now - 1  # 过期时刻合法（= 已到期）
     assert trigger._sane_next(now + 60, now) == now + 60
     assert trigger._sane_next(bound, now) == bound  # 上界含等号
     for bad in (None, "x", float("nan"), float("inf"), float("-inf"), 10**309, bound + 1, -1):
         assert trigger._sane_next(bad, now) is None, f"未判损坏：{bad!r}"
+    # 上界可由配置推出（sane_ahead_for），不再是一个「7 天」式的宽常量
+    assert trigger.sane_ahead_for(120.0) == 420.0
+    assert trigger.sane_ahead_for(86400.0) == 86700.0
+    assert trigger.sane_ahead_for(0.0) == 420.0  # <=0 时退化为默认封顶
+
+
+def test_load_rejects_next_beyond_configured_cap(tmp_path: Path, capsys):
+    """Issue #51 上游审核 M-1 的**残余带**也要关掉：`next ∈ (now+retry_max, now+7d]`。
+
+    「有限值一律采信」的口径矛盾不能只从「永久锁死」缩到「≤7 天静默锁死」：
+    程序自身只可能写出 `next ≤ now + retry_max`，故比 `now + sane_ahead` 更晚的
+    `next` 一律判损坏（→ 立即可重试 + WARNING）。
+    """
+    now = time.time()
+    state_file = tmp_path / "state.json"
+    _write_state(
+        state_file,
+        {
+            "d-lock-6d": {"n": 1, "next": now + 6 * 24 * 3600},  # 旧 7 天口径下被采信
+            "d-lock-3h": {"n": 1, "next": now + 3 * 3600},  # 旧 7 天口径下被采信
+            "d-legit": {"n": 2, "next": now + 90},  # 合法：≤ now + (120 + 300)
+        },
+    )
+    st = trigger.TriggerState.load(state_file, sane_ahead=trigger.sane_ahead_for(120.0))
+    assert st.failures["d-lock-6d"]["next"] == 0.0
+    assert st.failures["d-lock-3h"]["next"] == 0.0
+    assert st.failures["d-legit"]["next"] == now + 90  # 合法条目不得误伤
+    out = capsys.readouterr().out
+    # 必须是 WARNING 级（不是 info 级留痕）：损坏状态属「必须留痕事件」
+    assert out.count("[dashboard_trigger] WARNING: state 损坏") == 2
+    assert "d-legit" not in out
+    assert trigger.retry_due(st) is True
+
+
+def test_load_warns_on_normalization_and_silent_on_legit(tmp_path: Path, capsys):
+    """归一化必须留痕（M-1 ①：只修「永久锁死」不修「无 WARNING」= 静默丢弃缩量保留）。"""
+    state_file = tmp_path / "state.json"
+    now = time.time()
+    _write_state(
+        state_file,
+        {
+            "d-huge": {"n": 1, "next": 1e308},
+            "d-notdict": "garbage",
+            "d-ok": {"n": 3, "next": now + 30},
+        },
+    )
+    st = trigger.TriggerState.load(state_file)
+    out = capsys.readouterr().out
+    assert "[dashboard_trigger] WARNING: state 损坏" in out
+    assert "d-huge" in out and "d-notdict" in out and "d-ok" not in out
+    assert st.failures["d-ok"] == {"n": 3, "next": now + 30}
+
+
+@pytest.mark.parametrize(
+    ("label", "payload"),
+    [
+        # json.loads 对 >4300 位整数字面量抛 ValueError（不是 JSONDecodeError）
+        ("4301 位整数", b'{"failures":{"d":{"n":' + b"9" * 4301 + b',"next":0}}}'),
+        # 非 UTF-8 字节 → UnicodeDecodeError（ValueError 子类，不是 OSError）
+        ("非 UTF-8 字节", b'{"failures":{},"x":"\xff\xfe\x80"}'),
+        # 超深嵌套 → RecursionError（既非 OSError 也非 ValueError）
+        ("超深嵌套", b"[" * 200000 + b"]" * 200000),
+    ],
+)
+def test_load_survives_json_layer_damage(tmp_path: Path, label: str, payload: bytes, capsys):
+    """Issue #51/#66 上游审核 H-1：损坏发生在 `json.loads` / `read_text` 层时也不得崩溃。
+
+    修复前异常网只捕 `(OSError, json.JSONDecodeError)` → 上述三种形态直穿 `main()`
+    → systemd `Restart=always` 静默重启循环。本用例只断言「不抛异常 + 状态自洽」
+    （不锁死具体解析结果，故对不同 CPython 的 `int_max_str_digits` 设置也稳定）。
+    """
+    state_file = tmp_path / "state.json"
+    state_file.write_bytes(payload)
+    st = trigger.TriggerState.load(state_file)  # 修复前此处抛异常
+    assert isinstance(st.handled_ids, set)
+    for entry in st.failures.values():
+        assert 0 <= entry["n"] <= trigger.MAX_SANE_ATTEMPTS
+        assert isinstance(entry["next"], float)
+    assert trigger.retry_due(st) in (True, False)  # 可调用、不崩
+    assert "WARNING" in capsys.readouterr().out or not st.failures, label
+
+
+@pytest.mark.parametrize(
+    ("raw_n", "expect"),
+    [(0, 0), (1, 1), (1023, 1023), (1024, 1024), (1025, 0), (10**6, 0), (-1, 0)],
+)
+def test_normalize_failure_attempts_boundary(tmp_path: Path, raw_n: int, expect: int):
+    """`n` 的上下界钉死（L-4）：`[0, MAX_SANE_ATTEMPTS]` 保留，越界归 0。"""
+    now = time.time()
+    entry = {"n": raw_n, "next": now + 10}
+    fixed = trigger._normalize_failure(entry, now, trigger.DEFAULT_SANE_AHEAD)
+    assert fixed["n"] == expect, f"n={raw_n} → {fixed!r}"
+    assert trigger._attempts({"n": raw_n, "next": 0}) == expect
+    assert fixed["next"] == now + 10  # 合法 next 不得被连带改动
+
+
+def test_build_config_rejects_bad_retry_params(tmp_path: Path):
+    """L-4：`--retry-max <= 0` / `--retry-base < 0` 在启动期即拒（否则可写出 `next: Infinity`）。"""
+    base_argv = [
+        "--inbox",
+        str(tmp_path / "inbox.jsonl"),
+        "--trigger-cmd",
+        "/bin/sh -c 'exit 0'",
+    ]
+    for extra in (["--retry-max", "0"], ["--retry-max", "-5"], ["--retry-base", "-1"]):
+        with pytest.raises(SystemExit):
+            trigger.build_config(trigger.parse_args(base_argv + extra))
+    cfg = trigger.build_config(trigger.parse_args(base_argv + ["--retry-base", "0"]))
+    assert cfg.retry_base == 0.0  # base=0（立即重试）仍是合法调试口径
+
+
+def test_delivery_id_lone_surrogate_is_bad_line(tmp_path: Path, capsys):
+    """L-6：`"\\ud800"` 这类孤立代理字符的 delivery_id 不得让 listener 崩溃。
+
+    它既不能 `print`（UnicodeEncodeError）也不能作为 argv 传给子进程 —— 修复前
+    `_log` 处抛 UnicodeEncodeError 直穿 main()。现按坏行处理（指纹去重 + `!r` 转义打印）。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _touch_cmd(marker))
+    cfg.inbox.write_text(
+        '{"delivery_id":"\\ud800","action":"opened","repo_full_name":"' + REPO + '"}\n',
+        encoding="utf-8",
+    )
+    state = trigger.TriggerState()
+    assert trigger.process_once(cfg, state) == 0  # 修复前此处抛 UnicodeEncodeError
+    assert _read_marker(marker) == []
+    assert state.handled_ids == set()
+    assert len(state.bad_hashes) == 1
+    assert "malformed inbox line" in capsys.readouterr().out
+
+
+def test_main_warns_when_inbox_missing(tmp_path: Path):
+    """L-3：inbox 不存在 + 有到期条目 = 零进度零日志的静默态 → 启动时至少留一条痕。"""
+    state_file = tmp_path / "state.json"
+    _write_state(state_file, {"d-x": {"n": 1, "next": 0.0}})
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--inbox",
+            str(tmp_path / "nope.jsonl"),  # 不存在
+            "--state-file",
+            str(state_file),
+            "--trigger-cmd",
+            "/bin/sh -c 'exit 0'",
+            "--poll-interval",
+            "0.05",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        time.sleep(0.4)
+    finally:
+        proc.terminate()
+        try:
+            out = proc.stdout.read() if proc.stdout else ""
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out = proc.stdout.read() if proc.stdout else ""
+    assert out.count("不存在") == 1, f"提示缺失或刷屏（应为 1 条）：\n{out}"
 
 
 def test_prune_failures_for_handled_ids(tmp_path: Path):
