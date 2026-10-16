@@ -68,11 +68,13 @@ MemoryMax=256M
 TasksMax=64
 
 # 安全沙箱（不影响主站）
+# ⚠️ 服务代码/venv 在 /root/DailyCheck 下：ProtectHome 必须 ≤ read-only
+#    （true 会让 /root 不可见 → ExecStart 报 status=203/EXEC；2026-10-16 实测踩坑）
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/dailycheck-prod-agent /var/log/dailycheck
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 RestrictRealtime=true

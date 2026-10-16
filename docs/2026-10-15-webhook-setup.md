@@ -6,9 +6,11 @@
 >
 > **设计文档**：`docs/agent-framework/case-studies/2026-10-15-self-contained-dev-loop.md` 第 6 章"蓝绿部署" + 第 10 章"复盘"。
 >
-> **预计耗时**：40-60 分钟（DNS / 证书重签 / systemd / nginx reload / GitHub 配 webhook / §3.8 watcher+rotate）。
+> **预计耗时**：50-70 分钟（DNS / **443 放行核验** / **申请 hook 独立证书** / systemd / nginx / GitHub 配 webhook / §3.8 watcher+rotate）。
 >
 > **更新**：2026-10-16 增补 §3.8（inbox watcher + rotate，Issue #47）—— 链路「inbox.jsonl → Prod Agent」从「Prod 侧自行实现」变为本手册可部署的实装。
+>
+> **更新**：2026-10-16 首次部署完成后修正 —— ① 证书改**独立申请**（阿里云免费证书=单域名，不能给主证书加 SAN）；② 新增 **443 防火墙放行**前置与外部 vantage 复验；③ nginx 改**独立文件**部署；④ systemd `ProtectHome` 203/EXEC 踩坑记录。
 
 ## 1. 架构
 
@@ -50,10 +52,38 @@ hook.kjtang.cn:443 (新子域名)               │                      ▼  �
 | # | 项 | 验证命令 / 操作 | 期望 |
 |---|----|-----------------|------|
 | 1 | 域名 A 记录可加 | 阿里云 DNS 控制台 | 当前 `kjtang.cn` / `www.kjtang.cn` 已解析 → 112.124.18.246 |
-| 2 | 阿里云 SSL 证书可加 SAN | 阿里云 SSL 控制台 | 当前证书 `kjtang.cn` 阿里云 DV，2027-01-03 到期 |
-| 3 | /var/lib/dailycheck-prod-agent 目录 | `mkdir -p /var/lib/dailycheck-prod-agent && chown root:root` | 写入权限 + inbox 落盘 |
-| 4 | .venv 路径正确 | `ls /root/DailyCheck/.venv/bin/gunicorn` | 存在 |
-| 5 | 8443 端口空闲 | `ss -tlnp \| grep 8443` | 空（已被实测空闲） |
+| 2 | **443 入站已放行** | 见下方「⚠️ 443 核验」 | 外部 vantage 可达（**本机 curl 不算数**） |
+| 3 | 阿里云 SSL 可新增独立证书 | 阿里云 SSL 控制台 | 免费「个人测试证书」额度可用（每年 20 张） |
+| 4 | /var/lib/dailycheck-prod-agent 目录 | `mkdir -p /var/lib/dailycheck-prod-agent && chown root:root` | 写入权限 + inbox 落盘 |
+| 5 | .venv 路径正确 | `ls /root/DailyCheck/.venv/bin/gunicorn` | 存在 |
+| 6 | 8443 端口空闲 | `ss -tlnp \| grep 8443` | 空（已被实测空闲） |
+
+### ⚠️ 443 入站核验（2026-10-16 血泪教训，必做）
+
+**背景**：VPS 的 ufw 二进制已卸载（`dpkg -l ufw` 状态 `rc`），但**残留 iptables 链仍在生效**，
+`INPUT` policy = DROP，唯一放行清单是 `ufw-user-input` 链。2026-10-15 主站 HTTPS 上线时
+**漏了 443 放行** → `kjtang.cn` 的 443 对公网一直不可达（本地验证却全绿）。本次 webhook 部署一并修复。
+
+**最高危陷阱**：**VPS 本机 `curl https://...` 走 `lo` 接口被直通，照样返回 200 —— 不能证明外网可达！**
+（本次故障被本地验证整整掩盖一天。）外网可达性必须从**外部 vantage** 复验（§4 验收第 6 项）。
+
+```bash
+# 1. 查放行清单是否含 443（期望有输出；无输出 = 缺放行 = 外网 502/超时）
+iptables -S ufw-user-input | grep -E 'dport 443'
+
+# 2. 若缺，补放行（运行态）：
+iptables -I ufw-user-input 1 -p tcp -m tcp --dport 443 -j ACCEPT
+
+# 3. 持久化（不写文件则重启失效）——同步 /etc/iptables/rules.v4：
+#    在已有 '--dport 80 -j ACCEPT' 行后补同格式 443 行（或 netfilter-persistent save 全量落盘）
+netfilter-persistent save
+
+# 4. 复验：外部 vantage（§4 验收第 6 项）；另跑 nginx -T 确认运行态
+```
+
+> - 不要用 `ufw allow 443`（二进制已卸载）；不要只改 `rules.v4` 不应用（运行态不变）。
+> - `iptables -S` 会警告 `iptables-legacy tables present` —— 属残留表，**放行链以默认（nft 后端）输出为准**。
+> - `netfilter-persistent.service` = enabled，重启时从 `/etc/iptables/rules.v4` 恢复 → 文件必须同步。
 
 ## 3. 实施步骤
 
@@ -68,32 +98,31 @@ hook.kjtang.cn:443 (新子域名)               │                      ▼  �
    - TTL：10 分钟（短 TTL 调试期）
 4. 验证：`dig +short hook.kjtang.cn` → 应返回 `112.124.18.246`
 
-### 3.2 重新签证书加 SAN `hook.kjtang.cn`（15-30 分钟，含签发等待）
+### 3.2 申请 hook.kjtang.cn 独立证书（15-30 分钟，含签发等待）
 
-1. 登录阿里云 SSL 控制台
-2. 找到当前 `kjtang.cn` 证书 → 「续费」或「重新申请」
-3. 域名列表：保留 `kjtang.cn` / `www.kjtang.cn`，**追加 `hook.kjtang.cn`**
-4. 提交审核（DV 证书通常几分钟内签发）
-5. 下载证书（nginx 格式 = pem + key）
-6. **生产备份现证书**：
+> ⚠️ **阿里云免费「个人测试证书」是单域名产品** —— **不能**给现有主站证书追加 SAN。
+> hook 必须**单独申请**一张证书；主站证书完全不动（各自独立 90 天轮换，互不影响）。
+> （2026-10-16 修正：原文写的「重签主证书加 SAN」在阿里云免费证书上行不通。）
+
+1. 登录阿里云 SSL 控制台 → 「免费证书」→ 创建证书
+2. 域名填 `hook.kjtang.cn`（DNS 自动验证要求域名在本账号 —— `kjtang.cn` 已满足）
+3. 提交审核（DV 通常几分钟内签发；2026-10-16 实测签发，有效期至 **2027-01-13**）
+4. 下载（nginx 格式 = pem + key 两个文件）
+5. 上传到 VPS 并设权限：
    ```bash
-   cp /etc/nginx/ssl/kjtang.cn.pem /etc/nginx/ssl/kjtang.cn.pem.bak.$(date +%Y%m%d-%H%M%S)
-   cp /etc/nginx/ssl/kjtang.cn.key /etc/nginx/ssl/kjtang.cn.key.bak.$(date +%Y%m%d-%H%M%S)
+   scp <cert>.pem root@112.124.18.246:/etc/nginx/ssl/hook.kjtang.cn.pem
+   scp <key>.key  root@112.124.18.246:/etc/nginx/ssl/hook.kjtang.cn.key
+   ssh root@112.124.18.246 "chown root:root /etc/nginx/ssl/hook.kjtang.cn.pem /etc/nginx/ssl/hook.kjtang.cn.key \
+     && chmod 644 /etc/nginx/ssl/hook.kjtang.cn.pem && chmod 600 /etc/nginx/ssl/hook.kjtang.cn.key"
    ```
-7. 替换证书：
+6. 验证（在 VPS 上）：
    ```bash
-   # 新证书覆盖
-   cp <new-cert>.pem /etc/nginx/ssl/kjtang.cn.pem
-   cp <new-key>.key  /etc/nginx/ssl/kjtang.cn.key
-   chown root:root /etc/nginx/ssl/kjtang.cn.{pem,key}
-   chmod 644 /etc/nginx/ssl/kjtang.cn.pem
-   chmod 600 /etc/nginx/ssl/kjtang.cn.key
+   openssl x509 -in /etc/nginx/ssl/hook.kjtang.cn.pem -noout -subject -dates
+   # 期望：subject=CN=hook.kjtang.cn；notAfter 约 90 天后
+   openssl x509 -in /etc/nginx/ssl/hook.kjtang.cn.pem -noout -text | grep -A1 'Subject Alternative Name'
+   # 期望 SAN 含 DNS:hook.kjtang.cn
    ```
-8. 验证证书含 hook 域名：
-   ```bash
-   openssl x509 -in /etc/nginx/ssl/kjtang.cn.pem -noout -text | grep -A1 'Subject Alternative Name'
-   # 应含：DNS:kjtang.cn, DNS:www.kjtang.cn, DNS:hook.kjtang.cn
-   ```
+7. 记下到期日（90 天轮换）—— 届时重复本步骤重签，**不需动主站证书**。
 
 ### 3.3 写 WEBHOOK_SECRET 文件（1 分钟）
 
@@ -124,6 +153,11 @@ systemctl daemon-reload
 systemctl enable dc-webhook-receiver.service
 systemctl start dc-webhook-receiver.service
 
+# ⚠️ 若 start 报 status=203/EXEC —— 是 ProtectHome 沙箱问题：
+#    服务代码/venv 在 /root/DailyCheck 下，ProtectHome=true 会让 /root 不可见。
+#    本仓库 unit 已修正为 ProtectHome=read-only（2026-10-16 实测踩坑）；
+#    若从旧版本部署，先核对 unit 里这一行再 restart。
+
 # 4. 探活
 curl -sS http://127.0.0.1:8443/health
 # 期望：{"inbox_path":"/var/lib/dailycheck-prod-agent/inbox.jsonl","inbox_size":0,"max_inbox_lines":1000,"status":"ok"}
@@ -133,23 +167,33 @@ tail -F /var/log/dailycheck/webhook-receiver-access.log
 tail -F /var/log/dailycheck/webhook-receiver-error.log
 ```
 
-### 3.5 部署 nginx 片段（5 分钟）
+### 3.5 部署 nginx 配置（5 分钟）
 
 ```bash
-# 1. 在 /etc/nginx/sites-enabled/dailycheck 末尾追加 hook.kjtang.cn 段
-#    （debian 系 nginx 主配置是 include sites-enabled/*，追加到现有文件即可）
-cat deploy/nginx/hook.kjtang.cn.snippet.conf >> /etc/nginx/sites-enabled/dailycheck
+# 1. 独立文件部署（⚠️ 不要追加进 dailycheck 文件——那个文件归蓝绿 switch.sh 管，
+#    混写会被切换流程的备份/重写波及；独立文件与之完全解耦）
+cp deploy/nginx/hook.kjtang.cn.conf /etc/nginx/sites-enabled/hook.kjtang.cn
 
 # 2. 验证语法
 nginx -t
 # 期望：syntax is ok / test is successful
+# 若报 limit_req_zone "not allowed here" / "duplicate" → 它被放进了 server{}，
+#   必须在文件顶部 http 上下文（见配置文件头注释）
 
 # 3. reload（流式，0 中断）
 systemctl reload nginx
 
-# 4. 探活（外部域名）
-curl -I https://hook.kjtang.cn/health
+# 4. 本机路由验证（经 nginx → receiver，SNI 正确）
+curl -sI --resolve hook.kjtang.cn:443:127.0.0.1 https://hook.kjtang.cn/health
 # 期望：HTTP/2 200
+
+# ⚠️ 本机 200 ≠ 外网可达（lo 直通陷阱，见 §2）→ 必须外部 vantage 复验（§4 第 6 项）
+```
+
+**验证 nginx 运行态（conf 文件 ≠ 运行态，写文件后 reload 失败会悄悄分歧）**：
+
+```bash
+nginx -T 2>/dev/null | grep -c 'server_name hook.kjtang.cn'   # 期望：2（443 + 80 两个 server）
 ```
 
 ### 3.6 配 GitHub repo Webhook（3 分钟）
@@ -169,9 +213,9 @@ curl -I https://hook.kjtang.cn/health
 ### 3.7 端到端验证（5 分钟）
 
 1. 打开 https://github.com/ericmr1981/DailyCheck/settings/hooks
-2. 找到刚加的 webhook → 「Recent Deliveries」→ 应该是空
+2. 找到刚加的 webhook → 「Recent Deliveries」→ 应至少有 1 条 **ping** delivery（GitHub 添加时自动发）；若 ping 失败（红叉），先修通 ping（通常是 443 可达性，见 §2）再做下一步
 3. 让 Dev Agent 提一个测试 PR（或手动在 GitHub UI 上开一个空 PR）
-4. 回到 webhook 详情页 → 应看到一条 delivery 记录，HTTP response 202
+4. 回到 webhook 详情页 → 应看到一条 `pull_request` delivery 记录，HTTP response 202
 5. 验证 inbox 落盘：
    ```bash
    tail -1 /var/lib/dailycheck-prod-agent/inbox.jsonl | python3 -m json.tool
@@ -242,34 +286,45 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 
 | # | 项 | 命令 / 验证 |
 |---|----|-------------|
-| 1 | DNS 解析 | `dig +short hook.kjtang.cn` |
-| 2 | 证书含 hook 域名 | `openssl x509 -in /etc/nginx/ssl/kjtang.cn.pem -noout -text \| grep -A1 'Subject Alternative Name'` |
-| 3 | systemd 单元 active | `systemctl status dc-webhook-receiver.service` |
-| 4 | /health 200 | `curl -sS http://127.0.0.1:8443/health` |
-| 5 | nginx conf 验语法 | `nginx -T 2>&1 \| grep -A1 'server_name hook.kjtang.cn'` |
-| 6 | 外部 443 探活 | `curl -I https://hook.kjtang.cn/health` |
-| 7 | inbox 落盘 | `cat /var/lib/dailycheck-prod-agent/inbox.jsonl`（dev 测 PR 后应至少 1 行） |
-| 8 | 限速规则生效 | `head /var/log/nginx/hook.kjtang.cn.error.log`（看有无 503 限速日志） |
-| 9 | 单元测试通过 | `pytest tests/test_webhook_receiver.py tests/test_inbox_watcher.py -q`（CI 自动跑） |
-| 10 | GitGuardian pass | PR CI GitGuardian check pass |
-| 11 | watcher unit active | `systemctl status dc-inbox-watcher` |
-| 12 | inbox 新行 ≤5s 触发 | §3.8 步骤 4：手工投递 → journal 出现 `triggered: delivery=test-1`（≤5s） |
-| 13 | rotate timer 已启用 | `systemctl list-timers dc-inbox-rotate.timer`（下次 00:30） |
-| 14 | 端到端：PR → webhook → inbox → watcher → Prod Agent | 提一个测试 PR → GitHub Delivery 202 → watcher journal `triggered:` → Prod Agent 侧收到事件
+| 1 | DNS 解析 | `dig +short hook.kjtang.cn` → `112.124.18.246` |
+| 2 | 443 放行 + 持久化 | `iptables -S ufw-user-input \| grep -E 'dport 443'` 有输出；`grep 'dport 443' /etc/iptables/rules.v4` 有行 |
+| 3 | 证书为 hook 独立证书 | `openssl x509 -in /etc/nginx/ssl/hook.kjtang.cn.pem -noout -subject -dates`（CN=hook.kjtang.cn） |
+| 4 | systemd 单元 active | `systemctl status dc-webhook-receiver.service` |
+| 5 | /health 200（本机直连 receiver） | `curl -sS http://127.0.0.1:8443/health` |
+| 6 | **外网 443 可达（必须外部 vantage）** | **非 VPS 网络** curl `https://hook.kjtang.cn/health` → 200；或 check-host.net 多节点复验。⚠️ VPS 本机 curl 走 lo 直通会假阳性（§2） |
+| 7 | nginx 运行态含 hook server | `nginx -T 2>/dev/null \| grep -c 'server_name hook.kjtang.cn'` → 2 |
+| 8 | inbox 落盘 | `cat /var/lib/dailycheck-prod-agent/inbox.jsonl`（dev 测 PR 后应至少 1 行） |
+| 9 | 限速规则生效 | `head /var/log/nginx/hook.kjtang.cn.error.log`（看有无 503 限速日志） |
+| 10 | 单元测试通过 | `pytest tests/test_webhook_receiver.py tests/test_inbox_watcher.py -q`（CI 自动跑） |
+| 11 | GitGuardian pass | PR CI GitGuardian check pass |
+| 12 | watcher unit active | `systemctl status dc-inbox-watcher` |
+| 13 | inbox 新行 ≤5s 触发 | §3.8 步骤 4：手工投递 → journal 出现 `triggered: delivery=test-1`（≤5s） |
+| 14 | rotate timer 已启用 | `systemctl list-timers dc-inbox-rotate.timer`（下次 00:30） |
+| 15 | 端到端：PR → webhook → inbox → watcher → Prod Agent | 提一个测试 PR → GitHub Delivery 202 → watcher journal `triggered:` → Prod Agent 侧收到事件 |
+
+**2026-10-16 首次部署实测结果**（全链路已通，供下次部署对照）：
+
+- DNS ✅（本机/8.8.8.8/1.1.1.1/223.5.5.5 均解析至 112.124.18.246）
+- 外部 vantage（check-host.net 4/4 节点）✅ hook 与主站 443 均可达（主站 443 系本次一并修复的历史故障）
+- 测试 PR #49 → GitHub delivery `pull_request/opened` **202**（1.66s）→ inbox.jsonl 完整落盘 → receiver access log 可查 → PR 已关闭
+- redeliver ping delivery：修复前 502 → 修复后 **200**（0.68s）
 
 ## 5. 风险与回滚
 
 | 风险 | 缓解 | 回滚 |
 |------|------|------|
-| 证书重签期 webhook 不可达 | **先签好新证书再切 nginx**（步骤 3.2 顺序） | 用 .bak 还原证书 + `systemctl reload nginx` |
-| nginx 语法错 reload 失败 | 步骤 3.5 强制 `nginx -t` 验证 | `cp /etc/nginx/sites-enabled/dailycheck.bak /etc/nginx/sites-enabled/dailycheck` + reload |
+| **443 防火墙缺放行 → 外网不可达**（症状：外网 502/超时；⚠️ VPS 本机 curl 假阳性 200） | §2 前置核验（`iptables -S ufw-user-input` + 持久化文件） + §4 第 6 项**外部 vantage** 复验 | 无需回滚（补放行即修复；本次已修复并持久化） |
+| **hook 证书轮换期 webhook 短暂不可达**（替换文件 + reload 的瞬间） | 先下载签发好的新证书再替换，独立证书不动主站；90 天周期提前重签 | 还原旧 `.pem/.key`（替换前先 `.bak` 备份）+ `systemctl reload nginx` |
+| nginx 语法错 reload 失败 | 步骤 3.5 强制 `nginx -t` 验证 | **独立文件**：`rm /etc/nginx/sites-enabled/hook.kjtang.cn` + `systemctl reload nginx`（删文件即还原，不动主站） |
 | receiver 进程挂掉 | systemd `Restart=always`（5s 自动拉起） | `systemctl restart dc-webhook-receiver.service` |
+| **receiver 起不来 `status=203/EXEC`** | unit `ProtectHome=read-only`（已修正，服务代码在 /root 下） | 核对 unit 该行后 `systemctl daemon-reload && systemctl restart` |
 | inbox 写满 1000 | 反压返回 503，GitHub 暂停重试 | 手动 rotate inbox → 移到 `processed.jsonl` |
 | HMAC secret 泄漏 | secret 写 `/etc/dailycheck/webhook-secret`（600 root），不出现 prompt/git/log | GitHub repo webhook 设置里点「Redeliver」+ 重新生成 secret + 更新 systemd EnvironmentFile + 重启 receiver |
 | 旧 webhook 重投同一 delivery | 幂等按 delivery_id（receiver 200 duplicate） | 不需处理，receiver 自动忽略 |
 
 ## 6. 监控
 
+- **证书轮换（90 天周期，两份独立证书）**：hook 独立证书 2026-10-16 签发 → **2027-01-13 到期**；主站证书 → **2027-01-03 到期**。到期前重签（hook 走 §3.2）。远程查看到期时间：`echo | openssl s_client -connect hook.kjtang.cn:443 -servername hook.kjtang.cn 2>/dev/null | openssl x509 -noout -dates`
 - **inbox rotate（已实装，#47）**：`dc-inbox-rotate.timer` 每日 00:30 归档 >7 天条目到 `inbox.archive.jsonl`
 - **watcher 触发失败**：`journalctl -u dc-inbox-watcher | grep WARNING` 非空即链路告警（脚本内退避重试中；30 分钟兜底轮询不变）
 - **inbox size 观察**：`curl -sS http://127.0.0.1:8443/health` 的 `inbox_size`（持续逼近 1000 = rotate 失效需排查）

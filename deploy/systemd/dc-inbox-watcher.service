@@ -54,13 +54,15 @@ MemoryMax=256M
 TasksMax=64
 
 # 安全沙箱（与 dc-webhook-receiver.service 同规）
+# ⚠️ 脚本/venv 在 /root/DailyCheck 下：ProtectHome 必须 ≤ read-only（true → 203/EXEC）
+#    /root/.hermes 的写权限由 ReadWritePaths 在只读 home 上重新授予
 NoNewPrivileges=true
 ProtectSystem=strict
 # /var/lib/dailycheck-prod-agent: inbox + state 读写
 # /root/.hermes: 默认触发命令（Hermes webhook test）的 home 写路径
 ReadWritePaths=/var/lib/dailycheck-prod-agent /root/.hermes
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=read-only
 RestrictSUIDSGID=true
 RestrictNamespaces=true
 RestrictRealtime=true
