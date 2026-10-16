@@ -74,6 +74,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
         --ok:#1a7f37;--warn:#b45309;--err:#c73a3a;--idle:#9aa4b1;--accent:#2f6fed;
     }
     *{box-sizing:border-box}
+    html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
     body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;margin:0;background:var(--bg);color:var(--t1)}
     .wrap{max-width:1080px;margin:0 auto;padding:20px 20px 60px}
     .top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px;flex-wrap:wrap;gap:8px}
@@ -95,7 +96,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
     .bt{font-size:17px;font-weight:700}
     .banner .bs{font-size:12.5px;color:var(--t2);margin-top:3px}
     .banner .btime{margin-left:auto;font-size:12px;color:var(--t3);flex:none}
-    .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:6px}
+    .kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:6px}
     .kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
     .kpi .kv{font-size:25px;font-weight:700;line-height:1.15}
     .kpi .kv small{font-size:13px;font-weight:500;color:var(--t2)}
@@ -113,7 +114,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
     .task.err{border-top-color:#ef4444}
     .task.pending{border-top-color:#93c5fd}
     .task.warn{border-top-color:#f59e0b}
-    .task .th{display:flex;justify-content:space-between;align-items:center;gap:6px}
+    .task .th{display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap}
     .task .tn{font-size:14px;font-weight:700}
     .task .tm{font-size:12px;color:var(--t2);margin-top:5px;line-height:1.6}
     .task .tl{margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px;color:var(--t2);line-height:1.7}
@@ -129,6 +130,8 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
     td{padding:7px 12px;border-top:1px solid #f1f2f4}
     tr:hover td{background:#fafbfc}
     .num{text-align:right;font-variant-numeric:tabular-nums}
+    .tbl{overflow-x:auto;-webkit-overflow-scrolling:touch}
+    .tl,.tm,.issue .id,.note,.meta span,td{overflow-wrap:break-word}
     .b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;white-space:nowrap}
     .b.ok{background:#e6f7ec;color:#0a7a35}
     .b.warn{background:#fdf0e0;color:#b45309}
@@ -148,11 +151,45 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
     .cv.ok{color:#0a7a35}
     .cv.q{color:#9ca3af;font-weight:400}
     .cv.bad{color:#dc2626}
+    /* ---------- 响应式：平板（iPad 竖屏 / 小笔记本）---------- */
+    @media(max-width:1024px){
+        .wrap{padding:18px 18px 52px}
+    }
+    /* ---------- 响应式：手机 / 小屏 ---------- */
     @media(max-width:760px){
-        .kpis{grid-template-columns:repeat(2,1fr)}
+        .wrap{padding:16px 14px calc(48px + env(safe-area-inset-bottom))}
+        h1{font-size:19px}
+        nav{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+        nav::-webkit-scrollbar{display:none}
+        nav a{white-space:nowrap;flex:none;padding:6px 10px}
+        .banner{flex-wrap:wrap;padding:14px 16px;gap:10px}
+        .banner .btime{display:none}
+        .bt{font-size:15.5px}
+        .kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+        .kpi{padding:12px 14px}
+        .kpi .kv{font-size:22px}
+        h2{font-size:15px;flex-wrap:wrap}
+        h2 .hint{margin-left:0;flex-basis:100%}
         .tasks{grid-template-columns:1fr}
-        .issue{flex-direction:column;gap:2px}
-        .banner{flex-wrap:wrap}.banner .btime{display:none}
+        .issue{flex-direction:column;gap:2px;padding:10px 12px}
+        .tbl table{min-width:560px}
+        th,td{padding:7px 10px;font-size:12.5px}
+        .note{padding:12px 14px}
+        .meta{gap:4px 10px}
+    }
+    /* ---------- 响应式：小屏手机 ---------- */
+    @media(max-width:480px){
+        .wrap{padding:14px 12px calc(40px + env(safe-area-inset-bottom))}
+        h1{font-size:17.5px}
+        .sub{font-size:11.5px}
+        .banner{padding:12px 14px;margin:10px 0 12px}
+        .bt{font-size:15px}
+        .banner .bs{font-size:12px}
+        .kpi .kv{font-size:19.5px}
+        .kpi .kk{font-size:12px}
+        .kpi .kdiff{font-size:11px}
+        .tbl table{min-width:520px}
+        h2{margin:22px 0 10px}
     }
 </style>
 </head>
@@ -446,7 +483,7 @@ def _render_issues(issues: list[dict]) -> str:
         )
         details = (
             '<details><summary>最近 Closed Issue（最多 5 条）</summary>'
-            f'<div class="inner"><table><tr><th>#</th><th>标题</th><th>关闭日</th></tr>{rows}</table></div>'
+            f'<div class="inner"><div class="tbl"><table><tr><th>#</th><th>标题</th><th>关闭日</th></tr>{rows}</table></div></div>'
             '</details>'
         )
     return body + "\n" + details
@@ -488,7 +525,7 @@ def _render_prs(prs: list[dict]) -> str:
         )
         sections.append(
             f'<div class="note" style="padding:8px 14px; margin:0 0 8px"><b>已合并（近 20）</b></div>'
-            f'<table><tr><th>PR</th><th>分支</th><th>标题</th><th>合并日</th></tr>{rows}</table>'
+            f'<div class="tbl"><table><tr><th>PR</th><th>分支</th><th>标题</th><th>合并日</th></tr>{rows}</table></div>'
         )
 
     # OPEN（限 20）
@@ -502,7 +539,7 @@ def _render_prs(prs: list[dict]) -> str:
         )
         sections.append(
             f'<div class="note" style="padding:8px 14px; margin:14px 0 8px"><b>Open（最多 20）</b></div>'
-            f'<table><tr><th>PR</th><th>分支</th><th>标题</th><th>创建日</th></tr>{rows}</table>'
+            f'<div class="tbl"><table><tr><th>PR</th><th>分支</th><th>标题</th><th>创建日</th></tr>{rows}</table></div>'
         )
 
     # CLOSED（限 10）
@@ -516,7 +553,7 @@ def _render_prs(prs: list[dict]) -> str:
         )
         sections.append(
             f'<div class="note" style="padding:8px 14px; margin:14px 0 8px"><b>Closed 未合并（最多 10）</b></div>'
-            f'<table><tr><th>PR</th><th>分支</th><th>标题</th><th>创建日</th></tr>{rows}</table>'
+            f'<div class="tbl"><table><tr><th>PR</th><th>分支</th><th>标题</th><th>创建日</th></tr>{rows}</table></div>'
         )
 
     return "\n".join(sections) if sections else '<div class="note">无 PR 数据</div>'
@@ -532,4 +569,4 @@ def _render_worktrees(worktrees: list[dict]) -> str:
         f'<td><span class="b info">活跃</span></td></tr>'
         for w in worktrees
     )
-    return f'<table><tr><th>路径</th><th>分支</th><th>HEAD</th><th>状态</th></tr>{rows}</table>'
+    return f'<div class="tbl"><table><tr><th>路径</th><th>分支</th><th>HEAD</th><th>状态</th></tr>{rows}</table></div>'
