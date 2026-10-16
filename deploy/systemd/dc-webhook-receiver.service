@@ -1,0 +1,85 @@
+# deploy/systemd/dc-webhook-receiver.service
+#
+# DailyCheck PR Webhook Receiver 的 systemd unit。
+# 监听 127.0.0.1:8443，由 nginx 在 443 做 TLS 终结 + proxy_pass。
+# inbox 落 /var/lib/dailycheck-prod-agent/inbox.jsonl。
+# Prod Agent 订阅 inbox.jsonl 跑 merge 决策。
+#
+# 安装（owner / Prod Agent 手动）：
+#   1. 写 WEBHOOK_SECRET 到 /etc/dailycheck/webhook-secret（mode 600 root）
+#   2. mkdir -p /var/lib/dailycheck-prod-agent && chown root:root
+#   3. cp deploy/systemd/dc-webhook-receiver.service /etc/systemd/system/
+#   4. systemctl daemon-reload
+#   5. systemctl enable --now dc-webhook-receiver.service
+#   6. curl http://127.0.0.1:8443/health  # 探活
+#   7. tail -F /var/log/dailycheck/webhook-receiver.log  # 跟日志
+#   8. 配置 GitHub repo Webhook：URL=https://hook.kjtang.cn/webhook
+#      Secret=<同 /etc/dailycheck/webhook-secret>
+#      Events: 只勾 "Pull requests"
+#
+# 设计：单实例（-w 1），append-only inbox 不需要并发；systemd Restart=always
+# 是兜底（崩溃自动拉起，inbox 文件已落盘不丢事件）。
+
+[Unit]
+Description=DailyCheck GitHub PR Webhook Receiver (Flask, behind nginx 443)
+After=network.target
+# 不依赖 dailycheck.service / nginx.service —— receiver 是独立基础设施，
+# nginx 挂了 receiver 仍能起（虽然 443 不可达）；receiver 挂了 nginx 仍能
+# 服务 443（只是 hook 子域不可用）。
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+WorkingDirectory=/root/DailyCheck
+Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+# 必填：与 GitHub repo webhook secret 完全一致（32 字节强密码）
+EnvironmentFile=/etc/dailycheck/webhook-secret
+# inbox / processed 路径（默认；可被 EnvironmentFile 覆盖）
+Environment=INBOX_PATH=/var/lib/dailycheck-prod-agent/inbox.jsonl
+Environment=PROCESSED_PATH=/var/lib/dailycheck-prod-agent/processed.jsonl
+Environment=MAX_INBOX_LINES=1000
+Environment=LISTEN_HOST=127.0.0.1
+Environment=LISTEN_PORT=8443
+
+# 单 worker（inbox append-only 不需要并发；w>1 会有并发写风险）
+ExecStart=/root/DailyCheck/.venv/bin/gunicorn \
+    -w 1 \
+    --threads 4 \
+    --worker-class=gthread \
+    -b 127.0.0.1:8443 \
+    --timeout 30 \
+    --access-logfile /var/log/dailycheck/webhook-receiver-access.log \
+    --error-logfile /var/log/dailycheck/webhook-receiver-error.log \
+    --capture-output \
+    --log-level info \
+    scripts.blue_green.webhook_receiver:app
+
+ExecStop=/bin/kill -TERM $MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+
+# 资源限制（防 receiver 异常占资源影响主站）
+MemoryMax=256M
+TasksMax=64
+
+# 安全沙箱（不影响主站）
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dailycheck-prod-agent /var/log/dailycheck
+PrivateTmp=true
+ProtectHome=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target
