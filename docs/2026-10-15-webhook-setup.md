@@ -11,6 +11,8 @@
 > **更新**：2026-10-16 增补 §3.8（inbox watcher + rotate，Issue #47）—— 链路「inbox.jsonl → Prod Agent」从「Prod 侧自行实现」变为本手册可部署的实装。
 >
 > **更新**：2026-10-16 首次部署完成后修正 —— ① 证书改**独立申请**（阿里云免费证书=单域名，不能给主证书加 SAN）；② 新增 **443 防火墙放行**前置与外部 vantage 复验；③ nginx 改**独立文件**部署；④ systemd `ProtectHome` 203/EXEC 踩坑记录。
+>
+> **更新**：2026-10-16 增补 **§3.10（CI 完成快通道）** —— webhook 补勾 "Check suites" 事件；`check_suite`（全绿）经同一 receiver → inbox → watcher 链路秒级唤醒 Prod Agent；新增 `dailycheck-ci` 订阅 + gateway `webhook.py` [SILENT] 抑制补丁（§3.8 步骤 2c）。
 
 ## 1. 架构
 
@@ -206,7 +208,7 @@ nginx -T 2>/dev/null | grep -c 'server_name hook.kjtang.cn'   # 期望：2（443
 6. SSL verification: Enable（默认）
 7. 「Which events would you like to trigger this webhook?」
    - 选择 "Let me select individual events"
-   - **只勾 "Pull requests"**（不要 issue、不要 push 等）
+   - **勾 "Pull requests" + "Check suites"**（2026-10-16 起两个都勾：前者 = PR 生命周期触点，后者 = CI 完成快通道 §3.10；不要 issue、不要 push 等）
 8. Active: ✓
 9. 「Add webhook」
 
@@ -258,12 +260,27 @@ chmod 755 /usr/local/bin/dc-notify-prod-agent
 #    重启 gateway 生效（root 用户级 systemd；重启会中断进行中的会话）：
 XDG_RUNTIME_DIR=/run/user/0 systemctl --user restart hermes-gateway.service
 ss -tlnp | grep 8644           # 期望 127.0.0.1:8644 LISTEN
-#    然后建订阅（CLI 一律走 venv 绝对路径，理由同步骤 1）：
+#    然后建订阅（CLI 一律走 venv 绝对路径，理由同步骤 1；两个订阅都要建）：
 cd /root/hermes-agent
 /root/hermes-agent/.venv/bin/hermes webhook subscribe dailycheck-pr \
-  --prompt 'DailyCheck PR 通知: PR #{pr_number} {action} by {pr_author} ({pr_head_sha}) —— 走 dailycheck-prod-agent skill 判定 merge' \
+  --prompt 'DailyCheck PR 通知: PR #{pr_number} {action} by {pr_author} ({pr_head_sha}) —— 走 dailycheck-prod-agent skill 判定 merge。最终回复=恰好一行 ≤50 字轻提醒（会原样推送飞书）。' \
   --skills dailycheck-prod-agent
-/root/hermes-agent/.venv/bin/hermes webhook list            # 确认 dailycheck-pr 在列
+/root/hermes-agent/.venv/bin/hermes webhook subscribe dailycheck-ci \
+  --prompt 'DailyCheck CI 完成通知: PR #{pr_number}，head {pr_head_sha}。走 dailycheck-prod-agent skill 判定 merge；若两必需 check 未全绿或无需动作 → 仅回 [SILENT]（不发消息）；有实质动作（merge/上报）→ 最终回复恰好一行 ≤50 字轻提醒。' \
+  --skills dailycheck-prod-agent
+/root/hermes-agent/.venv/bin/hermes webhook list            # 确认 dailycheck-pr + dailycheck-ci 都在列
+#    （prompt 文案可按需调整；⚠️ [SILENT] 中间态静默依赖下一步 2c 的补丁）
+
+#    c) （2026-10-16 增，CI 快通道静默必需）gateway [SILENT] 抑制补丁：
+#       上游 Hermes 仅 cron 投递支持 [SILENT]；webhook 跨平台投递会把它当普通
+#       文本原样发出。在 gateway/platforms/webhook.py 的 send() 中、
+#       「Cross-platform delivery」分支之前插入：
+#         if content.strip().upper().startswith("[SILENT]"):
+#             logger.info("[webhook] Suppressed delivery for %s ([SILENT])", chat_id)
+#             return SendResult(success=True)
+#       改完重启 gateway 生效（同 a/b 的 restart 命令）。
+#       ⚠️ 本地补丁（非上游能力）：Hermes 重装/升级后需重打——
+#          核对：grep -n 'SILENT' /root/hermes-agent/gateway/platforms/webhook.py
 
 # 3. watcher + rotate units
 cp deploy/systemd/dc-inbox-watcher.service \
@@ -332,6 +349,40 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 - `DCPOLL_REPO` 环境变量仅用于测试输出格式；生产 cron 不设置（默认 `ericmr1981/DailyCheck`）。
 - 该 job 是 webhook 快通道的**冗余保底**，不是替代——两条通道独立，都指向同一 `dailycheck-prod-agent` skill 判定流程（merge 判定幂等）。
 
+### 3.10 CI 完成快通道（2026-10-16 增，check_suite）
+
+**目标**：CI 全绿 → **秒级**触发 Prod Agent 判定 merge（此前 merge 环节靠 §3.9 兜底轮询接棒，最坏 ≤30 分钟延迟）。
+
+**链路**：GitHub `check_suite`（completed + success + 有 PR 关联）→ receiver（§3.6 同一 webhook，Events 补勾 "Check suites"）→ inbox.jsonl → watcher（§3.8，unit `--actions` 含 `completed`）→ `dc-notify-prod-agent.sh`（按 `event` 路由 `dailycheck-ci` 订阅）→ Prod Agent（全绿即 merge；中间态回 `[SILENT]` 静默不打扰）。
+
+**部署变更点**（相对 §3.3-3.9 的增量，代码已在本 repo）：
+
+| # | 位置 | 变更 |
+|---|------|------|
+| 1 | GitHub webhook Events | 补勾 "Check suites"（§3.6 步骤 7） |
+| 2 | `scripts/blue_green/webhook_receiver.py` | 支持 check_suite：`completed` + `conclusion=success` + 有 PR 关联才落盘（其余 200 ignored） |
+| 3 | `deploy/systemd/dc-inbox-watcher.service` | `--actions opened,synchronize,reopened,completed` |
+| 4 | `deploy/scripts/dc-notify-prod-agent.sh` | 按 `event` 字段路由订阅（check_suite → dailycheck-ci；其余 → dailycheck-pr）；exec 行 venv 绝对路径（同 §3.8 步骤 1） |
+| 5 | Hermes 侧 | 订阅 `dailycheck-ci`（§3.8 步骤 2）+ gateway `webhook.py` [SILENT] 补丁（§3.8 步骤 2c） |
+
+**验证**（真 PR 的 CI 全绿后）：
+
+```bash
+# 1. GitHub 侧：webhook Recent Deliveries 出现 check_suite 类型 delivery，202
+# 2. receiver 侧：
+tail -1 /var/lib/dailycheck-prod-agent/inbox.jsonl | python3 -m json.tool
+#    期望："event": "check_suite"、"check_conclusion": "success"、含 pr_number
+# 3. watcher 侧：
+journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
+# 4. Prod Agent 侧：merge 时间戳 − CI 完成时间 < 1 分钟（对比旧链路 ≤30 分钟）
+```
+
+**注意**：
+
+- 一个 PR 的 CI 过程通常产生**多个 check_suite**（每个 workflow 一个 + 第三方 App 如 GitGuardian），每个 success 的 suite 完成都会触发一次判定——前面 suite 完成时两必需 check 未齐 → Prod Agent 回 `[SILENT]`（**不产生飞书消息**）；最后一个凑齐全绿的 suite 才触发 merge + 一行轻提醒。多跑几次判定是幂等且静默的，属预期。
+- `conclusion=failure` 的 suite **不转发**（无 merge 动作可做；失败由 Dev 侧修复，兜底轮询照常看板）。
+- [SILENT] 抑制依赖 gateway 本地补丁（§3.8 步骤 2c）；补丁缺失时会往飞书发字面 "[SILENT]" 消息——见 §5 风险表。
+
 ## 4. 验收 checklist
 
 | # | 项 | 命令 / 验证 |
@@ -353,6 +404,9 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 | 15 | 端到端：PR → webhook → inbox → watcher → Prod Agent | 提一个测试 PR → GitHub Delivery 202 → watcher journal `triggered:` → Prod Agent 侧收到事件 |
 | 16 | 兜底轮询 job active | `hermes cron list` → 「DailyCheck PR 兜底轮询」（`*/30`，deliver local，skill dailycheck-prod-agent） |
 | 17 | 兜底轮询静默语义 | `hermes cron run <id>` 一次 → `cron/output/<id>/<ts>.md` 结尾 `Response = [SILENT]`（无 open PR 时） |
+| 18 | check_suite 快通道落盘 | 真 PR CI 全绿后 inbox 出现 `"event":"check_suite"` 行 / GitHub delivery 202（§3.10） |
+| 19 | CI 快通道秒级 merge | 全绿 suite 完成 → merge 时间差 < 1 分钟（§3.10 验证第 4 条） |
+| 20 | [SILENT] 抑制生效 | 中间态判定不产生飞书消息；`grep 'Suppressed delivery' /path/agent.log` 或日志无声即成功 |
 
 **2026-10-16 首次部署实测结果**（全链路已通，供下次部署对照）：
 
@@ -383,6 +437,7 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 | 旧 webhook 重投同一 delivery | 幂等按 delivery_id（receiver 200 duplicate） | 不需处理，receiver 自动忽略 |
 | **watcher 触发失败后无新事件 → 退避重试不发动**（Issue #51，实测延迟 1h） | §3.9 兜底轮询 30 分钟保底；journal WARNING 可见 | 修复见 Issue #51（主循环加 pending-retry 条件，pending-retry PR） |
 | **Hermes gateway 重启窗口**（订阅热加载前）事件落 inbox 但未触发 | watcher 状态文件保留未处理条目（重启后补触发）+ §3.9 兜底轮询 | 无需处理；确认 `ss -tlnp \| grep 8644` 恢复 LISTEN |
+| **[SILENT] 补丁被 Hermes 升级/重装冲掉**（症状：中间态判定开始往飞书发字面 `[SILENT]` 消息） | §3.8 步骤 2c 重打补丁（5 行）；`grep -n 'SILENT' /root/hermes-agent/gateway/platforms/webhook.py` 核对 | 无需回滚；补丁缺失只影响静默语义，事件不丢（兜底轮询照常） |
 
 ## 6. 监控
 
