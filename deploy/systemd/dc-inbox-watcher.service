@@ -23,6 +23,9 @@
 #   - 触发失败由脚本内指数退避重试（不依赖 systemd 重启搬救兵）
 #   - 触发命令是子进程，同样受本 unit 沙箱约束：若 Prod Agent 入口需要
 #     额外写路径，在 ReadWritePaths 追加（默认为 /root/.hermes）
+#   - --actions 白名单含 completed：check_suite（CI 完成）事件的 action=completed，
+#     与 pull_request 三 action 合并放行（receiver 侧已按事件过滤 + 仅转发
+#     success，此处为纵深防御；completed 不会被 pull_request 事件使用，无放宽风险）
 
 [Unit]
 Description=DailyCheck inbox watcher (prod-agent 秒级 PR 通知, Issue #47)
@@ -42,6 +45,7 @@ ExecStart=/root/DailyCheck/.venv/bin/python \
     /root/DailyCheck/scripts/prod_agent/inbox_watcher.py \
     --inbox /var/lib/dailycheck-prod-agent/inbox.jsonl \
     --state-file /var/lib/dailycheck-prod-agent/inbox_watcher_state.json \
+    --actions opened,synchronize,reopened,completed \
     --trigger-cmd /usr/local/bin/dc-notify-prod-agent
 
 Restart=always

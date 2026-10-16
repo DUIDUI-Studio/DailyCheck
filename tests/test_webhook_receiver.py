@@ -10,6 +10,11 @@
 - /health 端点：返回 inbox 大小
 - 缺 WEBHOOK_SECRET env：500
 
+验证（v2，2026-10-16 check_suite 快通道）：
+- check_suite completed + conclusion=success + 有 PR 关联 → 202 落盘（check_* 字段）
+- 无 PR 关联 / conclusion≠success / 非 completed action → 200 ignored 不落盘
+- action 白名单按事件分叉（check_suite 不接受 opened 等）
+
 不测（实跑在 VPS 由 Prod Agent 验）：
 - 真 gunicorn 启动
 - 真 nginx 8443 反代
@@ -392,3 +397,180 @@ def _read_first_line(path: Path) -> dict:
             if line:
                 return json.loads(line)
     raise ValueError("empty inbox")
+
+
+# ============================================================
+# 9. check_suite 事件（CI 完成快通道，v2）
+# ============================================================
+def _make_check_suite_payload(
+    *,
+    action: str = "completed",
+    conclusion: str = "success",
+    number: int = 42,
+    head_sha: str = "cafe" * 10,
+    branch: str = "feat/issue-42-x",
+    include_prs: bool = True,
+) -> bytes:
+    """构造 GitHub check_suite 事件 payload（字段按官方 webhook 结构裁剪）。"""
+    suite: dict = {
+        "id": 987654321,
+        "head_sha": head_sha,
+        "head_branch": branch,
+        "status": "completed",
+        "conclusion": conclusion,
+    }
+    if include_prs:
+        suite["pull_requests"] = [
+            {
+                "number": number,
+                "head": {"sha": head_sha, "ref": branch},
+                "base": {"ref": "main"},
+            }
+        ]
+    payload = {
+        "action": action,
+        "check_suite": suite,
+        "repository": {
+            "full_name": "ericmr1981/DailyCheck",
+            "visibility": "public",
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def test_check_suite_success_queued(tmp_path, monkeypatch):
+    """completed + success + 有 PR 关联 → 202 落盘，check_* 字段完整。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    payload = _make_check_suite_payload(number=52)
+    sig = _make_signature(_TEST_SECRET, payload)
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "check_suite",
+            "X-GitHub-Delivery": "del-cs-1",
+            "X-Hub-Signature-256": sig,
+        },
+    )
+    assert resp.status_code == 202
+    assert b"queued" in resp.data
+    rec = _read_first_line(tmp_path / "inbox.jsonl")
+    assert rec["delivery_id"] == "del-cs-1"
+    assert rec["event"] == "check_suite"
+    assert rec["action"] == "completed"
+    assert rec["pr_number"] == 52
+    assert rec["pr_head_sha"] == "cafe" * 10
+    assert rec["pr_base_ref"] == "main"
+    assert rec["repo_full_name"] == "ericmr1981/DailyCheck"
+    assert rec["check_conclusion"] == "success"
+    assert rec["check_suite_id"] == 987654321
+    assert rec["pr_url"] == "https://github.com/ericmr1981/DailyCheck/pull/52"
+
+
+def test_check_suite_failure_conclusion_ignored(tmp_path, monkeypatch):
+    """conclusion ∈ {failure, cancelled, timed_out, neutral, skipped} → ignored。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    for conclusion in ("failure", "cancelled", "timed_out", "neutral", "skipped"):
+        payload = _make_check_suite_payload(conclusion=conclusion)
+        sig = _make_signature(_TEST_SECRET, payload)
+        resp = client.post(
+            "/webhook",
+            data=payload,
+            headers={
+                "X-GitHub-Event": "check_suite",
+                "X-GitHub-Delivery": f"del-cs-{conclusion}",
+                "X-Hub-Signature-256": sig,
+            },
+        )
+        assert resp.status_code == 200
+        assert b"ignored" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_check_suite_without_pr_ignored(tmp_path, monkeypatch):
+    """无 PR 关联的 check_suite（如 main push CI）→ ignored 不落盘。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    payload = _make_check_suite_payload(include_prs=False)
+    sig = _make_signature(_TEST_SECRET, payload)
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "check_suite",
+            "X-GitHub-Delivery": "del-cs-nopr",
+            "X-Hub-Signature-256": sig,
+        },
+    )
+    assert resp.status_code == 200
+    assert b"ignored" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_check_suite_non_completed_action_ignored(tmp_path, monkeypatch):
+    """action ∈ {requested, rerequested, created} → ignored（仅 completed 放行）。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    for action in ("requested", "rerequested", "created"):
+        payload = _make_check_suite_payload(action=action)
+        sig = _make_signature(_TEST_SECRET, payload)
+        resp = client.post(
+            "/webhook",
+            data=payload,
+            headers={
+                "X-GitHub-Event": "check_suite",
+                "X-GitHub-Delivery": f"del-cs-act-{action}",
+                "X-Hub-Signature-256": sig,
+            },
+        )
+        assert resp.status_code == 200
+        assert b"ignored" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_check_suite_uses_own_action_allowlist(tmp_path, monkeypatch):
+    """action 白名单按事件分叉：check_suite + pull_request 惯用 action（opened）→ ignored。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    payload = _make_check_suite_payload(action="opened")
+    sig = _make_signature(_TEST_SECRET, payload)
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "check_suite",
+            "X-GitHub-Delivery": "del-cs-opened",
+            "X-Hub-Signature-256": sig,
+        },
+    )
+    assert resp.status_code == 200
+    assert b"ignored" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_check_suite_idempotent_on_duplicate_delivery(tmp_path, monkeypatch):
+    """同一 delivery_id 第二次投递 → 200 duplicate，inbox 不重复写。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    payload = _make_check_suite_payload(number=60)
+    sig = _make_signature(_TEST_SECRET, payload)
+    headers = {
+        "X-GitHub-Event": "check_suite",
+        "X-GitHub-Delivery": "del-cs-dup-1",
+        "X-Hub-Signature-256": sig,
+    }
+    resp1 = client.post("/webhook", data=payload, headers=headers)
+    assert resp1.status_code == 202
+    resp2 = client.post("/webhook", data=payload, headers=headers)
+    assert resp2.status_code == 200
+    assert b"duplicate" in resp2.data
+    assert _inbox_line_count(tmp_path / "inbox.jsonl") == 1
+

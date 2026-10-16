@@ -163,10 +163,10 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 
 **组件**（`scripts/blue_green/webhook_receiver.py`，Flask 127.0.0.1:8443）：
 - **HMAC-SHA256 验签**（`X-Hub-Signature-256` + `WEBHOOK_SECRET` env）—— 拒伪 + 拒重放，constant-time 防时序攻击
-- **事件过滤**：仅 `pull_request`，action 仅 `{opened, synchronize, reopened}`（`closed` / `edited` / `labeled` 等跳过）
+- **事件过滤**：`pull_request`（action 仅 `{opened, synchronize, reopened}`，`closed` / `edited` / `labeled` 等跳过）+ `check_suite`（action 仅 `completed`，且仅「有 PR 关联 + conclusion=success」落盘 —— CI 全绿秒级唤醒快通道，2026-10-16 增）
 - **幂等**：按 `X-GitHub-Delivery` 去重（GitHub 会重试 6 次，receiver 必须幂等否则 inbox 写脏）
 - **反压**：`inbox_size ≥ MAX_INBOX_LINES`（默认 1000）返回 503，GitHub 暂停重试（指数退避 1s/2s/.../1h）
-- **inbox 落盘**：每行 JSON，append-only，含 `delivery_id / event / action / pr_number / pr_title / pr_head_sha / pr_base_ref / pr_author / repo_full_name / received_at_ms`
+- **inbox 落盘**：每行 JSON，append-only，含 `delivery_id / event / action / pr_number / pr_title / pr_head_sha / pr_base_ref / pr_author / repo_full_name / received_at_ms`；`check_suite` 记录追加 `check_conclusion / check_head_branch / check_suite_id`（payload 没有的字段如 pr_title / pr_author 填空串，字段形状与 pull_request 记录对齐）
 
 **部署**（owner / Prod Agent 手动，不进 Dev 自动化）：
 - **前置：443 入站必须放行**（2026-10-16 实测踩坑）——残留 ufw 链 + `INPUT` policy DROP 布局下，`ufw-user-input` 须含 `tcp dpt:443 ACCEPT` 且 `/etc/iptables/rules.v4` 同步补行；**本机 `curl` 走 `lo` 接口被直通——200 不能证明外网可达**，必须外部 vantage 复验（详见手册 §2/§4）
@@ -175,19 +175,20 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 - systemd：`deploy/systemd/dc-webhook-receiver.service`（监听 127.0.0.1:8443，单 worker，gunicorn，Restart=always 5s）
 - nginx：`deploy/nginx/hook.kjtang.cn.conf` 部署为**独立文件** `/etc/nginx/sites-enabled/hook.kjtang.cn`（与蓝绿 `switch.sh` 解耦：布局守卫只检查 dailycheck 文件；443 TLS 终结 + proxy_pass，limit_req 30r/s 防滥刷；`limit_req_zone` 只能放 http 上下文，勿放 `server{}` 内）
 - WEBHOOK_SECRET：32 字节强密码，写 `/etc/dailycheck/webhook-secret`（600 root），**不出现 git 仓库 / 文档 / prompt**（仅 systemd unit `EnvironmentFile=` 引用 + GitHub repo webhook 设置）
-- GitHub repo：Settings → Webhooks → Add，URL `https://hook.kjtang.cn/webhook`，Secret 同上，Events **只勾 "Pull requests"**
+- GitHub repo：Settings → Webhooks → Add，URL `https://hook.kjtang.cn/webhook`，Secret 同上，Events 勾 **"Pull requests" + "Check suites"**（后者 = CI 完成快通道，2026-10-16 增）
 
 **生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（50-70 分钟手动部署；DNS / **443 放行核验** / 申请 hook 独立证书 / systemd / nginx reload / GitHub 配 webhook + 端到端验证）。
 
-**测试**：`tests/test_webhook_receiver.py`（13 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 各自对应测试 FAIL）。
+**测试**：`tests/test_webhook_receiver.py`（19 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点 / check_suite 六态（success 落盘 + check_* 字段 / 非 success 拒绝 / 无 PR 拒绝 / 非 completed 拒绝 / action 白名单分叉 / 幂等）；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 / 删 conclusion 过滤 / 删 no_pr 过滤 / 白名单误加 opened 各自对应测试 FAIL）。
 
 **Prod Agent 集成（2026-10-16 实装，Issue #47）**：`scripts/prod_agent/inbox_watcher.py` 常驻订阅 `inbox.jsonl`，新条目 **≤5s** 内触发 `--trigger-cmd`（事件 JSON 原样走 stdin；样例 `deploy/scripts/dc-notify-prod-agent.sh` 把事件投给 Prod Agent 入口，默认指向 Hermes webhook 订阅）。要点：
 
 - **tail 语义**（纯 stdlib、跨平台）：轮询 `stat(inode, size, mtime)` 检测变更（默认 0.5s 间隔），只处理以 `\n` 结尾的完整行（半行留待下轮）——不用 inotify（Linux-only）、不引三方库
 - **去重语义**：全文件扫描 + `handled_ids` 状态集合（原子写 `inbox_watcher_state.json`）—— 重启 / rotate 换 inode / 停机期间新增等任何时序下，每条 `delivery_id` 至多触发一次、未触发过的必然补触发
-- **机械过滤**（纵深防御）：仅 `repo_full_name == ericmr1981/DailyCheck` 且 action 属白名单的条目触发；draft 等业务语义交 Prod Agent 判定，本脚本不预判
+- **机械过滤**（纵深防御）：仅 `repo_full_name == ericmr1981/DailyCheck` 且 action 属白名单（unit 显式传 `--actions opened,synchronize,reopened,completed`，`completed` 供 check_suite 事件使用）的条目触发；draft 等业务语义交 Prod Agent 判定，本脚本不预判
 - **失败重试**：触发非 0 退出 / 超时 → 指数退避（1s→60s 封顶）+ WARNING 留痕，绝不静默丢弃。⚠️ **已知限制（Issue #51）**：重试被主循环的「inbox 文件签名变化」gating——inbox 无新行时退避条目不会自行重试（2026-10-16 部署实测延迟 1h，直到下一事件写入才连带补发）；由下方兜底轮询保底
 - **兜底轮询（2026-10-16 实装，§3.9）**：Prod 侧 Hermes cron 每 30 分钟跑 `dailycheck_pr_poll.py`（repo 同源 `deploy/scripts/`）直接查 `gh pr list --state open`——webhook 快通道整体故障时的保底发现通道；无 open PR 零 stdout（agent 回 `[SILENT]` 无投递），有 PR 走同一 `dailycheck-prod-agent` skill 判定
+- **CI 完成快通道（2026-10-16 增）**：`check_suite`（CI 全绿）事件走同一 inbox → watcher 链路，`dc-notify-prod-agent.sh` 按事件类型路由订阅（check_suite → `dailycheck-ci`，其余 → `dailycheck-pr`）——CI 一绿即触发 Prod Agent 判定 merge（此前 merge 环节需等兜底轮询接棒，最坏 ≤30 分钟）。中间态（suite 绿但两必需 check 未齐）由 Prod Agent 回 `[SILENT]` 抑制投递。⚠️ webhook 通道的 `[SILENT]` 抑制 = gateway `gateway/platforms/webhook.py` 的**本地补丁**（上游出厂仅 cron 投递支持），Hermes 重装/升级后需重打，见手册 §3.8 步骤 3.5
 - **归档（防反压挂死）**：`scripts/prod_agent/inbox_rotate.py` + 每日 timer 把 >7 天旧行迁到 `inbox.archive.jsonl`（rename+重建+收敛回填，与 receiver 并发不丢行）—— inbox 是反压闸门（≥1000 行 receiver 返 503），只增不减会挂死新通知
 - **部署**：`deploy/systemd/dc-inbox-watcher.service`（Restart=always / 5s）+ `dc-inbox-rotate.{service,timer}`（每日 00:30）。⚠️ 两个要点（2026-10-16 实测）：unit 的 `ProtectHome` 必须 ≤ `read-only`（`=true` 屏蔽整个 `/root` → `203/EXEC` 无限重启）；触发命令走 Hermes 时必须用 venv 绝对路径 `/root/hermes-agent/.venv/bin/hermes`（`#!/usr/bin/env python3` wrapper 在 watcher 的 PATH 下会解析到 DailyCheck venv，缺 yaml）。手册见 `docs/2026-10-15-webhook-setup.md` §3.8/§3.9
 - **测试**：`tests/test_inbox_watcher.py`（30 用例：完整行/半行/U+2028 不误切 / 过滤 / 去重（重启不重复、停机补触发）/ 失败退避 / rotate 七态 / 真实子进程 ≤5s 端到端 / 确定性「旧 fd 窗口」收敛回填；关键断言经变异验证真 FAIL —— 删去重 / 删半行等待 / 失败走成功分支 / 删尾部回填 / 边界反转各自对应测试 FAIL）
