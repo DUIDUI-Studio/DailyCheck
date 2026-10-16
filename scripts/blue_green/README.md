@@ -117,6 +117,13 @@ if current_app.config.get("DRY_RUN"):
   接管生产写流量；
 - **conf 应用核验**（sed 未命中 → 回滚拒跑）、**reload 失败显式回滚**、
   **落点核验**（100%/0% 边界用 nonce 探针核对流量真实落到目标实例 access log）。
+  ⚠️ **探针会重发（Issue #55）**：nginx worker 在 reload 后需 1-3 秒刷新
+  in-memory upstream，探针首次命中旧配置属正常——脚本会**换新 nonce 重发**
+  （默认最多 5 次，常态化等待预算约 10 秒），命中目标 access log 才算通过；
+  回滚判据是「**所有尝试**都没命中目标 log **且**至少一次落在对侧」（仅一次
+  落对侧不判死，那是刷新窗口内的正常现象）。初版只发一次探针 → 撞上刷新窗口
+  就必然误回滚（生产实测 `switch.sh green 100` 被误判失败，需人工 `sleep 3`
+  绕过），勿回退该重发逻辑；`LAND_TRY_MAX=1` 会退回该行为并打 WARNING。
   ⚠️ **前置耦合**：`BLUE_ACCESS_LOG` / `GREEN_ACCESS_LOG` 必须与 nginx 实况一致（默认蓝
   `/root/DailyCheck/access.log`、绿 `/var/log/dailycheck/green-access.log`）；**改 nginx 布局
   或 access_log 路径后必须同步这两个变量**。日志读不到时行为是「无法判定 → 仅告警不阻断」，
