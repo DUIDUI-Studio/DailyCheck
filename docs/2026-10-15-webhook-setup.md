@@ -232,11 +232,18 @@ receiver 只负责「把事件落进 inbox」；本步部署「inbox → Prod Ag
 # 1. 触发命令适配器（把事件投递给 Prod Agent 入口）
 cp deploy/scripts/dc-notify-prod-agent.sh /usr/local/bin/dc-notify-prod-agent
 chmod 755 /usr/local/bin/dc-notify-prod-agent
+#    ⚠️ exec 行必须用 venv 绝对路径 /root/hermes-agent/.venv/bin/hermes ——
+#    /root/hermes-agent/hermes 的 shebang 是 #!/usr/bin/env python3，在 watcher 的
+#    PATH（/root/DailyCheck/.venv/bin 排第一）下解析到 DailyCheck venv（缺 PyYAML）
+#    → 触发恒失败 rc=1 ModuleNotFoundError: No module named 'yaml'（2026-10-16 实测）。
 #    默认实现 = Hermes webhook 订阅（见步骤 2）；若 Prod Agent 入口不同，
 #    按脚本头部注释替换 exec 那一行即可，watcher 不需要改动。
 
 # 2. （Hermes 侧，一次性）启用 webhook platform + 建订阅
-#    在 /root/.hermes/config.yaml 加：
+#    读取路径有两条，必须双写（2026-10-16 实测）：
+#      · CLI（hermes webhook list/subscribe/test）读 config.yaml 顶层 platforms；
+#      · gateway 启动读 .env 的 WEBHOOK_* 环境变量。
+#    a) /root/.hermes/config.yaml 顶层追加（注意是顶层，display.platforms 无关）：
 #      platforms:
 #        webhook:
 #          enabled: true
@@ -244,18 +251,28 @@ chmod 755 /usr/local/bin/dc-notify-prod-agent
 #            host: "127.0.0.1"        # 仅本地（投递者是本机 watcher），勿暴露公网
 #            port: 8644
 #            secret: "<随机强密码>"
-#    重启 gateway 生效，然后建订阅：
+#    b) /root/.hermes/.env 追加（三键，secret 与上一致）：
+#      WEBHOOK_ENABLED=true
+#      WEBHOOK_PORT=8644
+#      WEBHOOK_SECRET=<同一随机强密码>
+#    重启 gateway 生效（root 用户级 systemd；重启会中断进行中的会话）：
+XDG_RUNTIME_DIR=/run/user/0 systemctl --user restart hermes-gateway.service
+ss -tlnp | grep 8644           # 期望 127.0.0.1:8644 LISTEN
+#    然后建订阅（CLI 一律走 venv 绝对路径，理由同步骤 1）：
 cd /root/hermes-agent
-./hermes webhook subscribe dailycheck-pr \
+/root/hermes-agent/.venv/bin/hermes webhook subscribe dailycheck-pr \
   --prompt 'DailyCheck PR 通知: PR #{pr_number} {action} by {pr_author} ({pr_head_sha}) —— 走 dailycheck-prod-agent skill 判定 merge' \
   --skills dailycheck-prod-agent
-./hermes webhook list          # 确认 dailycheck-pr 在列
+/root/hermes-agent/.venv/bin/hermes webhook list            # 确认 dailycheck-pr 在列
 
 # 3. watcher + rotate units
 cp deploy/systemd/dc-inbox-watcher.service \
    deploy/systemd/dc-inbox-rotate.service \
    deploy/systemd/dc-inbox-rotate.timer \
    /etc/systemd/system/
+#    ⚠️ 覆盖后核对两处 ProtectHome=read-only（旧版 unit 若为 =true，/root 被全屏蔽 →
+#    203/EXEC 无限重启；2026-10-16 实测因此空转 1800+ 次）：
+grep ProtectHome /etc/systemd/system/dc-inbox-watcher.service /etc/systemd/system/dc-inbox-rotate.service
 systemctl daemon-reload
 systemctl enable --now dc-inbox-watcher.service
 systemctl enable --now dc-inbox-rotate.timer
@@ -279,8 +296,41 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 
 - **首次部署 watcher 时，inbox 里已存在的历史条目会被立即触发一遍**（无状态文件 = 全部视为待触发；保守设计宁多勿漏）。不想打搅就先跑步骤 5 的 rotate 清旧行，或接受首次补触发（merge 判定幂等，无副作用）。
 - inbox 是接收器反压闸门（≥1000 行时 receiver 返 503 拒新通知）；rotate 每日归档 >7 天旧行，让行数回落。归档文件 `inbox.archive.jsonl` 只增不删（低频，人工按需清理）。
-- watcher 的触发失败会 WARNING + 指数退避重试（journal 可见）；**30 分钟兜底轮询不变**——webhook 链路整体故障时仍按原节奏发现新 PR。
+- watcher 的触发失败会 WARNING + 指数退避重试（journal 可见）。⚠️ **已知限制（Issue #51）**：重试由主循环的「inbox 文件签名变化」gating —— inbox 无新行时退避条目**不会自行重试**（2026-10-16 实测延迟 1h：11:38 部署后失败，14:29 新事件写入才连带补发）。webhook 整体故障时由 **§3.9 兜底轮询**保底（≤30 分钟发现新 PR）。
 - watcher 的 systemd 沙箱默认只放行 `/var/lib/dailycheck-prod-agent` + `/root/.hermes` 写权限；若替换触发命令且需要别的写路径，在 unit 的 `ReadWritePaths` 追加。
+
+### 3.9 部署兜底轮询（10 分钟，Issue #47 / #51）
+
+webhook 快通道（§3.3-3.8）的保底通道：Prod 侧 Hermes cron **每 30 分钟**直接查 `gh pr list --state open`——快通道整体故障（receiver 挂 / watcher 卡 / gateway 重启窗口 / GitHub 投递失败 / §3.8 的 retry-gating）时仍能在 ≤30 分钟发现新 PR。
+
+脚本 `deploy/scripts/dailycheck_pr_poll.py`（与 Prod 部署版逐字一致），静默语义（skill `no-agent-cron-script-pattern`）：**无 open PR → 零 stdout**（agent 回 `[SILENT]`，无投递）；有 open PR → 输出清单（agent 走 dailycheck-prod-agent skill 判定）；查询失败 → ⚠️ 告警输出（保底通道自身故障必须可见，不得静默）。
+
+```bash
+# 1. 脚本部署（Hermes cron 只允许 HERMES_HOME/scripts/ 内的脚本）
+cp deploy/scripts/dailycheck_pr_poll.py /root/.hermes/scripts/dailycheck_pr_poll.py
+chmod 755 /root/.hermes/scripts/dailycheck_pr_poll.py
+
+# 2. 手动验证两种输出路径
+/root/hermes-agent/.venv/bin/python /root/.hermes/scripts/dailycheck_pr_poll.py
+#    无 open PR → 零输出（静默）；DCPOLL_REPO=cli/cli ... 借活跃仓库验证「有 PR」输出格式
+
+# 3. 注册 cron job（30 分钟）
+cd /root/hermes-agent
+/root/hermes-agent/.venv/bin/hermes cron create "*/30 * * * *" \
+  "这是 DailyCheck PR 兜底轮询（webhook 快通道失效时的保底发现通道）。脚本输出 = 当前 open PR 清单；无 open PR 时脚本静默，你也仅回 [SILENT]，不发任何消息。有 open PR → 按 dailycheck-prod-agent skill 走 merge 判定流程（CI 两必需 check 全绿才进队列；红线文件命中转 owner）。静默优先：无待处理事项不输出任何内容。" \
+  --name "DailyCheck PR 兜底轮询" --deliver local --skill dailycheck-prod-agent --script dailycheck_pr_poll.py
+
+# 4. 立即触发一次并验证静默
+/root/hermes-agent/.venv/bin/hermes cron run <job-id>   # 下一个 scheduler tick（≤60s）执行
+ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md，结尾 Response = [SILENT]
+```
+
+**注意**：
+
+- Hermes 调度器**忽略 `no_agent` 字段**（见 skill `no-agent-cron-script-pattern` 的 CRITICAL REALITY NOTE）——每 tick 仍起一个 agent 会话（脚本输出注入 prompt 头部）。静默 tick 的代价 = 一次 LLM call，可接受（既有 fail2ban / SSH 监测 job 同模式）。
+- 脚本必须在 `HERMES_HOME/scripts/` 内（scheduler 强制校验，防任意路径执行）。
+- `DCPOLL_REPO` 环境变量仅用于测试输出格式；生产 cron 不设置（默认 `ericmr1981/DailyCheck`）。
+- 该 job 是 webhook 快通道的**冗余保底**，不是替代——两条通道独立，都指向同一 `dailycheck-prod-agent` skill 判定流程（merge 判定幂等）。
 
 ## 4. 验收 checklist
 
@@ -301,6 +351,8 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 | 13 | inbox 新行 ≤5s 触发 | §3.8 步骤 4：手工投递 → journal 出现 `triggered: delivery=test-1`（≤5s） |
 | 14 | rotate timer 已启用 | `systemctl list-timers dc-inbox-rotate.timer`（下次 00:30） |
 | 15 | 端到端：PR → webhook → inbox → watcher → Prod Agent | 提一个测试 PR → GitHub Delivery 202 → watcher journal `triggered:` → Prod Agent 侧收到事件 |
+| 16 | 兜底轮询 job active | `hermes cron list` → 「DailyCheck PR 兜底轮询」（`*/30`，deliver local，skill dailycheck-prod-agent） |
+| 17 | 兜底轮询静默语义 | `hermes cron run <id>` 一次 → `cron/output/<id>/<ts>.md` 结尾 `Response = [SILENT]`（无 open PR 时） |
 
 **2026-10-16 首次部署实测结果**（全链路已通，供下次部署对照）：
 
@@ -308,6 +360,14 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 - 外部 vantage（check-host.net 4/4 节点）✅ hook 与主站 443 均可达（主站 443 系本次一并修复的历史故障）
 - 测试 PR #49 → GitHub delivery `pull_request/opened` **202**（1.66s）→ inbox.jsonl 完整落盘 → receiver access log 可查 → PR 已关闭
 - redeliver ping delivery：修复前 502 → 修复后 **200**（0.68s）
+
+**2026-10-16 §3.8 / §3.9 部署实测（第二批次：唤醒链，Issue #47）**：
+
+- watcher 修复 `ProtectHome=true` → `read-only` 后 `active (running)`（此前 203/EXEC 空转 1800+ 次）；rotate 手动跑 `archived=0 kept=2` ✅
+- Hermes webhook platform 启用（config.yaml 顶层 `platforms` + .env `WEBHOOK_*` 双写）→ `127.0.0.1:8644` LISTEN ✅
+- 订阅 `dailycheck-pr` 建成；`hermes webhook test` → **202**；`agent.log` 确认会话生成（15s 内响应、api_calls=2）✅
+- 端到端（真实补发 + 测试）：inbox 3 事件（PR #49/#50 真实通知 + 测试事件）→ journal 全部 `triggered:` → Prod Agent 3 会话全部正确判定（#49 已关闭→静默；#50 已 merge→确认；测试事件→识破不动作）✅
+- 兜底轮询 job `02ee9e01cb13` 首跑静默 `[SILENT]` ✅；**实测暴露 watcher retry-gating 缺陷 → Issue #51**（PR #49/#50 通知延迟 1h 才补发，根因见 §3.8 注意第 3 条）
 
 ## 5. 风险与回滚
 
@@ -321,12 +381,16 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 | inbox 写满 1000 | 反压返回 503，GitHub 暂停重试 | 手动 rotate inbox → 移到 `processed.jsonl` |
 | HMAC secret 泄漏 | secret 写 `/etc/dailycheck/webhook-secret`（600 root），不出现 prompt/git/log | GitHub repo webhook 设置里点「Redeliver」+ 重新生成 secret + 更新 systemd EnvironmentFile + 重启 receiver |
 | 旧 webhook 重投同一 delivery | 幂等按 delivery_id（receiver 200 duplicate） | 不需处理，receiver 自动忽略 |
+| **watcher 触发失败后无新事件 → 退避重试不发动**（Issue #51，实测延迟 1h） | §3.9 兜底轮询 30 分钟保底；journal WARNING 可见 | 修复见 Issue #51（主循环加 pending-retry 条件，pending-retry PR） |
+| **Hermes gateway 重启窗口**（订阅热加载前）事件落 inbox 但未触发 | watcher 状态文件保留未处理条目（重启后补触发）+ §3.9 兜底轮询 | 无需处理；确认 `ss -tlnp \| grep 8644` 恢复 LISTEN |
 
 ## 6. 监控
 
 - **证书轮换（90 天周期，两份独立证书）**：hook 独立证书 2026-10-16 签发 → **2027-01-13 到期**；主站证书 → **2027-01-03 到期**。到期前重签（hook 走 §3.2）。远程查看到期时间：`echo | openssl s_client -connect hook.kjtang.cn:443 -servername hook.kjtang.cn 2>/dev/null | openssl x509 -noout -dates`
 - **inbox rotate（已实装，#47）**：`dc-inbox-rotate.timer` 每日 00:30 归档 >7 天条目到 `inbox.archive.jsonl`
-- **watcher 触发失败**：`journalctl -u dc-inbox-watcher | grep WARNING` 非空即链路告警（脚本内退避重试中；30 分钟兜底轮询不变）
+- **watcher 触发失败**：`journalctl -u dc-inbox-watcher | grep WARNING` 非空即链路告警（脚本内退避重试中；注意 Issue #51 gating 限制——inbox 无新行时不自行重试，由 §3.9 兜底轮询 ≤30 分钟保底）
+- **兜底轮询健康（§3.9）**：`hermes cron list` 看「DailyCheck PR 兜底轮询」last run `ok`；`cron/output/<id>/*.md` 连续出现 ⚠️ 输出 = 轮询通道故障（gh/token/网络）需排查
+- **Hermes webhook adapter 健康**：`ss -tlnp | grep 8644` 有 LISTEN；`agent.log` 中 `[webhook] POST` 出现频率 = 快通道实际投递频率
 - **inbox size 观察**：`curl -sS http://127.0.0.1:8443/health` 的 `inbox_size`（持续逼近 1000 = rotate 失效需排查）
 - 后续可加：Prometheus 暴露 `/metrics`：inbox size / 处理延迟 / 5xx 计数
 - 后续可加：systemd `WatchdogSec`：receiver 30s 内必须发一次心跳，超时重启
