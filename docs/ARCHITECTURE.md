@@ -803,7 +803,7 @@ flowchart LR
     subgraph MCP["mcp_server/ 进程 (uvicorn :5100)"]
         Main["main.py<br/>lifespan + AuthMiddleware + 健康检查"]
         Protocol["protocol/<br/>server.py + tools/"]
-        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement"]
+        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical"]
         Data["data/<br/>master.py / warehouse.py / unit_of_work.py"]
         Infra["infra/<br/>errors.py / access_log.py"]
     end
@@ -815,7 +815,7 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 13 个 MCP 工具
+### 9.2 24 个 MCP 工具
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
@@ -832,6 +832,19 @@ flowchart LR
 | `item_forecast` | forecast | read | per-token |
 | `procurement_store` | procurement | read | per-token |
 | `procurement_hub` | procurement | read | per-token |
+| `canonical_list` | canonical | read | 全局（跨仓） |
+| `canonical_detail` | canonical | read | 全局（跨仓） |
+| `canonical_categories` | canonical | read | 全局（跨仓） |
+| `canonical_fanout_targets` | canonical | read | 全局（跨仓） |
+| `canonical_conflicts` | canonical | read | 全局（跨仓） |
+| `canonical_fanout_event` | canonical | read | 全局（跨仓） |
+| `canonical_create` | canonical | write | 全局（跨仓） |
+| `canonical_update` | canonical | write | 全局（跨仓） |
+| `canonical_claim` | canonical | write | per-token |
+| `canonical_unclaim` | canonical | write | per-token |
+| `canonical_fanout` | canonical | write | 显式传 warehouse_codes |
+| `canonical_resolve_conflict` | canonical | write | 全局（跨仓） |
+| `canonical_set_binding_active` | canonical | write | per-token |
 
 ### 9.3 双传输模式
 
@@ -1042,7 +1055,7 @@ flowchart TB
         MCPPure["test_*_pure.py"]
         MCPRoute["test_*_route.py"]
         MCPData["test_data/test_warehouse.py"]
-        MCPService["test_service/test_inbound.py"]
+        MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>(26 用例 mock)"]
     end
 
     Pytest --> Conftest
