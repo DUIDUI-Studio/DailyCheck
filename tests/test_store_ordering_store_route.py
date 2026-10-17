@@ -1,6 +1,9 @@
 """Route tests for storefront store-ordering flows."""
+
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -103,6 +106,7 @@ def store_env(tmp_path, monkeypatch):
     store.close()
 
     from app import create_app
+
     app = create_app()
     app.config["TESTING"] = True
     client = app.test_client()
@@ -133,6 +137,48 @@ def test_catalog_with_dc(store_env):
     body = resp.data.decode()
     assert "测试包材A" in body
     assert "加入购物车" in body
+
+
+def test_catalog_draft_scope_is_user_and_dc(store_env):
+    """Catalog persists un-submitted selections under a per-user/DC scope.
+
+    Regression: category chips do a full page reload, so the draft key must be
+    scoped by user id + delivery centre to restore (and never cross-contaminate)
+    the selections.
+    """
+    resp = store_env["client"].get("/store-ordering/catalog?dc=dc_test")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+
+    assert 'id="catalog-draft-bar"' in body
+    assert "dc.catalogDraft.v1:" in body
+
+    m = re.search(r"var DRAFT_SCOPE = (\"[^\"]*\");", body)
+    assert m, "catalog.html 未注入 DRAFT_SCOPE"
+    assert json.loads(m.group(1)) == "1:dc_test"
+
+
+def test_catalog_draft_scope_without_dc(store_env):
+    """DC selector page renders the same script; scope must stay well-formed."""
+    resp = store_env["client"].get("/store-ordering/catalog")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    m = re.search(r"var DRAFT_SCOPE = (\"[^\"]*\");", body)
+    assert m
+    assert json.loads(m.group(1)) == "1:"
+
+
+def test_cart_page_clears_catalog_draft(store_env):
+    """Landing on the cart means the draft was consumed; the page must clear it."""
+    client = store_env["client"]
+    with client.session_transaction() as s:
+        s["store_ordering_dc"] = "dc_test"
+    resp = client.get("/store-ordering/cart")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    m = re.search(r"'dc\.catalogDraft\.v1:'\s*\+\s*(\"[^\"]*\")", body)
+    assert m, "cart.html 未渲染草稿清理脚本"
+    assert json.loads(m.group(1)) == "1:dc_test"
 
 
 def test_add_to_cart_and_cart_view(store_env):
@@ -198,9 +244,7 @@ def test_submit_order_shortage_allowed(store_env):
     # DB 状态确认 pending。
     master = sqlite3.connect(str(store_env["master_path"]))
     master.row_factory = sqlite3.Row
-    row = master.execute(
-        "SELECT status FROM store_orders ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    row = master.execute("SELECT status FROM store_orders ORDER BY id DESC LIMIT 1").fetchone()
     master.close()
     assert row["status"] == "pending"
 
@@ -253,7 +297,9 @@ def test_order_detail(store_env):
     )
     master = sqlite3.connect(str(store_env["master_path"]))
     master.row_factory = sqlite3.Row
-    order_id = master.execute("SELECT id FROM store_orders ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    order_id = master.execute("SELECT id FROM store_orders ORDER BY id DESC LIMIT 1").fetchone()[
+        "id"
+    ]
     master.close()
     resp = client.get(f"/store-ordering/orders/{order_id}")
     assert resp.status_code == 200

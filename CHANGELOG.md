@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Fixed — 门店订货：未提交的数量选择在切换筛选后被清零（fix/catalog-draft-persist，2026-10-17）
+- **症状**（Issue #100）：订货页选好品类、给几张卡片填了数量，**没点「加入购物车」**就点别的品类或「全部」，填过的数量全部消失，得重填一遍。
+- **根因**：已填数量只存在于当页 DOM（卡片 hidden input + `data-saved-qty`），而品类 chip 和搜索框都是整页 GET 跳转，DOM 重建即归零。
+- **修复**：按 `dc.catalogDraft.v1:<user_id>:<dc_code>` 把「canonical_id → 数量 / 单位名 / 单位档位」落到 localStorage（7 天过期），页面渲染后回填当前可见卡片；被筛选隐藏的项留在草稿里，不误删。页面顶部给出「已填 N 项（含其他品类筛选下的选择）」提示条。
+- **跨筛选一并提交**：「加入购物车」前把草稿里未在当前页渲染的条目追加成 hidden input 一起 POST。此前跨品类分批填的数量会静默漏单（`cart_add_batch` 只收当前页卡片）。
+- **收口点**：购物车页渲染时清空该 dc 草稿（批次加购已整体消费，防 bfcache 回退后重复加购）；「清空选择」同时清草稿；`pageshow(persisted)` 按草稿重新同步卡片。
+- **附带修复**：重复编辑已填卡片时弹窗单位 pill 无法回填——`unit[]` 存的是中文单位名（后端契约），却拿它去匹配 `base`/`aux` 档位，导致两个 pill 都不高亮、点「确认」静默无响应。改由卡片 `data-saved-unit` 提供档位。
+- **测试**：`tests/test_store_ordering_store_route.py` 新增 3 个模板契约用例（草稿 scope 必须是 `user:dc`、cart 页清空脚本存在），变异验证 3/3 变红；另用 Playwright 在真实浏览器跑通 24 项交互断言（含反向验证：回滚模板后「去掉筛选」必现 `—`）。
+
 ### Fixed — 反馈派发的 page_path 语义修正 + DC 品项开关整页重载（fix/feedback-page-path-and-toggles，2026-10-17）
 - **`page_path` 是「提交时所在页面」，不是「出问题页面」**（Issue #93 实测）。中转页（`auth` 蓝图下 login / logout / select-warehouse）不再产生代码线索，`collect()` 返回 `matched=False` + `reason=transient_page`；按 endpoint 前缀判定而非硬编码路径，改路由时黑名单不会静默失效。失败原因细分为 `no_path` / `unmatched` / `transient_page`，正文文案各不相同（中转页明写「不能作为出问题位置的证据，以现象为准」）。
 - **验收标准不再断言具体页面**。原第一条「站内 `<page>` 页面按现象描述逐项复现」在 page_path 错误时等于让开发侧改错文件还自认合格；改为「已核对代码线索指向的页面确实就是现象所在页面，不一致时以现象为准」。
