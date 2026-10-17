@@ -18,6 +18,7 @@ import logging
 from flask import (
     Blueprint,
     abort,
+    current_app,
     flash,
     g,
     redirect,
@@ -31,6 +32,7 @@ from db import get_master_db
 from permissions import require_login, require_platform_admin
 
 from . import feedback_dispatch as dispatch
+from . import feedback_introspect as introspect
 from . import feedback_notify as notify
 from .feedback_pure import (
     STATUS_DISPATCHED,
@@ -186,12 +188,18 @@ def admin_feedback_detail(ticket_id: int):
             "SELECT username FROM users WHERE id=?", (ticket["user_id"],)
         ).fetchone()
     ticket["submitter"] = submitter["username"] if submitter is not None else None
+    # 判定区给管理员一个「派发后正文会带什么代码线索」的预览。只在待处理时算：
+    # 终态单子不再派发，没必要为它跑一次 git。collect 全程 fail-soft。
+    clues: dict = {}
+    if ticket.get("status") == STATUS_OPEN:
+        clues = introspect.collect(current_app._get_current_object(), ticket.get("page_path"))
     return render_template(
         "admin/feedback_detail.html",
         ticket=ticket,
         comments=comments,
         is_admin_view=True,
         dispatch_enabled=dispatch.dispatch_enabled(),
+        code_clues=clues,
     )
 
 
@@ -256,9 +264,13 @@ def dispatch_feedback(ticket_id: int):
             flash("评论已保存，但派发通道未配置（FEEDBACK_GITHUB_TOKEN 为空），请手动建 Issue。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
+        # 代码定位在发请求前做：正文的精确度主要靠这一段，而不是靠用户措辞。
+        # collect 内部全程 fail-soft，失败只是少一段线索，不会让派发失败。
+        clues = introspect.collect(current_app._get_current_object(), ticket.get("page_path"))
         issue = dispatch.create_issue(
             dispatch.build_issue_title(ticket),
-            dispatch.build_issue_body(ticket, comments, base_url=_base_url()),
+            dispatch.build_issue_body(
+                ticket, comments, base_url=_base_url(), code_clues=clues),
         )
         if issue is None:
             flash("评论已保存，但创建 GitHub Issue 失败（详见服务端日志），请手动建单。")

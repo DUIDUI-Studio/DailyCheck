@@ -54,12 +54,39 @@
 </p>
 {% endif %}
 
+{% if code_clues and code_clues.matched %}
+<div class="feedback-clue">
+  <p class="feedback-hint">派发后 Issue 会自动带上这段代码线索，开发侧不必再猜位置：</p>
+  <ul class="feedback-clue-list">
+    <li>路由 <code>{{ code_clues.rule }}</code> → <code>{{ code_clues.endpoint }}</code></li>
+    {% if code_clues.source %}
+    <li>实现 <code>{{ code_clues.source }}:{{ code_clues.line }}</code></li>
+    {% endif %}
+    {% if code_clues.template %}
+    <li>模板 <code>templates/{{ code_clues.template }}</code></li>
+    {% endif %}
+    {% if code_clues.commits %}
+    <li>近期改动
+      {% for c in code_clues.commits %}<code>{{ c.sha }}</code> {{ c.date }} {{ c.subject }}{% if not loop.last %} · {% endif %}{% endfor %}
+    </li>
+    {% endif %}
+  </ul>
+</div>
+{% elif ticket.page_path %}
+<p class="feedback-hint">
+  页面 <code>{{ ticket.page_path }}</code> 未能自动定位到路由，Issue 会提示开发侧自行推断入口。
+</p>
+{% endif %}
+
 <form method="post" action="{{ url_for('feedback.dispatch_feedback', ticket_id=ticket.id) }}" class="grid">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>处理意见
-    <textarea name="comment" rows="5" maxlength="2000" required
-              placeholder="例：确认是导出按钮漏绑事件，已派发修复；影响范围仅报表页。"></textarea>
+    <textarea name="comment" rows="6" maxlength="2000" required
+              placeholder="现象：菜单点导出没反应，报表页也一样&#10;影响范围：只影响报表和库存两个页面&#10;期望结果：点导出能下载 xlsx"></textarea>
   </label>
+  {# 三段结构能显著提高 Issue 的可执行性，但强制分段会让管理员嫌烦，
+     所以做成「一键插入」而不是必填项。 #}
+  <button type="button" class="btn-sm" data-fill-template>插入结构模板</button>
   <button type="submit" {% if not dispatch_enabled %}disabled{% endif %}>
     发送并派发开发（建 GitHub Issue）
   </button>
@@ -73,6 +100,23 @@
     派发后本单进入终态，开发闭环（开发 → PR → CI → merge → 部署）由 Issue 驱动。
   </p>
 </form>
+
+<script>
+(function () {
+  'use strict';
+  var btn = document.querySelector('[data-fill-template]');
+  if (!btn) { return; }
+  btn.addEventListener('click', function () {
+    var box = document.querySelector('textarea[name="comment"]');
+    if (!box) { return; }
+    // 只在没写过结构时插入，避免重复点击把模板叠成三份。
+    if (box.value.indexOf('现象：') === -1) {
+      box.value = '现象：\n影响范围：\n期望结果：\n' + (box.value ? '\n' + box.value : '');
+    }
+    box.focus();
+  });
+})();
+</script>
 
 <form method="post" action="{{ url_for('feedback.ignore_feedback', ticket_id=ticket.id) }}"
       data-ajax data-ajax-confirm="确认忽略这条反馈？忽略后不可恢复。">

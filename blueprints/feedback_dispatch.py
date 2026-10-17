@@ -7,6 +7,9 @@
 - 幂等由调用方保证：``feedback_pure.attach_issue`` 只在
   ``issue_number IS NULL`` 时更新，重复点「发送」不会造出第二张单。
 - 纯标准库（``urllib``），与 wecom_notify_pure 的口径一致。
+- **正文渲染不在本模块**：见 ``feedback_issue_body``。这里 re-export 是为了让
+  调用方（路由与测试）继续按 ``feedback_dispatch.build_issue_body`` 访问，
+  避免为一次纯重构改动所有引用点。
 
 Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）。
 """
@@ -19,7 +22,15 @@ import urllib.request
 from typing import Any
 
 import config
-from blueprints.feedback_pure import summarize
+
+from .feedback_issue_body import (  # noqa: F401 - 对外 re-export
+    MIN_ADMIN_NOTE_LEN,
+    MIN_BODY_LEN,
+    admin_notes,
+    build_issue_body,
+    build_issue_title,
+    detect_gaps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,77 +49,6 @@ def dispatch_enabled() -> bool:
 
 def repo_slug() -> str:
     return str(getattr(config, "FEEDBACK_GITHUB_REPO", "") or "").strip() or "ericmr1981/DailyCheck"
-
-
-# ---------------------------------------------------------------------------
-# 正文渲染
-# ---------------------------------------------------------------------------
-
-def build_issue_title(ticket: dict[str, Any] | None) -> str:
-    """``[反馈] FB-20261017-0001 库存页导出按钮没反应``。"""
-    ticket = ticket if isinstance(ticket, dict) else {}
-    no = str(ticket.get("ticket_no") or "").strip() or "无单号"
-    title = summarize(ticket.get("title") or "", 60) or "（无标题）"
-    return f"[反馈] {no} {title}"
-
-
-def build_issue_body(
-    ticket: dict[str, Any] | None,
-    comments: list[dict[str, Any]] | None = None,
-    base_url: str = "",
-) -> str:
-    """Issue 正文：反馈原文 + 管理员处理意见 + 闭环要求。
-
-    正文是给开发侧（人或 agent）看的任务单，所以带「验收口径」一节，
-    避免拿到一张只有一句话的 issue 无从下手。
-    """
-    ticket = ticket if isinstance(ticket, dict) else {}
-    lines: list[str] = ["## 用户反馈", ""]
-
-    meta = [
-        ("单号", ticket.get("ticket_no")),
-        ("提交人", ticket.get("submitter") or ticket.get("username")),
-        ("仓库", ticket.get("warehouse_code")),
-        ("页面", ticket.get("page_path")),
-        ("分类", ticket.get("category_label") or ticket.get("category")),
-        ("提交时间", ticket.get("created_at")),
-    ]
-    for label, value in meta:
-        text = str(value or "").strip()
-        if text:
-            lines.append(f"- **{label}**：{text}")
-
-    lines += ["", "### 问题描述", "", str(ticket.get("body") or "").strip(), ""]
-
-    admin_notes = [
-        c for c in (comments or [])
-        if isinstance(c, dict) and c.get("is_admin") and str(c.get("body") or "").strip()
-    ]
-    if admin_notes:
-        lines += ["### 管理员处理意见", ""]
-        for c in admin_notes:
-            who = str(c.get("username") or "管理员").strip()
-            when = str(c.get("created_at") or "").strip()
-            lines.append(f"- **{who}**（{when}）：{str(c.get('body') or '').strip()}")
-        lines.append("")
-
-    site = str(base_url or "").strip().rstrip("/")
-    if site and ticket.get("id") is not None:
-        lines += [
-            "### 来源",
-            "",
-            f"站内处理页：{site}/admin/feedback/{int(ticket['id'])}",
-            "",
-        ]
-
-    lines += [
-        "### 闭环要求",
-        "",
-        "本单由站内反馈派发，按项目标准闭环推进：",
-        "开发 → PR → CI 全绿 → merge → 部署。",
-        "修复后请在本 issue 说明改动点，便于回到站内标记闭环。",
-    ]
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -405,13 +405,46 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 
 两条提醒都跑在**业务事务之外**（企微走 daemon 线程），任一失败不回滚已落库的单子，也不阻断用户的成功页。
 
-**Issue 派发**（`blueprints/feedback_dispatch.py`，`urllib` 直调 REST）：
+**Issue 派发**（`blueprints/feedback_dispatch.py` 只管 GitHub API，正文渲染在 `feedback_issue_body.py`；`urllib` 直调 REST）：
 
 - **先落评论，再建 Issue**。顺序是刻意的：外部 API 挂了最多是没建单，管理员写的处理意见一个字都不丢 —— Issue 正文正是由这些评论渲染的。
 - **幂等**：`attach_issue()` 的 `WHERE issue_number IS NULL` 保证重复点「发送」不会造第二张单；已派发的单子点派发只回一句「未重复建单」。
 - **标签**：`user-feedback`（`0e8a16`）。先 `POST /labels` 尽力创建（`422` = 已存在，算成功），建不出来就不带标签建单 —— 标签是给自动化识别用的增强，不是前提。
 - **降级**：`FEEDBACK_GITHUB_TOKEN` 为空 → 只存评论 + 明确提示「请手动建 Issue」，**绝不伪装成功**；HTTP 失败同理（页面原话「创建 GitHub Issue 失败，请手动建单」）。
 - 正文含 **闭环要求** 一节，明确「开发 → PR → CI 全绿 → merge → 部署」，避免开发侧拿到一张只有一句话的 issue 无从下手。
+
+**Issue 精确化**（`blueprints/feedback_introspect.py`，2026-10-17 追加）：
+
+派发出的 Issue 是交给自动化巡检（`automation-1784861165563`，每 4 小时，`gh issue list --state open` 全量拉取，不依赖标签）执行的任务单。巡检侧对「判断不清或有产品决策属性」的 issue 会跳过并转人工，所以正文的精确度直接决定这单是「自动跑」还是「回到人工」。而精确度**不来自用户措辞**——用户不懂代码、管理员只做判定，这两处粗糙是常态；精确度来自机器能从 `page_path` 反查到什么。
+
+正文结构（`build_issue_body()`）：
+
+| 段 | 作用 | 来源 |
+|---|---|---|
+| 顶部结论 | 「已确认需要修复，不需要再回问」 | 固定文案，挡在巡检的「转人工」门外 |
+| `## 现象（用户原文）` | 引用块，逐行 `>` | `feedback_tickets.body` |
+| `## 管理员判定` | 判定依据与期望 | `feedback_comments`（`is_admin=1`） |
+| `## 代码线索（自动生成）` | 路由 / endpoint / 文件:行号 / 模板 / 近期 5 次改动 | **`feedback_introspect.collect()` 反射生成** |
+| `## 信息缺口` | 缺什么 + 「开发侧自行推断，不要阻塞等待」 | `detect_gaps()` |
+| `## 验收标准（逐项核对）` | 4 条可复核项（含「失败集 ⊆ known_failures」） | 固定模板 + 页面路径 |
+| `## 范围边界` | 不做顺带重构；语义变更须先评论 | 固定文案 |
+
+**代码线索怎么来**（全程 fail-soft，绝不阻断派发）：
+
+1. `clean_path()` — 只留 path 部分；非站内值（`https://` / `//host` / `javascript:`）一律丢弃，与 `page_path` 的既有注入约束同一条边界（该字段会进 Issue 正文）
+2. `match_endpoint()` — `app.url_map.bind("localhost").match(path, method="GET")` 反查 endpoint；只用 GET（用户停在 GET 页面），`static` 与匹配失败返回空
+3. `locate_view()` — `inspect.unwrap(app.view_functions[endpoint])` 取**真实视图函数**。权限装饰器都用了 `functools.wraps`，**不解包会定位到 `permissions.py` 的 wrapper，行号毫无意义**（该行为有变异验证覆盖），再取 `getsourcefile` / `getsourcelines` / 函数体内的 `render_template("x.html")`
+4. `recent_commits()` — `git log -5 --format=...- - <源码> <模板>`，**3 秒超时**，失败返回空表
+
+整个探测只读、不 import 蓝图模块、不碰业务库，毫秒级完成。任一步失败 → 正文写「未能自动定位：<原因>」+「按关键词在 `blueprints/` 全文检索」，**不留白也不假装有线索**。
+
+**管理员侧预览**：`GET /admin/feedback/<id>` 在 `status=open` 时算一次线索，渲染成「派发后 Issue 会带上这段代码线索」，管理员据此判断自动定位对不对；定位失败时提示「未能自动定位到路由」。判定区 textarea 提供「插入结构模板」按钮（`现象 / 影响范围 / 期望结果` 三段），**不强制**——强制分段会让管理员嫌烦，一键插入更现实。
+
+**与巡检自动化的契约**（本节另一半在 `automation-1784861165563` 的 prompt 里，2026-10-17 同步升级）：
+
+- 巡检新增 `2c-pre`：接手前必须 `gh issue edit` 把正文固化成 `现象 / 根因 / 修复方案 / 验收标准` 四节，原文移入 `## 原始记录`。把「用户口语 → 可执行任务」的翻译点显式化，而不是让开发 Agent 边猜边改
+- 巡检 2c 的「判断不清 → 转人工」新增例外：正文带「已确认需要修复」的**默认按确定要修处理**，只有实现中撞到产品行为语义变更才转人工
+
 
 **配置**（`config.py`，全部服务器 env 注入，**不进 git**）：
 
@@ -432,7 +465,9 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 
 角标 `feedback_open_count` 由 `blueprints/_helpers.py:register_template_context` 注入，**只对超管查**（普通用户看到「3 条待处理」却点不进去是纯噪音）。
 
-**测试**（`tests/test_feedback.py`，45 用例）：纯逻辑（空值/超长/分类回落/单据号递增/忽略终态/派发幂等/评论派发时点/收件箱排序/超管 id 取数）、**页面字段注入防护**（`https://` `//host` `javascript:` 一律丢弃）、企微渲染（关键字段/无 base_url 不发链接/空单据不崩/未配置静默跳过）、Issue 渲染与创建（token 缺失返回 None / 标签缺失仍建单 / 422 判失败 / 缺 `number` 判失败）、路由端到端（未登录 302 / 非超管 403 / 别人的单子 404 / 提交后站内扇出 / **跨用户：门店提交 → 超管通知中心可见** / 忽略流转 / 无 token 时评论保留且状态不变 / 派发成功置终态 / 重复派发不建第二单 / 仅存评论不建单 / 空评论不派发）。全部用例 `monkeypatch` 掉 `_request` 与 `send_webhook_markdown`，**不出网**。
+**测试**（`tests/test_feedback.py` 51 用例 + `tests/test_feedback_introspect.py` 32 用例）：纯逻辑（空值/超长/分类回落/单据号递增/忽略终态/派发幂等/评论派发时点/收件箱排序/超管 id 取数）、**页面字段注入防护**（`https://` `//host` `javascript:` 一律丢弃）、企微渲染（关键字段/无 base_url 不发链接/空单据不崩/未配置静默跳过）、Issue 渲染与创建（token 缺失返回 None / 标签缺失仍建单 / 422 判失败 / 缺 `number` 判失败）、路由端到端（未登录 302 / 非超管 403 / 别人的单子 404 / 提交后站内扇出 / **跨用户：门店提交 → 超管通知中心可见** / 忽略流转 / 无 token 时评论保留且状态不变 / 派发成功置终态 / 重复派发不建第二单 / 仅存评论不建单 / 空评论不派发）。全部用例 `monkeypatch` 掉 `_request` 与 `send_webhook_markdown`，**不出网**。
+
+精确化层单测（`tests/test_feedback_introspect.py`）：`clean_path` 六种外部值全部丢弃 + 五种 path 归一、`match_endpoint` 命中既有路由 / 未知路由返回空 / 忽略 query / `app=None` 不崩、`locate_view` 定位到 `items.py` 且行号 > 0（**变异验证：去掉 `inspect.unwrap` 该用例变红**）、`collect` 完整字段（`with_commits=False` 不依赖宿主 git 历史）、定位失败与外部 URL 均为 soft 返回、`recent_commits` 对非仓库路径返回空表、正文四要素（「已确认需要修复」／代码线索／验收标准／范围边界）逐段断言、无线索时写实话、`detect_gaps` 对短描述与缺线索报警而对完整输入不误报、`admin_notes` 过滤非管理员与空评论、管理员页线索预览与「未能自动定位」提示。三组变异验证（去掉 `inspect.unwrap` / 去掉既定结论声明 / `clean_path` 放行外部 URL）各自让对应用例变红。
 
 ---
 
