@@ -275,19 +275,19 @@
   </tbody>
 </table>
 
-<div class="actions" style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;">
-  {# —— A8: 按钮样式统一 —— #}
+<div class="order-actions">
+  {# —— 审批操作：主操作「通过」实心，危险操作「拒绝」描边红，同高同宽 —— #}
   {% if can_review and order.status == 'pending' %}
   <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="decision" value="approved" />
-    <button type="submit" class="btn-sm ok">通过</button>
+    <button type="submit" class="btn-action primary">通过审批</button>
   </form>
   <form method="post" action="{{ url_for('store_ordering.review_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="decision" value="rejected" />
-    <input name="note" placeholder="拒绝原因" required />
-    <button type="submit" class="btn-sm danger">拒绝</button>
+    <input name="note" placeholder="拒绝原因（必填）" required />
+    <button type="submit" class="btn-action danger">拒绝</button>
   </form>
   {% endif %}
 
@@ -301,7 +301,7 @@
   {% if can_deliver and ns.has_receivable %}
   <form method="post" action="{{ url_for('store_ordering.deliver_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button type="submit" class="btn-sm">一次性收货已到货物</button>
+    <button type="submit" class="btn-action ghost">一次性收货已到货物</button>
   </form>
   {% endif %}
 
@@ -309,13 +309,13 @@
   {% if order.status == 'pending' or order.status == 'approved' %}
   <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认取消该订单?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input name="reason" placeholder="取消原因" required style="min-width:180px" />
-    <button type="submit" class="btn-sm danger">取消订单</button>
+    <input name="reason" placeholder="取消原因（必填）" required />
+    <button type="submit" class="btn-action danger">取消订单</button>
   </form>
   {% endif %}
 
   {% if is_dc_view %}
-  <a class="btn-sm" href="{{ url_for('store_ordering.shipment_list') }}">返回出库清单</a>
+  <a class="btn-action ghost" href="{{ url_for('store_ordering.shipment_list') }}">返回出库清单</a>
   {% endif %}
 </div>
 
