@@ -5,6 +5,19 @@
 > 辅助：`scripts/arch_touched_sections.py` — 基于 `git diff --cached` 提示需更新章节。
 > 维护成本：< 5 分钟/次。**不维护的代价**：下一个开发者必然踩坑。
 
+**分工（2026-10-17 确立）**
+
+| 想知道 | 看哪里 |
+|---|---|
+| 有哪些路由、每条要什么权限、有哪些数据表、哪些模块在役 | [`ARCHITECTURE_MAP.md`](ARCHITECTURE_MAP.md) —— **机器生成、禁止手改**；`tests/test_arch_map.py` 在 CI 的 `test` job 里强制校验一致性 |
+| 为什么这样设计、踩过什么坑、怎么部署、怎么回滚 | 本文件（人工维护，只写「为什么」与稳定结构） |
+
+本文件**不再收录逐条路由清单与模块规模**——它们随每个功能变化，一律由派生图回答。
+要改派生图的内容就改 `scripts/arch_map.py`，然后 `python3 scripts/arch_map.py --write`。
+
+**想知道「这一周架构变了什么」**：`python3 scripts/arch_digest.py`（默认近 7 天，可 `--since "30 days ago"` 或 `--base <sha>`）。
+它比的是派生图的结构化事实，只报新增/删除路由、鉴权收紧、表增删、蓝图装配变化，不会把表格重排当成变更。
+
 ---
 
 ## 目录
@@ -1445,6 +1458,7 @@ with app.test_client() as c, c.session_transaction() as s:
 
 ### 必读
 
+- [`ARCHITECTURE_MAP.md`](ARCHITECTURE_MAP.md) — **架构事实图**（机器生成）：全部路由 × 鉴权、数据表、蓝图装配状态。先看这个，再看本文件
 - [`CLAUDE.md`](../CLAUDE.md) — 项目权威文档（dev 环境、目录、提交规范）
 - [`AGENT.md`](../AGENT.md) — 精简开发指南
 - [`docs/DEV_ENV.md`](DEV_ENV.md) — wdg-systemd 容器部署细节
@@ -1507,5 +1521,6 @@ with app.test_client() as c, c.session_transaction() as s:
 | `tests/**` | §12 |
 | `.github/workflows/*` / `deploy/**` / `scripts/**` | §3 §12 §附 |
 | `docs/ARCHITECTURE.md`（本文件） | 自更新 |
+| `scripts/arch_map.py` 或路由/权限/表结构 | 先改脚本语义，再 `python3 scripts/arch_map.py --write` 重生成 `docs/ARCHITECTURE_MAP.md`（一致性由 `tests/test_arch_map.py` 在 CI 强制） |
 
 **门禁脚本**：`scripts/git-hooks/pre-commit` 已装。运行 `python scripts/arch_touched_sections.py` 看本 commit 该改哪些章节。
