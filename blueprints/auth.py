@@ -173,6 +173,10 @@ def load_user_and_warehouse():
 
 @bp.route("/login", methods=["GET", "POST"])
 def login():
+    # 模板只渲染**已校验**的 next：未校验值（如 `?next=http://evil.example`）
+    # 不得回显进表单 action / 隐藏域。校验点仍只有 `_safe_next` 一处，
+    # 这里只是把它的结论交给模板，避免把攻击者可控的字符串写进 HTML。
+    next_url = _safe_next(request.values.get("next")) or ""
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -195,7 +199,7 @@ def login():
         )
         if locked:
             flash(f"失败次数过多，已临时锁定，请 {remaining // 60 + 1} 分钟后再试")
-            return render_template("login.html"), 429
+            return render_template("login.html", next_url=next_url), 429
 
         row = master.execute(
             "SELECT * FROM users WHERE username=?", (username,)
@@ -204,7 +208,7 @@ def login():
         # 顺序：密码校验之前先查 is_active，避免已停用账号仍触发失败计数。
         if row is not None and row["is_active"] == 0:
             flash("账号已停用，请联系平台管理员")
-            return render_template("login.html"), 403
+            return render_template("login.html", next_url=next_url), 403
         if row is None or not check_password_hash(row["password_hash"], password):
             new_count, new_lock = next_failure_state(
                 throttle["failed_count"] if throttle else 0,
@@ -222,7 +226,7 @@ def login():
             )
             master.commit()
             flash("账号或密码错误")
-            return render_template("login.html"), 401
+            return render_template("login.html", next_url=next_url), 401
 
         # 登录成功：清除该 (ip, username) 的失败计数。
         master.execute(
@@ -241,7 +245,7 @@ def login():
             "auth.warehouse_picker"
         )
         return redirect(nxt)
-    return render_template("login.html")
+    return render_template("login.html", next_url=next_url)
 
 
 @bp.route("/logout")

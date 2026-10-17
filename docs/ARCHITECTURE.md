@@ -818,7 +818,7 @@ flowchart TB
 |------|-------------|----------|
 | 未登录跳登录 | `next = permissions.current_relative_path()`（`request.full_path` 去掉结尾 `?`，即 **path + query**） | `permissions.py` 全部守卫（`require_login` / `require_role` / `require_platform_admin` / `require_warehouse_type` / `_guard_prelude`）+ `blueprints/auth.py:load_user_and_warehouse` |
 | 已登录未选仓跳 picker | `next` 同上，`warehouse_picker` 读回并传给模板 | `permissions.py`、`blueprints/auth.py:warehouse_picker` |
-| 登录表单 | action 带 `next` **且** 加 `<input type="hidden" name="next">`（双保险：action 丢 query 时仍拿得到） | `templates/login.html` |
+| 登录表单 | action 带 `next` **且** 加 `<input type="hidden" name="next">`（双保险：action 丢 query 时仍拿得到）；模板只渲染**已过 `_safe_next`** 的 `next_url`（视图传参），未校验值不进 HTML | `templates/login.html`、`blueprints/auth.py:login` |
 | 登录成功 | `nxt = _safe_next(request.values.get("next"))`（`values` 覆盖 query + 表单）；无则 `url_for("auth.warehouse_picker")` | `blueprints/auth.py:login` |
 | 选仓表单 | action + 隐藏域都带 `next_url`（视图传入，无则空串） | `templates/warehouse_picker.html` |
 | 选仓成功 | 有 `next` → `redirect(next)`；无 → `redirect(url_for("core.land"))` | `blueprints/auth.py:warehouse_select` |

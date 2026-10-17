@@ -339,6 +339,21 @@ def test_login_page_hidden_field_and_action_carry_next(deeplink_env):
     assert f'name="next" value="{path}"' in body
 
 
+@pytest.mark.parametrize("bad", UNSAFE_NEXT_VALUES[:5])
+def test_login_page_does_not_echo_unsafe_next(deeplink_env, bad):
+    """未校验的 next 不许回显进表单（action / 隐藏域只能出现已校验值）。"""
+    client = _client(deeplink_env)
+    page = client.get(f"/login?next={quote(bad, safe='')}")
+
+    assert page.status_code == 200
+    body = page.get_data(as_text=True)
+    assert "evil.example" not in body
+    assert "javascript:" not in body
+    # 表单退化成不带 next 的干净形态
+    assert 'action="/login"' in body
+    assert 'name="next" value=""' in body
+
+
 # ---------------------------------------------------------------------------
 # 6) 回归：不带 next 的老行为 + 选仓的租户/绑定闸
 # ---------------------------------------------------------------------------

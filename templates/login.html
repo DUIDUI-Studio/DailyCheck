@@ -16,11 +16,12 @@
       </ul>
       {% endif %}
     {% endwith %}
-    <form method="post" action="{{ url_for('auth.login', next=request.args.get('next')) }}">
+    <form method="post" action="{{ url_for('auth.login', next=next_url or None) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         {# 深链回跳双保险：action 已带 next 查询串；隐藏域保证即使 action 丢 query
-           （或浏览器/代理重写了 action）POST 仍能拿到原始目标。 #}
-        <input type="hidden" name="next" value="{{ request.args.get('next', '') }}">
+           （或浏览器/代理重写了 action）POST 仍能拿到原始目标。
+           next_url 由视图传入，且已过 _safe_next —— 未校验值不进 HTML。 #}
+        <input type="hidden" name="next" value="{{ next_url or '' }}">
       <label>账号
         <input name="username" required autofocus autocomplete="username" />
       </label>
