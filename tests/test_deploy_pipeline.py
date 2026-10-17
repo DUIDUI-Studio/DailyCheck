@@ -298,3 +298,106 @@ def test_heartbeat_loop_phase_not_clobbered(sandbox):
     finally:
         popen.terminate()
         popen.wait(timeout=10)
+
+
+# ---------------------------------------------------------------- 观察窗（PR #101 事故）
+def _observe_tools(sb: dict, *, blocked_lines: int = 0, code: str = "302",
+                   noise_lines: int = 0):
+    """给观察窗装 fake curl / journalctl，并记录 journalctl 收到的参数。
+
+    真 journalctl 只在 Linux 有，且沙盒里不该连真流量 —— 因此两个外部命令都
+    走 env 钩子注入（见 deploy_pipeline.sh observe_window）。
+    """
+    jlog = sb["tmp"] / "jctl-argv.txt"
+    jctl = sb["tmp"] / "fake-journalctl"
+    body = "".join(f"[dry_run] BLOCKED write #{i} (log-only)\n" for i in range(blocked_lines))
+    body += "".join(f"WARNING something BLOCKED unrelated #{i}\n" for i in range(noise_lines))
+    jctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{jlog}"\n'
+        f'cat <<"JEOF"\n{body}JEOF\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    jctl.chmod(0o755)
+    curl = sb["tmp"] / "fake-curl"
+    curl.write_text(f"#!/usr/bin/env bash\nprintf '%s' '{code}'\n", encoding="utf-8")
+    curl.chmod(0o755)
+    return (
+        {
+            "DAILYCHECK_PIPELINE_JOURNALCTL": str(jctl),
+            "DAILYCHECK_PIPELINE_CURL": str(curl),
+        },
+        jlog,
+    )
+
+
+def test_observe_window_quiet_green_passes(sandbox):
+    """绿实例无 BLOCKED、探针 302 → 观察窗放行，不回滚。
+
+    回归：BLOCKED 统计曾按「总观察时长」回溯（--since "30 min ago"），把
+    promote 之前 DRY_RUN 期间 verify 探针产生的 [dry_run] BLOCKED 也捞进来，
+    首次检查必然误判「写隔离没关」→ rc 24 回滚蓝（PR #101 实测）。
+    """
+    extra, jlog = _observe_tools(sandbox, blocked_lines=0)
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "5", **extra)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    argv = jlog.read_text(encoding="utf-8")
+    assert "--since" in argv
+    assert "min ago" not in argv, f"BLOCKED 统计窗口仍在按总时长回溯：{argv}"
+    assert "观察 +1min" in proc.stdout
+    assert _calls(sandbox)[-1] == "switch.sh green 100"
+
+
+def test_observe_window_rolls_back_on_blocked(sandbox):
+    """观察窗内真的出现 BLOCKED（写隔离没关）→ rc 24 + 回滚蓝。"""
+    extra, _ = _observe_tools(sandbox, blocked_lines=3)
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "5", **extra)
+
+    assert proc.returncode == 24, proc.stdout + proc.stderr
+    calls = _calls(sandbox)
+    assert calls[-1] == "switch.sh blue 100", calls
+    assert "观察窗异常" in proc.stdout
+    assert _state(sandbox).get("deployed") is None, "观察窗失败不得推进 deployed 锚点"
+
+
+def test_observe_ignores_non_dry_run_blocked_noise(sandbox):
+    """只有 `[dry_run] BLOCKED` 才算写隔离没关，别的 BLOCKED 字样不算。
+
+    宽匹配（grep 'BLOCKED'）会把日志里任何含该词的告警都当成写隔离残留 ——
+    与本次事故同一类误报，故匹配收窄到 dry-run 前缀。
+    """
+    extra, _ = _observe_tools(sandbox, blocked_lines=0, noise_lines=2)
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "5", **extra)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _calls(sandbox)[-1] == "switch.sh green 100"
+
+
+def test_observe_window_probe_failure_rolls_back(sandbox):
+    """探针非 302/200（站点 5xx）→ 回滚。"""
+    extra, _ = _observe_tools(sandbox, blocked_lines=0, code="502")
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "5", **extra)
+
+    assert proc.returncode == 24
+    assert _calls(sandbox)[-1] == "switch.sh blue 100"
+
+
+def test_observe_rollback_log_does_not_clobber_main_log(sandbox):
+    """回滚输出必须落独立文件。
+
+    回归：回滚曾用 `switch.sh ... >>"${LOG}"`，与调用方把 stdout 重定向到同一
+    个 LOG 时形成双写，父进程缓冲按旧 offset 覆盖掉子进程刚写的行，把「观察
+    +Nmin / 观察窗异常」两行诊断直接吃掉（生产事故时无从判断回滚缘由）。
+    """
+    extra, _ = _observe_tools(sandbox, blocked_lines=1)
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "5", **extra)
+
+    assert proc.returncode == 24
+    main_log = (sandbox["tmp"] / "pipeline.log").read_text(encoding="utf-8")
+    rb_log = sandbox["tmp"] / "pipeline.log.rollback"
+    assert rb_log.exists(), "回滚日志文件未生成"
+    assert "args=blue 100" in rb_log.read_text(encoding="utf-8")
+    assert "回滚" not in main_log, "主日志仍被子进程回滚输出污染"
+

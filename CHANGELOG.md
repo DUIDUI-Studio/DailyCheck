@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Fixed — 部署编排观察窗误判回滚：BLOCKED 统计窗口 + 回滚日志双写（fix/pipeline-observe-window，2026-10-17）
+- **事故**（PR #101 首次完整跑 pipeline 观察窗）：up → verify 8/8 → promote 转正 → `switch.sh green 100` 全部通过，5 分钟后观察窗却判定「写隔离没关」，自动 `switch.sh blue 100` 回滚并 rc 24 —— 新代码白转正、流量压在旧蓝实例，靠人工 `switch.sh green 100` 恢复（锚点随后正常推进到 `ce1e553`）。
+- **根因 1（判定）**：`observe_window` 统计 `[dry_run] BLOCKED` 用 `journalctl --since "${minutes} min ago"`，`minutes` 是**总观察时长**（默认 30）。首次检查只过 5 分钟就回溯 30 分钟，把 **promote 之前**绿实例在 DRY_RUN 下承接 verify 探针产生的 3 条 BLOCKED 全捞进来，必然误判。改为以「观察窗开始时刻」为统计起点。
+- **根因 2（可观测性）**：回滚用 `switch.sh ... >>"${LOG}"`，与调用方把 stdout 重定向到同一个 LOG 形成双写 —— 父进程缓冲按旧 offset 覆盖，把「观察 +5min: probe=… blocked=…」和「观察窗异常 —— 回滚蓝」两行诊断直接吃掉，日志里只剩 `target=blue`，排查时无法判断回滚缘由。回滚输出改落 `${LOG}.rollback`。
+- **观察窗可测**：`curl` / `journalctl` / green unit 名改为可经 `DAILYCHECK_PIPELINE_CURL` / `_JOURNALCTL` / `_GREEN_UNIT` 注入；进度标签改用真实流逝时间（此前按 `i*5` 硬算，改 tick 后标签失真）。
+- **测试**：`tests/test_deploy_pipeline.py` 22 → 26 用例，新增观察窗四态（放行 / BLOCKED 回滚 / 探针 502 回滚 / 回滚日志独立）。变异验证：窗口退回总时长、回滚输出写回主日志，各自打红对应用例。
+- **匹配收窄**：`grep -c 'BLOCKED'` → `grep -c '\[dry_run\] BLOCKED'`。promote 之后绿实例不该再产生任何 dry-run 拦截，但日志里另有别的含 `BLOCKED` 来源时，宽匹配会误判。
+
 ### Fixed — 门店订货：未提交的数量选择在切换筛选后被清零（fix/catalog-draft-persist，2026-10-17）
 - **症状**（Issue #100）：订货页选好品类、给几张卡片填了数量，**没点「加入购物车」**就点别的品类或「全部」，填过的数量全部消失，得重填一遍。
 - **根因**：已填数量只存在于当页 DOM（卡片 hidden input + `data-saved-qty`），而品类 chip 和搜索框都是整页 GET 跳转，DOM 重建即归零。

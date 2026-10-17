@@ -195,25 +195,45 @@ observe_window() {
   local minutes=$1
   local tick="${DAILYCHECK_PIPELINE_TICK_SEC:-300}"
   local probe="${DAILYCHECK_PIPELINE_PROBE_URL:-http://127.0.0.1:8080/}"
+  local green_unit="${DAILYCHECK_PIPELINE_GREEN_UNIT:-dailycheck-green}"
+  local curl_bin="${DAILYCHECK_PIPELINE_CURL:-curl}"
+  local jctl_bin="${DAILYCHECK_PIPELINE_JOURNALCTL:-journalctl}"
   if [[ ${minutes} -le 0 ]]; then
     log "观察窗跳过（--observe-min 0）"
     return 0
   fi
   local rounds=$(( (minutes + 4) / 5 ))
   [[ ${rounds} -lt 1 ]] && rounds=1
-  local i code blocked
+  # BLOCKED 统计起点 = 观察窗开始时刻。⚠️ 不能按「总观察时长」回溯：promote
+  # 之前绿实例仍在 DRY_RUN 下承接 verify 探针，那批 [dry_run] BLOCKED 会落进
+  # 窗口，使首次检查（+5min）必然误判「写隔离没关」并回滚蓝。2026-10-17
+  # PR #101 首次完整跑观察窗即命中（rc 24，回滚后新代码没上线）。
+  local since_ts
+  since_ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  local i code blocked elapsed_sec=0 elapsed_min
   for (( i=1; i<=rounds; i++ )); do
     sleep "${tick}"
-    _hb "observe-$((i*5))m"
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${probe}" 2>/dev/null)"
+    elapsed_sec=$(( elapsed_sec + tick ))
+    elapsed_min=$(( elapsed_sec / 60 ))
+    [[ ${elapsed_min} -lt 1 ]] && elapsed_min=1
+    _hb "observe-${elapsed_min}m"
+    code="$("${curl_bin}" -s -o /dev/null -w '%{http_code}' --max-time 10 "${probe}" 2>/dev/null)"
     code="${code:-000}"
-    blocked="$(journalctl -u dailycheck-green --since "${minutes} min ago" 2>/dev/null \
-               | grep -c 'BLOCKED' || true)"
+    blocked="$("${jctl_bin}" -u "${green_unit}" --since "${since_ts}" 2>/dev/null \
+               | grep -c '\[dry_run\] BLOCKED' || true)"
     blocked="${blocked:-0}"
-    log "观察 +$((i*5))min: probe=${code} blocked=${blocked}"
+    log "观察 +${elapsed_min}min: probe=${code} blocked=${blocked}（BLOCKED 统计自 ${since_ts}）"
     if [[ "${blocked}" -gt 0 || ( "${code}" != "302" && "${code}" != "200" ) ]]; then
       log "✗ 观察窗异常 —— 回滚蓝"
-      bash "${SCRIPT_DIR}/switch.sh" blue 100 >>"${LOG}" 2>&1 || log "WARN: 回滚亦失败"
+      # 回滚输出必须写独立文件：与主日志共用同一文件时，父进程 stdout 的缓冲
+      # 会在 append offset 上覆盖子进程刚写下的内容，把上面两行诊断吃掉，
+      # 事后只剩「已回滚」而无缘由。
+      local rb_log="${LOG}.rollback"
+      if bash "${SCRIPT_DIR}/switch.sh" blue 100 >>"${rb_log}" 2>&1; then
+        log "已回滚蓝（回滚日志 ${rb_log}）"
+      else
+        log "WARN: 回滚亦失败，见 ${rb_log}"
+      fi
       FAIL_STAGE="observe"
       exit 24
     fi
