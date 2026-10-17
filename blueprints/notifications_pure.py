@@ -24,6 +24,8 @@ ALLOWED_EVENT_TYPES = frozenset({
     "store_order_delivered",
     "store_order_received",
     "store_order_cancelled",
+    # 用户反馈提单（2026-10-17）：扇出给所有平台超管，见 blueprints/feedback.py
+    "feedback_submitted",
 })
 
 SUMMARY_MAX_LEN = 200

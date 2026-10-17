@@ -247,7 +247,10 @@ def register_template_context(app) -> None:
     def _inject():
         role = g.get("role")
         unread = 0
-        if g.get("user") is not None:
+        feedback_open = 0
+        user = g.get("user")
+        is_admin_flag = bool(user["is_admin"]) if user is not None else False
+        if user is not None:
             try:
                 # Use a direct sqlite3 connection (not get_master_db) to
                 # avoid pulling g.state into a context that may not be
@@ -260,13 +263,22 @@ def register_template_context(app) -> None:
                     row = m.execute(
                         "SELECT COUNT(*) AS c FROM notifications "
                         "WHERE user_id=? AND read_at IS NULL",
-                        (g.user["id"],),
+                        (user["id"],),
                     ).fetchone()
-                unread = int(row[0]) if row else 0
+                    unread = int(row[0]) if row else 0
+                    # 反馈收件箱角标只对平台超管查：普通用户看到「有 3 条待处理」
+                    # 却点不进去，是纯噪音。一次 COUNT 换一个可用的待办提醒。
+                    if is_admin_flag:
+                        frow = m.execute(
+                            "SELECT COUNT(*) AS c FROM feedback_tickets "
+                            "WHERE status='open'"
+                        ).fetchone()
+                        feedback_open = int(frow[0]) if frow else 0
             except Exception:  # noqa: BLE001
-                # Never break template rendering over a notification count
-                # failure — fall back to 0 (no badge).
+                # Never break template rendering over a count failure —
+                # fall back to 0 (no badge).
                 unread = 0
+                feedback_open = 0
         wh_type = g.warehouse["warehouse_type"] if g.get("warehouse") is not None else None
         # v2 账号管理（feat/user-admin-v2）：把当前用户的 tenant_id 注入模板，
         # 让账号管理 UI 显示「当前租户」并在筛选器里默认选中。
@@ -274,7 +286,6 @@ def register_template_context(app) -> None:
         # 以及测试 fixture 手搓的 dict（可能没 tenant_id）—— 后者用 try/except
         # 兜底而不是 KeyError，避免破坏已有测试。
         current_tenant_id = None
-        user = g.get("user")
         if user is not None:
             try:
                 current_tenant_id = user["tenant_id"]
@@ -283,13 +294,14 @@ def register_template_context(app) -> None:
         return {
             "current_role": role["role"] if role else None,
             "unread_notifications_count": unread,
+            "feedback_open_count": feedback_open,
             # Mirror g.user["is_admin"] into the template namespace. base.html
             # gates several nav links on `is_admin or is_storefront`, but the
             # bare `is_admin` name was never injected — so admins lost those
             # links in non-storefront warehouses (e.g. the R&D center). This
             # restores the documented "admin not limited by warehouse type"
             # behaviour. See base.html lines 27/35.
-            "is_admin": bool(g.user["is_admin"]) if g.get("user") is not None else False,
+            "is_admin": is_admin_flag,
             # Warehouse type flags. Hoisted here from `{% set %}` in base.html's
             # sidebar block — Jinja2 block scope doesn't propagate to child
             # template blocks, so items.html / edit_item.html couldn't see

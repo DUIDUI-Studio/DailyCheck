@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}{{ ticket.ticket_no }}{% endblock %}
+{% block content %}
+<div class="list-head">
+  <h2>{{ ticket.ticket_no }}</h2>
+  <a class="btn-sm btn-edit" href="{{ url_for('feedback.my_feedback') }}">返回列表</a>
+</div>
+
+<div class="fc-head" style="margin-bottom:10px;">
+  <span class="fc-title">{{ ticket.title }}</span>
+  <span class="feedback-status st-{{ ticket.status }}">{{ ticket.status_label }}</span>
+</div>
+
+<dl class="feedback-kv">
+  <dt>类型</dt><dd>{{ ticket.category_label }}</dd>
+  <dt>提交时间</dt><dd>{{ ticket.created_at }}</dd>
+  {% if ticket.page_path %}<dt>相关页面</dt><dd>{{ ticket.page_path }}</dd>{% endif %}
+  {% if ticket.warehouse_code %}<dt>所在仓库</dt><dd>{{ ticket.warehouse_code }}</dd>{% endif %}
+  {% if ticket.issue_number %}
+  <dt>开发单</dt>
+  <dd>
+    {% if ticket.issue_url %}
+    <a href="{{ ticket.issue_url }}" target="_blank" rel="noopener">Issue #{{ ticket.issue_number }}</a>
+    {% else %}Issue #{{ ticket.issue_number }}{% endif %}
+  </dd>
+  {% endif %}
+</dl>
+
+<h3>问题描述</h3>
+<div class="feedback-body">{{ ticket.body }}</div>
+
+{% if comments %}
+<h3>管理员回复</h3>
+{% for c in comments %}
+<div class="feedback-comment{% if c.dispatched_at %} is-trigger{% endif %}">
+  <div class="comment-head">
+    {{ c.username or '管理员' }} · {{ c.created_at }}
+    {% if c.dispatched_at %}<span class="trigger-tag">已派发开发</span>{% endif %}
+  </div>
+  <div class="comment-body">{{ c.body }}</div>
+</div>
+{% endfor %}
+{% else %}
+<p class="muted">管理员还没有回复。</p>
+{% endif %}
+
+{% include "feedback_shared_styles.html" %}
+{% endblock %}

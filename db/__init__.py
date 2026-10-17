@@ -636,6 +636,55 @@ CREATE TABLE IF NOT EXISTS approval_policies (
 );
 CREATE INDEX IF NOT EXISTS idx_approval_policies_lookup
     ON approval_policies(tenant_id, scope, warehouse_code);
+
+-- ---------------------------------------------------------------------------
+-- 用户反馈 / 问题提单（2026-10-17）
+-- 系统级数据 → master.db：反馈描述的是「这套系统用起来哪里不对」，
+-- 与具体仓库的业务数据无关，跨仓可见才符合运维语义。
+-- status 生命周期：open →（管理员判定）
+--            ├─ ignored        认为不重要，已读忽略（终态）
+--            └─ dispatched     已加评论并派发成 GitHub Issue（终态，等 PR 关闭）
+-- 详见 docs/ARCHITECTURE.md §3.10（反馈闭环）。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS feedback_tickets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_no      TEXT NOT NULL UNIQUE,           -- FB-YYYYMMDD-NNNN
+    user_id        INTEGER NOT NULL,
+    warehouse_code TEXT,                           -- 提交时所在仓（可空）
+    page_path      TEXT,                           -- 出问题的页面路径（可空）
+    category       TEXT NOT NULL DEFAULT 'other',  -- bug|usability|data|other
+    title          TEXT NOT NULL,
+    body           TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'open',   -- open|ignored|dispatched
+    issue_number   INTEGER,                        -- GitHub Issue 编号（派发后写入）
+    issue_url      TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    handled_by     INTEGER,                        -- 处理人 user_id
+    handled_at     TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (handled_by) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_status_created
+    ON feedback_tickets(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_user_created
+    ON feedback_tickets(user_id, created_at DESC);
+
+-- 管理员对反馈的处理评论。dispatched_at 非空 = 该评论是触发派发的那一条
+-- （只记时点，Issue 号在 feedback_tickets.issue_number，一票一单不重复派发）。
+CREATE TABLE IF NOT EXISTS feedback_comments (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id     INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    body          TEXT NOT NULL,
+    is_admin      INTEGER NOT NULL DEFAULT 0,
+    dispatched_at TEXT,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY (ticket_id) REFERENCES feedback_tickets(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_comments_ticket
+    ON feedback_comments(ticket_id, id);
 """
 
 # v3 P0 增量：ALTER 必须在 MASTER_SCHEMA 之外，否则 executescript 在已迁移的

@@ -153,3 +153,24 @@ SAFETY_STOCK_ROUND_DIGITS = 2
 # ─────────────────────────────────────────────────────────────────────
 WECOM_STORE_ORDER_WEBHOOK = os.environ.get("WECOM_STORE_ORDER_WEBHOOK", "").strip()
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://kjtang.cn").rstrip("/")
+
+# ─────────────────────────────────────────────────────────────────────
+# 用户反馈闭合通道（2026-10-17）
+#
+# 用户在页面提交「使用问题」→ 企微群机器人推一条 → 管理员判定：
+#   忽略（终态） / 加评论并发起 GitHub Issue（终态，进开发闭环）。
+# 见 blueprints/feedback_pure.py 与 docs/ARCHITECTURE.md §3.10。
+#
+# - WECOM_FEEDBACK_WEBHOOK：反馈专用 webhook，**为空 = 不推企微**
+#   （站内通知仍然照发，不提消息通道就丢数据）。
+#   独立于订货单 webhook，方便「反馈消息太吵」时单独静音。
+# - FEEDBACK_GITHUB_TOKEN：建 Issue 用的 PAT（repo scope）。
+#   **为空 = 不建 Issue**：路由降级为只存评论 + 提示管理员去手动建单，
+#   绝不伪装成功。
+# - FEEDBACK_GITHUB_REPO：owner/name。默认主仓。
+# ─────────────────────────────────────────────────────────────────────
+WECOM_FEEDBACK_WEBHOOK = os.environ.get("WECOM_FEEDBACK_WEBHOOK", "").strip()
+FEEDBACK_GITHUB_TOKEN = os.environ.get("FEEDBACK_GITHUB_TOKEN", "").strip()
+FEEDBACK_GITHUB_REPO = os.environ.get(
+    "FEEDBACK_GITHUB_REPO", "ericmr1981/DailyCheck"
+).strip()

@@ -87,6 +87,18 @@
         <span class="nav-badge">{{ unread_notifications_count }}</span>
         {% endif %}
       </a>
+      {# 问题反馈是「用户 → 管理员」的上行通道。三条链接必须与 land.html
+         的「问题反馈」卡片严格同集（test_nav_integration 双向相等断言）。 #}
+      <a href="{{ url_for('feedback.new_feedback') }}">提交问题</a>
+      <a href="{{ url_for('feedback.my_feedback') }}">我提交过的</a>
+      {% if is_admin %}
+      <a href="{{ url_for('feedback.admin_inbox') }}">
+        反馈收件箱
+        {% if feedback_open_count and feedback_open_count > 0 %}
+        <span class="nav-badge">{{ feedback_open_count }}</span>
+        {% endif %}
+      </a>
+      {% endif %}
     </nav>
 
     {# 管理员模块置底：账号/Token/品项数据/主数据；权限管理页由权限项目落地后补入。 #}
@@ -125,6 +137,7 @@
       <span class="ctx-user">
         {{ g.user['username'] }}{% if g.user['is_admin'] %} <small>[平台管理员]</small>{% elif g.role %}<small>[{{ g.role['role'] }}]</small>{% endif %}
       </span>
+      <a class="ctx-link" href="{{ url_for('feedback.new_feedback', page=request.path) }}">反馈</a>
       <a class="ctx-link" href="{{ url_for('auth.logout') }}">注销</a>
     </div>
     {% endif %}

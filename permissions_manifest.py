@@ -169,6 +169,20 @@ ROUTE_MATRIX: dict[str, str] = {
     "core.summary": LOGIN,                      # 终裁④：不脱敏
     "core.categories": LOGIN,
     "core.delete_category": f"{ROLE_PREFIX}staff",
+    # ---- feedback（用户问题提单 → 管理员判定 → 派发开发闭环）----
+    # 用户侧：任意登录用户可提交/看自己的单子（含被忽略的，让他知道被处理过）。
+    "feedback.my_feedback": LOGIN,
+    "feedback.new_feedback": LOGIN,
+    "feedback.submit_feedback": LOGIN,
+    "feedback.ticket_detail": LOGIN,            # 函数体内再收一次：非本人且非超管 404
+    # 管理员侧：收件箱、判定、评论、派发 —— 平台超管专属。
+    # 不开权限点：反馈处理涉及「对外建 Issue / 触发部署」，属于平台级动作，
+    # 与 admin.user.manage 同一档，不进任何仓库角色包。
+    "feedback.admin_inbox": PLATFORM,
+    "feedback.admin_feedback_detail": PLATFORM,
+    "feedback.ignore_feedback": PLATFORM,
+    "feedback.save_comment": PLATFORM,
+    "feedback.dispatch_feedback": PLATFORM,
     # ---- forecast ----
     "forecast.forecast_index": PLATFORM,        # 清除死装饰器
     "forecast.forecast_item": f"{ROLE_PREFIX}manager",
