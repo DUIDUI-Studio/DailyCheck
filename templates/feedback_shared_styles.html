@@ -47,6 +47,13 @@
   .feedback-actions form { margin: 0; width: auto; background: none; border: 0; padding: 0; }
   .feedback-actions button, .feedback-actions a.btn-secondary { width: auto; }
   .feedback-hint { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+  /* 派发前的代码线索预览：管理员据此判断自动定位对不对，不对就补一句页面。 */
+  .feedback-clue {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 12px;
+  }
+  .feedback-clue-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.7; }
+  .feedback-clue-list code { font-size: 11px; word-break: break-all; }
   .feedback-warn {
     font-size: 12px; background: #fffbeb; border: 1px solid #fcd34d;
     color: #92400e; border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
