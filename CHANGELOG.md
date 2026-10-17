@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Fixed — 反馈派发的 page_path 语义修正 + DC 品项开关整页重载（fix/feedback-page-path-and-toggles，2026-10-17）
+- **`page_path` 是「提交时所在页面」，不是「出问题页面」**（Issue #93 实测）。中转页（`auth` 蓝图下 login / logout / select-warehouse）不再产生代码线索，`collect()` 返回 `matched=False` + `reason=transient_page`；按 endpoint 前缀判定而非硬编码路径，改路由时黑名单不会静默失效。失败原因细分为 `no_path` / `unmatched` / `transient_page`，正文文案各不相同（中转页明写「不能作为出问题位置的证据，以现象为准」）。
+- **验收标准不再断言具体页面**。原第一条「站内 `<page>` 页面按现象描述逐项复现」在 page_path 错误时等于让开发侧改错文件还自认合格；改为「已核对代码线索指向的页面确实就是现象所在页面，不一致时以现象为准」。
+- **正文「页面」字段改名为「提交时所在页面」**，措辞本身即警示。
+- **管理员可覆盖实际页面**：`/admin/feedback/<id>` 新增「实际页面」输入框，`dispatch_feedback` 读 `page_override` 后重新定位；覆盖值同样经 `clean_path()` 受「只可能是站内相对路径」约束。覆盖生效时正文同时保留两行（提交时所在页面 / 实际页面（管理员指定）），可追溯。
+- **「插入结构模板」空骨架不再进正文**：新增 `strip_empty_structure()`，剥掉值为空的 `现象：/影响范围：/期望结果：` 行（只匹配标签后无内容者，`现象：点导出没反应` 原样保留）；净化放在 `admin_notes()` 入口，正文与信息缺口判定共用。前端同时修光标定位（`setSelectionRange(3,3)` 落到「现象：」之后，原先 `value` 重设后 selection 归末尾，人顺着最后一行写、三行骨架全空着提交）。
+- **DC 品项可订开关改 AJAX**：`templates/store_ordering/dc_items.html` 的 toggle form 补 `data-ajax data-ajax-mode="reload-stay"`。此前点「下架/恢复可订」走整页 POST → 302 重渲染 → 滚动归零，而本页按品类分组渲染多张表，连续调整多个品项必须反复从顶部滚回来（Issue #93 本体）。
+- 测试：新增 `tests/test_feedback_page_path.py`（20 用例）；`test_feedback_introspect.py` 拆分到 279 行。四组变异验证全部 KILLED（去掉中转页判定 / 去掉骨架净化 / 不读 `page_override` / 模板去掉 `data-ajax`）。
+
 ### Added — Issue 精确化：派发正文自带代码定位与验收标准（feat/feedback-issue-precision，2026-10-17）
 - **自动代码定位**：新增 `blueprints/feedback_introspect.py`，从反馈单的 `page_path` 反查 Flask endpoint → 源码文件:行号 → 模板 → 该文件最近 5 次提交，写进 Issue 正文的「代码线索（自动生成）」段。派发时不再只有用户一句口语。全程 fail-soft（探测失败只少一段线索，绝不阻断派发）、只读、`git` 调用 3 秒超时。
 - **正文改为验收契约**：`build_issue_body()` 五段结构——顶部「已确认需要修复，不需要再回问」（挡在巡检「判断不清→转人工」的门外）、现象（引用块）、管理员判定、代码线索、信息缺口（缺什么 + 「开发侧自行推断，不要阻塞等待」）、验收标准（4 条可复核项）、范围边界（不做顺带重构，语义变更须先评论）。

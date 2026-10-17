@@ -11,6 +11,7 @@ Spec: docs/ARCHITECTURE.md §3.10（反馈闭环 / Issue 精确化）。
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .feedback_pure import summarize
@@ -19,6 +20,13 @@ from .feedback_pure import summarize
 # 只用于正文提示，不阻断派发。
 MIN_BODY_LEN = 20
 MIN_ADMIN_NOTE_LEN = 15
+
+# 管理员详情页「插入结构模板」按钮会前置插入三行骨架
+# （现象：/ 影响范围：/ 期望结果：）。用户点完按钮后光标落在文本框末尾，
+# 很自然从最后一行往下写，于是三行空骨架被原样提交进 Issue 正文
+# （Issue #93 实况）。空标签对开发侧零信息，必须在渲染前剥掉 ——
+# 前端光标定位也修了，但不能指望所有入口都守规矩。
+_EMPTY_STRUCT_LABEL_RE = re.compile(r"^(现象|影响范围|期望结果)\s*[:：]\s*$")
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +75,14 @@ def build_issue_body(
         ("单号", ticket.get("ticket_no")),
         ("提交人", ticket.get("submitter") or ticket.get("username")),
         ("仓库", ticket.get("warehouse_code")),
-        ("页面", ticket.get("page_path")),
+        ("提交时所在页面", ticket.get("page_path")),
         ("分类", ticket.get("category_label") or ticket.get("category")),
         ("提交时间", ticket.get("created_at")),
     ]
+    # 管理员手填了「实际页面」= 有意纠正自动定位，两条都要留，谁改的能追溯。
+    override = str(ticket.get("page_path_override") or "").strip()
+    if override:
+        meta.insert(4, ("实际页面（管理员指定）", override))
     for label, value in meta:
         text = str(value or "").strip()
         if text:
@@ -134,14 +146,36 @@ def build_issue_body(
     return "\n".join(lines)
 
 
+def strip_empty_structure(text: Any) -> str:
+    """剥掉「现象：」「影响范围：」「期望结果：」这类**后面没有内容**的骨架行。
+
+    只删完全空白的标签行：``现象：``（含全角冒号、尾随空格）会被删，
+    ``现象：点导出没反应`` 原样保留。宁可少删不可多删 —— 误删正文内容比
+    留三个空标签糟得多。
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+    kept = [ln for ln in raw.splitlines() if not _EMPTY_STRUCT_LABEL_RE.match(ln.strip())]
+    return "\n".join(kept).strip()
+
+
 def admin_notes(comments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """只取管理员写的、非空的评论，按时间正序（调用方已排好，这里只过滤）。"""
-    return [
-        c for c in (comments or [])
-        if isinstance(c, dict)
-        and c.get("is_admin")
-        and str(c.get("body") or "").strip()
-    ]
+    """只取管理员写的、净化后非空的评论，按时间正序（调用方已排好，这里只过滤）。
+
+    净化在**入口处**做：正文渲染和信息缺口判定都消费这个结果，一处清洗两边受益。
+    """
+    notes: list[dict[str, Any]] = []
+    for comment in comments or []:
+        if not isinstance(comment, dict) or not comment.get("is_admin"):
+            continue
+        cleaned = strip_empty_structure(comment.get("body"))
+        if not cleaned:
+            continue
+        note = dict(comment)
+        note["body"] = cleaned
+        notes.append(note)
+    return notes
 
 
 def _quote(text: str) -> str:
@@ -152,19 +186,51 @@ def _quote(text: str) -> str:
 
 
 def _render_clue_lines(clues: dict[str, Any]) -> list[str]:
-    """代码线索段。探测失败时给一句实话 + 下一步，而不是留白。"""
+    """代码线索段。
+
+    探测失败**不能只写一句「未定位」就完事** —— 三种失败的可信度完全不同，
+    开发侧需要知道该不该相信上下文：
+
+    - ``transient_page``：已知不可信（中转页），必须明说「别用这个路径」；
+    - ``unmatched``：路径存在但没路由，可能是前端路由/已下线；
+    - ``no_path``：根本没记路径。
+
+    成功时也要声明「这是提交时所在页面」，因为用户可能在 A 页遇到问题、
+    切到 B 页才提反馈（Issue #93 实况）。
+    """
     if not clues or not clues.get("matched"):
-        path = str((clues or {}).get("page_path") or "").strip()
-        reason = (
-            f"`{path}` 没有匹配到任何 GET 路由（可能是前端路由、已下线页面，或参数不合法）"
-            if path else "提交时没有记录出问题的页面"
-        )
+        clues = clues or {}
+        path = str(clues.get("page_path") or "").strip()
+        reason = str(clues.get("reason") or "").strip()
+
+        if reason == "transient_page":
+            endpoint = str(clues.get("transient_endpoint") or "").strip()
+            return [
+                f"- ⚠️ **提交时所在页面 `{path}` 是纯中转页**"
+                + (f"（endpoint `{endpoint}`）" if endpoint else "")
+                + "，登录/仓库选择一类，页面上没有任何业务内容，"
+                "**不能作为出问题位置的证据**。",
+                "- 原因：用户可能是**路过该页**时点开「反馈」的。",
+                "- 请以「现象」为准：按关键词在 `templates/` 与 `blueprints/` 检索，"
+                "或从描述提到的功能模块入手定位。",
+            ]
+
+        if reason == "unmatched" and path:
+            return [
+                f"- 未能自动定位：`{path}` 没有匹配到任何 GET 路由"
+                "（可能是前端路由、已下线页面，或参数不合法）。",
+                "- 请从用户原文和描述里推断入口，必要时按关键词在 `blueprints/` 全文检索。",
+            ]
+
         return [
-            f"- 未能自动定位：{reason}。",
+            "- 未能自动定位：提交时没有记录出问题的页面。",
             "- 请从用户原文和描述里推断入口，必要时按关键词在 `blueprints/` 全文检索。",
         ]
 
-    lines: list[str] = []
+    lines: list[str] = [
+        "- 以下位置依据是「**提交反馈时所在的页面**」，通常就是出问题的页面，"
+        "但若与「现象」描述不符，**以现象为准**。",
+    ]
     endpoint = str(clues.get("endpoint") or "").strip()
     rule = str(clues.get("rule") or clues.get("page_path") or "").strip()
     if rule and endpoint:
@@ -199,21 +265,27 @@ def _render_clue_lines(clues: dict[str, Any]) -> list[str]:
 
 
 def _render_acceptance(clues: dict[str, Any]) -> list[str]:
-    """验收标准：每条都必须能被第三方复核，不写「体验变好」这类无法判定的词。"""
+    """验收标准：每条都必须能被第三方复核，不写「体验变好」这类无法判定的词。
+
+    第一条**不绑定具体页面路径**：路径来自「提交时所在页面」，可能与真实现象
+    无关（Issue #93）。把错误路径写进验收标准，等于让开发侧改错文件还自认合格。
+    改成「核对线索页面是否就是现象所在页面」，把它降级成一个待确认项。
+    """
+    items = ["- [ ] 按「现象」描述能稳定复现，修复后不再出现"]
     page = ""
     if clues and clues.get("matched"):
         page = str(clues.get("rule") or clues.get("page_path") or "").strip()
-    first = (
-        f"- [ ] 站内 `{page}` 页面按「现象」描述逐项复现，修复后不再出现"
-        if page
-        else "- [ ] 按「现象」描述能稳定复现，修复后不再出现"
-    )
-    return [
-        first,
+    if page:
+        items.append(
+            f"- [ ] 已核对「代码线索」指向的 `{page}` 确实就是现象所在页面；"
+            "**不一致时以现象为准并在本 issue 说明真实页面**"
+        )
+    items += [
         "- [ ] 修复不改变其他页面和接口的现有行为",
         "- [ ] 全量 `pytest` 的失败集 ⊆ `tests/known_failures.txt`（零新增失败）",
         "- [ ] 在本 issue 评论说明改动点、影响范围与验证方式",
     ]
+    return items
 
 
 def detect_gaps(

@@ -439,8 +439,23 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 | `## 管理员判定` | 判定依据与期望 | `feedback_comments`（`is_admin=1`） |
 | `## 代码线索（自动生成）` | 路由 / endpoint / 文件:行号 / 模板 / 近期 5 次改动 | **`feedback_introspect.collect()` 反射生成** |
 | `## 信息缺口` | 缺什么 + 「开发侧自行推断，不要阻塞等待」 | `detect_gaps()` |
-| `## 验收标准（逐项核对）` | 4 条可复核项（含「失败集 ⊆ known_failures」） | 固定模板 + 页面路径 |
+| `## 验收标准（逐项核对）` | 可复核项（含「失败集 ⊆ known_failures」+ 「核对线索页面是否就是现象所在页面」） | 固定模板；**不绑定具体页面路径** |
 | `## 范围边界` | 不做顺带重构；语义变更须先评论 | 固定文案 |
+
+⚠️ **`page_path` 的语义边界（Issue #93，2026-10-17 实测修正）**
+
+`page_path` 是「**用户点「反馈」那一刻所在的页面**」，不是「出问题的页面」。两者通常一致，但以下情况必定不一致：
+
+- **纯中转页**：登录 / 登出 / 仓库选择（`auth` 蓝图下全部四个路由）。用户可能只是**路过**就顺手提了反馈，页面上没有任何业务内容。
+- 用户在 A 页遇到问题，切到 B 页（查数据等）后才想起来提反馈。
+
+实测代价（#93）：真凶是 `templates/store_ordering/dc_items.html` 里一个漏了 `data-ajax` 的 form，自动定位却认成了 `blueprints/auth.py`（仓库选择页），并且这个错误路径被写进了**验收标准第一条**——开发侧照着改就是改错文件，还自以为在验收。**给错线索比不给线索更坏。**
+
+因此三条护栏：
+
+1. `collect()` 对 `endpoint` 以 `TRANSIENT_ENDPOINT_PREFIX`（`auth.`）开头的页面**拒绝出线索**，返回 `matched=False` + `reason=transient_page`。按 endpoint 前缀而非硬编码路径判定 —— 改路由时黑名单不会静默失效。
+2. `matched=False` 分三种，文案**必须可区分**（可信度不同）：`no_path`（没记路径）/ `unmatched`（路径无路由）/ `transient_page`（已知不可信，正文明确写「不能作为出问题位置的证据，以现象为准」）。正文「来源」段的字段名也改成 **「提交时所在页面」**，措辞本身就是警示。
+3. 管理员可在派发前用 **「实际页面」** 输入框覆盖 `page_path`（`dispatch_feedback` 读 `page_override`，经 `clean_path()` 同样受「只可能是站内相对路径」约束）。覆盖生效时正文同时保留「提交时所在页面」与「实际页面（管理员指定）」两行，谁改的能追溯。
 
 **代码线索怎么来**（全程 fail-soft，绝不阻断派发）：
 
@@ -451,7 +466,12 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 
 整个探测只读、不 import 蓝图模块、不碰业务库，毫秒级完成。任一步失败 → 正文写「未能自动定位：<原因>」+「按关键词在 `blueprints/` 全文检索」，**不留白也不假装有线索**。
 
-**管理员侧预览**：`GET /admin/feedback/<id>` 在 `status=open` 时算一次线索，渲染成「派发后 Issue 会带上这段代码线索」，管理员据此判断自动定位对不对；定位失败时提示「未能自动定位到路由」。判定区 textarea 提供「插入结构模板」按钮（`现象 / 影响范围 / 期望结果` 三段），**不强制**——强制分段会让管理员嫌烦，一键插入更现实。
+**管理员侧预览**：`GET /admin/feedback/<id>` 在 `status=open` 时算一次线索，渲染成「派发后 Issue 会带上这段代码线索」，管理员据此判断自动定位对不对。三种失败状态各自给不同提示：`transient_page` 用 `feedback-warn` 明说「这条路径不会写进 Issue，否则等于让开发侧改错文件」；`unmatched` 提示「未能自动定位到路由」；`no_path` 不占版面。定位成功时也补一句「依据是**提交反馈时所在的页面**，不符请在「实际页面」里更正」。
+
+判定区 textarea 提供「插入结构模板」按钮（`现象 / 影响范围 / 期望结果` 三段），**不强制**——强制分段会让管理员嫌烦，一键插入更现实。⚠️ 该按钮的两个坑（Issue #93 实测）：
+
+- 骨架**前置插入**后必须 `setSelectionRange(3, 3)` 把光标放到「现象：」之后。不设的话 `value` 重设后 selection 归末尾，人会顺着最后一行往下写，三行骨架全空着被提交。
+- 即便前端修好，也**不能指望所有入口都守规矩**：`strip_empty_structure()` 在后端渲染前剥离「值为空的 `现象：/影响范围：/期望结果：` 行」（`_EMPTY_STRUCT_LABEL_RE` 只匹配标签后无内容的行，`现象：点导出没反应` 原样保留）。净化放在 `admin_notes()` 入口，正文与「信息缺口」判定共用一份清洗结果。
 
 **与巡检自动化的契约**（本节另一半在 `automation-1784861165563` 的 prompt 里，2026-10-17 同步升级）：
 
@@ -481,6 +501,8 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 **测试**（`tests/test_feedback.py` 51 用例 + `tests/test_feedback_introspect.py` 32 用例）：纯逻辑（空值/超长/分类回落/单据号递增/忽略终态/派发幂等/评论派发时点/收件箱排序/超管 id 取数）、**页面字段注入防护**（`https://` `//host` `javascript:` 一律丢弃）、企微渲染（关键字段/无 base_url 不发链接/空单据不崩/未配置静默跳过）、Issue 渲染与创建（token 缺失返回 None / 标签缺失仍建单 / 422 判失败 / 缺 `number` 判失败）、路由端到端（未登录 302 / 非超管 403 / 别人的单子 404 / 提交后站内扇出 / **跨用户：门店提交 → 超管通知中心可见** / 忽略流转 / 无 token 时评论保留且状态不变 / 派发成功置终态 / 重复派发不建第二单 / 仅存评论不建单 / 空评论不派发）。全部用例 `monkeypatch` 掉 `_request` 与 `send_webhook_markdown`，**不出网**。
 
 精确化层单测（`tests/test_feedback_introspect.py`）：`clean_path` 六种外部值全部丢弃 + 五种 path 归一、`match_endpoint` 命中既有路由 / 未知路由返回空 / 忽略 query / `app=None` 不崩、`locate_view` 定位到 `items.py` 且行号 > 0（**变异验证：去掉 `inspect.unwrap` 该用例变红**）、`collect` 完整字段（`with_commits=False` 不依赖宿主 git 历史）、定位失败与外部 URL 均为 soft 返回、`recent_commits` 对非仓库路径返回空表、正文四要素（「已确认需要修复」／代码线索／验收标准／范围边界）逐段断言、无线索时写实话、`detect_gaps` 对短描述与缺线索报警而对完整输入不误报、`admin_notes` 过滤非管理员与空评论、管理员页线索预览与「未能自动定位」提示。三组变异验证（去掉 `inspect.unwrap` / 去掉既定结论声明 / `clean_path` 放行外部 URL）各自让对应用例变红。
+
+`page_path` 语义边界回归（`tests/test_feedback_page_path.py`，Issue #93）：中转页三种（`/select-warehouse` `/login` `/logout`）`collect` 必须返回 `reason=transient_page` 且**不带出 `source`/`endpoint`**；正文写「是纯中转页 / 不能作为出问题位置的证据 / 以「现象」为准」且**不含 `blueprints/auth.py`**；`unmatched` 与 `no_path` 文案可区分；正文标签为「提交时所在页面」；验收标准**不再断言**「站内 `<page>` 页面按现象复现」而改成「核对线索页面是否就是现象所在页面」；`strip_empty_structure` 四种输入（含全角冒号、尾随空格、有内容标签不误删）；全空骨架的评论被 `admin_notes` 丢弃；`page_override` 生效时正文含「实际页面（管理员指定）」并定位到 `items.py`，外部 URL 覆盖被 `clean_path` 拦掉；**模板层断言** `dc_items.html` 的可订开关 form 必须带 `data-ajax` + `data-ajax-mode="reload-stay"`（pytest 抓不到 JS 行为，锁住"标记存在"这个可静态检查的前提）。四组变异验证（去掉中转页判定 / 去掉骨架净化 / 不读 `page_override` / 模板去掉 `data-ajax`）各自让对应用例变红。
 
 ---
 

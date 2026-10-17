@@ -1,9 +1,21 @@
 """Issue 精确化：把 ``page_path`` 反查成代码位置，供派发时的 Issue 正文使用。
 
 为什么需要这一层：用户写「导出按钮没反应」，管理员写「确认是按钮问题，修一下」，
-这两句都没法直接变成任务。但用户点「反馈」时 URL 已经自动带上了出问题的页面，
-而「页面 → 视图函数 → 源文件行号 → 模板 → 最近的改动」全都可以机器算出来。
-一段行号比三百字描述更能让开发侧一次做对。
+这两句都没法直接变成任务。但用户点「反馈」时 URL 已经自动带上了**当时所在的
+页面**，而「页面 → 视图函数 → 源文件行号 → 模板 → 最近的改动」全都可以机器算
+出来。一段行号比三百字描述更能让开发侧一次做对。
+
+⚠️ ``page_path`` 的语义边界（Issue #93 实测踩到）：
+它是「**点反馈那一刻所在的页面**」，不是「出问题的页面」。两者通常一致，
+在以下情况必定不一致，此时给线索等于给错答案 —— 比没有线索更坏，因为开发侧
+会照着改错误的文件：
+
+- **纯中转页**（登录 / 登出 / 仓库选择）── 用户只是路过，页面上没有任何业务
+  内容。这类页面按 endpoint 前缀（``auth.``）判定并直接拒绝出线索。
+- 用户在 A 页遇到问题，切到 B 页（比如去查个数据）后才想起来提反馈。
+
+所以正文侧一律以「提交时所在页面」字样呈现，并保留「以现象为准」的兜底；
+管理员也可在派发前人工覆盖实际页面（见 ``feedback.dispatch_feedback``）。
 
 设计约定：
 - **绝不抛异常**。探测是锦上添花，任何一步失败只是少一段线索，不能阻断
@@ -30,6 +42,17 @@ GIT_TIMEOUT_SECONDS = 3.0
 MAX_COMMITS = 5
 # 模板行里取一个够用的展示宽度，避免把整条长路径塞进正文。
 MAX_SUBJECT_LEN = 100
+
+# 纯中转页：``auth`` 蓝图下只有 login / logout / select-warehouse 四个路由，
+# 全部不含业务内容。按 endpoint 前缀判定而不是硬编码路径 —— 改路由时黑名单
+# 不会静默失效。见 Issue #93：用户在仓库选择页顺手提了反馈，自动定位把
+# ``blueprints/auth.py`` 当成"出问题的代码"，而真凶在
+# ``templates/store_ordering/dc_items.html``。
+TRANSIENT_ENDPOINT_PREFIX = "auth."
+# collect() 的 matched=False 分两种，文案和可信度都不同：
+REASON_NO_PATH = "no_path"                # 提交时就没记路径
+REASON_UNMATCHED = "unmatched"            # 有路径但没匹配到路由
+REASON_TRANSIENT = "transient_page"       # 匹配到了，但是纯中转页
 
 _TEMPLATE_RE = re.compile(r"""render_template\(\s*["']([^"']+\.html)["']""")
 
@@ -179,7 +202,7 @@ def collect(
 ) -> dict[str, Any]:
     """一次探测，返回可直接交给 ``feedback_dispatch`` 渲染的字典。
 
-    返回结构（``matched=False`` 时只带 ``page_path``）::
+    返回结构（``matched=False`` 时带 ``page_path`` + ``reason``）::
 
         {
           "matched": True,
@@ -193,14 +216,27 @@ def collect(
           "commits": [{"sha": "3d9f2a1", "date": "2026-10-15", "subject": "..."}],
         }
 
+    ``matched=False`` 时 ``reason`` 取 ``no_path`` / ``unmatched`` /
+    ``transient_page`` 之一 —— 渲染层据此给不同文案，因为三种「没线索」的
+    可信度完全不同（中转页是**已知不可信**，不是**未知**）。
+
     ``with_commits=False`` 供单元测试用，避免测试依赖宿主仓库的 git 历史。
     """
     path = clean_path(page_path)
     if not path:
-        return {"matched": False, "page_path": ""}
+        return {"matched": False, "page_path": "", "reason": REASON_NO_PATH}
     endpoint, rule = match_endpoint(app, page_path)
     if not endpoint:
-        return {"matched": False, "page_path": path}
+        return {"matched": False, "page_path": path, "reason": REASON_UNMATCHED}
+    if endpoint.startswith(TRANSIENT_ENDPOINT_PREFIX):
+        # 中转页一律拒绝出线索：这里的文件路径（auth.py）与用户描述的问题
+        # 毫无关系，写进正文就是误导。见 Issue #93。
+        return {
+            "matched": False,
+            "page_path": path,
+            "reason": REASON_TRANSIENT,
+            "transient_endpoint": endpoint,
+        }
 
     info = locate_view(app, endpoint)
     source = str(info.get("source") or "")
