@@ -8,6 +8,9 @@
 
   组件一：会话级部署锁（心跳式，TTL 30 分钟）
     - acquire 抢锁（被活跃锁占用时拒绝）；heartbeat 续约；release 收官。
+    - heartbeat --loop 为编排脚本提供常驻续约：一个进程持续打心跳，
+      把「阶段耗时超过 TTL」从结构上消掉（up/verify/promote/switch 内部
+      只 check 不 beat，靠调用方自觉打点是不可靠的）。
     - 持有者崩溃 -> 心跳过期 -> 锁自动失效，后来者可抢占（无死锁）。
   组件二：事实锚点「已部署 sha」+ 追平检测（catchup）
     - release success 记录 deployed.sha；catchup 对比 origin/main：
@@ -50,6 +53,7 @@ import fcntl
 import json
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -307,24 +311,83 @@ def cmd_acquire(args) -> int:
         return EXIT_OK
 
 
-def cmd_heartbeat(args) -> int:
-    """续约。token 必须匹配当前锁；过期锁若未被抢占仍可救活。"""
+def _beat(args, apply_phase: bool) -> tuple[int, dict]:
+    """一次续约。返回 (rc, payload)，不做 I/O 输出，供单发与循环共用。"""
     directory = _state_dir()
     token = _resolve_token(args, directory)
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
         lock = state.get("lock")
         if not isinstance(lock, dict) or not token or lock.get("token") != token:
-            _emit({"ok": False, "reason": "token-mismatch-or-no-lock"})
-            return EXIT_TOKEN_MISMATCH
+            return EXIT_TOKEN_MISMATCH, {"ok": False, "reason": "token-mismatch-or-no-lock"}
         now = _now()
         expired = not _lock_active(lock, now, _ttl())
         lock["heartbeat_at"] = now
-        if args.phase:
+        if apply_phase and args.phase:
             lock["phase"] = args.phase
         _save_state(directory, state)
-        _emit({"ok": True, "revived": expired, "phase": lock.get("phase")})
-        return EXIT_OK
+        return EXIT_OK, {"ok": True, "revived": expired, "phase": lock.get("phase")}
+
+
+def _heartbeat_loop(args) -> int:
+    """周期续约循环（供编排脚本后台常驻）。
+
+    与单发心跳的区别：一次进程存活期内持续续约，把「阶段耗时超过 TTL」这
+    一类故障从结构上消掉 —— 2026-10-17 实测 verify 10 分钟、promote 7.5 分钟
+    都不打心跳（up/verify/promote/switch 内部只 check 不 beat），只能靠放大
+    TTL 硬兜。
+
+    - phase 只在第一拍应用：主流程后续可用单发 heartbeat --phase 推进阶段，
+      不会被后台循环盖回去。
+    - token 不匹配（锁被抢占 / 已被 release）→ 立即退出 rc 11，不制造噪音。
+    - SIGTERM / SIGINT 优雅退出 rc 0，便于编排脚本 cleanup 时收割。
+    """
+    try:
+        interval = int(args.interval)
+    except (TypeError, ValueError):
+        return _fail("--interval 需要整数秒", EXIT_USAGE)
+    if interval < 1:
+        return _fail("--interval 必须 >= 1", EXIT_USAGE)
+
+    stop = {"flag": False}
+
+    def _on_signal(_signum, _frame):
+        stop["flag"] = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass  # 非主线程（被 import 复用）时只能靠 terminate 强杀
+
+    beats = 0
+    while not stop["flag"]:
+        rc, payload = _beat(args, apply_phase=(beats == 0))
+        payload["beat"] = beats + 1
+        _emit(payload)
+        if rc != EXIT_OK:
+            print("[deploy_state] heartbeat loop 终止：锁已不属于本会话", file=sys.stderr)
+            return rc
+        beats += 1
+        if args.max_beats and beats >= args.max_beats:
+            return EXIT_OK
+        # 切片 sleep：SIGTERM 最多延迟 0.5s 生效，不用等满整个 interval
+        slept = 0.0
+        while slept < interval and not stop["flag"]:
+            time.sleep(min(0.5, interval - slept))
+            slept += 0.5
+
+    print(f"[deploy_state] heartbeat loop 收到终止信号，共 {beats} 拍", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_heartbeat(args) -> int:
+    """续约。token 必须匹配当前锁；过期锁若未被抢占仍可救活。"""
+    if getattr(args, "loop", False):
+        return _heartbeat_loop(args)
+    rc, payload = _beat(args, apply_phase=True)
+    _emit(payload)
+    return rc
 
 
 def cmd_release(args) -> int:
@@ -521,6 +584,12 @@ def main(argv=None) -> int:
     g.add_argument("--token", default="", help="锁 token（缺省读 <state_dir>/lock.token）")
     g.add_argument("--token-file", default="", help="从指定文件读 token")
     p.add_argument("--phase", default="")
+    p.add_argument("--loop", action="store_true",
+                   help="常驻循环续约（供编排脚本后台跑；收到 SIGTERM/SIGINT 优雅退出）")
+    p.add_argument("--interval", type=int, default=120,
+                   help="--loop 的续约间隔秒（默认 120，须 < TTL/2）")
+    p.add_argument("--max-beats", type=int, default=0,
+                   help="--loop 最多拍数（默认 0 = 无限；测试与短任务用）")
     p.set_defaults(func=cmd_heartbeat)
 
     p = sub.add_parser("release", help="收官（success 更新 deployed 锚点）")
