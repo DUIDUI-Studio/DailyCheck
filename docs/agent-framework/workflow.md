@@ -103,8 +103,7 @@ Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 ```
 deploy_state.py acquire --pr <N> --sha <merge sha>
              ├─ rc 10（他人在部署）→ 不排队、直接结束，欠账留待下一次 catchup（兜底轮询 ≤30min 保底）
-             └─ rc 0 → 持锁进入部署（token 自动落 <state_dir>/lock.token，长步骤间
-                       deploy_state.py heartbeat --phase <阶段> —— 缺省读该文件，无需手传 token）
+             └─ rc 0 → 持锁进入部署（长步骤间 deploy_state.py heartbeat --token <t> --phase <阶段>）
 git pull → up.sh <pr> <sha>
              ├─ 守卫：绿 unit 必须声明 DAILYCHECK_DB_DIR 且 = 拷贝目标，否则拒启
              ├─ cp -aL 真库 ${APP_DIR}/db → /var/lib/dailycheck-green/db（独立副本）
@@ -119,7 +118,7 @@ git pull → up.sh <pr> <sha>
              ⚠️ 未转正时 switch.sh 的 DRY_RUN 守卫会拒跑（exit 3）——这是预期拦截，不是故障
          → switch.sh 灰度 5% → 50% → 100%（每档观察；100%/0% 边界自动做落点核验）
          → 观察窗 ≥30min → 收官（绿=生产，蓝 standby）
-         → deploy_state.py release --result success（推进 deployed 锚点，token 缺省读 lock.token）
+         → deploy_state.py release --token <t> --result success（推进 deployed 锚点）
              失败：release --result failed —— 同 sha 不自动重试（防坏 main 死循环），留 last_attempt 供追查
 ```
 
