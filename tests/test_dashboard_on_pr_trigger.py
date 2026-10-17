@@ -895,6 +895,24 @@ def test_main_loop_does_not_reprocess_when_idle(tmp_path: Path):
     assert warns >= 1, f"首轮未处理（用例失效）\n{out}"
 
 
+@pytest.mark.parametrize("bad_action", [[], {}, None, 5, True])
+def test_action_non_hashable_does_not_crash(tmp_path: Path, bad_action):
+    """inbox 行的 action 为 list / dict 等不可哈希值时不得崩溃（M-1-r4）。
+
+    `x in frozenset` 对不可哈希对象**先抛 TypeError**（不返回 False）→ 直穿
+    main() → Restart=always 每次崩在同一行。修复后按「非白名单 action」走
+    ignored 分支（`!r` 留痕），该行正常进 handled_ids。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _touch_cmd(marker))
+    rec = _event(action=bad_action)
+    _append_lines(cfg.inbox, [rec])
+    state = trigger.TriggerState()
+    assert trigger.process_once(cfg, state) == 0  # 修复前抛 TypeError
+    assert rec["delivery_id"] in state.handled_ids
+    assert _read_marker(marker) == []
+
+
 def test_triggered_log_survives_surrogate_values(tmp_path: Path, capsys):
     """H-1-r3 反回归：`triggered:` 日志必须转义 `delivery_id` 之外的 inbox 字段。
 

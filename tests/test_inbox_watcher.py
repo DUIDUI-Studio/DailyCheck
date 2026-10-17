@@ -1133,6 +1133,34 @@ def test_failure_retries_after_backoff_with_no_new_inbox_lines(tmp_path: Path):
             proc.kill()
 
 
+@pytest.mark.parametrize("bad_action", [[], {}, None, 5, True])
+def test_action_non_hashable_does_not_crash(tmp_path: Path, bad_action):
+    """inbox 行的 action 为 list / dict 等不可哈希值时不得崩溃（M-1-r4）。
+
+    `x in frozenset` 对不可哈希对象**先抛 TypeError**（不返回 False）→ 直穿
+    main() → Restart=always 每次崩在同一行（该行永远进不了 handled_ids /
+    bad_hashes，故永不跳过）。修复后按「非白名单 action」走 ignored 分支
+    （`!r` 留痕），该行正常进 handled_ids。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    cfg.inbox.write_text(
+        json.dumps(
+            {
+                "delivery_id": "d-act",
+                "action": bad_action,
+                "repo_full_name": REPO,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = inbox_watcher.WatcherState()
+    assert inbox_watcher.process_once(cfg, state) == 0  # 修复前抛 TypeError
+    assert "d-act" in state.handled_ids
+    assert _read_marker(marker) == []
+
+
 def test_triggered_log_survives_surrogate_values(tmp_path: Path, capsys):
     """规则 7 的「一切 inbox 键值进日志前必须转义」也必须覆盖 `delivery_id` 之外的字段。
 

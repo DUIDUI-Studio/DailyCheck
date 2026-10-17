@@ -499,7 +499,10 @@ def process_once(cfg: WatcherConfig, state: WatcherState) -> int:
             _log(f"ignored: delivery={did} repo={rec.get('repo_full_name')!r} (not {cfg.repo})")
             continue
         action = rec.get("action")
-        if action not in cfg.actions:
+        # M-1-r4：action 为 list / dict 等**不可哈希**值时，`x in frozenset` 抛
+        # TypeError（不返回 False）→ 直穿 main() → Restart=always 永久崩溃循环。
+        # 先判类型，非字符串一律按「非白名单」走既有 ignored 分支（!r 留痕）。
+        if not isinstance(action, str) or action not in cfg.actions:
             state.handled_ids.add(did)
             dirty = True
             _log(f"ignored: delivery={did} action={action!r} (not in allowlist)")
@@ -518,7 +521,7 @@ def process_once(cfg: WatcherConfig, state: WatcherState) -> int:
             dirty = True
             _log(
                 f"triggered: delivery={did} pr={_short(rec.get('pr_number'))} "
-                f"action={action} head={_short(rec.get('pr_head_sha', ''))[:8]}"
+                f"action={action} head={_short(str(rec.get('pr_head_sha', ''))[:8])}"
             )
         else:
             attempts = _attempts(fail) + 1
