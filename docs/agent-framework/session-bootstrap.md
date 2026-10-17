@@ -3,6 +3,9 @@
 > 用途：让**任何** agent session（新的或旧的、Dev 或 Prod 角色）接入
 > `docs/agent-framework/workflow.md` 定义的协作机制。
 > 本文件是提示词的持久化载体——不依赖任何聊天记录。
+>
+> ⚠️ **如果你的仓库还没有这套机制**，不要用本文件——它是"接入"，不是"搭建"。
+> 从零建请用 [`AGENT-BOOTSTRAP.md`](AGENT-BOOTSTRAP.md)（分级停靠 + 能力自检 + 施工单）。
 
 ## 机制设计：为什么这样保证跨 session 生效
 
