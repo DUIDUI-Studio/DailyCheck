@@ -534,7 +534,11 @@ def process_once(cfg: WatcherConfig, state: WatcherState) -> int:
     # prune：状态只保留 inbox 中仍存在的条目（rotate 归档后自动收缩）
     new_handled = state.handled_ids & file_ids
     new_bad = state.bad_hashes & file_bad
-    new_failures = {k: v for k, v in state.failures.items() if k in file_ids}
+    # failures 额外排除已 handled 的 id：process_once 开头的 handled 短路使这类条目
+    # 永不重试（且**无任何日志**），留在表里只会让 retry_due() 恒 True → 主循环空转
+    new_failures = {
+        k: v for k, v in state.failures.items() if k in file_ids and k not in new_handled
+    }
     if new_handled != state.handled_ids or new_bad != state.bad_hashes:
         dirty = True
     if new_failures != state.failures:

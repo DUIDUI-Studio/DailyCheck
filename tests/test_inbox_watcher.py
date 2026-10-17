@@ -1030,6 +1030,25 @@ def test_corrupted_failure_entry_rewritten_on_repeat_failure(
     assert inbox_watcher.retry_due(state, now=time.time()) is False
 
 
+def test_prune_excludes_handled_failure_entries(tmp_path: Path):
+    """prune 必须清掉「已 handled 但仍在 failures 表」的残留条目。
+
+    这类条目永远走 handled 短路（不重试、无任何日志），留在表里只会让
+    `retry_due()` 恒 True → 主循环每轮空跑。只在状态文件被手改 / 旧版本遗留时出现。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    state = inbox_watcher.WatcherState()
+    state.handled_ids.add(rec["delivery_id"])
+    state.failures[rec["delivery_id"]] = {"n": 1, "next": 0.0}  # 已到期
+    assert inbox_watcher.retry_due(state) is True  # 残留会让主循环空转
+    assert inbox_watcher.process_once(cfg, state) == 0
+    assert rec["delivery_id"] not in state.failures  # prune 清掉
+    assert inbox_watcher.retry_due(state) is False  # 主循环不再空转
+
+
 def test_retry_delay_survives_huge_attempts(tmp_path: Path):
     """异常大的 attempts 不得崩溃或挂死 —— 一律封顶（Issue #66 复现项）。
 
