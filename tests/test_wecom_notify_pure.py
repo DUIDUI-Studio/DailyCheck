@@ -5,9 +5,10 @@
   ``send_webhook_markdown``），断言只看「调用了几次 / 发了什么 / 返回值」。
 - **不含真实密钥**：webhook 一律是运行期拼出来的假地址；另有专门用例断言
   日志里永不出现 key。
-- 覆盖口径：模板字段与链接、base_url 尾斜杠、未配置不发送、errcode 成功 /
-  业务失败、首败重试成功（2 次调用）、HTTP / 超时 / 非 JSON、background
-  两态、异常只记日志不抛。
+- 覆盖口径：模板字段与链接（含「无 base_url 不发链接」）、base_url 尾斜杠、
+  未配置不发送、errcode 成功 / 业务失败 / **bool 排除**、首败重试成功（2 次调用）、
+  HTTP / 超时 / 非 JSON、background 两态、异常只记日志不抛、
+  **畸形 URL 四形态不泄露 key**、成功日志 WARNING 级。
 """
 from __future__ import annotations
 
@@ -25,6 +26,20 @@ from blueprints.store_ordering_pure import EVENT_ORDER_APPROVED, EVENT_ORDER_SUB
 FAKE_KEY = "fake" + "-" + "0" * 20
 FAKE_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + FAKE_KEY
 OK_BODY = b'{"errcode":0,"errmsg":"ok"}'
+
+# 安全回归用的「密钥」标记：任何形态的 webhook 都含它，断言日志里永不出现。
+SECRET = "SUPERSECRET" + "123456"
+
+# 畸形 webhook 地址四形态。缺 scheme 那条会在
+# ``urllib.request.Request()`` **构造期**抛
+# ``ValueError("unknown url type: '<完整 URL>'")``——异常文本含 key 明文。
+# 之前现有用例只喂 urlopen 异常，够不到「Request 构造失败」这条边。
+MALFORMED_URLS = [
+    pytest.param("qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + SECRET, id="missing-scheme"),
+    pytest.param("htps://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + SECRET, id="scheme-typo"),
+    pytest.param('"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=' + SECRET + '"', id="quoted"),
+    pytest.param("ftp://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + SECRET, id="ftp-scheme"),
+]
 
 
 class _FakeResponse:
@@ -120,9 +135,16 @@ def test_markdown_base_url_trailing_slash_normalized(base_url):
     assert "//store-ordering" not in md
 
 
-def test_markdown_without_base_url_keeps_relative_link():
+def test_markdown_without_base_url_omits_link():
+    """``PUBLIC_BASE_URL`` 未配置时不发链接。
+
+    退回相对路径 ``/store-ordering/orders/42`` 在企微客户端里点不开（没有
+    host），发出去只会误导；与 docstring「无 base_url 返回空串」对齐。
+    """
     md = wn.build_store_order_markdown(_order())
-    assert "[查看单据](/store-ordering/orders/42)" in md
+    assert "查看单据" not in md
+    assert "/store-ordering/orders/42" not in md
+    assert "> 单号：SO-20261016-0007" in md
 
 
 def test_markdown_has_no_amount():
@@ -279,6 +301,78 @@ def test_mask_webhook_url(url, expected):
 
 
 # ---------------------------------------------------------------------------
+# 畸形 webhook URL（安全回归：曾经把 key 打进 traceback）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", MALFORMED_URLS)
+def test_send_malformed_url_returns_false_and_never_logs_key(urlopen, caplog, url):
+    """畸形地址只允许返回 False —— 且日志里绝不出现 key。
+
+    ``caplog.text`` 走 ``logging.Formatter.format()``，带 ``exc_info`` 的记录
+    会把 traceback 一并渲染进来，所以这条断言能真正抓住「异常文本泄露 URL」。
+    """
+    # urlopen 兜底：三个形态可能根本到不了 urlopen（Request 构造期就炸），
+    # 真到了也不许联外网。
+    urlopen.script = [urllib.error.URLError("no route to host")] * 4
+    with caplog.at_level(logging.DEBUG):
+        result = wn.send_webhook_markdown(url, "## hi")
+    assert result is False
+    assert isinstance(result, bool), "契约：任何输入都只返回 bool"
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("url", MALFORMED_URLS)
+def test_notify_malformed_url_never_leaks_key_through_send_safely(
+    monkeypatch, urlopen, caplog, url,
+):
+    """完整链路（含 ``_send_safely`` 的兜底 WARNING）同样不得泄露 key。
+
+    泄露点原本在 ``_send_safely``：``logger.warning(..., exc_info=True)`` 会把
+    ``ValueError`` 的 traceback 打出来。所以必须从业务入口这一层再钉一遍。
+    """
+    monkeypatch.setattr(config, "WECOM_STORE_ORDER_WEBHOOK", url)
+    monkeypatch.setattr(config, "PUBLIC_BASE_URL", "https://example.invalid")
+    urlopen.script = [urllib.error.URLError("no route to host")] * 4
+    with caplog.at_level(logging.DEBUG):
+        wn.notify_store_order_submitted(_order(), background=False)  # 不得抛
+    assert SECRET not in caplog.text
+    assert "wecom_notify_failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# errcode 解析：bool 必须排除（false == 0 会把失败判成成功）
+# ---------------------------------------------------------------------------
+
+def test_parse_errcode_excludes_bool():
+    assert wn._parse_errcode(b'{"errcode": false}') is None
+    assert wn._parse_errcode(b'{"errcode": true}') is None
+    # 对照：整数 0 才算成功
+    assert wn._parse_errcode(b'{"errcode": 0}') == 0
+
+
+@pytest.mark.parametrize("body", [b'{"errcode": false}', b'{"errcode": true}'])
+def test_send_bool_errcode_is_failure(urlopen, body):
+    """``{"errcode": false}`` 若按 ``false == 0`` 判成功就是假绿。"""
+    urlopen.script = [body] * 4
+    assert wn.send_webhook_markdown(FAKE_WEBHOOK, "## hi") is False
+
+
+# ---------------------------------------------------------------------------
+# 单据链接：无 base_url 不退回相对路径
+# ---------------------------------------------------------------------------
+
+def test_build_order_url_requires_base():
+    """base_url 为空时返回空串——群消息里的相对链接点不开，宁可省略。"""
+    assert wn.build_order_url(42, "") == ""
+    assert wn.build_order_url(42, "   ") == ""
+    assert wn.build_order_url(None, "https://kjtang.cn") == ""
+    assert wn.build_order_url("", "https://kjtang.cn") == ""
+    assert wn.build_order_url(42, "https://kjtang.cn/") == (
+        "https://kjtang.cn/store-ordering/orders/42"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 业务入口
 # ---------------------------------------------------------------------------
 
@@ -344,6 +438,16 @@ def test_notify_swallows_internal_error(enabled, caplog, monkeypatch):
 def test_notify_unregistered_event_is_noop(enabled, urlopen):
     wn.notify_store_order_event(EVENT_ORDER_APPROVED, _order(), background=False)
     assert urlopen.calls == []  # 扩展位未登记 → 不推送
+
+
+def test_notify_ok_logged_at_warning(enabled, urlopen, caplog):
+    """成功日志必须是 WARNING 级：生产 root 阈值 WARNING，INFO 会被吞掉。"""
+    with caplog.at_level(logging.DEBUG):
+        wn.notify_store_order_submitted(_order(), background=False)
+    records = [r for r in caplog.records if "wecom_notify_ok" in r.getMessage()]
+    assert records, "推送成功没有留痕"
+    assert records[0].levelno == logging.WARNING
+    assert "SO-20261016-0007" in records[0].getMessage()
 
 
 def test_notify_tolerates_empty_order(enabled, urlopen):
