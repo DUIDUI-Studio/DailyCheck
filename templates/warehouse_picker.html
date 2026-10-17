@@ -9,8 +9,10 @@
 <ul class="warehouse-list">
   {% for wh in warehouses %}
   <li>
-    <form method="post" action="{{ url_for('auth.warehouse_select', warehouse_id=wh['id']) }}">
+    <form method="post" action="{{ url_for('auth.warehouse_select', warehouse_id=wh['id'], next=next_url or None) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {# 深链回跳：把登录前要访问的目标带过选仓这一步。 #}
+        <input type="hidden" name="next" value="{{ next_url or '' }}">
       <button type="submit" class="btn block">
         <strong>{{ wh['name'] }}</strong>
         <span class="muted">{{ wh['code'] }}</span>
