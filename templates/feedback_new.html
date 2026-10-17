@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}问题反馈{% endblock %}
+{% block content %}
+<div class="list-head">
+  <h2>问题反馈</h2>
+  <a class="btn-sm btn-edit" href="{{ url_for('feedback.my_feedback') }}">我提交过的</a>
+</div>
+
+<p class="muted" style="margin-top:-4px;">
+  用着不对、找不到入口、数据看着不对 —— 都可以在这里说。
+  提交后管理员会收到提醒，处理结果会出现在「我提交过的」里。
+</p>
+
+<form method="post" action="{{ url_for('feedback.submit_feedback') }}" class="grid">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="page_path" value="{{ page_path }}">
+
+  <label>问题类型
+    <select name="category">
+      <option value="bug">功能异常（点了没反应 / 报错）</option>
+      <option value="usability">用起来别扭（不好找 / 步骤太多）</option>
+      <option value="data">数据不对（数量 / 金额 / 名称）</option>
+      <option value="other" selected>其他</option>
+    </select>
+  </label>
+
+  <label>一句话说明
+    <input type="text" name="title" maxlength="120" required
+           placeholder="例：库存查阅页导出按钮点了没反应">
+  </label>
+
+  <label>详细描述
+    <textarea name="body" rows="8" maxlength="4000" required
+              placeholder="在哪一步、看到什么、期望是什么。有单号或品名麻烦写上。"></textarea>
+  </label>
+
+  {% if page_path %}
+  <p class="muted" style="font-size:12px;">附带页面：{{ page_path }}</p>
+  {% endif %}
+
+  <button type="submit">提交给管理员</button>
+</form>
+{% endblock %}

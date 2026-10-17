@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}反馈收件箱{% endblock %}
+{% block content %}
+<div class="list-head">
+  <h2>反馈收件箱{% if open_count %}<small class="muted">（{{ open_count }} 待处理）</small>{% endif %}</h2>
+</div>
+
+<div class="pill-group">
+  <a class="pill {% if not active_status %}pill--active{% endif %}"
+     href="{{ url_for('feedback.admin_inbox') }}">全部</a>
+  <a class="pill {% if active_status == 'open' %}pill--active{% endif %}"
+     href="{{ url_for('feedback.admin_inbox', status='open') }}">待处理</a>
+  <a class="pill {% if active_status == 'ignored' %}pill--active{% endif %}"
+     href="{{ url_for('feedback.admin_inbox', status='ignored') }}">已忽略</a>
+  <a class="pill {% if active_status == 'dispatched' %}pill--active{% endif %}"
+     href="{{ url_for('feedback.admin_inbox', status='dispatched') }}">已派发</a>
+</div>
+
+{% if not dispatch_enabled %}
+<p class="feedback-warn">
+  派发通道未配置（``FEEDBACK_GITHUB_TOKEN`` 为空）：仍可忽略 / 存评论，但「发送并派发」不会建 Issue。
+</p>
+{% endif %}
+
+<div class="feedback-list">
+  {% for t in tickets %}
+  <a class="feedback-card" href="{{ url_for('feedback.admin_feedback_detail', ticket_id=t.id) }}">
+    <div class="fc-head">
+      <span class="fc-title">{{ t.title }}</span>
+      <span class="feedback-status st-{{ t.status }}">{{ t.status_label }}</span>
+    </div>
+    <div class="fc-meta">
+      <span>{{ t.ticket_no }}</span>
+      <span class="sep">·</span>
+      <span>{{ t.category_label }}</span>
+      <span class="sep">·</span>
+      <span>{{ t.submitter or ('用户#' ~ t.user_id) }}</span>
+      {% if t.warehouse_code %}<span class="sep">·</span><span>{{ t.warehouse_code }}</span>{% endif %}
+      <span class="sep">·</span>
+      <span>{{ t.created_at }}</span>
+      {% if t.issue_number %}
+      <span class="sep">·</span>
+      <span class="fc-issue">Issue #{{ t.issue_number }}</span>
+      {% endif %}
+    </div>
+  </a>
+  {% else %}
+  <p class="muted">没有符合条件的反馈。</p>
+  {% endfor %}
+</div>
+
+{% include "feedback_shared_styles.html" %}
+{% endblock %}

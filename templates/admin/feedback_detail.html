@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}{{ ticket.ticket_no }} · 处理反馈{% endblock %}
+{% block content %}
+<div class="list-head">
+  <h2>{{ ticket.ticket_no }}</h2>
+  <a class="btn-sm btn-edit" href="{{ url_for('feedback.admin_inbox') }}">返回收件箱</a>
+</div>
+
+<div class="fc-head" style="margin-bottom:10px;">
+  <span class="fc-title">{{ ticket.title }}</span>
+  <span class="feedback-status st-{{ ticket.status }}">{{ ticket.status_label }}</span>
+</div>
+
+<dl class="feedback-kv">
+  <dt>提交人</dt><dd>{{ ticket.submitter or ('用户#' ~ ticket.user_id) }}</dd>
+  <dt>类型</dt><dd>{{ ticket.category_label }}</dd>
+  <dt>提交时间</dt><dd>{{ ticket.created_at }}</dd>
+  {% if ticket.warehouse_code %}<dt>所在仓库</dt><dd>{{ ticket.warehouse_code }}</dd>{% endif %}
+  {% if ticket.page_path %}<dt>相关页面</dt><dd>{{ ticket.page_path }}</dd>{% endif %}
+  {% if ticket.issue_number %}
+  <dt>开发单</dt>
+  <dd>
+    {% if ticket.issue_url %}
+    <a href="{{ ticket.issue_url }}" target="_blank" rel="noopener">Issue #{{ ticket.issue_number }}</a>
+    {% else %}Issue #{{ ticket.issue_number }}{% endif %}
+  </dd>
+  {% endif %}
+  {% if ticket.handled_at %}<dt>处理时间</dt><dd>{{ ticket.handled_at }}</dd>{% endif %}
+</dl>
+
+<h3>问题描述</h3>
+<div class="feedback-body">{{ ticket.body }}</div>
+
+{% if comments %}
+<h3>处理记录</h3>
+{% for c in comments %}
+<div class="feedback-comment{% if c.dispatched_at %} is-trigger{% endif %}">
+  <div class="comment-head">
+    {{ c.username or ('用户#' ~ c.user_id) }}{% if c.is_admin %}（管理员）{% endif %} · {{ c.created_at }}
+    {% if c.dispatched_at %}<span class="trigger-tag">本次触发派发</span>{% endif %}
+  </div>
+  <div class="comment-body">{{ c.body }}</div>
+</div>
+{% endfor %}
+{% endif %}
+
+{% if ticket.status == 'open' %}
+<h3>判定</h3>
+
+{% if not dispatch_enabled %}
+<p class="feedback-warn">
+  派发通道未配置（``FEEDBACK_GITHUB_TOKEN`` 为空）。可以先存评论；要真正建 Issue
+  需在服务器 env 注入该变量后重启。
+</p>
+{% endif %}
+
+<form method="post" action="{{ url_for('feedback.dispatch_feedback', ticket_id=ticket.id) }}" class="grid">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <label>处理意见
+    <textarea name="comment" rows="5" maxlength="2000" required
+              placeholder="例：确认是导出按钮漏绑事件，已派发修复；影响范围仅报表页。"></textarea>
+  </label>
+  <button type="submit" {% if not dispatch_enabled %}disabled{% endif %}>
+    发送并派发开发（建 GitHub Issue）
+  </button>
+  {# 同一份文字两种去向：formaction 让「存评论」复用上面的 textarea，
+     避免为「仅保存」再放一个输入框（两个框的内容一定会有人填错）。 #}
+  <button type="submit" class="btn-secondary"
+          formaction="{{ url_for('feedback.save_comment', ticket_id=ticket.id) }}">
+    先存评论（不派发）
+  </button>
+  <p class="feedback-hint">
+    派发后本单进入终态，开发闭环（开发 → PR → CI → merge → 部署）由 Issue 驱动。
+  </p>
+</form>
+
+<form method="post" action="{{ url_for('feedback.ignore_feedback', ticket_id=ticket.id) }}"
+      data-ajax data-ajax-confirm="确认忽略这条反馈？忽略后不可恢复。">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <button type="submit" class="btn-danger" style="width:100%;">不重要，忽略（已读）</button>
+</form>
+{% else %}
+<p class="muted">本单已处理完成（{{ ticket.status_label }}），状态为终态。</p>
+{% endif %}
+
+{% include "feedback_shared_styles.html" %}
+{% endblock %}

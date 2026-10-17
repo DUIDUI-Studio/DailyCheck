@@ -89,9 +89,12 @@
   </section>
   {% endif %}
 
+  {# 「问题反馈」不单独开卡片：它属于「通知」域，侧栏也是挂在通知组下的。
+     模块集合由 test_nav_integration.test_nav_carriers_share_same_modules 双向钉住，
+     多开一张卡就会红。三条链接与侧栏严格同集。 #}
   <section class="land-card">
     <h3>通知</h3>
-    <p>查看全站通知，标记已读</p>
+    <p>全站通知 + 问题反馈</p>
     <ul class="land-links">
       <li><a href="{{ url_for('notifications.notifications_feed') }}">
         通知中心
@@ -99,6 +102,18 @@
         <span class="nav-badge">{{ unread_notifications_count }}</span>
         {% endif %}
       </a></li>
+      {% if g.user %}
+      <li><a href="{{ url_for('feedback.new_feedback') }}">提交问题</a></li>
+      <li><a href="{{ url_for('feedback.my_feedback') }}">我提交过的</a></li>
+      {% if is_admin %}
+      <li><a href="{{ url_for('feedback.admin_inbox') }}">
+        反馈收件箱
+        {% if feedback_open_count and feedback_open_count > 0 %}
+        <span class="nav-badge">{{ feedback_open_count }}</span>
+        {% endif %}
+      </a></li>
+      {% endif %}
+      {% endif %}
     </ul>
   </section>
 

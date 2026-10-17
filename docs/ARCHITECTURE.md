@@ -358,6 +358,84 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 ---
 
+### 3.10 用户反馈闭环（问题提单 → 管理员判定 → 开发任务，2026-10-17 起）
+
+前九节的链路都是「系统 → 用户」的下行推送；本节补的是**上行通道**：用户在任意页面遇到问题，就地提一条，管理员收到提醒后判定「忽略」或「派发开发」，派发即生成一张 GitHub Issue 进入标准开发闭环（开发 → PR → CI → merge → 部署）。
+
+**为什么不复用 `notifications` 表**：站内通知是「一人一行」的扇出（`user_id` 维度、只读即可），而反馈单需要状态机、管理员评论、以及到 Issue 的单向绑定。两套语义混在一张表里，`read_at` 与 `status` 会互相污染。因此**新建两张表**，`notifications` 只承担「提醒超管有新单」这一个扇出动作。
+
+**数据模型**（`master.db`，见 `db/__init__.py` 的 `MASTER_SCHEMA`）：
+
+| 表 | 作用 | 关键列 |
+|---|---|---|
+| `feedback_tickets` | 反馈单主体 | `ticket_no`（`FB-YYYYMMDD-NNNN`，UNIQUE）、`user_id`、`warehouse_code`、`page_path`、`category`、`title`、`body`、`status`、`issue_number` / `issue_url`、`handled_by` / `handled_at` |
+| `feedback_comments` | 管理员处理评论 | `ticket_id`、`user_id`、`body`、`is_admin`、`dispatched_at`（非空 = 这条评论触发了派发） |
+
+落 master.db 而非仓库库：反馈描述的是「这套系统用起来哪里不对」，跨仓可见才符合运维语义。
+
+**状态机**（三态，两个终态，**不可回退**）：
+
+```
+open ──┬── 忽略 ────────→ ignored       （管理员认为不重要；终态）
+       └── 评论+派发 ──→ dispatched    （已建 Issue；终态，实际关闭以 Issue 为准）
+```
+
+刻意**不设「已解决」态**：真解决了是 Issue closed，再在站内标记一次只会造出第二套真相。
+
+**路由**（`blueprints/feedback.py`，逻辑在 `feedback_pure.py`）：
+
+| 路由 | 权限 | 作用 |
+|---|---|---|
+| `GET /feedback` | 登录 | 我提交过的（含已忽略/已派发，用户能看见处理结果） |
+| `GET /feedback/new` | 登录 | 提交表单（`?page=` 自动回填出问题页面） |
+| `POST /feedback` | 登录 | 落库 → 站内扇出超管 → 企微推送 |
+| `GET /feedback/<id>` | 登录 | 详情。**非本人且非超管一律 404**（不用 403：403 会泄露 id 存在） |
+| `GET /admin/feedback` | 平台超管 | 收件箱，`?status=open\|ignored\|dispatched` 筛选，待处理置顶 |
+| `GET /admin/feedback/<id>` | 平台超管 | 处理页：原文 + 评论历史 + 判定操作 |
+| `POST /admin/feedback/<id>/ignore` | 平台超管 | 标记忽略（仅 `open` 生效） |
+| `POST /admin/feedback/<id>/comment` | 平台超管 | 仅存评论，不派发 |
+| `POST /admin/feedback/<id>/dispatch` | 平台超管 | 存评论 + 建 Issue，置 `dispatched` |
+
+`ROUTE_MATRIX` 已登记全部 9 条（用户侧 `LOGIN`、管理侧 `PLATFORM`），未开权限点：派发会对外建 Issue 并触发部署，与 `admin.user.manage` 同档，属平台级动作，不进任何仓库角色包。
+
+**双通道提醒**（提交后同时触发，互不依赖）：
+
+1. **站内**：`feedback_pure.build_admin_user_ids()` 取 `users.is_admin = 1` 的全部 id → `notifications_pure.emit_event("feedback_submitted", ...)` 扇出。`target_url` 指向处理页。无超管时只记 WARNING，不造假收件人。
+2. **企微**：`blueprints/feedback_notify.py` 复用 `wecom_notify_pure.send_webhook_markdown`（脱敏、3s 超时、1 次重试、**绝不抛异常**全部继承，不重写第二份）。模板：标题 + 单号 / 问题 / 分类 / 提交人 / 时间 + 处理页链接。**无 `PUBLIC_BASE_URL` 时整行省略链接**（相对路径在企微客户端点不开）。
+
+两条提醒都跑在**业务事务之外**（企微走 daemon 线程），任一失败不回滚已落库的单子，也不阻断用户的成功页。
+
+**Issue 派发**（`blueprints/feedback_dispatch.py`，`urllib` 直调 REST）：
+
+- **先落评论，再建 Issue**。顺序是刻意的：外部 API 挂了最多是没建单，管理员写的处理意见一个字都不丢 —— Issue 正文正是由这些评论渲染的。
+- **幂等**：`attach_issue()` 的 `WHERE issue_number IS NULL` 保证重复点「发送」不会造第二张单；已派发的单子点派发只回一句「未重复建单」。
+- **标签**：`user-feedback`（`0e8a16`）。先 `POST /labels` 尽力创建（`422` = 已存在，算成功），建不出来就不带标签建单 —— 标签是给自动化识别用的增强，不是前提。
+- **降级**：`FEEDBACK_GITHUB_TOKEN` 为空 → 只存评论 + 明确提示「请手动建 Issue」，**绝不伪装成功**；HTTP 失败同理（页面原话「创建 GitHub Issue 失败，请手动建单」）。
+- 正文含 **闭环要求** 一节，明确「开发 → PR → CI 全绿 → merge → 部署」，避免开发侧拿到一张只有一句话的 issue 无从下手。
+
+**配置**（`config.py`，全部服务器 env 注入，**不进 git**）：
+
+| env | 缺省 | 作用 |
+|-----|------|------|
+| `WECOM_FEEDBACK_WEBHOOK` | 空串 | 反馈专用群机器人；**空 = 不推企微**（站内通知照发） |
+| `FEEDBACK_GITHUB_TOKEN` | 空串 | 建 Issue 的 PAT（`repo` scope）；**空 = 不建 Issue**（降级为只存评论） |
+| `FEEDBACK_GITHUB_REPO` | `ericmr1981/DailyCheck` | `owner/name` |
+| `PUBLIC_BASE_URL` | `https://kjtang.cn` | 消息与 Issue 正文里的域名（复用 §3.9 同一项） |
+
+`WECOM_FEEDBACK_WEBHOOK` 与 `WECOM_STORE_ORDER_WEBHOOK` **刻意分开**：反馈消息与订单消息频率、受众不同，合用一个 webhook 就无法单独静音其中一路。
+
+**UI 入口**（三处，覆盖桌面与移动）：
+
+- 侧边栏「通知」组：`问题反馈`（所有人）、`反馈收件箱`（超管，带待处理角标）
+- `ctx-bar`（每页右上）：`反馈` 链接，自动带 `?page=<当前路径>`
+- 移动端「更多」→ `问题反馈` 卡片：提交 / 我提交过的 / 收件箱（超管）
+
+角标 `feedback_open_count` 由 `blueprints/_helpers.py:register_template_context` 注入，**只对超管查**（普通用户看到「3 条待处理」却点不进去是纯噪音）。
+
+**测试**（`tests/test_feedback.py`，45 用例）：纯逻辑（空值/超长/分类回落/单据号递增/忽略终态/派发幂等/评论派发时点/收件箱排序/超管 id 取数）、**页面字段注入防护**（`https://` `//host` `javascript:` 一律丢弃）、企微渲染（关键字段/无 base_url 不发链接/空单据不崩/未配置静默跳过）、Issue 渲染与创建（token 缺失返回 None / 标签缺失仍建单 / 422 判失败 / 缺 `number` 判失败）、路由端到端（未登录 302 / 非超管 403 / 别人的单子 404 / 提交后站内扇出 / **跨用户：门店提交 → 超管通知中心可见** / 忽略流转 / 无 token 时评论保留且状态不变 / 派发成功置终态 / 重复派发不建第二单 / 仅存评论不建单 / 空评论不派发）。全部用例 `monkeypatch` 掉 `_request` 与 `send_webhook_markdown`，**不出网**。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态
