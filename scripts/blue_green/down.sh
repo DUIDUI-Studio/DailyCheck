@@ -47,6 +47,27 @@ GREEN_DB="${GREEN_DB:-/var/lib/dailycheck-green}"
 EVIDENCE_DIR="${EVIDENCE_BASE:-/var/log/dailycheck}"
 
 # ============================================================
+# 进程级互斥（纵深防御 · flock；dry-run / 已持锁时跳过）
+# ============================================================
+# down 是清理方向：不做会话级锁校验（清理/恢复场景不被部署锁阻塞），
+# 只用 flock 等待至多 30s —— 拿不到说明另一脚本正在动蓝绿设施，拒绝并发。
+if [[ ${DRY_RUN_FLAG} -eq 0 && "${DAILYCHECK_BG_LOCK_HELD:-0}" != "1" ]]; then
+  _BG_LOCK_FILE="${DAILYCHECK_BG_LOCK_FILE:-/var/lock/dailycheck-bluegreen.lock}"
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[down] WARN: flock 不可用 —— 进程级互斥跳过" >&2
+  elif ! mkdir -p "$(dirname "${_BG_LOCK_FILE}")" 2>/dev/null || ! : >>"${_BG_LOCK_FILE}" 2>/dev/null; then
+    echo "[down] WARN: 锁文件不可写（${_BG_LOCK_FILE}）—— 进程级互斥跳过" >&2
+  else
+    exec 9>"${_BG_LOCK_FILE}"
+    if ! flock -w 30 9; then
+      echo "[down] ERROR: 等待 30s 未获得蓝绿锁（另一操作进行中）—— 拒绝并发；确需强制请先停掉相关脚本" >&2
+      exit 10
+    fi
+    export DAILYCHECK_BG_LOCK_HELD=1
+  fi
+fi
+
+# ============================================================
 # 辅助：dry-run 模式
 # ============================================================
 _run() {
