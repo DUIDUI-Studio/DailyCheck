@@ -343,7 +343,7 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 **生产侧**：`WECOM_STORE_ORDER_WEBHOOK` 写 `/etc/dailycheck/app.env`（0600）后重启进程生效；群里「添加机器人」拿到的地址即用。**机器人被移出群 / key 轮换后旧地址失效**，此时推送失败只记 errcode（`wecom_notify_dropped`），无兜底重发队列（见 §14）。
 
-**测试**：`tests/test_wecom_notify_pure.py`（44 用例：模板字段与链接 / `base_url` 尾斜杠收敛 / 金额不出现 / 计数缺失即省略 / 时间三形态 / 空 webhook 不发送 / `errcode=0` 成功 / `errcode≠0` 失败 / 首败重试成功（2 次调用）/ HTTP·超时·非 JSON 各自 False 且不抛 / `retries=0` 仅一次 / `background=False` 直发一次 / `background=True` 走 daemon 线程 / 通道异常只记 WARNING / 日志不含 key / P0 无 emoji）+ `tests/test_wecom_notify_hook.py`（4 用例：提交点计数接线、后台语义、通道异常不外溢、空订单 no-op）。**全部用例 monkeypatch `urllib.request.urlopen`，不透网**；关键断言逐条经变异验证真 FAIL（去重试 / errcode 当成功 / 日志漏 key / 改同步发送 / `base_url` 不收敛尾斜杠 / 编造计数 / 不吞异常 各自对应测试 FAIL）。
+**测试**（三份，共 65 用例）：`tests/test_wecom_notify_pure.py`（57 用例：模板字段与链接 / `base_url` 尾斜杠收敛 / 无 base_url 不发链接 / 金额不出现 / 计数缺失即省略 / 时间三形态 / 空 webhook 不发送 / `errcode=0` 成功 / `errcode≠0` 失败 / **`errcode` 为 bool 判失败** / 首败重试成功（2 次调用）/ HTTP·超时·非 JSON 各自 False 且不抛 / `retries=0` 仅一次 / `background=False` 直发一次 / `background=True` 走 daemon 线程 / 通道异常只记 WARNING / **成功日志 WARNING 级** / 日志不含 key / **畸形 URL 四形态（缺 scheme·scheme 拼错·带引号·ftp）只返回 False 且不泄露 key** / P0 无 emoji）+ `tests/test_wecom_notify_hook.py`（4 用例：提交点计数接线、后台语义、通道异常不外溢、空订单 no-op）+ `tests/test_wecom_notify_route_wiring.py`（4 用例：**从 HTTP 入口**验证「恰好一次 + 计数正确」/「独立连接可见订单，即 commit 先于通知」/「被业务校验拦下的提交不推送」/「通知抛异常时订单仍落库且响应 200」）。**全部用例 monkeypatch `urllib.request.urlopen` 或挂钩出口，不透网**；关键断言逐条经变异验证真 FAIL（去重试 / errcode 当成功 / 日志漏 key / 改同步发送 / `base_url` 不收敛尾斜杠 / 编造计数 / 不吞异常 / **删掉视图里的 `_notify_wecom_new_order(order)`** 各自对应测试 FAIL）。
 
 ---
 
@@ -1250,7 +1250,12 @@ with app.test_client() as c, c.session_transaction() as s:
 - **env-only，不入仓库**：`WECOM_STORE_ORDER_WEBHOOK`（群机器人地址，含 `key=` = 密钥）与 `PUBLIC_BASE_URL`（消息链接域名）都由部署侧注入 `/etc/dailycheck/app.env`。仓库内缺省值为空串 / `https://kjtang.cn`，**任何真实 webhook 都不得出现在代码、测试夹具、文档、日志里**（同 §3.5 的 `WEBHOOK_SECRET` 口径）。
 - **空值 = 功能关闭，不是错误**：`webhook_for_event()` 返回空串时静默 return。dev / CI 没有该 env 是常态，若在缺配置时抛错或刷 WARNING，会把「未启用」误报成故障。
 - **日志只落脱敏 URL + errcode**：所有对外通道日志经 `mask_webhook_url()`，保留 host + path、查询串打码成 `key=***`。失败日志前缀可检索：`wecom_notify_attempt_failed` / `wecom_notify_dropped` / `wecom_notify_failed` / `wecom_notify_error`。
+- **成功/失败均 WARNING，保证生产可观测**：`wecom_notify_ok` 与 `wecom_notify_failed` 同为 WARNING（同 §13.9 的成因——app 不设 `logging.basicConfig`，生产 root 阈值 WARNING，INFO 级被静默吞掉）。推送成功是「消息已出网」的运维事实，事后要能证明发过，因此不允许降级为 INFO；`tests/test_wecom_notify_pure.py::test_notify_ok_logged_at_warning` 钉住级别。
+- **畸形 URL 必须就地降级，不得冒泡**：`urllib.request.Request()` 在**构造期**对缺 scheme / scheme 拼错 / 被引号包住的地址抛 `ValueError("unknown url type: '<完整 URL>'")`，异常文本即 `key=` 明文。它若冒出 `_post_once()`，会一路冒到 `_send_safely()` 的 `exc_info=True` → traceback 把密钥打进日志。因此 `Request` 构造必须与 `urlopen` 同在 `try` 内，`reason` 只放异常类型名（`unexpected=ValueError`）或数字码，**禁止拼接 URL 片段**；`send_webhook_markdown()` 对任何输入只返回 `bool`。回归用例覆盖「缺 scheme / scheme 拼错 / 带引号 / ftp」四形态，断言 `caplog.text` 不含密钥（2026-10-17 补，QA 阻断项）。
+- **`PUBLIC_BASE_URL` 为空时消息里不带链接**：`build_order_url()` 在 base 为空时返回空串（不退回相对路径 `/store-ordering/orders/{id}`——群里点不开、只会误导），由 `build_store_order_markdown()` 整行省略。
 - **`PUBLIC_BASE_URL` 必须是公网域名**：消息里的「查看单据」是给人点的，`127.0.0.1` / 内网地址在群里点不开；改部署布局（域名迁移）时同步改 env。
+- **提交点接线必须有路由级用例**：`tests/test_wecom_notify_hook.py` 直接调悬挂挂钩函数，覆盖不到「视图里那一行有没有被删」；`tests/test_wecom_notify_route_wiring.py` 从 HTTP 入口断言「恰好调用 1 次 / 独立连接可见订单（commit 先于通知）/ 被拦提交不推送 / 通知异常不下沉」，删除 `submit_order_route` 中的 `_notify_wecom_new_order(order)` 即实战红（2026-10-17 补，QA 阻断项）。
+
 - **开关粒度**：v1 是「一个事件一个 webhook」。要做多群 / 多事件时在 `WEBHOOK_EVENT_MAP` 登记新的 config 属性，不要在视图里写 `if 群A ... else 群B`。
 
 ---

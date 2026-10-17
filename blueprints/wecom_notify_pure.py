@@ -6,7 +6,10 @@
   ``WEBHOOK_EVENT_MAP`` 是扩展位：新增事件只需在该表登记一行，
   发送链路（构建 → 发送 → 后台线程 → 日志脱敏）完全复用。
 - 纯标准库（``urllib``），不引入 ``requests``。
-- 本模块**绝不向上抛异常**：对外通道故障不得影响下单事务。
+- 本模块**绝不向上抛异常**：对外通道故障不得影响下单事务。含畸形 URL——
+  ``urllib.request.Request()`` 会在构造期对缺 scheme / scheme 拼错的地址抛
+  ``ValueError``，其文本带完整 URL（``key=`` 明文），所以它必须被就地降级，
+  不能让它冒到日志里。
 - webhook URL 含 `key=`（等同密钥），日志里一律经
   :func:`mask_webhook_url` 脱敏，禁止打印完整 URL。
 
@@ -114,14 +117,18 @@ def build_store_order_markdown(
 
 
 def build_order_url(order_id: Any, base_url: str = "") -> str:
-    """拼单据详情链接；无 base_url 或无 order_id 时返回空串。"""
+    """拼单据详情链接；``base_url`` 或 ``order_id`` 缺失时返回空串。
+
+    ``base_url`` 为空**不**退回相对路径：企微群里的消息是给人点的，
+    ``/store-ordering/orders/42`` 这种相对链接在客户端点不开（无 host），
+    发出去只会误导。宁可整行省略，等 ``PUBLIC_BASE_URL`` 配置好再带上链接。
+    """
     if order_id is None or str(order_id).strip() == "":
         return ""
-    path = f"/store-ordering/orders/{order_id}"
     base = (base_url or "").strip().rstrip("/")
     if not base:
-        return path
-    return f"{base}{path}"
+        return ""
+    return f"{base}/store-ordering/orders/{order_id}"
 
 
 def _format_counts(item_count: int | None, total_qty: Any) -> str:
@@ -206,7 +213,12 @@ def send_webhook_markdown(
     masked = mask_webhook_url(url)
     last_reason = ""
     for attempt in range(1, attempts + 1):
-        ok, errcode, reason = _post_once(url, payload, timeout)
+        try:
+            ok, errcode, reason = _post_once(url, payload, timeout)
+        except Exception as exc:  # 兜底：_post_once 已自吞，防未来改动回归
+            # 注意：不得 exc_info=True —— traceback 会带出异常文本，
+            # 而 URL 类异常文本包含完整 webhook（即 key 明文）。
+            ok, errcode, reason = False, None, f"unexpected={type(exc).__name__}"
         if ok:
             return True
         last_reason = reason
@@ -224,15 +236,26 @@ def _post_once(
     payload: bytes,
     timeout: float,
 ) -> tuple[bool, int | None, str]:
-    """单次 POST。返回 (是否成功, errcode, 失败原因)。"""
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    """单次 POST。返回 (是否成功, errcode, 失败原因)。**绝不抛异常**。
+
+    ``Request`` 的构造也在 ``try`` 内——这是安全边界，不是风格问题：
+    畸形 URL（缺 scheme、scheme 拼错、被引号包住、``ftp://``）会让
+    ``urllib.request.Request()`` 抛 ``ValueError("unknown url type: '<完整 URL>'"``，
+    异常文本里就是 ``key=`` 明文。它若冒出本函数，会一路冒到
+    ``_send_safely()`` 的 ``exc_info=True`` → traceback 把密钥打进日志，
+    违反模块自述「绝不抛异常 / 完整 URL 不允许出现在日志」。
+
+    失败原因（reason）只放**异常类型名**或 HTTP/errcode 数字，
+    绝不拼进 URL 片段。
+    """
     # URL 来自 config（运维注入的企微地址），不是用户输入。
     try:
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read()
     except urllib.error.HTTPError as exc:
@@ -242,7 +265,7 @@ def _post_once(
         return False, None, f"urlerror={_short(exc.reason)}"
     except (TimeoutError, OSError) as exc:
         return False, None, f"oserror={type(exc).__name__}"
-    except Exception as exc:  # 兜底：外部通道不得影响主流程
+    except Exception as exc:  # 兜底：含 Request 构造的 ValueError（畸形 URL）
         return False, None, f"unexpected={type(exc).__name__}"
 
     errcode = _parse_errcode(body)
@@ -367,11 +390,17 @@ def notify_store_order_event(
 
 
 def _send_safely(webhook_url: str, markdown: str, order_no: str = "") -> None:
-    """后台线程体：吞掉一切异常，只记订单号。"""
+    """后台线程体：吞掉一切异常，只记订单号。
+
+    成功与失败**都用 WARNING**：app 不设 ``logging.basicConfig``，生产 root
+    logger 阈值是 WARNING，INFO 级会被静默吞掉（见 ARCHITECTURE §13.9）。
+    推送成功是「必须留痕」的运维事实（对外消息已出网，事后要能证明发过），
+    所以不能是 INFO。
+    """
     try:
         sent = send_webhook_markdown(webhook_url, markdown)
         if sent:
-            logger.info("wecom_notify_ok: order_no=%s", order_no)
+            logger.warning("wecom_notify_ok: order_no=%s", order_no)
         else:
             logger.warning("wecom_notify_failed: order_no=%s", order_no)
     except Exception:  # 兜底：后台线程绝不冒泡
