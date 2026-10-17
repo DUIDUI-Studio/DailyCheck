@@ -249,5 +249,32 @@ fi
 
 observe_window "${OBSERVE_MIN}"
 _release success
+
+# ---------------------------------------------------------------- 仪表盘钩子
+# 部署成功后立即刷新运维仪表盘（2026-10-17 owner 定：不装常驻 webhook 触发器，
+# 用「脚本内钩子 + systemd timer 兜底」两段式）。
+# 为什么钩子放脚本里、不放 Prod Agent 的指令里：
+#   会话随时可能在中途终止（#97 实测：promote 后会话死掉，流量压在蓝 7 分钟），
+#   而本脚本一定会跑到最后一行 —— 把「记得刷新报表」从自然语言约束变成代码。
+# 为什么 || 兜底 + timer：渲染依赖 gh/审计日志，任一不可用都不能让部署变红。
+render_dashboard() {
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "${DAILYCHECK_DASHBOARD_HOOK:-1}" == "0" ]]; then
+    log "仪表盘钩子已禁用（DAILYCHECK_DASHBOARD_HOOK=0）"
+    return 0
+  fi
+  log "→ 刷新运维仪表盘"
+  if ( cd "${REPO_ROOT}" && "${PY}" -m scripts.dailycheck_dashboard render \
+         --trigger-kind deploy --trigger-event-id "pr-${PR}" ) >>"${LOG}" 2>&1; then
+    log "✓ 仪表盘已刷新"
+  else
+    log "WARN: 仪表盘刷新失败 —— 不影响部署结果；dc-dashboard-refresh.timer 会在 15 分钟内补上"
+  fi
+  return 0
+}
+render_dashboard
+
 log "✅ 全链完成 PR #${PR} sha=${SHA:0:12}"
 exit 0

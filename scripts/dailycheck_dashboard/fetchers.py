@@ -67,7 +67,12 @@ def fetch_issues(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
 
 
 def fetch_prs(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
-    """所有 PR（state=all，limit=200），snake_case 规范化。"""
+    """所有 PR（state=all，limit=200），snake_case 规范化。
+
+    created_at / merged_at 只到日（落库口径不变）；
+    created_ts / merged_ts 保留完整 ISO 8601，供交付周期（创建→合并）计算，
+    不写进 prs_snapshot（避免改 db schema）。
+    """
     raw = _run([
         "gh", "pr", "list",
         "--repo", repo,
@@ -84,9 +89,18 @@ def fetch_prs(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
             "head_ref": it.get("headRefName") or "",
             "created_at": (it.get("createdAt") or "")[:10] or None,
             "merged_at": (it.get("mergedAt") or "")[:10] or None,
+            "created_ts": _norm_ts(it.get("createdAt")),
+            "merged_ts": _norm_ts(it.get("mergedAt")),
         }
         for it in items
     ]
+
+
+def _norm_ts(ts: str | None) -> str | None:
+    """GitHub 的 '2026-10-17T12:42:47Z'（可能带毫秒）→ 秒级 UTC ISO。"""
+    if not ts:
+        return None
+    return ts[:19] + "Z"
 
 
 # ============================================================

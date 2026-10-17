@@ -1,0 +1,55 @@
+# deploy/systemd/dc-dashboard-refresh.service
+#
+# 运维仪表盘「兜底刷新」：一次性渲染，跑完即退（Type=oneshot）。
+# 由 dc-dashboard-refresh.timer 每 15 分钟拉一次。
+#
+# 为什么是 timer 而不是常驻 webhook 触发器：
+#   dc-dashboard-generator.service（2026-10-16 PR #54 写的常驻订阅式触发）从未在生产安装 ——
+#   多一个常驻单元就多一处会静默死掉的地方，而报表晚 15 分钟没人会疼。
+#   主路径是 deploy_pipeline.sh 尾部的钩子（部署完成即刷），本 timer 只兜底：
+#   会话中途终止 / 手动改库 / 补历史 —— 这三种场景钩子都覆盖不到。
+#
+# 安装（owner / Prod Agent 手动）：
+#   1. mkdir -p /var/lib/dailycheck-dashboard/snapshots
+#   2. cp deploy/systemd/dc-dashboard-refresh.{service,timer} /etc/systemd/system/
+#   3. systemctl daemon-reload
+#   4. systemctl enable --now dc-dashboard-refresh.timer
+#   5. systemctl start dc-dashboard-refresh.service        # 手动跑一次
+#      journalctl -u dc-dashboard-refresh -n 50
+#   6. 验收：/var/lib/dailycheck-dashboard/latest.html 的 mtime 在 15 分钟内变化
+#
+# 数据源（任一不可用 → 该区块降级，不 FAIL）：
+#   /var/lib/dailycheck-deploy/audit.log      部署阶段时间戳（只读）
+#   /root/DailyCheck/backups/prod-verifications  八项验证报告（只读，ProtectHome=read-only 够）
+#   /root/.hermes/state.db                    token 用量（只读打开，2GB 不复制）
+
+[Unit]
+Description=DailyCheck ops dashboard refresh (one-shot render)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+WorkingDirectory=/root/DailyCheck
+Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/DailyCheck/.venv/bin/python -m scripts.dailycheck_dashboard render \
+    --trigger-kind timer
+
+# 渲染要拉 gh + 读 2GB state.db 的聚合，给足余量；卡死也不能拖住下一次
+TimeoutStartSec=180
+
+# 安全沙箱（与 dc-inbox-rotate.service 同规）
+# ⚠️ 脚本/venv 在 /root/DailyCheck 下：ProtectHome 必须 ≤ read-only（true → 203/EXEC）
+#    gh 的凭据在 /root/.config/gh，同样只需要读
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dailycheck-dashboard
+PrivateTmp=true
+ProtectHome=read-only
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true

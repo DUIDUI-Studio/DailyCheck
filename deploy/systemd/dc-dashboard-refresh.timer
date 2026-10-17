@@ -1,0 +1,21 @@
+# deploy/systemd/dc-dashboard-refresh.timer
+#
+# 每 15 分钟刷新一次运维仪表盘（兜底路径，主路径是 deploy_pipeline.sh 的尾部钩子）。
+#
+# 为什么 15 分钟：
+#   - 报表是日维度，15 分钟的陈旧度完全够看；
+#   - 相比 5 分钟，把 gh API 调用量压到 1/3（每次渲染 2 次 gh 调用）；
+#   - 相比 30 分钟，不会让「手动改库 / 补历史」后长时间看不到更新。
+# Persistent=true：机器错过窗口（重启/休眠）恢复后补跑一次。
+
+[Unit]
+Description=Refresh DailyCheck ops dashboard every 15 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=dc-dashboard-refresh.service
+
+[Install]
+WantedBy=timers.target

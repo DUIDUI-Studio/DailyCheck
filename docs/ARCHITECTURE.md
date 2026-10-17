@@ -268,6 +268,37 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 **手动出活**（验证用）：`python3 -m scripts.dailycheck_dashboard render --trigger-kind manual` —— 与 PR 触发的产物格式完全一致，仅 `trigger_kind` 字段差异
 
+#### 3.6.1 运维看板（交付流水线 / token / 验证矩阵，2026-10-17 起）
+
+**目标**：把「今天 PR 处理得怎么样」变成一屏可读的事实——交付周期、部署各阶段耗时、卡在哪一步、token 花在谁身上。回答的是「哪一步慢了」，不是「有没有跑」。
+
+**为什么不用常驻 webhook 触发器**：`dc-dashboard-generator.service`（§3.6，PR #54）从 10-16 写出来到 10-17 一直**没在生产装过**——四件套（unit + 触发二进制 + 状态目录 + inbox 订阅）任何一环没落地就整条链不出活。故本版改为**两段式**：
+1. **主路径**：`deploy_pipeline.sh` 尾部钩子（部署成功后同步渲染，秒级）。钩子写在**脚本里**而不是 Prod Agent 的 SKILL 指令里——会话随时会在中途终止（#97 实测：promote 后会话死掉、流量压在蓝 7 分钟），脚本一定会跑到最后一行。失败只 WARN（`|| true`），绝不让部署变红；`DAILYCHECK_DASHBOARD_HOOK=0` 可关。
+2. **兜底**：`dc-dashboard-refresh.timer`（15 分钟 oneshot）。覆盖钩子够不到的三种场景：会话中途终止 / 手动改库补数 / 历史回填。新鲜度换组件数——日维度报表晚 15 分钟没人疼，多一个常驻单元就多一处会静默死掉的地方。
+
+**数据源与分工**（三个源各自降级，任一不可用只丢那一块，页面不白屏）：
+
+| 源 | 路径 | 取什么 | 失败时 |
+|---|---|---|---|
+| 部署审计 | `/var/lib/dailycheck-deploy/audit.log` | up/verify/promote/switch 时间戳 | 瀑布图空，其余照常 |
+| 验证报告 | `backups/prod-verifications/*-pr-N.md` | 八项检查逐项 PASS/FAIL | 矩阵与徽章空 |
+| Hermes state.db | `/root/.hermes/state.db`（**只读** `mode=ro`） | 日 × source 的 token 聚合 | token 图空 |
+
+**为什么成本不显示**：`state.db.sessions` 的 `estimated_cost_usd` / `actual_cost_usd` **近 8 天 3298 个会话全为 0**（`api_call_count` 同样全 0）——库内没有可信金额，硬画就是编数字。当前只出 token 数 + 缓存命中率；要金额须另配价目表（owner 决定先留空）。
+
+**为什么部署耗时不能从 state.db 取**：`webhook` 来源的会话 `ended_at` 普遍为 NULL（长会话不落结束时间，近 8 天 98 个），拿不到时长。故阶段耗时只认 `audit.log` 的时间戳序列。
+
+**解析口径（三条必须遵守）**：
+- **JSON 起点用 `find("{")` 不能用 `rfind`**：审计行尾部是 `{… "lock": {…}}`，`rfind` 抓到内层对象 → `json.loads` 见 `…}}` 抛错 → `lock.pr` / `lock.sha` 全丢 → 无 `pr=` 参数的 promote/switch 行被整行丢弃，瀑布图只剩 `up` 一段（2026-10-17 实 hit，已由 `tests/test_dashboard_ops.py` 锁死）。
+- **switch.sh 取最后一次**：同一条 PR 的 switch.sh 会出现多次（verify check 4 的回滚演练也调它），只有最后一次才是真切流。
+- **不猜「中断」**：阶段耗时超阈值只标 `stalled`（仅 `up` / `promote` 这类秒级阶段，阈值 300s），渲染侧只上色不改事实。`verify` 天然 10–15 分钟，不参与卡顿判定。
+
+**存储（事件型，与快照型分开）**：`db.py` 的三张表是快照型（每次渲染整份写一份），按 15 分钟一次存会 96 份/天的重复。故新增 `ops_db.py` 三张**时间序列表** + 幂等 upsert（主键 `(pr, sha)` / `(day, source)` / `(pr, generated_at)`），只借 `db.connect()`，不改既有表。
+
+**版面（`render_ops.py`，注入主模板 `${ops_css}` / `${ops_html}` 两处占位符）**：顶部 6 张运维 KPI（今日合并 / 交付周期中位数 / 今日部署 / 平均验证耗时 / 今日 token / 部署卡顿）→ 交付流水线瀑布（每 PR 一行：创建→合并→up→verify→promote，红色斜纹＝卡顿）→ token 7 日堆叠（按 source 拆 webhook/cron/feishu）→ 验证矩阵（8 项 × 最近 6 次）→ 异常归因。原 ①–⑤ 章节顺延为 ②–⑥。
+
+---
+
 **部署（owner 手动）**：
 1. `mkdir -p /var/lib/dailycheck-dashboard/snapshots` + `chown -R root:root /var/lib/dailycheck-dashboard`
 2. `cp deploy/scripts/dailycheck_dashboard_on_pr.py /usr/local/bin/dc-dashboard-trigger` + `chmod 755`

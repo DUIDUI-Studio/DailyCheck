@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from string import Template
 from typing import Any
 
+from . import render_ops
+
 
 # ============================================================
 # 渲染输入
@@ -28,6 +30,12 @@ class RenderInput:
     worktrees: list[dict] = field(default_factory=list)
     inbox_stats: dict = field(default_factory=dict)
     diff: dict | None = None  # 与上次快照的 KPI 差值（v1: {open_issues: +1, ...}）
+    # 运维事实（ops_parse 采集；任一源失败留在 ops_unavailable 里，不阻塞整页）
+    deploy_events: list[dict] = field(default_factory=list)
+    verifications: list[dict] = field(default_factory=list)
+    token_rows: list[dict] = field(default_factory=list)
+    ops_unavailable: list[str] = field(default_factory=list)
+    ops_fetched_at: str = ""
 
 
 # ============================================================
@@ -191,6 +199,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
         .tbl table{min-width:520px}
         h2{margin:22px 0 10px}
     }
+${ops_css}
 </style>
 </head>
 <body>
@@ -202,11 +211,12 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
 </div>
 
 <nav>
-    <a href="#monitor">① 任务运行</a>
-    <a href="#issues">② Issue 追踪</a>
-    <a href="#prs">③ PR 管线</a>
-    <a href="#worktrees">④ Worktree</a>
-    <a href="#inbox">⑤ Inbox 事件</a>
+    <a href="#ops">① 交付看板</a>
+    <a href="#monitor">② 任务运行</a>
+    <a href="#issues">③ Issue 追踪</a>
+    <a href="#prs">④ PR 管线</a>
+    <a href="#worktrees">⑤ Worktree</a>
+    <a href="#inbox">⑥ Inbox 事件</a>
 </nav>
 
 <div class="banner ${banner_class}">
@@ -241,8 +251,10 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
     </div>
 </div>
 
+${ops_html}
+
 <h2 id="monitor">
-    <span class="no">1</span>
+    <span class="no">2</span>
     任务运行监控 · 触发链组件
     <span class="hint">PR webhook → inbox.jsonl → 生成快照</span>
 </h2>
@@ -283,7 +295,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
 </div>
 
 <h2 id="issues">
-    <span class="no">2</span>
+    <span class="no">3</span>
     Issue 追踪
     <span class="hint">Open ${open_issues_count} · 总 ${issues_total}</span>
 </h2>
@@ -291,7 +303,7 @@ HTML_TEMPLATE = Template("""<!DOCTYPE html>
 ${issues_html}
 
 <h2 id="prs">
-    <span class="no">3</span>
+    <span class="no">4</span>
     PR 管线
     <span class="hint">已合并（近 7 天）${merged_7d_count} · 未合并（CLOSED）${closed_unmerged_count} · 全部 ${prs_total}</span>
 </h2>
@@ -299,7 +311,7 @@ ${issues_html}
 ${prs_html}
 
 <h2 id="worktrees">
-    <span class="no">4</span>
+    <span class="no">5</span>
     Worktree 在用
     <span class="hint">${worktrees_count} 个</span>
 </h2>
@@ -307,7 +319,7 @@ ${prs_html}
 ${worktrees_html}
 
 <h2 id="inbox">
-    <span class="no">5</span>
+    <span class="no">6</span>
     Inbox 事件（dc-webhook-receiver 写入）
     <span class="hint">实时扫描 inbox.jsonl</span>
 </h2>
@@ -372,6 +384,14 @@ def render(input: RenderInput) -> str:
     issues_html = _render_issues(input.issues)
     prs_html = _render_prs(input.prs)
     worktrees_html = _render_worktrees(input.worktrees)
+    ops_html = render_ops.render_ops_block(
+        events=input.deploy_events,
+        prs=input.prs,
+        verifications=input.verifications,
+        token_rows=input.token_rows,
+        fetched_at=input.ops_fetched_at,
+        unavailable=input.ops_unavailable,
+    )
 
     # PR 状态分布计数
     merged_7d_count = _count_merged_7d(input.prs)
@@ -390,6 +410,9 @@ def render(input: RenderInput) -> str:
         banner_sub=_esc(banner_sub),
         head_short=_esc(head_short),
         origin_main_short=_esc(origin_main_short),
+    # 运维区块（CSS + HTML 两处注入）
+    ops_css=render_ops.OPS_CSS,
+    ops_html=ops_html,
     # KPIs
     kpi_open_class=kpi_open_class,
     kpi_wt_class=kpi_wt_class,
