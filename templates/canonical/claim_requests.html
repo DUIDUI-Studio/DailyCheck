@@ -28,13 +28,13 @@
       <td>{{ r['submitted_by'] or '—' }}</td>
       <td><small>{{ r['created_at'] }}</small></td>
       <td><small>{{ r['review_note'] or '' }}</small></td>
-      <td>
+      <td class="inline">
         {% if r['status'] == 'pending' and g.user and g.user['is_admin'] %}
-        <form method="post" action="{{ url_for('canonical.canonical_review_claim_request', request_id=r['id']) }}" style="display:inline" data-ajax data-ajax-mode="reload-stay">
+        <form method="post" action="{{ url_for('canonical.canonical_review_claim_request', request_id=r['id']) }}" class="inline" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <select name="decision"><option value="approved">approve</option><option value="rejected">reject</option></select>
           <input name="note" placeholder="备注" />
-          <button type="submit" class="btn-sm">提交</button>
+          <button type="submit" class="btn-sm primary">提交</button>
         </form>
         {% endif %}
       </td>
