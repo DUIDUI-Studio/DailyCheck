@@ -319,7 +319,8 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 **① 状态原语** `scripts/blue_green/deploy_state.py`（stdlib only；状态目录 `DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy/`）：
 
-- **会话级部署锁**（心跳式，TTL 900s，`DAILYCHECK_DEPLOY_HEARTBEAT_TTL` 可调）：`acquire --pr N --sha <sha>`（返回 token，并写 `<state_dir>/lock.token`）→ 长步骤间 `heartbeat [--phase <阶段>]` → 收官 `release --result success|failed`（token 缺省从 `lock.token` 读，也可 `--token` / `--token-file` 显式指定）。持有者崩溃 → 心跳过期 → 锁自动失效可被后来者抢占（`last_evicted` 留证据），**无死锁**；`clear-lock --yes` = break-glass 人工清锁。
+- **会话级部署锁**（心跳式，TTL 1800s，`DAILYCHECK_DEPLOY_HEARTBEAT_TTL` 可调）：`acquire --pr N --sha <sha>`（返回 token，并写 `<state_dir>/lock.token`）→ 长步骤间 `heartbeat [--phase <阶段>]` → 收官 `release --result success|failed`（token 缺省从 `lock.token` 读，也可 `--token` / `--token-file` 显式指定）。持有者崩溃 → 心跳过期 → 锁自动失效可被后来者抢占（`last_evicted` 留证据），**无死锁**；`clear-lock --yes` = break-glass 人工清锁。
+  - ⚠️ **TTL 必须明显长于单步最长耗时**：verify 实测 12-14 分钟，原 900s 会在 verify 中途过期 —— 2026-10-17 PR #96 实测 `last_evicted`（心跳 20:17:10，20:37:19 被抢占），等于「合法抢占」把单飞保证打穿。取 1800s（≈2 倍余量）。
 - **token 交接走文件（0600），不走 stdout**：会话层（Hermes / 飞书）会把 stdout 里形似密钥的值脱敏成 `***`，`acquire` 返回的 token 在会话侧拿不到 —— 若只走 stdout，调用方只能去 `state.json` 手抠，而 `cat … | python3` 会撞上「管道进解释器」审批门禁（2026-10-17 PR #96 实测卡 5 分钟、PR #95 同遇脱敏）。故 acquire 同时落 `lock.token`、release / clear-lock 删除；`state.json` 与状态目录一并收紧到 `0600` / `0700`。
 - **事实锚点 + 追平检测**：`release success` 把 `deployed.sha` 推进到已部署 sha；`catchup` 对比 `origin/main` vs `deployed.sha` → `rc 0` 已追平 / `rc 1` 有欠账（该部署）/ `rc 2` 同 sha 上次失败（**不自动重试**，防坏 main 死循环）/ `rc 3` 未初始化（先 `init`）/ `rc 65` 取不到 main。**正确性不依赖任何会话「记得排队」**：任何后来者（含兜底轮询）都能从事实独立算出「要不要部署」。
 - 退出码：0=正常 / 1=欠账 / 2=失败待决 / 3=未初始化 / 10=锁被占用 / 11=token 不匹配 / 12=锁属另一 PR / 64=用法错 / 65=无法确定 main。除 `status` 外输出均为单行 JSON。
@@ -338,10 +339,10 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 - 进程级锁文件 `/var/lock/dailycheck-bluegreen.lock`（`DAILYCHECK_BG_LOCK_FILE` 可覆盖）；**嵌套调用经 `DAILYCHECK_BG_LOCK_HELD=1` 环境变量继承跳过**（verify.sh check 4 内嵌调 switch.sh —— 父已持锁时子脚本不得对自己的锁自锁死）。
 - 放行路径记 `audit.log` 审计行（`up.sh pr=N {...}`）；`DAILYCHECK_DEPLOY_UNLOCKED=1` = 人工逃生舱（警告放行）；`deploy_state.py` / `python3` / `flock` 不可用时降级为警告跳过（不打断应急路径）。
-- **会话侧协议**（Prod Agent skill，merge 后）：先 `acquire`；`rc 10`（他人在部署）→ **不排队、直接结束** —— 欠账由任何人下一次 `catchup` 从事实发现并补上（兜底轮询 ≤30 分钟保底）；部署失败则 `release --result failed`（记 `last_attempt`）。长步骤间必须 heartbeat，否则 15 分钟 TTL 到期会被下一会话合法抢占。
+- **会话侧协议**（Prod Agent skill，merge 后）：先 `acquire`；`rc 10`（他人在部署）→ **不排队、直接结束** —— 欠账由任何人下一次 `catchup` 从事实发现并补上（兜底轮询 ≤30 分钟保底）；部署失败则 `release --result failed`（记 `last_attempt`）。长步骤间必须 heartbeat，否则 30 分钟 TTL 到期会被下一会话合法抢占。
 - **激活顺序（一次性，防自锁）**：先更新 Prod Agent skill 到「会话侧协议」→ 再 `init` 建状态目录。反序（机制先激活、旧 skill 不握锁）会让下一次 up.sh 在守卫处拒跑（exit 10）。
 
-**测试**：`tests/test_deploy_state.py`（42 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
+**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
 
 ---
 

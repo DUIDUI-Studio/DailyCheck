@@ -6,7 +6,7 @@
 同时全绿 / 同一 PR 多个 check_suite 事件）可能让两个部署会话在同一套
 蓝绿设施上重叠 —— 本原语提供「部署单飞」所需的全部状态机：
 
-  组件一：会话级部署锁（心跳式，TTL 15 分钟）
+  组件一：会话级部署锁（心跳式，TTL 30 分钟）
     - acquire 抢锁（被活跃锁占用时拒绝）；heartbeat 续约；release 收官。
     - 持有者崩溃 -> 心跳过期 -> 锁自动失效，后来者可抢占（无死锁）。
   组件二：事实锚点「已部署 sha」+ 追平检测（catchup）
@@ -29,7 +29,9 @@
 
 环境变量：
     DAILYCHECK_DEPLOY_STATE_DIR       状态目录（默认 /var/lib/dailycheck-deploy）
-    DAILYCHECK_DEPLOY_HEARTBEAT_TTL   心跳过期阈值秒（默认 900）
+    DAILYCHECK_DEPLOY_HEARTBEAT_TTL   心跳过期阈值秒（默认 1800 —— 必须明显长于
+                                      单步最长耗时：verify 实测 12-14 分钟，
+                                      900s 会让锁在 verify 中途就过期被合法抢占）
     DAILYCHECK_PROD_REPO              catchup 默认取 main 的仓库（默认 /root/DailyCheck）
 
 输入/输出：
@@ -55,7 +57,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 DEFAULT_STATE_DIR = "/var/lib/dailycheck-deploy"
-DEFAULT_TTL = 900
+DEFAULT_TTL = 1800
 DEFAULT_PROD_REPO = "/root/DailyCheck"
 
 STATE_FILENAME = "state.json"

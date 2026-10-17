@@ -142,6 +142,16 @@ def test_acquire_evicts_stale_lock(state_dir: Path):
     assert data["last_evicted"]["pr"] == 7
 
 
+def test_lock_survives_verify_length_gap(state_dir: Path):
+    """回归：verify 实测 12-14 分钟 —— 旧 TTL 900s 会在 verify 中途过期被抢占
+    （2026-10-17 PR #96 生产实测 last_evicted：心跳 20:17:10 → 20:37:19 被抢）。
+    TTL 必须明显长于单步最长耗时，否则「单飞」被合法抢占打穿。"""
+    _acquire(state_dir)
+    _age_lock(state_dir, seconds=1000)  # 旧 900s 已判过期；1800s 仍应活跃
+    assert _run(state_dir, "check").returncode == 10
+    assert "1800s" in _run(state_dir, "status").stdout
+
+
 def test_acquire_creates_missing_dir(tmp_path: Path):
     missing = tmp_path / "fresh"
     proc = _run(missing, "acquire", "--pr", "1", "--sha", "x")
