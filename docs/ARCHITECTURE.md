@@ -320,6 +320,7 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 **① 状态原语** `scripts/blue_green/deploy_state.py`（stdlib only；状态目录 `DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy/`）：
 
 - **会话级部署锁**（心跳式，TTL 1800s，`DAILYCHECK_DEPLOY_HEARTBEAT_TTL` 可调）：`acquire --pr N --sha <sha>`（返回 token，并写 `<state_dir>/lock.token`）→ 长步骤间 `heartbeat [--phase <阶段>]` → 收官 `release --result success|failed`（token 缺省从 `lock.token` 读，也可 `--token` / `--token-file` 显式指定）。持有者崩溃 → 心跳过期 → 锁自动失效可被后来者抢占（`last_evicted` 留证据），**无死锁**；`clear-lock --yes` = break-glass 人工清锁。
+  - `heartbeat --loop --interval <秒>` = 常驻续约循环（供编排脚本后台跑）：一个进程存活期内持续打心跳，`SIGTERM`/`SIGINT` 优雅退出 rc 0；token 失效（锁被抢占或已 release）→ 立即退出 rc 11，不空转。`--phase` 只在**第一拍**写入，主流程后续可用单发 heartbeat 推进阶段而不被盖回去。
   - ⚠️ **TTL 必须明显长于单步最长耗时**：verify 实测 12-14 分钟，原 900s 会在 verify 中途过期 —— 2026-10-17 PR #96 实测 `last_evicted`（心跳 20:17:10，20:37:19 被抢占），等于「合法抢占」把单飞保证打穿。取 1800s（≈2 倍余量）。
 - **token 交接走文件（0600），不走 stdout**：会话层（Hermes / 飞书）会把 stdout 里形似密钥的值脱敏成 `***`，`acquire` 返回的 token 在会话侧拿不到 —— 若只走 stdout，调用方只能去 `state.json` 手抠，而 `cat … | python3` 会撞上「管道进解释器」审批门禁（2026-10-17 PR #96 实测卡 5 分钟、PR #95 同遇脱敏）。故 acquire 同时落 `lock.token`、release / clear-lock 删除；`state.json` 与状态目录一并收紧到 `0600` / `0700`。
 - **事实锚点 + 追平检测**：`release success` 把 `deployed.sha` 推进到已部署 sha；`catchup` 对比 `origin/main` vs `deployed.sha` → `rc 0` 已追平 / `rc 1` 有欠账（该部署）/ `rc 2` 同 sha 上次失败（**不自动重试**，防坏 main 死循环）/ `rc 3` 未初始化（先 `init`）/ `rc 65` 取不到 main。**正确性不依赖任何会话「记得排队」**：任何后来者（含兜底轮询）都能从事实独立算出「要不要部署」。
@@ -342,7 +343,30 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 - **会话侧协议**（Prod Agent skill，merge 后）：先 `acquire`；`rc 10`（他人在部署）→ **不排队、直接结束** —— 欠账由任何人下一次 `catchup` 从事实发现并补上（兜底轮询 ≤30 分钟保底）；部署失败则 `release --result failed`（记 `last_attempt`）。长步骤间必须 heartbeat，否则 30 分钟 TTL 到期会被下一会话合法抢占。
 - **激活顺序（一次性，防自锁）**：先更新 Prod Agent skill 到「会话侧协议」→ 再 `init` 建状态目录。反序（机制先激活、旧 skill 不握锁）会让下一次 up.sh 在守卫处拒跑（exit 10）。
 
-**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
+**③ 编排固化** `scripts/blue_green/deploy_pipeline.sh <pr> <sha>` —— 一条命令跑完 merge 后的整条链（2026-10-17 起）：
+
+```
+acquire → 起后台 heartbeat --loop → up → verify → promote → switch green 100 → 观察窗 → release
+```
+
+**为什么要有这一层**：此前编排由 Prod Agent 会话「读 SKILL.md 现场拼命令」承担，一天内撞出四类同型故障 ——
+① switch 跑在 promote 之前被 DRY_RUN 守卫拒（顺序靠自然语言约束不可靠）；
+② verify 10 分钟 / promote 7.5 分钟期间无人打心跳，锁在 900s TTL 下被合法抢占（PR #96 `last_evicted`）；
+③ 会话空回复终止 → 绿已转正但流量仍压在蓝，挂到人工接管（PR #97）；
+④ 漏 `release` → `deployed` 锚点不前进，`catchup` 永远 behind。
+四者共同的根因是**步骤记忆**这个变量。把顺序写进代码、心跳交给后台进程、收锁交给 `trap`，这四类故障在结构上消失。
+
+- **顺序不可配**：`promote` 必须早于 `switch`（switch 的 DRY_RUN 守卫会拒未转正的绿），脚本内写死。
+- **收锁不可漏**：`trap cleanup EXIT` 保证成功 → `release success`、失败/中断 → `release failed`（记 `last_attempt`，`deployed` 不假前进）。失败路径不重试，交回 `catchup` 或人工。
+- **心跳不可断**：`heartbeat --loop --interval 120` 后台常驻，阶段耗时不再受 TTL 约束（TTL 只需兜「进程被 KILL」）。
+- **幂等**：`deployed.sha` 已等于目标 sha → 直接 rc 0 退出，不动任何子脚本。
+- **`--dry-run`**：只透传子脚本的 `--dry-run`，**不** acquire / 不 release / 不进观察窗（不碰部署状态）。
+- **观察窗**：默认 30 分钟，每 5 分钟探 `:8080/` 与 `journalctl -u dailycheck-green | grep BLOCKED`；任一异常即 `switch.sh blue 100` 回滚并 rc 24。
+- 退出码：0 成功 / 10 锁被占 / 11 acquire 失败 / 20 up / 21 verify / 22 promote / 23 switch / 24 观察窗异常 / 64 参数错。
+
+**会话侧协议**（Prod Agent skill）随之收缩为一行调用 —— 不再有「第 1 步到第 9 步」需要 LLM 记住。
+
+**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（22 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，以及 `heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase，三处变异分别打红 3 / 1 / 1 个用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
 
 ---
 

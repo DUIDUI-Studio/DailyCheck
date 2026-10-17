@@ -29,12 +29,41 @@
 
 | 文件 | 用途 | 状态 |
 |------|------|------|
+| `deploy_state.py` | 部署单飞状态原语（会话级锁 / 心跳 / `deployed` 锚点 / `catchup`；`heartbeat --loop` 常驻续约） | 已实装（2026-10-16 起，2026-10-17 加循环心跳） |
+| `deploy_pipeline.sh` | **端到端编排**（acquire → 后台心跳 → up → verify → promote → switch → 观察窗 → release，trap 保证收锁） | 已实装（2026-10-17 起） |
 | `up.sh` | 起绿环境（cp DB + **复位静息态** + systemctl **restart** dailycheck-green.service + 健康检查；**绿在役时先切蓝**） | 骨架 + systemd TODO |
 | `verify.sh` | 跑八项生产验证 | 骨架（占位报告，exit 0 警告） |
 | `promote.sh` | **绿转正**（关 DRY_RUN + DB 指回真库 + daemon-reload/restart + 健康复核；幂等 + 备份 + 失败回滚） | 已实装（2026-10-17 事故后新增） |
 | `switch.sh` | 切流量（nginx upstream weight + reload） | 骨架 + systemd TODO |
 | `rollback.sh` | 秒级切回蓝（weight=0 + 不停绿进程） | 骨架 + systemd TODO |
 | `down.sh` | 清理绿（systemctl stop + 可选 rm DB） | 骨架 + systemd TODO |
+
+## 端到端编排（`deploy_pipeline.sh`，2026-10-17 起）
+
+merge 之后**只需要这一条命令**：
+
+```bash
+bash scripts/blue_green/deploy_pipeline.sh <pr-num> <merge-sha>
+```
+
+它按固定顺序跑完 `acquire → 后台心跳 → up → verify → promote → switch green 100 → 观察窗 → release`，
+顺序写死在代码里、心跳由后台进程常驻、收锁由 `trap` 兜底 —— 会话侧不再需要「记住第几步」。
+
+| 选项 | 说明 |
+|------|------|
+| `--observe-min N` | 观察窗分钟数（默认 30；`0` 跳过）。窗口内每 5 分钟探 `:8080/` + `grep BLOCKED`，异常自动回滚蓝 |
+| `--skip-verify` | 跳过八项验证（仅限人工应急，会打 WARN） |
+| `--dry-run` | 只透传子脚本的 `--dry-run`，不 acquire / 不 release / 不碰流量 |
+| `--session NAME` | 锁归属标签（默认 `pipeline-<pr>`），审计可追溯 |
+| `--heartbeat-interval N` | 后台心跳间隔（默认 120s） |
+| `--sim-user` / `--sim-pass` | verify check 2 探针账号（缺省沿用 env，再缺省自动生成一次性密码） |
+
+退出码：`0` 成功 / `10` 锁被占 / `11` acquire 失败 / `20` up / `21` verify / `22` promote /
+`23` switch / `24` 观察窗异常（已回滚）/ `64` 参数错。
+
+**设计理由**：此前编排由 Prod Agent 会话读 SKILL.md 现场拼命令，2026-10-17 一天内撞出四类同型故障
+（switch 早于 promote 被 DRY_RUN 守卫拒 / verify 与 promote 期间无心跳导致锁被合法抢占 / 会话空回复终止
+让流量压在蓝 / 漏 release 使 `catchup` 永远 behind）。四者的共同根因是「步骤记忆」这个变量，本脚本把它消掉。
 
 ## 端口/路由约定
 
