@@ -24,8 +24,27 @@ import subprocess
 import threading
 from pathlib import Path
 
+import pytest
+
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
 SWITCH = SCRIPTS_DIR / "switch.sh"
+
+
+@pytest.fixture(autouse=True)
+def _pin_deploy_singleflight(monkeypatch, tmp_path):
+    """钉死部署单飞宿主态（Issue #81）。
+
+    本文件 live 调 `switch.sh`，而 PR #59 给 switch.sh 加了会话级锁守卫：
+    状态目录（默认 `/var/lib/dailycheck-deploy`）存在且 `deploy_state.py check`
+    判无锁 / 锁属他 PR 时 `exit 10` 拒跑。生产 VPS 上该目录随机制上线已存在
+    → 无锁时这 9 个 live 用例全红（dev/CI 无该目录 → 放行），且持锁时还会往
+    生产 `audit.log` 追加审计行（测试写生产状态）。
+
+    本文件只测 DRY_RUN 守卫（及 conf 核验 / 落点核验），锁守卫行为由
+    tests/test_blue_green_deploy_lock.py 专项覆盖。
+    """
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_STATE_DIR", str(tmp_path / "no-deploy-state"))
+    monkeypatch.setenv("DAILYCHECK_BG_LOCK_HELD", "1")
 
 # 单 upstream 新布局基准 conf（Issue #32 模板形态；green 初始 down）
 _CONF_BASE = """\
