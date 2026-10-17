@@ -320,6 +320,33 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 ---
 
+### 3.9 外部通知通道（企业微信群机器人，2026-10-16 起）
+
+站内通知（`notifications` 表 + 通知中心页，§10.3 的 fan-out）只覆盖登录用户——门店提交订货单后，DC 审批人未必正在看页面。本节补的是**系统第一条对外推送通道**：新订货单提交 → 企微工作群机器人，秒级提醒。
+
+**链路**：`blueprints/store_ordering.py::submit_order_route`（`sop.notify_order_event(...)` 站内 fan-out 之后）→ `_notify_wecom_new_order(order)` → `blueprints/wecom_notify_pure.py` → `urllib` POST 群机器人 webhook。**站内通知与对外推送互不依赖**：任一条链路失败都不回滚订单（订单已 commit），对外推送失败最多留一条 WARNING 日志。
+
+**组件**（`blueprints/wecom_notify_pure.py`，纯标准库 `urllib`，不引 `requests`）：
+
+- `build_store_order_markdown(order, item_count, total_qty, submitted_at, base_url)` —— 锁定模板：标题 + 单号 / 门店 / 品项 / 时间 + 单据链接，**不含金额**（订货金额属敏感信息，工作群不需要）。计数取订单行项目（`order["order_items"]`），取不到就**省略**「品项」行，不编造；时间容错解析（19 字符 / 16 字符 / ISO-T 三形态，见 §13.8），都解析不出就省略该行。门店标识与全站页面一致用 warehouse code（`order["store_name"]` 存在时优先用名称）。
+- `send_webhook_markdown(webhook_url, markdown, timeout=3, retries=1)` —— POST `{"msgtype":"markdown"}`，超时 3s；HTTP 异常 / 非 JSON 响应 / `errcode != 0`（key 失效、机器人被移出群等业务错）**均判失败**并重试 1 次（最多 2 次尝试）；返回 bool，**绝不抛异常**。
+- `notify_store_order_event(event_type, ...)` —— 事件 → 通道分发入口。`background=True`（默认）用 `threading.Thread(daemon=True)` 发送，**不阻塞下单请求**（webhook 慢 / 挂不影响用户提交）。
+- `mask_webhook_url()` —— 日志脱敏：保留 host + path，查询串一律打码成 `key=***`。**webhook 的 `key=` 就是密钥**，完整 URL 不得出现在任何日志 / 异常信息里（与 §3.5 的 `WEBHOOK_SECRET` 同一口径）。
+- **扩展位**：`WEBHOOK_EVENT_MAP` 一行一事件，v1 只登记 `store_order_submitted`。后续要推「审批通过 / 已发货」时加一行即可复用整条链路；未登记的事件在 `webhook_for_event()` 处返回空串 → 静默跳过（不报错）。
+
+**配置**（`config.py`，全部由服务器 env 注入，**不进 git**）：
+
+| env | 缺省 | 作用 |
+|-----|------|------|
+| `WECOM_STORE_ORDER_WEBHOOK` | 空串 | 群机器人地址；**空 = 功能关闭**（静默 return，不报错、不刷日志） |
+| `PUBLIC_BASE_URL` | `https://kjtang.cn` | 消息里「查看单据」链接的域名（群里点得开 = 公网域名，不能用 127.0.0.1） |
+
+**生产侧**：`WECOM_STORE_ORDER_WEBHOOK` 写 `/etc/dailycheck/app.env`（0600）后重启进程生效；群里「添加机器人」拿到的地址即用。**机器人被移出群 / key 轮换后旧地址失效**，此时推送失败只记 errcode（`wecom_notify_dropped`），无兜底重发队列（见 §14）。
+
+**测试**：`tests/test_wecom_notify_pure.py`（44 用例：模板字段与链接 / `base_url` 尾斜杠收敛 / 金额不出现 / 计数缺失即省略 / 时间三形态 / 空 webhook 不发送 / `errcode=0` 成功 / `errcode≠0` 失败 / 首败重试成功（2 次调用）/ HTTP·超时·非 JSON 各自 False 且不抛 / `retries=0` 仅一次 / `background=False` 直发一次 / `background=True` 走 daemon 线程 / 通道异常只记 WARNING / 日志不含 key / P0 无 emoji）+ `tests/test_wecom_notify_hook.py`（4 用例：提交点计数接线、后台语义、通道异常不外溢、空订单 no-op）。**全部用例 monkeypatch `urllib.request.urlopen`，不透网**；关键断言逐条经变异验证真 FAIL（去重试 / errcode 当成功 / 日志漏 key / 改同步发送 / `base_url` 不收敛尾斜杠 / 编造计数 / 不吞异常 各自对应测试 FAIL）。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态
@@ -588,6 +615,7 @@ flowchart TB
         ForecastPure["forecast_pure.py"]
         ProcurementPure["procurement_pure.py"]
         NotificationsPure["notifications_pure.py"]
+        WecomNotifyPure["wecom_notify_pure.py<br/>企微群机器人推送<br/>（对外通道，§3.9）"]
         PublishRecipePure["publish_recipe_pure.py"]
         ReportsHealthPure["reports_health_pure.py<br/>FIFO 账龄重放 / DOS / ABC / BOM 超耗"]
     end
@@ -625,6 +653,7 @@ flowchart LR
     Canonical --> CanonicalPure[canonical_pure.py]:::pure
     StoreOrdering[store_ordering.py]:::bp --> Shared
     StoreOrdering --> StoreOrderingPure[store_ordering_pure.py]:::pure
+    StoreOrdering --> WecomNotifyPure[wecom_notify_pure.py]:::pure
     StoreOrderingPure --> Procurement[procurement.py]:::bp
     StoreOrderingPure --> NotificationsPure[notifications_pure.py]:::pure
     StoreOrderingPure --> ProcurementPure[procurement_pure.py]:::pure
@@ -650,6 +679,7 @@ flowchart LR
 - 蓝图层可以调 **pure 层 + 其他蓝图层**（如 `recipe_cost` 调 `auth.audit()`）。
 - **pure 层不依赖 Flask 上下文**（不 import flask），便于测试和跨场景复用。
 - `store_ordering_pure` 是跨最多业务的纯模块（订货同时触发采购缓存重建 + 通知事件）。
+- `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
 
 ---
 
@@ -960,6 +990,8 @@ stateDiagram-v2
     end note
 ```
 
+**通知**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out（收件人按事件方向选 DC 审批人 / 门店用户，排除操作者自己）。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
+
 ### 10.4 Canonical 扇出流程
 
 ```mermaid
@@ -1104,9 +1136,11 @@ flowchart TB
 
 **权限精细化基线（2026-10-15，`feat/permission-granularity`，并流 main `9bb9d99` 后）**：14 failed / 928 passed（CI 口径；本地全量 16 failed / 1006 passed）。新增 `test_route_permission_matrix.py` 49 用例（A 覆盖 / B deny-allow / C 不变式）、`test_master_db_migrate.py` RBAC 迁移 +7 用例、`tests/conftest.py` 角色夹具（`manager_client` / `viewer_client` / `finance_client`）；并流后 `url_map` 实测 151 endpoint，Test A 双向断言无遗漏 / 无残留。失败集与 `known_failures.txt` 逐行一致，零新增，门禁 exit 0。
 
+**外部通知基线（2026-10-16，`feat/store-order-wecom-notify`，基于 `1aa9cbc`）**：14 failed / 1156 passed（CI 口径 `pytest tests/ --ignore=tests/mcp_server`，`--basetemp=/tmp/pytest-dc`）。失败集与 `known_failures.txt` 逐行一致（14/16，`mcp_server` 两条在该口径下不收集），`scripts/check_known_failures.py` exit 0，零新增。新增 `test_wecom_notify_pure.py` 44 用例 + `test_wecom_notify_hook.py` 4 用例，全部 **monkeypatch `urllib.request.urlopen`、不透网**，夹具 webhook 为运行期拼接的假地址（不含真实 key）。
+
 ⚠️ **基线数字必须写明口径**（两套数字不能混用）：
-- **CI 口径** = `pytest tests/ --ignore=tests/mcp_server`：14 failed / 928 passed。CI 以此为准，`known_failures.txt` 的 `mcp_server` 两行在 CI 里永不触发（属超集）。
-- **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：16 failed / 1006 passed。
+- **CI 口径** = `pytest tests/ --ignore=tests/mcp_server`：**以本文件最近一条基线为准**（2026-10-16：14 failed / 1156 passed）。CI 以此为准，`known_failures.txt` 的 `mcp_server` 两行在 CI 里永不触发（属超集）。
+- **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：失败数 = CI 口径 + 2（2026-10-15 实测 16 failed / 1006 passed；passed 数随新增用例变化，引用旧值须换算）。
 - 「零新增对比法」比对的是**失败集逐行**，不是 passed 总数；引用总数时必须带口径，否则跨环境对比会误判。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
@@ -1211,6 +1245,14 @@ with app.test_client() as c, c.session_transaction() as s:
 - 原因：app 不设 `logging.basicConfig`（只有 `mcp_server/main.py` 设 INFO）→ 生产 root logger 默认阈值 WARNING，**INFO 级拦截日志被静默吞掉**——2026-10-15 事故取证时被吞写清单只能靠实例 access log 反推
 - 约束：新增任何「必须留痕」的运维事件日志照此办理（WARNING + 可检索前缀），**不得**降级为 INFO/DEBUG
 
+### 13.10 外部通道的开关与密钥（2026-10-16 起，§3.9）
+
+- **env-only，不入仓库**：`WECOM_STORE_ORDER_WEBHOOK`（群机器人地址，含 `key=` = 密钥）与 `PUBLIC_BASE_URL`（消息链接域名）都由部署侧注入 `/etc/dailycheck/app.env`。仓库内缺省值为空串 / `https://kjtang.cn`，**任何真实 webhook 都不得出现在代码、测试夹具、文档、日志里**（同 §3.5 的 `WEBHOOK_SECRET` 口径）。
+- **空值 = 功能关闭，不是错误**：`webhook_for_event()` 返回空串时静默 return。dev / CI 没有该 env 是常态，若在缺配置时抛错或刷 WARNING，会把「未启用」误报成故障。
+- **日志只落脱敏 URL + errcode**：所有对外通道日志经 `mask_webhook_url()`，保留 host + path、查询串打码成 `key=***`。失败日志前缀可检索：`wecom_notify_attempt_failed` / `wecom_notify_dropped` / `wecom_notify_failed` / `wecom_notify_error`。
+- **`PUBLIC_BASE_URL` 必须是公网域名**：消息里的「查看单据」是给人点的，`127.0.0.1` / 内网地址在群里点不开；改部署布局（域名迁移）时同步改 env。
+- **开关粒度**：v1 是「一个事件一个 webhook」。要做多群 / 多事件时在 `WEBHOOK_EVENT_MAP` 登记新的 config 属性，不要在视图里写 `if 群A ... else 群B`。
+
 ---
 
 ## 14. pre-existing 风险清单
@@ -1229,6 +1271,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 侧边栏 `<h1>` 与模块标题同名 | 低 | pre-existing（2026-10-14 登记） | `base.html` 侧栏 `<h1>库存管理</h1>` 与「库存管理」模块标题重复；文案由 owner 定 |
 | `/production*` 页无侧栏 | 低 | pre-existing（2026-10-14 登记） | `templates/production/{products,runs,product_edit,session}.html` 把 `sidebar` block 覆盖为空 → 桌面端在这些页没有导航（只能靠返回/页内链接）。本次新增的「生产记录」入口沿用同布局。移动端不受影响（`mobile-nav` 未被覆盖） |
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
+| 企微推送无重发队列 / 无失败告警 | 低 | 已知限制（2026-10-16 登记，§3.9） | 对外通道失败只留 WARNING（`wecom_notify_dropped` + errcode），不阻塞下单、不回滚、不补发；机器人被移出群 / key 轮换后需人工更新 `/etc/dailycheck/app.env` 才恢复。通知 SLA 属商业化项，另立项 |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 
 ---

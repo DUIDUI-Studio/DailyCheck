@@ -5,6 +5,7 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §4 / §6.
 from __future__ import annotations
 
 import functools
+import logging
 import sqlite3
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
@@ -23,6 +24,7 @@ from flask import (
 )
 
 from blueprints import store_ordering_pure as sop
+from blueprints import wecom_notify_pure as wecom_notify
 from blueprints._helpers import parse_qty
 from db import get_master_db
 from permissions import (
@@ -34,6 +36,8 @@ from permissions import (
 )
 
 bp = Blueprint("store_ordering", __name__, url_prefix="/store-ordering")
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +389,25 @@ def clear_cart_route() -> str:
     return redirect(url_for("store_ordering.catalog"))
 
 
+def _notify_wecom_new_order(order: dict[str, Any] | None) -> None:
+    """新单提交 → 企微工作群（外部通道，v1 唯一事件）。
+
+    契约：**绝不影响下单事务**。企微不可达 / 未配置 / 内部异常都在这里
+    吞掉，最多留一条 WARNING；订单已经落库，通知失败不回滚、不报错。
+    计数取订单行项目（详情查询已带回），拿不到就让模板省略「品项」行。
+    """
+    try:
+        if not isinstance(order, dict) or not order:
+            return
+        item_count, total_qty = wecom_notify.order_item_counts(order)
+        wecom_notify.notify_store_order_submitted(
+            order, item_count=item_count, total_qty=total_qty,
+        )
+    except Exception:  # 兜底：外部通知异常不得冒泡到视图
+        order_no = order.get("order_no", "") if isinstance(order, dict) else ""
+        logger.warning("wecom_notify_hook_failed: order_no=%s", order_no, exc_info=True)
+
+
 @bp.route("/cart/submit", methods=["GET", "POST"])
 @require_permission("order.create")
 @_storefront_or_admin
@@ -432,6 +455,9 @@ def submit_order_route() -> str:
                     _date_input(expected_date), note or None,
                 )
                 sop.notify_order_event(master, sop.EVENT_ORDER_SUBMITTED, order, g.user["id"])
+                # 站内通知之后补一条对外通道（企微群）；后台线程发送，
+                # 失败不影响本次提交 —— 见 _notify_wecom_new_order。
+                _notify_wecom_new_order(order)
                 session.pop("store_ordering_dc", None)
                 flash(f"订单 {order['order_no']} 提交成功")
                 return redirect(url_for("store_ordering.order_detail", order_id=order["id"]))
