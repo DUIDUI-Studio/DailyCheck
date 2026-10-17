@@ -893,3 +893,29 @@ def test_main_loop_does_not_reprocess_when_idle(tmp_path: Path):
     warns = out.count("cannot read inbox")
     assert warns <= 2, f"主循环空跑：0.9s 内 {warns} 条 WARNING（gating 失效）\n{out}"
     assert warns >= 1, f"首轮未处理（用例失效）\n{out}"
+
+
+def test_triggered_log_survives_surrogate_values(tmp_path: Path, capsys):
+    """H-1-r3 反回归：`triggered:` 日志必须转义 `delivery_id` 之外的 inbox 字段。
+
+    `json.loads` 能把 inbox 行里的 `"\\ud800"` 解成孤立代理字符；修复前
+    `pr_number` / `pr_head_sha` 被**原样**插进 f-string → `print` 抛
+    UnicodeEncodeError → `process_once` 未返回、`state.save()` 永不执行 →
+    systemd `Restart=always` 每次崩在同一行。规则 7 的绝对口径必须真正覆盖
+    全部 inbox 字段，而不是只在 `delivery_id` 上做守卫。
+    ⚠️ 必须用 `capsys`：pytest 默认 fd 捕获 `errors="replace"` 会吞掉该异常。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _touch_cmd(marker))
+    cfg.inbox.write_text(
+        '{"delivery_id":"d-surr","action":"opened","repo_full_name":"'
+        + REPO
+        + '","pr_number":"\\ud800","pr_head_sha":"\\ud800"}\n',
+        encoding="utf-8",
+    )
+    state = trigger.TriggerState()
+    assert trigger.process_once(cfg, state) == 0  # 修复前此处抛 UnicodeEncodeError
+    out = capsys.readouterr().out
+    assert "triggered:" in out
+    assert "d-surr" in state.handled_ids
+    assert len(_read_marker(marker)) == 1

@@ -40,7 +40,9 @@
 #          JSONDecodeError / UnicodeDecodeError / json 对 >4300 位整数与 inbox 行
 #          解析的 ValueError）+ RecursionError（超深嵌套）；日志里一切来自状态文件
 #          或 inbox 的键值都必须过 `_short()`（孤立代理字符原样 print 会抛
-#          UnicodeEncodeError，那又是同一条崩溃路径）
+#          UnicodeEncodeError，那又是同一条崩溃路径）—— **`delivery_id` 之外的
+#          字段（`pr_number` / `pr_head_sha` / `repo_full_name` / `action` 等）
+#          同受本规则约束**，不得只在 id 字段上做转义
 #        · 损坏的条目绝不能被静默锁死 —— 归一化后只剩「立即重试」或「合法等待」
 #          两种归宿，两者都在 journal 有痕
 #      归一化只用 _sane_next / _normalize_failure / _str_set，上界存在状态对象上
@@ -529,8 +531,8 @@ def process_once(cfg: TriggerConfig, state: TriggerState) -> int:
             state.failures.pop(did, None)
             dirty = True
             _log(
-                f"triggered: delivery={did} pr=#{rec.get('pr_number')} "
-                f"action={action} head={str(rec.get('pr_head_sha', ''))[:8]}"
+                f"triggered: delivery={did} pr={_short(rec.get('pr_number'))} "
+                f"action={action} head={_short(rec.get('pr_head_sha', ''))[:8]}"
             )
         else:
             attempts = _attempts(fail) + 1

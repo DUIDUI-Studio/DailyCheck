@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -686,18 +687,18 @@ def test_delivery_id_lone_surrogate_is_bad_line(tmp_path: Path, capsys):
 
 
 def test_state_load_survives_surrogate_key(tmp_path: Path, capsys):
-    """第 2 轮 H-1（孪生侧防守）：状态里的**键**是孤立代理字符时不得崩溃。
+    """状态里的**键**是孤立代理字符时，归一化留痕本身不得崩溃。
 
-    inbox_watcher 侧目前不做归一化留痕（规则 7 由 Issue #51 承接，见
-    docs/ARCHITECTURE.md §3.5），故本用例只钉住「不抛异常」这一底线；一旦该侧
-    补上留痕，必须同时保证留痕值经 `!r` / `repr` 转义（否则 print 抛
-    UnicodeEncodeError 直穿 main()）。
+    规则 7（Issue #66 收口 #51）已在本侧落地：`{"failures": {"\\ud800": ...}}`
+    是合法 JSON，归一化会为该条目打 WARNING —— 留痕必须经 `_short()`（repr）
+    转义，否则 print 抛 UnicodeEncodeError 直穿 main() → Restart=always 崩溃循环。
     ⚠️ 必须用 `capsys`：pytest 默认 fd 捕获 `errors="replace"` 会吞掉该异常。
     """
     state_file = tmp_path / "state.json"
     state_file.write_text('{"failures":{"\\ud800":{"n":1}}}', encoding="utf-8")
-    st = inbox_watcher.WatcherState.load(state_file)
-    capsys.readouterr()
+    st = inbox_watcher.WatcherState.load(state_file)  # 修复前此处抛 UnicodeEncodeError
+    out = capsys.readouterr().out
+    assert "[inbox_watcher] WARNING: state 损坏" in out
     assert "\ud800" in st.failures
 
 
@@ -723,6 +724,419 @@ def test_parse_record_never_raises(tmp_path: Path, label: str, line: str):
     assert inbox_watcher.process_once(cfg, state) == 0  # 修复前此处抛异常
     assert _read_marker(marker) == []
     assert len(state.bad_hashes) == 1
+
+
+# ============================================================
+# 损坏状态：load() 边界归一化（唯一口径）+ 纵深防御（Issue #66 收口 #51）
+# ============================================================
+def _write_state(path: Path, failures: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "handled_ids": [],
+                "bad_hashes": [],
+                "failures": failures,
+                "updated_at_ms": int(time.time() * 1000),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_retry_due_condition(tmp_path: Path):
+    """退避到期的判定（主循环解除签名 gating 的依据，Issue #51 / #66）。"""
+    now = 1000.0
+    # 无失败条目 → 不驱动额外轮次（保住「无变化不空转」的原设计）
+    assert inbox_watcher.retry_due(inbox_watcher.WatcherState(), now) is False
+    # 退避未到期 → False
+    s = inbox_watcher.WatcherState()
+    s.failures["d-future"] = {"n": 1, "next": now + 60}
+    assert inbox_watcher.retry_due(s, now) is False
+    # 退避到期（含恰好等于 now 的边界）→ True
+    s.failures["d-due"] = {"n": 2, "next": now}
+    assert inbox_watcher.retry_due(s, now) is True
+    s.failures["d-due"]["next"] = now - 1
+    assert inbox_watcher.retry_due(s, now) is True
+    # 状态损坏（缺 key / 非数值 / 非 dict / 有限巨值）→ 保守视作到期，不崩不锁死
+    for bad in (
+        {"n": 1},
+        {"n": 1, "next": "not-a-number"},
+        "garbage",
+        {"n": 1, "next": 1e308},
+    ):
+        s = inbox_watcher.WatcherState()
+        s.failures["d-bad"] = bad  # type: ignore[assignment]
+        assert inbox_watcher.retry_due(s, now) is True, f"未按已到期处理：{bad!r}"
+
+
+def test_load_normalizes_corrupt_failure_entries(tmp_path: Path):
+    """load() 边界是唯一归一化点：8 类损坏形态全部被钳制为合法值。
+
+    这是 #51 连续 4 轮审核 FAIL 的根治姿势 —— 把归一化**上提**到状态入口一次性
+    完成，而不是在每个使用点逐形态补 except（后者会被审核者逐轮找出新形态）。
+    """
+    now = time.time()
+    state_file = tmp_path / "state.json"
+    _write_state(
+        state_file,
+        {
+            "d-str": {"n": 1, "next": "not-a-number"},
+            "d-none": {"n": 1, "next": None},
+            "d-nan": {"n": 1, "next": float("nan")},
+            "d-inf": {"n": 1, "next": float("inf")},
+            "d-neg": {"n": -5, "next": -1},
+            "d-overflow": {"n": 1, "next": 10**309},
+            "d-huge": {"n": 1, "next": 1e308},
+            "d-n-inf": {"n": float("inf"), "next": 0},
+            "d-notdict": "garbage",
+            "d-legit": {"n": 3, "next": now + 30},
+        },
+    )
+    st = inbox_watcher.WatcherState.load(state_file)
+
+    # 逐条断言归一结果（非 dict 值丢弃；除 d-legit 外 next 一律归 0.0 = 已到期，
+    # 而**仍然合法**的 n 必须原样保留 —— 归一化只钳制损坏字段，不得误伤合法字段）
+    assert st.failures == {
+        "d-str": {"n": 1, "next": 0.0},
+        "d-none": {"n": 1, "next": 0.0},
+        "d-nan": {"n": 1, "next": 0.0},
+        "d-inf": {"n": 1, "next": 0.0},
+        "d-neg": {"n": 0, "next": 0.0},  # 负次数归零、负时刻 → 已到期
+        "d-overflow": {"n": 1, "next": 0.0},  # 309 位整数：float() 抛 OverflowError
+        "d-huge": {"n": 1, "next": 0.0},  # 有限巨值：M-1「永久锁死」形态
+        "d-n-inf": {"n": 0, "next": 0.0},  # int(inf) 抛 OverflowError
+        "d-legit": {"n": 3, "next": now + 30},  # 合法条目原样保留（不得误伤）
+    }
+    assert inbox_watcher.retry_due(st, now) is True
+
+
+def test_huge_next_no_longer_locks_entry(tmp_path: Path):
+    """#51 第 5 轮 M-1 反回归：`next=1e308` 的条目不再被永久锁死。
+
+    修复前该形态被判为「有限值 = 合法」→ `retry_due()` 恒 False、条目永不重试、
+    无任何 WARNING（静默丢弃），与 `10**309` / `inf` 反而自愈的口径相矛盾。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    _write_state(cfg.state_file, {rec["delivery_id"]: {"n": 1, "next": 1e308}})
+
+    state = inbox_watcher.WatcherState.load(cfg.state_file)
+    assert state.failures[rec["delivery_id"]]["next"] == 0.0
+    assert inbox_watcher.retry_due(state) is True
+    assert inbox_watcher.process_once(cfg, state) == 0
+    assert len(_read_marker(marker)) == 1, "巨值 next 仍把条目锁死（M-1 回归）"
+    assert rec["delivery_id"] in state.handled_ids
+
+
+def test_sane_next_boundaries(tmp_path: Path):
+    """`_sane_next` 的边界语义钉死（下界含 0、上界含 now + sane_ahead，越界/非有限 → None）。"""
+    now = 1000.0
+    ahead = inbox_watcher.DEFAULT_SANE_AHEAD
+    assert ahead == inbox_watcher.DEFAULT_RETRY_MAX + inbox_watcher.RETRY_NEXT_CLOCK_SLACK_S
+    bound = now + ahead
+    assert inbox_watcher._sane_next(0, now) == 0.0  # 下界含 0（已到期）
+    assert inbox_watcher._sane_next(now - 1, now) == now - 1  # 过期时刻合法
+    assert inbox_watcher._sane_next(now + 60, now) == now + 60
+    assert inbox_watcher._sane_next(bound, now) == bound  # 上界含等号
+    for bad in (
+        None,
+        "x",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        10**309,
+        bound + 1,
+        -1,
+    ):
+        assert inbox_watcher._sane_next(bad, now) is None, f"未判损坏：{bad!r}"
+    # 上界可由配置推出（sane_ahead_for），不再是一个「7 天」式的宽常量
+    assert inbox_watcher.sane_ahead_for(60.0) == 360.0
+    assert inbox_watcher.sane_ahead_for(86400.0) == 86700.0
+    assert inbox_watcher.sane_ahead_for(0.0) == 360.0  # <=0 时退化为默认封顶
+
+
+def test_load_rejects_next_beyond_configured_cap(tmp_path: Path, capsys):
+    """Issue #51 上游审核 M-1 的**残余带**也要关掉：`next ∈ (now+retry_max, now+7d]`。"""
+    now = time.time()
+    state_file = tmp_path / "state.json"
+    _write_state(
+        state_file,
+        {
+            "d-lock-6d": {"n": 1, "next": now + 6 * 24 * 3600},  # 旧 7 天口径下被采信
+            "d-lock-3h": {"n": 1, "next": now + 3 * 3600},  # 旧 7 天口径下被采信
+            "d-legit": {"n": 2, "next": now + 90},  # 合法：≤ now + (60 + 300)
+        },
+    )
+    st = inbox_watcher.WatcherState.load(
+        state_file, sane_ahead=inbox_watcher.sane_ahead_for(60.0)
+    )
+    assert st.failures["d-lock-6d"]["next"] == 0.0
+    assert st.failures["d-lock-3h"]["next"] == 0.0
+    assert st.failures["d-legit"]["next"] == now + 90  # 合法条目不得误伤
+    out = capsys.readouterr().out
+    assert out.count("[inbox_watcher] WARNING: state 损坏") == 2
+    assert "d-legit" not in out
+    assert inbox_watcher.retry_due(st) is True
+
+
+def test_load_warns_on_normalization_and_silent_on_legit(tmp_path: Path, capsys):
+    """归一化必须留痕（M-1：只修「永久锁死」不修「无 WARNING」= 静默丢弃缩量保留）。"""
+    state_file = tmp_path / "state.json"
+    now = time.time()
+    _write_state(
+        state_file,
+        {
+            "d-huge": {"n": 1, "next": 1e308},  # 钳制形态
+            "d-notdict": "garbage",  # 丢弃形态
+            "d-ok": {"n": 3, "next": now + 30},  # 合法：不得打扰
+        },
+    )
+    st = inbox_watcher.WatcherState.load(state_file)
+    out = capsys.readouterr().out
+    warn_lines = [ln for ln in out.splitlines() if ln.startswith("[inbox_watcher]")]
+    assert len(warn_lines) == 2, f"留痕条数不符（应恰为 2 条钳制/丢弃）：\n{out}"
+    assert all("WARNING: state 损坏" in ln for ln in warn_lines), out
+    assert "d-huge" in out and "d-notdict" in out and "d-ok" not in out
+    assert st.failures["d-ok"] == {"n": 3, "next": now + 30}
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("failures", [{"n": 1, "next": 0.0}]),
+        ("failures", "oops"),
+        ("handled_ids", "d1"),
+        ("handled_ids", {"d1": True}),
+        ("bad_hashes", {"h": 1}),
+    ],
+)
+def test_load_warns_on_container_level_damage(
+    tmp_path: Path, field: str, bad_value: object, capsys
+):
+    """容器级损坏（`failures`/`handled_ids`/`bad_hashes` 形状不对）也必须留痕。
+
+    静默降级有真实副作用：`handled_ids` 形状损坏 → 去重集无声清空 → 同一 delivery
+    被**重复触发**；`failures` 形状损坏 → 整张退避表无声丢失（全部立即重试）。
+    """
+    state_file = tmp_path / "state.json"
+    payload: dict = {"failures": {}, "handled_ids": ["h1"], "bad_hashes": ["b1"]}
+    payload[field] = bad_value
+    state_file.write_text(json.dumps(payload), encoding="utf-8")
+    st = inbox_watcher.WatcherState.load(state_file)
+    out = capsys.readouterr().out
+    assert "[inbox_watcher] WARNING: state 损坏" in out, (
+        f"容器级损坏静默：{field}={bad_value!r}"
+    )
+    assert field in out, out
+    assert st.failures == {} or field == "failures"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"failures": {}, "handled_ids": ["d1", 7, None]},
+        {"failures": {}, "bad_hashes": ["h1", {"x": 1}]},
+    ],
+)
+def test_load_warns_on_non_string_items_in_sets(
+    tmp_path: Path, payload: dict, capsys
+):
+    """集合内混入非字符串元素 → 丢弃并留痕（`handled_ids` 静默丢弃 = 重复触发）。"""
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(payload), encoding="utf-8")
+    st = inbox_watcher.WatcherState.load(state_file)
+    out = capsys.readouterr().out
+    assert "[inbox_watcher] WARNING: state 损坏" in out
+    assert "非字符串元素" in out
+    assert st.handled_ids == {"d1"} or st.bad_hashes == {"h1"}
+
+
+@pytest.mark.parametrize(
+    ("raw_n", "expect"),
+    [(0, 0), (1, 1), (1023, 1023), (1024, 1024), (1025, 0), (10**6, 0), (-1, 0)],
+)
+def test_normalize_failure_attempts_boundary(tmp_path: Path, raw_n: int, expect: int):
+    """`n` 的上下界钉死：`[0, MAX_SANE_ATTEMPTS]` 保留，越界归 0。"""
+    now = time.time()
+    entry = {"n": raw_n, "next": now + 10}
+    fixed = inbox_watcher._normalize_failure(
+        entry, now, inbox_watcher.DEFAULT_SANE_AHEAD
+    )
+    assert fixed["n"] == expect, f"n={raw_n} → {fixed!r}"
+    assert inbox_watcher._attempts({"n": raw_n, "next": 0}) == expect
+    assert fixed["next"] == now + 10  # 合法 next 不得被连带改动
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"n": "not-a-number", "next": "not-a-number"},
+        {"n": "bad", "next": None},
+        {"n": 0, "next": float("nan")},
+        {"n": 1, "next": float("inf")},
+        {"n": 1, "next": float("-inf")},
+        {"n": 1, "next": 10**309},
+        {"n": float("inf"), "next": 0},
+        {"n": -5, "next": 0.0},
+        {"n": 1, "next": 1e308},
+        {"n": 1, "next": 1e18},
+        "garbage",
+    ],
+)
+def test_corrupted_failure_entry_self_heals_without_crash(
+    tmp_path: Path, bad: object
+):
+    """损坏 `next` / `n`（但 JSON 合法）→ 不崩 + 一轮自愈。
+
+    修复前 `process_once` 里 `float(fail.get("next", 0))` 无兜底 → ValueError 直穿
+    main()（只捕 KeyboardInterrupt）→ systemd `Restart=always` 崩溃循环。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    state = inbox_watcher.WatcherState()
+    state.failures[rec["delivery_id"]] = bad  # type: ignore[assignment]
+
+    assert inbox_watcher.retry_due(state) is True
+    assert inbox_watcher.process_once(cfg, state) == 0  # 修复前此处抛异常
+    assert rec["delivery_id"] in state.handled_ids
+    assert rec["delivery_id"] not in state.failures
+    assert len(_read_marker(marker)) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_n", ["bad", -5, None, float("inf"), float("-inf"), float("nan")]
+)
+def test_corrupted_failure_entry_rewritten_on_repeat_failure(
+    tmp_path: Path, bad_n: object
+):
+    """损坏条目 + 触发仍失败 → next / n 被重写成合法值（不永久损坏）。"""
+    cfg = _cfg(tmp_path, ["/bin/sh", "-c", "exit 1"], retry_base=3600.0)
+    rec = _event()
+    _append_lines(cfg.inbox, [rec])
+    state = inbox_watcher.WatcherState()
+    state.failures[rec["delivery_id"]] = {"n": bad_n, "next": None}
+
+    assert inbox_watcher.process_once(cfg, state) == 1
+    entry = state.failures[rec["delivery_id"]]
+    assert entry["n"] == 1, f"损坏计数未归零重算：{entry!r}"
+    assert isinstance(entry["next"], float)
+    assert inbox_watcher.retry_due(state, now=time.time()) is False
+
+
+def test_retry_delay_survives_huge_attempts(tmp_path: Path):
+    """异常大的 attempts 不得崩溃或挂死 —— 一律封顶（Issue #66 复现项）。
+
+    旧实现 `base * 2 ** (attempts - 1)` 对 `attempts=10**18` 实测挂死 >8s、
+    `int(1e300)` 挂死 >5 分钟。
+    """
+    cfg = _cfg(tmp_path, ["/bin/sh", "-c", "true"], retry_base=2.0, retry_max=60.0)
+    assert inbox_watcher._retry_delay(cfg, 1) == 2.0
+    assert inbox_watcher._retry_delay(cfg, 3) == 8.0  # 与 base*2^(n-1) 等价
+    assert inbox_watcher._retry_delay(cfg, 7) == 60.0  # 已封顶
+    assert inbox_watcher._retry_delay(cfg, 1000) == 60.0
+    started = time.monotonic()
+    assert inbox_watcher._retry_delay(cfg, 10**6) == 60.0  # 旧式在此抛 OverflowError
+    assert inbox_watcher._retry_delay(cfg, 10**18) == 60.0  # 旧式在此挂死 >8s
+    assert inbox_watcher._retry_delay(cfg, int(1e300)) == 60.0  # 旧式挂死 >5min
+    assert time.monotonic() - started < 1.0, "退避计算不得退化成长时间挂死"
+    zero = _cfg(tmp_path, ["/bin/sh", "-c", "true"], retry_base=0.0)
+    assert inbox_watcher._retry_delay(zero, 5) == 0.0
+
+
+def test_failure_retries_after_backoff_with_no_new_inbox_lines(tmp_path: Path):
+    """Issue #51 核心回归：触发失败 + inbox **无任何新行** → 退避到期必须自动重试。
+
+    修复前主循环只在文件签名变化时 process_once，而重试不写 inbox（签名不变）
+    → 退避条目永不重试，本用例会一直等到 deadline 后失败。
+    """
+    script = (
+        Path(__file__).resolve().parent.parent
+        / "scripts"
+        / "prod_agent"
+        / "inbox_watcher.py"
+    )
+    inbox = tmp_path / "inbox.jsonl"
+    inbox.write_text("", encoding="utf-8")
+    marker = tmp_path / "marker.txt"
+    counter = tmp_path / "attempts.txt"
+    body = (
+        f"n=$(cat {shlex.quote(str(counter))} 2>/dev/null || echo 0); "
+        f"n=$((n+1)); echo $n > {shlex.quote(str(counter))}; "
+        f'if [ "$n" -lt 2 ]; then exit 1; fi; '
+        f"cat >> {shlex.quote(str(marker))}; printf '\\n' >> {shlex.quote(str(marker))}"
+    )
+    rec = _event()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "--inbox",
+            str(inbox),
+            "--state-file",
+            str(tmp_path / "state.json"),
+            "--trigger-cmd",
+            f"/bin/sh -c {shlex.quote(body)}",
+            "--poll-interval",
+            "0.05",
+            "--retry-base",
+            "0.3",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        time.sleep(0.5)  # 首扫（空 inbox）
+        t0 = time.monotonic()
+        with inbox.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        deadline = t0 + 5.0
+        while time.monotonic() < deadline and not _read_marker(marker):
+            time.sleep(0.05)
+        elapsed = time.monotonic() - t0
+        # 关键：这 5 秒内 inbox 未再追加任何行，重试只能由 retry_due() 驱动
+        assert len(inbox.read_text(encoding="utf-8").splitlines()) == 1
+        assert _read_marker(marker), "退避后的重试未发生（Issue #51 回归）"
+        assert elapsed >= 0.25, f"未走退避（elapsed={elapsed:.2f}s）"
+        assert counter.read_text(encoding="utf-8").strip() == "2"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_triggered_log_survives_surrogate_values(tmp_path: Path, capsys):
+    """规则 7 的「一切 inbox 键值进日志前必须转义」也必须覆盖 `delivery_id` 之外的字段。
+
+    审核 H-1-r3：`json.loads` 能把 inbox 行里的 `"\\ud800"` 解成孤立代理字符；
+    修复前 `triggered:` 日志把 `pr_number` / `pr_head_sha` **原样**插 f-string →
+    `print` 抛 UnicodeEncodeError → `process_once` 未返回、`state.save()` 永不执行
+    → systemd `Restart=always` 每次崩在同一行（该行已进 handled 前就崩，故永不跳过）。
+    ⚠️ 必须用 `capsys`：pytest 默认 fd 捕获 `errors="replace"` 会吞掉该异常。
+    """
+    marker = tmp_path / "marker.txt"
+    cfg = _cfg(tmp_path, _cat_cmd(marker))
+    cfg.inbox.write_text(
+        '{"delivery_id":"d-surr","action":"opened","repo_full_name":"'
+        + REPO
+        + '","pr_number":"\\ud800","pr_head_sha":"\\ud800"}\n',
+        encoding="utf-8",
+    )
+    state = inbox_watcher.WatcherState()
+    assert inbox_watcher.process_once(cfg, state) == 0  # 修复前此处抛 UnicodeEncodeError
+    out = capsys.readouterr().out
+    assert "triggered:" in out
+    assert "d-surr" in state.handled_ids
+    assert len(_read_marker(marker)) == 1
 
 
 if __name__ == "__main__":
