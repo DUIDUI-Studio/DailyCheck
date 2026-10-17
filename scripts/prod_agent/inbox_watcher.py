@@ -173,10 +173,12 @@ def _str_set(value: object, field: str) -> set[str]:
         _warn(f"state 损坏: {field} 不是列表（{_short(value)}）→ 该集合按空处理")
         return set()
     items = {x for x in value if isinstance(x, str)}
-    dropped = len(value) - len(items)
-    if dropped:
+    # 只统计**真正非字符串**的元素（去重导致的减少不算「损坏」，
+    # 否则 ["d1","d1","d1"] 会被误报成「含 2 个非字符串元素」）
+    non_str = sum(1 for x in value if not isinstance(x, str))
+    if non_str:
         _warn(
-            f"state 损坏: {field} 含 {dropped} 个非字符串元素 → 丢弃"
+            f"state 损坏: {field} 含 {non_str} 个非字符串元素 → 丢弃"
             f"（保留 {len(items)} 条）"
         )
     return items

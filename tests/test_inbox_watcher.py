@@ -139,7 +139,7 @@ def test_read_complete_lines_u2028_not_split(tmp_path: Path):
 # ============================================================
 # watcher — 触发 / 过滤 / 去重
 # ============================================================
-def test_triggers_on_new_complete_line_and_passthrough(tmp_path: Path):
+def test_triggers_on_new_complete_line_and_passthrough(tmp_path: Path, capsys):
     marker = tmp_path / "marker.txt"
     cfg = _cfg(tmp_path, _cat_cmd(marker))
     rec = _event()
@@ -153,6 +153,9 @@ def test_triggers_on_new_complete_line_and_passthrough(tmp_path: Path):
     # 原样透传：stdin 收到的 JSON 与 inbox 行等价
     assert json.loads(got[0])["delivery_id"] == rec["delivery_id"]
     assert state.handled_ids == {rec["delivery_id"]}
+    # L-1-r4b：head 必须先切 8 位再过 repr —— 钉住「8 位有效短 sha + 引号」口径，
+    # 防止回退成 `_short(...)[:8]`（只剩 7 位 + 前导引号）
+    assert "head='deadbeef'" in capsys.readouterr().out
 
 
 def test_half_line_waits_until_completed(tmp_path: Path):
@@ -954,6 +957,16 @@ def test_load_warns_on_non_string_items_in_sets(
     assert "[inbox_watcher] WARNING: state 损坏" in out
     assert "非字符串元素" in out
     assert st.handled_ids == {"d1"} or st.bad_hashes == {"h1"}
+
+
+def test_str_set_duplicates_not_reported_as_damage(tmp_path: Path, capsys):
+    """集合字段里的重复项不算损坏（L-1-r3 残留）：去重是正常语义，不得误报。"""
+    state_file = tmp_path / "state.json"
+    state_file.write_text('{"handled_ids":["d1","d1","d1"]}', encoding="utf-8")
+    st = inbox_watcher.WatcherState.load(state_file)
+    out = capsys.readouterr().out
+    assert "非字符串元素" not in out, f"重复项被误报为损坏：{out}"
+    assert st.handled_ids == {"d1"}
 
 
 @pytest.mark.parametrize(

@@ -109,7 +109,7 @@ def _cfg(tmp_path: Path, trigger_cmd: list[str], **kw) -> trigger.TriggerConfig:
 # ============================================================
 # 触发 / 过滤 / 去重
 # ============================================================
-def test_triggers_on_new_complete_line(tmp_path: Path):
+def test_triggers_on_new_complete_line(tmp_path: Path, capsys):
     marker = tmp_path / "marker.txt"
     cfg = _cfg(tmp_path, _touch_cmd(marker))
     rec = _event()
@@ -119,6 +119,9 @@ def test_triggers_on_new_complete_line(tmp_path: Path):
     assert trigger.process_once(cfg, state) == 0
     assert len(_read_marker(marker)) == 1
     assert state.handled_ids == {rec["delivery_id"]}
+    # L-1-r4b：head 必须先切 8 位再过 repr —— 钉住「8 位有效短 sha + 引号」口径，
+    # 防止回退成 `_short(...)[:8]`（只剩 7 位 + 前导引号）
+    assert "head='deadbeef'" in capsys.readouterr().out
 
 
 def test_half_line_waits_until_completed(tmp_path: Path):
@@ -717,6 +720,16 @@ def test_load_survives_json_layer_damage(tmp_path: Path, label: str, payload: by
         assert isinstance(entry["next"], float)
     assert trigger.retry_due(st) in (True, False)  # 可调用、不崩
     assert "WARNING" in capsys.readouterr().out or not st.failures, label
+
+
+def test_str_set_duplicates_not_reported_as_damage(tmp_path: Path, capsys):
+    """集合字段里的重复项不算损坏（L-1-r3 残留）：去重是正常语义，不得误报。"""
+    state_file = tmp_path / "state.json"
+    state_file.write_text('{"handled_ids":["d1","d1","d1"]}', encoding="utf-8")
+    st = trigger.TriggerState.load(state_file)
+    out = capsys.readouterr().out
+    assert "非字符串元素" not in out, f"重复项被误报为损坏：{out}"
+    assert st.handled_ids == {"d1"}
 
 
 @pytest.mark.parametrize(
