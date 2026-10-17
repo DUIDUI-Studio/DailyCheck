@@ -1204,6 +1204,14 @@ stateDiagram-v2
 
 **通知**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out（收件人按事件方向选 DC 审批人 / 门店用户，排除操作者自己）。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
 
+**未提交选择的草稿（2026-10-17，Issue #100）**：catalog 页的品类 chip 与搜索框都是**整页 GET 跳转**，而弹窗确认的数量原先只活在当页 DOM 的 hidden input 里，一换筛选就重建清零。现在按 `dc.catalogDraft.v1:<user_id>:<warehouse_code>` 落 localStorage（7 天过期），**只存 canonical_id → 数量 / 单位名 / 单位档位**，不存整页快照：被筛选隐藏的项留在草稿里等下次露面，当前可见项由服务端重新渲染后再回填。选 localStorage 而非服务端 session，是因为弹窗「确认」是纯前端动作，走 session 得为每次点击加一次往返请求。三个收口点必须联动，缺一个就变静默漏单：
+
+1. **弹窗确认** → 写/删对应条目 + 回填卡片；
+2. **「加入购物车」submit** → 把草稿里**未在当前页渲染**的条目追加成 hidden input 一并提交（`cart_add_batch` 校验三组等长，追加时须同步 `selected[]`/`qty[]`/`unit[]`）。否则「A 品类填完 → 切到 B 品类 → 提交」只会提交 B；
+3. **购物车页渲染时清空该 dc 的草稿** —— 批次加购已把草稿整体消费，不清的话从 bfcache 回退到 catalog 会拿旧 DOM 重复加购（`add_cart_item` 是**累加**语义）。
+
+「清空选择」按钮同时清草稿；`pageshow(persisted)` 时按草稿重新同步一次卡片，修复 bfcache 的陈旧 DOM。附带修复：卡片 `unit[]` 存的是中文单位名（后端契约），弹窗单位 pill 的回填改读 `data-saved-unit` 的 `base`/`aux` 档位——原先直接读 `unit[]`，导致重复编辑同一张卡片时两个 pill 都不高亮、点「确认」静默无响应。
+
 ### 10.4 Canonical 扇出流程
 
 ```mermaid

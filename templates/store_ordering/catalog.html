@@ -48,6 +48,12 @@
   </div>
   {% endif %}
 
+  {# Draft bar: selections persist across category/search reloads (localStorage),
+     so the count may include items hidden by the current filter. #}
+  <div id="catalog-draft-bar" class="calc-hint" style="margin:0 0 10px" hidden>
+    已填 <strong id="catalog-draft-count">0</strong> 项（含其他品类筛选下的选择），点「加入购物车」会一并提交。
+  </div>
+
   {# Batch-add-to-cart form. Each card ships 3 hidden inputs (selected[]/qty[]/unit[]); the JS fills qty/unit when the user confirms the modal. #}
   <form method="post" action="{{ url_for('store_ordering.cart_add_batch') }}" id="catalog-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -158,6 +164,126 @@
   var _currentId = null, _currentUnit = null, _currentAuxUnit = null,
       _currentAuxRate = 0, _currentUnitPrice = 0, _currentStock = 0, _currentSuggested = 0;
 
+  // ---- Draft store ------------------------------------------------------
+  // Selections live in localStorage keyed by (user, delivery centre) so they
+  // survive the full page reload caused by a category chip or search submit.
+  // Only canonical_ids are stored, so items hidden by the current filter stay
+  // in the draft until they are added to the cart or explicitly cleared.
+  var DRAFT_PREFIX = 'dc.catalogDraft.v1:';
+  var DRAFT_SCOPE = {{ ((g.user['id'] | string) ~ ':' ~ (selected_dc or '')) | tojson }};
+  var DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  var DRAFT_KEY = DRAFT_PREFIX + DRAFT_SCOPE;
+
+  function readDraft() {
+    try {
+      var raw = window.localStorage.getItem(DRAFT_KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return {};
+      if (typeof parsed.ts === 'number' && (Date.now() - parsed.ts) > DRAFT_TTL_MS) {
+        window.localStorage.removeItem(DRAFT_KEY);
+        return {};
+      }
+      var items = parsed.items;
+      return (items && typeof items === 'object') ? items : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function writeDraft(items) {
+    try {
+      if (!items || !Object.keys(items).length) {
+        window.localStorage.removeItem(DRAFT_KEY);
+        return;
+      }
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ ts: Date.now(), items: items }));
+    } catch (e) {
+      // Quota / private mode: the draft is best-effort, never block ordering.
+    }
+  }
+
+  function setDraftEntry(id, qty, pillKey, unitName) {
+    var items = readDraft();
+    items[String(id)] = { q: qty, u: pillKey, n: unitName || '' };
+    writeDraft(items);
+  }
+
+  function removeDraftEntry(id) {
+    var items = readDraft();
+    if (Object.prototype.hasOwnProperty.call(items, String(id))) {
+      delete items[String(id)];
+      writeDraft(items);
+    }
+  }
+
+  function updateDraftBar() {
+    var bar = document.getElementById('catalog-draft-bar');
+    var cnt = document.getElementById('catalog-draft-count');
+    if (!bar || !cnt) return;
+    var n = Object.keys(readDraft()).length;
+    if (n > 0) {
+      cnt.textContent = n;
+      bar.removeAttribute('hidden');
+    } else {
+      bar.setAttribute('hidden', '');
+    }
+  }
+
+  function findCard(id) {
+    var cards = document.querySelectorAll('.inv-card[data-canonical-id]');
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].getAttribute('data-canonical-id') === String(id)) return cards[i];
+    }
+    return null;
+  }
+
+  function clearCardSelection(card) {
+    var qtyInput = card.querySelector('[data-input-qty]');
+    var unitInput = card.querySelector('[data-input-unit]');
+    var display = card.querySelector('[data-display-qty]');
+    if (qtyInput) qtyInput.value = '';
+    if (unitInput) unitInput.value = '';  // cleared; backend defaults to canonical unit
+    card.removeAttribute('data-saved-qty');
+    card.removeAttribute('data-saved-unit');
+    card.classList.remove('card--filled');
+    if (display) display.textContent = '—';
+  }
+
+  // Paint a selection onto its card. unit[] carries the human-readable unit
+  // name (backend contract) while data-saved-unit keeps the base/aux pill key.
+  function applyCardSelection(card, qty, pillKey, unitName) {
+    var n = parseFloat(qty);
+    if (qty === '' || isNaN(n) || n <= 0) {
+      clearCardSelection(card);
+      return;
+    }
+    var qtyInput = card.querySelector('[data-input-qty]');
+    var unitInput = card.querySelector('[data-input-unit]');
+    var display = card.querySelector('[data-display-qty]');
+    if (qtyInput) qtyInput.value = qty;
+    if (unitInput) unitInput.value = unitName || '';
+    card.setAttribute('data-saved-qty', qty);
+    card.setAttribute('data-saved-unit', pillKey || 'base');
+    card.classList.add('card--filled');
+    if (display) display.textContent = qty + ' ' + (unitName || '');
+  }
+
+  // Idempotent: wipe every visible card, then re-apply whatever the draft holds.
+  function restoreDraft() {
+    var cards = document.querySelectorAll('.inv-card[data-canonical-id]');
+    for (var i = 0; i < cards.length; i++) clearCardSelection(cards[i]);
+    var draft = readDraft();
+    var ids = Object.keys(draft);
+    for (var j = 0; j < ids.length; j++) {
+      var card = findCard(ids[j]);
+      if (!card) continue;  // hidden by the current filter — keep it in the draft
+      var e = draft[ids[j]] || {};
+      applyCardSelection(card, e.q || '', e.u || 'base', e.n || '');
+    }
+    updateDraftBar();
+  }
+
   function setActiveCmPill(u) {
     var btns = document.querySelectorAll('#cm-pills .pill');
     for (var i = 0; i < btns.length; i++) {
@@ -203,13 +329,13 @@
       cmPillAux.style.display = 'none';
     }
 
-    // restore from previous edit
-    var qtyInput = el.querySelector('[data-input-qty]');
-    var unitInput = el.querySelector('[data-input-unit]');
-    var savedUnit = unitInput ? unitInput.value : 'base';
-    setActiveCmPill(savedUnit);
+    // restore from previous edit: the pill key lives in data-saved-unit because
+    // unit[] holds the human-readable unit name (e.g. "箱"), not base/aux.
+    var savedPill = el.getAttribute('data-saved-unit') || 'base';
+    if (savedPill === 'aux' && cmPillAux.style.display === 'none') savedPill = 'base';
+    setActiveCmPill(savedPill);
 
-    var savedQty = qtyInput && qtyInput.value ? qtyInput.value : '';
+    var savedQty = el.getAttribute('data-saved-qty') || '';
     cmQty.value = savedQty;
     updateCatalogAmount();
     modalOverlay.removeAttribute('hidden');
@@ -255,47 +381,64 @@
     if (!activePill) return;
     var u = activePill.getAttribute('data-u');
 
-    var card = document.querySelector('.inv-card[data-canonical-id="' + _currentId + '"]');
+    var card = findCard(_currentId);
     if (!card) { closeCatalogModal(); return; }
 
-    var qtyInput = card.querySelector('[data-input-qty]');
-    var unitInput = card.querySelector('[data-input-unit]');
-    if (qtyInput) qtyInput.value = v;
     // Store the actual unit name (e.g. "件" / "箱"), not the "base"/"aux"
     // pill key, so the unit column shows the right thing downstream.
-    if (unitInput) unitInput.value = (u === 'aux') ? (_currentAuxUnit || '') : (_currentUnit || '');
-
-    card.setAttribute('data-saved-qty', v);
-    card.setAttribute('data-saved-unit', u);
-
-    var display = card.querySelector('[data-display-qty]');
+    var labelUnit = (u === 'aux') ? (_currentAuxUnit || '') : (_currentUnit || '');
     var n = parseFloat(v);
-    if (v && !isNaN(n) && n > 0) {
-      card.classList.add('card--filled');
-      var labelUnit = (u === 'aux') ? _currentAuxUnit : _currentUnit;
-      display.textContent = v + ' ' + (labelUnit || '');
+    if (v !== '' && !isNaN(n) && n > 0) {
+      applyCardSelection(card, v, u, labelUnit);
+      setDraftEntry(_currentId, v, u, labelUnit);
     } else {
-      card.classList.remove('card--filled');
-      display.textContent = '—';
+      clearCardSelection(card);
+      removeDraftEntry(_currentId);
     }
+    updateDraftBar();
     closeCatalogModal();
   };
 
   window.resetCatalogForm = function () {
-    var cards = document.querySelectorAll('.inv-card');
-    for (var i = 0; i < cards.length; i++) {
-      var card = cards[i];
-      var qi = card.querySelector('[data-input-qty]');
-      var ui = card.querySelector('[data-input-unit]');
-      if (qi) qi.value = '';
-      if (ui) ui.value = '';  // cleared; backend defaults to canonical unit
-      card.removeAttribute('data-saved-qty');
-      card.removeAttribute('data-saved-unit');
-      card.classList.remove('card--filled');
-      var d = card.querySelector('[data-display-qty]');
-      if (d) d.textContent = '—';
-    }
+    var cards = document.querySelectorAll('.inv-card[data-canonical-id]');
+    for (var i = 0; i < cards.length; i++) clearCardSelection(cards[i]);
+    writeDraft({});  // drops the localStorage key entirely
+    updateDraftBar();
   };
+
+  // Items filled under another category filter ride along with this submit,
+  // otherwise they would sit in the draft and silently miss the cart.
+  function appendHidden(form, name, value) {
+    var input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+
+  var catalogForm = document.getElementById('catalog-form');
+  if (catalogForm) {
+    catalogForm.addEventListener('submit', function () {
+      var draft = readDraft();
+      var ids = Object.keys(draft);
+      for (var i = 0; i < ids.length; i++) {
+        if (findCard(ids[i])) continue;  // already rendered into this form
+        var e = draft[ids[i]] || {};
+        if (!e.q) continue;
+        appendHidden(catalogForm, 'selected[]', ids[i]);
+        appendHidden(catalogForm, 'qty[]', e.q);
+        appendHidden(catalogForm, 'unit[]', e.n || 'base');
+      }
+    });
+  }
+
+  // The cart page clears the draft once it consumes it; re-sync when the user
+  // navigates back here through the bfcache so stale cards don't re-submit.
+  window.addEventListener('pageshow', function (ev) {
+    if (ev.persisted) restoreDraft();
+  });
+
+  restoreDraft();
 })();
 </script>
 {% endblock %}

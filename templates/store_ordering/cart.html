@@ -62,4 +62,18 @@
 {% else %}
 <p class="empty">购物车为空</p>
 {% endif %}
+
+<script>
+(function () {
+  // The batch-add form consumed every filled card (including ones picked under
+  // another category filter), so the catalog draft is spent. Key mirrors
+  // templates/store_ordering/catalog.html.
+  try {
+    window.localStorage.removeItem(
+      'dc.catalogDraft.v1:' +
+      {{ ((g.user['id'] | string) ~ ':' ~ (dc_code or '')) | tojson }}
+    );
+  } catch (e) { /* private mode / quota: nothing to clear */ }
+})();
+</script>
 {% endblock %}
