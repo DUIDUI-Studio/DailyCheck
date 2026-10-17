@@ -148,12 +148,13 @@ def render_ops_block(
     token_rows: list[dict],
     fetched_at: str = "",
     unavailable: list[str] | None = None,
+    pr_data_ok: bool = True,
 ) -> str:
     """返回整段运维区块 HTML（KPI 条 + 瀑布 + token + 验证矩阵 + 归因）。"""
     unavailable = unavailable or []
     pr_by_num = {int(p["number"]): p for p in prs if p.get("number") is not None}
 
-    kpi_html = _render_kpis(events, prs, token_rows)
+    kpi_html = _render_kpis(events, prs, token_rows, pr_data_ok=pr_data_ok)
     body_parts: list[str] = []
 
     if events:
@@ -182,7 +183,9 @@ def render_ops_block(
 
 
 # ------------------------------------------------------------ KPI
-def _render_kpis(events: list[dict], prs: list[dict], token_rows: list[dict]) -> str:
+def _render_kpis(
+    events: list[dict], prs: list[dict], token_rows: list[dict], *, pr_data_ok: bool = True
+) -> str:
     # 与 db._now_iso() 同口径：用进程本地时区判「今天」（prod 进程 = CST+8）
     today = time.strftime("%Y-%m-%d")
     cutoff = time.time() - 7 * 86400
@@ -217,10 +220,18 @@ def _render_kpis(events: list[dict], prs: list[dict], token_rows: list[dict]) ->
             f'<div class="ok" style="color:var(--t3)">{_esc(sub)}</div></div>'
         )
 
+    # 拉不到 PR 列表 ≠ 今天没合并 —— 前者显示「—」，后者才是 0
+    if pr_data_ok:
+        c_merged = card(str(merged_today), "个", "今日合并 PR", f"近 7 天样本 {len(cycles)} 个")
+        c_cycle = card(_fmt_sec(median_cycle), "", "交付周期（中位）", "创建 → 合并")
+    else:
+        c_merged = card("—", "", "今日合并 PR", "GitHub 拉取失败", "hot")
+        c_cycle = card("—", "", "交付周期（中位）", "GitHub 拉取失败", "hot")
+
     return (
         '<div class="ops-kpis">'
-        + card(str(merged_today), "个", "今日合并 PR", f"近 7 天样本 {len(cycles)} 个")
-        + card(_fmt_sec(median_cycle), "", "交付周期（中位）", "创建 → 合并")
+        + c_merged
+        + c_cycle
         + card(str(deploy_count), "次", "今日部署", f"近 {len(events)} 次有记录")
         + card(_fmt_sec(avg_verify), "", "平均验证耗时", "八项检查")
         + card(_fmt_tok(tok_today), "", "今日 Token", f"近 7 天 {len(token_rows)} 组")

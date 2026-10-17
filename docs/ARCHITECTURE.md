@@ -297,6 +297,8 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 **版面（`render_ops.py`，注入主模板 `${ops_css}` / `${ops_html}` 两处占位符）**：顶部 6 张运维 KPI（今日合并 / 交付周期中位数 / 今日部署 / 平均验证耗时 / 今日 token / 部署卡顿）→ 交付流水线瀑布（每 PR 一行：创建→合并→up→verify→promote，红色斜纹＝卡顿）→ token 7 日堆叠（按 source 拆 webhook/cron/feishu）→ 验证矩阵（8 项 × 最近 6 次）→ 异常归因。原 ①–⑤ 章节顺延为 ②–⑥。
 
+**「拉不到」不等于「没有」**：`fetch_prs` 失败（生产实测 `gh` 认证失效）时 `pr_data_ok=False`，两张 PR 相关 KPI 出 `—` + 「GitHub 拉取失败」，**不出 0** —— 把「拉不到」渲染成「今日 0 个合并」是错误事实，比空着更糟。同理其余源失败一律进 `ops_unavailable`，页面底部列出不可用源。
+
 ---
 
 **部署（owner 手动）**：

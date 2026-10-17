@@ -81,6 +81,9 @@ def cmd_render(args: argparse.Namespace) -> int:
     #    而 latest_snapshot() 只判 exists() 不建表 → 会撞 "no such table: snapshots"
     db.init_schema(db_path)
 
+    # 本轮的降级记录（PR 抓取失败也要记在这里，故先于各 fetch 初始化）
+    ops_unavailable: list[str] = []
+
     # 1. 拉数据（容错：单条失败不阻塞整体）
     try:
         issues = fetchers.fetch_issues(DEFAULT_REPO)
@@ -92,9 +95,13 @@ def cmd_render(args: argparse.Namespace) -> int:
     try:
         prs = fetchers.fetch_prs(DEFAULT_REPO)
         _log(f"  prs: {len(prs)}")
+        pr_data_ok = True
     except fetchers.FetchError as exc:
         _log(f"  prs fetch FAILED: {exc}")
         prs = []
+        # 拉不到 ≠ 没有：KPI 必须显示「—」而不是 0（gh 未认证时曾把「今日 0 个合并」当真）
+        pr_data_ok = False
+        ops_unavailable.append("GitHub PR 列表")
 
     try:
         worktrees = fetchers.fetch_worktrees(repo_dir)
@@ -117,7 +124,6 @@ def cmd_render(args: argparse.Namespace) -> int:
 
     # 1b. 运维事实（三个源各自降级：单源坏了只丢那一块）
     ops_fetched_at = _now_iso_cst()
-    ops_unavailable: list[str] = []
     deploy_events = _collect(
         "部署审计日志", ops_unavailable,
         lambda: ops_parse.parse_audit_log(Path(args.audit_log)),
@@ -184,6 +190,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         token_rows=token_rows,
         ops_unavailable=ops_unavailable,
         ops_fetched_at=ops_fetched_at,
+        pr_data_ok=pr_data_ok,
     )
     html_str = render_mod.render(ri)
 

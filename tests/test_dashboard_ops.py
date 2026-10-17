@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -267,6 +268,18 @@ def test_render_degrades_when_all_sources_missing():
     assert "运维数据源暂不可用" in html
     assert "Hermes state.db" in html
     assert "Issue 追踪" in html and "PR 管线" in html, "其余章节不受影响"
+
+
+def test_render_shows_dash_not_zero_when_pr_fetch_failed():
+    """GitHub 拉不到 PR ≠ 今天没合并 PR：KPI 必须显示「—」，否则读成「今天 0 个」。"""
+    html = render.render(_sample_input(
+        prs=[], pr_data_ok=False, ops_unavailable=["GitHub PR 列表"],
+    ))
+    assert "GitHub 拉取失败" in html
+    value = re.search(
+        r'<div class="ov">([^<]*)</div><div class="ok">今日合并 PR</div>', html
+    ).group(1)
+    assert value.strip() == "—", f"拉取失败时不该显示 {value!r}"
 
 
 def test_render_ops_block_empty_has_kpi_but_no_waterfall():

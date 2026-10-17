@@ -36,6 +36,8 @@ class RenderInput:
     token_rows: list[dict] = field(default_factory=list)
     ops_unavailable: list[str] = field(default_factory=list)
     ops_fetched_at: str = ""
+    # PR 列表是否真的拿到了：拉不到时 KPI 显示「—」而不是 0（两种事实不能混）
+    pr_data_ok: bool = True
 
 
 # ============================================================
@@ -391,6 +393,7 @@ def render(input: RenderInput) -> str:
         token_rows=input.token_rows,
         fetched_at=input.ops_fetched_at,
         unavailable=input.ops_unavailable,
+        pr_data_ok=input.pr_data_ok,
     )
 
     # PR 状态分布计数
