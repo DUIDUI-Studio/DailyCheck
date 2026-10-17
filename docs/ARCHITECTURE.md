@@ -141,7 +141,7 @@ flowchart LR
 
 ### 3.4 蓝绿部署（Phase 1 实装，2026-10-13 起）
 
-Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起绿：DB `cp -a` + systemd **restart** + 30×2s 健康检查）→ `verify.sh`（八项生产验证，报告落 `backups/prod-verifications/`）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。
+Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起绿：DB `cp -a` + systemd **restart** + 30×2s 健康检查，**重启前先判绿是否在承流**，在役则先切蓝；**并把 unit 复位成静息态**——`DRY_RUN=true` + 副本库）→ `verify.sh`（八项生产验证，报告落 `backups/prod-verifications/`）→ `promote.sh`（**绿转正**：关 `DRY_RUN` + DB 指回真库 + daemon-reload/restart + 健康复核，幂等 + 备份 + 失败回滚）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。**完整时序**：up（复位静息态 → 重启为 `DRY_RUN=true` + 副本库）→ verify → promote → switch（5/50/100）。
 
 **铁律**：
 - **nginx 备份绝不写 `sites-enabled/`** —— 主配置 `include sites-enabled/*` 会把 `.bak` 当配置加载 → duplicate upstream 永久 fail（Issue #24 Bug A）。统一落 `BACKUP_DIR`（默认 `/var/lib/dailycheck-blue-green-backups/`）。
@@ -153,8 +153,11 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 5 脚本：`up.sh`（起�
 - **nginx 单 upstream 蓝绿同池（Issue #32）** —— `location` 的 `proxy_pass` 永远指向合并的 `dailycheck` / `dailycheck-mcp` upstream，蓝绿是同 upstream 内的两个 `server` 节点；切流量只改 server 行的 `weight=N` / `down` —— **switch.sh 不动 location 也不新增 `dailycheck-blue/green` upstream**（旧布局下 location 硬编码，upstream 切了真实流量不动 → 502 必现，Issue #32 实测）。三道防线：① `switch.sh` 头部布局守卫 grep `proxy_pass http://dailycheck-(blue|green)` 命中旧布局直接拒跑（exit 2），强制 Prod Agent 先按 `scripts/blue_green/nginx-site.conf` 模板重构；② `switch.sh` 尾部 post-switch 探活，过 nginx 入口（默认 `http://127.0.0.1:8080`，可用 `NGINX_ENTRY` 环境变量覆盖，dry-run 路径也透传）取 `http_code`，5xx/000 自动 cp 备份回滚 + reload；③ `verify.sh` check 8 终态保险，再过一遍入口探活捕获 reload → observe window 期间的状态漂移。**改 nginx 布局必须保持单 upstream 模型**，新增独立 upstream 必须同时承担布局守卫与探活的改造。
 - **DRY_RUN 实例绝不承接流量（Issue #41，2026-10-15 P0 事故）** —— 绿实例的 `DRY_RUN=true` 写隔离只允许存在于验证期：窗口期曾发生「绿实例接管生产流量 44 分钟、全部写操作被吞」（HTTP 200 / 审计照记 / DB 不落盘）。`switch.sh` 四道防线：① **DRY_RUN 守卫** —— 切换后凡承接流量（weight>0）的实例检测到 `DRY_RUN=true`（取证次序：进程 `/proc/<pid>/environ` → unit `systemctl show Environment`；无法判定仅告警）即拒跑（exit 3），必须先按 README「绿转正」（关 DRY_RUN + DB 指回真库 + restart）再切；② **conf 应用核验** —— sed 后逐行核对 4 条 server 行与期望一致（sed 未命中时 `nginx -t` 仍过、reload 仍「成功」而权重根本没变，静默失败）；③ **reload 失败显式回滚**（旧版 `set -e` 直退会留下 conf/运行态分歧）；④ **落点核验** —— 100%/0% 边界用带 nonce 的探针核对流量真实落到目标实例 access log（**全部尝试**均未命中目标且至少一次落对侧=回滚；日志不可读=仅告警）；**探针必须重发（Issue #55）**：nginx worker 在 `reload` 后需 1-3 秒才刷新 in-memory upstream，只发一次探针必然落在旧配置（对侧），「反复 grep 同一个 nonce」等不来路由改变 → 必然误判「reload 未生效」并自动回滚（2026-10-16 生产实测：`switch.sh green 100` 被误判失败，部署只能人工 `sleep 3` 绕过）。现为「每次尝试用**新 nonce** 重发探针 + 轮询日志」，命中目标 access log 即成功（默认最多 `LAND_TRY_MAX=5` 次、每次轮询 4×0.25s、尝试间等 1 秒 ≈ 常态等待预算 10 秒；探针自身 `--max-time 5`，入口持续无响应的最坏耗时可到约 35 秒）；对侧命中不再一票判死（那是 race 的正常表现），只有「所有尝试均未命中目标且至少一次落对侧」才认定 reload 真的没生效 → 回滚；若最终命中而此前有探针落过对侧，成功信息会额外回显一行说明，避免运维把刷新窗口当故障。`LAND_TRY_MAX < 2` 会打 WARNING（等于退回 #55 的只发一次，仅供调试）。节奏参数 `LAND_TRY_MAX` / `LAND_POLL_MAX` / `LAND_POLL_STEP` / `LAND_RETRY_SLEEP` 可 env 覆盖（测试用 0 秒只跑行为断言）。**「绿转正」标准步骤见 `scripts/blue_green/README.md`**。
 - 端口 0 权重不被 nginx 1.24 接受，用 `down` 关键字标记不参与负载。
+- **活流量守卫：绿在役时 up.sh 必须先切蓝（Issue #81，2026-10-17 P0 事故）** —— `up.sh` 在 restart 绿之前解析 nginx conf（`NGINX_CONF`，默认 `/etc/nginx/sites-enabled/dailycheck`）：`server 127.0.0.1:8091` 非 `down` 且 `weight>0` = 绿在承流 → **先探活蓝**（`BLUE_HEALTH_URL`，默认 `http://127.0.0.1:8090/health` 须 200），健康则 `switch.sh blue 100` 把流量挪走，再继续重启绿；蓝不健康 → 报错 exit 1 且**绝不重启在役的绿**。绿不承流（`down` / `weight=0` / 不在 upstream）行为与加固前一致。**conf 读不到 / 无 `upstream dailycheck` 块 / `weight` 值不可解析 → 一律 exit 1 拒绝执行**（此刻无法判断重启会不会打断在役实例，静默放行等于赌运气）。时机关卡位置：守卫必须在「拷 DB / 重启 unit」**之前**——一旦开动，绿的在役状态已被破坏，再想先切蓝已无处可退。事故形态即「绿承接 100% 流量时原地 restart 绿」→ 全站 502 +（unit 仍带 `DRY_RUN` 时）把线上实例换回「写隔离 + 副本库」→ 写操作静默假成功；`switch.sh` 的 DRY_RUN 守卫只挡「切换动作」，挡不住这条路径。
+- **转正必须是可重放脚本，不能只是 README 步骤（Issue #81）** —— `promote.sh` 固化「关 `DRY_RUN` + DB 指回真库 + `daemon-reload` + restart + 健康复核」，语义与 README「绿转正」段一一对应：unit（及存在的 `GREEN_ENV_FILE` / `GREEN_MCP_ENV_FILE`）的 `DRY_RUN=true→false`（**无该行则不加**）、`DAILYCHECK_DB_DIR=*` → `${APP_DIR}/db`；改前备份到 `BACKUP_DIR`（清单化，供恢复）、改后**复验**（sed 未命中 = 静默失败，必须显式拦下）；任一步失败 → 按清单恢复 + `daemon-reload` + exit 1；**已转正 → 打印 `already promoted` 并 exit 0，绝不重复 restart 在役实例**（重启在役实例就是事故本身）；沿用部署锁门禁（无锁 exit 10，`DAILYCHECK_DEPLOY_UNLOCKED=1` 逃生）。退出码：0 成功/已转正、1 失败（已回滚）、10 无锁、64 参数错。
+- **静息态复位是 up.sh 的职责，且只能在「流量已离开绿」之后做（Issue #28 闭环）** —— `promote.sh` 转正会把绿 unit 改成「真实态」（`DRY_RUN=false` + DB 指回 `${APP_DIR}/db`），而生产当前绿就是转正态；若 `up.sh` 不复位，下一轮部署要么被隔离守卫 `exit 1` 拒启（fail-closed 停摆），要么让绿以**真实写能力**跑副本库（写进将被丢弃的库）。故 `up.sh` 步骤 3.0 负责把 app unit 的 `DRY_RUN` 置 `true`、两个 unit 的 `DAILYCHECK_DB_DIR` 指 `${GREEN_DB}`（缺行则插入 `[Service]` 段首——转正侧「无该行则不加」、复位侧「必须保证在」，两边刻意相反），env 文件（`GREEN_ENV_FILE`）里的 `DRY_RUN=false` 一并改（systemd 语义：`EnvironmentFile` 覆盖 unit 的 `Environment=`；同理 `promote.sh` 转正时也一并改）。**三条安全边界**：① 复位必须排在 2.5 活流量守卫**之后**——绿在承流时改 unit，任何一次 restart（本脚本 / 别的会话 / systemd `Restart=always`）都会把在役实例变成写隔离；② 复位 → 断言 → `daemon-reload` → restart 之间不插入别的动作，把「文件≠运行态」的窗口压到最短；③ **绝不**在 `switch.sh green` 成功后把 unit 改回 `DRY_RUN=true`——复位只在 `up.sh` 开头做（`promote.sh` 是反向的唯一入口）。幂等：已静息 → 打印 `already resting`，**不写文件、不 daemon-reload**。改写用「awk → 临时文件 → mv」（跳过整行注释；`sed -i` 与 sed 的 `a\` 插入命令 GNU/BSD 语法不同，均为不可移植陷阱），改完**复验**（awk 未命中 = 静默失败）+ step 3.5 三层取证（文件生效行 / `systemctl show -p Environment`（抓 drop-in 覆盖）/ unit 必须声明 DB），任一不通过 → 按 `BACKUP_DIR` 清单恢复 + `daemon-reload` + exit 1 且**不重启绿**。注意 3.5 **不**看 `/proc/<pid>/environ`：此刻还没 restart，进程环境是上一轮转正的事实。
 - **起绿必须 `systemctl restart`（Issue #38）** —— `up.sh` 步骤 4 对绿 Flask / MCP 两个 unit 一律 `restart`（未跑则起、在跑则重启）：`start` 对**已在运行**的 unit 是 no-op，而步骤 3 已把新 DB 拷进绿库 → 变成「新 DB + 旧代码」，verify / switch 判定的对象一半新一半旧。两处 restart 必须带 `|| true`（`set -euo pipefail` 直退会跳过步骤 7 的 journalctl + DB 取证，失败现场就丢了），失败交给步骤 5/6 健康检查判红；另须在 restart 前回显 `systemctl is-active` 的 pre-state（「新库 + 旧码」只有对照 pre-state 才看得出），该回显要绑到 live 分支的命令本体而不是 dry-run 的 echo 文案。改 up.sh 启动段必须同时保住这四个语义（restart / `|| true` / 取证可达 / pre-state 真实查询）。
-- 单测：`tests/test_blue_green_implementation.py`（80 用例，bash -n / dry-run 回显 / 参数解析 / 关键不变量 / sim_user 假服务器全流程（含 Issue #38 路径 5：500 拦截 / 403 提示 / 落点校验防假绿）/ 绿库账号 provision（Issue #34：env pin 覆盖语义 + `--admin` + 可见仓/停用/密码三条复核 + 写库前「拒绝写蓝库」双闸（路径形态 + inode），函数按标记抽取真跑）/ config env 覆盖；关键断言逐条经变异验证）。**夹具凭据一律不写字面量**：口令用 `secrets.token_hex()` 运行期生成（`_SIM_PW` / `_OTHER_PW`）——`password="<字面量>"` 会被 GitGuardian 的 Generic Password 规则判为泄露、直接把 PR 检查打红，而断言从不依赖取值。另有 `tests/test_blue_green_dryrun_guard.py`（13 用例：DRY_RUN 守卫拦截/放行/无法判定三态、conf 应用核验、落点核验（命中/对侧回滚/不可读告警/**reload race 重发重试（Issue #55：第 1 次探针落对侧 → 重发后命中，不误回滚；绿/蓝两个方向）+ 重发默认预算静态钉死**）、灰度跳过；live 全流程跑 switch.sh，PATH 前置 fake systemctl/nginx + 本地假入口服务器（假服务器可按探针**次数**分别落目标侧/对侧，用于复现 worker 刷新窗口）；关键断言逐条经变异验证）。两文件合计 93 用例（80 + 13）。
+- 单测：`tests/test_blue_green_implementation.py`（80 用例，bash -n / dry-run 回显 / 参数解析 / 关键不变量 / sim_user 假服务器全流程（含 Issue #38 路径 5：500 拦截 / 403 提示 / 落点校验防假绿）/ 绿库账号 provision（Issue #34：env pin 覆盖语义 + `--admin` + 可见仓/停用/密码三条复核 + 写库前「拒绝写蓝库」双闸（路径形态 + inode），函数按标记抽取真跑）/ config env 覆盖；关键断言逐条经变异验证）。**夹具凭据一律不写字面量**：口令用 `secrets.token_hex()` 运行期生成（`_SIM_PW` / `_OTHER_PW`）——`password="<字面量>"` 会被 GitGuardian 的 Generic Password 规则判为泄露、直接把 PR 检查打红，而断言从不依赖取值。另有 `tests/test_blue_green_dryrun_guard.py`（13 用例：DRY_RUN 守卫拦截/放行/无法判定三态、conf 应用核验、落点核验（命中/对侧回滚/不可读告警/**reload race 重发重试（Issue #55：第 1 次探针落对侧 → 重发后命中，不误回滚；绿/蓝两个方向）+ 重发默认预算静态钉死**）、灰度跳过；live 全流程跑 switch.sh，PATH 前置 fake systemctl/nginx + 本地假入口服务器（假服务器可按探针**次数**分别落目标侧/对侧，用于复现 worker 刷新窗口）；关键断言逐条经变异验证）。两文件合计 93 用例（80 + 13）。另有 `tests/test_blue_green_promote_guard.py`（25 用例：`promote.sh` 的 dry-run 无副作用 / 正常转正（含 unit DB 值**带引号**形态）/ 幂等不重复 restart / 锁门禁与 `DAILYCHECK_DEPLOY_UNLOCKED` 逃生 / 健康失败与 restart 失败各自回滚恢复 / env 文件里的 DRY_RUN 覆盖也一并转正 + `up.sh` 活流量守卫的 绿在役先切蓝（**调用顺序**断言）/ 蓝不健康拒跑 / conf 解析失败与缺失拒跑 / 绿不承流行为不变 / 切蓝失败阻断重启 + `up.sh` **静息态复位**的 已转正态被复位（**切蓝之后、restart 之前**，用 fake `switch.sh` 的「切流量瞬间 unit 快照」硬断言）/ 缺行插入 `[Service]` 段 / 幂等（文件与 mtime 不变、零 daemon-reload）/ dry-run 零副作用 / drop-in 仍覆盖成 `DRY_RUN=false` 时 fail-closed 且不重启绿 / 注释行不被改写 / env 文件覆盖一起复位；fake systemctl/curl/ss/switch + tmp unit，macOS 与 Linux 同解；关键断言经变异验证 —— 去掉 `switch.sh` 调用、短路复位分支、把复位挪到切流量之前，三者各自打红对应用例）。
 - **协作流程与门禁**：Dev 提 PR 必含「生产侧事项」段（`check_reports.py` 强制，缺失即红），只写规范流程粒度不写操作脚本；**merge 由 Prod Agent 判定执行**（CI 全绿 + 独立审查，异议打回），红线清单见 `docs/agent-framework/workflow.md` §四。
 
 ### 3.5 PR Webhook 接收器（2026-10-15 实装）
@@ -301,12 +304,13 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 - 退出码：0=正常 / 1=欠账 / 2=失败待决 / 3=未初始化 / 10=锁被占用 / 11=token 不匹配 / 12=锁属另一 PR / 64=用法错 / 65=无法确定 main。除 `status` 外输出均为单行 JSON。
 - **激活**：`init --sha <sha>` 一次性建目录 + 设 deployed 基线；**状态目录存在 = 机制激活**（不存在 = 全部守卫放行，向后兼容窗口；删状态目录 = 卸载机制）。
 
-**② 五脚本守卫**（仅 live；`--dry-run` 完全跳过，CI / 演练行为不变）：
+**② 六脚本守卫**（仅 live；`--dry-run` 完全跳过，CI / 演练行为不变）：
 
 | 脚本 | 会话级锁校验 | 进程级 flock | 角色 |
 |------|-------------|--------------|------|
 | `up.sh` | 需活跃锁且 PR 匹配（`check --pr`；无锁 / 锁属他 PR → exit 10） | `-n` 立即拒 | 部署方向 |
 | `verify.sh` | 同上（**守卫必须放在 `trap _write_report EXIT` 注册之前** —— 被拒时不产出「八项从未运行」的误导报告） | `-n` 立即拒 | 部署方向 |
+| `promote.sh` | 需活跃锁（不校验 PR 归属——转正无 PR 参数；无锁 → exit 10） | `-n` 立即拒 | 部署方向（转正会 restart 生产实例，绝不能与另一会话重叠） |
 | `switch.sh` | 仅 `green` 目标需活跃锁（不校验 PR 归属——switch 无 PR 参数）；`blue` 目标**豁免** | `-n` 立即拒 | green=承接流量方向；blue=安全方向（rollback 演练内嵌 switch 不被锁阻塞） |
 | `rollback.sh` | **免校验**（应急止损不被部署锁阻塞） | `-w 30` 等待 | 应急方向 |
 | `down.sh` | **免校验**（清理不被部署锁阻塞） | `-w 30` 等待 | 清理方向 |
@@ -1101,7 +1105,7 @@ flowchart TB
         Aux["test_aux_unit.py /<br/>test_master_db_migrate.py<br/>pre-existing 失败来源"]
         Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>6 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
-        BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>蓝绿 5 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
+        BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
     end
 
     subgraph Conftest["tests/conftest.py"]
@@ -1159,6 +1163,8 @@ flowchart TB
 - **③ 真实 nginx conf**（`NGINX_DAILYCHECK_CONF`）—— `switch.sh` 的布局守卫与 `cp`/`sed` 只在 conf **存在**时动作。prod 上默认路径真实存在，dev/CI 上不存在；继承宿主 conf 时 dry-run 用例的退出码就取决于那台机器的 conf 布局。
 
 **修法（Issue #81 定稿）**：fake systemctl 抽到共享模块 `tests/blue_green_testenv.py`（`install_fake_systemctl()`），`test_blue_green_implementation.py` 与 `test_blue_green_deploy_lock.py` **共用同一份实现**（此前是两份副本漂移 —— 后者漏装 fixture 即 #81 的 3 个 fail 之一）；`test_blue_green_deploy_lock.py` 追加 `test_fake_systemctl_pins_not_dry_run` 自检，把「fake 真的接管 PATH 且判 `not_dry_run`」钉成事实断言（否则 fake 退化成 unknown 时 CI 依然全绿 —— dev/CI 本就没有 systemctl）。`verify.sh` live 用例统一走 `_hermetic_verify_env()`：状态目录指向不存在的 tmp 路径（= 机制未激活）、`DAILYCHECK_BG_LOCK_HELD=1`（不碰 `/var/lock`）、conf 指向不存在的 tmp 路径（布局守卫跳过 + `cp` 在 `set -e` 下立即失败 → **check 4 的回滚演练永远到不了 `systemctl reload nginx`**，绝不改写生产 conf / 切真实流量）、`BACKUP_DIR` 与 `DC_PYTHON` / `DAILYCHECK_APP_DIR` 全部落 tmp；「绿不可达」场景改由闭端口显式制造，不再依赖宿主 `:8091` 恰好没起。`test_blue_green_dryrun_guard.py` 的 live 用例同族补齐（autouse 钉状态目录 + 跳过 flock），否则生产上「无活跃锁」时 9 例 `exit 10` 全红、持锁时还会往生产 `audit.log` 追加审计行（测试写生产状态）。**新增调用 `scripts/blue_green/*.sh` 的用例必须沿用这两条约定**：否则下一次 `up.sh` 会被 verify check 1 的「零新增违例」拒启（fail-closed → 部署整体卡死）。
+
+**同族新增**：`tests/test_blue_green_promote_guard.py` 在 `_base_env()` 里统一注入同一套隔离（状态目录指向不存在的 tmp 路径、`DAILYCHECK_BG_LOCK_HELD=1`、`SYSTEMCTL_BIN` / `CURL_BIN` / fake `ss` 全部落 fakebin），故 `promote.sh` 与 `up.sh` 的 live 用例在 dev / CI / prod 三处同解。
 
 **Pre-existing 16 failed 分布**（2026-10-13 起）：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
@@ -1300,7 +1306,7 @@ with app.test_client() as c, c.session_transaction() as s:
 
 ### 部署 / 运维
 
-- [`scripts/blue_green/README.md`](../scripts/blue_green/README.md) — 蓝绿部署操作手册（5 脚本用法 / 验证矩阵 / **「绿转正」标准步骤**，2026-10-15 事故后增补）
+- [`scripts/blue_green/README.md`](../scripts/blue_green/README.md) — 蓝绿部署操作手册（6 脚本用法 / 验证矩阵 / **「绿转正」标准步骤**，2026-10-15 事故后增补）
 
 ### 业务领域
 

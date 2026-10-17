@@ -1252,13 +1252,21 @@ def test_up_sh_copies_real_db_tree_dereferenced():
 
 
 def test_up_sh_requires_unit_db_dir_declaration():
-    """up.sh 必须守卫：绿 unit 未声明 DAILYCHECK_DB_DIR 或与拷贝目标不一致时拒启。"""
+    """up.sh 必须守卫：绿 unit 的 DAILYCHECK_DB_DIR 必须等于拷贝目标，否则拒启。
+
+    Issue #28 的原始形态是「前置检查 + 文案」，现升级为「复位 + fail-closed 断言」
+    （2026-10-17，#28 闭环）：缺失 / 不一致统一由 `_db_ok`（`require=1`：unit 必须
+    **显式声明**，缺失即隔离从未生效）与 `_resting_ok` 判死；失败路径 `_fail_restore`
+    → 按备份恢复 + daemon-reload + exit 1。行为断言见
+    `tests/test_blue_green_promote_guard.py` 的静息态复位用例组。
+    """
     content = UP.read_text(encoding="utf-8")
     assert "DAILYCHECK_DB_DIR" in content
-    assert "未声明 DAILYCHECK_DB_DIR" in content
-    # 两处失败路径都必须 exit 1（不匹配 / 缺声明）
+    assert '_db_ok "${f}" 1' in content, "unit 缺声明未判死（require=1 守卫丢失）"
+    assert '"${v}" == "${GREEN_DB}"' in content, "DB 不一致未判死"
+    # 失败路径必须 exit 1（改写失败 / 断言不通过 / daemon-reload 失败）
     assert content.count("exit 1") >= 2
-    assert "daemon-reload" in content  # 错误信息给出修复方法
+    assert "daemon-reload" in content  # 错误处理链给出修复方法
 
 
 def test_up_sh_green_db_default_is_isolated_copy_dir():
