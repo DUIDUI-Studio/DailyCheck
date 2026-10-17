@@ -137,3 +137,19 @@ DRYRUN_COPY_DIR = Path("/tmp/dc_dryrun")
 SAFETY_STOCK_WINDOW_DAYS = 7
 SAFETY_STOCK_FACTOR = 1.2
 SAFETY_STOCK_ROUND_DIGITS = 2
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 外部通知通道（企业微信群机器人，2026-10-16 起）
+#
+# 门店提交订货单时推一条 markdown 到工作群，见
+# blueprints/wecom_notify_pure.py 与 docs/ARCHITECTURE.md §3.9。
+#
+# - 两个值都由**服务器 env 注入**（生产写 /etc/dailycheck/app.env），
+#   **不进 git**：webhook 的 key= 等同密钥，泄露即可被任意人往群里发消息。
+# - WECOM_STORE_ORDER_WEBHOOK 为空 = 功能关闭（代码静默跳过，不报错）。
+# - PUBLIC_BASE_URL 用于拼消息里的「查看单据」链接（群里点得开 = 可外网
+#   访问的域名，不是 127.0.0.1）。
+# ─────────────────────────────────────────────────────────────────────
+WECOM_STORE_ORDER_WEBHOOK = os.environ.get("WECOM_STORE_ORDER_WEBHOOK", "").strip()
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://kjtang.cn").rstrip("/")
