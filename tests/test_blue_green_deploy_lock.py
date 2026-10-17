@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests import blue_green_testenv
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
 UP = SCRIPTS_DIR / "up.sh"
@@ -38,6 +41,21 @@ def _skip_flock_env(monkeypatch):
     monkeypatch.setenv("DAILYCHECK_BG_LOCK_HELD", "1")
 
 
+@pytest.fixture(autouse=True)
+def _fake_systemctl(monkeypatch, tmp_path):
+    """PATH 前置 fake systemctl（Environment 恒 DRY_RUN=false）。
+
+    Issue #81：本文件是 PR #59 新增的，漏装了 Issue #44 在本仓库确立的
+    「屏蔽宿主 systemd」fixture → switch.sh 的 DRY_RUN 守卫去问宿主 systemd，
+    dev/CI（无可用 systemctl）判 unknown 仅告警 → 放行；生产 VPS 的
+    dailycheck-green.service 固定 Environment=DRY_RUN=true（绿未转正）→ 守卫按
+    设计拒跑（exit 3；若那台机器 conf 还是旧布局，则更早撞布局守卫 exit 2）。
+    同一用例 dev/CI 绿、prod 红。
+    """
+    bindir = blue_green_testenv.install_fake_systemctl(tmp_path / "fakebin")
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
+
+
 def _run(script: Path, *args: str, state_dir: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["DAILYCHECK_DEPLOY_STATE_DIR"] = str(state_dir)
@@ -48,6 +66,19 @@ def _run(script: Path, *args: str, state_dir: Path, extra_env: dict | None = Non
         ["bash", str(script), *args],
         capture_output=True, text=True, env=env, timeout=60,
     )
+
+
+def _tmp_nginx_env(tmp_path: Path) -> dict:
+    """把 nginx conf / 备份目录钉到 tmp（Issue #81）。
+
+    生产 VPS 上默认的 /etc/nginx/sites-enabled/dailycheck 真实存在，switch.sh
+    的布局守卫会去读它；dev/CI 上没有该文件 → 守卫跳过。dry-run 用例若继承
+    宿主 conf，结果就又取决于「在哪台机器上跑」。
+    """
+    return {
+        "NGINX_DAILYCHECK_CONF": str(tmp_path / "no-such-conf"),
+        "BACKUP_DIR": str(tmp_path / "backups"),
+    }
 
 
 def _acquire(state_dir: Path, pr: int, sha: str = "cafe000") -> None:
@@ -69,6 +100,23 @@ def activated_dir(tmp_path: Path) -> Path:
 
 
 UP_ENV = {"DAILYCHECK_APP_DIR": "/nonexistent-app-dir-for-test"}
+
+
+def test_fake_systemctl_pins_not_dry_run():
+    """自检：fake systemctl 真的在 PATH 里，且判 not_dry_run（Issue #81）。
+
+    fake 一旦退化成「Environment 返回空」= 守卫走 unknown、仅告警放行，而
+    dev/CI 本来就没有 systemctl（同样走 unknown）→ CI 侧依然全绿，只有下一次
+    生产部署才会 fail-closed 撞墙。故用纯事实断言把这条回归网钉住。
+    """
+    out = subprocess.run(
+        ["systemctl", "show", "-p", "Environment", "--value", "x.service"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert out.returncode == 0
+    assert out.stdout.strip() == "DRY_RUN=false", out.stdout
+    which = shutil.which("systemctl")
+    assert which is not None and Path(which).parent.name == "fakebin", which
 
 
 # ----------------------------------------------------------------------
@@ -207,8 +255,14 @@ def test_switch_blue_live_skips_state_guard(activated_dir: Path, tmp_path: Path)
     assert proc.returncode == 2  # 过守卫，停在布局守卫
 
 
-def test_switch_dry_run_skips_guard(activated_dir: Path):
-    proc = _run(SWITCH, "green", "5", "--dry-run", state_dir=activated_dir)
+def test_switch_dry_run_skips_guard(activated_dir: Path, tmp_path: Path):
+    # conf / backup 一并钉到 tmp（Issue #81）：生产 VPS 上默认 conf 真实存在，
+    # 布局守卫会去读它（旧布局则本例先撞 exit 2；新布局则继续走到 DRY_RUN
+    # 守卫）；dev/CI 无此文件 → 守卫整段跳过。不钉住就取决于那台机器的 conf。
+    proc = _run(
+        SWITCH, "green", "5", "--dry-run", state_dir=activated_dir,
+        extra_env=_tmp_nginx_env(tmp_path),
+    )
     assert proc.returncode == 0
 
 
@@ -216,13 +270,19 @@ def test_switch_dry_run_skips_guard(activated_dir: Path):
 # rollback / down：dry-run 行为不变（锁段跳过）
 # ----------------------------------------------------------------------
 
-def test_rollback_dry_run_unaffected(activated_dir: Path):
-    proc = _run(ROLLBACK, "--dry-run", state_dir=activated_dir)
+def test_rollback_dry_run_unaffected(activated_dir: Path, tmp_path: Path):
+    proc = _run(
+        ROLLBACK, "--dry-run", state_dir=activated_dir,
+        extra_env=_tmp_nginx_env(tmp_path),
+    )
     assert proc.returncode == 0
 
 
-def test_down_dry_run_unaffected(activated_dir: Path):
-    proc = _run(DOWN, "--dry-run", state_dir=activated_dir)
+def test_down_dry_run_unaffected(activated_dir: Path, tmp_path: Path):
+    proc = _run(
+        DOWN, "--dry-run", state_dir=activated_dir,
+        extra_env=_tmp_nginx_env(tmp_path),
+    )
     assert proc.returncode == 0
 
 

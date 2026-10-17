@@ -39,6 +39,8 @@ from pathlib import Path
 import pytest
 from werkzeug.security import generate_password_hash
 
+from tests import blue_green_testenv
+
 # 脚本路径
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
 REPO_ROOT = SCRIPTS_DIR.parent.parent
@@ -91,27 +93,12 @@ def _run(script: Path, *args: str, cwd: Path | None = None) -> subprocess.Comple
 # `journalctl` 等仍走真命令，verify.sh 的失败路径用例语义不变。
 @pytest.fixture(autouse=True)
 def _fake_systemctl(monkeypatch, tmp_path):
-    """PATH 前置 fake systemctl（Environment 恒 DRY_RUN=false）。"""
-    bindir = tmp_path / "fakebin"
-    bindir.mkdir()
-    fake = bindir / "systemctl"
-    fake.write_text(
-        "#!/usr/bin/env bash\n"
-        "# switch.sh 测试用 fake：只服务 show -p <prop> --value <unit>\n"
-        "prop=''\n"
-        'for a in "$@"; do\n'
-        '  case "$a" in MainPID|Environment) prop="$a" ;; esac\n'
-        "done\n"
-        'if [[ "${1:-}" == "show" ]]; then\n'
-        '  case "$prop" in\n'
-        '    MainPID) echo "" ;;\n'
-        '    Environment) echo "DRY_RUN=false" ;;\n'
-        "  esac\n"
-        "fi\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
+    """PATH 前置 fake systemctl（Environment 恒 DRY_RUN=false）。
+
+    实现见 tests/blue_green_testenv.py —— 与 test_blue_green_deploy_lock.py
+    共用同一份 fake（Issue #81：两份副本漂移过一次，后者漏装导致 prod 红）。
+    """
+    bindir = blue_green_testenv.install_fake_systemctl(tmp_path / "fakebin")
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ.get('PATH', '')}")
 
 
@@ -442,17 +429,63 @@ def test_up_rejects_mismatched_sha_live():
     assert result.stdout + result.stderr  # 不空
 
 
+# ============================================================
+# verify.sh live 用例的宿主态隔离（Issue #81）
+# ============================================================
+def _closed_port() -> int:
+    """取一个「刚关闭」的本地端口，用于制造「绿不可达」的确定性场景。"""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _hermetic_verify_env(tmp_path: Path, green_url: str) -> dict:
+    """verify.sh live 运行的隔离环境（dev / CI / 生产 VPS 结果一致）。
+
+    Issue #81 现场：同一批用例在 PR #80 的 CI 上全绿，在生产 VPS 上 3 个 fail
+    （verify check 1 报「零新增违例」→ 蓝绿部署 abort）。根因是 PR #59 给
+    verify.sh 加了**部署单飞守卫**：状态目录 /var/lib/dailycheck-deploy 在生产
+    上已激活（无活跃锁 → check rc 0 → exit 10），在 CI / dev 上不存在（放行）。
+    原用例只重定向 REPORT_DIR / DAILYCHECK_APP_DIR，没钉住这套宿主态，于是
+    「在哪台机器上跑」决定了红绿——是测试缺陷。
+
+    这里把宿主事实一次性钉成 dev / CI 态，同时**保证绝不触达真生产资源**：
+    - DAILYCHECK_DEPLOY_STATE_DIR → 不存在的路径 = 单飞机制未激活（放行）
+    - DAILYCHECK_BG_LOCK_HELD     → 跳过进程级 flock（不碰 /var/lock）
+    - NGINX_DAILYCHECK_CONF       → 不存在的路径：switch.sh 布局守卫跳过，
+      且 `cp`/`sed` 立即失败（`set -e` 中止）→ check 4 的回滚演练**永远到不了**
+      `systemctl reload nginx`，既不改写生产 conf、也不切真实流量
+    - BACKUP_DIR                   → tmp（不写 /var/lib/dailycheck-blue-green-backups）
+    - DC_PYTHON / DAILYCHECK_APP_DIR → tmp 空壳：check 1 不真跑 pytest
+    - GREEN_URL / BLUE_URL / NGINX_ENTRY → 调用方指定（fake server 或闭端口）
+    """
+    env = os.environ.copy()
+    env["REPORT_DIR"] = str(tmp_path)
+    env["DAILYCHECK_APP_DIR"] = str(tmp_path / "no-repo")
+    env["DC_PYTHON"] = str(tmp_path / "no-python")
+    env["GREEN_URL"] = green_url
+    env["BLUE_URL"] = green_url
+    env["NGINX_ENTRY"] = green_url
+    env["DAILYCHECK_DEPLOY_STATE_DIR"] = str(tmp_path / "no-deploy-state")
+    env["DAILYCHECK_BG_LOCK_HELD"] = "1"
+    env["NGINX_DAILYCHECK_CONF"] = str(tmp_path / "no-such-nginx.conf")
+    env["BACKUP_DIR"] = str(tmp_path / "bg-backups")
+    return env
+
+
 def test_verify_writes_report_on_fail(tmp_path):
     """verify.sh fail 路径也写 report（Issue #22 fix + #24 Bug B 回归）。
 
-    场景：绿 :8091 不可达 → 前置检查失败 → 必须写报告再 exit 1。
+    场景：绿不可达 → 前置检查失败 → 必须写报告再 exit 1。
+    「不可达」由闭端口显式制造（原先依赖宿主 :8091 恰好没起，生产 VPS 上
+    :8091 是真的绿实例 → 用例会走完全不同的分支，Issue #81）。
     用 REPORT_DIR 重定向到 tmp，避免污染真仓库；日期用 glob 匹配
     （旧版硬编码 20261014 换天即假失败）。
     """
     repo_root = SCRIPTS_DIR.parent.parent
-    env = os.environ.copy()
-    env["REPORT_DIR"] = str(tmp_path)
-    env["DAILYCHECK_APP_DIR"] = str(tmp_path / "no-repo")  # check 1 不真跑 pytest
+    env = _hermetic_verify_env(tmp_path, f"http://127.0.0.1:{_closed_port()}")
     result = subprocess.run(
         ["bash", str(VERIFY), "22"],
         capture_output=True, text=True, env=env, timeout=30, cwd=repo_root,
@@ -510,10 +543,7 @@ def test_verify_continues_after_check_fail_and_writes_report(tmp_path):
     t = threading.Thread(target=_serve, daemon=True)
     t.start()
     try:
-        env = os.environ.copy()
-        env["REPORT_DIR"] = str(tmp_path)
-        env["GREEN_URL"] = f"http://127.0.0.1:{port}"
-        env["DAILYCHECK_APP_DIR"] = str(tmp_path / "no-repo")
+        env = _hermetic_verify_env(tmp_path, f"http://127.0.0.1:{port}")
         result = subprocess.run(
             ["bash", str(VERIFY), "24"],
             capture_output=True, text=True, env=env,
@@ -528,6 +558,14 @@ def test_verify_continues_after_check_fail_and_writes_report(tmp_path):
     content = Path(reports[-1]).read_text(encoding="utf-8")
     assert "[x] **打回**" in content, "有失败项时决策摘要应勾「打回」"
     assert "❌ FAIL" in content, "报告应记录具体失败项"
+    # 「继续跑完剩余 check」这一半必须显式断言 —— 否则用例名里的 continues
+    # 是空头支票：把 _run_check 的失败分支改回 `exit 1`（Issue #24 Bug B 本体）
+    # 后，`trap _write_report EXIT` 照样落盘、照样勾「打回」、照样有 ❌ FAIL，
+    # 断言全绿，而实测报告第 2~8 行全是初始态 ⏳（= 流程被截断）。
+    # ⏳ 只出现在 verify.sh:89 的 R1..R8 初值，报告正文其余位置不用该符号。
+    assert "⏳" not in content, (
+        "有 check 仍停留在初始态（⏳）= 失败截断了主流程（Issue #24 Bug B 复发）"
+    )
 
 
 def test_verify_no_set_e_and_has_exit_trap():

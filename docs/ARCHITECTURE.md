@@ -316,7 +316,7 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 - **会话侧协议**（Prod Agent skill，merge 后）：先 `acquire`；`rc 10`（他人在部署）→ **不排队、直接结束** —— 欠账由任何人下一次 `catchup` 从事实发现并补上（兜底轮询 ≤30 分钟保底）；部署失败则 `release --result failed`（记 `last_attempt`）。长步骤间必须 heartbeat，否则 15 分钟 TTL 到期会被下一会话合法抢占。
 - **激活顺序（一次性，防自锁）**：先更新 Prod Agent skill 到「会话侧协议」→ 再 `init` 建状态目录。反序（机制先激活、旧 skill 不握锁）会让下一次 up.sh 在守卫处拒跑（exit 10）。
 
-**测试**：`tests/test_deploy_state.py`（31 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（16 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx。
+**测试**：`tests/test_deploy_state.py`（31 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
 
 ---
 
@@ -1152,6 +1152,13 @@ flowchart TB
 - **`agent-framework-reports` 门禁（2026-10-15 起）**：`check_reports.py` 要求 PR body 含 h2「报告 1/4」「Checklist」「生产侧事项」三段且无未消解 ❌；CI 读事件时刻 body 快照，事后补 body 须推空 commit。
 
 **测试的环境无关性（2026-10-15 起，Issue #44）**：用例结果不得取决于「在哪台机器上跑」。最脆的一维是**宿主 systemd**：`switch.sh` 的 DRY_RUN 守卫（PR #42）以 `systemctl show -p MainPID / -p Environment --value <unit>` 取证，于是 dev/CI（**无可用 systemd** —— dev 机没有 `systemctl` 命令；CI 镜像有该命令，但 systemd 未作 PID 1 致取证为空；两者都判「无法判定」→ 仅告警放行）与生产 VPS（`dailycheck-green.service` 固定 `Environment=DRY_RUN=true`，绿未「转正」→ 按设计 `exit 3` 拒跑）结论相反 —— 同一批 `test_blue_green_implementation.py` 用例在 prod 全红、在 dev/CI 全绿（Issue #44 现场 = 跑 `verify.sh` 时 check 1 报 5 个 fail）。**约定**：凡调用 `scripts/blue_green/*.sh` 的用例，必须把宿主 systemd 态**显式钉死**，不许默认「本机没有 systemctl」。`test_blue_green_implementation.py` 用模块级 autouse fixture `_fake_systemctl` 前置 fake `systemctl`（`Environment` 恒 `DRY_RUN=false` =「绿转正后的合法生产态」→ 守卫判 `not_dry_run` 放行），使用例回到「验证切流量动作本身」的原始意图；守卫自身行为由 `test_blue_green_dryrun_guard.py` 专项覆盖（该文件自建按 unit 注入 `Environment` 的 fake）。两处 fake 均只接管 `show`，其余子命令 `exit 0`，故 `journalctl` 等真命令缺失仍能让 `verify.sh` 的失败路径用例保持原语义。
+
+**宿主态隔离的第二维与第三维（2026-10-17，Issue #81）**：除宿主 systemd，还有两维会让同一批蓝绿用例「dev/CI 绿、prod 红」，PR #59（部署单飞）上线后同时踩中：
+
+- **② 部署单飞状态目录**（`DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy`）—— `verify.sh` / `switch.sh` 的锁守卫只在目录**存在**时生效。生产上该目录已随单飞机制激活：无锁（`deploy_state.py check` rc 0）或锁属他 PR（rc 12）都会让**嵌套调用的** `verify.sh` 在 check 1 之前 `exit 10`（#81 现场是后者 —— pytest 里跑的是 `verify.sh 22/24`，锁属于正在部署的 PR #80 → rc 12），dev/CI 上该目录不存在 → 放行。于是 live 调 `verify.sh` 的用例（`test_verify_writes_report_on_fail` / `test_verify_continues_after_check_fail_and_writes_report`）在 prod 拿到的 rc 是 10 而非 1，且锁守卫在 `trap` 注册之前拒绝 → 报告也不生成。
+- **③ 真实 nginx conf**（`NGINX_DAILYCHECK_CONF`）—— `switch.sh` 的布局守卫与 `cp`/`sed` 只在 conf **存在**时动作。prod 上默认路径真实存在，dev/CI 上不存在；继承宿主 conf 时 dry-run 用例的退出码就取决于那台机器的 conf 布局。
+
+**修法（Issue #81 定稿）**：fake systemctl 抽到共享模块 `tests/blue_green_testenv.py`（`install_fake_systemctl()`），`test_blue_green_implementation.py` 与 `test_blue_green_deploy_lock.py` **共用同一份实现**（此前是两份副本漂移 —— 后者漏装 fixture 即 #81 的 3 个 fail 之一）；`test_blue_green_deploy_lock.py` 追加 `test_fake_systemctl_pins_not_dry_run` 自检，把「fake 真的接管 PATH 且判 `not_dry_run`」钉成事实断言（否则 fake 退化成 unknown 时 CI 依然全绿 —— dev/CI 本就没有 systemctl）。`verify.sh` live 用例统一走 `_hermetic_verify_env()`：状态目录指向不存在的 tmp 路径（= 机制未激活）、`DAILYCHECK_BG_LOCK_HELD=1`（不碰 `/var/lock`）、conf 指向不存在的 tmp 路径（布局守卫跳过 + `cp` 在 `set -e` 下立即失败 → **check 4 的回滚演练永远到不了 `systemctl reload nginx`**，绝不改写生产 conf / 切真实流量）、`BACKUP_DIR` 与 `DC_PYTHON` / `DAILYCHECK_APP_DIR` 全部落 tmp；「绿不可达」场景改由闭端口显式制造，不再依赖宿主 `:8091` 恰好没起。`test_blue_green_dryrun_guard.py` 的 live 用例同族补齐（autouse 钉状态目录 + 跳过 flock），否则生产上「无活跃锁」时 9 例 `exit 10` 全红、持锁时还会往生产 `audit.log` 追加审计行（测试写生产状态）。**新增调用 `scripts/blue_green/*.sh` 的用例必须沿用这两条约定**：否则下一次 `up.sh` 会被 verify check 1 的「零新增违例」拒启（fail-closed → 部署整体卡死）。
 
 **Pre-existing 16 failed 分布**（2026-10-13 起）：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
