@@ -56,26 +56,6 @@ jobs:
       - name: Zero-new-failure gate
         run: python scripts/check_known_failures.py /tmp/pytest-output.txt
 
-  arch-map:
-    # 架构事实图一致性门禁：docs/ARCHITECTURE_MAP.md 必须与「从源码派生」的结果逐字节一致。
-    # 只有结构真的变了（路由 / 权限 / 数据表 / 蓝图装配 / MCP 域）才需要重生成，
-    # 其余 PR 天然通过（实测约 84% 的提交不触及结构）。
-    # 修复方式：python3 scripts/arch_map.py --write，把结果一并提交。
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Architecture fact-map is up to date
-        run: python scripts/arch_map.py --check
-
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
     # 详见 docs/agent-framework/v0.1.md §三

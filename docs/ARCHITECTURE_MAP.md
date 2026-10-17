@@ -1,7 +1,8 @@
 # DailyCheck 架构事实图
 
 > 本文件由 `scripts/arch_map.py` **自动生成，禁止手工编辑**。
-> CI 会校验本文件与源码一致；要更新请运行 `python3 scripts/arch_map.py --write`。
+> 一致性由 `tests/test_arch_map.py` 在 CI 的 `test` job 强制：与源码不符即失败。
+> 要更新请运行 `python3 scripts/arch_map.py --write`。
 
 **怎么用这张表**
 

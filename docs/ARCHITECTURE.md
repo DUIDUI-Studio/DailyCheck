@@ -9,7 +9,7 @@
 
 | 想知道 | 看哪里 |
 |---|---|
-| 有哪些路由、每条要什么权限、有哪些数据表、哪些模块在役 | [`ARCHITECTURE_MAP.md`](ARCHITECTURE_MAP.md) —— **机器生成、禁止手改**；CI `arch-map` 门禁保证与源码一致 |
+| 有哪些路由、每条要什么权限、有哪些数据表、哪些模块在役 | [`ARCHITECTURE_MAP.md`](ARCHITECTURE_MAP.md) —— **机器生成、禁止手改**；`tests/test_arch_map.py` 在 CI 的 `test` job 里强制校验一致性 |
 | 为什么这样设计、踩过什么坑、怎么部署、怎么回滚 | 本文件（人工维护，只写「为什么」与稳定结构） |
 
 本文件**不再收录逐条路由清单与模块规模**——它们随每个功能变化，一律由派生图回答。
@@ -1486,6 +1486,6 @@ with app.test_client() as c, c.session_transaction() as s:
 | `tests/**` | §12 |
 | `.github/workflows/*` / `deploy/**` / `scripts/**` | §3 §12 §附 |
 | `docs/ARCHITECTURE.md`（本文件） | 自更新 |
-| `scripts/arch_map.py` 或路由/权限/表结构 | 先改脚本语义，再 `python3 scripts/arch_map.py --write` 重生成 `docs/ARCHITECTURE_MAP.md`（CI `arch-map` 会校验） |
+| `scripts/arch_map.py` 或路由/权限/表结构 | 先改脚本语义，再 `python3 scripts/arch_map.py --write` 重生成 `docs/ARCHITECTURE_MAP.md`（一致性由 `tests/test_arch_map.py` 在 CI 强制） |
 
 **门禁脚本**：`scripts/git-hooks/pre-commit` 已装。运行 `python scripts/arch_touched_sections.py` 看本 commit 该改哪些章节。
