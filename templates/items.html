@@ -3,7 +3,8 @@
 {% block content %}
 <div class="page-header">
   <h2>品类与品项</h2>
-  {% if g.user and g.user['is_admin'] %}
+  <div class="page-header-actions">
+    {% if g.user and g.user['is_admin'] %}
     <form method="post" action="{{ url_for('items.recompute_safety_stock') }}" class="inline"
           onsubmit="return confirm('按「近 {{ safety_stock_window }} 天消耗量 × {{ safety_stock_factor }}」重算本仓全部品项的安全库存？\n消耗历史不足 {{ safety_stock_window }} 天的品项将写 0。');">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -12,7 +13,8 @@
     <a href="{{ url_for('import_items.upload_form') }}" class="btn-sm">
       📥 批量导入
     </a>
-  {% endif %}
+    {% endif %}
+  </div>
 </div>
 
 <div class="cat-bar" role="tablist" aria-label="按品类筛选">

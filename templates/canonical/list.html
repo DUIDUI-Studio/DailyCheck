@@ -4,9 +4,9 @@
 {% set is_admin = g.user and g.user['is_admin'] %}
 <div class="page-header">
   <h2>品项主数据</h2>
-  <div>
+  <div class="page-header-actions">
     {% if is_admin %}
-    <a class="btn-sm" href="{{ url_for('canonical.canonical_edit') }}">➕ 新建</a>
+    <a class="btn-sm primary" href="{{ url_for('canonical.canonical_edit') }}">➕ 新建</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_bulk_import') }}">📥 批量导入</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout') }}">📤 扇出</a>
     {% if price_managed %}
@@ -52,7 +52,7 @@
     </label>
   </div>
   <div class="form-actions">
-    <button type="submit" class="btn-sm">筛选</button>
+    <button type="submit" class="btn-sm primary">筛选</button>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_list') }}">清除</a>
   </div>
 </form>
@@ -98,7 +98,7 @@
         {% endif %}
       </td>
       <td><small>{{ it['created_from'] }}</small></td>
-      <td>
+      <td class="inline">
         {% set edit_args = {'canonical_id': it['id'], 'q': filters.q or none, 'category': filters.category or none, 'status': filters.status or none} %}
         {% set detail_args = {'canonical_id': it['id'], 'q': filters.q or none, 'category': filters.category or none, 'status': filters.status or none} %}
         <a class="btn-sm" href="{{ url_for('canonical.canonical_detail', **detail_args) }}">查看</a>
@@ -148,7 +148,9 @@
       </select>
     </label>
   </div>
-  <button type="submit">批量修改选中项</button>
+  <div class="form-actions">
+    <button type="submit" class="btn">批量修改选中项</button>
+  </div>
 </div>
 </form>
 <script>

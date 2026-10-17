@@ -19,8 +19,10 @@
     <strong>{{ s['name'] }}</strong> (id={{ s['canonical_id'] }}, score={{ s['score'] }})
   </label>
   {% endfor %}
-  <button type="submit" class="btn">选用</button>
-  <a class="btn-link" href="{{ url_for('items.items_list') }}">取消</a>
+  <div class="form-actions">
+    <button type="submit" class="btn">选用</button>
+    <a class="btn-link" href="{{ url_for('items.items_list') }}">取消</a>
+  </div>
 </form>
 
 {% elif pending['next_action'] == 'request_new' %}
