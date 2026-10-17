@@ -52,8 +52,13 @@
           {% if not it.canonical_active %}
             <span class="muted" title="主数据总闸已关闭，订货目录已整体过滤该品项">由主数据控制</span>
           {% else %}
-          <form method="post" action="{{ url_for('store_ordering.manage_dc_items') }}" class="inline-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          {# 加 data-ajax：不打这个标记时点「下架/恢复可订」会整页 POST →
+             302 重渲染 → 滚动归零。本页按品类分组有多张表，连续调整多个
+             品项就得反复从顶部滚回来（Issue #93）。reload-stay 由
+             static/ajax-form.js 的 reloadStay() + pageshow 还原位置。 #}
+          <form method="post" action="{{ url_for('store_ordering.manage_dc_items') }}"
+                class="inline-form" data-ajax data-ajax-mode="reload-stay">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="canonical_id" value="{{ it.canonical_id }}" />
             <input type="hidden" name="is_orderable" value="{{ 0 if it.is_orderable else 1 }}" />
             <button type="submit" class="btn-sm {{ 'danger' if it.is_orderable else 'ok' }}">

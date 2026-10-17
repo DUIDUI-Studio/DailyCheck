@@ -71,10 +71,22 @@
     </li>
     {% endif %}
   </ul>
+  {# 这段依据是「提交时所在页面」，不是「出问题页面」。管理员的判断比机器准，
+     所以留一个改正入口，别让错误定位进 Issue 正文（Issue #93 教训）。 #}
+  <p class="feedback-hint">
+    依据是<b>提交反馈时所在的页面</b>。如果和「现象」不符，在下面「实际页面」填正确路径即可重新定位。
+  </p>
+</div>
+{% elif code_clues and code_clues.reason == 'transient_page' %}
+<div class="feedback-warn">
+  提交时停在纯中转页 <code>{{ ticket.page_path }}</code>（登录 / 仓库选择一类），
+  页面上没有任何业务内容，这条路径<b>不会</b>写进 Issue 的代码线索 —— 否则等于让开发侧改错文件。
+  知道真正出问题的页面就填在下面「实际页面」里。
 </div>
 {% elif ticket.page_path %}
 <p class="feedback-hint">
   页面 <code>{{ ticket.page_path }}</code> 未能自动定位到路由，Issue 会提示开发侧自行推断入口。
+  知道确切路径的话填在下面「实际页面」里。
 </p>
 {% endif %}
 
@@ -84,6 +96,14 @@
     <textarea name="comment" rows="6" maxlength="2000" required
               placeholder="现象：菜单点导出没反应，报表页也一样&#10;影响范围：只影响报表和库存两个页面&#10;期望结果：点导出能下载 xlsx"></textarea>
   </label>
+  {# 页面路径可覆盖：自动带的是「点反馈时所在页面」，与「出问题页面」不总是一致。 #}
+  <label>实际页面（可选）
+    <input type="text" name="page_override" maxlength="500"
+           placeholder="{{ ticket.page_path or '/store-ordering/dc/items' }}">
+  </label>
+  <p class="feedback-hint">
+    留空 = 沿用提交时所在页面 <code>{{ ticket.page_path or '（未记录）' }}</code>；填了就用它重新定位。
+  </p>
   {# 三段结构能显著提高 Issue 的可执行性，但强制分段会让管理员嫌烦，
      所以做成「一键插入」而不是必填项。 #}
   <button type="button" class="btn-sm" data-fill-template>插入结构模板</button>
@@ -114,6 +134,10 @@
       box.value = '现象：\n影响范围：\n期望结果：\n' + (box.value ? '\n' + box.value : '');
     }
     box.focus();
+    // 光标必须落在「现象：」之后。不设的话 value 重设后 selection 归末尾，
+    // 人会顺着最后一行往下写，三行骨架全空着被提交（Issue #93 实况）。
+    // 「现象：」= 2 个汉字 + 1 个全角冒号 → 偏移 3。
+    try { box.setSelectionRange(3, 3); } catch (_) {}
   });
 })();
 </script>

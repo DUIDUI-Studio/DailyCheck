@@ -266,7 +266,16 @@ def dispatch_feedback(ticket_id: int):
 
         # 代码定位在发请求前做：正文的精确度主要靠这一段，而不是靠用户措辞。
         # collect 内部全程 fail-soft，失败只是少一段线索，不会让派发失败。
-        clues = introspect.collect(current_app._get_current_object(), ticket.get("page_path"))
+        #
+        # 定位来源优先级：管理员在「实际页面」里手填的 > 用户提交时所在页面。
+        # 前者是有意纠正（Issue #93：用户停在仓库选择页提的反馈，自动路径完全
+        # 无关），后者只是「点反馈那一刻在哪」。clean_path 会把外部 URL 洗成空，
+        # 所以非法输入自然回落，不需要额外校验。
+        override = introspect.clean_path(request.form.get("page_override", ""))
+        if override and override != str(ticket.get("page_path") or ""):
+            ticket["page_path_override"] = override
+        locate_from = ticket.get("page_path_override") or ticket.get("page_path")
+        clues = introspect.collect(current_app._get_current_object(), locate_from)
         issue = dispatch.create_issue(
             dispatch.build_issue_title(ticket),
             dispatch.build_issue_body(
