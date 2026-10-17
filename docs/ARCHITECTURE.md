@@ -292,6 +292,7 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 - **JSON 起点用 `find("{")` 不能用 `rfind`**：审计行尾部是 `{… "lock": {…}}`，`rfind` 抓到内层对象 → `json.loads` 见 `…}}` 抛错 → `lock.pr` / `lock.sha` 全丢 → 无 `pr=` 参数的 promote/switch 行被整行丢弃，瀑布图只剩 `up` 一段（2026-10-17 实 hit，已由 `tests/test_dashboard_ops.py` 锁死）。
 - **switch.sh 取最后一次**：同一条 PR 的 switch.sh 会出现多次（verify check 4 的回滚演练也调它），只有最后一次才是真切流。
 - **不猜「中断」**：阶段耗时超阈值只标 `stalled`（仅 `up` / `promote` 这类秒级阶段，阈值 300s），渲染侧只上色不改事实。`verify` 天然 10–15 分钟，不参与卡顿判定。
+- **`promote.sh` 不总留审计行**（生产实测：#97 有、#89/#90/#94/#96 无，推测与是否走 `deploy_pipeline.sh` 及 `deploy_state check` 调用点有关）。因此当 promote 标记缺失时，段会从 `verify` 一路并到切流 —— KPI 相应改名为**「验证到切流」（verify → switch，含 promote）**，不叫「八项检查耗时」：后者会把 #97 的 10:08 说成 16:37。
 
 **存储（事件型，与快照型分开）**：`db.py` 的三张表是快照型（每次渲染整份写一份），按 15 分钟一次存会 96 份/天的重复。故新增 `ops_db.py` 三张**时间序列表** + 幂等 upsert（主键 `(pr, sha)` / `(day, source)` / `(pr, generated_at)`），只借 `db.connect()`，不改既有表。
 
