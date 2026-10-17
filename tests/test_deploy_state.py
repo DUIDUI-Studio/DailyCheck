@@ -142,6 +142,16 @@ def test_acquire_evicts_stale_lock(state_dir: Path):
     assert data["last_evicted"]["pr"] == 7
 
 
+def test_lock_survives_verify_length_gap(state_dir: Path):
+    """回归：verify 实测 12-14 分钟 —— 旧 TTL 900s 会在 verify 中途过期被抢占
+    （2026-10-17 PR #96 生产实测 last_evicted：心跳 20:17:10 → 20:37:19 被抢）。
+    TTL 必须明显长于单步最长耗时，否则「单飞」被合法抢占打穿。"""
+    _acquire(state_dir)
+    _age_lock(state_dir, seconds=1000)  # 旧 900s 已判过期；1800s 仍应活跃
+    assert _run(state_dir, "check").returncode == 10
+    assert "1800s" in _run(state_dir, "status").stdout
+
+
 def test_acquire_creates_missing_dir(tmp_path: Path):
     missing = tmp_path / "fresh"
     proc = _run(missing, "acquire", "--pr", "1", "--sha", "x")
@@ -343,3 +353,103 @@ def test_corrupt_state_read_commands_survive(state_dir: Path):
     proc = _run(state_dir, "check")
     assert proc.returncode == 0  # 不炸；按空状态处理
     assert not list(state_dir.glob("state.json.corrupt-*"))  # 只读命令不落盘
+
+
+# ----------------------------------------------------------------------
+# token 文件交接（会话层脱敏的规避通道）
+#
+# 背景：Hermes 会把工具 stdout 里形似密钥的值脱敏成 ***，acquire 输出的
+# token 在会话侧拿不到（2026-10-17 PR #96：agent 转去 cat state.json 手抠，
+# 撞上「管道进解释器」审批门禁）。因此 token 必须落 0600 文件，heartbeat /
+# release 缺省从文件取 —— 这些用例锁住"文件存在、权限对、生命周期对"。
+# ----------------------------------------------------------------------
+
+def _token_file(state_dir: Path) -> Path:
+    return state_dir / "lock.token"
+
+
+def test_acquire_writes_token_file(state_dir: Path):
+    token = _acquire(state_dir)
+    path = _token_file(state_dir)
+    assert path.exists()
+    assert path.read_text(encoding="utf-8").strip() == token
+    assert (path.stat().st_mode & 0o777) == 0o600  # token 不许同机可读
+
+
+def test_acquire_reports_token_file_path(state_dir: Path):
+    proc = _run(state_dir, "acquire", "--pr", "7", "--sha", "aaa111")
+    payload = _out(proc)
+    assert payload["token_file"] == str(_token_file(state_dir))
+
+
+def test_acquire_preempt_overwrites_token_file(state_dir: Path):
+    first = _acquire(state_dir, pr=7)
+    _age_lock(state_dir)
+    proc = _run(state_dir, "acquire", "--pr", "8", "--sha", "bbb")
+    assert proc.returncode == 0
+    now = _token_file(state_dir).read_text(encoding="utf-8").strip()
+    assert now == _out(proc)["token"]
+    assert now != first  # 抢占必须换 token，旧 token 立即失效
+
+
+def test_heartbeat_defaults_to_token_file(state_dir: Path):
+    _acquire(state_dir)
+    # 不传 --token：走 <state_dir>/lock.token
+    proc = _run(state_dir, "heartbeat", "--phase", "verify")
+    assert proc.returncode == 0
+    assert _state(state_dir)["lock"]["phase"] == "verify"
+
+
+def test_heartbeat_token_file_option(state_dir: Path):
+    token = _acquire(state_dir)
+    custom = state_dir.parent / "carried.token"
+    custom.write_text(token + "\n", encoding="utf-8")
+    proc = _run(state_dir, "heartbeat", "--token-file", str(custom))
+    assert proc.returncode == 0
+
+
+def test_heartbeat_missing_token_file_rejected(state_dir: Path):
+    _acquire(state_dir)
+    _token_file(state_dir).unlink()
+    proc = _run(state_dir, "heartbeat")
+    assert proc.returncode == 11  # 拿不到 token = fail-closed，不猜
+
+
+def test_release_defaults_to_token_file(state_dir: Path):
+    _acquire(state_dir, pr=7, sha="aaa111")
+    proc = _run(state_dir, "release", "--result", "success")
+    assert proc.returncode == 0
+    assert _state(state_dir)["deployed"]["sha"] == "aaa111"
+    assert not _token_file(state_dir).exists()  # 收官后 token 不留在盘上
+
+
+def test_release_failed_also_removes_token_file(state_dir: Path):
+    _acquire(state_dir)
+    _run(state_dir, "release", "--result", "failed")
+    assert not _token_file(state_dir).exists()
+
+
+def test_clear_lock_removes_token_file(state_dir: Path):
+    _acquire(state_dir)
+    assert _token_file(state_dir).exists()
+    assert _run(state_dir, "clear-lock", "--yes").returncode == 0
+    assert not _token_file(state_dir).exists()
+
+
+def test_status_reports_token_file(state_dir: Path):
+    _acquire(state_dir)
+    human = _run(state_dir, "status")
+    assert "token_file:" in human.stdout
+    assert "present" in human.stdout
+    payload = _out(_run(state_dir, "status", "--json"))
+    assert payload["token_file"]["present"] is True
+    assert payload["token_file"]["path"] == str(_token_file(state_dir))
+
+
+def test_state_file_not_world_readable(state_dir: Path):
+    _acquire(state_dir)
+    # token 在 state.json 里也有一份 —— 两个文件都必须 0600
+    assert ((state_dir / "state.json").stat().st_mode & 0o777) == 0o600
+    # 目录也收紧（否则 0600 文件在 0755 目录里仍可被列举）
+    assert (state_dir.stat().st_mode & 0o777) == 0o700
+

@@ -6,7 +6,7 @@
 同时全绿 / 同一 PR 多个 check_suite 事件）可能让两个部署会话在同一套
 蓝绿设施上重叠 —— 本原语提供「部署单飞」所需的全部状态机：
 
-  组件一：会话级部署锁（心跳式，TTL 15 分钟）
+  组件一：会话级部署锁（心跳式，TTL 30 分钟）
     - acquire 抢锁（被活跃锁占用时拒绝）；heartbeat 续约；release 收官。
     - 持有者崩溃 -> 心跳过期 -> 锁自动失效，后来者可抢占（无死锁）。
   组件二：事实锚点「已部署 sha」+ 追平检测（catchup）
@@ -29,10 +29,17 @@
 
 环境变量：
     DAILYCHECK_DEPLOY_STATE_DIR       状态目录（默认 /var/lib/dailycheck-deploy）
-    DAILYCHECK_DEPLOY_HEARTBEAT_TTL   心跳过期阈值秒（默认 900）
+    DAILYCHECK_DEPLOY_HEARTBEAT_TTL   心跳过期阈值秒（默认 1800 —— 必须明显长于
+                                      单步最长耗时：verify 实测 12-14 分钟，
+                                      900s 会让锁在 verify 中途就过期被合法抢占）
     DAILYCHECK_PROD_REPO              catchup 默认取 main 的仓库（默认 /root/DailyCheck）
 
-输出：除 status 外均为单行 JSON（stdout）；错误信息走 stderr。
+输入/输出：
+    - 除 status 外均为单行 JSON（stdout）；错误信息走 stderr。
+    - **token 走文件，不走 stdout**：acquire 除 JSON 外还写 `<state_dir>/lock.token`
+      （0600），heartbeat / release 缺省从该文件取 token。原因：会话层（Hermes /
+      飞书）会把 stdout 里形似密钥的值脱敏成 `***`，token 一旦只走 stdout，
+      调用方就只能去 state.json 手抠 —— 那一步会撞上「管道进解释器」审批门禁。
 stdlib only（fcntl 限 POSIX —— 本项目运行时只有 macOS dev / Linux prod）。
 """
 
@@ -50,11 +57,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 DEFAULT_STATE_DIR = "/var/lib/dailycheck-deploy"
-DEFAULT_TTL = 900
+DEFAULT_TTL = 1800
 DEFAULT_PROD_REPO = "/root/DailyCheck"
 
 STATE_FILENAME = "state.json"
 FLOCK_FILENAME = ".state.lock"
+TOKEN_FILENAME = "lock.token"
 
 EXIT_OK = 0
 EXIT_BEHIND = 1
@@ -123,13 +131,61 @@ def _load_state(directory: Path, heal: bool = False) -> dict:
 def _save_state(directory: Path, state: dict) -> None:
     tmp = directory / f".{STATE_FILENAME}.tmp-{os.getpid()}"
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # state 里有锁 token，按密钥对待；umask 不可靠，显式收紧
+    os.chmod(tmp, 0o600)
     os.replace(tmp, directory / STATE_FILENAME)
+
+
+def _token_path(directory: Path) -> Path:
+    return directory / TOKEN_FILENAME
+
+
+def _write_token_file(directory: Path, token: str) -> Path:
+    """把锁 token 落到 0600 文件。
+
+    为什么要有文件：Hermes / 飞书等会话层会把形似密钥的值脱敏成 `***`，
+    会话侧从 stdout 拿不到 token（2026-10-17 PR #96 实测：agent 只好去
+    cat state.json 手抠，撞上「管道进解释器」审批门禁卡 5 分钟）。文件是
+    唯一稳定的交接通道：写入方是脚本，读取方是同机 root 会话。
+    """
+    path = _token_path(directory)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token + "\n")
+    os.chmod(path, 0o600)  # O_CREAT 的 mode 对已存在文件不生效
+    return path
+
+
+def _remove_token_file(directory: Path) -> None:
+    try:
+        _token_path(directory).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[deploy_state] WARN: 清理 token 文件失败（{exc}）", file=sys.stderr)
+
+
+def _resolve_token(args, directory: Path) -> str:
+    """--token 优先，其次 --token-file，都省略则读 <state_dir>/lock.token。"""
+    explicit = (getattr(args, "token", "") or "").strip()
+    if explicit:
+        return explicit
+    raw = (getattr(args, "token_file", "") or "").strip()
+    path = Path(raw) if raw else _token_path(directory)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 @contextmanager
 def _write_lock(directory: Path):
     """写命令的读-改-写全程排他互斥（防两个进程同时改 state）。"""
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(directory, 0o700)  # 目录里有 token，别留 0755
+    except OSError:
+        pass
     with open(directory / FLOCK_FILENAME, "a+") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -238,9 +294,11 @@ def cmd_acquire(args) -> int:
             "heartbeat_at": now,
         }
         _save_state(directory, state)
+        token_file = _write_token_file(directory, token)
         _emit({
             "ok": True,
             "token": token,
+            "token_file": str(token_file),
             "pr": args.pr,
             "sha": args.sha or "",
             "ttl": _ttl(),
@@ -252,10 +310,11 @@ def cmd_acquire(args) -> int:
 def cmd_heartbeat(args) -> int:
     """续约。token 必须匹配当前锁；过期锁若未被抢占仍可救活。"""
     directory = _state_dir()
+    token = _resolve_token(args, directory)
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
         lock = state.get("lock")
-        if not isinstance(lock, dict) or lock.get("token") != args.token:
+        if not isinstance(lock, dict) or not token or lock.get("token") != token:
             _emit({"ok": False, "reason": "token-mismatch-or-no-lock"})
             return EXIT_TOKEN_MISMATCH
         now = _now()
@@ -271,10 +330,11 @@ def cmd_heartbeat(args) -> int:
 def cmd_release(args) -> int:
     """收官。success -> 更新 deployed 锚点并清 last_attempt；failed -> 记 last_attempt。"""
     directory = _state_dir()
+    token = _resolve_token(args, directory)
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
         lock = state.get("lock")
-        if not isinstance(lock, dict) or lock.get("token") != args.token:
+        if not isinstance(lock, dict) or not token or lock.get("token") != token:
             _emit({"ok": False, "reason": "token-mismatch-or-no-lock"})
             return EXIT_TOKEN_MISMATCH
 
@@ -298,6 +358,7 @@ def cmd_release(args) -> int:
 
         state["lock"] = None
         _save_state(directory, state)
+        _remove_token_file(directory)  # 锁已放手，token 文件一律不留在盘上
         _emit({"ok": True, "result": args.result, "sha": sha, "pr": pr})
         return EXIT_OK
 
@@ -387,6 +448,7 @@ def cmd_clear_lock(args) -> int:
         old = state.get("lock")
         state["lock"] = None
         _save_state(directory, state)
+        _remove_token_file(directory)
         print("[deploy_state] WARN: 锁已被人工清除（clear-lock --yes）", file=sys.stderr)
         _emit({"ok": True, "cleared": _lock_brief(old) if old else None})
         return EXIT_OK
@@ -404,6 +466,7 @@ def cmd_status(args) -> int:
         _emit({
             "state_dir": str(directory),
             "activated": directory.is_dir(),
+            "token_file": {"path": str(_token_path(directory)), "present": _token_path(directory).exists()},
             "lock_active": active,
             "lock": _lock_brief(lock),
             "deployed": state.get("deployed"),
@@ -414,6 +477,8 @@ def cmd_status(args) -> int:
 
     print(f"state_dir : {directory}  ({'activated' if directory.is_dir() else 'NOT activated'})")
     print(f"ttl       : {_ttl()}s")
+    tok = _token_path(directory)
+    print(f"token_file: {tok}  ({'present' if tok.exists() else 'absent'})")
     if active:
         print(f"lock      : ACTIVE  pr={lock.get('pr')} phase={lock.get('phase')} "
               f"session={lock.get('session') or '-'} beat={_fmt_ts(lock.get('heartbeat_at'))}")
@@ -452,12 +517,16 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_acquire)
 
     p = sub.add_parser("heartbeat", help="续约（rc 11=token 不匹配）")
-    p.add_argument("--token", required=True)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--token", default="", help="锁 token（缺省读 <state_dir>/lock.token）")
+    g.add_argument("--token-file", default="", help="从指定文件读 token")
     p.add_argument("--phase", default="")
     p.set_defaults(func=cmd_heartbeat)
 
     p = sub.add_parser("release", help="收官（success 更新 deployed 锚点）")
-    p.add_argument("--token", required=True)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--token", default="", help="锁 token（缺省读 <state_dir>/lock.token）")
+    g.add_argument("--token-file", default="", help="从指定文件读 token")
     p.add_argument("--result", required=True, choices=["success", "failed"])
     p.add_argument("--sha", default="")
     p.add_argument("--note", default="")
