@@ -93,6 +93,16 @@ def test_digest_detects_auth_tightening():
     assert delta["chg_auth"] == [("auth.logout", "公开", "平台超管")]
 
 
+def test_digest_detects_table_addition():
+    """新增数据表必须被识别——它意味着有迁移要上生产。"""
+    base = arch_map.render()
+    new_text = base.replace("`login_throttle`", "`login_throttle` · `arch_probe_table`", 1)
+    delta = arch_digest.compute_delta(
+        arch_digest.parse_map(base), arch_digest.parse_map(new_text)
+    )
+    assert delta["add_tbl"] == ["arch_probe_table"]
+
+
 def test_digest_reports_no_change_for_identical_maps():
     base = arch_map.render()
     delta = arch_digest.compute_delta(

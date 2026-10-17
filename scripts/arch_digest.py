@@ -71,7 +71,8 @@ def parse_map(text: str) -> dict:
 
 def resolve_base(since: str, base: str | None) -> tuple[str | None, str]:
     if base:
-        return base, git("log", "-1", "--format=%ad", "--date=short", base).strip()
+        sha = git("rev-parse", base).strip() or base
+        return sha, git("log", "-1", "--format=%ad", "--date=short", sha).strip()
     cutoff = git("log", "-1", "--format=%cI", f"--before={since}", "--", MAP_REL).strip()
     sha = git("log", "-1", "--format=%H", f"--before={since}", "--", MAP_REL).strip()
     if not sha:

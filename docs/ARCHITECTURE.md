@@ -15,6 +15,9 @@
 本文件**不再收录逐条路由清单与模块规模**——它们随每个功能变化，一律由派生图回答。
 要改派生图的内容就改 `scripts/arch_map.py`，然后 `python3 scripts/arch_map.py --write`。
 
+**想知道「这一周架构变了什么」**：`python3 scripts/arch_digest.py`（默认近 7 天，可 `--since "30 days ago"` 或 `--base <sha>`）。
+它比的是派生图的结构化事实，只报新增/删除路由、鉴权收紧、表增删、蓝图装配变化，不会把表格重排当成变更。
+
 ---
 
 ## 目录
