@@ -29,8 +29,9 @@
 
 | 文件 | 用途 | 状态 |
 |------|------|------|
-| `up.sh` | 起绿环境（cp DB + systemctl **restart** dailycheck-green.service + 健康检查） | 骨架 + systemd TODO |
+| `up.sh` | 起绿环境（cp DB + systemctl **restart** dailycheck-green.service + 健康检查；**绿在役时先切蓝**） | 骨架 + systemd TODO |
 | `verify.sh` | 跑八项生产验证 | 骨架（占位报告，exit 0 警告） |
+| `promote.sh` | **绿转正**（关 DRY_RUN + DB 指回真库 + daemon-reload/restart + 健康复核；幂等 + 备份 + 失败回滚） | 已实装（2026-10-17 事故后新增） |
 | `switch.sh` | 切流量（nginx upstream weight + reload） | 骨架 + systemd TODO |
 | `rollback.sh` | 秒级切回蓝（weight=0 + 不停绿进程） | 骨架 + systemd TODO |
 | `down.sh` | 清理绿（systemctl stop + 可选 rm DB） | 骨架 + systemd TODO |
@@ -61,7 +62,11 @@
 | `GREEN_MCP_SERVICE_UNIT` | `dailycheck-green-mcp.service` | 绿 MCP unit |
 | `GREEN_ENV_FILE` | `/etc/wdg/dailycheck-green.env` | 绿 Flask env 文件 |
 | `GREEN_MCP_ENV_FILE` | `/etc/wdg/dailycheck-green-mcp.env` | 绿 MCP env 文件（模板：蓝 `/etc/wdg/dailycheck-mcp.env`） |
-| `NGINX_DAILYCHECK_CONF` | `/etc/nginx/sites-enabled/dailycheck` | nginx 配置路径 |
+| `NGINX_DAILYCHECK_CONF` | `/etc/nginx/sites-enabled/dailycheck` | nginx 配置路径（`up.sh` 活流量守卫另支持 `NGINX_CONF` 覆盖，同值） |
+| `BLUE_HEALTH_URL` | `http://127.0.0.1:8090/health` | `up.sh` 绿在役时切蓝前探活蓝 |
+| `SYSTEMD_UNIT_DIR` / `GREEN_UNIT_PATH` / `GREEN_MCP_UNIT_PATH` | `/etc/systemd/system` + `dailycheck-green{,-mcp}.service` | `promote.sh` 改写的 unit 文件路径 |
+| `SYSTEMCTL_BIN` / `CURL_BIN` | `systemctl` / `curl` | `promote.sh` 命令二进制（单测用 fake） |
+| `HEALTH_TRIES` / `HEALTH_INTERVAL` | `30` / `2` | `promote.sh` 健康轮询次数 / 间隔秒 |
 | `REPORT_DIR` | `backups/prod-verifications` | verify.sh 报告输出 |
 | `EVIDENCE_BASE` | `/var/log/dailycheck` | rollback.sh 取证目录 |
 | `BLUE_URL` | `http://127.0.0.1:8090` | verify.sh 蓝基准 URL |
@@ -99,16 +104,59 @@ if current_app.config.get("DRY_RUN"):
 承接生产流量。2026-10-15 生产事故（绿实例接管流量 44 分钟、全站写操作「假成功」）
 即由此造成。
 
-标准步骤（`verify.sh` 全绿之后、切流量之前执行）：
+### 标准用法（`verify.sh` 全绿之后、切流量之前执行）
 
-1. **关写隔离**：`dailycheck-green.service` 删除 `DRY_RUN=true`（或改 `false`）；
-2. **DB 指回生产真库**：绿两个 unit 的 env 文件（`GREEN_ENV_FILE` /
-   `GREEN_MCP_ENV_FILE`）删除或改写 `DAILYCHECK_DB_DIR` → `${APP_DIR}/db`
-   （验证期独立副本 `/var/lib/dailycheck-green/db` 不再使用）。
+```bash
+# 部署会话已 acquire 锁的前提下（无锁 → exit 10；人工操作可 DAILYCHECK_DEPLOY_UNLOCKED=1）
+./scripts/blue_green/promote.sh --dry-run   # 先看它要做哪三件事（不写文件、不调 systemctl）
+./scripts/blue_green/promote.sh             # 真跑：关写隔离 + DB 指回真库 + daemon-reload/restart + 健康复核
+```
+
+`promote.sh` 把原来靠人记的三步固化成一条可重放的命令（2026-10-17 事故：漏做转正
+= 全站写静默假成功，且绿在役时 `up.sh` 重启绿会把线上实例换回写隔离态）：
+
+1. **备份**：`dailycheck-green.service` / `dailycheck-green-mcp.service`（以及存在的
+   `GREEN_ENV_FILE` / `GREEN_MCP_ENV_FILE`）→ `BACKUP_DIR`（默认
+   `/var/lib/dailycheck-blue-green-backups`），并写清单供失败回滚；
+2. **关写隔离**：app unit 的 `Environment=DRY_RUN=true` 改为 `false`
+   ——**无该行则不加**（等于本来就没开，视为已转正）；
+3. **DB 指回生产真库**：两个 unit（及存在的 env 文件）的 `DAILYCHECK_DB_DIR=...`
+   → `${APP_DIR}/db`（`DAILYCHECK_APP_DIR` 可覆盖）。验证期独立副本
+   `/var/lib/dailycheck-green/db` 不再使用。
    ⚠️ 此步后绿具备真实写能力，其后任何流量都会直接写入生产库；
-3. `systemctl daemon-reload && systemctl restart dailycheck-green dailycheck-green-mcp`；
-4. 复验：`systemctl show dailycheck-green -p Environment --value` 不含 `DRY_RUN=true`；
-5. 灰度切流量：`switch.sh green 5 → 50 → 100`（每步观察窗；100%/0% 边界自动做落点核验）。
+4. `systemctl daemon-reload` → `restart dailycheck-green dailycheck-green-mcp`；
+5. **健康复核**：轮询 `:8091/health` 必须 200；`:5101/health` 返回 200 或 401 均视为活
+   （MCP 带 token 鉴权，活着的实例对无凭据探针返 401）；
+6. 手动复验（可选，等价于脚本步骤 5）：
+   `systemctl show dailycheck-green -p Environment --value` 不含 `DRY_RUN=true`；
+7. 灰度切流量：`switch.sh green 5 → 50 → 100`（每步观察窗；100%/0% 边界自动做落点核验）。
+
+**幂等**：已转正（无 `DRY_RUN=true` 且 DB 已指向 `${APP_DIR}/db`）→ 打印
+`already promoted` 并 exit 0，**不会**再 restart 在役实例（重启在役实例本身就是事故）。
+
+**失败**：任一步失败（文件缺失 / sed 未命中 / daemon-reload / restart / 健康超时）
+→ 按备份清单恢复被改文件 + 再 `daemon-reload` + 明确错误信息，exit 1。宁可留在
+写隔离态（不接流量），也不留「半转正」。
+
+**退出码**：`0` 成功/已转正、`1` 失败（已回滚）、`10` 无活跃部署锁、`64` 参数错。
+
+**可测试性**：unit / env 路径、`SYSTEMCTL_BIN`、`CURL_BIN`、`BACKUP_DIR`、健康 URL
+与节奏参数全部 env 可覆盖（默认为生产值），单测用 fake 命令驱动：
+`tests/test_blue_green_promote_guard.py`。
+
+### 绿在役时 `up.sh` 会先切蓝（2026-10-17 事故加固）
+
+`up.sh` 重启绿之前会解析 nginx conf（`NGINX_CONF`，默认
+`/etc/nginx/sites-enabled/dailycheck`）判断绿是否正在承流
+（`server 127.0.0.1:8091` 非 `down` 且 `weight>0`）：
+
+| 判定 | `up.sh` 行为 |
+|------|-------------|
+| **serving**（绿在役） | 先探活蓝（`BLUE_HEALTH_URL`，须 200）→ 健康则 `switch.sh blue 100` 把流量挪走 → 再重启绿；蓝不健康 → **exit 1 且不重启绿** |
+| **idle**（`down` / `weight=0` / 不在 upstream） | 与加固前一致，直接重启 |
+| **unknown**（conf 读不到 / 无 `upstream dailycheck` 块 / `weight` 值不可解析） | **exit 1 拒绝执行**，提示人工核对 nginx 布局 |
+
+不允许静默降级：判断不了「重启会不会打断在役实例」时，脚本选择不动。
 
 **防线（switch.sh 内置，2026-10-15 事故后加固）**：
 
@@ -163,15 +211,23 @@ read -rsp 'SIM_USER_PASSWORD: ' SIM_USER_PASSWORD; export SIM_USER_PASSWORD  # �
 # 3. dry_run 隔离证据采集
 ./scripts/agent_framework/prod_dryrun_evidence.sh
 
-# 4. 通过后切流量（5% → 50% → 100%）
+# 4. 绿转正（关写隔离 + DB 指回真库 + restart）—— 漏这步就是「全站写假成功」
+./scripts/blue_green/promote.sh --dry-run
+./scripts/blue_green/promote.sh
+
+# 5. 通过后切流量（5% → 50% → 100%）
 ./scripts/blue_green/switch.sh green 5
 ./scripts/blue_green/switch.sh green 50
 ./scripts/blue_green/switch.sh green 100
 
-# 5. 观察窗 30 分钟无异常 → 合 PR
-# 6. 蓝环境 standby 7 天后清理
+# 6. 观察窗 30 分钟无异常 → 合 PR
+# 7. 蓝环境 standby 7 天后清理
 ./scripts/blue_green/down.sh --keep-blue
 ```
+
+> ⚠️ **转正之后不要再直接跑 `up.sh` 起新绿**：绿在承流时 `up.sh` 会先探活蓝并
+> `switch.sh blue 100` 把流量挪走再重启绿（见上文「绿在役时 up.sh 会先切蓝」）。
+> 若蓝已不可用，`up.sh` 会直接 exit 1 拒绝执行 —— 此时先恢复蓝，别硬重启绿。
 
 ## 与现有 deploy_vps.sh 的关系
 

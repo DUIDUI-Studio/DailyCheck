@@ -15,6 +15,13 @@
 #   - 蓝 :8090 不 kill（0 中断）
 #   - 绿 :8091 起 gunicorn 2 workers + DRY_RUN=true；**用 restart 而非 start**
 #     （Issue #38：start 对在跑的 unit 是 no-op → 新 DB + 旧代码）
+#   - **活流量守卫（2026-10-17 事故）**：restart 绿之前先解析 nginx conf
+#     （NGINX_CONF，默认 /etc/nginx/sites-enabled/dailycheck）判断绿是否在承流
+#     ——`server 127.0.0.1:8091` 非 down 且 weight>0 即「在役」。在役则先探活蓝
+#     （BLUE_HEALTH_URL），健康就 `switch.sh blue 100` 把流量挪走再重启绿；蓝不
+#     健康则报错 exit 1（**不重启绿**）。conf 读不到 / 解析不了同样 exit 1
+#     （不放行猜测）。根因：绿承接 100% 流量时原地 restart 绿 = 全站 502 +
+#     （unit 仍带 DRY_RUN 时）把线上实例换回「写隔离 + 副本库」→ 写操作静默假成功。
 #   - 健康检查：30 次 × 2s = 60s 超时；/health 期望 200 + JSON
 #   - 失败时取证：journalctl → /var/log/dailycheck/green-up-fail-${PR_NUM}.log
 #
@@ -75,6 +82,21 @@ GREEN_MCP_UNIT="${GREEN_MCP_SERVICE_UNIT:-dailycheck-green-mcp.service}"
 GREEN_HEALTH_URL="${GREEN_HEALTH_URL:-http://127.0.0.1:${GREEN_PORT}/health}"
 GREEN_MCP_HEALTH_URL="${GREEN_MCP_HEALTH_URL:-http://127.0.0.1:${GREEN_MCP_PORT}/health}"
 EVIDENCE_DIR="${EVIDENCE_BASE:-/var/log/dailycheck}"
+
+# ============================================================
+# 活流量守卫配置（2026-10-17 生产事故加固）
+# ============================================================
+# 事故形态：绿当时已承接 100% 流量（switch.sh green 100 之后、转正之前/之后），
+# 此时再跑 up.sh 会**原地 restart 正在服务 100% 流量的绿**——重启窗口内全站
+# 502/超时；若 unit 仍带 DRY_RUN=true 与副本库，重启后还会把线上实例换回
+# 「写隔离 + 副本库」态，全站写静默变「假成功」（HTTP 200、库不落盘）。
+# switch.sh 的 DRY_RUN 守卫只拦「切换动作」，拦不住这条路径，故在 up.sh 里加
+# 前置判定：绿在承流 → 先探活蓝并切蓝（switch.sh blue 100），再重启绿。
+NGINX_CONF="${NGINX_CONF:-${NGINX_DAILYCHECK_CONF:-/etc/nginx/sites-enabled/dailycheck}}"
+BLUE_HEALTH_URL="${BLUE_HEALTH_URL:-http://127.0.0.1:8090/health}"
+CURL_BIN="${CURL_BIN:-curl}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SWITCH_SCRIPT="${SWITCH_SCRIPT:-${SCRIPT_DIR}/switch.sh}"
 
 # ============================================================
 # 部署单飞守卫 + 进程级互斥（deploy-singleflight，2026-10-16）
@@ -142,6 +164,67 @@ _run() {
 }
 
 # ============================================================
+# 辅助：绿是否正在承接流量（nginx conf 解析，2026-10-17 事故加固）
+# ============================================================
+_http_code() {
+  local url="$1"
+  "${CURL_BIN}" -s -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null || true
+}
+
+# 输出 serving / idle / unknown（**只读**，不碰 conf）
+#
+#   serving —— 绿在承流（重启会打断在役实例）
+#   idle    —— 绿不承流（down / weight=0 / 不在 upstream）
+#   unknown —— 无法判定（conf 读不到、缺 dailycheck upstream、weight 值不可解析）
+#
+# unknown 一律**拒绝执行**（见主流程 2.5）：此刻重启绿可能直接打断在役实例，
+# 静默放行等于把判断权交给运气。
+_green_traffic_state() {
+  local line lines state="idle" w
+  if [[ ! -r "${NGINX_CONF}" ]]; then
+    echo "unknown"
+    return 0
+  fi
+  # 旧布局（location 直指 dailycheck-green upstream）：绿恒在承流，保守判定。
+  # 该布局下 switch.sh 会以 exit 2 拒跑（Issue #32），所以守卫命中后会安全失败。
+  if grep -qE 'proxy_pass[[:space:]]+http://dailycheck-green([[:space:];]|$)' "${NGINX_CONF}" 2>/dev/null; then
+    echo "serving"
+    return 0
+  fi
+  # 拿不到 app upstream 块 → 不是本套布局，无从判定
+  if ! grep -qE '^[[:space:]]*upstream[[:space:]]+dailycheck[[:space:]]*\{' "${NGINX_CONF}" 2>/dev/null; then
+    echo "unknown"
+    return 0
+  fi
+  lines="$(grep -E '^[[:space:]]*server[[:space:]]+127\.0\.0\.1:'"${GREEN_PORT}"'([[:space:];]|$)' "${NGINX_CONF}" 2>/dev/null || true)"
+  if [[ -z "${lines}" ]]; then
+    echo "idle"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    # `down` → 该 server 不参与负载
+    if [[ "${line}" =~ (^|[[:space:]])down([[:space:];]|$) ]]; then
+      continue
+    fi
+    if [[ "${line}" =~ (^|[[:space:]])weight=[[:space:]]*([0-9]+) ]]; then
+      w="${BASH_REMATCH[2]}"
+      if [[ ${w} -gt 0 ]]; then
+        state="serving"
+      fi
+    elif [[ "${line}" =~ (^|[[:space:]])weight= ]]; then
+      # weight= 后面不是数字 → 解析不了就拒绝执行
+      echo "unknown"
+      return 0
+    else
+      # 无 weight 声明 → nginx 默认 weight=1（在承流）
+      state="serving"
+    fi
+  done <<< "${lines}"
+  echo "${state}"
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 echo "[up] === 起绿环境 (PR #${PR_NUM} @ ${COMMIT_SHA:0:7}) ==="
@@ -174,6 +257,50 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   fi
 else
   echo "[up] [DRY-RUN] would cd ${APP_DIR} && verify git HEAD == ${COMMIT_SHA:0:7}"
+fi
+
+# 2.5 活流量守卫（2026-10-17 生产事故）
+#
+# 时机刻意放在「改任何东西之前」：一旦开拷 DB / 重启 unit，绿的在役状态就已被
+# 破坏，再想"先切蓝"已无处可退（蓝可能还在跑旧代码/旧库）。
+#   serving → 探活蓝，健康则 switch.sh blue 100 把流量挪走，再继续重启绿；
+#             蓝不健康 → 明确报错 exit 1，**绝不**重启在役的绿；
+#   idle    → 绿不在承流（down / weight=0），行为与加固前一致；
+#   unknown → 读不到 / 解析不了 conf → 拒绝执行（人工核对）。
+if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
+  echo "[up] [DRY-RUN] would resolve green 承流状态 from ${NGINX_CONF}"
+  echo "[up] [DRY-RUN] would probe ${BLUE_HEALTH_URL} and run switch.sh blue 100 if green 在役"
+else
+  GREEN_TRAFFIC_STATE="$(_green_traffic_state)"
+  echo "[up] green 承流状态: ${GREEN_TRAFFIC_STATE}（conf=${NGINX_CONF}）"
+  case "${GREEN_TRAFFIC_STATE}" in
+    serving)
+      echo "[up] green 在役（nginx 正给 :${GREEN_PORT} 分流量）—— 先切蓝，避免重启打断在役实例"
+      BLUE_CODE="$(_http_code "${BLUE_HEALTH_URL}")"
+      if [[ "${BLUE_CODE}" != "200" ]]; then
+        echo "[up] ERROR: 蓝 ${BLUE_HEALTH_URL} 不健康（HTTP ${BLUE_CODE:-无响应}）" >&2
+        echo "[up]   —— 既不能切蓝，就不得重启在役的绿：本次 up.sh 中止，未做任何改动。" >&2
+        echo "[up]   —— 处置：先恢复蓝（systemctl restart dailycheck）再重跑 up.sh。" >&2
+        exit 1
+      fi
+      echo "[up] 蓝健康（${BLUE_HEALTH_URL} 200）→ switch.sh blue 100 把流量从绿挪走"
+      if ! _run bash "${SWITCH_SCRIPT}" blue 100; then
+        echo "[up] ERROR: switch.sh blue 100 失败 —— 绿仍在承流，禁止重启绿。" >&2
+        echo "[up]   —— 处置：人工核对 switch.sh 输出（可能 nginx reload 失败），修复后重跑。" >&2
+        exit 1
+      fi
+      echo "[up] 流量已切到蓝（green weight=0），可安全重启绿"
+      ;;
+    idle)
+      echo "[up] green 未承流（down / weight=0 / 不在 upstream）—— 直接重启不打断线上"
+      ;;
+    *)
+      echo "[up] ERROR: 无法判定绿是否在承接流量（conf=${NGINX_CONF}）" >&2
+      echo "[up]   —— 读不到 conf / 缺 dailycheck upstream / weight 值不可解析。" >&2
+      echo "[up]   —— 此刻重启绿可能直接打断在役实例，拒绝执行；请人工核对 nginx 布局。" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # 3. cp 真库 → 绿独立副本（Issue #28）
