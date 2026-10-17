@@ -1631,6 +1631,147 @@ table.bom-table td .bom-temp-price {
 .status-pill.suggested { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
 .status-pill.cancelled { background: #f3f4f6; color: #4b5563; border: 1px solid #e5e7eb; }
 
+/* === 订单操作条（order_detail 底部审批/发货/取消区）===
+   统一按钮高度 40px + 同字号 + 同圆角，避免 .btn-sm（11px 字/4px padding）
+   与全局 input（11px padding）混排时高低不齐、主次不分。
+   注意：作用域限定在 .order-actions 内，不改全站 .btn-sm 行为。 */
+.order-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
+}
+.order-actions form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  width: auto;
+}
+/* 表单内的输入框与按钮同高；宽度自适应但仍可分到空间 */
+.order-actions form input:not([type="hidden"]) {
+  width: auto;
+  flex: 1 1 160px;
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  font-size: 13px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+.order-actions form input:not([type="hidden"]):focus {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+}
+
+/* 按钮基类：统一尺寸，主次靠配色区分 */
+.order-actions .btn-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  height: 40px;
+  min-width: 104px;
+  padding: 0 18px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.order-actions .btn-action:active { transform: translateY(1px); }
+
+/* 主操作（通过）：实心品牌色 */
+.order-actions .btn-action.primary {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+.order-actions .btn-action.primary:hover {
+  background: var(--brand-ink);
+  border-color: var(--brand-ink);
+}
+
+/* 危险操作（拒绝 / 取消订单）：默认描边，hover 实心 */
+.order-actions .btn-action.danger {
+  background: #fff;
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+.order-actions .btn-action.danger:hover {
+  background: #b91c1c;
+  border-color: #b91c1c;
+  color: #fff;
+}
+
+/* 次要操作（一次性收货 / 返回）：中性描边 */
+.order-actions .btn-action.ghost {
+  background: #fff;
+  border-color: var(--border);
+  color: var(--brand-ink);
+}
+.order-actions .btn-action.ghost:hover {
+  background: rgba(15, 118, 110, 0.08);
+  border-color: var(--brand);
+}
+
+/* 移动端：竖排满宽，输入框独占一行 */
+@media (max-width: 640px) {
+  .order-actions { flex-direction: column; align-items: stretch; }
+  .order-actions form { width: 100%; }
+  .order-actions form input:not([type="hidden"]) { flex: 1 1 100%; }
+  .order-actions .btn-action { width: 100%; }
+}
+
+/* 表格行内操作按钮（订货审批列表「详情/审批」等）：
+   32px 高 + 13px 字，比 .btn-sm（11px 字）好点，又不撑破紧凑表格。 */
+a.btn-table,
+button.btn-table {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid var(--brand);
+  background: #fff;
+  color: var(--brand-ink);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+a.btn-table:hover,
+button.btn-table:hover {
+  background: var(--brand);
+  color: #fff;
+}
+
+/* 键盘可达性：两类新按钮统一 focus 轮廓 */
+.order-actions .btn-action:focus-visible,
+a.btn-table:focus-visible,
+button.btn-table:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
 /* ajax-form.js 成功提示浮窗。
    跟随 .is-show 类做淡入淡出；超时后自动消失。 */
 .ajax-flash {

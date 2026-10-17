@@ -36,7 +36,7 @@
       <td>{{ o.expected_delivery_date or '—' }}</td>
       <td>{{ o.note or '—' }}</td>
       <td>
-        <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情/审批</a>
+        <a class="btn-table" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情/审批</a>
       </td>
     </tr>
     {% endfor %}
@@ -67,7 +67,7 @@
       <td>{{ o.approved_at or '—' }}</td>
       <td>{{ o.expected_delivery_date or '—' }}</td>
       <td>
-        <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情/出库</a>
+        <a class="btn-table" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情/出库</a>
       </td>
     </tr>
     {% endfor %}
