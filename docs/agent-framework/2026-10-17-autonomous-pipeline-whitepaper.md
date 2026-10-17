@@ -443,7 +443,8 @@ Prod Agent 判定
 | `docs/agent-framework/workflow.md` | 三方协作权威口径（角色/流程/门禁/红线） |
 | `docs/agent-framework/v0.1.md` | 框架设计稿 v0.1→v0.2（含三次自我批评） |
 | `docs/agent-framework/case-studies/2026-10-15-self-contained-dev-loop.md` | Issue #32 完整案例（2 小时 7 分闭环） |
-| `docs/agent-framework/session-bootstrap.md` | 跨 session 接入提示词 |
+| `docs/agent-framework/session-bootstrap.md` | 跨 session 接入提示词（已有机制，接进来） |
+| `docs/agent-framework/AGENT-BOOTSTRAP.md` | **给 Agent 的移植执行包**（没有机制，从零建）：分级停靠 L1–L4 / 能力自检 / 施工单 / 可粘贴提示词 / 红线机器判据 |
 | `docs/ARCHITECTURE_MAP.md` | 架构事实图（机器生成） |
 | `docs/ARCHITECTURE.md` | 架构铁律与「为什么」 |
 
