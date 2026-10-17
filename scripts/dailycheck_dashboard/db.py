@@ -19,13 +19,15 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 
-# 触发来源（与 inbox.jsonl action 对齐 + 手动出活）
+# 触发来源（与 inbox.jsonl action 对齐 + 手动出活 + 运维刷新）
 TRIGGER_KINDS = frozenset({
     "pr_opened",
     "pr_synchronize",
     "pr_reopened",
     "manual",
     "init",
+    "deploy",   # deploy_pipeline.sh 尾部钩子（PR 合并部署完成时）
+    "timer",    # dc-dashboard-refresh.timer 兜底刷新
 })
 
 
