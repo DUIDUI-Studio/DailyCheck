@@ -9,7 +9,12 @@ dailycheck-green`，把它重启成 `DRY_RUN=true` + 副本库 —— 全站写�
 本文件覆盖：
 A. `promote.sh` —— dry-run 无副作用 / 正常转正 / 幂等 / 锁门禁 / 健康失败回滚；
 B. `up.sh` 活流量守卫 —— 绿在役先切蓝（**顺序**断言）/ 蓝不健康拒跑 / conf
-   解析不了拒跑 / 绿不承流时行为不变。
+   解析不了拒跑 / 绿不承流时行为不变；
+C. `up.sh` **静息态复位**（步骤 3.0，Issue #28 闭环）—— 已转正态 unit 被复位为
+   `DRY_RUN=true` + 副本库（**切蓝之后、restart 之前**，用 fake switch 的
+   「切流量瞬间 unit 快照」硬断言顺序）/ 缺行则插入 `[Service]` 段 / 幂等（不写
+   文件、不 daemon-reload）/ dry-run 无副作用 / drop-in 仍覆盖成 `DRY_RUN=false`
+   时 fail-closed 且不重启绿 / 注释行不被改写 / env 文件覆盖也一起复位。
 
 跨平台约束（macOS dev 与 Linux prod 都要能跑）：
 - 不碰真实 systemd / nginx / curl：`SYSTEMCTL_BIN` / `CURL_BIN` 指向 fake 脚本，
@@ -61,6 +66,50 @@ Type=simple
 Environment=DAILYCHECK_DB_DIR="{OLD_DB}"
 ExecStart=/usr/bin/python3 mcp_server/server.py
 Restart=always
+"""
+
+# 已转正态（promoted）的绿 app unit —— **生产当前的真实态**，也是 up.sh 步骤 3.0
+# 必须复位的那一侧：DRY_RUN=false（真写）+ DB 指回真库。若 up.sh 不复位，下一轮
+# up 的 3.5 守卫会 exit 1（fail-closed 停摆），或绿以真实写能力跑副本库。
+PROMOTED_GREEN_UNIT = f"""\
+[Unit]
+Description=DailyCheck green (candidate)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={APP_DIR}
+Environment=PYTHONUNBUFFERED=1
+Environment=DRY_RUN=false
+Environment=DAILYCHECK_DB_DIR={TARGET_DB}
+ExecStart=/usr/bin/gunicorn -w 2 --threads 4 -b 127.0.0.1:8091 app:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+PROMOTED_GREEN_MCP_UNIT = f"""\
+[Service]
+Type=simple
+Environment=DAILYCHECK_DB_DIR="{TARGET_DB}"
+ExecStart=/usr/bin/python3 mcp_server/server.py
+Restart=always
+"""
+
+# 完全没有 DRY_RUN / DAILYCHECK_DB_DIR 行的 unit（up.sh 必须补出来：转正侧
+# 「无该行则不加」，复位侧「无该行也必须保证在」，两边相反是刻意的）
+BARE_GREEN_UNIT = """\
+[Unit]
+Description=DailyCheck green (candidate)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gunicorn -w 2 --threads 4 -b 127.0.0.1:8091 app:app
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 """
 
 # 单 upstream 布局 conf：green weight=100（= 绿在承流）
@@ -133,6 +182,11 @@ exit 0
 _FAKE_SWITCH = """\
 #!/usr/bin/env bash
 printf 'switch.sh %s\\n' "$*" >> "${FAKE_LOG}"
+# 切流量那一刻的 unit 快照 —— 「复位是否真的发生在切流量之后」的唯一硬证据：
+# 若复位先于切蓝，快照里就会看到 DRY_RUN=true（= 在役实例的配置被改）。
+if [[ -n "${FAKE_SNAPSHOT_UNIT:-}" && -f "${FAKE_SNAPSHOT_UNIT}" ]]; then
+  printf 'snapshot-at-switch:%s\\n' "$(tr '\\n' '|' < "${FAKE_SNAPSHOT_UNIT}")" >> "${FAKE_LOG}"
+fi
 exit "${FAKE_SWITCH_RC:-0}"
 """
 
@@ -420,13 +474,21 @@ def _git_repo(path: Path) -> str:
 
 @pytest.fixture()
 def up_env(tmp_path: Path, fakebin: Path) -> dict[str, str]:
-    """up.sh live 环境：真 APP_DIR 用 tmp git 仓库替代，conf/DB/降级路径全落 tmp。"""
+    """up.sh live 环境：真 APP_DIR 用 tmp git 仓库替代，conf/DB/unit/备份全落 tmp。
+
+    绿 unit 初始为**已转正态**（PROMOTED_*）—— 生产当前就是这个状态，也是
+    up.sh 步骤 3.0（复位为静息态）唯一被要求处理的那一侧。
+    """
     repo = tmp_path / "repo"
     sha = _git_repo(repo)
     greendb = tmp_path / "green-db"
     greendb.mkdir(exist_ok=True)
     conf = tmp_path / "nginx.conf"
     conf.write_text(CONF_GREEN_SERVING, encoding="utf-8")
+    unit = tmp_path / "dailycheck-green.service"
+    unit.write_text(PROMOTED_GREEN_UNIT, encoding="utf-8")
+    mcp_unit = tmp_path / "dailycheck-green-mcp.service"
+    mcp_unit.write_text(PROMOTED_GREEN_MCP_UNIT, encoding="utf-8")
     env = _base_env(
         tmp_path,
         fakebin,
@@ -435,6 +497,16 @@ def up_env(tmp_path: Path, fakebin: Path) -> dict[str, str]:
         GREEN_DB=str(greendb),
         FAKE_UNIT_DB_DIR=str(greendb),
         BLUE_HEALTH_URL="http://127.0.0.1:8090/health",
+        # 静息态复位（步骤 3.0 / 3.5）：unit / env / 备份目录全部落 tmp
+        GREEN_UNIT_PATH=str(unit),
+        GREEN_MCP_UNIT_PATH=str(mcp_unit),
+        GREEN_ENV_FILE=str(tmp_path / "dailycheck-green.env"),  # 不存在 → 跳过
+        GREEN_MCP_ENV_FILE=str(tmp_path / "dailycheck-green-mcp.env"),
+        BACKUP_DIR=str(tmp_path / "up-backups"),
+        # fake systemctl show = 复位**成功后** systemd 该报的事实
+        FAKE_SYSTEMCTL_ENV=f"DAILYCHECK_DB_DIR={greendb} DRY_RUN=true",
+        # fake switch.sh 在切流量时快照 unit（顺序断言用）
+        FAKE_SNAPSHOT_UNIT=str(unit),
     )
     env["_SHA"] = sha  # 仅测试侧用（不传给脚本也无害）
     return env
@@ -521,3 +593,180 @@ def test_up_switch_failure_blocks_restart(up_env, tmp_path):
     calls = _calls(env)
     assert [c for c in calls if c.startswith("switch.sh")], "未尝试切蓝"
     assert not [c for c in calls if "restart" in c], f"切蓝失败却重启了绿：{calls}"
+
+
+# ============================================================
+# B2. up.sh 静息态复位（步骤 3.0，Issue #28 闭环）
+# ============================================================
+# 闭环本体：promote.sh 把绿 unit 改成「真写 + 真库」并重启，下一轮 up.sh 必须把
+# 它**复位**成「写隔离 + 副本库」，否则 3.5 守卫 exit 1（停摆），或者更糟 ——
+# 绿以真实写能力跑副本库（写进将被丢弃的库）。
+def _line_index(lines: list[str], needle: str) -> int:
+    return next(i for i, line in enumerate(lines) if line == needle)
+
+
+def test_up_resets_promoted_unit_after_switch_before_restart(up_env, tmp_path):
+    """已转正态 + 绿在役 → 切蓝 → **再**复位 unit → **再** restart（顺序硬断言）。"""
+    unit = tmp_path / "dailycheck-green.service"
+    mcp_unit = tmp_path / "dailycheck-green-mcp.service"
+    greendb = up_env["GREEN_DB"]
+    assert "DRY_RUN=false" in unit.read_text(encoding="utf-8"), "夹具不是已转正态"
+
+    r = _run_up(up_env, up_env["_SHA"])
+
+    assert r.returncode == 0, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    calls = _calls(up_env)
+    switch_idx = [i for i, c in enumerate(calls) if c.startswith("switch.sh")]
+    reload_idx = [i for i, c in enumerate(calls) if "daemon-reload" in c]
+    restart_idx = [i for i, c in enumerate(calls) if "restart dailycheck-green.service" in c]
+    assert switch_idx and reload_idx and restart_idx, f"缺少关键调用：{calls}"
+    assert calls[switch_idx[0]] == "switch.sh blue 100"
+    assert switch_idx[0] < reload_idx[0] < restart_idx[0], (
+        f"顺序错（复位/重启早于切流量）：{calls}"
+    )
+    # 切流量那一刻 unit 仍是转正态 —— 复位确实发生在「流量已离开绿」之后
+    snap = [c for c in calls if c.startswith("snapshot-at-switch:")]
+    assert snap, "fake switch.sh 未留下切蓝时的 unit 快照"
+    assert "DRY_RUN=false" in snap[0], f"切蓝时 unit 已被改写（复位早于切流量）：{snap[0][:200]}"
+
+    text = unit.read_text(encoding="utf-8")
+    assert "DRY_RUN=true" in text
+    assert "DRY_RUN=false" not in text
+    assert f"DAILYCHECK_DB_DIR={greendb}" in text
+    assert TARGET_DB not in text, "unit 仍指向真库（隔离失效）"
+    # MCP unit：DB 换成副本库，且**不带引号**残留（BSD sed 零长度命中陷阱回归）
+    mcp_text = mcp_unit.read_text(encoding="utf-8")
+    assert mcp_text.count(greendb) == 1
+    assert TARGET_DB not in mcp_text
+    assert '""' not in mcp_text
+    # 备份留痕（失败可恢复）
+    assert list((tmp_path / "up-backups").glob("*.pre-up.*.bak")), "未生成 unit 备份"
+
+
+def test_up_inserts_missing_dry_run_and_db_into_service_section(up_env, tmp_path):
+    """unit 里两行都没有 → 都插到 [Service] 段首（复位侧必须保证存在）。"""
+    unit = tmp_path / "dailycheck-green.service"
+    mcp_unit = tmp_path / "dailycheck-green-mcp.service"
+    unit.write_text(BARE_GREEN_UNIT, encoding="utf-8")
+    mcp_unit.write_text(BARE_GREEN_UNIT, encoding="utf-8")
+    greendb = up_env["GREEN_DB"]
+
+    r = _run_up(up_env, up_env["_SHA"])
+
+    assert r.returncode == 0, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    lines = unit.read_text(encoding="utf-8").splitlines()
+    svc = _line_index(lines, "[Service]")
+    assert lines[svc + 1] == "Environment=DRY_RUN=true", lines[svc : svc + 3]
+    assert lines[svc + 2] == f"Environment=DAILYCHECK_DB_DIR={greendb}", lines[svc : svc + 3]
+    # MCP unit 只要 DB 行（不该凭空给 MCP 加 DRY_RUN）
+    mcp_lines = mcp_unit.read_text(encoding="utf-8").splitlines()
+    mcp_svc = _line_index(mcp_lines, "[Service]")
+    assert mcp_lines[mcp_svc + 1] == f"Environment=DAILYCHECK_DB_DIR={greendb}", mcp_lines[:4]
+    assert not [line for line in mcp_lines if "DRY_RUN" in line], "给 MCP unit 塞了 DRY_RUN"
+
+
+def test_up_resting_state_is_idempotent(up_env, tmp_path):
+    """已静息 → 文件内容与 mtime 不变、无 daemon-reload、无备份（幂等）。"""
+    unit = tmp_path / "dailycheck-green.service"
+    mcp_unit = tmp_path / "dailycheck-green-mcp.service"
+    greendb = up_env["GREEN_DB"]
+    resting = (
+        f"[Service]\nType=simple\nEnvironment=DRY_RUN=true\n"
+        f"Environment=DAILYCHECK_DB_DIR={greendb}\nRestart=always\n"
+    )
+    unit.write_text(resting, encoding="utf-8")
+    mcp_unit.write_text(
+        f'[Service]\nEnvironment=DAILYCHECK_DB_DIR="{greendb}"\n', encoding="utf-8"
+    )
+    before = (
+        unit.read_text(encoding="utf-8"),
+        mcp_unit.read_text(encoding="utf-8"),
+        unit.stat().st_mtime_ns,
+        mcp_unit.stat().st_mtime_ns,
+    )
+
+    r = _run_up(up_env, up_env["_SHA"])
+
+    assert r.returncode == 0, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    assert "already resting" in r.stdout
+    after = (
+        unit.read_text(encoding="utf-8"),
+        mcp_unit.read_text(encoding="utf-8"),
+        unit.stat().st_mtime_ns,
+        mcp_unit.stat().st_mtime_ns,
+    )
+    assert after == before, "幂等路径改动了 unit（内容或 mtime）"
+    assert _count(_calls(up_env), "daemon-reload") == 0, "幂等路径仍 daemon-reload"
+    assert not (tmp_path / "up-backups").exists(), "幂等路径建了备份"
+
+
+def test_up_dry_run_does_not_touch_units(up_env, tmp_path):
+    """--dry-run：不写 unit、不调 daemon-reload / restart（演练无副作用）。"""
+    unit = tmp_path / "dailycheck-green.service"
+    before = unit.read_text(encoding="utf-8")
+
+    clean = {k: v for k, v in up_env.items() if not k.startswith("_")}
+    r = _run(UP, "99", up_env["_SHA"], "--skip-db-copy", "--dry-run", env=clean, timeout=120)
+
+    assert r.returncode == 0, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    assert "[DRY-RUN]" in r.stdout
+    assert unit.read_text(encoding="utf-8") == before, "dry-run 改动了 unit"
+    assert _calls(up_env) == [], f"dry-run 调用了真命令：{_calls(up_env)}"
+
+
+def test_up_guard_fails_when_dropin_keeps_dry_run_false(up_env, tmp_path):
+    """文件改成 DRY_RUN=true，但 systemd 视角仍 false（drop-in 覆盖）→ exit 1。
+
+    宁可停摆也不能让绿以「真实写能力 + 副本库」跑起来：写会落进将被丢弃的库。
+    """
+    unit = tmp_path / "dailycheck-green.service"
+    before = unit.read_text(encoding="utf-8")
+    env = dict(up_env, FAKE_SYSTEMCTL_ENV="DRY_RUN=false")
+
+    r = _run_up(env, up_env["_SHA"])
+
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    assert "仍报 DRY_RUN=false" in out, f"未明确指出覆盖源：{out[-800:]!r}"
+    calls = _calls(env)
+    assert not [c for c in calls if "restart" in c], f"守卫不通过却重启了绿：{calls}"
+    assert unit.read_text(encoding="utf-8") == before, "守卫不通过后 unit 未按备份回滚"
+
+
+def test_up_does_not_rewrite_commented_out_lines(up_env, tmp_path):
+    """整行注释不是生效行：`#Environment=DRY_RUN=false` 必须原样保留。"""
+    unit = tmp_path / "dailycheck-green.service"
+    greendb = up_env["GREEN_DB"]
+    unit.write_text(
+        "[Service]\n"
+        "Environment=DRY_RUN=false\n"
+        "#Environment=DRY_RUN=false\n"
+        f"Environment=DAILYCHECK_DB_DIR={TARGET_DB}\n"
+        f"#Environment=DAILYCHECK_DB_DIR={greendb}/old\n",
+        encoding="utf-8",
+    )
+
+    r = _run_up(up_env, up_env["_SHA"])
+
+    assert r.returncode == 0, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    text = unit.read_text(encoding="utf-8")
+    assert "#Environment=DRY_RUN=false" in text, f"注释行被改写：{text!r}"
+    assert f"#Environment=DAILYCHECK_DB_DIR={greendb}/old" in text, f"注释行被改写：{text!r}"
+    assert "\nEnvironment=DRY_RUN=true\n" in text
+
+
+def test_up_resets_env_file_that_overrides_dry_run(up_env, tmp_path):
+    """EnvironmentFile 覆盖 unit Environment=：env 文件里的 DRY_RUN=false 必须一起改。"""
+    env_file = tmp_path / "dailycheck-green.env"
+    env_file.write_text(f"DRY_RUN=false\nDAILYCHECK_DB_DIR={TARGET_DB}\n", encoding="utf-8")
+    greendb = up_env["GREEN_DB"]
+    env = dict(up_env, GREEN_ENV_FILE=str(env_file))
+
+    r = _run_up(env, up_env["_SHA"])
+
+    assert r.returncode == 0, f"stdout={r.stdout[-2000:]!r} stderr={r.stderr[-800:]!r}"
+    text = env_file.read_text(encoding="utf-8")
+    assert "DRY_RUN=false" not in text, f"env 文件仍会覆盖成真写：{text!r}"
+    assert "DRY_RUN=true" in text
+    assert f"DAILYCHECK_DB_DIR={greendb}" in text
+

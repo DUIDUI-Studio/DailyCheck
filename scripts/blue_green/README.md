@@ -29,7 +29,7 @@
 
 | 文件 | 用途 | 状态 |
 |------|------|------|
-| `up.sh` | 起绿环境（cp DB + systemctl **restart** dailycheck-green.service + 健康检查；**绿在役时先切蓝**） | 骨架 + systemd TODO |
+| `up.sh` | 起绿环境（cp DB + **复位静息态** + systemctl **restart** dailycheck-green.service + 健康检查；**绿在役时先切蓝**） | 骨架 + systemd TODO |
 | `verify.sh` | 跑八项生产验证 | 骨架（占位报告，exit 0 警告） |
 | `promote.sh` | **绿转正**（关 DRY_RUN + DB 指回真库 + daemon-reload/restart + 健康复核；幂等 + 备份 + 失败回滚） | 已实装（2026-10-17 事故后新增） |
 | `switch.sh` | 切流量（nginx upstream weight + reload） | 骨架 + systemd TODO |
@@ -64,7 +64,8 @@
 | `GREEN_MCP_ENV_FILE` | `/etc/wdg/dailycheck-green-mcp.env` | 绿 MCP env 文件（模板：蓝 `/etc/wdg/dailycheck-mcp.env`） |
 | `NGINX_DAILYCHECK_CONF` | `/etc/nginx/sites-enabled/dailycheck` | nginx 配置路径（`up.sh` 活流量守卫另支持 `NGINX_CONF` 覆盖，同值） |
 | `BLUE_HEALTH_URL` | `http://127.0.0.1:8090/health` | `up.sh` 绿在役时切蓝前探活蓝 |
-| `SYSTEMD_UNIT_DIR` / `GREEN_UNIT_PATH` / `GREEN_MCP_UNIT_PATH` | `/etc/systemd/system` + `dailycheck-green{,-mcp}.service` | `promote.sh` 改写的 unit 文件路径 |
+| `SYSTEMD_UNIT_DIR` / `GREEN_UNIT_PATH` / `GREEN_MCP_UNIT_PATH` | `/etc/systemd/system` + `dailycheck-green{,-mcp}.service` | `promote.sh`（转正）**与 `up.sh`**（复位静息态）改写的 unit 文件路径 |
+| `BACKUP_DIR` | `/var/lib/dailycheck-blue-green-backups` | `switch.sh` / `promote.sh` / `up.sh` 共用的备份目录（转正前 / 复位前的 unit 副本 + 恢复清单） |
 | `SYSTEMCTL_BIN` / `CURL_BIN` | `systemctl` / `curl` | `promote.sh` 命令二进制（单测用 fake） |
 | `HEALTH_TRIES` / `HEALTH_INTERVAL` | `30` / `2` | `promote.sh` 健康轮询次数 / 间隔秒 |
 | `REPORT_DIR` | `backups/prod-verifications` | verify.sh 报告输出 |
@@ -181,6 +182,57 @@ if current_app.config.get("DRY_RUN"):
 
 > 若不打算续用蓝绿路径：`down.sh` 清理绿实例即可，无需走转正。
 
+## 静息态复位（`up.sh` 自动，幂等 —— 每轮 up 必做）
+
+「静息态」= 绿 unit 处于**可验证态**：app unit `DRY_RUN=true`（写隔离）+ 两个 unit
+的 `DAILYCHECK_DB_DIR` 指向 `${GREEN_DB}`（副本库隔离），env 文件（若存在）同步。
+这是 `promote.sh` 转正**前**的状态，也是每一轮 `up.sh` 必须重新建立的状态。
+
+**为什么必须自动做**：`promote.sh` 转正会把同一批 unit / env 文件改成「真实态」
+（`DRY_RUN=false` + DB 指回 `${APP_DIR}/db`）。生产当前绿就是转正态，于是第二轮
+`up.sh` 若不复位：
+
+- 旧的隔离前置守卫会因 `DAILYCHECK_DB_DIR != ${GREEN_DB}` 直接 `exit 1` ——
+  **每一轮自动部署都 fail-closed 停摆**；
+- 若不守而放行，绿会以**真实写能力**跑副本库：验证期写进一个随后被丢弃的库
+  （「假成功」的镜像形态，方向相反、后果一样）。
+
+此前这一步靠人在部署前手改 unit / env（漏一次就停摆一次，改错时机更危险）。
+现在由 `up.sh` 步骤 3.0 自动完成，**不要再手工改**：手工改既不幂等，也没有
+「切完流量才能改」的顺序保证。
+
+| 现状 | `up.sh` 行为 |
+|------|-------------|
+| 已是静息态 | 打印 `already resting`，**不写文件、不 daemon-reload**，直接进重启步骤（幂等，重跑安全） |
+| 转正态（`DRY_RUN=false` / DB 指真库） | 备份 → 改写 → 断言 → `daemon-reload`，再进重启步骤 |
+| unit 缺 `DRY_RUN` / `DAILYCHECK_DB_DIR` 行 | 在 `[Service]` 段首**插入** `Environment=DRY_RUN=true` / `Environment=DAILYCHECK_DB_DIR=${GREEN_DB}`（转正侧「无该行则不加」，复位侧「无该行也必须保证在」——两边刻意相反） |
+| 整行注释（`#Environment=DRY_RUN=false`） | **不算生效行，原样保留**（不会被改写命中） |
+| env 文件（`GREEN_ENV_FILE`）写着 `DRY_RUN=false` | 一起改成 `true` —— systemd 语义里 `EnvironmentFile` **覆盖** unit 的 `Environment=`，只改 unit 等于没改 |
+| 改写后断言不通过 / `daemon-reload` 失败 | 按 `BACKUP_DIR` 清单**恢复**被改文件 + 再 `daemon-reload` + `exit 1`；绿**不**重启、流量仍在蓝 |
+
+**顺序与安全边界（不可调换）**：
+
+1. 复位**只在流量已离开绿之后**执行 —— 由「绿在役时先切蓝」那一步保证（蓝不健康
+   → 那一步已 `exit 1`，根本到不了复位）；
+2. 复位 → `daemon-reload` → 隔离守卫（步骤 3.5，fail-closed 断言）→ `restart` 之间
+   不插入别的动作：「文件说 `DRY_RUN=true`、进程仍是转正态」的窗口越短越好；
+3. **绝不**在 `switch.sh green` 成功之后（绿已在承流）把 unit 改回 `DRY_RUN=true`——
+   那是「文件 ≠ 运行态」：下一次任何 `systemctl restart`（脚本 / 人工 / systemd 自身
+   `Restart=always`）都会把在役实例悄悄变成写隔离。复位只在 `up.sh` 开头做，
+   `promote.sh` 是反向的唯一入口。
+
+**隔离守卫（步骤 3.5，fail-closed）** 三层取证，任一不通过即 `exit 1`：
+
+1. 文件生效行 —— `DRY_RUN=true` 且 `DAILYCHECK_DB_DIR=${GREEN_DB}`；
+2. systemd 视角 —— `systemctl show -p Environment --value <unit>` 若仍报
+   `DRY_RUN=false`（典型：`dailycheck-green.service.d/*.conf` drop-in 或另一个
+   `EnvironmentFile`）→ 拒跑，**不重启绿**（此时重启等于让绿以真实写能力跑副本库）；
+   读不到 systemd 视角则只告警（与 `promote.sh` / `switch.sh` 的「无法判定仅告警」同口径）；
+3. unit 未声明 `DAILYCHECK_DB_DIR` → 视同隔离从未生效，拒跑。
+
+> 守卫**不**看 `/proc/<pid>/environ`：此刻还没 `restart`，进程环境是上一轮转正的
+> 事实，拿它判会把「正确的复位」误判成失败。
+
 ## 待补（v0.3 阶段）
 
 - [ ] `dailycheck-green.service` systemd unit（模板见 up.sh TODO + 蓝 `dailycheck.service`）
@@ -196,8 +248,16 @@ if current_app.config.get("DRY_RUN"):
 
 ## 使用流程
 
+**完整时序（每轮都一样，四步不可换序）**：
+
+```text
+up（复位静息态 → 重启为 DRY_RUN=true + 副本库）→ verify（八项验证）
+   → promote（转正：DRY_RUN=false + DB 指回真库 + 重启）→ switch（5 → 50 → 100）
+```
+
 ```bash
-# 1. 起绿环境
+# 1. 起绿环境（up.sh 自动把 unit 复位成静息态：DRY_RUN=true + 副本库；
+#    已是静息态则打印 already resting 并跳过改动 —— 幂等）
 ./scripts/blue_green/up.sh pr-123 abc1234
 
 # 2. 跑八项生产验证（出 templates/05 报告）
@@ -225,9 +285,13 @@ read -rsp 'SIM_USER_PASSWORD: ' SIM_USER_PASSWORD; export SIM_USER_PASSWORD  # �
 ./scripts/blue_green/down.sh --keep-blue
 ```
 
-> ⚠️ **转正之后不要再直接跑 `up.sh` 起新绿**：绿在承流时 `up.sh` 会先探活蓝并
-> `switch.sh blue 100` 把流量挪走再重启绿（见上文「绿在役时 up.sh 会先切蓝」）。
-> 若蓝已不可用，`up.sh` 会直接 exit 1 拒绝执行 —— 此时先恢复蓝，别硬重启绿。
+> ⚠️ **转正之后可以直接跑 `up.sh` 起下一轮绿**（unit 处于转正态也没问题：`up.sh`
+> 会先探活蓝并 `switch.sh blue 100` 把流量挪走，再把 unit 复位成静息态并重启）。
+> 唯一前提是**蓝健康**——蓝不可用时 `up.sh` 会直接 `exit 1` 拒绝执行，此时先恢复蓝，
+> 别硬重启绿。
+>
+> ⚠️ 不要手工改绿 unit 的 `DRY_RUN` / `DAILYCHECK_DB_DIR`：复位由 `up.sh` 做、转正由
+> `promote.sh` 做，两边都带备份/断言/回滚。手改绕过了顺序保证与 `switch.sh` 的守卫链。
 
 ## 与现有 deploy_vps.sh 的关系
 
