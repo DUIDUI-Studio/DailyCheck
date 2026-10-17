@@ -233,7 +233,8 @@ def _render_kpis(
         + c_merged
         + c_cycle
         + card(str(deploy_count), "次", "今日部署", f"近 {len(events)} 次有记录")
-        + card(_fmt_sec(avg_verify), "", "平均验证耗时", "八项检查")
+        # ⚠️ 不能叫「八项检查耗时」：promote.sh 不总留审计行，段常常从 verify 一路并到切流
+        + card(_fmt_sec(avg_verify), "", "验证到切流", "verify → switch（含 promote）")
         + card(_fmt_tok(tok_today), "", "今日 Token", f"近 7 天 {len(token_rows)} 组")
         + card(str(stalls), "处", "部署卡顿", "up/promote 段 > 5 分钟", "bad" if stalls else "")
         + "</div>"
