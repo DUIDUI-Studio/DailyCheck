@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import (
     Blueprint,
@@ -28,10 +29,50 @@ from werkzeug.security import check_password_hash
 
 from config import BASE_DIR
 from db import get_master_db
-from permissions import require_login
+from permissions import current_relative_path, require_login
 
 bp = Blueprint("auth", __name__)
 pwa_bp = Blueprint("pwa", __name__)
+
+
+# ---------------------------------------------------------------------------
+# Deep-link helper
+# ---------------------------------------------------------------------------
+
+def _safe_next(raw: str | None) -> str | None:
+    """Return `raw` only when it is a safe same-origin redirect target.
+
+    Purpose: **prevent open redirect**. `next` travels through the browser
+    (login form hidden field / query string / picker form action), so by the
+    time it comes back it is untrusted input. A bare `redirect(next)` would
+    let anyone craft `/login?next=https://evil.example` — the victim logs in
+    for real, then lands on the attacker's page and gets phished for the same
+    credentials.
+
+    Accepts only same-origin *relative* paths:
+      - non-empty, starting with exactly one "/"
+      - not starting with "//" or "/\\" (protocol-relative / browser-quirk
+        forms that a browser resolves to another host)
+      - `urlsplit()` yields neither a scheme nor a netloc
+      - no control characters (defence against header injection)
+
+    Returns None for anything else, so callers fall back to their default
+    landing page. Never raises: a malformed value must not turn the login
+    flow into a 500.
+    """
+    if not raw:
+        return None
+    candidate = raw.strip()
+    if not candidate.startswith("/"):
+        return None
+    if candidate.startswith("//") or candidate.startswith("/\\"):
+        return None
+    if any(ch < " " or ch == "\x7f" for ch in candidate):
+        return None
+    parts = urlsplit(candidate)
+    if parts.scheme or parts.netloc:
+        return None
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +113,7 @@ def load_user_and_warehouse():
 
     if user_id is None:
         if request.endpoint not in PUBLIC_ENDPOINTS:
-            return redirect(url_for("auth.login", next=request.path))
+            return redirect(url_for("auth.login", next=current_relative_path()))
         return None
 
     master = get_master_db()
@@ -81,7 +122,7 @@ def load_user_and_warehouse():
     ).fetchone()
     if g.user is None:
         session.clear()
-        return redirect(url_for("auth.login"))
+        return redirect(url_for("auth.login", next=current_relative_path()))
 
     # P0-1 多租户 PoC：平台管理员（is_admin=1）跨租户；普通用户锁定本租户。
     g.tenant_id = g.user["tenant_id"]
@@ -111,13 +152,17 @@ def load_user_and_warehouse():
 
     # If a non-public route fires but warehouse is missing, send to picker.
     # Skip the picker itself to avoid an infinite redirect loop.
+    # `next` carries the original target so the deep-link survives both the
+    # login detour and the warehouse-selection detour.
     if (
         request.endpoint not in PUBLIC_ENDPOINTS
         and request.endpoint != "auth.warehouse_picker"
         and g.warehouse is None
         and request.method == "GET"
     ):
-        return redirect(url_for("auth.warehouse_picker"))
+        return redirect(
+            url_for("auth.warehouse_picker", next=current_relative_path())
+        )
 
     return None
 
@@ -128,6 +173,10 @@ def load_user_and_warehouse():
 
 @bp.route("/login", methods=["GET", "POST"])
 def login():
+    # 模板只渲染**已校验**的 next：未校验值（如 `?next=http://evil.example`）
+    # 不得回显进表单 action / 隐藏域。校验点仍只有 `_safe_next` 一处，
+    # 这里只是把它的结论交给模板，避免把攻击者可控的字符串写进 HTML。
+    next_url = _safe_next(request.values.get("next")) or ""
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -150,7 +199,7 @@ def login():
         )
         if locked:
             flash(f"失败次数过多，已临时锁定，请 {remaining // 60 + 1} 分钟后再试")
-            return render_template("login.html"), 429
+            return render_template("login.html", next_url=next_url), 429
 
         row = master.execute(
             "SELECT * FROM users WHERE username=?", (username,)
@@ -159,7 +208,7 @@ def login():
         # 顺序：密码校验之前先查 is_active，避免已停用账号仍触发失败计数。
         if row is not None and row["is_active"] == 0:
             flash("账号已停用，请联系平台管理员")
-            return render_template("login.html"), 403
+            return render_template("login.html", next_url=next_url), 403
         if row is None or not check_password_hash(row["password_hash"], password):
             new_count, new_lock = next_failure_state(
                 throttle["failed_count"] if throttle else 0,
@@ -177,7 +226,7 @@ def login():
             )
             master.commit()
             flash("账号或密码错误")
-            return render_template("login.html"), 401
+            return render_template("login.html", next_url=next_url), 401
 
         # 登录成功：清除该 (ip, username) 的失败计数。
         master.execute(
@@ -190,9 +239,13 @@ def login():
             "UPDATE users SET last_login_at=? WHERE id=?", (now, row["id"])
         )
         master.commit()
-        nxt = request.args.get("next") or url_for("auth.warehouse_picker")
+        # 深链回跳：next 可能来自 query（登录前 302 带的）或表单隐藏域
+        # （action 丢 query 时的双保险），故用 request.values 同时覆盖两者。
+        nxt = _safe_next(request.values.get("next")) or url_for(
+            "auth.warehouse_picker"
+        )
         return redirect(nxt)
-    return render_template("login.html")
+    return render_template("login.html", next_url=next_url)
 
 
 @bp.route("/logout")
@@ -213,6 +266,11 @@ def warehouse_picker():
     Per project decision: no auto-remember of last warehouse. User clicks
     each time. Admins see all warehouses; regular users see only those
     bound via warehouse_users.
+
+    `next` (validated) is handed to the template so each warehouse button
+    can carry the original deep-link target into the POST below; without it
+    the user lands on /land after selecting a warehouse and the
+    notification link is lost for good.
     """
     master = get_master_db()
     if g.user["is_admin"]:
@@ -230,7 +288,13 @@ def warehouse_picker():
                ORDER BY w.id""",
             (g.user["id"], g.user["tenant_id"]),
         ).fetchall()
-    return render_template("warehouse_picker.html", warehouses=rows, no_sidebar=True)
+    next_url = _safe_next(request.args.get("next")) or ""
+    return render_template(
+        "warehouse_picker.html",
+        warehouses=rows,
+        no_sidebar=True,
+        next_url=next_url,
+    )
 
 
 @bp.route("/select-warehouse/<int:warehouse_id>", methods=["POST"])
@@ -253,6 +317,10 @@ def warehouse_select(warehouse_id: int):
         if binding is None:
             abort(403)
     session["warehouse_id"] = warehouse_id
+    # 深链回跳：有 next 就回到用户原本要看的页面，否则维持原有 /land 行为。
+    nxt = _safe_next(request.values.get("next"))
+    if nxt:
+        return redirect(nxt)
     return redirect(url_for("core.land"))
 
 

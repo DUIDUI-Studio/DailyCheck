@@ -802,6 +802,33 @@ flowchart TB
 
 **注意**：`@require_role` 和 `@require_platform_admin` 都允许 `is_admin=1` 通过。`@require_platform_admin` 反而**要求** `is_admin`，这是有意区分（前者"在这个仓库里权限够" vs 后者"全局管理权限"）。
 
+### 8.8 深链回跳（next 透传 + 同源校验，2026-10-17 起）
+
+**症状**：企微群订货通知带 `https://kjtang.cn/store-ordering/orders/<id>`，点开后落到登录页，登录完回到仓库选择页 / 首页，**回不到那张订单**。
+
+**根因是三处断点连成的链**（缺一处就断）：
+
+1. `templates/login.html` 的 `form action` 用 `url_for('auth.login')`，**不含查询串** → POST 打到无 `next` 的 `/login`，`request.args.get("next")` 恒为 `None`；
+2. 跳转侧只给 `request.path`（丢查询串），且 `/select-warehouse` 跳转**不带 next**；
+3. `warehouse_select` 结束固定 `redirect(url_for("core.land"))`，深链在这一步彻底丢失。
+
+**契约（新增跳转必须照此实现）**：
+
+| 环节 | 产出 / 消费 | 代码位置 |
+|------|-------------|----------|
+| 未登录跳登录 | `next = permissions.current_relative_path()`（`request.full_path` 去掉结尾 `?`，即 **path + query**） | `permissions.py` 全部守卫（`require_login` / `require_role` / `require_platform_admin` / `require_warehouse_type` / `_guard_prelude`）+ `blueprints/auth.py:load_user_and_warehouse` |
+| 已登录未选仓跳 picker | `next` 同上，`warehouse_picker` 读回并传给模板 | `permissions.py`、`blueprints/auth.py:warehouse_picker` |
+| 登录表单 | action 带 `next` **且** 加 `<input type="hidden" name="next">`（双保险：action 丢 query 时仍拿得到）；模板只渲染**已过 `_safe_next`** 的 `next_url`（视图传参），未校验值不进 HTML | `templates/login.html`、`blueprints/auth.py:login` |
+| 登录成功 | `nxt = _safe_next(request.values.get("next"))`（`values` 覆盖 query + 表单）；无则 `url_for("auth.warehouse_picker")` | `blueprints/auth.py:login` |
+| 选仓表单 | action + 隐藏域都带 `next_url`（视图传入，无则空串） | `templates/warehouse_picker.html` |
+| 选仓成功 | 有 `next` → `redirect(next)`；无 → `redirect(url_for("core.land"))` | `blueprints/auth.py:warehouse_select` |
+
+**`_safe_next(raw)`（`blueprints/auth.py`）是唯一可信入口**：`next` 会经浏览器往返，回来时按不可信输入处理——裸 `redirect(next)` 等于开放重定向（`/login?next=https://evil.example`：受害者真登录，然后落到钓鱼页被再收一次密码）。只接受**同源相对路径**：非空、以单个 `/` 开头、不以 `//` 或 `/\` 开头、`urlsplit()` 的 `scheme`/`netloc` 为空、无控制字符；其余一律返回 `None`（调用方回落默认页），**不抛异常**（畸形值不能把登录流程变成 500）。
+
+**铁律**：任何人新增「跳转 + 回跳」逻辑，`next` 必须过 `_safe_next`；直接 `redirect(request.args.get("next"))` 视为安全缺陷。`warehouse_select` 的租户闸 / 绑定闸（→ 403）与 `next` 无关，先校验后跳转，顺序不得调换。
+
+**回归**：`tests/test_auth_next_redirect.py`（34 用例）——未登录/未选仓两条链路的 next 保留、登录（隐藏域 + 查询串两种形态）、选仓有无 next 两个分支、开放重定向 6 种载荷参数化（`http://evil.com` / `//evil.com` / `/\evil.com` / `https:/evil.com` / `javascript:` / 空串）、跨租户与未绑定仍 403、以及端到端链 `未登录深链 → 登录 → 选仓 → 订单详情 200`。
+
 ### 8.6 租户隔离（P0-1 轻方案 PoC，2026-10-10 起）
 
 - `master.db`：`tenants` 注册表 + `users/warehouses/canonical_items.tenant_id`（默认 1 = 存量单租户，老库 ALTER 自动回填）。

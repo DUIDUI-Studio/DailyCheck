@@ -111,6 +111,28 @@ def has_permission(*codes: str) -> bool:
     return set(codes) <= current_permissions()
 
 
+def current_relative_path() -> str:
+    """Return the current request target, suitable as a `next` deep-link value.
+
+    Emitted by every guard that bounces an anonymous user to `/login` or a
+    warehouse-less user to `/select-warehouse`, so the page they originally
+    asked for survives the detour (企微群通知里的
+    `/store-ordering/orders/<id>` 这类深链曾因此丢在登录页)。
+
+    Uses `request.full_path` (path **+** query string) rather than
+    `request.path`: a list page's filters would otherwise be dropped.
+    `full_path` always appends a trailing "?" — stripped here, because
+    `next=%2Fitems%3F` would land on a different URL than `/items`.
+
+    The value is server-derived and therefore starts with "/"; the login side
+    still re-validates it (`blueprints/auth.py:_safe_next`) before any
+    `redirect()`, since it round-trips through the browser and is untrusted
+    input by the time it comes back.
+    """
+    path = request.full_path.rstrip("?")
+    return path if path.startswith("/") else f"/{path}"
+
+
 def current_role() -> str | None:
     """Return the role of the logged-in user on the current warehouse, or None."""
     if g.user is None:
@@ -129,7 +151,7 @@ def require_role(min_role: str) -> Callable:
         @functools.wraps(view)
         def wrapped(*args, **kwargs):
             if g.user is None:
-                return redirect(url_for("auth.login", next=request.path))
+                return redirect(url_for("auth.login", next=current_relative_path()))
             if g.user["is_admin"]:
                 return view(*args, **kwargs)
             role = current_role()
@@ -155,7 +177,7 @@ def require_platform_admin(view: Callable) -> Callable:
     @functools.wraps(view)
     def wrapped(*args, **kwargs):
         if g.user is None:
-            return redirect(url_for("auth.login", next=request.path))
+            return redirect(url_for("auth.login", next=current_relative_path()))
         if not g.user["is_admin"]:
             flash("需要平台管理员权限")
             abort(403)
@@ -172,9 +194,9 @@ def require_login(view: Callable) -> Callable:
     @functools.wraps(view)
     def wrapped(*args, **kwargs):
         if g.user is None:
-            return redirect(url_for("auth.login", next=request.path))
+            return redirect(url_for("auth.login", next=current_relative_path()))
         if view.__name__ not in WAREHOUSE_EXEMPT and g.get("warehouse_db_path") is None:
-            return redirect(url_for("auth.warehouse_picker"))
+            return redirect(url_for("auth.warehouse_picker", next=current_relative_path()))
         return view(*args, **kwargs)
     return wrapped
 
@@ -194,10 +216,10 @@ def require_warehouse_type(*allowed: str) -> Callable:
         @functools.wraps(view)
         def wrapped(*args, **kwargs):
             if g.user is None:
-                return redirect(url_for("auth.login", next=request.path))
+                return redirect(url_for("auth.login", next=current_relative_path()))
             wh = g.get("warehouse")
             if wh is None:
-                return redirect(url_for("auth.warehouse_picker"))
+                return redirect(url_for("auth.warehouse_picker", next=current_relative_path()))
             if g.user["is_admin"]:
                 return view(*args, **kwargs)
             wh_type = wh["warehouse_type"] if hasattr(wh, "keys") else wh["warehouse_type"]
@@ -246,11 +268,11 @@ def _guard_prelude(view: Callable) -> tuple[bool, object]:
     login -> platform-admin bypass -> warehouse-selected -> permission check.
     """
     if g.get("user") is None:
-        return False, redirect(url_for("auth.login", next=request.path))
+        return False, redirect(url_for("auth.login", next=current_relative_path()))
     if g.user["is_admin"]:
         return True, None
     if view.__name__ not in WAREHOUSE_EXEMPT and g.get("warehouse_db_path") is None:
-        return False, redirect(url_for("auth.warehouse_picker"))
+        return False, redirect(url_for("auth.warehouse_picker", next=current_relative_path()))
     return True, None
 
 
