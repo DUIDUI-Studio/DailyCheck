@@ -194,16 +194,60 @@ def wants_ajax() -> bool:
     return "application/json" in accept
 
 
+def _redirect_kind(location: str | None, endpoint: str | None) -> str:
+    """Classify a 3xx Location into an auth/warehouse/business outcome.
+
+    Why this exists (2026-10-18 假成功事故根修):
+      auth.py 的 before_app_request 在会话过期时直接 ``redirect(/login)``
+      短路返回——此时 request.endpoint 仍是原目标视图（如 items.delete），
+      而 **不是** auth.login。旧版 hook 无条件把任何 3xx 改写成
+      ``200 {ok:true}``，于是「登录过期」被前端当成「操作成功」：弹已提交、
+      清空输入、实际一条没写。
+
+    分类只认「重定向去哪」，不认「谁触发的」，因此对新增端点天然成立：
+      - → 登录页 且 endpoint 不是 logout      ⇒ "auth"      (会话过期)
+      - → 选仓页                              ⇒ "warehouse" (未选仓库)
+      - 其它 PRG（含 logout 成功回登录页）    ⇒ "business"  (真成功)
+
+    用 url_for 解析路径而非硬编码 "/login"，路由改名不会静默失效。
+    """
+    if not location:
+        return "business"
+    # 去掉 query string（?next=...）再比路径
+    path = location.split("?", 1)[0]
+    try:
+        from flask import url_for
+
+        login_path = url_for("auth.login").split("?", 1)[0]
+        picker_path = url_for("auth.warehouse_picker").split("?", 1)[0]
+    except Exception:  # noqa: BLE001 — 端点缺失时退回保守判定（当业务成功）
+        return "business"
+    if path == picker_path:
+        return "warehouse"
+    if path == login_path:
+        # logout 成功也回登录页，但那是真成功，不能误判成会话过期
+        if endpoint == "auth.logout":
+            return "business"
+        return "auth"
+    return "business"
+
+
 def register_ajax_handlers(app) -> None:
     """after_request hook: convert 3xx redirects into JSON for AJAX callers.
 
     When a row-level action (delete / rollback / toggle / ...) is submitted
     via the ajax-form.js interceptor, the view still does its PRG
     `redirect(...)` as normal. This hook catches the resulting 3xx and
-    rewrites it into a 200 JSON envelope so the client can decide what to
-    do locally (default: remove the row from the DOM). The original
-    redirect target is preserved in `location`, and any pending flash
-    message is drained into `message`.
+    rewrites it into a JSON envelope so the client can decide what to do
+    locally (default: remove the row from the DOM). The original redirect
+    target is preserved in `location`, and any pending flash message is
+    drained into `message`.
+
+    ⚠️ 不再无条件 ok:true。3xx 有三种语义（见 _redirect_kind）：
+      - business  → 200 {ok:true,  location, message}   真 PRG 成功
+      - auth      → 401 {ok:false, reason:auth_required,      location, message}
+      - warehouse → 409 {ok:false, reason:warehouse_required, location, message}
+    401/409 让 fetch 的 res.ok=false 走失败分支，杜绝「登录过期弹已提交」。
 
     Non-AJAX requests (full-page POST, browser navigation, MCP, ...)
     keep the existing redirect behaviour byte-for-byte — zero observable
@@ -226,13 +270,32 @@ def register_ajax_handlers(app) -> None:
         # so popping is the right thing. Non-AJAX callers never reach here.
         flashes = session.pop("_flashes", []) if "_flashes" in session else []
         message = "\n".join(str(m) for _, m in flashes) if flashes else ""
-        payload = {"ok": True}
+
+        kind = _redirect_kind(location, request.endpoint)
+        if kind == "auth":
+            payload = {
+                "ok": False,
+                "reason": "auth_required",
+                "message": message or "登录已过期，请重新登录后再试。",
+            }
+            status = 401
+        elif kind == "warehouse":
+            payload = {
+                "ok": False,
+                "reason": "warehouse_required",
+                "message": message or "请先选择仓库。",
+            }
+            status = 409
+        else:
+            payload = {"ok": True}
+            if message:
+                payload["message"] = message
+            status = 200
         if location:
             payload["location"] = location
-        if message:
-            payload["message"] = message
+
         envelope = jsonify(payload)
-        envelope.status_code = 200  # explicit; jsonify defaults to 200 anyway
+        envelope.status_code = status
         return envelope
 
 

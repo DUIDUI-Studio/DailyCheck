@@ -134,23 +134,40 @@
       },
       redirect: 'follow'
     }).then(function (res) {
-      // 服务端 after_request hook 会把 3xx 转成 200 JSON。
-      // 但个别路由若 abort/raise 返回 HTML 错误页 → res.ok === false
-      if (!res.ok) {
-        throw new Error('HTTP ' + res.status);
-      }
+      // 服务端 after_request hook 把 3xx 按语义转成 JSON：
+      //   真成功 PRG      → 200 {ok:true, location, message}
+      //   登录过期        → 401 {ok:false, reason:'auth_required', location}
+      //   未选仓库        → 409 {ok:false, reason:'warehouse_required', location}
+      // 无论 res.ok 与否都先尝试解析 JSON body —— 401/409 的 reason 在里面，
+      // 不能只报 "HTTP 401" 让用户一脸茫然。
       return res.json().catch(function () {
-        // 兜底：服务端万一返回非 JSON（例如仍是 redirect HTML），
-        // 视为成功 + reload，避免给用户错觉"失败"。
-        return { ok: true, _fallback: true };
+        // 服务端返回非 JSON（例如未走 hook 的 HTML 错误页 / abort）。
+        // 这时 res.ok 才可信：ok 就当成功，非 ok 就抛状态码。
+        if (res.ok) return { ok: true, _fallback: true };
+        throw new Error('HTTP ' + res.status);
       });
     }).then(function (envelope) {
       if (envelope && envelope.ok) {
         showSuccess(form, envelope);
         applyLocalSideEffect(form, envelope);
-      } else {
-        throw new Error((envelope && envelope.message) || '操作失败');
+        return;
       }
+      // 失败信封：按 reason 给准话 + 决定跳转，而不是笼统"操作失败"。
+      var reason = envelope && envelope.reason;
+      var loc = envelope && envelope.location;
+      if (reason === 'auth_required') {
+        btns.forEach(function (b) { b.disabled = false; });
+        window.alert((envelope.message || '登录已过期') + '\n即将跳转到登录页。');
+        window.location.href = loc || '/login';
+        return;
+      }
+      if (reason === 'warehouse_required') {
+        btns.forEach(function (b) { b.disabled = false; });
+        window.alert(envelope.message || '请先选择仓库');
+        window.location.href = loc || '/select-warehouse';
+        return;
+      }
+      throw new Error((envelope && envelope.message) || '操作失败');
     }).catch(function (err) {
       // 失败：恢复按钮 + 弹窗
       btns.forEach(function (b) { b.disabled = false; });
