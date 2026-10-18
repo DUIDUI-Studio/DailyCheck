@@ -1527,6 +1527,37 @@ tr.is-hidden { display: none; }
   color: var(--muted); cursor: pointer; padding: 4px;
 }
 
+/* 反馈悬浮窗（Issue #108）：表单比数字键盘弹层宽，纵向可滚，窄屏占满宽度 */
+.modal.modal--feedback {
+  width: 520px; max-width: 92vw;
+  max-height: 88vh; overflow-y: auto;
+}
+.modal--feedback label {
+  display: block; font-size: 13px; color: var(--muted);
+  margin-bottom: 12px;
+}
+.modal--feedback input[type="text"],
+.modal--feedback select,
+.modal--feedback textarea {
+  width: 100%; margin-top: 5px;
+  font-family: inherit; font-size: 14px; color: var(--text);
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 9px 11px;
+}
+.modal--feedback textarea { resize: vertical; }
+.modal--feedback input[type="text"]:focus,
+.modal--feedback select:focus,
+.modal--feedback textarea:focus {
+  outline: none; border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+}
+.modal--feedback .fb-error {
+  margin: 0 0 12px; font-size: 13px; color: #b91c1c;
+}
+.modal--feedback .modal-actions {
+  display: flex; justify-content: flex-end; gap: 8px;
+}
+
 /* Pill group — separate rounded pills */
 .pill-group {
   display: flex; gap: 12px; margin-bottom: 14px;

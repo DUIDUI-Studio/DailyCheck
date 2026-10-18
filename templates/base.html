@@ -10,7 +10,7 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=20" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=21" />
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
@@ -137,7 +137,10 @@
       <span class="ctx-user">
         {{ g.user['username'] }}{% if g.user['is_admin'] %} <small>[平台管理员]</small>{% elif g.role %}<small>[{{ g.role['role'] }}]</small>{% endif %}
       </span>
-      <a class="ctx-link" href="{{ url_for('feedback.new_feedback', page=request.path) }}">反馈</a>
+      {# Issue #108：反馈按钮改为悬浮窗（就地提交）；href 保留给无 JS 环境兜底，
+         JS 命中 data-feedback-open 时拦下跳转。 #}
+      <a class="ctx-link" href="{{ url_for('feedback.new_feedback', page=request.path) }}"
+         data-feedback-open>反馈</a>
       <a class="ctx-link" href="{{ url_for('auth.logout') }}">注销</a>
     </div>
     {% endif %}
@@ -173,7 +176,9 @@
       <a href="{{ url_for('core.land') }}">更多</a>
     </nav>
   </div>
+  {% include "_feedback_widget.html" %}
   <script src="{{ url_for('static', filename='ajax-form.js') }}?v=1" defer></script>
+  <script src="{{ url_for('static', filename='feedback-widget.js') }}?v=1" defer></script>
   <script>
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", function () {

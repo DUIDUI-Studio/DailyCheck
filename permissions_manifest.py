@@ -174,6 +174,9 @@ ROUTE_MATRIX: dict[str, str] = {
     "feedback.my_feedback": LOGIN,
     "feedback.new_feedback": LOGIN,
     "feedback.submit_feedback": LOGIN,
+    # 悬浮窗用的 JSON 提交端点（Issue #108）：与 submit_feedback 同一档权限，
+    # 只差响应形态（JSON vs PRG 重定向）。
+    "feedback.submit_feedback_api": LOGIN,
     "feedback.ticket_detail": LOGIN,            # 函数体内再收一次：非本人且非超管 404
     # 管理员侧：收件箱、判定、评论、派发 —— 平台超管专属。
     # 不开权限点：反馈处理涉及「对外建 Issue / 触发部署」，属于平台级动作，

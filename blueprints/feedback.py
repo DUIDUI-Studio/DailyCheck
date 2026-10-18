@@ -21,6 +21,7 @@ from flask import (
     current_app,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -79,6 +80,57 @@ def _is_platform_admin() -> bool:
         return False
 
 
+@bp.before_request
+def _api_guard():
+    """``POST /feedback/api`` 的前置鉴权：已登录但未选仓时回 409 JSON。
+
+    ⚠️ 未登录这一档**拦在这里已经太晚**：``blueprints/auth.py`` 的
+    ``before_app_request`` 在蓝图钩子之前就跑，未登录会先 302 到登录页，
+    再被全局 ``register_ajax_handlers`` 改写成 **200 + {ok:true, location}**。
+    所以前端**不能拿 ``ok`` 当成功判据**，必须见到 ``ticket_no``
+    （见 static/feedback-widget.js）。本钩子只管「登录了但没选仓」这档 ——
+    auth 的选仓重定向只对 GET 生效，POST 会走到这里。
+    """
+    if request.endpoint != "feedback.submit_feedback_api":
+        return None
+    if g.get("user") is None:
+        # 正常不会走到（auth 钩子已先重定向）；留作纵深防御。
+        return jsonify({
+            "ok": False,
+            "reason": "unauthenticated",
+            "message": "登录已过期，请重新登录后再提交反馈。",
+        }), 401
+    if g.get("warehouse_db_path") is None:
+        return jsonify({
+            "ok": False,
+            "reason": "no_warehouse",
+            "message": "请先在右上角选择仓库，再提交反馈。",
+        }), 409
+    return None
+
+
+def _create_ticket(form):
+    """表单 → 落库 + 站内扇出超管。校验失败抛 ``ValueError``。
+
+    表单端点（PRG）与悬浮窗端点（JSON）共用：校验与落库只此一份，
+    避免两条路径对「空标题 / 超长正文」给出不同判据。
+    """
+    warehouse = g.get("warehouse")
+    with get_master_db() as db:
+        ticket = create_ticket(
+            db,
+            user_id=g.user["id"],
+            title=form.get("title", ""),
+            body=form.get("body", ""),
+            category=normalize_category(form.get("category")),
+            warehouse_code=warehouse["code"] if warehouse is not None else None,
+            page_path=form.get("page_path", ""),
+        )
+        ticket["submitter"] = g.user["username"]
+        _fanout_admins(db, ticket)
+    return ticket
+
+
 # ---------------------------------------------------------------------------
 # 用户侧
 # ---------------------------------------------------------------------------
@@ -107,21 +159,8 @@ def new_feedback():
 @require_login
 def submit_feedback():
     """落库 → 站内通知扇出 → 企微推送，然后回到「我的反馈」。"""
-    form = request.form
-    warehouse = g.get("warehouse")
     try:
-        with get_master_db() as db:
-            ticket = create_ticket(
-                db,
-                user_id=g.user["id"],
-                title=form.get("title", ""),
-                body=form.get("body", ""),
-                category=normalize_category(form.get("category")),
-                warehouse_code=warehouse["code"] if warehouse is not None else None,
-                page_path=form.get("page_path", ""),
-            )
-            ticket["submitter"] = g.user["username"]
-            _fanout_admins(db, ticket)
+        ticket = _create_ticket(request.form)
     except ValueError as exc:
         flash(f"提交失败：{exc}")
         return redirect(url_for("feedback.new_feedback"))
@@ -130,6 +169,32 @@ def submit_feedback():
     notify.notify_feedback_submitted(ticket)
     flash(f"已提交（{ticket.get('ticket_no', '')}），管理员会尽快处理。")
     return redirect(url_for("feedback.my_feedback"))
+
+
+@bp.route("/feedback/api", methods=["POST"])
+def submit_feedback_api():
+    """悬浮窗的 JSON 提交端点（Issue #108）。
+
+    与 ``POST /feedback`` 只差**响应形态**：表单端点走 PRG（302 + flash），
+    本端点返回 JSON，让悬浮窗在当前页就地提交 —— 用户填了一半的表单、
+    滚动位置、已展开的弹层都不丢。落库 / 扇出 / 企微推送复用同一份
+    ``_create_ticket``，两条路径不存第二套校验。
+
+    ⚠️ 这里**不用 ``@require_login``**：它未登录 / 未选仓时返回 302，
+    而全局 ``register_ajax_handlers`` 会把带 ``X-Requested-With: fetch``
+    的 3xx 改写成 **200 + ``{ok: true}``** —— 前端会当成功收起弹层，
+    实际一张单都没建（用户输入被清空）。所以本端点在
+    ``_api_guard()`` 里自己返回 401 / 409 JSON，绝不产生 3xx。
+    """
+    try:
+        ticket = _create_ticket(request.form)
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": f"提交失败：{exc}"}), 400
+
+    notify.notify_feedback_submitted(ticket)
+    ticket_no = ticket.get("ticket_no", "")
+    message = f"已提交（{ticket_no}），管理员会尽快处理。"
+    return jsonify({"ok": True, "ticket_no": ticket_no, "message": message})
 
 
 @bp.route("/feedback/<int:ticket_id>", methods=["GET"])

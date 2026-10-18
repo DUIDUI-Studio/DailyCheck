@@ -467,7 +467,8 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 |---|---|---|
 | `GET /feedback` | 登录 | 我提交过的（含已忽略/已派发，用户能看见处理结果） |
 | `GET /feedback/new` | 登录 | 提交表单（`?page=` 自动回填出问题页面） |
-| `POST /feedback` | 登录 | 落库 → 站内扇出超管 → 企微推送 |
+| `POST /feedback` | 登录 | 落库 → 站内扇出超管 → 企微推送（PRG：302 回「我的反馈」） |
+| `POST /feedback/api` | 登录 | 同上，但回 JSON `{ok, ticket_no, message}`；校验失败 **400**。悬浮窗专用（Issue #108） |
 | `GET /feedback/<id>` | 登录 | 详情。**非本人且非超管一律 404**（不用 403：403 会泄露 id 存在） |
 | `GET /admin/feedback` | 平台超管 | 收件箱，`?status=open\|ignored\|dispatched` 筛选，待处理置顶 |
 | `GET /admin/feedback/<id>` | 平台超管 | 处理页：原文 + 评论历史 + 判定操作 |
@@ -475,7 +476,20 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 | `POST /admin/feedback/<id>/comment` | 平台超管 | 仅存评论，不派发 |
 | `POST /admin/feedback/<id>/dispatch` | 平台超管 | 存评论 + 建 Issue，置 `dispatched` |
 
-`ROUTE_MATRIX` 已登记全部 9 条（用户侧 `LOGIN`、管理侧 `PLATFORM`），未开权限点：派发会对外建 Issue 并触发部署，与 `admin.user.manage` 同档，属平台级动作，不进任何仓库角色包。
+`ROUTE_MATRIX` 已登记全部 10 条（用户侧 `LOGIN`、管理侧 `PLATFORM`），未开权限点：派发会对外建 Issue 并触发部署，与 `admin.user.manage` 同档，属平台级动作，不进任何仓库角色包。
+
+**悬浮窗提交**（Issue #108，`templates/_feedback_widget.html` + `static/feedback-widget.js`）：
+
+ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**当前页填了一半的内容、滚动位置、已展开的抽屉全丢**，于是「想提但懒得提」。现在改为就地弹层：
+
+- **渐进增强**：入口仍是 `<a href="/feedback/new?page=…">`，JS 只是拦下点击。脚本没加载 / fetch 拿不到结构化响应 → 回退原生表单提交（`action` 指向 PRG 端点），行为与改造前一致，**不会出现「点了没反应」**。
+- **两条服务端路径共用校验**：`blueprints/feedback.py:_create_ticket()` 是唯一的落库入口，表单端点与 `/feedback/api` 只差响应形态。不要为弹层另写一套校验 —— 两份判据必然漂移（空标题一处放行一处拒绝）。
+- **失败语义必须显式**：`/feedback/api` 校验失败返回 **400 + `{ok:false, message}`**，前端据此把错误留在弹层内、输入不清空。若回 200，前端会把「没提交成功」当成功收起弹层，用户以为提了。
+- ⚠️ **新端点绝不能产生 3xx**：全局 `register_ajax_handlers()`（`blueprints/_helpers.py`）会把带 `X-Requested-With: fetch` 的 **任何 3xx 改写成 200 + `{ok:true}`**。`@require_login` 未登录 / 未选仓正是 302 —— 直接套在 JSON 端点上会造出「假成功 + 清空输入 + 一张单都没建」。所以 `/feedback/api` 不用该装饰器，改由 `blueprints/feedback.py:_api_guard()`（`before_request`）返回 **401 / 409 JSON**。前端也不以 `ok` 为成功判据，**必须见 `ticket_no`**（重定向改写出来的 `ok:true` 没有单号）。
+- **`page_path` 由前端填当前页**：`location.pathname + search`，服务端 `normalize_page_path()` 仍会拦站外 URL —— 派发时 `feedback_introspect` 靠它定位代码。
+- **不丢字**：失败留在弹层；非 JSON 响应（CSRF 过期回 HTML 400）先把草稿存 `sessionStorage` 再提示刷新。只有 fetch 网络层 reject 才回退原生提交 —— 4xx/5xx 回退会在服务端「已落库但响应丢失」时建第二张单。
+
+静态资源版本：`style.css?v=21`（弹层样式）与 `sw.js` 的 `CACHE_NAME=dailycheck-v10` 同批 bump —— `/static/` 下的 GET 走 cache-first，只改文件不升版本，老客户端会一直用旧 CSS/JS。
 
 **双通道提醒**（提交后同时触发，互不依赖）：
 

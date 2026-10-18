@@ -1,0 +1,55 @@
+{# 反馈悬浮窗（Issue #108）
+ *
+ * 为什么存在：ctx-bar 的「反馈」原先是整页跳转到 /feedback/new。用户在
+ * 填单中途点它，当前页面里填了一半的内容、滚动位置、已展开的抽屉全部丢失，
+ * 所以站内反馈是「想提但懒得提」。
+ *
+ * 行为：点击 → 当前页弹出弹层 → 提交后自动收起，人还在原地。
+ * 降级：JS 未加载 / fetch 失败 → 表单 action 仍是 POST /feedback（PRG 跳转），
+ *       与改造前完全一致，不会出现「点了没反应」。
+ * 弹层结构复用全局 .modal-overlay / .modal（见 static/style.css）。
+ #}
+{% if g.user %}
+<div id="feedback-modal" class="modal-overlay" hidden>
+  <div class="modal modal--feedback" role="dialog" aria-modal="true"
+       aria-labelledby="feedback-modal-title">
+    <button type="button" class="modal-close" data-feedback-close
+            aria-label="关闭">&times;</button>
+    <h3 id="feedback-modal-title">问题反馈</h3>
+    <p class="modal-stock">用着不对、找不到入口、数据看着不对 —— 都可以在这里说。</p>
+
+    <form id="feedback-modal-form" method="post"
+          action="{{ url_for('feedback.submit_feedback') }}"
+          data-endpoint="{{ url_for('feedback.submit_feedback_api') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="page_path" value="">
+
+      <label>问题类型
+        <select name="category">
+          <option value="bug">功能异常（点了没反应 / 报错）</option>
+          <option value="usability">用起来别扭（不好找 / 步骤太多）</option>
+          <option value="data">数据不对（数量 / 金额 / 名称）</option>
+          <option value="other" selected>其他</option>
+        </select>
+      </label>
+
+      <label>一句话说明
+        <input type="text" name="title" maxlength="120" required
+               placeholder="例：库存查阅页导出按钮点了没反应">
+      </label>
+
+      <label>详细描述
+        <textarea name="body" rows="4" maxlength="4000" required
+                  placeholder="在哪一步、看到什么、期望是什么。有单号或品名麻烦写上。"></textarea>
+      </label>
+
+      <p class="fb-error" data-feedback-error role="alert" aria-live="assertive" hidden></p>
+
+      <div class="modal-actions">
+        <button type="button" class="btn-sm" data-feedback-close>取消</button>
+        <button type="submit" class="btn-sm primary">提交给管理员</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endif %}
