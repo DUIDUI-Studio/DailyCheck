@@ -29,6 +29,7 @@
         <th>品项</th>
         <th>单位</th>
         <th>库存</th>
+        <th>起订倍数</th>
         <th>状态</th>
         <th>操作</th>
       </tr>
@@ -39,6 +40,22 @@
         <td>{{ it.canonical_name }}</td>
         <td>{{ it.unit }}</td>
         <td>{{ it.quantity | fmt_qty }}</td>
+        <td>
+          {% if it.canonical_active %}
+          {# 起订倍数：1 = 不限；N = 门店下单数量必须是 N 的整数倍。 #}
+          <form method="post" action="{{ url_for('store_ordering.set_dc_item_multiple') }}"
+                class="inline-form" data-ajax data-ajax-mode="reload-stay">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="canonical_id" value="{{ it.canonical_id }}" />
+            <input name="order_multiple" type="number" min="1" step="0.5"
+                   value="{{ it.order_multiple | fmt_qty }}"
+                   title="1 = 不限；填 5 表示只能按 5、10、15… 订购" />
+            <button type="submit" class="btn-sm">保存</button>
+          </form>
+          {% else %}
+          <span class="muted">—</span>
+          {% endif %}
+        </td>
         <td>
           {% if not it.canonical_active %}
             <span class="status-pill danger">{{ it.canonical_status_label }}</span>

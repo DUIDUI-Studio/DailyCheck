@@ -1297,7 +1297,8 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 # full executescript AND ran an unconditional UPDATE over items).
 #   v1 → canonical 列（canonical_id / is_alias / canonical_status / ...）
 #   v2 → items.is_active（方案 P0-10 单仓品项启停，2026-10-09）
-WAREHOUSE_SCHEMA_VERSION = 2
+#   v3 → items.order_multiple（门店订货起订倍数，2026-10-18）
+WAREHOUSE_SCHEMA_VERSION = 3
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
@@ -1357,6 +1358,13 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if "is_orderable" not in item_cols:
             conn.execute(
                 "ALTER TABLE items ADD COLUMN is_orderable INTEGER NOT NULL DEFAULT 1"
+            )
+        # v3（2026-10-18）：门店订货「起订倍数」。1 = 不限；N>1 时门店下单
+        # 数量必须是 N 的整数倍（DC 品项管理页逐品项配置）。
+        # 属「本仓字段」——与 is_orderable 同级，主数据扇出不覆盖。
+        if "order_multiple" not in item_cols:
+            conn.execute(
+                "ALTER TABLE items ADD COLUMN order_multiple REAL NOT NULL DEFAULT 1"
             )
         # ─────────────────────────────────────────────────────────────────
         # Canonical-item columns (Spec §2.2). All idempotent via PRAGMA.

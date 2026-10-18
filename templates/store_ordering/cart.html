@@ -29,11 +29,18 @@
       <td>
         <form method="post" action="{{ url_for('store_ordering.update_cart_item', cart_item_id=item.cart_item_id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <input name="quantity" type="number" min="0" step="0.01" value="{{ item.quantity | fmt_qty }}" required />
+          <input name="quantity" type="number" min="0"
+                 step="{{ item.order_multiple | fmt_qty }}"
+                 value="{{ item.quantity | fmt_qty }}" required />
           <button type="submit" class="btn-sm">更新</button>
         </form>
+        {% if item.order_multiple and item.order_multiple > 1 %}
+        <div class="qty-hint{{ '' if item.multiple_ok else ' warn' }}">
+          需为 {{ item.order_multiple | fmt_qty }} 的倍数{% if not item.multiple_ok %}（当前 {{ item.quantity | fmt_qty }} 不合规）{% endif %}
+        </div>
+        {% endif %}
       </td>
-      <td>¥ {{ (item.line_subtotal or 0) | fmt_money }}</td>
+      <td{% if not item.multiple_ok %} class="qty-bad"{% endif %}>¥ {{ (item.line_subtotal or 0) | fmt_money }}</td>
       <td>
         <form method="post" action="{{ url_for('store_ordering.remove_cart_item_route', cart_item_id=item.cart_item_id) }}" class="inline-form" data-ajax data-ajax-confirm="从购物车删除该品项?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
