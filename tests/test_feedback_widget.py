@@ -234,3 +234,81 @@ def test_widget_script_is_referenced(logged_client):
     client, _ = logged_client
     html = client.get("/land").get_data(as_text=True)
     assert "feedback-widget.js" in html
+
+
+# ---------------------------------------------------------------------------
+# F6 回归：单号耗尽是服务端故障（5xx），不是用户校验失败（400）
+# 2026-10-18 复盘：旧版两者共用 ValueError，端点统一 catch 成 400，
+# 把「服务端没能建单」谎报成「你提交的东西有问题」。
+# ---------------------------------------------------------------------------
+
+
+def _exhaust_ticket_no(client, monkeypatch, occupied_no):
+    """让 next_ticket_no 恒返回已占用单号 → 每次 INSERT 撞 UNIQUE → 重试耗尽。"""
+    import blueprints.feedback_pure as fp
+
+    monkeypatch.setattr(fp, "next_ticket_no", lambda db, now=None: occupied_no)
+
+
+def test_ticket_no_exhausted_is_not_value_error():
+    """TicketNoExhaustedError 必须不是 ValueError 子类。
+
+    否则任何 ``except ValueError`` 都会误吞它，又退化成 400。继承 RuntimeError。
+    """
+    from blueprints.feedback_pure import TicketNoExhaustedError
+
+    assert not issubclass(TicketNoExhaustedError, ValueError)
+    assert issubclass(TicketNoExhaustedError, RuntimeError)
+
+
+def test_api_ticket_no_exhaustion_returns_503_not_400(logged_client, monkeypatch):
+    """核心判据：单号耗尽 → 503（可重试），绝不能是 400（那是「你填错了」）。"""
+    client, _ = logged_client
+    first = _post_api(client)
+    assert first.status_code == 200
+    occupied_no = first.get_json()["ticket_no"]
+
+    _exhaust_ticket_no(client, monkeypatch, occupied_no)
+
+    resp = _post_api(client, title="第二单", body="正文内容")
+    assert resp.status_code == 503, (
+        f"单号耗尽应 503，实际 {resp.status_code}（旧 bug 回 400）"
+    )
+    body = resp.get_json()
+    assert body["ok"] is False
+    assert body.get("reason") == "server_busy"
+    # 第二单没落库，只有第一单
+    assert len(_tickets()) == 1
+
+
+def test_form_endpoint_ticket_exhaustion_shows_busy_flash(logged_client, monkeypatch):
+    """降级表单路径：耗尽仍走 302 PRG（浏览器不跟随 503 的 Location），
+    但 flash 文案必须是「系统繁忙」而非「提交失败：你的输入有问题」。"""
+    client, _ = logged_client
+    client.post("/feedback", data={"title": "占号单", "body": "b"}, follow_redirects=False)
+    occupied_no = _tickets()[0]["ticket_no"]
+
+    _exhaust_ticket_no(client, monkeypatch, occupied_no)
+
+    resp = client.post(
+        "/feedback", data={"title": "第二单", "body": "b"}, follow_redirects=True
+    )
+    html = resp.get_data(as_text=True)
+    assert "系统繁忙" in html, "表单路径耗尽应提示系统繁忙，不是校验失败"
+    assert len(_tickets()) == 1
+
+
+def test_widget_open_resets_inflight_lock():
+    """open() 必须复位 inFlight —— 否则上次请求挂起后重开弹层按钮静默无响应。
+
+    JS 运行时行为 pytest 抓不到，这里锁「源码里确有复位语句」这个静态前提
+    （参照 test_feedback_page_path.py 的模板层断言惯例）。
+    """
+    from pathlib import Path
+
+    src = Path("static/feedback-widget.js").read_text(encoding="utf-8")
+    start = src.index("function open(")
+    end = src.index("function close(", start)
+    open_body = src[start:end]
+    assert "inFlight = false" in open_body, "open() 未复位 inFlight，会残留死锁"
+

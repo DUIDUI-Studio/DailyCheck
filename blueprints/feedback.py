@@ -39,6 +39,7 @@ from .feedback_pure import (
     STATUS_DISPATCHED,
     STATUS_IGNORED,
     STATUS_OPEN,
+    TicketNoExhaustedError,
     add_comment,
     attach_issue,
     build_admin_user_ids,
@@ -161,6 +162,12 @@ def submit_feedback():
     """落库 → 站内通知扇出 → 企微推送，然后回到「我的反馈」。"""
     try:
         ticket = _create_ticket(request.form)
+    except TicketNoExhaustedError:
+        # 服务端瞬时故障，不是用户输入问题。表单（非 AJAX）路径靠 flash 文案区分，
+        # 仍走 302 PRG——不能返 503：浏览器不跟随 503 的 Location，用户会看到错误页。
+        logger.exception("feedback ticket_no exhausted")
+        flash("系统繁忙，提交没成功，请稍后重试（你写的内容不会被清空）。")
+        return redirect(url_for("feedback.new_feedback"))
     except ValueError as exc:
         flash(f"提交失败：{exc}")
         return redirect(url_for("feedback.new_feedback"))
@@ -182,12 +189,21 @@ def submit_feedback_api():
 
     ⚠️ 这里**不用 ``@require_login``**：它未登录 / 未选仓时返回 302，
     而全局 ``register_ajax_handlers`` 会把带 ``X-Requested-With: fetch``
-    的 3xx 改写成 **200 + ``{ok: true}``** —— 前端会当成功收起弹层，
-    实际一张单都没建（用户输入被清空）。所以本端点在
-    ``_api_guard()`` 里自己返回 401 / 409 JSON，绝不产生 3xx。
+    的 3xx 改写成 JSON 信封（2026-10-18 起按 Location 语义分流：
+    →登录页 401、→选仓页 409，见 ``_helpers._redirect_kind``）。即便如此，
+    本端点仍在 ``_api_guard()`` 里自己返回 401 / 409 JSON，语义显式、不依赖
+    hook 的隐式分类。
     """
     try:
         ticket = _create_ticket(request.form)
+    except TicketNoExhaustedError:
+        # 服务端瞬时故障（并发撞单号超预算）→ 503 可重试，不是用户输入问题。
+        logger.exception("feedback ticket_no exhausted")
+        return jsonify({
+            "ok": False,
+            "reason": "server_busy",
+            "message": "系统繁忙，请稍后重试（你写的内容已保留）。",
+        }), 503
     except ValueError as exc:
         return jsonify({"ok": False, "message": f"提交失败：{exc}"}), 400
 
