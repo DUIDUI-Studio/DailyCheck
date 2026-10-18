@@ -12,8 +12,8 @@
 
 ## 0. 一览
 
-- 蓝图 19 个（已装配 18 / 未装配 1）
-- 路由 **167** 条（按鉴权强度：平台超管 48 · 登录 45 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 6 · 任一权限 1）
+- 蓝图 20 个（已装配 19 / 未装配 1）
+- 路由 **168** 条（按鉴权强度：平台超管 49 · 登录 45 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 6 · 任一权限 1）
 - 数据表 **59** 张，`WAREHOUSE_SCHEMA_VERSION = 3`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -41,6 +41,7 @@
 | `procurement` | `procurement.py` | 4 | 在役 |
 | `agent_tokens` | `agent_tokens.py` | 3 | 在役 |
 | `notifications` | `notifications.py` | 3 | 在役 |
+| `ops` | `ops.py` | 1 | 在役 |
 
 ## 2. 路由 × 鉴权（唯一事实来源：`permissions_manifest.ROUTE_MATRIX`）
 
@@ -155,6 +156,12 @@
 | `notifications.mark_notification_read` | POST | `/notifications/<int:event_id>/read` | 登录 |  |
 | `notifications.notifications_feed` | GET | `/notifications` | 登录 |  |
 | `notifications.test_emit` | POST | `/admin/notifications/test-emit` | 平台超管 |  |
+
+### `ops`
+
+| endpoint | 方法 | 规则 | 鉴权 | 明细 |
+|---|---|---|---|---|
+| `ops.ops_dashboard` | GET | `/ops` | 平台超管 |  |
 
 ### `outbound`
 
