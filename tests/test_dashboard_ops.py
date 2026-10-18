@@ -297,3 +297,54 @@ def test_fmt_sec_boundaries():
     assert render_ops._fmt_sec(59) == "59s"
     assert render_ops._fmt_sec(62) == "1:02"
     assert render_ops._fmt_sec(3600 + 62) == "1:01:02"
+
+
+# ============================================================
+# KPI 的「今日」语义
+# ============================================================
+def _kpi_values(html_text: str) -> dict[str, str]:
+    """从 KPI 条抽 {label: 值}（值里的 <small> 单位一并剥掉）。"""
+    return {
+        label: re.sub(r"<[^>]+>", "", value).strip()
+        for value, label in re.findall(
+            r'<div class="ov">(.*?)</div><div class="ok">([^<]*)</div>', html_text, re.S
+        )
+    }
+
+
+def _cst_noon_utc_iso() -> str:
+    """CST 今天 12:00 对应的 UTC ISO —— 保证换算回 CST 仍是「今天」。"""
+    cst = datetime.now(timezone(timedelta(hours=8)))
+    return (cst.replace(hour=12, minute=0, second=0, microsecond=0)
+            - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_kpi_counts_only_todays_deploys():
+    events = [{
+        "pr": 105,
+        "started_at": _cst_noon_utc_iso(),
+        "segments": [{"name": "verify", "sec": 600}],
+    }]
+    vals = _kpi_values(render_ops._render_kpis(events, [], []))
+    assert vals["今日部署"] == "1 次"
+    assert vals["验证到切流"] == "10:00"
+
+
+def test_kpi_today_is_strict_when_no_deploy_today():
+    """今天没部署 = 0 次，**不能回退成历史全部次数**。
+
+    2026-10-18 生产实测命中：当天零部署，卡片却显示「12 次」
+    （`today_events or events` 的兜底把历史当成了今天）。
+    """
+    past = (datetime.now(timezone.utc) - timedelta(hours=36)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events = [{
+        "pr": 97,
+        "started_at": past,
+        "segments": [{"name": "verify", "sec": 608}],
+    }]
+    html = render_ops._render_kpis(events, [], [])
+    vals = _kpi_values(html)
+
+    assert vals["今日部署"] == "0 次"
+    assert vals["验证到切流"] == "—"  # 不给历史均值冒充今日
+    assert "#97" in html              # 但要说清「最近一次」是哪次，否则 0 会被读成没跑

@@ -199,8 +199,12 @@ def _render_kpis(
     median_cycle = cycles[len(cycles) // 2] if cycles else None
 
     today_events = [e for e in events if _cst_day(e.get("started_at")) == today]
+    # 「今日」必须严格：今天没部署就显示 0 / —，**不能回退成历史全部**。
+    # 回退会把「今天一次没部署」渲染成「今天部署了 12 次」—— 与「拉不到 PR 列表
+    # 却显示 0 个合并」是同一类错误，只是方向相反。2026-10-18 生产实测命中：
+    # 当天没有部署，卡片仍显示 12 次。
     verify_secs = [
-        seg["sec"] for e in (today_events or events)
+        seg["sec"] for e in today_events
         for seg in e.get("segments", [])
         if seg.get("name") == "verify" and seg.get("sec")
     ]
@@ -210,7 +214,16 @@ def _render_kpis(
     stalls = sum(
         1 for e in events for seg in e.get("segments", []) if seg.get("stalled")
     )
-    deploy_count = len(today_events) if today_events else len(events)
+    deploy_count = len(today_events)
+
+    # 今天没部署时，副标题要说清「最近一次是哪天」，否则 0 会被读成「数据没跑」
+    last_event = max(events, key=lambda e: e.get("started_at") or "", default=None)
+    if today_events or last_event is None:
+        deploy_sub = f"近 {len(events)} 次有记录"
+        verify_sub = "verify → switch（含 promote）"
+    else:
+        deploy_sub = f"最近一次 #{last_event.get('pr')} · {_cst_day(last_event.get('started_at'))}"
+        verify_sub = "今日无部署，不取历史值"
 
     def card(value: str, unit: str, label: str, sub: str, cls: str = "") -> str:
         unit_html = f"<small> {unit}</small>" if unit else ""
@@ -232,11 +245,12 @@ def _render_kpis(
         '<div class="ops-kpis">'
         + c_merged
         + c_cycle
-        + card(str(deploy_count), "次", "今日部署", f"近 {len(events)} 次有记录")
+        + card(str(deploy_count), "次", "今日部署", deploy_sub)
         # ⚠️ 不能叫「八项检查耗时」：promote.sh 不总留审计行，段常常从 verify 一路并到切流
-        + card(_fmt_sec(avg_verify), "", "验证到切流", "verify → switch（含 promote）")
+        + card(_fmt_sec(avg_verify), "", "验证到切流", verify_sub)
         + card(_fmt_tok(tok_today), "", "今日 Token", f"近 7 天 {len(token_rows)} 组")
-        + card(str(stalls), "处", "部署卡顿", "up/promote 段 > 5 分钟", "bad" if stalls else "")
+        + card(str(stalls), "处", "部署卡顿", f"近 {len(events)} 次中 up/promote > 5 分钟",
+               "bad" if stalls else "")
         + "</div>"
     )
 
