@@ -82,6 +82,11 @@
   function open(trigger) {
     lastFocus = trigger || document.activeElement;
     clearError();
+    // 复位提交锁：inFlight 只在 fetch 的 then/catch 里清零，若上一次请求挂起
+    // （既不 resolve 也不 reject），锁会永久卡住 → 重开弹层后按钮静默无响应
+    // （submit 第 131 行 if(inFlight) return）。open() = 用户重新开始一次交互，
+    // 之前挂起的请求不该再阻塞新提交。（2026-10-18 复盘 F6）
+    inFlight = false;
     if (submitBtn) submitBtn.disabled = false;
     if (pageInput) {
       // 记录「提交时所在页面」，供派发时做代码定位（feedback_introspect 消费）
@@ -179,8 +184,9 @@
       }
 
       if (r.body && r.body.message) {
-        // 400 校验失败 / 401 登录过期 / 409 未选仓：都留在弹层里，输入不清空
-        if (r.status === 401) saveDraft();
+        // 400 校验失败留在弹层；401 登录过期 / 503 系统繁忙（单号耗尽等瞬时故障）
+        // 可能要刷新重试，额外存草稿防丢——用户写的内容绝不静默清空。
+        if (r.status === 401 || r.status === 503) saveDraft();
         showError(r.body.message);
         return;
       }

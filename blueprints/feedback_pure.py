@@ -7,6 +7,9 @@ Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）.
 - 数据落 master.db —— 反馈是「系统级」问题，不属于任何单个仓库。
 - 校验失败一律 raise ``ValueError``（沿用 notifications_pure 的范式），
   且**不写库**，调用方可先校验再落库。
+- 例外：**单号生成重试耗尽** raise ``TicketNoExhaustedError``（RuntimeError 子类，
+  非 ValueError）—— 那是服务端瞬时故障，不是用户输入问题，端点须回 5xx 可重试，
+  不能被 ``except ValueError → 400`` 误吞（2026-10-18 复盘 F6）。
 - 状态机极简（三态）：open → ignored | dispatched，均为终态，不可回退。
   不引入「已解决」态：真解决了是 GitHub Issue closed，以那为准，别造两套真相。
 """
@@ -42,6 +45,20 @@ PAGE_PATH_MAX_LEN = 200
 
 _LIST_LIMIT = 200
 _TICKET_NO_ATTEMPTS = 5
+
+
+class TicketNoExhaustedError(RuntimeError):
+    """单号生成重试耗尽（并发撞车超过预算）。
+
+    这是**服务端瞬时故障**，不是用户输入问题：标题/正文都合法，只是这一瞬间
+    单号序列被并发请求占满。必须与校验失败的 ``ValueError`` 分开——
+    前者应回 5xx（可重试 / 该告警），后者回 400（用户改输入）。
+
+    2026-10-18 复盘 F6：旧版两者共用 ValueError，端点统一 catch 成 400，
+    于是「服务端没能建单」被报成「你提交的东西有问题」，既误导用户又埋没告警。
+    继承 RuntimeError 而非 ValueError，保证任何 ``except ValueError`` 都不会
+    误吞它。
+    """
 
 
 def _now() -> str:
@@ -170,7 +187,9 @@ def create_ticket(
             if "ticket_no" not in str(exc):
                 raise
             last_exc = exc
-    raise ValueError(f"生成反馈单号失败（重试 {_TICKET_NO_ATTEMPTS} 次）") from last_exc
+    raise TicketNoExhaustedError(
+        f"生成反馈单号失败（重试 {_TICKET_NO_ATTEMPTS} 次）"
+    ) from last_exc
 
 
 def add_comment(

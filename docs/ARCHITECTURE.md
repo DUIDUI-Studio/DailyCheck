@@ -498,7 +498,7 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 | `GET /feedback` | 登录 | 我提交过的（含已忽略/已派发，用户能看见处理结果） |
 | `GET /feedback/new` | 登录 | 提交表单（`?page=` 自动回填出问题页面） |
 | `POST /feedback` | 登录 | 落库 → 站内扇出超管 → 企微推送（PRG：302 回「我的反馈」） |
-| `POST /feedback/api` | 登录 | 同上，但回 JSON `{ok, ticket_no, message}`；校验失败 **400**。悬浮窗专用（Issue #108） |
+| `POST /feedback/api` | 登录 | 同上，但回 JSON `{ok, ticket_no, message}`；校验失败 **400**；单号生成耗尽 **503** `{reason:server_busy}`（服务端瞬时故障，非用户输入问题，见 §3.10 失败语义）。悬浮窗专用（Issue #108） |
 | `GET /feedback/<id>` | 登录 | 详情。**非本人且非超管一律 404**（不用 403：403 会泄露 id 存在） |
 | `GET /admin/feedback` | 平台超管 | 收件箱，`?status=open\|ignored\|dispatched` 筛选，待处理置顶 |
 | `GET /admin/feedback/<id>` | 平台超管 | 处理页：原文 + 评论历史 + 判定操作 |
@@ -514,12 +514,12 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 - **渐进增强**：入口仍是 `<a href="/feedback/new?page=…">`，JS 只是拦下点击。脚本没加载 / fetch 拿不到结构化响应 → 回退原生表单提交（`action` 指向 PRG 端点），行为与改造前一致，**不会出现「点了没反应」**。
 - **两条服务端路径共用校验**：`blueprints/feedback.py:_create_ticket()` 是唯一的落库入口，表单端点与 `/feedback/api` 只差响应形态。不要为弹层另写一套校验 —— 两份判据必然漂移（空标题一处放行一处拒绝）。
-- **失败语义必须显式**：`/feedback/api` 校验失败返回 **400 + `{ok:false, message}`**，前端据此把错误留在弹层内、输入不清空。若回 200，前端会把「没提交成功」当成功收起弹层，用户以为提了。
+- **失败语义必须显式，且按「谁的错」分状态码**：`/feedback/api` 校验失败返回 **400 + `{ok:false, message}`**，前端据此把错误留在弹层内、输入不清空。若回 200，前端会把「没提交成功」当成功收起弹层，用户以为提了。**单号生成重试耗尽（并发撞车超预算）是服务端瞬时故障，不是用户输入问题** —— 回 **503 + `{ok:false, reason:server_busy}`**（可重试），由 `TicketNoExhaustedError`（RuntimeError 子类，故意不继承 ValueError）与校验失败区分；表单端点则仍走 302 PRG、靠 flash 文案区分（浏览器不跟随 503 的 Location）。2026-10-18 复盘 F6：旧版两者共用 `ValueError` → 端点统一 400，把「服务端没能建单」谎报成「你提交的东西有问题」。
 - ⚠️ **JSON 端点仍应显式返回 401/409，别依赖 3xx 兜底**：全局 `register_ajax_handlers()`（`blueprints/_helpers.py`）会把带 `X-Requested-With: fetch` 的 3xx 改写成 JSON 信封。**2026-10-18 起该 hook 已按 Location 语义分流**（`_redirect_kind`）：→登录页（非 logout）判 `auth` 返 **401 `{ok:false, reason:auth_required}`**、→选仓页判 `warehouse` 返 **409**、其余 PRG 才返 200 `{ok:true}`。这修掉了旧版「任何 3xx 一律 200 ok:true」造成的假成功（登录过期被当成操作成功、清空输入、一条没写）。但 `@require_login` 套在 JSON 端点上仍不推荐——依赖 hook 的 Location 分类是隐式契约，端点自己用 `before_request` 守卫（如 `feedback.py:_api_guard()` 返回 401/409 JSON）才是显式的。前端也不以 `ok` 为成功判据，**必须见 `ticket_no`**。
 - **`page_path` 由前端填当前页**：`location.pathname + search`，服务端 `normalize_page_path()` 仍会拦站外 URL —— 派发时 `feedback_introspect` 靠它定位代码。
 - **不丢字**：失败留在弹层；非 JSON 响应（CSRF 过期回 HTML 400）先把草稿存 `sessionStorage` 再提示刷新。只有 fetch 网络层 reject 才回退原生提交 —— 4xx/5xx 回退会在服务端「已落库但响应丢失」时建第二张单。
 
-静态资源版本：`style.css?v=21`（弹层样式）与 `sw.js` 的 `CACHE_NAME=dailycheck-v10` 同批 bump —— `/static/` 下的 GET 走 cache-first，只改文件不升版本，老客户端会一直用旧 CSS/JS。
+静态资源版本：弹层样式走 `style.css?v=N`、`static/sw.js` 走 `CACHE_NAME=dailycheck-vN`，改任一个 `/static/` 文件都必须同批 bump —— `/static/` 下的 GET 走 cache-first，只改文件不升版本，老客户端会一直用旧 CSS/JS。**本文不写死具体版本号**（此前写死 `v10`，下一次 bump 立刻腐烂成假信息）；当前值以 `static/sw.js` 第 1 行与 `templates/base.html` 的 `?v=` 为准。
 
 **双通道提醒**（提交后同时触发，互不依赖）：
 
