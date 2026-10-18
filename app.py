@@ -97,6 +97,7 @@ def create_app() -> Flask:
     from blueprints.import_items import bp as import_items_bp
     from blueprints.items import bp as items_bp
     from blueprints.notifications import bp as notifications_bp
+    from blueprints.ops import bp as ops_bp
     from blueprints.outbound import bp as outbound_bp
     from blueprints.procurement import bp as procurement_bp
     from blueprints.production import bp as production_bp
@@ -125,6 +126,7 @@ def create_app() -> Flask:
     app.register_blueprint(canonical_bp)
     app.register_blueprint(store_ordering_bp)
     app.register_blueprint(feedback_bp)
+    app.register_blueprint(ops_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp

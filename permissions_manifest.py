@@ -169,6 +169,9 @@ ROUTE_MATRIX: dict[str, str] = {
     "core.summary": LOGIN,                      # 终裁④：不脱敏
     "core.categories": LOGIN,
     "core.delete_category": f"{ROLE_PREFIX}staff",
+    # ---- ops（运维交付看板：托管 dc-dashboard-refresh.timer 的渲染产物）----
+    # 内容含部署阶段耗时 / 会话 token 用量，属内部运维信息 → 仅平台超管。
+    "ops.ops_dashboard": PLATFORM,
     # ---- feedback（用户问题提单 → 管理员判定 → 派发开发闭环）----
     # 用户侧：任意登录用户可提交/看自己的单子（含被忽略的，让他知道被处理过）。
     "feedback.my_feedback": LOGIN,
