@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -113,8 +115,18 @@ def test_build_ticket_no_pads_sequence():
 def test_create_ticket_increments_ticket_no(master_conn):
     first = feedback_pure.create_ticket(master_conn, 2, "第一个问题", "详情一")
     second = feedback_pure.create_ticket(master_conn, 2, "第二个问题", "详情二")
-    assert first["ticket_no"] == "FB-20261017-0001"
-    assert second["ticket_no"] == "FB-20261017-0002"
+
+    # 单据号里带「当天」日期，不能硬编码 —— 写死 FB-20261017-0001 的话，
+    # 一到 10-18 整条用例必红（2026-10-18 实测踩中）。这里断言格式与递增，
+    # 日期只要求落在今天/昨天，以兼容恰好在午夜前后切换的那一瞬。
+    m = re.fullmatch(r"FB-(\d{8})-(\d{4})", first["ticket_no"])
+    assert m, first["ticket_no"]
+    today = datetime.now().strftime("%Y%m%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    assert m.group(1) in {today, yesterday}
+    assert m.group(2) == "0001"
+    assert second["ticket_no"] == f"FB-{m.group(1)}-0002"
+
     assert first["status"] == feedback_pure.STATUS_OPEN
     assert first["category"] == "other"
 
