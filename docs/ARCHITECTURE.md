@@ -306,6 +306,13 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 **数据源演进（2026-10-18）**：首版走 `gh` CLI，上线当天即发现生产 `/root/.config/gh/hosts.yml` 的 token 失效，两张 PR KPI 长期 `—`。改 REST 匿名后实测拿到 63 条真实 PR（编号 1–105，中间 42 个缺号是历史删除，并非漏抓）+ 41 条 Issue。**不引入新密钥**：仓库 public，匿名配额（60/h）对 15 分钟一轮的渲染绰绰有余；`GH_TOKEN` 存在则自动升级到 5000/h，留作将来仓库转私有时的开关。
 
+**访问入口 `GET /ops`（`blueprints/ops.py`，2026-10-18 起）**：产物此前只躺在 VPS 文件系统（`/var/lib/dailycheck-dashboard/latest.html`），**没有任何 URL**，要看只能 ssh/scp 取文件。现由应用托管：
+- **原样返回 + 两处包装**：注入 `<meta http-equiv="refresh" content="300">`（文件 15 分钟一换，浏览器 5 分钟自刷足够）+ `Cache-Control: no-store`（否则用户会长期盯着缓存里的旧图）。**不解析、不重排、不缓存**——渲染口径的唯一事实来源在 `render_ops.py`，Web 层只做搬运。
+- **权限 = `PLATFORM`（`users.is_admin=1`）**：内容含部署阶段耗时与会话 token 用量，属内部运维信息；用 `@require_platform_admin` 而非 `report.view`，避免门店 viewer 看到发布链路。
+- **产物缺失返回 200 而不是 500/503**：路由本身可达，缺的是内容。页面给出路径 + `systemctl start dc-dashboard-refresh.service` 自救命令；若返 503，`/land` 与侧栏的可达性巡检（`test_nav_integration`）会把一次「还没生成」判成链路故障。
+- **入口两处同集**：侧栏「管理员」分组 + `/land` 管理员卡片，删一处会被 `test_nav_integration` 的对称差断言拦下。
+- 测试：`tests/test_ops_dashboard.py`（10 用例：正常返回 / 不缓存 / meta 注入位置 / 无 `<head>` 退化 / 缺失与空文件说明页 / 非超管 403 / 匿名 302 / 默认路径 / 权限矩阵意图）。
+
 ---
 
 **部署（owner 手动）**：
