@@ -546,7 +546,14 @@ def test_drift_guard_skipped_when_not_a_git_repo(sandbox):
 
 
 def test_observe_window_shortened_records_audit(sandbox):
-    proc = _pipe(sandbox, "42", SHA, "--observe-min", "10")
+    """压缩观察窗必须留痕。
+
+    ⚠️ 必须注入 fake curl/journalctl（_observe_tools）：--observe-min 10 会真进
+    观察窗探测 127.0.0.1:8080，本机 dev 容器返回 302 能过、CI 上无监听得 000
+    → 触发回滚 exit 24（2026-10-18 CI 实 hit：本地全绿、CI 判红）。测试要脱真流量。
+    """
+    extra, _ = _observe_tools(sandbox, blocked_lines=0, code="302")
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "10", **extra)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     audit = _audit(sandbox)
