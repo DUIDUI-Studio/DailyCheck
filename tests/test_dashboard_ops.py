@@ -173,7 +173,11 @@ def _make_state_db(path: Path, rows: list[tuple]) -> None:
 
 def test_fetch_token_usage_groups_by_cst_day(tmp_path):
     db_path = tmp_path / "state.db"
-    now = time.time()
+    # ⚠️ 样本时间必须钉在 CST 今天中午，不能用 `now - 600`：
+    # CI 常在 UTC 16:0x（= CST 次日 00:0x）跑，`now-600` 会落到 CST **前一天**，
+    # 而断言要求是「今天」→ 必然判红（2026-10-18 CI 实 hit，本地非午夜时段跑不出）。
+    # 钉中午后，±700s 的偏移无论如何都跨不过午夜。
+    now = _cst_noon_epoch()
     _make_state_db(db_path, [
         ("s1", "webhook", now - 600, now, 100, 10, 1000, 0, 0, 5),
         ("s2", "cron", now - 700, now, 20, 2, 30, 0, 0, 1),
@@ -181,7 +185,7 @@ def test_fetch_token_usage_groups_by_cst_day(tmp_path):
     ])
     rows = ops_parse.fetch_token_usage(db_path, days=7)
     by_key = {(r["day"], r["source"]): r for r in rows}
-    today_cst = datetime.now(timezone.utc).astimezone(
+    today_cst = datetime.fromtimestamp(now, timezone.utc).astimezone(
         timezone(timedelta(hours=8))
     ).strftime("%Y-%m-%d")
     assert (today_cst, "webhook") in by_key
@@ -319,6 +323,17 @@ def _cst_noon_utc_iso() -> str:
             - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _cst_noon_epoch() -> float:
+    """CST 今天 12:00 的 epoch（与 _cst_noon_utc_iso 同一时刻，只是数值形态）。
+
+    给需要 REAL 时间戳的 sessions 表用。钉在正午而非 `time.time()`：
+    CI 常在 UTC 16:0x（= CST 次日 00:0x）跑，用 now 会让「now-600s」这类
+    偏移样本掉进 CST 前一天，断言「今天」必然判红。
+    """
+    cst = datetime.now(timezone(timedelta(hours=8)))
+    return cst.replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+
+
 def test_kpi_counts_only_todays_deploys():
     events = [{
         "pr": 105,
@@ -328,6 +343,53 @@ def test_kpi_counts_only_todays_deploys():
     vals = _kpi_values(render_ops._render_kpis(events, [], []))
     assert vals["今日部署"] == "1 次"
     assert vals["验证到切流"] == "10:00"
+
+
+def test_kpi_today_boundary_is_tz_independent(monkeypatch):
+    """钉死时刻在 CST 午夜窗口内，断言「今天」判据与进程时区无关。
+
+    回归：`today` 曾用 `time.strftime`（进程本地时区）。生产 unit 未声明 TZ
+    → 进程 now() 即 CST，侥幸正确；但 CI 与 dev 容器是 UTC，在 UTC 16:00–24:00
+    （= CST 次日 00:00–08:00）窗口内本地时区的「今天」比 CST 少一天，与
+    `_cst_day()`（显式 +8h）错位 → 「今日部署」恒显 0 次。
+    2026-10-18 16:06 UTC 的 CI 实 hit（本地非午夜时段跑不出来）。
+
+    钉死时刻 + 切进程 TZ 后，本用例在任何真实时间下都有区分度——不依赖
+    「恰好在这个窗口跑 CI」这种运气。
+    """
+    # 钉死：UTC 2026-10-18 16:30 = CST 2026-10-19 00:30（正落在出问题的窗口内）
+    frozen_utc = datetime(2026, 10, 18, 16, 30, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen_utc.astimezone(tz) if tz else frozen_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(render_ops, "datetime", _FrozenDatetime)
+
+    # 事件时刻 = CST 2026-10-19 12:00，与钉死的「CST 今天」同日
+    events = [{
+        "pr": 105,
+        "started_at": "2026-10-19T04:00:00Z",
+        "segments": [{"name": "verify", "sec": 600}],
+    }]
+
+    tz_names = ["UTC", "Asia/Shanghai"]
+    if hasattr(time, "tzset"):
+        tz_names.append("America/New_York")
+    for tz_name in tz_names:
+        if hasattr(time, "tzset"):
+            monkeypatch.setenv("TZ", tz_name)
+            time.tzset()
+        try:
+            vals = _kpi_values(render_ops._render_kpis(events, [], []))
+            assert vals["今日部署"] == "1 次", (
+                f"进程 TZ={tz_name} 时「今日部署」判错（应按 CST 口径算 1 次）：{vals}"
+            )
+        finally:
+            if hasattr(time, "tzset"):
+                monkeypatch.delenv("TZ", raising=False)
+                time.tzset()
 
 
 def test_kpi_today_is_strict_when_no_deploy_today():

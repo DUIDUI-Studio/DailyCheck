@@ -1480,9 +1480,11 @@ flowchart TB
 ### 13.3 时区不一致（**生产 bug**）
 
 - **dev 容器 = UTC**（`/etc/timezone`）
+- **CI = UTC**（GitHub runner 默认；2026-10-18 实证：`test_dashboard_ops` 两个用例在 CI 判红、本地 CST 全绿）
 - **prod 进程 = CST+8**（unit 未设 TZ）
 - `datetime.now()` = 进程时区；`datetime('now')` SQL = UTC
-- **时间类 bug 在 dev 不可复现、生产必现**
+- **时间类 bug 在 dev 不可复现、生产必现**；反方向也成立——**依赖进程本地时区的代码在 prod「侥幸正确」，在 CI/dev 判红**
+- ⚠️ **「今日」判据必须显式 CST，禁止 `time.strftime("%Y-%m-%d")`**：后者取进程本地时区，只在 prod 成立。`render_ops.py` 用模块级 `CST = timezone(timedelta(hours=8))` + `datetime.now(CST)`，与同文件 `_cst_day()`（显式 +8h）、`ops_parse.TOKEN_SQL` 的 `'+8 hours'` **同源**——三处各自写 `+8` 迟早漂移（同型缺陷见 `inbox_watcher` 归一化漂移，Issue #51→#66）。错位窗口 = UTC 16:00–24:00（= CST 次日 00:00–08:00），症状是「今日部署/今日合并 PR」恒显 0。回归网：`test_kpi_today_boundary_is_tz_independent`（钉死时刻 + 切进程 TZ，任何真实时间跑都有区分度）。
 
 ### 13.4 数量精度
 
