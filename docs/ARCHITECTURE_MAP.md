@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 20 个（已装配 19 / 未装配 1）
-- 路由 **167** 条（按鉴权强度：平台超管 49 · 登录 44 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 6 · 任一权限 1）
+- 路由 **168** 条（按鉴权强度：平台超管 49 · 登录 45 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 6 · 任一权限 1）
 - 数据表 **59** 张，`WAREHOUSE_SCHEMA_VERSION = 3`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -28,8 +28,8 @@
 | `stocktake` | `stocktake.py` | 12 | 在役 |
 | `users` | `users.py` | 12 | 在役 |
 | `items` | `items.py` | 11 | 在役 |
+| `feedback` | `feedback.py` | 10 | 在役 |
 | `production` | `production.py` | 10 | 在役 |
-| `feedback` | `feedback.py` | 9 | 在役 |
 | `reports` | `reports.py` | 7 | 在役 |
 | `auth / pwa` | `auth.py` | 6 | 在役 |
 | `core` | `core.py` | 6 | 在役 |
@@ -107,6 +107,7 @@
 | `feedback.new_feedback` | GET | `/feedback/new` | 登录 |  |
 | `feedback.save_comment` | POST | `/admin/feedback/<int:ticket_id>/comment` | 平台超管 |  |
 | `feedback.submit_feedback` | POST | `/feedback` | 登录 |  |
+| `feedback.submit_feedback_api` | POST | `/feedback/api` | 登录 |  |
 | `feedback.ticket_detail` | GET | `/feedback/<int:ticket_id>` | 登录 |  |
 
 ### `forecast`
