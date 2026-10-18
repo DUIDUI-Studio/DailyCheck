@@ -148,7 +148,9 @@
       });
     }).then(function (r) {
       inFlight = false;
-      // 判据看 ticket_no：302 被全局 hook 改写成 200 {ok:true} 的情况没有单号
+      // 判据看 ticket_no：成功必带单号。会话过期时全局 hook 返 401
+      // {ok:false, reason:'auth_required', location}（不再是旧的 200 ok:true），
+      // 两种情况都没有 ticket_no，绝不会误判成功。
       if (r.body && r.body.ok && r.body.ticket_no) {
         dropDraft();
         form.reset();
@@ -159,8 +161,8 @@
       }
       if (submitBtn) submitBtn.disabled = false;
 
-      // 被全局 after_request 改写的重定向（登录过期 / 未选仓）：body 是
-      // {ok:true, location} 但没有 ticket_no —— 绝不能当成功。
+      // 登录过期 / 未选仓：hook 现在返 401/409 {ok:false, reason, location}。
+      // 按 location 给准话并暂存草稿——用户写的内容绝不能静默丢失。
       if (r.body && r.body.location) {
         var loc = String(r.body.location);
         saveDraft();

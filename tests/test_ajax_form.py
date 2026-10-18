@@ -145,3 +145,82 @@ def test_ajax_form_js_loaded_in_base_html(logged_client):
     r = client.get("/items")
     html = r.get_data(as_text=True)
     assert 'ajax-form.js' in html, "base.html 应包含 ajax-form.js 的 <script> 标签"
+
+
+# ---------------------------------------------------------------------------
+# F2 回归：3xx 语义分流，杜绝「登录过期被当成操作成功」（2026-10-18 假成功事故）
+# ---------------------------------------------------------------------------
+
+
+def test_ajax_expired_session_returns_401_not_false_success(logged_client):
+    """核心判据：会话过期时 AJAX POST 必须返 401，绝不能是 200 {ok:true}。
+
+    事故形态：用户点「删除」→ 会话已过期 → auth.before_app_request 短路
+    redirect(/login) → 旧 hook 无条件改写成 200 {ok:true} → 前端弹「已删除」
+    并移除该行，但服务端一条没删。本用例锁死这个回归。
+    """
+    client, wh_path = logged_client
+    item_id = _seed_item(wh_path, name="expired-session-item")
+    r = client.get("/items")
+    token = _csrf(r.get_data(as_text=True))
+
+    # 清掉登录态，模拟会话过期（保留 CSRF token 以便走到 auth 短路而非 CSRF 拦截）
+    with client.session_transaction() as s:
+        s.clear()
+
+    r2 = client.post(
+        f"/items/{item_id}/delete",
+        data={"csrf_token": token},
+        headers={"X-Requested-With": "fetch", "Accept": "application/json"},
+    )
+    assert r2.status_code == 401, (
+        f"会话过期必须 401，实际 {r2.status_code}（旧 bug 会返 200）"
+    )
+    assert r2.is_json
+    body = r2.get_json()
+    assert body["ok"] is False, "过期绝不能报 ok:true"
+    assert body.get("reason") == "auth_required"
+    assert "/login" in body.get("location", "")
+
+
+def test_ajax_business_redirect_still_200_ok(logged_client):
+    """真 PRG 成功（登录态正常）仍是 200 {ok:true} —— 分流不能误伤正常路径。"""
+    client, wh_path = logged_client
+    item_id = _seed_item(wh_path, name="still-ok-item")
+    r = client.get("/items")
+    token = _csrf(r.get_data(as_text=True))
+    r2 = client.post(
+        f"/items/{item_id}/delete",
+        data={"csrf_token": token},
+        headers={"X-Requested-With": "fetch", "Accept": "application/json"},
+    )
+    assert r2.status_code == 200
+    body = r2.get_json()
+    assert body["ok"] is True
+    assert body.get("reason") is None
+
+
+def test_redirect_kind_classification_matrix():
+    """_redirect_kind 分类矩阵单测（纯函数，不依赖 app 上下文之外的状态）。
+
+    只认「重定向去哪」：→登录页=auth（logout 除外）、→选仓页=warehouse、其余=business。
+    """
+    from flask import Flask
+
+    from blueprints._helpers import _redirect_kind
+
+    app = Flask(__name__)
+    # 注册最小路由表，让 url_for 能解析 auth.login / auth.warehouse_picker
+    from blueprints import auth as auth_bp
+
+    app.register_blueprint(auth_bp.bp)
+    with app.test_request_context("/"):
+        login = "/login?next=/items"
+        picker = "/select-warehouse?next=/items"
+        assert _redirect_kind(login, "items.delete") == "auth"
+        assert _redirect_kind(picker, "items.delete") == "warehouse"
+        assert _redirect_kind("/items", "items.delete") == "business"
+        # logout 成功也回登录页，但那是真成功
+        assert _redirect_kind("/login", "auth.logout") == "business"
+        # 无 Location 保守当业务成功
+        assert _redirect_kind(None, "items.delete") == "business"

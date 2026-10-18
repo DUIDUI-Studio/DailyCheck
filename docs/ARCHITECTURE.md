@@ -492,7 +492,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 - **渐进增强**：入口仍是 `<a href="/feedback/new?page=…">`，JS 只是拦下点击。脚本没加载 / fetch 拿不到结构化响应 → 回退原生表单提交（`action` 指向 PRG 端点），行为与改造前一致，**不会出现「点了没反应」**。
 - **两条服务端路径共用校验**：`blueprints/feedback.py:_create_ticket()` 是唯一的落库入口，表单端点与 `/feedback/api` 只差响应形态。不要为弹层另写一套校验 —— 两份判据必然漂移（空标题一处放行一处拒绝）。
 - **失败语义必须显式**：`/feedback/api` 校验失败返回 **400 + `{ok:false, message}`**，前端据此把错误留在弹层内、输入不清空。若回 200，前端会把「没提交成功」当成功收起弹层，用户以为提了。
-- ⚠️ **新端点绝不能产生 3xx**：全局 `register_ajax_handlers()`（`blueprints/_helpers.py`）会把带 `X-Requested-With: fetch` 的 **任何 3xx 改写成 200 + `{ok:true}`**。`@require_login` 未登录 / 未选仓正是 302 —— 直接套在 JSON 端点上会造出「假成功 + 清空输入 + 一张单都没建」。所以 `/feedback/api` 不用该装饰器，改由 `blueprints/feedback.py:_api_guard()`（`before_request`）返回 **401 / 409 JSON**。前端也不以 `ok` 为成功判据，**必须见 `ticket_no`**（重定向改写出来的 `ok:true` 没有单号）。
+- ⚠️ **JSON 端点仍应显式返回 401/409，别依赖 3xx 兜底**：全局 `register_ajax_handlers()`（`blueprints/_helpers.py`）会把带 `X-Requested-With: fetch` 的 3xx 改写成 JSON 信封。**2026-10-18 起该 hook 已按 Location 语义分流**（`_redirect_kind`）：→登录页（非 logout）判 `auth` 返 **401 `{ok:false, reason:auth_required}`**、→选仓页判 `warehouse` 返 **409**、其余 PRG 才返 200 `{ok:true}`。这修掉了旧版「任何 3xx 一律 200 ok:true」造成的假成功（登录过期被当成操作成功、清空输入、一条没写）。但 `@require_login` 套在 JSON 端点上仍不推荐——依赖 hook 的 Location 分类是隐式契约，端点自己用 `before_request` 守卫（如 `feedback.py:_api_guard()` 返回 401/409 JSON）才是显式的。前端也不以 `ok` 为成功判据，**必须见 `ticket_no`**。
 - **`page_path` 由前端填当前页**：`location.pathname + search`，服务端 `normalize_page_path()` 仍会拦站外 URL —— 派发时 `feedback_introspect` 靠它定位代码。
 - **不丢字**：失败留在弹层；非 JSON 响应（CSRF 过期回 HTML 400）先把草稿存 `sessionStorage` 再提示刷新。只有 fetch 网络层 reject 才回退原生提交 —— 4xx/5xx 回退会在服务端「已落库但响应丢失」时建第二张单。
 
@@ -963,7 +963,7 @@ sequenceDiagram
     F->>DB: teardown_appcontext → close_dbs()
 ```
 
-**AJAX 双路径契约**：`static/ajax-form.js` 给请求打 `X-Requested-With: fetch` + `Accept: application/json`。`register_ajax_handlers(app)` 注册的 after_request hook 检测到这两个头时，把视图的 3xx redirect 改写成 200 JSON 信封 `{ok, location, message}`，同时 drain Flask flash 进 `message`；非 AJAX 路径（浏览器整页 POST / curl / MCP）保留 302 redirect 字节级不变。详见 §13.7。
+**AJAX 双路径契约**：`static/ajax-form.js` 给请求打 `X-Requested-With: fetch` + `Accept: application/json`。`register_ajax_handlers(app)` 注册的 after_request hook 检测到这两个头时，把视图的 3xx redirect 按 Location 语义改写成 JSON 信封——业务 PRG 返 **200 `{ok:true, location, message}`**、跳登录页返 **401 `{ok:false, reason:auth_required}`**、跳选仓页返 **409 `{ok:false, reason:warehouse_required}`**（2026-10-18 起，修掉旧版「任何 3xx 一律 200 ok:true」的假成功），同时 drain Flask flash 进 `message`；非 AJAX 路径（浏览器整页 POST / curl / MCP）保留 302 redirect 字节级不变。详见 §13.7。
 
 ### 7.2 MCP（HTTP Bearer）
 
@@ -1392,7 +1392,7 @@ flowchart TB
         E2E["test_*_e2e.py<br/>端到端 ~5%"]
         Acceptance["test_acceptance_*.py<br/>验收脚本 39 用例全绿"]
         Aux["test_aux_unit.py /<br/>test_master_db_migrate.py<br/>pre-existing 失败来源"]
-        Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>6 用例"]
+        Ajax["test_ajax_form.py<br/>行内 AJAX 双路径契约<br/>9 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
         BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
     end
@@ -1524,6 +1524,21 @@ with app.test_client() as c, c.session_transaction() as s:
 - 客户端 marker：`X-Requested-With: fetch`（主） OR `Accept: application/json`（forward-compat）—— 任一即可。
 - 服务端 after_request hook 仅在 3xx 命中时改写；4xx / 5xx 原样透传（让 `fetch().ok=false` 走 alert 失败分支）。
 - ⚠️ **坑**：after_request hook **必须返回 Response 对象**，不能返回 `(jsonify(...), 200)` tuple。Flask 后处理 `response.vary.add("Cookie")` 对 tuple AttributeError。
+
+**3xx 语义分流（2026-10-18 起，F2 假成功根修）**：
+旧版 hook 把**任何** 3xx 无条件改写成 `200 {ok:true}` —— 会话过期时 `auth.before_app_request` 短路 `redirect(/login)` 也被包成成功，前端弹「已删除」并移除该行，服务端却一条没改。现按 `_redirect_kind(location, request.endpoint)` 分类：
+
+| Location 去向 | endpoint | kind | 信封 |
+|---|---|---|---|
+| 登录页（`auth.login`） | 非 `auth.logout` | `auth` | **401** `{ok:false, reason:auth_required, location, message}` |
+| 登录页 | `auth.logout`（登出成功） | `business` | 200 `{ok:true, ...}` |
+| 选仓页（`auth.warehouse_picker`） | — | `warehouse` | **409** `{ok:false, reason:warehouse_required, location, message}` |
+| 其余业务 PRG | — | `business` | 200 `{ok:true, location, message}` |
+
+- 分类**只认 Location 去向**（用 `url_for` 解析路径，不硬编码 `/login`），对新增端点天然成立，无需逐端点适配。
+- `logout` 成功也回登录页，但 endpoint 是 `auth.logout` → 判 `business`，不误报「登录过期」。
+- 前端 `ajax-form.js` 据 `reason` 给准话 + 跳转（auth→登录页、warehouse→选仓页），不再笼统「操作失败」；`feedback-widget.js` 的成功判据仍是 `ticket_no`（401 信封无单号，天然不误判）。
+- 回归：`tests/test_ajax_form.py::test_ajax_expired_session_returns_401_not_false_success`（会话过期必 401）+ `test_redirect_kind_classification_matrix`（分类矩阵）；变异验证：把 `_redirect_kind` 调用改回恒 `business` → 401 用例变红。
 
 **模板侧**：
 - 行内 form 加 `data-ajax`；删除/回退类给行 `<tr>` / `<div>` 加 `data-row`，点完该行消失。
