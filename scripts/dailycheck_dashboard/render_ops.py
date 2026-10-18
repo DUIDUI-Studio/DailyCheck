@@ -10,6 +10,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+# 全站统一时区口径：CST+8（生产 unit 无 TZ 声明 → 进程 now() 即 CST）。
+# ⚠️ 必须显式写死偏移，**不能用 time.strftime 的进程本地时区**：CI 与 dev 容器
+# 都是 UTC，在 UTC 16:00–24:00（= CST 次日 00:00–08:00）这个窗口，本地时区判的
+# 「今天」会比 CST 少一天 → 与 _cst_day() / TOKEN_SQL 的 '+8 hours' 错位，
+# 「今日部署」恒显 0（2026-10-18 CI 实 hit，两个用例判红，本地 UTC 环境可复现）。
+CST_OFFSET = timedelta(hours=8)
+CST = timezone(CST_OFFSET)
+
 # 瀑布图横轴上限（分钟）：超过则整行按上限截断并标注
 AXIS_MAX_MIN = 90
 MAX_WATERFALL_ROWS = 6
@@ -186,8 +194,12 @@ def render_ops_block(
 def _render_kpis(
     events: list[dict], prs: list[dict], token_rows: list[dict], *, pr_data_ok: bool = True
 ) -> str:
-    # 与 db._now_iso() 同口径：用进程本地时区判「今天」（prod 进程 = CST+8）
-    today = time.strftime("%Y-%m-%d")
+    # ⚠️ 「今天」必须显式按 CST 算，与 _cst_day() 同源（都用 CST 常量）。
+    # 旧版用 time.strftime 的进程本地时区，注释写着「prod 进程 = CST+8」——
+    # 这个假设只在生产成立：CI / dev 容器是 UTC，UTC 16:00–24:00 窗口内本地
+    # 时区的「今天」比 CST 少一天，导致下方 `_cst_day(...) == today` 恒不成立，
+    # 「今日部署」「今日合并 PR」全部归零（2026-10-18 CI 实 hit）。
+    today = datetime.now(CST).strftime("%Y-%m-%d")
     cutoff = time.time() - 7 * 86400
 
     # 交付周期只取近 7 天合并的 PR，且用中位数（#59 那种 572 分钟的离群值会毁掉平均数）
@@ -266,7 +278,9 @@ def _cst_day(ts: str | None) -> str:
     parsed = _parse_iso(ts)
     if parsed is None:
         return ""
-    return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d")
+    # 复用模块级 CST_OFFSET：与 _render_kpis 的 today 同源，杜绝「两处各自 +8」
+    # 将来改一处漏一处（同型缺陷见 inbox_watcher 的归一化漂移，Issue #51→#66）。
+    return (parsed + CST_OFFSET).strftime("%Y-%m-%d")
 
 
 def _row_total(row: dict) -> int:
