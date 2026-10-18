@@ -410,3 +410,188 @@ def test_kpi_today_is_strict_when_no_deploy_today():
     assert vals["今日部署"] == "0 次"
     assert vals["验证到切流"] == "—"  # 不给历史均值冒充今日
     assert "#97" in html              # 但要说清「最近一次」是哪次，否则 0 会被读成没跑
+
+
+# ============================================================
+# 闭环完整性（2026-10-18 复盘：让 owner 不必 review 就能看见流程真相）
+# ============================================================
+
+LOOP_AUDIT_SAMPLE = """\
+2026-10-17T05:48:41Z up.sh pr=85 {"active": true, "lock": {"pr": 85, "sha": "@A@", "session": "pipeline-85"}}
+2026-10-17T06:11:25Z switch.sh target=green {"active": true, "lock": {"pr": 85, "sha": "@A@", "session": "pipeline-85"}}
+2026-10-17T12:18:08Z up.sh pr=96 {"active": true, "lock": {"pr": 96, "sha": "@B@", "session": "hermes-96"}}
+2026-10-17T12:38:02Z switch.sh target=green {"active": true, "lock": {"pr": 96, "sha": "@B@", "session": "dev-takeover"}}
+2026-10-17T01:57:56Z up.sh pr=80 {"active": true, "lock": {"pr": 80, "sha": "@A@", "session": ""}}
+2026-10-18T16:05:00Z pipeline-event kind=worktree-drift pr=110 sha=a80926b session=pipeline-110 verify 期间 HEAD 变了
+2026-10-18T16:10:00Z pipeline-event kind=observe-window-shortened pr=111 sha=07e8fef session=dev-111 observe=10min
+""".replace("@A@", _SHA_A).replace("@B@", _SHA_B)
+
+
+def test_classify_session_uses_whitelist():
+    """分类是白名单式：只有确定的自动前缀算 auto，其余非空一律 manual。
+
+    宁可多报不漏报——漏报人工接管会让「闭环成立」变成假结论。
+    """
+    for s in ("hermes-96", "pipeline-110", "webhook-ci-pr84", "release-84"):
+        assert ops_parse.classify_session(s) == "auto", s
+    for s in ("dev-takeover", "dev-111", "manual-switch-1018", "anything-new"):
+        assert ops_parse.classify_session(s) == "manual", s
+
+
+def test_classify_session_empty_is_unlabeled_not_auto():
+    """空 session 单列 unlabeled —— 算进 auto 会把自动率虚高。"""
+    assert ops_parse.classify_session("") == "unlabeled"
+
+
+def test_loop_integrity_excludes_unlabeled_from_rate_denominator():
+    """自动率分母**只含有标注记录**。
+
+    实测 88 行里 58 行是空 session（早期无机制）；摊进任何一侧都让比率失真。
+    """
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    li = ops_parse.build_loop_integrity(recs)
+
+    assert li["auto_records"] == 4      # pipeline-85 ×2 + hermes-96 + pipeline-110
+    assert li["manual_records"] == 2    # dev-takeover + dev-111
+    assert li["unlabeled_records"] == 1  # pr=80 那条空 session
+    # 4 / (4+2) —— 分母不含未标注的 1 条
+    assert abs(li["auto_rate"] - 4 / 6) < 1e-9
+
+
+def test_loop_integrity_rate_is_none_when_nothing_labeled():
+    """全无标注时 auto_rate 必须是 None（渲染成「—」），不能报 100% 假绿。"""
+    recs = ops_parse.parse_audit_text(
+        '2026-10-17T01:57:56Z up.sh pr=80 {"active": true, "lock": {"pr": 80, "session": ""}}\n'
+    )
+    li = ops_parse.build_loop_integrity(recs)
+
+    assert li["auto_rate"] is None
+    assert li["unlabeled_records"] == 1
+
+
+def test_loop_integrity_collects_manual_sessions_and_prs():
+    """人工接管的会话名与 PR 号都要能追到 —— 只给个数字没法定位。"""
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    li = ops_parse.build_loop_integrity(recs)
+
+    assert li["manual_sessions"] == ["dev-111", "dev-takeover"]
+    assert li["manual_prs"] == [96, 111]
+
+
+def test_loop_integrity_counts_event_kinds():
+    """异常留痕事件按 kind 计数（F1/F4/F5 写入的 pipeline-event 行）。"""
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    li = ops_parse.build_loop_integrity(recs)
+
+    assert li["events"] == {"worktree-drift": 1, "observe-window-shortened": 1}
+
+
+def test_loop_integrity_declares_rollback_blind_spot():
+    """回滚次数**不可观测**必须声明为盲区，绝不报 0。
+
+    `switch.sh` 只审计 target=green，切蓝不留痕。把「没记录」说成「没发生」
+    比不报更坏 —— 那会让人以为「回滚从没发生＝部署一直成功」。
+    """
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    li = ops_parse.build_loop_integrity(recs)
+
+    assert len(li["blind_spots"]) == 1
+    assert "回滚" in li["blind_spots"][0]
+    assert "rollback_count" not in li, "不得伪造一个回滚计数"
+
+
+def test_pipeline_event_does_not_create_ghost_deploy_event():
+    """回归：`pipeline-event` 行不得造出幽灵部署事件。
+
+    只出现过一条事件、从没跑过 up 的 PR，若被归组会得到 segments=[]、
+    total=0 的假「部署」，污染「今日部署」计数（本次实现时实测命中）。
+    """
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    events = ops_parse.build_deploy_events(recs)
+
+    prs = {e["pr"] for e in events}
+    assert 110 not in prs, "pr=110 只有一条 pipeline-event，不该算部署"
+    assert 111 not in prs, "pr=111 只有一条 pipeline-event，不该算部署"
+    assert {85, 96, 80} <= prs, f"真跑过阶段的 PR 丢了：{prs}"
+    # 注：pr=80 只有 up.sh 一条 → segments=[] 是**合法单点部署**（非幽灵），
+    # 该行为由 test_build_deploy_events_single_point_does_not_crash 覆盖，此处不重复断言。
+
+
+def test_parse_audit_extracts_session_from_both_forms():
+    """session 有两个来源，必须都认：阶段行的 lock.session、事件行的 session= 参数。
+
+    只认一处会让统计漏一半（单一归一化口径，Issue #51→#66 同型教训）。
+    """
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    by_pr_script = {(r["pr"], r["script"]): r for r in recs}
+
+    # 阶段行：session 来自行尾 JSON 的 lock.session
+    assert by_pr_script[(85, "up.sh")]["session"] == "pipeline-85"
+    # 事件行：session 来自 `session=` 参数（该行没有 JSON）
+    assert by_pr_script[(110, "pipeline-event")]["session"] == "pipeline-110"
+    assert by_pr_script[(110, "pipeline-event")]["kind"] == "worktree-drift"
+
+
+def test_loop_integrity_renders_kpis_and_detail_rows():
+    """渲染层：四张 KPI 卡 + 明细行都要出现，盲区行必须在场。"""
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    html = render_ops._render_loop_integrity(ops_parse.build_loop_integrity(recs))
+
+    assert 'id="loop"' in html
+    assert "闭环完整性" in html
+    vals = _kpi_values(html)
+    for label in ("自动闭环率", "人工接管", "异常留痕", "数据盲区"):
+        assert label in vals, f"缺 KPI 卡：{label}"
+    assert vals["人工接管"] == "2 次"
+    assert vals["数据盲区"] == "1 处"
+    # 明细：异常事件用中文人话，未标注与盲区都要露出来
+    assert "工作树漂移" in html
+    assert "观察窗被压缩" in html
+    assert "未标注会话" in html
+    assert "回滚次数不可观测" in html
+
+
+def test_loop_integrity_renders_dash_when_rate_unknown():
+    """无标注记录时自动率渲染成「—」并标 hot，不能显示成 100% 的绿。"""
+    recs = ops_parse.parse_audit_text(
+        '2026-10-17T01:57:56Z up.sh pr=80 {"active": true, "lock": {"pr": 80, "session": ""}}\n'
+    )
+    html = render_ops._render_loop_integrity(ops_parse.build_loop_integrity(recs))
+    vals = _kpi_values(html)
+
+    assert vals["自动闭环率"] == "—"
+    assert "无标注会话" in html
+
+
+def test_loop_integrity_empty_dict_renders_nothing():
+    """audit.log 不可用时（空 dict）本节整体不渲染，不留空壳标题。"""
+    assert render_ops._render_loop_integrity({}) == ""
+
+
+def test_ops_block_includes_loop_section_even_without_deploy_events():
+    """关键：没有部署事件时闭环完整性**仍要渲染** —— 盲区本身就是事实。
+
+    若跟着 body_parts 一起消失，「回滚不可观测」这类盲区就永远看不见。
+    """
+    html = render_ops.render_ops_block(
+        events=[], prs=[], verifications=[], token_rows=[],
+        loop_integrity={"auto_records": 0, "manual_records": 0,
+                        "unlabeled_records": 0, "auto_rate": None,
+                        "manual_sessions": [], "manual_prs": [], "events": {},
+                        "blind_spots": ["回滚次数不可观测：switch.sh 只审计 target=green"]},
+    )
+    assert "运维数据源暂不可用" in html
+    assert 'id="loop"' in html
+    assert "回滚次数不可观测" in html
+
+
+def test_ops_block_renumbers_anomaly_after_loop_section():
+    """章节号：闭环完整性占 4，异常归因必须顺延为 5（不得两个 4）。"""
+    recs = ops_parse.parse_audit_text(AUDIT_SAMPLE)
+    events = ops_parse.build_deploy_events(recs)
+    html = render_ops.render_ops_block(
+        events=events, prs=[], verifications=[], token_rows=[],
+        loop_integrity=ops_parse.build_loop_integrity(recs),
+    )
+    assert '<span class="no">4</span>闭环完整性' in html
+    assert '<span class="no">5</span>异常归因' in html

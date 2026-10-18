@@ -124,9 +124,19 @@ def cmd_render(args: argparse.Namespace) -> int:
 
     # 1b. 运维事实（三个源各自降级：单源坏了只丢那一块）
     ops_fetched_at = _now_iso_cst()
-    deploy_events = _collect(
-        "部署审计日志", ops_unavailable,
-        lambda: ops_parse.parse_audit_log(Path(args.audit_log)),
+    # ⚠️ audit.log 只读一次：部署事件与闭环完整性必须由同一份记录派生，
+    # 否则两侧口径会漂移（同型缺陷见 inbox_watcher，Issue #51→#66）。
+    audit_records: list[dict] = []
+    try:
+        audit_records = ops_parse.parse_audit_records(Path(args.audit_log))
+    except ops_parse.OpsParseError as exc:
+        _log(f"  [降级] 部署审计日志：{exc}")
+        ops_unavailable.append("部署审计日志")
+    deploy_events = (
+        ops_parse.build_deploy_events(audit_records) if audit_records else []
+    )
+    loop_integrity = (
+        ops_parse.build_loop_integrity(audit_records) if audit_records else {}
     )
     verifications = _collect(
         "验证报告", ops_unavailable,
@@ -138,7 +148,8 @@ def cmd_render(args: argparse.Namespace) -> int:
     )
     _log(
         f"  ops: deploy={len(deploy_events)} verif={len(verifications)} "
-        f"token={len(token_rows)} 不可用={ops_unavailable or '无'}"
+        f"token={len(token_rows)} 人工接管={loop_integrity.get('manual_records', 0)} "
+        f"异常事件={loop_integrity.get('events') or '无'} 不可用={ops_unavailable or '无'}"
     )
 
     # 1c. 落事件表（幂等 upsert）；写失败不阻塞渲染
@@ -188,6 +199,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         deploy_events=deploy_events,
         verifications=verifications,
         token_rows=token_rows,
+        loop_integrity=loop_integrity,
         ops_unavailable=ops_unavailable,
         ops_fetched_at=ops_fetched_at,
         pr_data_ok=pr_data_ok,
