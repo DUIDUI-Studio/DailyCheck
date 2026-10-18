@@ -29,7 +29,20 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 DS="${SCRIPT_DIR}/deploy_state.py"
-PY="${PYTHON:-python3}"
+# F4（2026-10-18 复盘）：优先仓库 venv 的 python，而非裸 python3。
+# 根因：VPS 系统 python3 的 dist-packages/scripts 是**常规包**，import 时
+# 优先级高于仓库的 namespace 包 scripts/（PEP 420 namespace 仅在全路径都
+# 找不到常规包时生效）→ 末尾 render_dashboard 的 `-m scripts.dailycheck_dashboard`
+# 必报 No module，钩子长期静默失败、只 WARN 靠 15min timer 兜底（掩盖了坏）。
+# verify.sh 早已 venv 优先（DC_PYTHON_BIN），此处对齐同一口径。
+# venv 不存在时（dev 沙盒 / 测试）退回 python3；PYTHON 环境变量仍可显式覆盖。
+if [[ -n "${PYTHON:-}" ]]; then
+  PY="${PYTHON}"
+elif [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+  PY="${REPO_ROOT}/.venv/bin/python"
+else
+  PY="python3"
+fi
 STATE_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-/var/lib/dailycheck-deploy}"
 
 LOG="${DAILYCHECK_PIPELINE_LOG:-/var/log/dailycheck/deploy-pipeline-$(date +%Y%m%d-%H%M%S).log}"
@@ -42,6 +55,10 @@ PR=""
 SHA=""
 SESSION=""
 OBSERVE_MIN=30
+# F5（2026-10-18 复盘）：机制要求的观察窗下限。低于此值不阻断部署（人工应急
+# 确实需要能压缩），但必须落一条 audit 事件——让「观察窗被压缩」从"没人知道"
+# 变成 Dashboard 可见。#111 实测压到 10min 却无任何留痕，正是复盘要消灭的静默降级。
+OBSERVE_MIN_REQUIRED=30
 SKIP_VERIFY=0
 DRY_RUN=0
 HB_INTERVAL=120
@@ -55,6 +72,20 @@ FAIL_STAGE=""
 
 log()  { printf '[pipeline] %s\n' "$*"; }
 die()  { local code=$1; shift; log "ERROR: $*"; exit "${code}"; }
+
+# ---------------------------------------------------------------- 结构化事件
+# 把「部署过程中的异常/非常规动作」写成一行结构化事件到 STATE_DIR/audit.log，
+# 供运维仪表盘消费（2026-10-18 复盘：让 Eric 不必 review 也能在 Dashboard 看到
+# 工作树漂移 / 观察窗压缩 / 仪表盘钩子失败这些「静默降级」信号）。
+# best-effort：状态目录不存在或写失败都不阻塞部署主链（只 log 不 die）。
+_audit_event() {
+  local kind="$1" detail="${2:-}"
+  local audit_file="${STATE_DIR}/audit.log"
+  [[ -d "${STATE_DIR}" ]] || return 0
+  printf '%s pipeline-event kind=%s pr=%s sha=%s session=%s %s\n' \
+    "$(date -u +%FT%TZ)" "${kind}" "${PR}" "${SHA:0:12}" "${SESSION}" "${detail}" \
+    >>"${audit_file}" 2>/dev/null || log "WARN: audit 事件写入失败（kind=${kind}，不影响部署）"
+}
 
 usage() {
   cat <<'EOF'
@@ -248,6 +279,7 @@ run_stage 20 up bash "${SCRIPT_DIR}/up.sh" "${PR}" "${SHA}" ${DRY_FLAG}
 
 if [[ "${SKIP_VERIFY}" -eq 1 ]]; then
   log "WARN: --skip-verify —— 跳过八项验证（仅限人工应急）"
+  _audit_event "skip-verify" "八项验证被跳过（人工应急）"
 else
   [[ -n "${SIM_USER}" ]] || SIM_USER="sim_user"
   if [[ -z "${SIM_PASS}" ]]; then
@@ -256,7 +288,49 @@ else
   fi
   export SIM_USER_USER="${SIM_USER}"
   export SIM_USER_PASSWORD="${SIM_PASS}"
-  run_stage 21 verify bash "${SCRIPT_DIR}/verify.sh" "${PR}" ${DRY_FLAG}
+
+  # ------------------------------------------------------------ F1 漂移守卫
+  # #110 首轮 verify 判红（195 failed + BuildError）的真因不是代码，是 verify
+  # 跑的 10 分钟里另一会话合了 #111 并 git pull，**工作树被换**：check1 的
+  # pytest 读到混合态（进程已 import 旧模块、模板读新文件）。绿实例（check2）
+  # 的 WorkingDirectory 由 systemd 写死为 REPO_ROOT，同样受漂移影响。
+  #
+  # 脚本层能做的：verify 前后各取一次工作树 HEAD，漂移即 fail-fast，把
+  # 「神秘的 195 failed」变成「工作树在 verify 中被改动」这条明确原因。
+  # ⚠️ 不能用 run_stage：它在 verify 失败时直接 exit，而 #110 正是 verify 因
+  # 漂移而失败——那样漂移检测永远跑不到，恰好错过要诊断的场景。故这里手动
+  # 捕获 verify rc，无论成败都先判漂移，再决定退出码与归因。
+  # （让绿实例也跑 pinned 代码需改生产 systemd unit，属 owner 决策，见 PR body。）
+  _head_before="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  log "→ verify"
+  _hb "verify-start"
+  bash "${SCRIPT_DIR}/verify.sh" "${PR}" ${DRY_FLAG} >>"${LOG}" 2>&1
+  _verify_rc=$?
+  _head_after="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+  if [[ "${_head_before}" != "${_head_after}" \
+        && "${_head_before}" != "unknown" && "${_head_after}" != "unknown" ]]; then
+    # 漂移优先归因：无论 verify 红绿，工作树被换都让结果不可信。
+    log "✗ 工作树在 verify 期间被改动（HEAD ${_head_before:0:12} → ${_head_after:0:12}）"
+    log "  verify 结果不可信：check1 pytest / check2 绿实例都可能读到混合态"
+    log "  （进程 import 旧模块 + 模板读新文件 = #110 的 195 failed 真因）。"
+    log "  根因：部署锁只护脚本、护不住 git pull。处理：等 release 后再 pull，"
+    log "        或对本 sha 重跑一轮部署。"
+    _audit_event "worktree-drift" \
+      "verify 期间 HEAD ${_head_before:0:12}->${_head_after:0:12}，结果不可信"
+    FAIL_STAGE="verify-drift"
+    exit 21
+  fi
+
+  if [[ ${_verify_rc} -ne 0 ]]; then
+    FAIL_STAGE="verify"
+    log "✗ verify 失败 (rc=${_verify_rc})"
+    log "--- 日志尾部 ${LOG} ---"
+    tail -n 20 "${LOG}" 2>/dev/null | sed 's/^/    /'
+    exit 21
+  fi
+  _hb "verify-done"
+  log "✓ verify"
 fi
 
 run_stage 22 promote bash "${SCRIPT_DIR}/promote.sh" ${DRY_FLAG}
@@ -265,6 +339,14 @@ run_stage 23 switch  bash "${SCRIPT_DIR}/switch.sh" green 100 ${DRY_FLAG}
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   log "dry-run 结束：不进入观察窗、不推进 deployed 锚点"
   exit 0
+fi
+
+# F5：观察窗被压缩到机制下限以下时留痕（不阻断——人工应急确实需要能压缩，
+# 但「压了却没人知道」正是复盘要消灭的静默降级；#111 实测压到 10min 无留痕）。
+if [[ "${OBSERVE_MIN}" -lt "${OBSERVE_MIN_REQUIRED}" ]]; then
+  log "WARN: 观察窗 ${OBSERVE_MIN}min < 机制要求 ${OBSERVE_MIN_REQUIRED}min —— 已记 audit"
+  _audit_event "observe-window-shortened" \
+    "observe=${OBSERVE_MIN}min < required=${OBSERVE_MIN_REQUIRED}min"
 fi
 
 observe_window "${OBSERVE_MIN}"
@@ -291,6 +373,10 @@ render_dashboard() {
     log "✓ 仪表盘已刷新"
   else
     log "WARN: 仪表盘刷新失败 —— 不影响部署结果；dc-dashboard-refresh.timer 会在 15 分钟内补上"
+    # F4：失败落 audit。此前钩子因 PY=python3 撞上 dist-packages 遮蔽而**长期
+    # 静默失败**，只 WARN 到易被忽略的日志、靠 timer 兜底掩盖。留一条结构化
+    # 事件，Dashboard 才能发现「钩子一直是坏的」，而不是等 timer 补上就以为没事。
+    _audit_event "dashboard-hook-failed" "render 失败，依赖 timer 兜底（见 ${LOG}）"
   fi
   return 0
 }
