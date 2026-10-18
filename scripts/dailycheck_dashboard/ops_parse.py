@@ -32,8 +32,20 @@ AUDIT_LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s+(?P<script>\S+)\s*(?P<rest>.*)$"
 )
 PR_ARG_RE = re.compile(r"\bpr=(\d+)\b")
+# pipeline-event 行（F1/F4/F5 新增的异常留痕）：kind=<k>，detail 跟在 sha/session 之后
+KIND_ARG_RE = re.compile(r"\bkind=([\w-]+)\b")
+# session 有两个来源：阶段行的行尾 JSON（lock.session）、pipeline-event 的 session= 参数。
+# 两处都必须认，否则人工接管统计会漏掉一半（单一归一化口径，见 Issue #51→#66 教训）。
+SESSION_JSON_RE = re.compile(r'"session":\s*"([^"]*)"')
+SESSION_ARG_RE = re.compile(r"\bsession=(\S+)")
 VERIF_NAME_RE = re.compile(r"(?P<date>\d{8})-pr-(?P<pr>\d+)\.md$")
 VERIF_TS_RE = re.compile(r"报告生成时间[:：]\s*(\S+)")
+
+# 自动闭环会话的命名前缀。判定用**白名单**：只有确定是自动的才算自动，
+# 其余非空 session 一律归「人工介入」——宁可多报也不漏报（与「零新增失败」同一哲学）。
+# 实测样本（88 行 audit.log）：hermes-* / pipeline-* / webhook-* / release-* = 自动；
+# dev-takeover / dev-recovery-101 / dev-111 / manual-switch-1018 = 人工。
+AUTO_SESSION_PREFIXES = ("hermes-", "pipeline-", "webhook-", "release-")
 
 
 class OpsParseError(RuntimeError):
@@ -102,11 +114,21 @@ def parse_audit_text(text: str) -> list[dict]:
             pr = int(pm.group(1)) if pm else None
         if pr is None:
             continue
+        # session：优先行尾 JSON 的 lock.session（阶段行），退回 session= 参数
+        # （pipeline-event 行）。两个来源同一口径，避免统计漏一半。
+        session = lock.get("session")
+        if not isinstance(session, str) or not session:
+            sm = SESSION_ARG_RE.search(args)
+            session = sm.group(1) if sm else ""
+        # kind：只有 pipeline-event 行才有（异常留痕），阶段行为空
+        km = KIND_ARG_RE.search(args)
         out.append({
             "ts": m.group("ts"),
             "script": m.group("script").rsplit("/", 1)[-1],
             "pr": pr,
             "sha": lock.get("sha") or None,
+            "session": session or "",
+            "kind": km.group(1) if km else "",
         })
     return out
 
@@ -132,10 +154,16 @@ def build_deploy_events(records: list[dict]) -> list[dict]:
 
     段名 = 「该段起点阶段」：up / verify / promote。
     只有 ≥2 个阶段点时才产生段，单点部署（只 up 过）总时长为 0。
+
+    ⚠️ 只用 STAGE_SCRIPTS 的记录归组：`pipeline-event`（F1/F4/F5 新增的异常
+    留痕行）不是部署阶段，若一并归组会为「只出现过一条事件、从没跑过 up」的
+    PR 造出幽灵部署事件（segments=[]、total=0），污染「今日部署」计数。
     """
     groups: dict[tuple[int, str], list[tuple[str, str]]] = {}
     last_sha: dict[int, str] = {}
     for rec in records:
+        if rec.get("script") not in STAGE_SCRIPTS:
+            continue
         if rec.get("sha"):
             last_sha[rec["pr"]] = rec["sha"]
         sha = rec.get("sha") or last_sha.get(rec["pr"]) or ""
@@ -175,8 +203,82 @@ def build_deploy_events(records: list[dict]) -> list[dict]:
     return events
 
 
-def parse_audit_log(path: Path, max_bytes: int = 4 * 1024 * 1024) -> list[dict]:
-    """读 audit.log 尾部并出部署事件。不存在 → OpsParseError。"""
+def classify_session(session: str) -> str:
+    """会话来源分类：``auto`` / ``manual`` / ``unlabeled``。
+
+    白名单式：只有确定是自动闭环的前缀才算 ``auto``，其余非空一律 ``manual``。
+    宁可多报不漏报——漏报人工接管会让「闭环成立」这个结论变成假的。
+
+    空 session 单列 ``unlabeled``：session 机制是后加的（实测 88 行里 58 行为空），
+    把空值算进任何一侧都会让比率失真。
+    """
+    if not session:
+        return "unlabeled"
+    return "auto" if session.startswith(AUTO_SESSION_PREFIXES) else "manual"
+
+
+# 异常留痕事件的已知 kind（F1/F4/F5 由 deploy_pipeline.sh 的 _audit_event 写入）。
+# 仅作解析层的「已知集合」参考；kind → 人话的**展示映射**在 render_ops.py
+# （展示层职责，解析层不碰文案）。未知 kind 照样透传，渲染侧原样显示不丢。
+KNOWN_EVENT_KINDS = frozenset({
+    "worktree-drift",
+    "observe-window-shortened",
+    "skip-verify",
+    "dashboard-hook-failed",
+})
+
+
+def build_loop_integrity(records: list[dict]) -> dict:
+    """从 audit.log 记录算「闭环完整性」——这套流程到底有没有真闭环。
+
+    为什么要有这个（2026-10-18 复盘）：白皮书声称「CI 全绿→合并人工介入 = 0」，
+    但那是**取样偏差**——它只统计到 merge，而事故全发生在 merge 之后。
+    把窗口延长到观察窗结束，实测两天 3 次人工接管。这类事实必须从看板可见，
+    不能只在事后 review 对话里才发现。
+
+    ⚠️ 只报有事实依据的数字，不猜（与 `_render_anomaly` 同一原则）：
+      - 人工/自动比率**只在有标注的记录内**算，未标注条数单独透出
+      - 回滚次数**不可观测**（`switch.sh` 只审计 target=green，切蓝不留痕），
+        故列入 blind_spots，而不是报「0 次」——把「没记录」说成「没发生」
+        比不报更坏
+    """
+    auto = manual = unlabeled = 0
+    manual_sessions: dict[str, int] = {}
+    kinds: dict[str, int] = {}
+    for rec in records:
+        cls = classify_session(rec.get("session") or "")
+        if cls == "auto":
+            auto += 1
+        elif cls == "manual":
+            manual += 1
+            s = rec.get("session") or ""
+            manual_sessions[s] = manual_sessions.get(s, 0) + 1
+        else:
+            unlabeled += 1
+        kind = rec.get("kind") or ""
+        if kind:
+            kinds[kind] = kinds.get(kind, 0) + 1
+
+    labeled = auto + manual
+    return {
+        "auto_records": auto,
+        "manual_records": manual,
+        "unlabeled_records": unlabeled,
+        # 比率分母只含已标注记录；labeled=0 时给 None（渲染成「—」，不是 0%）
+        "auto_rate": (auto / labeled) if labeled else None,
+        "manual_sessions": sorted(manual_sessions),
+        "manual_prs": sorted({int(r["pr"]) for r in records
+                              if classify_session(r.get("session") or "") == "manual"
+                              and r.get("pr") is not None}),
+        "events": kinds,
+        "blind_spots": [
+            "回滚次数不可观测：switch.sh 只审计 target=green，切蓝（回滚）不留痕",
+        ],
+    }
+
+
+def _read_audit_text(path: Path, max_bytes: int) -> str:
+    """读 audit.log 尾部（超出 max_bytes 则丢弃被截断的首行）。"""
     if not path.exists():
         raise OpsParseError(f"audit.log 不存在：{path}")
     try:
@@ -185,10 +287,23 @@ def parse_audit_log(path: Path, max_bytes: int = 4 * 1024 * 1024) -> list[dict]:
             if size > max_bytes:
                 fh.seek(size - max_bytes)
                 fh.readline()  # 丢掉被截断的首行
-            text = fh.read().decode("utf-8", errors="replace")
+            return fh.read().decode("utf-8", errors="replace")
     except OSError as exc:
         raise OpsParseError(f"audit.log 读失败：{exc}") from exc
-    return build_deploy_events(parse_audit_text(text))
+
+
+def parse_audit_records(path: Path, max_bytes: int = 4 * 1024 * 1024) -> list[dict]:
+    """读 audit.log → **原始记录**（一次读取，供 events 与 integrity 共用）。
+
+    单一归一化口径：部署事件与闭环完整性必须由同一份记录派生，
+    否则两侧会漂移（同型缺陷见 inbox_watcher，Issue #51→#66）。
+    """
+    return parse_audit_text(_read_audit_text(path, max_bytes))
+
+
+def parse_audit_log(path: Path, max_bytes: int = 4 * 1024 * 1024) -> list[dict]:
+    """读 audit.log 尾部并出部署事件。不存在 → OpsParseError。"""
+    return build_deploy_events(parse_audit_records(path, max_bytes))
 
 
 # ============================================================

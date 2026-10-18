@@ -32,6 +32,15 @@ SOURCE_LABELS = {
     "unknown": ("未知", "gray"),
 }
 
+# 异常留痕事件 kind → 人话（展示层职责；解析层只透传 kind，不碰文案）。
+# 未知 kind 用 `.get(k, k)` 原样显示 —— 新事件类型不会静默丢失。
+EVENT_KIND_LABELS = {
+    "worktree-drift": "工作树漂移（verify 期间被 git pull 换树）",
+    "observe-window-shortened": "观察窗被压缩到机制下限以下",
+    "skip-verify": "跳过了八项验证（人工应急）",
+    "dashboard-hook-failed": "仪表盘钩子渲染失败（靠 timer 兜底）",
+}
+
 # 图例用的实色（与 .tk .* 的 CSS 保持一致）
 SOURCE_COLORS = {
     "webhook": "#2f6fed",
@@ -94,12 +103,14 @@ def _cycle_sec(pr: dict) -> int | None:
 # ============================================================
 OPS_CSS = """
     .ops-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:14px 0 4px}
+    .loop-kpis{grid-template-columns:repeat(4,minmax(0,1fr))}
     .ops-kpi{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:11px 13px}
     .ops-kpi .ov{font-size:21px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums}
     .ops-kpi .ov small{font-size:12px;font-weight:500;color:var(--t2);margin-left:1px}
     .ops-kpi .ok{font-size:11.5px;color:var(--t2);margin-top:2px}
     .ops-kpi.hot .ov{color:var(--warn)}
     .ops-kpi.bad .ov{color:var(--err)}
+    .ops-kpi.ok .ov{color:var(--ok)}
     .wf-row{display:grid;grid-template-columns:58px 1fr 62px;gap:9px;align-items:center;padding:6px 0}
     .wf-row+.wf-row{border-top:1px solid #f1f2f4}
     .wf-l{font-size:12px;color:var(--t2);font-variant-numeric:tabular-nums}
@@ -134,14 +145,21 @@ OPS_CSS = """
     .al .n{font-variant-numeric:tabular-nums;font-weight:600}
     .al .n.ok{color:var(--ok)}.al .n.hot{color:var(--warn)}.al .n.bad{color:var(--err)}
     .ops-empty{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 15px;font-size:12.5px;color:var(--t2)}
-    @media(max-width:1024px){.ops-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+    @media(max-width:1024px){
+        .ops-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+        .loop-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+    }
     @media(max-width:760px){
         .ops-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+        .loop-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
         .cols2{grid-template-columns:1fr}
         .wf-row{grid-template-columns:50px 1fr 54px}
         .wf-bar{height:12px}
     }
-    @media(max-width:480px){.ops-kpi .ov{font-size:18px}}
+    @media(max-width:480px){
+        .ops-kpi .ov{font-size:18px}
+        .loop-kpis{grid-template-columns:1fr}
+    }
 """
 
 
@@ -157,9 +175,11 @@ def render_ops_block(
     fetched_at: str = "",
     unavailable: list[str] | None = None,
     pr_data_ok: bool = True,
+    loop_integrity: dict | None = None,
 ) -> str:
-    """返回整段运维区块 HTML（KPI 条 + 瀑布 + token + 验证矩阵 + 归因）。"""
+    """返回整段运维区块 HTML（KPI 条 + 瀑布 + token + 验证矩阵 + 闭环完整性 + 归因）。"""
     unavailable = unavailable or []
+    loop_integrity = loop_integrity or {}
     pr_by_num = {int(p["number"]): p for p in prs if p.get("number") is not None}
 
     kpi_html = _render_kpis(events, prs, token_rows, pr_data_ok=pr_data_ok)
@@ -172,6 +192,10 @@ def render_ops_block(
     if verifications:
         body_parts.append(_render_matrix(verifications))
 
+    # 闭环完整性**不受 body_parts 空判影响**：即使没有部署事件（audit.log 缺失），
+    # 「数据盲区」本身也是要暴露的事实——否则整块消失，盲区就永远看不见。
+    loop_html = _render_loop_integrity(loop_integrity)
+
     if not body_parts:
         note = "运维数据源暂不可用"
         if unavailable:
@@ -180,6 +204,7 @@ def render_ops_block(
             kpi_html
             + '<div class="ops-empty">' + note
             + "。仪表盘其余区块不受影响；接入后本区块自动出现。</div>"
+            + loop_html
         )
 
     anomaly = _render_anomaly(events, verifications, token_rows)
@@ -187,7 +212,7 @@ def render_ops_block(
     if unavailable:
         stamp += "<span><b>不可用源：</b>" + _esc("、".join(unavailable)) + "</span>"
     stamp += "</div>"
-    return kpi_html + "\n".join(body_parts) + anomaly + stamp
+    return kpi_html + "\n".join(body_parts) + loop_html + anomaly + stamp
 
 
 # ------------------------------------------------------------ KPI
@@ -435,6 +460,86 @@ def _render_matrix(verifications: list[dict]) -> str:
 
 
 # ------------------------------------------------------------ 归因
+def _render_loop_integrity(li: dict) -> str:
+    """闭环完整性：这套流程到底有没有真闭环（2026-10-18 复盘新增）。
+
+    为什么单列一节：现有 KPI 度量的是**吞吐与耗时**（合并数 / 周期 / 部署次数），
+    但复盘发现的问题全在**闭环的真实性**——人工接管了几次、有没有工作树漂移、
+    观察窗有没有被悄悄压缩。这些在原有版面里一个都看不见，只能靠事后 review
+    对话才发现。本节把它们变成一等公民。
+
+    只报有事实依据的数字（与 _render_anomaly 同一原则）：
+      - 自动率的分母**只含有标注的会话**，未标注条数单列，不摊进任何一侧
+      - 不可观测的量（回滚次数）明说「盲区」，绝不显示 0 —— 把「没记录」
+        说成「没发生」比不报更坏
+    """
+    if not li:
+        return ""
+
+    auto = int(li.get("auto_records") or 0)
+    manual = int(li.get("manual_records") or 0)
+    unlabeled = int(li.get("unlabeled_records") or 0)
+    rate = li.get("auto_rate")
+    events = li.get("events") or {}
+    manual_sessions = li.get("manual_sessions") or []
+    manual_prs = li.get("manual_prs") or []
+    blind = li.get("blind_spots") or []
+
+    def card(value: str, unit: str, label: str, sub: str, cls: str = "") -> str:
+        unit_html = f"<small> {unit}</small>" if unit else ""
+        return (
+            f'<div class="ops-kpi {cls}"><div class="ov">{value}{unit_html}</div>'
+            f'<div class="ok">{_esc(label)}</div>'
+            f'<div class="ok" style="color:var(--t3)">{_esc(sub)}</div></div>'
+        )
+
+    # 自动率：无标注记录时显示「—」，不显示 100%（那会被读成「全闭环」）
+    if rate is None:
+        c_rate = card("—", "", "自动闭环率", "无标注会话，不可判", "hot")
+    else:
+        pct = f"{rate * 100:.0f}"
+        c_rate = card(pct, "%", "自动闭环率", f"{auto} 自动 / {manual} 人工",
+                      "bad" if manual else "ok")
+    c_manual = card(str(manual), "次", "人工接管",
+                    f"涉及 PR {', '.join('#' + str(p) for p in manual_prs[:5]) or '—'}",
+                    "bad" if manual else "")
+    c_event = card(str(sum(events.values())), "起", "异常留痕",
+                   f"{len(events)} 类" if events else "无异常事件")
+    c_blind = card(str(len(blind)), "处", "数据盲区",
+                   "下列指标不可观测", "hot" if blind else "")
+
+    rows: list[str] = []
+    # 异常事件明细（有则列，无则明确说「无」——不说「无」会让人以为没采到）
+    if events:
+        detail = "、".join(
+            f"{EVENT_KIND_LABELS.get(k, k)} × {v}"
+            for k, v in sorted(events.items(), key=lambda kv: -kv[1])
+        )
+        rows.append(f'<li><span>异常事件明细</span><span class="n hot">{_esc(detail)}</span></li>')
+    else:
+        rows.append('<li><span>异常事件明细</span><span class="n ok">无（漂移 / 压缩观察窗 / 跳过验证 / 钩子失败均未发生）</span></li>')
+    if unlabeled:
+        rows.append(
+            f'<li><span>未标注会话</span><span class="n hot">{unlabeled} 条 —— 早期无 session 机制，不计入自动率分母</span></li>'
+        )
+    if manual_sessions:
+        rows.append(
+            '<li><span>人工接管会话</span><span class="n bad">'
+            + _esc(", ".join(manual_sessions)) + "</span></li>"
+        )
+    for b in blind:
+        rows.append(f'<li><span>数据盲区</span><span class="n hot">{_esc(b)}</span></li>')
+
+    return (
+        '<h2 id="loop"><span class="no">4</span>闭环完整性'
+        '<span class="hint">流程有没有真闭环，而不是跑得快不快</span></h2>'
+        '<div class="ops-kpis loop-kpis">'
+        + c_rate + c_manual + c_event + c_blind
+        + "</div>"
+        + '<div class="note"><ul class="al">' + "".join(rows) + "</ul></div>"
+    )
+
+
 def _render_anomaly(events: list[dict], verifications: list[dict], token_rows: list[dict]) -> str:
     stalls = 0
     slowest = 0
@@ -452,7 +557,7 @@ def _render_anomaly(events: list[dict], verifications: list[dict], token_rows: l
         return f'<li><span>{_esc(label)}</span><span class="n {cls}">{_esc(value)}</span></li>'
 
     return (
-        '<h2 id="anomaly"><span class="no">4</span>异常归因'
+        '<h2 id="anomaly"><span class="no">5</span>异常归因'
         '<span class="hint">只列有事实依据的项，不猜</span></h2>'
         '<div class="note"><ul class="al">'
         + li("up / promote 段卡顿", f"{stalls} 处" + (f"（最长 {_fmt_sec(slowest)}）" if slowest else ""),
