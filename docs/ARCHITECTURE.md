@@ -219,9 +219,9 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 - **核心包** `scripts/dailycheck_dashboard/`（dev 端，可 commit）：
   - `__main__.py`：CLI 三子命令 — `render`（拉数据 + 渲染 + 落 db）/ `history`（列最近 N 快照）/ `diff`（最近两次 KPI 对比）
   - `db.py`：SQLite 封装（`snapshots` 主表 + `issues_snapshot` / `prs_snapshot` / `worktrees_snapshot` 三个子表 + `schema_version` 幂等迁移；autocommit 模式 + WAL + `synchronous=NORMAL`）
-  - `fetchers.py`：gh CLI 包装（`issue list --state all --json` / `pr list --state all --json`，字段驼峰→snake_case 规范化）+ git worktree 解析（porcelain 格式）+ inbox 统计
+  - `fetchers.py`：**GitHub REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`per_page=100` 最多 3 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 REST 的 `/pulls` 只有 open/closed，「已合并」只能从 `merged_at` 判）+ git worktree 解析（porcelain 格式）+ inbox 统计。**不用 gh CLI**：仓库是 public，匿名即可读（60 次/小时，每轮约 3 次请求 = 12 次/小时）；生产 `gh` 的 `hosts.yml` 认证早已失效，而 gh 没认证就彻底不可用 —— 2026-10-17 正是它把「拉不到」变成了「今日 0 个合并」。环境里若存在 `GH_TOKEN` / `GITHUB_TOKEN` 会自动带上（配额 5000/h），代码无需再改
   - `render.py`：HTML 渲染（`string.Template` 内嵌 CSS，零三方依赖，KPI 卡片差异行用 `↑N` / `↓N` / `→` 三态箭头）
-  - **零外部依赖**：纯 stdlib（`sqlite3` / `subprocess` / `json` / `pathlib` / `string.Template`）
+  - **零三方依赖**：纯 stdlib（`sqlite3` / `subprocess` / `json` / `urllib` / `pathlib` / `string.Template`）
 - **触发 listener** `deploy/scripts/dailycheck_dashboard_on_pr.py`（VPS 端，systemd 拉起）：订阅 `inbox.jsonl`，收到 PR 事件（`{opened,synchronize,reopened}`）→ 调 `python -m scripts.dailycheck_dashboard render --trigger-kind pr_xxx --trigger-event-id <delivery_id>`。**与 `dc-inbox-watcher` 完全独立、互不干扰**（各自一份 handled_ids state-file；同一 inbox.jsonl 多读者，写者只有 receiver）。⚠️ 该脚本是 `scripts/prod_agent/inbox_watcher.py` 的**同源孪生副本**（退避语义、状态归一化规则共享，默认参数与触发方式有意不同）——**任一侧改动必须同步另一侧**，历史上出现过「一侧修、另一侧漏」的单侧漂移（Issue #51 → #66）。⚠️ **孪生口径已收口（2026-10-17，Issue #66 收口 #51）**：规则 7（损坏状态归一化 + 留痕 + `sane_ahead` 上界）现已**两侧同时落地**——本侧首发，孪生侧 `inbox_watcher.py` 随同一 PR 补齐（`_sane_next` / `_normalize_failure` / `_str_set` / `_next_at` / `_attempts` / `retry_due` / `state.sane_ahead`，主循环 gating 同为 `sig != last_sig or retry_due(state)`）。收口背景（按**实测**记录）：Issue #51 的修复分支（`6b70183`）只有 `retry_due` + `_next_at`，**不含** `_normalize_failure` / `_sane_next` / `_str_set` / `sane_ahead`——8 种条目级损坏形态与 3 种容器级形态**全部零 WARNING**，即「合并 #51 并不等于孪生侧收口」；故 owner 于 2026-10-17 拍板由 #66 统一收口，**#51 已关闭（not planned，留收口说明）**，本 PR 为该缺陷族唯一落点。⚠️ **修复前的风险口径（不得低估）**：在役 `dc-inbox-watcher` 对**非数值 / 溢出** `next` 是**抛异常崩溃**（`next="x"` → `ValueError`、`next=10**309` → `OverflowError`；`state.save()` 不执行 → 条目永久留在状态文件 → `Restart=always` 永久崩溃循环），「静默锁死」只描述**有限但越界**（如 `1e308`）这一种形态——两者现已同时关闭
 - **systemd 单元** `deploy/systemd/dc-dashboard-generator.service`（套 `dc-inbox-watcher.service` 模板：`Restart=always` / `RestartSec=5` / `ProtectHome=read-only` / `ReadWritePaths=/var/lib/dailycheck-dashboard,/var/lib/dailycheck-prod-agent`；触发命令走 venv 绝对路径）
 
@@ -296,9 +296,13 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 **存储（事件型，与快照型分开）**：`db.py` 的三张表是快照型（每次渲染整份写一份），按 15 分钟一次存会 96 份/天的重复。故新增 `ops_db.py` 三张**时间序列表** + 幂等 upsert（主键 `(pr, sha)` / `(day, source)` / `(pr, generated_at)`），只借 `db.connect()`，不改既有表。
 
-**版面（`render_ops.py`，注入主模板 `${ops_css}` / `${ops_html}` 两处占位符）**：顶部 6 张运维 KPI（今日合并 / 交付周期中位数 / 今日部署 / 平均验证耗时 / 今日 token / 部署卡顿）→ 交付流水线瀑布（每 PR 一行：创建→合并→up→verify→promote，红色斜纹＝卡顿）→ token 7 日堆叠（按 source 拆 webhook/cron/feishu）→ 验证矩阵（8 项 × 最近 6 次）→ 异常归因。原 ①–⑤ 章节顺延为 ②–⑥。
+**版面（`render_ops.py`，注入主模板 `${ops_css}` / `${ops_html}` 两处占位符）**：顶部 6 张运维 KPI（今日合并 / 交付周期中位数 / 今日部署 / 验证到切流 / 今日 token / 部署卡顿）→ 交付流水线瀑布（每 PR 一行：创建→合并→up→verify→promote，红色斜纹＝卡顿）→ token 7 日堆叠（按 source 拆 webhook/cron/feishu）→ 验证矩阵（8 项 × 最近 6 次）→ 异常归因。原 ①–⑤ 章节顺延为 ②–⑥。
 
-**「拉不到」不等于「没有」**：`fetch_prs` 失败（生产实测 `gh` 认证失效）时 `pr_data_ok=False`，两张 PR 相关 KPI 出 `—` + 「GitHub 拉取失败」，**不出 0** —— 把「拉不到」渲染成「今日 0 个合并」是错误事实，比空着更糟。同理其余源失败一律进 `ops_unavailable`，页面底部列出不可用源。
+**KPI 口径（不粉饰）**：「验证到切流」= verify 起点到切流完成的跨度，**含 promote**。`promote.sh` 并不总在 `audit.log` 留行（#97 有，#89/#90/#94/#96 都没有），缺标记时 verify 段会一路并到切流；从审计日志无法区分「verify 慢」和「promote 没打点」，硬拆只能靠猜，所以改标签不改算法。精确的八项耗时唯一可信源是 `backups/prod-verifications/*.md` 的生成时间。
+
+**「拉不到」不等于「没有」**：`fetch_prs` 失败时 `pr_data_ok=False`，两张 PR 相关 KPI 出 `—` + 「GitHub 拉取失败」，**不出 0** —— 把「拉不到」渲染成「今日 0 个合并」是错误事实，比空着更糟。同理其余源失败一律进 `ops_unavailable`，页面底部列出不可用源。
+
+**数据源演进（2026-10-18）**：首版走 `gh` CLI，上线当天即发现生产 `/root/.config/gh/hosts.yml` 的 token 失效，两张 PR KPI 长期 `—`。改 REST 匿名后实测拿到 63 条真实 PR（编号 1–105，中间 42 个缺号是历史删除，并非漏抓）+ 41 条 Issue。**不引入新密钥**：仓库 public，匿名配额（60/h）对 15 分钟一轮的渲染绰绰有余；`GH_TOKEN` 存在则自动升级到 5000/h，留作将来仓库转私有时的开关。
 
 ---
 
