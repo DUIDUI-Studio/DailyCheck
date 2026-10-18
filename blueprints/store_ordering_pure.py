@@ -59,6 +59,95 @@ ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
 SHIPMENT_ACTION: str = "门店订货出库"
 RECEIPT_ACTION: str = "门店订货入库"
 
+#: 起订倍数「不限」的取值。items.order_multiple 默认即此值。
+ORDER_MULTIPLE_UNLIMITED: float = 1.0
+
+
+class OrderMultipleError(ValueError):
+    """下单数量不满足品项起订倍数。
+
+    继承 ValueError 是为了让既有 ``except ValueError`` 的调用方（路由层）
+    无需改动即可捕获并 flash 出可读文案。
+    """
+
+    def __init__(self, name: str, quantity: float, multiple: float) -> None:
+        self.name = name
+        self.quantity = parse_qty(quantity)
+        self.multiple = normalize_order_multiple(multiple)
+        super().__init__(
+            f"{name} 的订购数量必须是 {fmt_multiple(self.multiple)} 的整数倍"
+            f"（当前填 {parse_qty(self.quantity)}）"
+        )
+
+
+def normalize_order_multiple(raw: Any) -> float:
+    """把配置值归一化成合法的订货倍数。
+
+    非法值（None / 非数字 / <= 0）一律回落成 1（不限），保证任何脏数据都
+    不会把门店卡死在「这个品项永远订不了」的状态。
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return ORDER_MULTIPLE_UNLIMITED
+    if value <= 0:
+        return ORDER_MULTIPLE_UNLIMITED
+    return parse_qty(value)
+
+
+def fmt_multiple(multiple: Any) -> str:
+    """倍数的人类可读写法：5.0 → '5'，2.50 → '2.5'。"""
+    value = normalize_order_multiple(multiple)
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "1"
+
+
+def is_multiple_of(quantity: Any, multiple: Any) -> bool:
+    """quantity 是否为 multiple 的整数倍（multiple=1 时恒为 True）。"""
+    step = normalize_order_multiple(multiple)
+    if step == ORDER_MULTIPLE_UNLIMITED:
+        return True
+    qty = parse_qty(quantity)
+    if qty <= 0:
+        return False
+    # 浮点容差：按「离最近整数倍的距离」判定，阈值随步长缩放，
+    # 避免 0.3 / 0.1 这类二进制表示误差被误判。
+    steps = qty / step
+    remainder = abs(qty - round(steps) * step)
+    return remainder <= max(1e-9, abs(step) * 1e-9)
+
+
+def next_valid_quantity(quantity: Any, multiple: Any) -> float:
+    """向上取到最近一个合法数量（≥ multiple）。前端/提示文案用。"""
+    step = normalize_order_multiple(multiple)
+    qty = parse_qty(quantity)
+    if step == ORDER_MULTIPLE_UNLIMITED:
+        return qty if qty > 0 else step
+    if qty <= 0:
+        return parse_qty(step)
+    steps = Decimal(str(qty)) / Decimal(str(step))
+    return parse_qty(float(Decimal(str(step)) * Decimal(int(steps.to_integral_value(rounding="ROUND_CEILING")))))
+
+
+def get_dc_item_order_multiple(
+    master_conn: sqlite3.Connection,
+    dc_warehouse_code: str,
+    canonical_id: int,
+) -> float:
+    """取某 DC 某品项的起订倍数；品项不存在时按「不限」处理。"""
+    dc_conn = open_warehouse_db(dc_warehouse_code)
+    try:
+        row = dc_conn.execute(
+            "SELECT order_multiple FROM items WHERE canonical_id=? ",
+            (canonical_id,),
+        ).fetchone()
+    finally:
+        dc_conn.close()
+    if row is None:
+        return ORDER_MULTIPLE_UNLIMITED
+    return normalize_order_multiple(row[0])
+
+
 
 # ---------------------------------------------------------------------------
 # Order number generation
@@ -209,6 +298,12 @@ def list_cart_items(
         )
         item["unit_price"] = unit_price
         item["line_subtotal"] = parse_qty(unit_price * float(item["quantity"]))
+        # 起订倍数（DC 本仓字段）：模板用它设 input 的 step/min 与提示文案。
+        multiple = normalize_order_multiple(
+            dc_item.get("order_multiple") if dc_item else ORDER_MULTIPLE_UNLIMITED
+        )
+        item["order_multiple"] = multiple
+        item["multiple_ok"] = is_multiple_of(item["quantity"], multiple)
         out.append(item)
     return out
 
@@ -220,7 +315,11 @@ def add_cart_item(
     quantity: float,
     unit: str,
 ) -> None:
-    """Add or merge a cart item by canonical_id."""
+    """Add or merge a cart item by canonical_id.
+
+    Raises OrderMultipleError when the merged quantity is not a multiple of
+    the DC item's ``order_multiple``（起订倍数）.
+    """
     master_conn.row_factory = sqlite3.Row
     qty = parse_qty(quantity)
     if qty <= 0:
@@ -230,16 +329,19 @@ def add_cart_item(
         "SELECT id, quantity FROM store_order_cart_items WHERE cart_id=? AND canonical_id=?",
         (cart_id, canonical_id),
     ).fetchone()
+    new_qty = parse_qty(qty) if existing is None else parse_qty(existing["quantity"] + qty)
+    multiple = get_cart_item_multiple(master_conn, cart_id, canonical_id)
+    if not is_multiple_of(new_qty, multiple):
+        raise OrderMultipleError(_canonical_name(master_conn, canonical_id), new_qty, multiple)
     ts = now()
     if existing is None:
         master_conn.execute(
             """INSERT INTO store_order_cart_items
                (cart_id, canonical_id, quantity, unit, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (cart_id, canonical_id, qty, unit, ts, ts),
+            (cart_id, canonical_id, new_qty, unit, ts, ts),
         )
     else:
-        new_qty = parse_qty(existing["quantity"] + qty)
         master_conn.execute(
             "UPDATE store_order_cart_items SET quantity=?, unit=?, updated_at=? WHERE id=?",
             (new_qty, unit, ts, existing["id"]),
@@ -248,22 +350,56 @@ def add_cart_item(
     master_conn.commit()
 
 
+def _canonical_name(master_conn: sqlite3.Connection, canonical_id: int) -> str:
+    """品项显示名，取不到时回落到 #id（错误文案永不为空）。"""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT name FROM canonical_items WHERE id=?", (canonical_id,)
+    ).fetchone()
+    return str(row["name"]) if row else f"#{canonical_id}"
+
+
+def get_cart_item_multiple(
+    master_conn: sqlite3.Connection,
+    cart_id: int,
+    canonical_id: int,
+) -> float:
+    """购物车所属 DC 上该品项的起订倍数。"""
+    master_conn.row_factory = sqlite3.Row
+    row = master_conn.execute(
+        "SELECT dc_warehouse_code FROM store_order_carts WHERE id=?", (cart_id,)
+    ).fetchone()
+    if row is None:
+        return ORDER_MULTIPLE_UNLIMITED
+    return get_dc_item_order_multiple(master_conn, row["dc_warehouse_code"], canonical_id)
+
+
 def update_cart_item_quantity(
     master_conn: sqlite3.Connection,
     cart_item_id: int,
     quantity: float,
 ) -> None:
-    """Update cart item quantity; delete if <= 0."""
+    """Update cart item quantity; delete if <= 0.
+
+    Raises OrderMultipleError when the new quantity does not match the
+    DC item's 起订倍数.
+    """
     master_conn.row_factory = sqlite3.Row
     qty = parse_qty(quantity)
     if qty <= 0:
         remove_cart_item(master_conn, cart_item_id)
         return
     item = master_conn.execute(
-        "SELECT cart_id FROM store_order_cart_items WHERE id=?", (cart_item_id,)
+        "SELECT cart_id, canonical_id FROM store_order_cart_items WHERE id=?",
+        (cart_item_id,),
     ).fetchone()
     if item is None:
         raise ValueError(f"cart_item_id={cart_item_id} not found")
+    multiple = get_cart_item_multiple(master_conn, item["cart_id"], item["canonical_id"])
+    if not is_multiple_of(qty, multiple):
+        raise OrderMultipleError(
+            _canonical_name(master_conn, item["canonical_id"]), qty, multiple
+        )
     master_conn.execute(
         "UPDATE store_order_cart_items SET quantity=?, updated_at=? WHERE id=?",
         (qty, now(), cart_item_id),
@@ -408,6 +544,7 @@ def list_available_dc_items(
             selling_price = float(item.get("selling_price") or 0)
             unit_cost = float(item.get("unit_cost") or 0)
             item["unit_price"] = selling_price if selling_price > 0 else unit_cost
+            item["order_multiple"] = normalize_order_multiple(item.get("order_multiple"))
             out.append(item)
         return out
     finally:
@@ -464,7 +601,8 @@ def list_dc_items_for_management(
     try:
         dc_conn.row_factory = sqlite3.Row
         rows = dc_conn.execute(
-            """SELECT id, sku, name, unit, quantity, canonical_id, is_orderable
+            """SELECT id, sku, name, unit, quantity, canonical_id, is_orderable,
+                      order_multiple
                FROM items
                WHERE canonical_id IS NOT NULL
                ORDER BY name"""
@@ -476,6 +614,7 @@ def list_dc_items_for_management(
             canon = canonical_map.get(canonical_id)
             if canon is None:
                 continue
+            item["order_multiple"] = normalize_order_multiple(item.get("order_multiple"))
             item["canonical_name"] = canon["name"]
             item["category_code"] = canon["category_code"]
             status = canon.get("status")
@@ -534,6 +673,37 @@ def set_dc_item_orderable(
         return True
     finally:
         dc_conn.close()
+
+
+def set_dc_item_order_multiple(
+    master_conn: sqlite3.Connection,
+    dc_warehouse_code: str,
+    canonical_id: int,
+    multiple: float,
+) -> float:
+    """设置单品的起订倍数，返回归一化后真正落库的值。
+
+    ``multiple`` <= 1（或非法）→ 落 1，等于「不限倍数」。
+    与 `set_dc_item_orderable` 不同，这里**不**校验主数据状态：倍数只影响
+    数量校验，主数据停用的品项本来就订不到，配置留着无害。
+
+    Raises ValueError 当该 DC 没有绑定此 canonical_id 的品项。
+    """
+    step = normalize_order_multiple(multiple)
+    dc_conn = open_warehouse_db(dc_warehouse_code)
+    try:
+        cur = dc_conn.execute(
+            "UPDATE items SET order_multiple=? WHERE canonical_id=?",
+            (step, canonical_id),
+        )
+        dc_conn.commit()
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"DC {dc_warehouse_code} 无 canonical_id={canonical_id} 的品项"
+            )
+    finally:
+        dc_conn.close()
+    return step
 
 
 def list_unorderable_cart_canonicals(
@@ -968,21 +1138,33 @@ def validate_cart_for_submit(
     DC 库存为 0 的品项。仅保留 canonical_id 绑定校验（unbound）和购物车
     非空校验。
 
-    Returns {"ok": bool, "unbound": [...]}
-      - ok: True 当且仅当购物车非空且没有未绑定品项
+    Returns {"ok": bool, "unbound": [...], "multiples": [...]}
+      - ok: True 当且仅当购物车非空、没有未绑定品项、且每行数量都满足起订倍数
       - unbound: list[{canonical_id, name}] 等待门店补绑定的品项
+      - multiples: list[{canonical_id, name, quantity, multiple, unit}] 数量
+        不满足 DC 端配置的起订倍数的品项（v3, 2026-10-18）
     """
     master_conn.row_factory = sqlite3.Row
     items = list_cart_items(master_conn, cart["id"])
     unbound: list[dict[str, Any]] = []
+    multiples: list[dict[str, Any]] = []
     for item in items:
         canonical_id = item["canonical_id"]
         name = item["name"]
         if not item.get("store_bound"):
             unbound.append({"canonical_id": canonical_id, "name": name})
+        if not item.get("multiple_ok", True):
+            multiples.append({
+                "canonical_id": canonical_id,
+                "name": name,
+                "quantity": parse_qty(item["quantity"]),
+                "multiple": normalize_order_multiple(item.get("order_multiple")),
+                "unit": item.get("cart_unit") or "",
+            })
     return {
-        "ok": not unbound and bool(items),
+        "ok": not unbound and not multiples and bool(items),
         "unbound": unbound,
+        "multiples": multiples,
     }
 
 

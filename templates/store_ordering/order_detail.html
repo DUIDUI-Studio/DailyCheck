@@ -36,17 +36,22 @@
     </div>
     <div><strong>送达时间：</strong>{{ order.delivered_at or '—' }}</div>
   </div>
-  <div class="info-card-total">
-    <span class="info-card-total-label">订单金额</span>
-    <span class="info-card-total-value">¥ {{ total_amount | fmt_money }}</span>
-  </div>
-  <div class="info-card-total" style="margin-top:6px;background:#f8fafc">
-    <span class="info-card-total-label">运费</span>
-    <span class="info-card-total-value">¥ {{ (order.shipping_fee or 0) | fmt_money }}</span>
-  </div>
-  <div class="info-card-total" style="margin-top:6px;background:#ecfdf5">
-    <span class="info-card-total-label"><strong>订单总计</strong></span>
-    <span class="info-card-total-value"><strong>¥ {{ ((total_amount or 0) + (order.shipping_fee or 0)) | fmt_money }}</strong></span>
+  {# 金额拆分（2026-10-18）：此前三个 .info-card-total 直接挂在 .info-card 的
+     两列 grid 上 → 第 2/3 个被自动排到卡片左侧，且浅底白字几乎看不见。
+     现在统一收进 .info-card-totals 一列（货品 / 运费 / 总计三行）。 #}
+  <div class="info-card-totals">
+    <div class="info-card-fee">
+      <span class="info-card-fee-label">货品金额</span>
+      <span class="info-card-fee-value">¥ {{ (total_amount or 0) | fmt_money }}</span>
+    </div>
+    <div class="info-card-fee">
+      <span class="info-card-fee-label">运费</span>
+      <span class="info-card-fee-value">¥ {{ (order.shipping_fee or 0) | fmt_money }}</span>
+    </div>
+    <div class="info-card-total">
+      <span class="info-card-total-label">订单总计</span>
+      <span class="info-card-total-value">¥ {{ ((total_amount or 0) + (order.shipping_fee or 0)) | fmt_money }}</span>
+    </div>
   </div>
 </div>
 

@@ -13,8 +13,8 @@
 ## 0. 一览
 
 - 蓝图 19 个（已装配 18 / 未装配 1）
-- 路由 **165** 条（按鉴权强度：平台超管 48 · 登录 44 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 5 · 任一权限 1）
-- 数据表 **59** 张，`WAREHOUSE_SCHEMA_VERSION = 2`
+- 路由 **166** 条（按鉴权强度：平台超管 48 · 登录 44 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 6 · 任一权限 1）
+- 数据表 **59** 张，`WAREHOUSE_SCHEMA_VERSION = 3`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
 
@@ -23,7 +23,7 @@
 | 蓝图 | 文件 | 路由数 | 装配 |
 |---|---|---|---|
 | `recipe_cost` | `recipe_cost.py` | 23 | 在役 |
-| `store_ordering` | `store_ordering.py` | 21 | 在役 |
+| `store_ordering` | `store_ordering.py` | 22 | 在役 |
 | `canonical` | `canonical.py` | 20 | 在役 |
 | `stocktake` | `stocktake.py` | 12 | 在役 |
 | `users` | `users.py` | 12 | 在役 |
@@ -291,6 +291,7 @@
 | `store_ordering.remove_cart_item_route` | POST | `/cart/remove/<int:cart_item_id>` | 权限点 | order.create |
 | `store_ordering.review_list` | GET | `/review` | 配送中心 | role:staff |
 | `store_ordering.review_order_route` | POST | `/orders/<int:order_id>/review` | 配送中心 | perm:order.approve |
+| `store_ordering.set_dc_item_multiple` | POST | `/dc/items/multiple` | 配送中心 | role:manager |
 | `store_ordering.ship_order_route` | POST | `/orders/<int:order_id>/ship` | 配送中心 | role:staff |
 | `store_ordering.shipment_list` | GET | `/shipments` | 配送中心 | role:staff |
 | `store_ordering.store_orders_list` | GET | `/orders` | 登录 |  |
@@ -316,7 +317,7 @@
 
 ## 3. 数据层
 
-- `WAREHOUSE_SCHEMA_VERSION = 2`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
+- `WAREHOUSE_SCHEMA_VERSION = 3`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
 - 表 59 张：
 
 - `adjustment_requests` · `agent_tokens` · `approval_policies` · `audit_log`

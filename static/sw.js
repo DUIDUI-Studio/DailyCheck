@@ -1,4 +1,4 @@
-const CACHE_NAME = "dailycheck-v8";
+const CACHE_NAME = "dailycheck-v9";
 const APP_SHELL = [
   "/",
   "/static/style.css",

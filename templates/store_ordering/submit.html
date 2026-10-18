@@ -30,6 +30,18 @@
 </div>
 {% endif %}
 
+{% if errors.multiples %}
+<div class="alert danger">
+  <p><strong>以下品项数量不符合起订倍数，请回购物车调整：</strong></p>
+  <ul>
+    {% for m in errors.multiples %}
+    <li>{{ m.name }}：当前 {{ m.quantity | fmt_qty }}{{ m.unit or '' }}，
+      需为 {{ m.multiple | fmt_qty }} 的整数倍</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <table class="data-table">
   <thead>
     <tr>
@@ -84,6 +96,6 @@
     <span>备注</span>
     <textarea name="note" rows="3">{{ note }}</textarea>
   </label>
-  <button type="submit" class="btn" {% if errors.unbound or errors.unorderable %}disabled{% endif %}>发送</button>
+  <button type="submit" class="btn" {% if errors.unbound or errors.unorderable or errors.multiples %}disabled{% endif %}>发送</button>
 </form>
 {% endblock %}

@@ -254,7 +254,11 @@ def add_to_cart() -> str:
         flash("当前未绑定门店仓库")
         return redirect(url_for("store_ordering.catalog", dc=dc_code))
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
-    sop.add_cart_item(master, cart["id"], canonical_id, quantity, unit)
+    try:
+        sop.add_cart_item(master, cart["id"], canonical_id, quantity, unit)
+    except ValueError as e:
+        flash(str(e))
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
     flash("已加入购物车")
     return redirect(url_for("store_ordering.catalog", dc=dc_code))
 
@@ -295,6 +299,7 @@ def cart_add_batch() -> str:
 
     added = 0
     skipped = 0
+    rejected: list[str] = []
     for cid_raw, qty_raw, unit_raw in zip(selected_list, qty_list, unit_list, strict=False):
         qty = parse_qty(qty_raw)
         if qty <= 0:
@@ -306,11 +311,24 @@ def cart_add_batch() -> str:
             skipped += 1
             continue
         unit = (unit_raw or "base").strip() or "base"
-        sop.add_cart_item(master, cart["id"], cid, qty, unit)
+        try:
+            sop.add_cart_item(master, cart["id"], cid, qty, unit)
+        except sop.OrderMultipleError as e:
+            # 起订倍数不符：不再静默吞掉，逐项告诉门店要改成什么数量。
+            rejected.append(
+                f"{e.name} 需为 {sop.fmt_multiple(e.multiple)} 的整数倍"
+                f"（填了 {parse_qty(e.quantity)}，建议 {sop.fmt_multiple(sop.next_valid_quantity(e.quantity, e.multiple))}）"
+            )
+            continue
+        except ValueError:
+            skipped += 1
+            continue
         added += 1
     if added:
         flash(f"已加入购物车 {added} 项")
-    else:
+    if rejected:
+        flash("以下品项未加入（数量不符合起订倍数）：" + "；".join(rejected))
+    if not added and not rejected:
         flash("没有可加入购物车的品项（请先在卡片弹窗中填写数量）")
     return redirect(url_for("store_ordering.cart_view"))
 
@@ -433,7 +451,9 @@ def submit_order_route() -> str:
 
     expected_date = _tomorrow()
     note = ""
-    errors: dict[str, Any] = {"shortages": [], "unbound": [], "unorderable": unorderable}
+    errors: dict[str, Any] = {
+        "shortages": [], "unbound": [], "unorderable": unorderable, "multiples": [],
+    }
 
     if request.method == "POST":
         expected_date = _parse_date_input(request.form.get("expected_delivery_date")) or _tomorrow()
@@ -448,7 +468,10 @@ def submit_order_route() -> str:
             validation = sop.validate_cart_for_submit(master, cart)
             if not validation["ok"]:
                 errors = validation
-                flash("提交失败，请检查门店绑定")
+                if validation.get("multiples"):
+                    flash("提交失败：部分品项数量不符合起订倍数，请先调整数量")
+                else:
+                    flash("提交失败，请检查门店绑定")
             else:
                 order = sop.submit_order(
                     master, cart["id"], g.user["id"],
@@ -742,6 +765,41 @@ def manage_dc_items() -> str:
         groups=groups,
         inactive_count=inactive_count,
     )
+
+
+@bp.route("/dc/items/multiple", methods=["POST"])
+@require_login
+@require_warehouse_type("distribution_center")
+@require_role("manager")
+def set_dc_item_multiple() -> str:
+    """设置单品起订倍数（v3，2026-10-18）。
+
+    表单：canonical_id + order_multiple。空值 / 0 / 1 一律表示「不限」。
+    """
+    dc_code = _current_warehouse_code()
+    if dc_code is None:
+        flash("请先选择配送中心仓库")
+        return redirect(url_for("core.dashboard"))
+
+    try:
+        canonical_id = int(request.form.get("canonical_id", ""))
+    except (TypeError, ValueError):
+        flash("请求参数无效")
+        return redirect(url_for("store_ordering.manage_dc_items"))
+
+    try:
+        multiple = sop.set_dc_item_order_multiple(
+            get_master_db(), dc_code, canonical_id,
+            request.form.get("order_multiple", ""),
+        )
+    except ValueError as e:
+        flash(str(e))
+    else:
+        if multiple <= sop.ORDER_MULTIPLE_UNLIMITED:
+            flash("已取消起订倍数限制")
+        else:
+            flash(f"已设为 {sop.fmt_multiple(multiple)} 的整数倍起订")
+    return redirect(url_for("store_ordering.manage_dc_items"))
 
 
 @bp.route("/orders/<int:order_id>/cancel", methods=["POST"])

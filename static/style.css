@@ -408,6 +408,56 @@ th, td {
 
 .inline { display: flex; gap: 8px; align-items: center; }
 .inline select { min-width: 104px; }
+/* 行内表单：表格单元格里的「数量输入 + 更新/删除」组合。
+   历史包袱（2026-10-18 修）：模板写的是 .inline-form，样式表只定义过
+   .inline —— 于是输入框吃全局 `input{width:100%}` 撑满整格，
+   td 又是 nowrap，32px 小按钮被挤出单元格、压在后一列金额文字上。 */
+.inline-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0;
+}
+.inline-form input:not([type="hidden"]):not([type="checkbox"]):not([type="number"]),
+.inline-form select {
+  width: 150px;
+  min-width: 0;
+  flex: 0 0 auto;
+  height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
+  border-radius: 8px;
+}
+.inline-form input[type="number"] {
+  width: 96px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.inline-form button,
+.inline-form .btn-sm {
+  width: auto;
+  flex: 0 0 auto;
+}
+/* 起订倍数提示 / 违规单元格（2026-10-18） */
+.qty-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.qty-hint.warn { color: #b45309; font-weight: 600; }
+td.qty-bad { color: #b91c1c; font-weight: 600; }
+.status-pill.multiple {
+  background: #eef2ff;
+  color: #4338ca;
+  border: 1px solid #c7d2fe;
+}
+/* 禁用态按钮（提交页在存在校验错误时置灰，避免点了没反应） */
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(0.3);
+}
 /* 行内表单控件与 32px 小按钮对齐（2026-10-17）：此前沿用全局 11px 内边距，
    和 btn-sm 并排时一高一矮。 */
 .inline input:not([type="hidden"]):not([type="checkbox"]),
@@ -1740,6 +1790,30 @@ table.bom-table td .bom-temp-price {
 }
 @media (max-width: 480px) {
   .info-card-grid { grid-template-columns: 1fr; }
+}
+.info-card-totals {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 200px;
+}
+/* 拆分项（货品金额 / 运费）：浅底深字，与大号总计形成层级对比 */
+.info-card-fee {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+}
+.info-card-fee-label { font-size: 12px; color: var(--muted); }
+.info-card-fee-value {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 .info-card-total {
   display: flex;

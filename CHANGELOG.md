@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### Added — 门店订货：品项起订倍数 + 审批页金额拆分（feat/order-multiple-fee-split，2026-10-18）
+- **起订倍数**：DC 可对每个品项设一个倍数（`items.order_multiple`，1 = 不限），门店下单数量必须是它的整数倍（设 5 → 只能订 5/10/15…）。配置入口在 **DC 品项管理页**（`/store-ordering/dc-items`）新增的「起订倍数」列，与「可订开关」同页同级、同为 DC manager 及以上，属本仓字段（主数据扇出不覆盖）。
+- **四道关口**：catalog 弹窗（`step/min` + 前端先拦一次并提示最近合法值）→ 加购（按合并后数量校验）→ 改数量 → 提交（`validate_cart_for_submit` 汇总 `multiples` + `submit_order` 二次校验，违规时「发送」置灰并列出原因）。此前「加购时合法、之后倍数被调大」的存量购物车会在提交时被挡下。
+- **浮点安全**：`is_multiple_of` 用相对容差判定而非 `%`（`0.3 / 0.1` 这类二进制误差不会误判）；`normalize_order_multiple` 把脏值回落成 1，配置错了不会把品项永久锁死。
+- **审批页金额拆分**：订单详情的「货品金额 / 运费 / 订单总计」原先三个 `.info-card-total` 直接挂在 `.info-card` 的两列 grid 上，第 2/3 个被自动排到卡片左侧、浅底白字几乎不可见，视觉上只剩一个总金额。改为收进 `.info-card-totals` 一列，货品与运费用浅底深字、总计用绿色 hero。
+- **测试**：新增 `tests/test_store_ordering_order_multiple.py` 32 例（纯函数边界、配置落库、加购/改量/提交三处拒绝、3 个真实 HTTP 路由用例）。
+
+### Fixed — 购物车数量输入把「更新」按钮挤出单元格（同 PR）
+- **症状**：购物车「数量」列里「更新」按钮压在小计金额上，金额只剩「5.00」这类残字，看起来像文字重叠。
+- **根因**：模板写的是 `class="inline-form"`，样式表只定义过 `.inline` —— 表单退回块布局，输入框吃全局 `input{width:100%}` 撑满整格，`th,td{white-space:nowrap}` 又不允许换行，32px 小按钮只能溢出到后一列。
+- **修复**：补齐 `.inline-form` 定义（flex + 定宽输入 + `flex:0 0 auto` 按钮），并补 `button:disabled` 置灰态。`order_detail.html` 的拒绝/取消行内表单同享此修复。
+
 ### Fixed — 部署编排观察窗误判回滚：BLOCKED 统计窗口 + 回滚日志双写（fix/pipeline-observe-window，2026-10-17）
 - **事故**（PR #101 首次完整跑 pipeline 观察窗）：up → verify 8/8 → promote 转正 → `switch.sh green 100` 全部通过，5 分钟后观察窗却判定「写隔离没关」，自动 `switch.sh blue 100` 回滚并 rc 24 —— 新代码白转正、流量压在旧蓝实例，靠人工 `switch.sh green 100` 恢复（锚点随后正常推进到 `ce1e553`）。
 - **根因 1（判定）**：`observe_window` 统计 `[dry_run] BLOCKED` 用 `journalctl --since "${minutes} min ago"`，`minutes` 是**总观察时长**（默认 30）。首次检查只过 5 分钟就回溯 30 分钟，把 **promote 之前**绿实例在 DRY_RUN 下承接 verify 探针产生的 3 条 BLOCKED 全捞进来，必然误判。改为以「观察窗开始时刻」为统计起点。

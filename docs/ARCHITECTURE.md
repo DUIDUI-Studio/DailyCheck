@@ -739,6 +739,7 @@ erDiagram
         string canonical_status "主数据下发后写入"
         int is_active "P0-10 单仓启停（扇出永不覆盖）"
         int is_orderable "v3.1 DC 可订开关"
+        real order_multiple "起订倍数（2026-10-18，1=不限）"
         int is_store_exclusive
         int price_follow_canonical
     }
@@ -785,7 +786,7 @@ flowchart LR
     Stamp --> Skip
 ```
 
-- **`WAREHOUSE_SCHEMA_VERSION = 2`**，改了 ALTER 块必须 bump。
+- **`WAREHOUSE_SCHEMA_VERSION = 3`**，改了 ALTER 块必须 bump。
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
@@ -1252,6 +1253,17 @@ stateDiagram-v2
 
 「清空选择」按钮同时清草稿；`pageshow(persisted)` 时按草稿重新同步一次卡片，修复 bfcache 的陈旧 DOM。附带修复：卡片 `unit[]` 存的是中文单位名（后端契约），弹窗单位 pill 的回填改读 `data-saved-unit` 的 `base`/`aux` 档位——原先直接读 `unit[]`，导致重复编辑同一张卡片时两个 pill 都不高亮、点「确认」静默无响应。
 
+**起订倍数（2026-10-18）**：DC 可对每个品项设一个正整数倍数（`items.order_multiple`，1 = 不限），门店下单数量必须是它的整数倍（例：设 5 → 只能订 5/10/15…）。配置入口在 **DC 品项管理页**（`/store-ordering/dc-items`，`store_ordering.set_dc_item_multiple`），与「可订开关」同级同页，属**本仓字段**，主数据扇出不覆盖。
+
+四道关口，缺一道就会被绕过：
+
+1. **catalog 弹窗**（`templates/store_ordering/catalog.html`）：卡片 `data-multiple` → 弹窗给 `cm-qty` 设 `step/min`，确认时前端先拦一次并提示最近的合法值；
+2. **加购**（`add_cart_item`）：按「合并后的数量」校验（3 + 2 = 5 通过，5 + 3 = 8 拒绝），抛 `OrderMultipleError`；
+3. **改数量**（`update_cart_item_quantity`）：同源校验，路由 catch `ValueError` 后 flash；
+4. **提交**（`validate_cart_for_submit` → `multiples` 列表 + `submit_order` 二次校验）：把「之前合法、后来倍数被调大」的存量购物车挡在订单外，模板禁用「发送」按钮。
+
+`is_multiple_of` 用**相对容差**（`abs(qty − round(qty/step)·step) ≤ max(1e-9, step·1e-9)`）判定，不用 `%`——浮点二进制误差会让 `0.3 / 0.1` 判成 False。`normalize_order_multiple` 把脏值（None/非数字/≤0）一律回落成 1，避免配置错误把某个品项永久锁死。
+
 ### 10.4 Canonical 扇出流程
 
 ```mermaid
@@ -1433,7 +1445,7 @@ flowchart TB
 ### 13.1 Schema 迁移
 
 - ✅ 任何新列**只**加到 `migrate_warehouse_db_columns()`，**不**进 `WAREHOUSE_SCHEMA`（tests 断言）
-- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 2）
+- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 3）
 - ✅ master.db 任何 schema 变更同步进 `init_master_db()`，否则 prod 首请求 `no such column`
 - ✅ `init_master_db()` 用 `fcntl.flock` 保护 gunicorn 多 worker
 

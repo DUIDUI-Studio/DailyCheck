@@ -308,6 +308,8 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.review_order_route": f"{DC_PREFIX}{perm('order.approve')}",
     "store_ordering.shipment_list": f"{DC_PREFIX}{ROLE_PREFIX}staff",
     "store_ordering.manage_dc_items": f"{DC_PREFIX}{ROLE_PREFIX}manager",
+    # 起订倍数（2026-10-18）：与「可订开关」同页同级，同一道 DC manager 门槛。
+    "store_ordering.set_dc_item_multiple": f"{DC_PREFIX}{ROLE_PREFIX}manager",
     "store_ordering.cancel_order_route": anyperm("order.create", "order.cancel.any"),
     # 兼容层：DC staff 发货是既有行为（order.ship 归 manager 包，迁移会让 DC
     # staff 失去发货能力 → 非白名单行为变化）。施工图 §1.2-E 修正说明。
