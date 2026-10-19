@@ -95,7 +95,11 @@ CREATE TABLE IF NOT EXISTS users (
     is_admin INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     last_login_at TEXT,
-    tenant_id INTEGER NOT NULL DEFAULT 1
+    tenant_id INTEGER NOT NULL DEFAULT 1,
+    -- 上次进入的仓库：登录后自动恢复，避免每次点通知深链都要重选一遍。
+    -- 可空 = 从未选过（或存量用户）。恢复前必须重跑绑定/租户校验，
+    -- 见 blueprints/auth.py::_warehouse_visible_to。
+    last_warehouse_id INTEGER
 );
 
 -- 多租户注册表（P0-1 轻方案 PoC）。tenant 1 = 存量单租户（默认）。
@@ -924,6 +928,18 @@ def init_master_db() -> None:
                     conn.execute(
                         "ALTER TABLE warehouses ADD COLUMN warehouse_type TEXT "
                         "NOT NULL DEFAULT 'storefront'"
+                    )
+
+                # 登录后恢复上次仓库（深链体验）：存量 master.db 补列。
+                # 无默认值 —— NULL 自然表示「没选过」，无需回填。
+                user_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(users)"
+                    ).fetchall()
+                }
+                if "last_warehouse_id" not in user_cols:
+                    conn.execute(
+                        "ALTER TABLE users ADD COLUMN last_warehouse_id INTEGER"
                     )
 
                 # v3 P0: store_order_items.shipped_quantity (partial-ship accumulator).
