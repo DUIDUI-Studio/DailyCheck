@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{% if view == 'outgoing' %}总仓调货 · 发送单{% else %}调货接收单{% endif %}{% endblock %}
+{% block title %}总仓调货 · 发送单{% endblock %}
 {% block content %}
 {% set doc_pill = {
   'awaiting_ship': 'pending',
@@ -8,43 +8,26 @@
   'completed': 'delivered',
   'cancelled': 'cancelled',
 } %}
-{% set rcv_pill = {
-  'awaiting_ship': 'pending',
-  'pending_receive': 'approved',
-  'partial_received': 'shipped',
-  'received': 'delivered',
-  'cancelled': 'cancelled',
-} %}
 
 <div class="page-header">
-  <h2>{% if view == 'outgoing' %}总仓调货 · 发送单{% else %}调货接收单{% endif %}</h2>
-  {% if view == 'outgoing' and can_create %}
+  <h2>总仓调货 · 发送单</h2>
+  {% if can_create %}
   <a class="btn-action primary" href="{{ url_for('dc_transfer.transfer_new') }}">＋ 新建调货单</a>
   {% endif %}
 </div>
 
-{% if view == 'outgoing' %}
-<p class="muted">总仓主动发往分仓的调货单。<b>创建即生效（无需审批）</b>，由总仓发货、分仓接收；发货与收货均支持多次部分操作。</p>
-{% else %}
-<p class="muted">分仓接收总仓发来的调货单。列表默认只显示<b>有货待收</b>的单据；点「接收」进入详情逐项确认数量。</p>
-<div style="margin:12px 0;display:flex;gap:8px">
-  <a class="btn-sm" href="{{ url_for('dc_transfer.transfer_list') }}"
-     {% if scope != 'all' %}style="font-weight:700"{% endif %}>待接收</a>
-  <a class="btn-sm" href="{{ url_for('dc_transfer.transfer_list', scope='all') }}"
-     {% if scope == 'all' %}style="font-weight:700"{% endif %}>全部</a>
-</div>
-{% endif %}
+<p class="muted">总仓主动发往分仓的调货单。<b>创建即生效（无需审批）</b>，由总仓发货、分仓接收；发货与收货均支持多次部分操作。分仓侧不另设页面，收到的调货单直接出现在其「本店订单」里。</p>
 
 {% if transfers %}
 <table class="data-table" style="margin-top:16px;">
   <thead>
     <tr>
       <th>调货单号</th>
-      <th>{% if view == 'outgoing' %}发送单状态{% else %}接收单状态{% endif %}</th>
+      <th>发送单状态</th>
       <th>发出仓</th>
       <th>接收仓</th>
       <th>已发 / 已收</th>
-      <th>{% if view == 'outgoing' %}待发{% else %}待收{% endif %}</th>
+      <th>待发</th>
       <th>创建时间</th>
       <th></th>
     </tr>
@@ -53,36 +36,20 @@
     {% for t in transfers %}
     <tr>
       <td>{{ t.order_no }}</td>
-      <td>
-        {% if view == 'outgoing' %}
-        <span class="status-pill {{ doc_pill[t.doc_state] }}">{{ t.doc_state_label }}</span>
-        {% else %}
-        <span class="status-pill {{ rcv_pill[t.rcv_state] }}">{{ t.rcv_state_label }}</span>
-        {% endif %}
-      </td>
+      <td><span class="status-pill {{ doc_pill[t.doc_state] }}">{{ t.doc_state_label }}</span></td>
       <td>{{ t.dc_warehouse_code }}</td>
       <td>{{ t.store_warehouse_code }}</td>
       <td>{{ t.shipped_qty | fmt_qty }} / {{ t.received_qty | fmt_qty }}</td>
-      <td>
-        {% if view == 'outgoing' %}
-        {{ t.pending_ship_qty | fmt_qty }}
-        {% else %}
-        <strong>{{ t.pending_receive_qty | fmt_qty }}</strong>
-        {% endif %}
-      </td>
+      <td>{{ t.pending_ship_qty | fmt_qty }}</td>
       <td>{{ t.created_at }}</td>
       <td>
-        <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=t.id) }}">
-          {% if view == 'outgoing' %}详情{% else %}接收 / 详情{% endif %}
-        </a>
+        <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=t.id) }}">详情</a>
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
 {% else %}
-<p class="empty">
-  {% if view == 'outgoing' %}暂无调货发送单{% else %}暂无待接收的调货单{% endif %}
-</p>
+<p class="empty">暂无调货发送单</p>
 {% endif %}
 {% endblock %}

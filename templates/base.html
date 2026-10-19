@@ -67,9 +67,6 @@
       <a href="{{ url_for('store_ordering.review_list') }}">订货审批</a>
       <a href="{{ url_for('dc_transfer.transfer_list') }}">总仓调货</a>
       {% endif %}
-      {% if is_storefront and not is_admin %}
-      <a href="{{ url_for('dc_transfer.transfer_list') }}">调货接收</a>
-      {% endif %}
       {% if (is_admin or is_distribution_center) and (is_admin or (g.role and g.role['role'] in ('manager', 'admin'))) %}
       <a href="{{ url_for('store_ordering.manage_dc_items') }}">品项管理</a>
       {% endif %}
