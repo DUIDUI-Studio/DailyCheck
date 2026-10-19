@@ -227,8 +227,44 @@ KNOWN_EVENT_KINDS = frozenset({
     "dashboard-hook-failed",
 })
 
+# 写这些 kind 的埋点所在文件（相对仓库根）。探测它有没有 `_audit_event`
+# 就能判定「异常留痕为 0」到底是「真没发生」还是「压根没人在记」。
+EVENT_INSTRUMENTATION_SCRIPT = "scripts/blue_green/deploy_pipeline.sh"
+# ⚠️ 匹配**函数定义形态**（行首 `_audit_event()` 或 `_audit_event ()`），
+# 不能做裸子串匹配：脚本里的注释 / 文档字符串只要提到 `_audit_event`
+# 就会让探测假阳性判成 deployed，「0 起 = 无异常」这个假信号随即复活
+# （2026-10-19 实现时实测命中）。
+EVENT_INSTRUMENTATION_RE = re.compile(r"^\s*_audit_event\s*\(\s*\)\s*\{", re.M)
 
-def build_loop_integrity(records: list[dict]) -> dict:
+
+def detect_event_instrumentation(repo_dir: Path) -> str:
+    """探测异常留痕埋点是否已部署。返回三态：
+
+    - ``"deployed"``    已部署脚本定义了 `_audit_event` → 事件数为 0 是真没发生
+    - ``"absent"``      脚本存在但无该函数 → **0 不代表没发生**，只是没人在记
+    - ``"unknown"``     脚本读不到（路径不对 / 权限）→ 无法判定，不猜
+
+    ⚠️ 为什么必须三态而不是 bool：``absent`` 与 ``unknown`` 的处置不同。
+    前者要明说「埋点未部署，别把 0 读成没问题」；后者连「没部署」都不能断言
+    —— 把「读不到」说成「未部署」同样是编造事实（与本模块「不猜」原则一致）。
+
+    背景（2026-10-19 实测）：#118 先于 #116 合并，生产脚本仍是
+    `PY="${PYTHON:-python3}"` 且无 `_audit_event`，看板却显示
+    「钩子失败均未发生」—— 而实测生产系统 python3 对
+    `scripts.dailycheck_dashboard` 抛 ModuleNotFoundError，即钩子一直是坏的。
+    这正是本模块铁律 #4 要禁止的「把没记录说成没发生」。
+    """
+    script = repo_dir / EVENT_INSTRUMENTATION_SCRIPT
+    try:
+        text = script.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "unknown"
+    return "deployed" if EVENT_INSTRUMENTATION_RE.search(text) else "absent"
+
+
+def build_loop_integrity(
+    records: list[dict], repo_dir: Path | None = None
+) -> dict:
     """从 audit.log 记录算「闭环完整性」——这套流程到底有没有真闭环。
 
     为什么要有这个（2026-10-18 复盘）：白皮书声称「CI 全绿→合并人工介入 = 0」，
@@ -241,6 +277,8 @@ def build_loop_integrity(records: list[dict]) -> dict:
       - 回滚次数**不可观测**（`switch.sh` 只审计 target=green，切蓝不留痕），
         故列入 blind_spots，而不是报「0 次」——把「没记录」说成「没发生」
         比不报更坏
+      - 异常事件数同理：``repo_dir`` 给定时探测埋点是否已部署，未部署则
+        计入 blind_spots，绝不渲染成「均未发生」
     """
     auto = manual = unlabeled = 0
     manual_sessions: dict[str, int] = {}
@@ -260,6 +298,22 @@ def build_loop_integrity(records: list[dict]) -> dict:
             kinds[kind] = kinds.get(kind, 0) + 1
 
     labeled = auto + manual
+
+    # 异常留痕埋点状态：未部署时「0 起」不代表没发生，必须计入盲区
+    instrumentation = (
+        detect_event_instrumentation(repo_dir) if repo_dir is not None else "unknown"
+    )
+    blind = [
+        "回滚次数不可观测：switch.sh 只审计 target=green，切蓝（回滚）不留痕",
+    ]
+    if instrumentation != "deployed":
+        why = (
+            "埋点未部署（deploy_pipeline.sh 无 _audit_event）"
+            if instrumentation == "absent"
+            else "埋点状态不可知（deploy_pipeline.sh 读不到）"
+        )
+        blind.append(f"异常留痕事件不可观测：{why} → 「0 起」不代表没发生")
+
     return {
         "auto_records": auto,
         "manual_records": manual,
@@ -271,9 +325,10 @@ def build_loop_integrity(records: list[dict]) -> dict:
                               if classify_session(r.get("session") or "") == "manual"
                               and r.get("pr") is not None}),
         "events": kinds,
-        "blind_spots": [
-            "回滚次数不可观测：switch.sh 只审计 target=green，切蓝（回滚）不留痕",
-        ],
+        # 只有埋点真部署了，事件数为 0 才有「无异常」的资格
+        "events_observable": instrumentation == "deployed",
+        "instrumentation": instrumentation,
+        "blind_spots": blind,
     }
 
 

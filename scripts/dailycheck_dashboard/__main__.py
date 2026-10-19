@@ -136,7 +136,8 @@ def cmd_render(args: argparse.Namespace) -> int:
         ops_parse.build_deploy_events(audit_records) if audit_records else []
     )
     loop_integrity = (
-        ops_parse.build_loop_integrity(audit_records) if audit_records else {}
+        ops_parse.build_loop_integrity(audit_records, repo_dir=repo_dir)
+        if audit_records else {}
     )
     verifications = _collect(
         "验证报告", ops_unavailable,

@@ -312,6 +312,8 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 2. **未标注单列，不摊进任何一侧**：session 机制是后加的（实测 88 行里 58 行为空），摊进 auto 虚高、摊进 manual 虚低。
 3. **无标注时自动率渲染「—」而非 100%**：0/0 显示 100% 是典型假绿。
 4. **盲区必须声明，绝不报 0**：`switch.sh` 只审计 `target=green`，切蓝（回滚）不留痕 → 回滚次数**不可观测**（实测 `audit.log` 里 `target=blue` 为 0 条，尽管 #110 的验证报告记录了回滚演练 PASS）。把「没记录」说成「没发生」比不报更坏——会让人以为「回滚从没发生 = 部署一直成功」。故列 `blind_spots` 且不伪造计数字段。
+5. **「异常留痕 0 起」必须先证明埋点已部署**（铁律 4 的同型应用，2026-10-19 实测补）：#118（看板）先于 #116（埋点）合并，生产 `deploy_pipeline.sh` 还没有 `_audit_event`，看板却渲染「漂移 / 压缩观察窗 / 跳过验证 / 钩子失败**均未发生**」——而实测生产系统 `python3` 对 `scripts.dailycheck_dashboard` 抛 `ModuleNotFoundError`，**钩子一直是坏的**，只是没人记。故 `detect_event_instrumentation(repo_dir)` 三态探测：`deployed`（脚本定义了 `_audit_event`）→ 0 起才可说「无异常」；`absent` / `unknown` → 异常留痕 KPI 渲染 `—` + hot、计入盲区、明说「0 起不代表没发生」。渲染侧 `events_observable` 缺键时 **fail-closed 当作不可观测**。
+   ⚠️ 探测用**函数定义正则** `^\s*_audit_event\s*\(\s*\)\s*\{` 而非裸子串：脚本注释里只要提到 `_audit_event` 就会让子串匹配假阳性判成 `deployed`，假信号随即复活（实现时实测命中，已加回归用例）。
 
 ⚠️ **单一归一化口径**：`audit.log` 只读一次（`parse_audit_records`），部署事件与闭环完整性由**同一份记录**派生；session 的两个来源（阶段行的 `lock.session`、事件行的 `session=` 参数）在同一处归一。分两处解析必然漂移（同型缺陷见 `inbox_watcher`，Issue #51→#66）。
 
@@ -319,7 +321,7 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 实测值（88 行 audit.log）：自动 22 / 人工 8 / 未标注 58 → **自动闭环率 73%**，人工接管涉及 PR #80 #96 #101 #111。这量化了白皮书「CI 全绿→合并人工介入 = 0」的**取样偏差**：那句只统计到 merge，而事故全发生在 merge 之后。
 
-**回归网**：`tests/test_dashboard_ops.py`（36 用例，本节占 14）锁死上述四条铁律——白名单分类 / 空值单列 / 自动率分母排除未标注 / 全无标注时 `None`（渲染「—」）/ 盲区声明且**不得伪造 `rollback_count`** / 幽灵事件不出现 / session 双来源归一 / 无部署事件时本节仍渲染（盲区本身是事实）/ 章节号顺延。四处变异验证（分类改黑名单、分母含未标注、去掉阶段过滤、清空盲区）各自打红对应用例。
+**回归网**：`tests/test_dashboard_ops.py`（42 用例，本节占 20）锁死上述五条铁律——白名单分类 / 空值单列 / 自动率分母排除未标注 / 全无标注时 `None`（渲染「—」）/ 盲区声明且**不得伪造 `rollback_count`** / **埋点三态探测（含注释不得假阳性、真实定义三形态须命中）** / **埋点未部署时「0 起」不得渲染成「均未发生」**（KPI 出 `—`、明细走 hot）/ 幽灵事件不出现 / session 双来源归一 / 无部署事件时本节仍渲染（盲区本身是事实）/ 章节号顺延。六处变异验证（分类改黑名单、分母含未标注、去掉阶段过滤、清空盲区、探测恒返 `deployed`、渲染层忽略 `events_observable`）各自打红对应用例。
 
 **KPI 口径（不粉饰）**：「验证到切流」= verify 起点到切流完成的跨度，**含 promote**。`promote.sh` 并不总在 `audit.log` 留行（#97 有，#89/#90/#94/#96 都没有），缺标记时 verify 段会一路并到切流；从审计日志无法区分「verify 慢」和「promote 没打点」，硬拆只能靠猜，所以改标签不改算法。精确的八项耗时唯一可信源是 `backups/prod-verifications/*.md` 的生成时间。
 
