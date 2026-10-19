@@ -1347,6 +1347,8 @@ stateDiagram-v2
 
 **权限**：新增 `transfer.create`（manager/admin 包，26 点 / `manager 18`、`admin 19`）。建单要求 DC 类型 + 该权限；列表对 DC / 门店分别开放，发货与收货复用 `store_ordering` 的既有路由与角色守卫。
 
+**列表口径**：分仓「我的订单」（`store_orders_list`）只列 `flow_type='store_order'`——调货单的 `approved` 语义是「待发货」而非「已审批」，混排会让分仓看不懂状态；调货单统一走「调货接收」入口。管理员订单板（`admin_orders`）保留全量，新增「类型」列并按 `flow_type` 切换状态文案（待发货 / 已发出 / 已完成）。
+
 详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
 
 ### 10.4 Canonical 扇出流程

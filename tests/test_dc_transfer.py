@@ -444,6 +444,20 @@ def test_list_transfers_only_receivable(transfer_env):
     assert listed[0]["pending_receive_qty"] == 5
 
 
+def test_my_orders_list_excludes_transfers(transfer_env, transfer_client):
+    """分仓「我的订单」只列订货单；调货单走「调货接收」入口，避免语义混淆。"""
+    order = _create(transfer_env)
+    body = transfer_client(4, 2).get("/store-ordering/orders").data.decode("utf-8")
+    assert order["order_no"] not in body
+
+
+def test_admin_order_board_marks_transfer_type(transfer_env, transfer_client):
+    order = _create(transfer_env)
+    body = transfer_client(1, 1).get("/store-ordering/admin/orders").data.decode("utf-8")
+    assert order["order_no"] in body
+    assert "总仓调货" in body
+
+
 def test_transfer_detail_renders_for_both_sides(transfer_env, transfer_client):
     """详情页按视角渲染发送单 / 接收单，且不因 flow 分支缺变量报 500。"""
     master = transfer_env["master"]

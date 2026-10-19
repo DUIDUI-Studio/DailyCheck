@@ -526,6 +526,7 @@ def store_orders_list() -> str:
         master,
         store_warehouse_code=store_code,
         status=status,
+        flow_type=sop.FLOW_STORE_ORDER,
         start_date=start_date,
         end_date=end_date,
     )
