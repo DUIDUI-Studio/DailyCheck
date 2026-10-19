@@ -46,7 +46,7 @@
 | 发起调货（建单） | 总仓 manager / admin；平台超管 | `require_warehouse_type("distribution_center")` + `require_permission("transfer.create")` |
 | 查看发送单列表 | 总仓 staff 及以上 | `require_warehouse_type(DC)`；建单按钮仅对持 `transfer.create` 者渲染 |
 | 安排发货 / 部分发货 | 总仓 staff 及以上 | 复用 `store_ordering.ship_order_route`（`require_role("staff")` + DC 类型 + `_assert_order_belongs_to_current_dc`） |
-| 查看接收单列表 | 分仓 staff 及以上 | `require_warehouse_type("storefront")` |
+| 查看待收货的调货单 | 分仓 staff 及以上 | 不设独立入口：进「本店订单」即可（`dc_transfer.transfer_list` 对门店 302 回订单列表） |
 | 确认接收 / 部分接收 | 分仓 manager / admin；平台超管 | 复用 `store_ordering.receive_order_route`（`order.receive` + storefront 类型 + 经理角色） |
 | 一次性收齐 | 分仓 manager / admin | 复用 `store_ordering.deliver_order_route`（`order.ship`） |
 | 取消调货单 | 总仓 manager / admin，且**未发货** | 复用 `cancel_order_route` 的 `approved` 分支 + `cancel_order()` 新增「已有发货记录不可取消」守卫 |
@@ -68,14 +68,16 @@
 | `completed` | 已完成 | 主状态 `delivered`（分仓全部收齐） |
 | `cancelled` | 已取消 | 主状态 `cancelled`（仅未发货时可进入） |
 
-### 4.2 接收单（分仓视角，由明细派生）
+### 4.2 收货视角（门店，由明细派生）
+
+> 门店侧**不引入「接收单」概念**：收到的调货单就是一张待收货的订单，列在「本店订单」里，状态按收货进度显示（2026-10-19 owner 明确）。
 
 | 状态 key | 展示 | 判定 |
 |---|---|---|
 | `awaiting_ship` | 待发货 | 可收量 = 0（总仓尚未发出任何数量） |
-| `pending_receive` | 待接收 | 可收量 > 0 且已收量 = 0 |
-| `partial_received` | 部分接收 | 可收量 > 0 且已收量 > 0 |
-| `received` | 已接收 | 主状态 `delivered` |
+| `pending_receive` | 待收货 | 可收量 > 0 且已收量 = 0 |
+| `partial_received` | 部分收货 | 可收量 > 0 且已收量 > 0 |
+| `received` | 已收货 | 主状态 `delivered` |
 | `cancelled` | 已取消 | 主状态 `cancelled` |
 
 > 可收量逐行用 `order_item_receivable_qty()` 计算：`max(0, min(已发, 订货) − 已收)`。列表上的「待收 N」与详情页收货输入框上限**同源**，不会出现「显示可收 5、实际收不了」。
@@ -97,7 +99,7 @@ stateDiagram-v2
 
     note right of approved
         发送单：待发货 / 部分发出
-        接收单：待发货 / 待接收 / 部分接收
+        门店收货视角：待发货 / 待收货 / 部分收货
         收货门禁 = status in (approved, shipped)
     end note
 ```
@@ -129,13 +131,13 @@ stateDiagram-v2
 | 报表口径 | 计入订货报表 | **排除**（`compute_store_order_report` 只统计 `flow_type='store_order'`） |
 | 取消限制 | 已收货不可取消 | 在「已收货不可取消」之外，**已发货也不可取消**（在途货物不能凭空作废） |
 | 通知文案 | 订货单 | 总仓调货单；创建时额外通知分仓准备接收 |
-| 列表 | `/store-ordering/orders` 我的订单 | `/dc-transfer/` 发送单 / 接收单两视角 |
+| 列表 | `/store-ordering/orders` 本店订单 | 总仓用 `/dc-transfer/` 发送单列表；门店仍在本店订单里看（多一列「类型」） |
 
 ## 7. 页面与接口
 
 | 方法与路径 | 作用 |
 |---|---|
-| `GET /dc-transfer/` | 总仓：发送单列表（含进度、待发量）；分仓：接收单列表（默认只看有货待收，`?scope=all` 看全部） |
+| `GET /dc-transfer/` | 总仓：发送单列表（含进度、待发量）；门店访问 302 回「本店订单」，不设独立页面 |
 | `GET /dc-transfer/new` | 建单页：选分仓 + 勾品项数量（仅列主数据启用且库存 > 0 的品项） |
 | `POST /dc-transfer/new` | 创建调货单，字段 `to_warehouse_code`、`items[<canonical_id>]`、`note` |
 | `GET /store-ordering/orders/<id>` | 调货单详情（复用），发送 / 接收 / 取消入口同页 |
@@ -157,7 +159,7 @@ stateDiagram-v2
 `tests/test_dc_transfer.py`（18 个用例）覆盖：
 
 - 建单：跳过 `pending`、单号递增与 `DT-` 前缀、跨仓 / 反向 / 未知品项 / 空明细拒绝、同 canonical 合并；
-- 状态：部分发货 → 部分收货 → 发齐 → 收齐的完整链路，发送单 / 接收单双视角断言；
+- 状态：部分发货 → 部分收货 → 发齐 → 收齐的完整链路，总仓发送 / 门店收货双视角断言；
 - 库存：`总仓调货出库` / `总仓调货入库` 流水与两仓库存数量；
 - 报表：调货单不计入 `compute_store_order_report`；
 - 取消：未发货可取消、发货后拒绝；

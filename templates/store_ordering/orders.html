@@ -72,16 +72,8 @@
       'delivered': '已送达',
       'cancelled': '已取消',
     } %}
-    {# 调货单与订货单共用主状态，但 approved/shipped/delivered 的业务语义
-       不同（待发货 / 已发出 / 已完成），列表里必须分开显示。 #}
-    {% set transfer_status_labels = {
-      'pending': '待审批',
-      'approved': '待发货',
-      'rejected': '已拒绝',
-      'shipped': '已发出',
-      'delivered': '已完成',
-      'cancelled': '已取消',
-    } %}
+    {# 调货单在门店视角就是一张待收货的订单：状态按收货进度展示
+       （待发货 / 待收货 / 部分收货 / 已收货），不暴露「发送单」概念。 #}
     {% for o in orders %}
     <tr>
       <td>{{ o.order_no }}</td>
@@ -94,7 +86,7 @@
       </td>
       <td>
         {% if o.flow_type == 'dc_transfer' %}
-        <span class="status-pill {{ o.status }}">{{ transfer_status_labels[o.status] or o.status }}</span>
+        <span class="status-pill {{ o.status }}">{{ o.rcv_state_label or o.status }}</span>
         {% else %}
         <span class="status-pill {{ o.status }}">{{ status_labels[o.status] or o.status }}</span>
         {% endif %}

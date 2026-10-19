@@ -1358,15 +1358,15 @@ stateDiagram-v2
 **两个视角、两套状态**（同一张单，派生而非落库）：
 
 - 发送单（总仓）：`awaiting_ship → partial_shipped → shipped → completed`（+ `cancelled`）
-- 接收单（分仓）：`awaiting_ship → pending_receive → partial_received → received`（+ `cancelled`）
+- 收货视角（门店，不叫「接收单」）：`awaiting_ship → pending_receive → partial_received → received`（+ `cancelled`）
 
-状态**不能只看主状态**：分批发货期间主状态停在 `approved`，只看 `status` 会把「已发 5 待收 5」显示成「待发货」。接收状态逐行用 `order_item_receivable_qty()` 派生，与收货门禁同源（列表上的「待收 N」= 详情页收货上限）。
+状态**不能只看主状态**：分批发货期间主状态停在 `approved`，只看 `status` 会把「已发 5 待收 5」显示成「待发货」。收货状态逐行用 `order_item_receivable_qty()` 派生，与收货门禁同源（列表上的「待收 N」= 详情页收货上限）。
 
 **与订货流程的差异**：① 无 `pending` 审批（创建即 `approved`，`approved_by` 记发起人）；② 单号 `DT-`；③ 运费恒 0、详情页不显示金额；④ 库存流水用 `总仓调货出库/入库`（已同步 `reports_health_pure` 的 `INBOUND_ACTIONS`/`CONSUME_ACTIONS` 与 `restock` 入库历史，漏改会静默漏算）；⑤ `compute_store_order_report` 排除调货单；⑥ `cancel_order` 新增「已发货不可取消」守卫（对订货单同样生效，修掉「部分发货后作废导致在途货悬空」的旧缺口）。
 
 **权限**：新增 `transfer.create`（manager/admin 包，26 点 / `manager 18`、`admin 19`）。建单要求 DC 类型 + 该权限；列表对 DC / 门店分别开放，发货与收货复用 `store_ordering` 的既有路由与角色守卫。
 
-**列表口径**：分仓「我的订单」（`store_orders_list`）只列 `flow_type='store_order'`——调货单的 `approved` 语义是「待发货」而非「已审批」，混排会让分仓看不懂状态；调货单统一走「调货接收」入口。管理员订单板（`admin_orders`）保留全量，新增「类型」列并按 `flow_type` 切换状态文案（待发货 / 已发出 / 已完成）。
+**列表口径（2026-10-19 修正）**：门店侧**不设独立调货入口**——调货单对门店就是一张待收货的订单，直接列在「本店订单」（`store_orders_list`）里；模板按 `flow_type` 显示「类型」列，状态用**收货进度**（待发货 / 待收货 / 部分收货 / 已收货）而非主状态——分批发货期间主状态停在 `approved`，直接展示会变成门店看不懂的「已审批」。`dc_transfer.transfer_list` 对门店 302 回订单列表；只有总仓／平台管理员有「总仓调货」入口。管理员订单板（`admin_orders`）同源处理。
 
 详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
 

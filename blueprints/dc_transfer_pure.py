@@ -49,9 +49,9 @@ DOC_STATE_LABELS: dict[str, str] = {
 
 RCV_STATE_LABELS: dict[str, str] = {
     RCV_AWAITING_SHIP: "待发货",
-    RCV_PENDING: "待接收",
-    RCV_PARTIAL: "部分接收",
-    RCV_RECEIVED: "已接收",
+    RCV_PENDING: "待收货",
+    RCV_PARTIAL: "部分收货",
+    RCV_RECEIVED: "已收货",
     RCV_CANCELLED: "已取消",
 }
 

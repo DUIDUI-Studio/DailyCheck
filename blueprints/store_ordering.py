@@ -526,10 +526,14 @@ def store_orders_list() -> str:
         master,
         store_warehouse_code=store_code,
         status=status,
-        flow_type=sop.FLOW_STORE_ORDER,
         start_date=start_date,
         end_date=end_date,
     )
+    # 调货单对门店就是一张「待收货的订单」，与订货单同列在本店订单里，
+    # 不另开入口。这里补上按收货进度派生的状态（待发货/待收货/部分收货/
+    # 已收货），主状态在分批发货期间停在 approved，直接展示会显示成
+    # 「已审批」，门店看不懂。
+    orders = dtp.enrich_transfers(master, orders)
     return render_template(
         "store_ordering/orders.html",
         orders=orders,
@@ -1194,6 +1198,8 @@ def admin_orders() -> str:
         start_date=start_date,
         end_date=end_date,
     )
+    # 与「本店订单」同源：调货单按收货进度展示状态，主状态不足以表达。
+    orders = dtp.enrich_transfers(master, orders)
     return render_template(
         "store_ordering/orders.html",
         orders=orders,

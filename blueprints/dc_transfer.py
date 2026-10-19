@@ -57,37 +57,29 @@ def _list_stores(master: sqlite3.Connection) -> list[dict[str, Any]]:
 @require_login
 @require_warehouse_type(DC, STOREFRONT)
 def transfer_list() -> str:
-    """总仓：发送单列表；分仓：接收单列表（默认只看未收完的）。"""
+    """总仓：发送单列表。
+
+    门店不设独立入口：分仓收到的调货单对门店就是一张待收货的订单，
+    统一在「本店订单」里查看与接收（2026-10-19 owner 明确），因此门店
+    访问本地址直接回到订单列表。
+    """
     wh = _current_warehouse()
     if wh is None:
         flash("请先选择仓库")
         return redirect(url_for("auth.warehouse_picker"))
 
-    master = get_master_db()
-    wh_type = wh["warehouse_type"]
-    code = wh["code"]
-    scope = (request.args.get("scope") or "").strip()
+    if wh["warehouse_type"] != DC:
+        return redirect(url_for("store_ordering.store_orders_list"))
 
-    if wh_type == DC:
-        view = "outgoing"
-        transfers = dtp.list_transfers(master, from_warehouse_code=code)
-    else:
-        view = "incoming"
-        # 默认「待接收」：有已发未收的单据。scope=all 看全部历史。
-        transfers = dtp.list_transfers(
-            master,
-            to_warehouse_code=code,
-            only_receivable=(scope != "all"),
-        )
+    master = get_master_db()
+    transfers = dtp.list_transfers(master, from_warehouse_code=wh["code"])
 
     return render_template(
         "store_ordering/transfers.html",
-        view=view,
         transfers=transfers,
-        scope=scope,
         # 建单入口只给持 transfer.create 的角色（DC manager/admin）；
         # staff 能看列表但看不到按钮，避免点进去吃 403。
-        can_create=(wh_type == DC and has_permission("transfer.create")),
+        can_create=has_permission("transfer.create"),
     )
 
 

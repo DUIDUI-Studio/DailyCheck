@@ -396,26 +396,16 @@ def test_storefront_cannot_open_transfer_new(transfer_env, transfer_client):
     assert client.get("/dc-transfer/new").status_code == 403
 
 
-def test_storefront_sees_incoming_list(transfer_env, transfer_client):
-    master = transfer_env["master"]
+def test_storefront_transfer_list_redirects_to_orders(transfer_env, transfer_client):
+    """门店不设独立调货入口：访问 /dc-transfer/ 回到「本店订单」。"""
     order = _create(transfer_env)
     item_id = order["order_items"][0]["id"]
-    sop.ship_order(master, order["id"], {item_id: 4}, shipped_by=3)
+    sop.ship_order(transfer_env["master"], order["id"], {item_id: 4}, shipped_by=3)
 
     client = transfer_client(4, 2)
     resp = client.get("/dc-transfer/")
-    assert resp.status_code == 200
-    body = resp.data.decode("utf-8")
-    assert "调货接收单" in body
-    assert order["order_no"] in body
-
-    # 收完之后默认视图不再列出（scope=all 仍可见）
-    sop.receive_order_item(
-        master, order_id=order["id"], order_item_id=item_id, qty=4,
-        actor_id=4, note=None,
-    )
-    assert order["order_no"] not in client.get("/dc-transfer/").data.decode("utf-8")
-    assert order["order_no"] in client.get("/dc-transfer/?scope=all").data.decode("utf-8")
+    assert resp.status_code == 302
+    assert resp.headers["Location"].endswith("/store-ordering/orders")
 
 
 def test_dc_list_shows_outgoing_and_create_entry(transfer_env, transfer_client):
@@ -444,11 +434,25 @@ def test_list_transfers_only_receivable(transfer_env):
     assert listed[0]["pending_receive_qty"] == 5
 
 
-def test_my_orders_list_excludes_transfers(transfer_env, transfer_client):
-    """分仓「我的订单」只列订货单；调货单走「调货接收」入口，避免语义混淆。"""
+def test_my_orders_includes_transfer_as_receipt_order(transfer_env, transfer_client):
+    """分仓「本店订单」必须包含调货单，并按收货进度显示（不暴露发送单概念）。"""
+    master = transfer_env["master"]
     order = _create(transfer_env)
+    item_id = order["order_items"][0]["id"]
+    sop.ship_order(master, order["id"], {item_id: 5}, shipped_by=3)
+
     body = transfer_client(4, 2).get("/store-ordering/orders").data.decode("utf-8")
-    assert order["order_no"] not in body
+    assert order["order_no"] in body
+    assert "总仓调货" in body
+    assert "待收货" in body
+
+    # 部分收货 → 列表显示「部分收货」
+    sop.receive_order_item(
+        master, order_id=order["id"], order_item_id=item_id, qty=2,
+        actor_id=4, note=None,
+    )
+    body = transfer_client(4, 2).get("/store-ordering/orders").data.decode("utf-8")
+    assert "部分收货" in body
 
 
 def test_admin_order_board_marks_transfer_type(transfer_env, transfer_client):
@@ -459,7 +463,7 @@ def test_admin_order_board_marks_transfer_type(transfer_env, transfer_client):
 
 
 def test_transfer_detail_renders_for_both_sides(transfer_env, transfer_client):
-    """详情页按视角渲染发送单 / 接收单，且不因 flow 分支缺变量报 500。"""
+    """详情页按视角渲染：总仓是调货单 / 发送视角，门店是订单 / 收货视角。"""
     master = transfer_env["master"]
     order = _create(transfer_env)
     item_id = order["order_items"][0]["id"]
@@ -468,16 +472,16 @@ def test_transfer_detail_renders_for_both_sides(transfer_env, transfer_client):
     dc_body = transfer_client(2, 1).get(
         f"/store-ordering/orders/{order['id']}"
     ).data.decode("utf-8")
-    assert "发送单" in dc_body
     assert "部分发出" in dc_body
     assert order["order_no"] in dc_body
 
     store_body = transfer_client(4, 2).get(
         f"/store-ordering/orders/{order['id']}"
     ).data.decode("utf-8")
-    assert "接收单" in store_body
-    assert "待接收" in store_body
-    assert "分仓入库流水" in store_body
+    # 门店侧不出现「接收单」这类新概念，就是一张订单 + 待收货
+    assert "接收单" not in store_body
+    assert "待收货" in store_body
+    assert "门店入库流水" in store_body
     # 内部调拨不展示结算金额
     assert "订单总计" not in store_body
     assert "内部调拨，不产生金额" in store_body

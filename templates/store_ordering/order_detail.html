@@ -10,9 +10,10 @@
   'delivered': '已送达',
   'cancelled': '已取消',
 } %}
-{# 调货单：发送单状态（总仓视角）/ 接收单状态（分仓视角）由路由注入。 #}
+{# 调货单对门店只是一张待收货的订单（沿用「订单」措辞），
+   对总仓才是「调货单」。#}
 {% set is_transfer = order.flow_type == 'dc_transfer' %}
-{% set doc_label = '调货单' if is_transfer else '订单' %}
+{% set doc_label = ('调货单' if is_dc_view else '订单') if is_transfer else '订单' %}
 {% set doc_pill = {
   'awaiting_ship': 'pending',
   'partial_shipped': 'approved',
@@ -36,9 +37,6 @@
     {% else %}
     <span class="status-pill {{ rcv_pill[transfer.rcv_state] }}">{{ transfer.rcv_state_label }}</span>
     {% endif %}
-    <span class="muted" style="margin-left:8px">
-      {{ '发送单' if is_dc_view else '接收单' }}
-    </span>
   {% else %}
   <span class="status-pill {{ order.status }}">{{ status_labels[order.status] or order.status }}</span>
   {% endif %}
@@ -254,7 +252,7 @@
 
 {# —— 门店入库流水（storefront 视角）：直接读门店仓 stock_movements —— #}
 {% if not is_dc_view %}
-<h3>{{ '分仓入库流水' if is_transfer else '门店入库流水' }}</h3>
+<h3>门店入库流水</h3>
 {% if store_inflows %}
 <table class="data-table">
   <thead>
@@ -353,8 +351,10 @@
   </form>
   {% endif %}
 
-  {% if is_transfer %}
+  {% if is_transfer and is_dc_view %}
   <a class="btn-action ghost" href="{{ url_for('dc_transfer.transfer_list') }}">返回调货列表</a>
+  {% elif is_transfer %}
+  <a class="btn-action ghost" href="{{ url_for('store_ordering.store_orders_list') }}">返回我的订单</a>
   {% elif is_dc_view %}
   <a class="btn-action ghost" href="{{ url_for('store_ordering.shipment_list') }}">返回出库清单</a>
   {% endif %}
