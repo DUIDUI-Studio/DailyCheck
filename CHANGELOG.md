@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Fixed — 登录后恢复上次仓库：通知深链不再停在选择页（fix/remember-last-warehouse，2026-10-19）
+- **症状**：点企微审批通知 → 未登录 → 登录成功 → **仍先落在 `/select-warehouse`**，要再点一次仓库才回到审批页。
+- **根因**：`next` 链路本身是通的（§8.8，PR #85 已修），卡的是「上次在哪个仓」——`login` 成功时的 `session.clear()` 顺带清掉 `warehouse_id`，而 picker 原设计明确「不记忆、每次都要点」。两条叠加，通知深链必然多一跳。
+- **修复**：手动选仓成功后写 `users.last_warehouse_id`；登录成功时读回，**重跑租户 + `warehouse_users` 绑定双闸**（`_warehouse_visible_to`）再置入 session。仓库已删 / 已解绑 / 跨租户一律视为「没选过」，回落 picker，不改变老行为。
+- **顺手补的洞**：每请求加载 session 仓库时原先只校验租户、不校验绑定，现在三条入口共用同一函数——自动选仓不能比手动点按钮更宽松。
+- **schema**：`users.last_warehouse_id INTEGER`（可空 = 从未选过），`init_master_db()` 里 PRAGMA 守卫做幂等 ALTER。
+- **测试**：新增 `tests/test_auth_remember_warehouse.py` 12 例；变异验证（去掉恢复 / 去掉绑定闸）各自打红 4 例。
+
 ### Added — 门店订货：品项起订倍数 + 审批页金额拆分（feat/order-multiple-fee-split，2026-10-18）
 - **起订倍数**：DC 可对每个品项设一个倍数（`items.order_multiple`，1 = 不限），门店下单数量必须是它的整数倍（设 5 → 只能订 5/10/15…）。配置入口在 **DC 品项管理页**（`/store-ordering/dc-items`）新增的「起订倍数」列，与「可订开关」同页同级、同为 DC manager 及以上，属本仓字段（主数据扇出不覆盖）。
 - **四道关口**：catalog 弹窗（`step/min` + 前端先拦一次并提示最近合法值）→ 加购（按合并后数量校验）→ 改数量 → 提交（`validate_cart_for_submit` 汇总 `multiples` + `submit_order` 二次校验，违规时「发送」置灰并列出原因）。此前「加购时合法、之后倍数被调大」的存量购物车会在提交时被挡下。

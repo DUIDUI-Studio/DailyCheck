@@ -1091,7 +1091,7 @@ flowchart TB
 | 未登录跳登录 | `next = permissions.current_relative_path()`（`request.full_path` 去掉结尾 `?`，即 **path + query**） | `permissions.py` 全部守卫（`require_login` / `require_role` / `require_platform_admin` / `require_warehouse_type` / `_guard_prelude`）+ `blueprints/auth.py:load_user_and_warehouse` |
 | 已登录未选仓跳 picker | `next` 同上，`warehouse_picker` 读回并传给模板 | `permissions.py`、`blueprints/auth.py:warehouse_picker` |
 | 登录表单 | action 带 `next` **且** 加 `<input type="hidden" name="next">`（双保险：action 丢 query 时仍拿得到）；模板只渲染**已过 `_safe_next`** 的 `next_url`（视图传参），未校验值不进 HTML | `templates/login.html`、`blueprints/auth.py:login` |
-| 登录成功 | `nxt = _safe_next(request.values.get("next"))`（`values` 覆盖 query + 表单）；无则 `url_for("auth.warehouse_picker")` | `blueprints/auth.py:login` |
+| 登录成功 | `nxt = _safe_next(request.values.get("next"))`（`values` 覆盖 query + 表单）；无 `next` 时：恢复上次仓库成功 → `core.land`，否则 `url_for("auth.warehouse_picker")`（§8.9） | `blueprints/auth.py:login` |
 | 选仓表单 | action + 隐藏域都带 `next_url`（视图传入，无则空串） | `templates/warehouse_picker.html` |
 | 选仓成功 | 有 `next` → `redirect(next)`；无 → `redirect(url_for("core.land"))` | `blueprints/auth.py:warehouse_select` |
 
@@ -1101,11 +1101,30 @@ flowchart TB
 
 **回归**：`tests/test_auth_next_redirect.py`（34 用例）——未登录/未选仓两条链路的 next 保留、登录（隐藏域 + 查询串两种形态）、选仓有无 next 两个分支、开放重定向 6 种载荷参数化（`http://evil.com` / `//evil.com` / `/\evil.com` / `https:/evil.com` / `javascript:` / 空串）、跨租户与未绑定仍 403、以及端到端链 `未登录深链 → 登录 → 选仓 → 订单详情 200`。
 
+### 8.9 登录后恢复上次仓库（2026-10-19 起）
+
+**症状**：点企微通知里的审批链接 → 未登录 → 登录成功 → **仍先停在 `/select-warehouse`**，要再点一次仓库才回到审批页。`next` 没丢（§8.8 已修），丢的是「上次在哪个仓」。
+
+**根因是两条独立决策叠加**：`login` 成功时 `session.clear()` 把 `warehouse_id` 一并清掉；picker 原设计又明确「不记忆、每次都要点」（`no auto-remember of last warehouse`）。对通知深链来说，这一跳纯属多余。
+
+**实现**：
+
+| 环节 | 行为 | 代码位置 |
+|------|------|----------|
+| 记住 | 手动选仓成功后写 `users.last_warehouse_id` | `blueprints/auth.py:warehouse_select` |
+| 恢复 | 登录成功后读回该列，校验通过则写入 `session["warehouse_id"]` | `blueprints/auth.py:login` |
+| 校验 | 恢复前重跑**租户闸 + `warehouse_users` 绑定闸**（`_warehouse_visible_to`）；仓库已删/已解绑/跨租户 → 视为「没选过」，回落 picker | `blueprints/auth.py` |
+| schema | `users.last_warehouse_id INTEGER`（可空 = 从未选过），`init_master_db()` 里 PRAGMA 守卫做幂等 ALTER | `db/__init__.py` |
+
+**铁律**：自动选仓不得比手动点按钮更宽松——三条入口（每请求钩子、登录恢复、picker POST）必须共用 `_warehouse_visible_to`。给它加任何「免绑定」豁免都等于开越权口子：非 admin 的合法组合只有「本租户 **且** 有绑定」。
+
+**回归**：`tests/test_auth_remember_warehouse.py`（12 用例）——写入/403 不写入、登录直达深链（含端到端 200）、无历史仍走 picker、跨租户/解绑/删仓三种失效回落、admin 跨租户例外、session 里塞未绑定仓被清回 picker。
+
 ### 8.6 租户隔离（P0-1 轻方案 PoC，2026-10-10 起）
 
 - `master.db`：`tenants` 注册表 + `users/warehouses/canonical_items.tenant_id`（默认 1 = 存量单租户，老库 ALTER 自动回填）。
 - 请求上下文：`g.tenant_id`（auth 钩子从 user 行取）。
-- 三道闸：① 钩子加载仓库时校验 `warehouse.tenant_id == user.tenant_id`（`is_admin` 平台管理员豁免）② picker 只列本租户 ③ `/select-warehouse/<id>` 租户闸先行（跨租户脏绑定 → 403）。
+- 三道闸：① 钩子加载仓库时校验 `warehouse.tenant_id == user.tenant_id` **且 `warehouse_users` 存在绑定**（`blueprints/auth.py:_warehouse_visible_to`；`is_admin` 平台管理员豁免。绑定闸 2026-10-19 补齐，见 §8.9）② picker 只列本租户 ③ `/select-warehouse/<id>` 走同一函数（跨租户 / 未绑定脏数据 → 403）。
 - 新仓放置：租户 1 保持 `db/warehouses/`；租户 N 落 `db/tenants/<N>/warehouses/`（`flask create-warehouse --tenant N`）。
 - **PoC 未覆盖（后续阶段）**：canonical 扇出/订单/MCP token/报表查询的租户化过滤；当前仅列/读仓与选择入口强制。回归 `tests/test_tenant_isolation.py`（8 用例）。
 - **账号管理（v2 2026-10-12 起）补完**：`/users` 路由全套按 tenant 过滤 —— `list_users` 接受 `?tenant_id=`（admin 跨租户可指定，非 admin 强制 scope 到 `g.tenant_id`）。见 §8.7。

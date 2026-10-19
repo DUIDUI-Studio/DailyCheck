@@ -76,6 +76,59 @@ def _safe_next(raw: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Warehouse access helpers
+# ---------------------------------------------------------------------------
+
+def _warehouse_visible_to(master, user, wh) -> bool:
+    """True when `user` is allowed to enter warehouse row `wh`.
+
+    Single source of truth shared by the three ways a warehouse gets bound
+    to a session: the per-request restore, the login auto-restore, and the
+    manual picker POST. Non-admins need BOTH gates — the tenant match and an
+    explicit `warehouse_users` binding. Platform admins are cross-tenant
+    operators and skip both, matching `warehouse_select`'s long-standing
+    behaviour.
+
+    Keeping this in one place matters: an auto-selected warehouse must never
+    be a softer door than one the user clicked.
+    """
+    if wh is None:
+        return False
+    if user["is_admin"]:
+        return True
+    if wh["tenant_id"] != user["tenant_id"]:
+        return False
+    return master.execute(
+        "SELECT 1 FROM warehouse_users WHERE user_id=? AND warehouse_id=?",
+        (user["id"], wh["id"]),
+    ).fetchone() is not None
+
+
+def _restore_last_warehouse(master, user) -> int | None:
+    """Return the user's previous warehouse id when it is still enterable.
+
+    Called right after a successful login *and* right after a picker POST
+    returns to the app, so a notification deep link no longer dead-ends on
+    `/select-warehouse`. Returning None (no history, warehouse deleted,
+    binding revoked, tenant changed) keeps the old behaviour: the picker is
+    shown. The restore is an optimisation, never a bypass.
+    """
+    try:
+        last_id = user["last_warehouse_id"]
+    except (IndexError, KeyError):
+        # Column missing on an un-migrated db — equivalent to "no history".
+        return None
+    if last_id is None:
+        return None
+    wh = master.execute(
+        "SELECT * FROM warehouses WHERE id=?", (last_id,)
+    ).fetchone()
+    if not _warehouse_visible_to(master, user, wh):
+        return None
+    return int(last_id)
+
+
+# ---------------------------------------------------------------------------
 # Request lifecycle
 # ---------------------------------------------------------------------------
 
@@ -131,9 +184,9 @@ def load_user_and_warehouse():
         row = master.execute(
             "SELECT * FROM warehouses WHERE id=?", (warehouse_id,)
         ).fetchone()
-        if row is not None and (
-            g.user["is_admin"] or row["tenant_id"] == g.tenant_id
-        ):
+        # 绑定闸与租户闸共用 _warehouse_visible_to：session 里的仓库
+        # 也可能来自「登录恢复」，不能只信租户匹配。
+        if _warehouse_visible_to(master, g.user, row):
             g.warehouse = row
             g.warehouse_db_path = str(BASE_DIR / row["db_path"])
             g.role = master.execute(
@@ -234,6 +287,12 @@ def login():
         )
         session.clear()
         session["user_id"] = row["id"]
+        # 恢复上次仓库：这是「点通知 → 登录 → 直接落审批页」的关键一步。
+        # 没有它，登录后即便 next 带着深链，也会先被仓库闸弹到选择页。
+        # 授权校验在 _restore_last_warehouse 内部完成，失效则当没选过。
+        restored = _restore_last_warehouse(master, row)
+        if restored is not None:
+            session["warehouse_id"] = restored
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         master.execute(
             "UPDATE users SET last_login_at=? WHERE id=?", (now, row["id"])
@@ -241,9 +300,13 @@ def login():
         master.commit()
         # 深链回跳：next 可能来自 query（登录前 302 带的）或表单隐藏域
         # （action 丢 query 时的双保险），故用 request.values 同时覆盖两者。
-        nxt = _safe_next(request.values.get("next")) or url_for(
-            "auth.warehouse_picker"
-        )
+        nxt = _safe_next(request.values.get("next"))
+        if nxt is None:
+            nxt = (
+                url_for("core.land")
+                if restored is not None
+                else url_for("auth.warehouse_picker")
+            )
         return redirect(nxt)
     return render_template("login.html", next_url=next_url)
 
@@ -261,11 +324,15 @@ def logout():
 @bp.route("/select-warehouse", methods=["GET"])
 @require_login
 def warehouse_picker():
-    """Always show the list of warehouses the user has access to.
+    """Show the warehouses the user may enter, for an explicit switch.
 
-    Per project decision: no auto-remember of last warehouse. User clicks
-    each time. Admins see all warehouses; regular users see only those
-    bound via warehouse_users.
+    Reachable on demand from the sidebar「切换」link. It is no longer the
+    mandatory stop after every login: `auth.login` restores
+    `users.last_warehouse_id` (re-validated against the tenant + binding
+    gates) so a notification deep link lands straight on its target page.
+
+    Admins see all warehouses; regular users see only those bound via
+    warehouse_users.
 
     `next` (validated) is handed to the template so each warehouse button
     can carry the original deep-link target into the POST below; without it
@@ -306,17 +373,16 @@ def warehouse_select(warehouse_id: int):
     ).fetchone()
     if wh is None:
         abort(404)
-    if not g.user["is_admin"]:
-        # P0-1 多租户：租户闸先行（跨租户绑定视为脏数据，直接拒绝）。
-        if wh["tenant_id"] != g.user["tenant_id"]:
-            abort(403)
-        binding = master.execute(
-            "SELECT 1 FROM warehouse_users WHERE user_id=? AND warehouse_id=?",
-            (g.user["id"], warehouse_id),
-        ).fetchone()
-        if binding is None:
-            abort(403)
+    # 租户闸 + 绑定闸与登录恢复共用同一实现（helper 内部对 admin 放行）。
+    if not _warehouse_visible_to(master, g.user, wh):
+        abort(403)
     session["warehouse_id"] = warehouse_id
+    # 记住这次选择：下次登录（以及企微通知深链）直接落在这里。
+    master.execute(
+        "UPDATE users SET last_warehouse_id=? WHERE id=?",
+        (warehouse_id, g.user["id"]),
+    )
+    master.commit()
     # 深链回跳：有 next 就回到用户原本要看的页面，否则维持原有 /land 行为。
     nxt = _safe_next(request.values.get("next"))
     if nxt:
