@@ -1347,6 +1347,12 @@ flowchart TB
 - detail 页头部「← 返回筛选结果」（有筛选时）/「← 返回品项列表」（无筛选时）
 - 目的：用户在筛选结果里点编辑/查看 → 保存 → 直接回到原筛选上下文，不丢工作流
 
+**库存健康页主数据同步**（Issue #121，2026-10-19）：
+- `/report/health` 与 `/report/health/export` 的所有展示口径（库存金额 SUM / 风险段 out_of_stock+below_safety / 超期未盘 unstale / 呆滞/超储/SKU 派生 / SKU 明细表）一律排除 `is_active=0` **且** `canonical_status='disabled'`（主数据扇出停用）的扇出行。
+- 谓词统一封装在 `reports_health_pure._visible_items_clause(alias=''|'i')`，与 `blueprints.canonical_pure.store_visible_clause()` 同源，独立落地一份以避免 `reports_health_pure`（顶层模块）回引 `blueprints`。
+- 修复前用户反馈：库存健康页展示了已经被主数据停用的品项；admin 判定：应被品项主数据同步。
+- 测试：`tests/test_reports_health.py::TestIssue121CanonicalDisabledExcluded`（5 个 case，覆盖五个口径 + is_active 守门员回归）。
+
 ---
 
 ## 11. PWA / 移动端
