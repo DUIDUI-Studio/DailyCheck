@@ -28,6 +28,27 @@ STALE_DAYS = 7            # 呆滞账龄阈值（天）
 DOS_THRESHOLD_DAYS = 7    # 超储可售天数阈值（天）
 DOS_WINDOW_DAYS = 30      # DOS 日均消耗回看窗口（天），与页面 range 解耦
 STOCKTAKE_MAX_GAP = 30    # 超期未盘阈值（天）
+
+# Issue #121（2026-10-19）：库存健康页应被品项主数据同步——主数据
+# canonical_items.status='disabled' 经扇出落到 items.canonical_status='disabled'
+# 的品项必须从所有展示口径里排除（SKU 表 / 风险段 / 库存金额 / 超期未盘 /
+# 呆滞/超储/SKU 派生）。与 blueprint.canonical_pure.store_visible_clause() 同源，
+# 此处独立落地一份以避免 reports_health_pure（顶层模块）回引 blueprint。
+CANONICAL_DISABLED = "disabled"
+
+
+def _visible_items_clause(alias: str = "") -> str:
+    """SQL 谓词：is_active=1 且未被主数据停用。供 WHERE 拼接。
+
+    alias 留空时用裸列名（适用于 FROM items 直接无 JOIN 的 SQL）；
+    传 'i' 时加上前缀（适用于 JOIN categories c ON c.id=i.category_id 等
+    多表场景）。
+    """
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"COALESCE({prefix}is_active, 1) = 1 AND "
+        f"COALESCE({prefix}canonical_status, '') <> '{CANONICAL_DISABLED}'"
+    )
 BOM_OVERUSE_PCT = 10      # BOM 超耗预警阈值（%）
 
 # ---------------------------------------------------------------------------
@@ -169,8 +190,13 @@ def compute_stale_and_dos(db, now: datetime) -> dict:
         last_outbound, last_inbound,           # 最后出库/入库日期或 None
     }}
     """
+    # Issue #121：选出仍参与呆滞/DOS 派生计算的品项——is_active=1 且
+    # 未被主数据停用；canonical_status='disabled' 的扇出行直接不出现在派生表。
     items = db.execute(
-        """SELECT id, name, quantity, unit_cost, is_active FROM items ORDER BY id"""
+        f"""SELECT id, name, quantity, unit_cost, is_active, canonical_status
+            FROM items
+            WHERE {_visible_items_clause()}
+            ORDER BY id"""
     ).fetchall()
     movements: dict[int, list] = {}
     for r in db.execute(
@@ -206,7 +232,9 @@ def compute_stale_and_dos(db, now: datetime) -> dict:
     result = {}
     for it in items:
         qty = float(it["quantity"])
-        if not it["is_active"] or qty <= 0:
+        # items 已在 SQL 层过滤 is_active=1 + canonical_status<>'disabled'，
+        # 保留 qty<=0 的早退：空跑 SKU 不进呆滞/超储派生。
+        if qty <= 0:
             continue
         mv = movements.get(it["id"], [])
         replay = replay_item_layers(mv, qty, now)
@@ -399,8 +427,11 @@ def compute_stocktake_quality(db, now: datetime) -> dict:
     ).fetchall()}
     gap_cutoff = (now - timedelta(days=STOCKTAKE_MAX_GAP)).strftime("%Y-%m-%d %H:%M:%S")
     unstale_items = []
+    # Issue #121：超期未盘点只看「is_active=1 且非主数据停用」品项；
+    # canonical_status='disabled' 的扇出行不计入 unstale_count / unstale_items。
     for it in db.execute(
-        "SELECT id, name FROM items WHERE is_active = 1").fetchall():
+        f"SELECT id, name FROM items WHERE {_visible_items_clause()}"
+    ).fetchall():
         d = last_by_item.get(it["id"])
         if d is None or d < gap_cutoff:
             unstale_items.append({"name": it["name"],
@@ -549,15 +580,19 @@ def compute_inventory_levels(db) -> dict:
     口径：断货 = is_active=1 AND quantity=0；低于安全 = is_active=1 AND
     0 < quantity < safety_stock；库存金额 = SUM(quantity × unit_cost) 全表。
     """
+    # Issue #121：库存金额只统计「is_active=1 且非主数据停用」品项；
+    # canonical_status='disabled' 的扇出行不计入库存账面。
     stock_value = float(db.execute(
-        "SELECT COALESCE(SUM(quantity * unit_cost), 0) AS c FROM items"
+        f"SELECT COALESCE(SUM(quantity * unit_cost), 0) AS c FROM items "
+        f"WHERE {_visible_items_clause()}"
     ).fetchone()["c"])
     out_of_stock, below_safety, active = [], [], 0
     for it in db.execute(
-        """SELECT i.id, i.name, i.quantity, i.safety_stock, i.unit_cost, i.unit,
+        f"""SELECT i.id, i.name, i.quantity, i.safety_stock, i.unit_cost, i.unit,
                   c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
-           WHERE i.is_active = 1 ORDER BY (i.quantity * i.unit_cost) DESC"""
+           WHERE {_visible_items_clause('i')}
+           ORDER BY (i.quantity * i.unit_cost) DESC"""
     ).fetchall():
         active += 1
         qty = float(it["quantity"])
@@ -595,11 +630,13 @@ def build_sku_table(db, stale_dos: dict, abc: dict, cutoff: str,
         "SELECT item_id, MAX(created_at) AS d FROM stocktakes GROUP BY item_id"
     ).fetchall()}
     rows = []
+    # Issue #121：SKU 表只展示「is_active=1 且非主数据停用」品项；
+    # canonical_status='disabled' 的扇出行不出现在 SKU 明细里。
     items = db.execute(
-        """SELECT i.id, i.name, i.quantity, i.safety_stock, i.unit_cost, i.unit,
+        f"""SELECT i.id, i.name, i.quantity, i.safety_stock, i.unit_cost, i.unit,
                   c.name AS category_name
            FROM items i JOIN categories c ON c.id = i.category_id
-           WHERE i.is_active = 1""").fetchall()
+           WHERE {_visible_items_clause('i')}""").fetchall()
     for it in items:
         qty = float(it["quantity"])
         sd = stale_dos.get(it["id"], {})

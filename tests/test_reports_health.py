@@ -39,6 +39,7 @@ CREATE TABLE items (
     id INTEGER PRIMARY KEY, name TEXT, quantity REAL DEFAULT 0,
     safety_stock REAL DEFAULT 0, unit TEXT DEFAULT '件', unit_cost REAL DEFAULT 0,
     gram_per_unit REAL, updated_at TEXT, is_active INTEGER DEFAULT 1,
+    canonical_status TEXT,            -- Issue #121：主数据扇出停用标记
     category_id INTEGER REFERENCES categories(id));
 CREATE TABLE stock_movements (
     id INTEGER PRIMARY KEY, item_id INTEGER, action TEXT, delta REAL,
@@ -74,12 +75,13 @@ def pdb():
 
 
 def add_item(pdb, name="椰浆", qty=0.0, cost=10.0, safety=0.0, active=1,
-             category="原料", cat_id=1):
+             canonical_status=None, category="原料", cat_id=1):
+    """建品项。canonical_status='disabled' 时模拟主数据扇出停用（Issue #121）。"""
     pdb.execute("INSERT OR IGNORE INTO categories VALUES (?, ?)", (cat_id, category))
     cur = pdb.execute(
         "INSERT INTO items (name, quantity, safety_stock, unit_cost, is_active,"
-        " category_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (name, qty, safety, cost, active, cat_id))
+        " canonical_status, category_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (name, qty, safety, cost, active, canonical_status, cat_id))
     pdb.commit()
     return cur.lastrowid
 
@@ -388,6 +390,80 @@ class TestLevelsAndOthers:
 
     def test_production_none_when_no_runs(self, pdb):
         assert hp.compute_production(pdb, "1970-01-01 00:00:00") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #121（2026-10-19）—— 库存健康页应被品项主数据同步
+#
+# 用户反馈：库存健康页 /report/health 展示了已经被主数据停用
+# （canonical_status='disabled'）的品项。admin 判定：应被品项主数据同步。
+# 修复口径：所有健康页展示口径（库存金额 / 风险段 / 超期未盘 / 呆滞/超储
+# 派生 / SKU 明细）一律排除 is_active=0 或 canonical_status='disabled'
+# 的扇出行。
+# ---------------------------------------------------------------------------
+class TestIssue121CanonicalDisabledExcluded:
+    """Issue #121：canonical_status='disabled' 行不进任何健康页口径。"""
+
+    def test_levels_excludes_disabled_inventory_and_segments(self, pdb):
+        # 断货/低安全/正常各一条，全部 is_active=1；同名品项另起一条
+        # canonical_status='disabled'，验证它从金额 / 风险段 / active_skus 全消失。
+        add_item(pdb, "断货", qty=0.0, safety=5.0, cost=1.0)              # id=1
+        add_item(pdb, "低安全", qty=3.0, safety=5.0, cost=2.0, cat_id=2)  # id=2
+        add_item(pdb, "正常", qty=10.0, safety=5.0, cost=3.0, cat_id=2)   # id=3
+        add_item(pdb, "已停用A", qty=99.0, safety=0.0, cost=100.0,
+                 canonical_status="disabled")                              # id=4
+        add_item(pdb, "已停用B", qty=0.0, safety=0.0, cost=50.0,
+                 canonical_status="disabled", cat_id=2)                    # id=5
+        levels = hp.compute_inventory_levels(pdb)
+        assert levels["active_skus"] == 3
+        # 库存金额只算未停用的：0*1 + 3*2 + 10*3 = 36
+        assert levels["stock_value"] == pytest.approx(36.0)
+        assert len(levels["out_of_stock"]) == 1
+        assert levels["out_of_stock"][0]["name"] == "断货"
+        assert len(levels["below_safety"]) == 1
+        assert levels["below_safety"][0]["name"] == "低安全"
+
+    def test_stale_and_dos_excludes_disabled(self, pdb):
+        add_item(pdb, "活跃", qty=50.0, cost=10.0, active=1)
+        add_item(pdb, "停用", qty=50.0, cost=10.0, active=1,
+                 canonical_status="disabled")
+        # 两条都补一次入库，给流水
+        for iid in (1, 2):
+            add_mv(pdb, iid, "补货入库", 50.0, days_ago=10)
+        result = hp.compute_stale_and_dos(pdb, NOW)
+        assert 1 in result
+        assert 2 not in result            # disabled 不进派生表
+
+    def test_sku_table_excludes_disabled(self, pdb):
+        add_item(pdb, "活跃", qty=5.0, cost=10.0, active=1)
+        add_item(pdb, "停用", qty=5.0, cost=10.0, active=1,
+                 canonical_status="disabled")
+        rows = hp.build_sku_table(pdb, {}, {}, "1970-01-01 00:00:00", "stock_value")
+        names = [r["name"] for r in rows]
+        assert "活跃" in names
+        assert "停用" not in names
+
+    def test_stocktake_unstale_excludes_disabled(self, pdb):
+        """已停用品项即使超过 STOCKTAKE_MAX_GAP 未盘，也不计入 unstale_count。"""
+        add_item(pdb, "活跃", cat_id=2)
+        add_item(pdb, "停用", canonical_status="disabled", cat_id=2)
+        # 两条都从未盘点 → 若不去除 disabled，unstale_count 应为 2；
+        # 修复后应只剩「活跃」=1。
+        q = hp.compute_stocktake_quality(pdb, NOW)
+        assert q["unstale_count"] == 1
+        assert q["unstale_items"] == [{"name": "活跃", "last_date": None}]
+
+    def test_is_active_zero_also_excluded(self, pdb):
+        """守门员回归：本仓 is_active=0 也不进健康页（修复前后都成立，但显式
+        写一遍以防 SQL 谓词被误改回仅过滤 canonical_status）。"""
+        add_item(pdb, "本仓停用", qty=10.0, cost=10.0, active=0)
+        add_item(pdb, "主数据停用", qty=10.0, cost=10.0, active=1,
+                 canonical_status="disabled")
+        add_item(pdb, "双重停用", qty=10.0, cost=10.0, active=0,
+                 canonical_status="disabled")
+        levels = hp.compute_inventory_levels(pdb)
+        assert levels["active_skus"] == 0
+        assert levels["stock_value"] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
