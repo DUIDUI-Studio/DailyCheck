@@ -495,9 +495,119 @@ def test_loop_integrity_declares_rollback_blind_spot():
     recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
     li = ops_parse.build_loop_integrity(recs)
 
-    assert len(li["blind_spots"]) == 1
-    assert "回滚" in li["blind_spots"][0]
+    assert any("回滚" in b for b in li["blind_spots"]), li["blind_spots"]
     assert "rollback_count" not in li, "不得伪造一个回滚计数"
+
+
+def test_detect_event_instrumentation_three_states(tmp_path):
+    """埋点探测三态：deployed / absent / unknown，各自语义不同。
+
+    ⚠️ 必须三态而非 bool：absent（脚本在但无埋点）要明说「0 不代表没发生」，
+    unknown（脚本读不到）连「未部署」都不能断言 —— 把「读不到」说成
+    「未部署」同样是编造事实。
+    """
+    # deployed：脚本含 _audit_event
+    ok_dir = tmp_path / "ok"
+    (ok_dir / "scripts" / "blue_green").mkdir(parents=True)
+    (ok_dir / "scripts/blue_green/deploy_pipeline.sh").write_text(
+        "_audit_event() { :; }\n", encoding="utf-8")
+    assert ops_parse.detect_event_instrumentation(ok_dir) == "deployed"
+
+    # absent：脚本在但无埋点（生产 2026-10-19 实测形态）
+    bare_dir = tmp_path / "bare"
+    (bare_dir / "scripts" / "blue_green").mkdir(parents=True)
+    (bare_dir / "scripts/blue_green/deploy_pipeline.sh").write_text(
+        'PY="${PYTHON:-python3}"\n', encoding="utf-8")
+    assert ops_parse.detect_event_instrumentation(bare_dir) == "absent"
+
+    # unknown：脚本读不到
+    assert ops_parse.detect_event_instrumentation(tmp_path / "nonexistent") == "unknown"
+
+
+def test_detect_event_instrumentation_ignores_comments(tmp_path):
+    """回归：注释/文档里提到 `_audit_event` **不得**让探测假阳性判成 deployed。
+
+    2026-10-19 实测命中：裸子串匹配下，一个只写了「# 无 _audit_event」注释的
+    脚本被判成 deployed → events_observable=True → 看板又渲染「均未发生」，
+    假信号复活。必须匹配函数定义形态。
+    """
+    d = tmp_path / "commented"
+    (d / "scripts" / "blue_green").mkdir(parents=True)
+    (d / "scripts/blue_green/deploy_pipeline.sh").write_text(
+        'PY="${PYTHON:-python3}"\n'
+        "# 无 _audit_event\n"
+        "# TODO: 调用 _audit_event 留痕\n",
+        encoding="utf-8")
+
+    assert ops_parse.detect_event_instrumentation(d) == "absent"
+
+
+def test_detect_event_instrumentation_matches_real_definition(tmp_path):
+    """真实定义形态必须命中（含缩进 / 空格变体），否则修复会把埋点判成未部署。"""
+    for i, body in enumerate([
+        '_audit_event() {\n  :\n}\n',
+        '_audit_event ()\n{\n  :\n}\n',
+        '  _audit_event() {  :\n  }\n',
+    ]):
+        d = tmp_path / f"real{i}"
+        (d / "scripts" / "blue_green").mkdir(parents=True)
+        (d / "scripts/blue_green/deploy_pipeline.sh").write_text(body, encoding="utf-8")
+        assert ops_parse.detect_event_instrumentation(d) == "deployed", body
+
+
+def test_events_zero_without_instrumentation_is_not_reported_as_clean(tmp_path):
+    """核心假信号回归：埋点未部署时，事件数 0 **不得**渲染成「无异常」。
+
+    2026-10-19 实测命中：#118（看板）先于 #116（埋点）合并，生产脚本无
+    `_audit_event`，看板却显示「钩子失败均未发生」——而实测生产系统 python3
+    对 scripts.dailycheck_dashboard 抛 ModuleNotFoundError，钩子一直是坏的。
+    这违反同一模块的铁律「把没记录说成没发生比不报更坏」。
+
+    ⚠️ 必须用**不含 pipeline-event 行**的样本（AUDIT_SAMPLE）：
+    LOOP_AUDIT_SAMPLE 自带 2 条事件，events 非空 → 永远走不到「0 起」分支，
+    而这个分支正是要区分「真无异常」与「没人在记」的地方。
+    """
+    recs = ops_parse.parse_audit_text(AUDIT_SAMPLE)
+    assert not ops_parse.build_loop_integrity(recs)["events"], "样本必须无事件行"
+
+    # 埋点在 → 0 起是真无异常
+    deployed = _write_instrumented_repo(tmp_path)
+    li_ok = ops_parse.build_loop_integrity(recs, repo_dir=deployed)
+    assert li_ok["events_observable"] is True
+    assert not any("异常留痕" in b for b in li_ok["blind_spots"])
+    html_ok = render_ops._render_loop_integrity(li_ok)
+    assert "均未发生" in html_ok
+
+    # 埋点不在 → 0 起必须标不可观测，且计入盲区
+    li_bad = ops_parse.build_loop_integrity(recs, repo_dir=tmp_path / "nope")
+    assert li_bad["events_observable"] is False
+    assert any("异常留痕" in b for b in li_bad["blind_spots"]), li_bad["blind_spots"]
+    html_bad = render_ops._render_loop_integrity(li_bad)
+    assert "均未发生" not in html_bad, "埋点未部署却宣称无异常 = 假信号"
+    assert "不可观测" in html_bad
+    assert 'class="n hot"' in html_bad, "不可观测必须是告警色，不能是绿"
+
+
+def test_events_card_shows_dash_when_not_observable():
+    """KPI 卡：不可观测时显示「—」+ hot，不显示「0 起」（0 会被读成正常）。"""
+    recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
+    html = render_ops._render_loop_integrity(
+        ops_parse.build_loop_integrity(recs, repo_dir=None))
+    vals = _kpi_values(html)
+
+    assert vals["异常留痕"] == "—"
+    assert "埋点未部署，不可观测" in html
+
+
+def _write_instrumented_repo(base: Path) -> Path:
+    """在 base 下建一个含 _audit_event 埋点的假仓库，返回仓库根。
+
+    用 tmp_path 而非 tempfile.mkdtemp：后者会泄漏目录且不受 pytest 清理管理。
+    """
+    (base / "scripts" / "blue_green").mkdir(parents=True, exist_ok=True)
+    (base / "scripts/blue_green/deploy_pipeline.sh").write_text(
+        "_audit_event() { :; }\n", encoding="utf-8")
+    return base
 
 
 def test_pipeline_event_does_not_create_ghost_deploy_event():
@@ -532,10 +642,16 @@ def test_parse_audit_extracts_session_from_both_forms():
     assert by_pr_script[(110, "pipeline-event")]["kind"] == "worktree-drift"
 
 
-def test_loop_integrity_renders_kpis_and_detail_rows():
-    """渲染层：四张 KPI 卡 + 明细行都要出现，盲区行必须在场。"""
+def test_loop_integrity_renders_kpis_and_detail_rows(tmp_path):
+    """渲染层：四张 KPI 卡 + 明细行都要出现，盲区行必须在场。
+
+    用「埋点已部署」的仓库，使盲区回到基线的 1 处（回滚），
+    异常事件也能正常渲染成人话。
+    """
+    repo = _write_instrumented_repo(tmp_path)
     recs = ops_parse.parse_audit_text(LOOP_AUDIT_SAMPLE)
-    html = render_ops._render_loop_integrity(ops_parse.build_loop_integrity(recs))
+    html = render_ops._render_loop_integrity(
+        ops_parse.build_loop_integrity(recs, repo_dir=repo))
 
     assert 'id="loop"' in html
     assert "闭环完整性" in html
@@ -544,6 +660,7 @@ def test_loop_integrity_renders_kpis_and_detail_rows():
         assert label in vals, f"缺 KPI 卡：{label}"
     assert vals["人工接管"] == "2 次"
     assert vals["数据盲区"] == "1 处"
+    assert vals["异常留痕"] == "2 起"  # 埋点在 → 事件数真实可观测
     # 明细：异常事件用中文人话，未标注与盲区都要露出来
     assert "工作树漂移" in html
     assert "观察窗被压缩" in html

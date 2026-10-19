@@ -484,6 +484,9 @@ def _render_loop_integrity(li: dict) -> str:
     manual_sessions = li.get("manual_sessions") or []
     manual_prs = li.get("manual_prs") or []
     blind = li.get("blind_spots") or []
+    # fail-closed：缺这个键就当作「不可观测」。没有证据时断言「无异常」
+    # 正是本次要修的假信号（#118 合并时埋点还在 #116 未部署）。
+    events_observable = bool(li.get("events_observable"))
 
     def card(value: str, unit: str, label: str, sub: str, cls: str = "") -> str:
         unit_html = f"<small> {unit}</small>" if unit else ""
@@ -503,21 +506,34 @@ def _render_loop_integrity(li: dict) -> str:
     c_manual = card(str(manual), "次", "人工接管",
                     f"涉及 PR {', '.join('#' + str(p) for p in manual_prs[:5]) or '—'}",
                     "bad" if manual else "")
-    c_event = card(str(sum(events.values())), "起", "异常留痕",
-                   f"{len(events)} 类" if events else "无异常事件")
+    n_events = sum(events.values())
+    if events_observable:
+        c_event = card(str(n_events), "起", "异常留痕",
+                       f"{len(events)} 类" if events else "无异常事件")
+    else:
+        # 埋点没部署 → 0 是「没人在记」，不是「没发生」。显示「—」而非 0，
+        # 否则一个坏掉的采集会看起来像一切正常。
+        c_event = card("—", "", "异常留痕", "埋点未部署，不可观测", "hot")
     c_blind = card(str(len(blind)), "处", "数据盲区",
                    "下列指标不可观测", "hot" if blind else "")
 
     rows: list[str] = []
-    # 异常事件明细（有则列，无则明确说「无」——不说「无」会让人以为没采到）
+    # 异常事件明细：三态。有事件→列出；埋点在且为 0→才能说「均未发生」；
+    # 埋点不在→必须说清「0 不代表没发生」，绝不渲染成绿色 OK。
     if events:
         detail = "、".join(
             f"{EVENT_KIND_LABELS.get(k, k)} × {v}"
             for k, v in sorted(events.items(), key=lambda kv: -kv[1])
         )
         rows.append(f'<li><span>异常事件明细</span><span class="n hot">{_esc(detail)}</span></li>')
-    else:
+    elif events_observable:
         rows.append('<li><span>异常事件明细</span><span class="n ok">无（漂移 / 压缩观察窗 / 跳过验证 / 钩子失败均未发生）</span></li>')
+    else:
+        rows.append(
+            '<li><span>异常事件明细</span><span class="n hot">'
+            '不可观测 —— 埋点未部署，「0 起」不代表没发生'
+            '（已部署的 deploy_pipeline.sh 缺 _audit_event）</span></li>'
+        )
     if unlabeled:
         rows.append(
             f'<li><span>未标注会话</span><span class="n hot">{unlabeled} 条 —— 早期无 session 机制，不计入自动率分母</span></li>'
