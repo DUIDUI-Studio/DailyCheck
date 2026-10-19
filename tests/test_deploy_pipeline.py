@@ -401,3 +401,245 @@ def test_observe_rollback_log_does_not_clobber_main_log(sandbox):
     assert "args=blue 100" in rb_log.read_text(encoding="utf-8")
     assert "回滚" not in main_log, "主日志仍被子进程回滚输出污染"
 
+
+# ================================================================ F1 漂移守卫
+# 2026-10-18 复盘 #110：verify 跑的 10 分钟里另一会话合了 PR 并 git pull，
+# 工作树被换 → check1 pytest 读到混合态（进程 import 旧模块 + 模板读新文件）
+# → 195 failed + BuildError，且**原因无从判断**。守卫把这种「神秘红」变成
+# 「工作树在 verify 中被改动」这条明确归因，并阻止拿不可信结果继续上线。
+#
+# 普通 sandbox 的 REPO_ROOT 不是 git 仓库 → `rev-parse` 失败 → 两侧都 unknown
+# → 守卫跳过（向后兼容，dev/离线沙盒不误伤）。要测守卫必须让 REPO_ROOT 是真仓库。
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, f"git {args} 失败: {proc.stderr}"
+    return proc.stdout.strip()
+
+
+@pytest.fixture()
+def repo_sandbox(tmp_path: Path):
+    """REPO_ROOT 本身是真 git 仓库的沙盒（F1 漂移守卫 / F4 venv 选择需要）。
+
+    ⚠️ 目录层级不能随手改：deploy_pipeline.sh 的 `REPO_ROOT="${SCRIPT_DIR}/../.."`，
+    故脚本必须放在 `<repo>/scripts/blue_green/` 下，REPO_ROOT 才等于 `<repo>`。
+    用普通 sandbox 时 REPO_ROOT 会算到 tmp_path 的**父目录**（pytest basetemp 根），
+    既不是仓库、又被多个测试共享 —— 在那儿 init 会互相干扰。
+    """
+    repo = tmp_path / "repo"
+    bg = repo / "scripts" / "blue_green"
+    bg.mkdir(parents=True)
+    for name in ("deploy_state.py", "deploy_pipeline.sh"):
+        shutil.copy2(BG_DIR / name, bg / name)
+        (bg / name).chmod(0o755)
+    calls = tmp_path / "calls.txt"
+    for name, rc in (("up.sh", 0), ("verify.sh", 0), ("promote.sh", 0), ("switch.sh", 0)):
+        _write_fake(bg / name, name, calls, rc)
+    state = tmp_path / "state"
+    state.mkdir()
+
+    _git(["init", "-q"], repo)
+    _git(["config", "user.email", "deploy-test@example.com"], repo)
+    _git(["config", "user.name", "deploy-test"], repo)
+    (repo / "SEED").write_text("seed\n", encoding="utf-8")
+    _git(["add", "SEED"], repo)
+    _git(["commit", "-q", "-m", "seed"], repo)
+
+    return {
+        "dir": bg, "calls": calls, "state": state, "tmp": tmp_path,
+        "repo": repo, "git_head": _git(["rev-parse", "HEAD"], repo),
+    }
+
+
+def _write_drifting_verify(sb: dict) -> None:
+    """假 verify.sh：执行时在 REPO_ROOT 提交一次 —— 模拟并发 git pull 换树。"""
+    p = sb["dir"] / "verify.sh"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "verify.sh $*" >> "{sb["calls"]}"\n'
+        f'git -C "{sb["repo"]}" commit -q --allow-empty -m "concurrent pull"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    p.chmod(0o755)
+
+
+def _audit(sb: dict) -> str:
+    p = sb["state"] / "audit.log"
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def test_worktree_drift_during_verify_fails_fast_with_audit(repo_sandbox):
+    """核心判据：verify 期间 HEAD 变了 → exit 21 + 明确归因 + audit 事件。"""
+    sb = repo_sandbox
+    _write_drifting_verify(sb)
+
+    proc = _pipe(sb, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 21, proc.stdout + proc.stderr
+    assert "工作树在 verify 期间被改动" in proc.stdout, proc.stdout
+    assert "kind=worktree-drift" in _audit(sb), _audit(sb)
+
+
+def test_worktree_drift_blocks_promote_and_switch(repo_sandbox):
+    """漂移后绝不许继续 promote/switch —— 拿不可信的验证结果上线就是事故。"""
+    sb = repo_sandbox
+    _write_drifting_verify(sb)
+
+    _pipe(sb, "42", SHA, "--observe-min", "0")
+
+    calls = _calls(sb)
+    assert any(c.startswith("verify.sh") for c in calls), calls
+    assert not any(c.startswith("promote.sh") for c in calls), f"漂移后仍 promote: {calls}"
+    assert not any(c.startswith("switch.sh") for c in calls), f"漂移后仍 switch: {calls}"
+
+
+def test_worktree_drift_still_releases_lock(repo_sandbox):
+    """漂移退出也必须收锁 —— 否则锁悬空，下一轮部署被自己的死锁挡住。"""
+    sb = repo_sandbox
+    _write_drifting_verify(sb)
+
+    _pipe(sb, "42", SHA, "--observe-min", "0")
+
+    assert _state(sb)["lock"] is None, "漂移退出后锁未释放"
+
+
+def test_no_drift_passes_when_head_stable(repo_sandbox):
+    """反向：真仓库但 HEAD 不动 → 正常全链通过，守卫不误伤。"""
+    proc = _pipe(repo_sandbox, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "工作树在 verify 期间被改动" not in proc.stdout
+    assert "worktree-drift" not in _audit(repo_sandbox)
+
+
+def test_verify_failure_without_drift_not_misattributed(repo_sandbox):
+    """反向：verify 真失败但 HEAD 没动 → 归因必须是「verify 失败」，不是漂移。
+
+    防「什么都赖漂移」：错误归因和没有归因一样坏（会把人引向查 git 而不是查代码）。
+    """
+    sb = repo_sandbox
+    _write_fake(sb["dir"] / "verify.sh", "verify.sh", sb["calls"], 1)
+
+    proc = _pipe(sb, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 21
+    assert "verify 失败" in proc.stdout, proc.stdout
+    assert "工作树在 verify 期间被改动" not in proc.stdout
+    assert "worktree-drift" not in _audit(sb), _audit(sb)
+
+
+def test_drift_guard_skipped_when_not_a_git_repo(sandbox):
+    """向后兼容：REPO_ROOT 不是 git 仓库（dev 沙盒 / 离线）→ 守卫跳过不阻断。"""
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "worktree-drift" not in _audit(sandbox)
+
+
+# ================================================================ F5 观察窗留痕
+# 机制要求观察窗 ≥30min，#111 实测压到 10min 却**无任何留痕**。压缩本身不该
+# 阻断（人工应急确实需要），但必须从「没人知道」变成 Dashboard 可见。
+
+
+def test_observe_window_shortened_records_audit(sandbox):
+    """压缩观察窗必须留痕。
+
+    ⚠️ 必须注入 fake curl/journalctl（_observe_tools）：--observe-min 10 会真进
+    观察窗探测 127.0.0.1:8080，本机 dev 容器返回 302 能过、CI 上无监听得 000
+    → 触发回滚 exit 24（2026-10-18 CI 实 hit：本地全绿、CI 判红）。测试要脱真流量。
+    """
+    extra, _ = _observe_tools(sandbox, blocked_lines=0, code="302")
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "10", **extra)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    audit = _audit(sandbox)
+    assert "kind=observe-window-shortened" in audit, audit
+    assert "observe=10min" in audit, audit
+
+
+def test_observe_window_skipped_entirely_records_audit(sandbox):
+    """--observe-min 0（完全跳过）比压缩更值得留痕。"""
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "kind=observe-window-shortened" in _audit(sandbox)
+
+
+def test_observe_window_at_required_records_no_shortened_audit(sandbox):
+    """反向：达到机制要求 30min → 不记压缩事件（否则告警天天响＝没告警）。
+
+    沙盒里 TICK_SEC=1，30min 折算 6 轮 ×1s，可接受。
+    """
+    extra, _ = _observe_tools(sandbox, blocked_lines=0, code="302")
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "30", **extra)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "observe-window-shortened" not in _audit(sandbox)
+
+
+def test_skip_verify_records_audit(sandbox):
+    """--skip-verify 是最危险的应急开关，必须留痕。"""
+    proc = _pipe(sandbox, "42", SHA, "--skip-verify", "--observe-min", "0")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "kind=skip-verify" in _audit(sandbox)
+
+
+# ================================================================ F4 venv + 钩子留痕
+# 根因：VPS 系统 python3 的 dist-packages/scripts 是常规包，import 优先级高于
+# 仓库 namespace 包 scripts/ → `-m scripts.dailycheck_dashboard` 必报 No module
+# → 仪表盘钩子长期静默失败，只 WARN 到日志、靠 15min timer 兜底掩盖。
+
+
+def test_py_prefers_repo_venv_python(repo_sandbox):
+    """REPO_ROOT/.venv/bin/python 存在时必须用它，而非裸 python3。"""
+    sb = repo_sandbox
+    venv_bin = sb["repo"] / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    marker = sb["tmp"] / "venv-python-used.txt"
+    fake = venv_bin / "python"
+    # 记录调用后转发给真 python —— 既证明被选中，又让 deploy_state.py 真能跑
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{marker}"\n'
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    proc = _pipe(sb, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert marker.exists(), "venv python 未被使用（PY 仍解析成裸 python3）"
+    assert "deploy_state.py" in marker.read_text(encoding="utf-8")
+
+
+def test_python_env_override_wins_over_venv(repo_sandbox):
+    """优先级 PYTHON > 仓库 venv > python3：显式覆盖必须生效。"""
+    sb = repo_sandbox
+    venv_bin = sb["repo"] / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    broken = venv_bin / "python"
+    broken.write_text("#!/usr/bin/env bash\nexit 9\n", encoding="utf-8")
+    broken.chmod(0o755)
+
+    # venv 里是必坏的假 python；PYTHON 指向真 python → 应走 PYTHON 而非 venv
+    proc = _pipe(sb, "42", SHA, "--observe-min", "0", PYTHON=sys.executable)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_dashboard_hook_failure_records_audit(sandbox):
+    """钩子失败必须留痕 —— 此前只 WARN，被 timer 兜底掩盖成「看起来没事」。
+
+    沙盒 REPO_ROOT 无 scripts/dailycheck_dashboard → render 必失败，正好验证。
+    """
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0")
+
+    assert proc.returncode == 0, "钩子失败不得影响部署结果"
+    assert "kind=dashboard-hook-failed" in _audit(sandbox), _audit(sandbox)
+
