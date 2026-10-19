@@ -60,6 +60,12 @@
       {% if is_admin or is_storefront %}
       <a href="{{ url_for('store_ordering.store_orders_list') }}">我的订单</a>
       {% endif %}
+      {# Issue #122：admin / DC 都能审批订单（DC staff+manager；admin 全权），
+         此前导航组里只有 admin 的子项，没有 DC 的审批入口；DC 用户只能靠通知链接进
+         审批页。本条补全「订货审批」导航入口。 #}
+      {% if is_admin or is_distribution_center %}
+      <a href="{{ url_for('store_ordering.review_list') }}">订货审批</a>
+      {% endif %}
       {% if (is_admin or is_distribution_center) and (is_admin or (g.role and g.role['role'] in ('manager', 'admin'))) %}
       <a href="{{ url_for('store_ordering.manage_dc_items') }}">品项管理</a>
       {% endif %}

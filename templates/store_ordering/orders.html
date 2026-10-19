@@ -75,8 +75,8 @@
     <tr>
       <td>{{ o.order_no }}</td>
       <td><span class="status-pill {{ o.status }}">{{ status_labels[o.status] or o.status }}</span></td>
-      <td>{{ o.store_warehouse_code }}</td>
-      <td>{{ o.dc_warehouse_code }}</td>
+      <td>{{ fmt_warehouse(o.store_warehouse_name, o.store_warehouse_code) }}</td>
+      <td>{{ fmt_warehouse(o.dc_warehouse_name, o.dc_warehouse_code) }}</td>
       <td>{{ o.created_at }}</td>
       <td>{{ o.expected_delivery_date or '—' }}</td>
       <td><a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=o.id) }}">详情</a></td>

@@ -945,8 +945,6 @@ def test_cancel_order_approved_allowed(ordering_env):
 def test_cancel_order_shipped_rejected(ordering_env):
     """已发货后不可取消（状态机限制）。"""
     conn, order_id = _make_approved_order(ordering_env, qty=5.0)
-    order = sop.get_order_detail(conn, order_id)
-    item_id = int(order["order_items"][0]["id"])
     sop.ship_order_full(conn, order_id, shipped_by=4)
 
     try:
@@ -1197,7 +1195,6 @@ def test_get_dc_items_for_order_detail(ordering_env):
 
 def _seed_outbound(store_path, item_id, qty, days_ago, ts):
     """在门店仓插入一条 outbound_requests（模拟历史消耗）。"""
-    import os
     from datetime import timedelta
     conn = sqlite3.connect(str(store_path))
     ts_old = (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1468,7 +1465,6 @@ def test_compute_store_order_report_filter_by_category(ordering_env):
 
 def test_compute_shipping_fee_basic(ordering_env):
     """B1: fee = base_fee + subtotal × pct_fee."""
-    conn = ordering_env["master_conn"]
     rule = {"base_fee": 5.0, "pct_fee": 0.01}
     assert sop.compute_shipping_fee(100.0, rule) == 6.0  # 5 + 100×0.01
 
@@ -1478,14 +1474,12 @@ def test_compute_shipping_fee_basic(ordering_env):
 
 def test_compute_shipping_fee_zero_subtotal(ordering_env):
     """B2: subtotal=0 时仍收 base_fee。"""
-    conn = ordering_env["master_conn"]
     rule = {"base_fee": 5.0, "pct_fee": 0.01}
     assert sop.compute_shipping_fee(0.0, rule) == 5.0
 
 
 def test_compute_shipping_fee_quantizes_2dp(ordering_env):
     """B3: 浮点精度 — 2dp 量化。"""
-    conn = ordering_env["master_conn"]
     rule = {"base_fee": 1.0, "pct_fee": 0.005}  # 0.005 = 0.5%
     # 33.33 × 0.005 = 0.16665 → 量化 0.17
     fee = sop.compute_shipping_fee(33.33, rule)
@@ -1625,7 +1619,6 @@ def test_list_available_dc_items_filters_unorderable(ordering_env):
 def test_set_dc_item_orderable_toggle(ordering_env):
     """A3: set_dc_item_orderable 切换后，catalog 列表反映新状态。"""
     conn = ordering_env["master_conn"]
-    dc_path = ordering_env["dc_path"]
 
     # 先关闭
     sop.set_dc_item_orderable(conn, "dc_test", 101, False)
@@ -1749,3 +1742,66 @@ def test_submit_blocked_by_unorderable_item(ordering_env):
     unorderable = sop.list_unorderable_cart_canonicals(conn, "dc_test", cart_canonicals)
     assert len(unorderable) == 1
     assert int(unorderable[0]["canonical_id"]) == 101
+
+
+# ---------------------------------------------------------------------------
+# Issue #122（2026-10-19）—— 订货单页面显示仓库中文名 + 导航审批入口
+#
+# 用户反馈：订货单管理页面看不到门店名字（只显示仓库代码如 wh_003）；
+# admin 判定：管理页面应包含门店名字 + 检查审批入口。
+# 修复口径：list_orders / get_order_detail JOIN warehouses 返回中文名；
+# 模板通过 fmt_warehouse(name, code) filter 显示 "name (code)"；
+# base.html 导航「门店订货」组补 "订货审批" 入口给 DC 用户。
+# ---------------------------------------------------------------------------
+
+
+def _submit_one_order(ordering_env):
+    """提一笔 pending 订单，dc_test -> store_test，方便后续断言。"""
+    conn = ordering_env["master_conn"]
+    cart = sop.get_or_create_cart(
+        conn, user_id=2, store_warehouse_code="store_test",
+        dc_warehouse_code="dc_test",
+    )
+    sop.add_cart_item(conn, cart["id"], 101, 3.0, "件")
+    return sop.submit_order(conn, cart["id"], requested_by=2,
+                            expected_delivery_date=None, note="")
+
+
+class TestIssue122WarehouseNames:
+    """Issue #122：list_orders / get_order_detail 返回仓库中文名。"""
+
+    def test_list_orders_returns_warehouse_names(self, ordering_env):
+        _submit_one_order(ordering_env)
+        conn = ordering_env["master_conn"]
+        rows = sop.list_orders(conn)
+        assert len(rows) >= 1
+        row = rows[0]
+        # warehouses 表里有「测试门店」「测试配送中心」（见 ordering_env fixture）。
+        assert row["store_warehouse_name"] == "测试门店"
+        assert row["dc_warehouse_name"] == "测试配送中心"
+        # code 仍保留（模板 fallback 用）。
+        assert row["store_warehouse_code"] == "store_test"
+        assert row["dc_warehouse_code"] == "dc_test"
+
+    def test_get_order_detail_returns_warehouse_names(self, ordering_env):
+        order = _submit_one_order(ordering_env)
+        conn = ordering_env["master_conn"]
+        detail = sop.get_order_detail(conn, order["id"])
+        assert detail is not None
+        assert detail["store_warehouse_name"] == "测试门店"
+        assert detail["dc_warehouse_name"] == "测试配送中心"
+
+    def test_list_orders_when_warehouse_row_missing(self, ordering_env):
+        """守门员：万一 master 里某 warehouse 记录被人工删（仅留 store_orders 引用），
+        JOIN 后 name 字段 = None，code 不受影响，模板端 fmt_warehouse 会降级到 code。"""
+        order = _submit_one_order(ordering_env)
+        conn = ordering_env["master_conn"]
+        # 删除 store_test 的 warehouse 记录
+        conn.execute("DELETE FROM warehouses WHERE code = 'store_test'")
+        conn.commit()
+        rows = sop.list_orders(conn)
+        assert len(rows) >= 1
+        row = next(r for r in rows if r["id"] == order["id"])
+        assert row["store_warehouse_code"] == "store_test"
+        assert row["store_warehouse_name"] is None  # LEFT JOIN → None
+        assert row["dc_warehouse_name"] == "测试配送中心"  # 未受影响

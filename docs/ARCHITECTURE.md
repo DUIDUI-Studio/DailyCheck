@@ -1312,6 +1312,12 @@ stateDiagram-v2
 3. **改数量**（`update_cart_item_quantity`）：同源校验，路由 catch `ValueError` 后 flash；
 4. **提交**（`validate_cart_for_submit` → `multiples` 列表 + `submit_order` 二次校验）：把「之前合法、后来倍数被调大」的存量购物车挡在订单外，模板禁用「发送」按钮。
 
+**门店订货「中文名 + 审批入口」（Issue #122，2026-10-19）**：
+- 订货单系列页面（`/store-ordering/review`、`/store-ordering/orders`、`/store-ordering/orders/<id>`）的「门店」「配送中心」列显示 `name (code)` 形式（`fmt_warehouse(name, code)` filter，定义在 `blueprints/_helpers.py`；name 缺失或与 code 等同时降级为 code），便于审批人识别门店。SQL 在 `blueprints/store_ordering_pure.list_orders` / `get_order_detail` 里 `LEFT JOIN warehouses ws/wd` 取 name。
+- 桌面侧栏 `templates/base.html` 与移动端全模块页 `templates/land.html` 的「门店订货」模块组新增「订货审批」子项（条件 `is_admin or is_distribution_center`），让 DC 用户不必绕通知链接即可进审批页（修复前 DC 用户的导航组里只有 admin 子项，DC 用户找不到入口）。
+- 「fmt_warehouse 注册方式」铁律：注册走 `app.jinja_env.globals["fmt_warehouse"] = fmt_warehouse`（**非 filters**），因为模板端是双参函数调用 `{{ fmt_warehouse(a, b) }}` 而非 filter pipe 形式 `{{ a | fmt_warehouse }}`；filter pipe 在双参情形下会被 Jinja 解析为「未知 filter」报 `UndefinedError`。
+- 测试：`tests/test_jinja_helpers.py::TestFmtWarehouse`（5 个 case 覆盖 None / 空串 / name==code / code 缺失）；`tests/test_store_ordering_pure.py::TestIssue122WarehouseNames`（3 个 case 验证 list_orders / get_order_detail 返回 name + LEFT JOIN 守门员）；`tests/test_issue_122_nav.py::TestNavHasReviewEntry`（6 个 parametrized case 验证侧栏 + /land 链接集对 DC / admin / storefront 各角色正确显隐「订货审批」）。
+
 `is_multiple_of` 用**相对容差**（`abs(qty − round(qty/step)·step) ≤ max(1e-9, step·1e-9)`）判定，不用 `%`——浮点二进制误差会让 `0.3 / 0.1` 判成 False。`normalize_order_multiple` 把脏值（None/非数字/≤0）一律回落成 1，避免配置错误把某个品项永久锁死。
 
 ### 10.4 Canonical 扇出流程
