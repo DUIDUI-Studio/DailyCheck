@@ -100,6 +100,7 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
   - `pytest` 测试通过、`ruff check .` 无错
   - **触及架构子系统时同步更新 `docs/ARCHITECTURE.md`**（门禁：`scripts/git-hooks/pre-commit` 自动检测）
 - 不要提交运行时文件：`.venv/`（含 `mcp_server/.venv/`）、`*.db`、`*.log`、截图、Playwright 调试文件（已在 `.gitignore` 覆盖）
+- **收尾汇报必须给 PR 终态**（Eric 硬要求，2026-10-19）：明确写出 ① PR 号 + 是否已合并；② 对应 issue 是否已关闭；③ CI / 部署是否成功（未完成要说卡在哪一步、何时有结论）。
 
 ## 后续优化建议
 - 增加审计日志与操作人追踪

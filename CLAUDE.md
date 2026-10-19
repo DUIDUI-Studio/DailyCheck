@@ -11,6 +11,7 @@
 - **push 已放开**（2026-10-15）：普通 push 不需 Eric 事先确认（hook 恒 exit 1，用 `git push --no-verify` 是既定姿势）；`--force`/删远程分支/改保护规则仍需确认。
 - **提 PR 必含三段**（`check_reports.py` 门禁强制）：`## 报告 1/4`（R 表 ❌ 待填全消解）+ `## Checklist` + `## 生产侧事项`（只写规范流程粒度，不写操作脚本）；body 全文禁字面「❌」字符。
 - **红线**（须 Eric 拍板）：扩张 `tests/known_failures.txt`、改 CI workflow、改分支保护、删 ARCHITECTURE 铁律、改 workflow.md 自身。
+- **汇报必须给 PR 终态**（Eric 硬要求，2026-10-19）：任务收尾回复**必须显式写清三件事** —— ① PR 是否已合并（给出 PR 号 + merged/仍 open）；② 对应 issue 是否已关闭；③ CI 与部署是否成功（未部署/部署中要说明卡在哪一步、何时有结论）。禁止「已交付，等 CI」这类看不出终态的表述。
 
 ## 技术栈
 - **后端**: Flask 3.1.1 + Python 3.10+
