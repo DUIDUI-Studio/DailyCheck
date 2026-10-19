@@ -19,8 +19,8 @@
 {# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
 <div class="info-card">
   <div class="info-card-grid">
-    <div><strong>门店：</strong>{{ order.store_warehouse_code }}</div>
-    <div><strong>配送中心：</strong>{{ order.dc_warehouse_code }}</div>
+    <div><strong>门店：</strong>{{ fmt_warehouse(order.store_warehouse_name, order.store_warehouse_code) }}</div>
+    <div><strong>配送中心：</strong>{{ fmt_warehouse(order.dc_warehouse_name, order.dc_warehouse_code) }}</div>
     <div><strong>下单人：</strong>{{ order.requested_by_username or order.requested_by }}</div>
     <div><strong>创建时间：</strong>{{ order.created_at }}</div>
     <div><strong>期望到货：</strong>{{ order.expected_delivery_date or '—' }}</div>

@@ -1414,11 +1414,15 @@ def list_orders(
         f"""SELECT so.*,
                    req.username AS requested_by_username,
                    appr.username AS approved_by_username,
-                   ship.username AS shipped_by_username
+                   ship.username AS shipped_by_username,
+                   ws.name AS store_warehouse_name,
+                   wd.name AS dc_warehouse_name
             FROM store_orders so
             LEFT JOIN users req ON req.id = so.requested_by
             LEFT JOIN users appr ON appr.id = so.approved_by
             LEFT JOIN users ship ON ship.id = so.shipped_by
+            LEFT JOIN warehouses ws ON ws.code = so.store_warehouse_code
+            LEFT JOIN warehouses wd ON wd.code = so.dc_warehouse_code
             {where}
             ORDER BY so.created_at DESC, so.id DESC
             LIMIT ? OFFSET ?""",
@@ -1450,12 +1454,16 @@ def get_order_detail(
                   req.username AS requested_by_username,
                   appr.username AS approved_by_username,
                   ship.username AS shipped_by_username,
-                  cancel.username AS cancelled_by_username
+                  cancel.username AS cancelled_by_username,
+                  ws.name AS store_warehouse_name,
+                  wd.name AS dc_warehouse_name
            FROM store_orders so
            LEFT JOIN users req ON req.id = so.requested_by
            LEFT JOIN users appr ON appr.id = so.approved_by
            LEFT JOIN users ship ON ship.id = so.shipped_by
            LEFT JOIN users cancel ON cancel.id = so.cancelled_by
+           LEFT JOIN warehouses ws ON ws.code = so.store_warehouse_code
+           LEFT JOIN warehouses wd ON wd.code = so.dc_warehouse_code
            WHERE so.id=?""",
         (order_id,),
     ).fetchone()

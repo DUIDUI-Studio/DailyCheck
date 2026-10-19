@@ -31,7 +31,7 @@
     {% for o in pending_orders %}
     <tr>
       <td>{{ o.order_no }}</td>
-      <td>{{ o.store_warehouse_code }}</td>
+      <td>{{ fmt_warehouse(o.store_warehouse_name, o.store_warehouse_code) }}</td>
       <td>{{ o.created_at }}</td>
       <td>{{ o.expected_delivery_date or '—' }}</td>
       <td>{{ o.note or '—' }}</td>
@@ -63,7 +63,7 @@
     {% for o in approved_orders %}
     <tr>
       <td>{{ o.order_no }}</td>
-      <td>{{ o.store_warehouse_code }}</td>
+      <td>{{ fmt_warehouse(o.store_warehouse_name, o.store_warehouse_code) }}</td>
       <td>{{ o.approved_at or '—' }}</td>
       <td>{{ o.expected_delivery_date or '—' }}</td>
       <td>

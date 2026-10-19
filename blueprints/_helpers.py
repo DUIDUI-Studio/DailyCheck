@@ -179,6 +179,25 @@ def register_jinja_filters(app) -> None:
     """Expose fmt_qty and fmt_money to Jinja templates."""
     app.jinja_env.filters["fmt_qty"] = fmt_qty
     app.jinja_env.filters["fmt_money"] = fmt_money
+    # Issue #122：订货单页面仓库显示 "name (code)"，便于审批人识别门店。
+    # 注意：注册走 globals 而非 filters——因为 fmt_warehouse 是双参数函数，模板
+    # 端用 `{{ fmt_warehouse(a, b) }}` 直接调用。Jinja filter pipe 形式
+    # `{{ a | fmt_warehouse(b) }}` 在某些 Flask 版本下需 filter 单参数 + pipe 形式
+    # 才生效；双参函数更直接走 globals 通道，避免 `UndefinedError` 误报。
+    app.jinja_env.globals["fmt_warehouse"] = fmt_warehouse
+
+
+def fmt_warehouse(name: str | None, code: str | None) -> str:
+    """Issue #122：仓库显示 "name (code)"，name 缺失或与 code 等同时降级为 code。
+
+    模板里直接 `{{ fmt_warehouse(order.store_warehouse_name, order.store_warehouse_code) }}`
+    即可。空 code 返空字符串（防御）。
+    """
+    if not code:
+        return ""
+    if not name or name == code:
+        return code
+    return f"{name} ({code})"
 
 
 def wants_ajax() -> bool:
