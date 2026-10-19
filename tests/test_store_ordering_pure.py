@@ -945,8 +945,6 @@ def test_cancel_order_approved_allowed(ordering_env):
 def test_cancel_order_shipped_rejected(ordering_env):
     """已发货后不可取消（状态机限制）。"""
     conn, order_id = _make_approved_order(ordering_env, qty=5.0)
-    order = sop.get_order_detail(conn, order_id)
-    item_id = int(order["order_items"][0]["id"])
     sop.ship_order_full(conn, order_id, shipped_by=4)
 
     try:
@@ -1197,7 +1195,6 @@ def test_get_dc_items_for_order_detail(ordering_env):
 
 def _seed_outbound(store_path, item_id, qty, days_ago, ts):
     """在门店仓插入一条 outbound_requests（模拟历史消耗）。"""
-    import os
     from datetime import timedelta
     conn = sqlite3.connect(str(store_path))
     ts_old = (datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
@@ -1468,7 +1465,6 @@ def test_compute_store_order_report_filter_by_category(ordering_env):
 
 def test_compute_shipping_fee_basic(ordering_env):
     """B1: fee = base_fee + subtotal × pct_fee."""
-    conn = ordering_env["master_conn"]
     rule = {"base_fee": 5.0, "pct_fee": 0.01}
     assert sop.compute_shipping_fee(100.0, rule) == 6.0  # 5 + 100×0.01
 
@@ -1478,14 +1474,12 @@ def test_compute_shipping_fee_basic(ordering_env):
 
 def test_compute_shipping_fee_zero_subtotal(ordering_env):
     """B2: subtotal=0 时仍收 base_fee。"""
-    conn = ordering_env["master_conn"]
     rule = {"base_fee": 5.0, "pct_fee": 0.01}
     assert sop.compute_shipping_fee(0.0, rule) == 5.0
 
 
 def test_compute_shipping_fee_quantizes_2dp(ordering_env):
     """B3: 浮点精度 — 2dp 量化。"""
-    conn = ordering_env["master_conn"]
     rule = {"base_fee": 1.0, "pct_fee": 0.005}  # 0.005 = 0.5%
     # 33.33 × 0.005 = 0.16665 → 量化 0.17
     fee = sop.compute_shipping_fee(33.33, rule)
@@ -1625,7 +1619,6 @@ def test_list_available_dc_items_filters_unorderable(ordering_env):
 def test_set_dc_item_orderable_toggle(ordering_env):
     """A3: set_dc_item_orderable 切换后，catalog 列表反映新状态。"""
     conn = ordering_env["master_conn"]
-    dc_path = ordering_env["dc_path"]
 
     # 先关闭
     sop.set_dc_item_orderable(conn, "dc_test", 101, False)
