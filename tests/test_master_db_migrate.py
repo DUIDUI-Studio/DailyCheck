@@ -359,13 +359,13 @@ def test_rbac_tables_created_on_empty_db(tmp_path, monkeypatch):
 
 
 def test_rbac_seed_row_counts(tmp_path, monkeypatch):
-    """播种：permissions==25；内置 roles==5；各包权限数精确等于契约。"""
+    """播种：permissions==26；内置 roles==5；各包权限数精确等于契约。"""
     import sqlite3
 
     from permissions_manifest import BUILTIN_PACKAGE_SIZES
     master = _init_empty(tmp_path, monkeypatch)
     conn = sqlite3.connect(master)
-    assert conn.execute("SELECT COUNT(*) FROM permissions").fetchone()[0] == 25
+    assert conn.execute("SELECT COUNT(*) FROM permissions").fetchone()[0] == 26
     assert conn.execute(
         "SELECT COUNT(*) FROM roles WHERE is_builtin=1").fetchone()[0] == 5
     sizes = {r[0]: r[1] for r in conn.execute(
@@ -391,7 +391,7 @@ def test_rbac_seed_idempotent(tmp_path, monkeypatch):
     rp = conn.execute("SELECT COUNT(*) FROM role_permissions").fetchone()[0]
     roles = conn.execute("SELECT COUNT(*) FROM roles WHERE is_builtin=1").fetchone()[0]
     conn.close()
-    assert perms == 25 and roles == 5 and rp == 52, (perms, roles, rp)
+    assert perms == 26 and roles == 5 and rp == 54, (perms, roles, rp)
 
 
 def test_agent_tokens_permission_codes_json_column_added(tmp_path, monkeypatch):

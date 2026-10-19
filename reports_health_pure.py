@@ -55,9 +55,9 @@ BOM_OVERUSE_PCT = 10      # BOM 超耗预警阈值（%）
 # stock_movements.action 语义分组（以生产实际数据为准，2026-10-15 全 6 仓核对）
 # ---------------------------------------------------------------------------
 # 正向入库事件：压新层（date=created_at, qty=delta）
-INBOUND_ACTIONS = frozenset({"补货入库", "门店订货入库"})
+INBOUND_ACTIONS = frozenset({"补货入库", "门店订货入库", "总仓调货入库"})
 # 消耗事件（负 delta）：SKU 级日均消耗 / 最后出库日均统计这两类
-CONSUME_ACTIONS = frozenset({"出库", "调整出库", "门店订货出库", "生产消耗"})
+CONSUME_ACTIONS = frozenset({"出库", "调整出库", "门店订货出库", "总仓调货出库", "生产消耗"})
 # 其余全部按「调整」处理：running += delta 后按比例缩放所有层对齐 running
 # （盘点修正/库存调整为强设数量型事件，无法定位动的是哪批货，按比例缩放；
 #   各类回退（出库回退/生产消耗回退/补货删除回滚负向消层）同样走通用分支）
@@ -212,8 +212,9 @@ def compute_stale_and_dos(db, now: datetime) -> dict:
     consume_qty: dict[int, float] = {}
     recent_consume: dict[int, bool] = {}
     for r in db.execute(
-        """SELECT item_id, delta, created_at FROM stock_movements
-           WHERE action IN (?, ?, ?, ?) AND created_at >= ?""",
+        f"""SELECT item_id, delta, created_at FROM stock_movements
+            WHERE action IN ({','.join('?' * len(CONSUME_ACTIONS))})
+              AND created_at >= ?""",
         (*sorted(CONSUME_ACTIONS), d_start.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchall():
         qty = -float(r["delta"])

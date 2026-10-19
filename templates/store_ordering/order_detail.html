@@ -10,22 +10,50 @@
   'delivered': '已送达',
   'cancelled': '已取消',
 } %}
+{# 调货单：发送单状态（总仓视角）/ 接收单状态（分仓视角）由路由注入。 #}
+{% set is_transfer = order.flow_type == 'dc_transfer' %}
+{% set doc_label = '调货单' if is_transfer else '订单' %}
+{% set doc_pill = {
+  'awaiting_ship': 'pending',
+  'partial_shipped': 'approved',
+  'shipped': 'shipped',
+  'completed': 'delivered',
+  'cancelled': 'cancelled',
+} %}
+{% set rcv_pill = {
+  'awaiting_ship': 'pending',
+  'pending_receive': 'approved',
+  'partial_received': 'shipped',
+  'received': 'delivered',
+  'cancelled': 'cancelled',
+} %}
 
 <div class="page-header">
-  <h2>订单 {{ order.order_no }}</h2>
+  <h2>{{ doc_label }} {{ order.order_no }}</h2>
+  {% if is_transfer and transfer %}
+    {% if is_dc_view %}
+    <span class="status-pill {{ doc_pill[transfer.doc_state] }}">{{ transfer.doc_state_label }}</span>
+    {% else %}
+    <span class="status-pill {{ rcv_pill[transfer.rcv_state] }}">{{ transfer.rcv_state_label }}</span>
+    {% endif %}
+    <span class="muted" style="margin-left:8px">
+      {{ '发送单' if is_dc_view else '接收单' }}
+    </span>
+  {% else %}
   <span class="status-pill {{ order.status }}">{{ status_labels[order.status] or order.status }}</span>
+  {% endif %}
 </div>
 
 {# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
 <div class="info-card">
   <div class="info-card-grid">
-    <div><strong>门店：</strong>{{ fmt_warehouse(order.store_warehouse_name, order.store_warehouse_code) }}</div>
-    <div><strong>配送中心：</strong>{{ fmt_warehouse(order.dc_warehouse_name, order.dc_warehouse_code) }}</div>
-    <div><strong>下单人：</strong>{{ order.requested_by_username or order.requested_by }}</div>
+    <div><strong>{{ '收货分仓' if is_transfer else '门店' }}：</strong>{{ fmt_warehouse(order.store_warehouse_name, order.store_warehouse_code) }}</div>
+    <div><strong>{{ '发出总仓' if is_transfer else '配送中心' }}：</strong>{{ fmt_warehouse(order.dc_warehouse_name, order.dc_warehouse_code) }}</div>
+    <div><strong>{{ '发起人' if is_transfer else '下单人' }}：</strong>{{ order.requested_by_username or order.requested_by }}</div>
     <div><strong>创建时间：</strong>{{ order.created_at }}</div>
     <div><strong>期望到货：</strong>{{ order.expected_delivery_date or '—' }}</div>
     <div><strong>备注：</strong>{{ order.note or '—' }}</div>
-    <div><strong>审批人：</strong>{{ order.approved_by_username or '—' }}</div>
+    <div><strong>{{ '发起审批' if is_transfer else '审批人' }}：</strong>{{ order.approved_by_username or '—' }}</div>
     <div><strong>审批时间：</strong>{{ order.approved_at or '—' }}</div>
     <div><strong>发货人：</strong>{{ order.shipped_by_username or '—' }}</div>
     <div><strong>发货时间：</strong>{{ order.shipped_at or '—' }}</div>
@@ -40,6 +68,12 @@
      两列 grid 上 → 第 2/3 个被自动排到卡片左侧，且浅底白字几乎看不见。
      现在统一收进 .info-card-totals 一列（货品 / 运费 / 总计三行）。 #}
   <div class="info-card-totals">
+    {% if is_transfer %}
+    <div class="info-card-fee">
+      <span class="info-card-fee-label">结算</span>
+      <span class="info-card-fee-value">内部调拨，不产生金额</span>
+    </div>
+    {% else %}
     <div class="info-card-fee">
       <span class="info-card-fee-label">货品金额</span>
       <span class="info-card-fee-value">¥ {{ (total_amount or 0) | fmt_money }}</span>
@@ -52,10 +86,11 @@
       <span class="info-card-total-label">订单总计</span>
       <span class="info-card-total-value">¥ {{ ((total_amount or 0) + (order.shipping_fee or 0)) | fmt_money }}</span>
     </div>
+    {% endif %}
   </div>
 </div>
 
-<h3>订单明细</h3>
+<h3>{{ doc_label }}明细</h3>
 
 {# —— 明细表：按视角分支 —— #}
 {% if is_dc_view %}
@@ -65,8 +100,8 @@
      互为兄弟节点（B16 根因）→ 提交时静默丢弃 → 服务端退化为「整单全发」。 #}
   {% set show_ship_form = can_ship and order.status == 'approved' %}
   {% if show_ship_form %}
-  <h3>DC 发货</h3>
-  <p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。<strong>发货量不得超过配送中心现有库存。</strong></p>
+  <h3>{{ '总仓发货' if is_transfer else 'DC 发货' }}</h3>
+  <p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。<strong>发货量不得超过{{ '总仓' if is_transfer else '配送中心' }}现有库存。</strong></p>
   <form method="post"
         action="{{ url_for('store_ordering.ship_order_route', order_id=order.id) }}"
         id="shipment-form"
@@ -78,10 +113,10 @@
       <tr>
         <th>品项</th>
         <th>单位</th>
-        <th>单价</th>
+        {% if not is_transfer %}<th>单价</th>{% endif %}
         <th>数量</th>
         <th>已发数</th>
-        <th>仓库库存</th>
+        <th>{{ '总仓库存' if is_transfer else '仓库库存' }}</th>
         {% if can_ship and order.status == 'approved' %}<th>本批发货</th>{% endif %}
       </tr>
     </thead>
@@ -95,7 +130,7 @@
         <tr>
           <td>{{ item.canonical_name }}</td>
           <td>{{ item.unit }}</td>
-          <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
+          {% if not is_transfer %}<td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>{% endif %}
           <td>{{ item.quantity | fmt_qty }}</td>
           <td>{{ shipped | fmt_qty }}</td>
           <td>
@@ -152,7 +187,7 @@
       <tr>
         <th>品项</th>
         <th>单位</th>
-        <th>单价</th>
+        {% if not is_transfer %}<th>单价</th>{% endif %}
         <th>数量</th>
         <th>已发数</th>
         <th>已收数</th>
@@ -171,7 +206,7 @@
         <tr>
           <td>{{ item.canonical_name }}</td>
           <td>{{ item.unit }}</td>
-          <td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>
+          {% if not is_transfer %}<td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>{% endif %}
           <td>{{ item.quantity | fmt_qty }}</td>
           <td>{{ shipped_qty | fmt_qty }}</td>
           <td>{{ fulfilled | fmt_qty }}</td>
@@ -186,7 +221,7 @@
               <button type="submit" class="btn-sm">收货</button>
             </form>
             {% elif effective_shipped <= 0 %}
-            <span class="muted">待配送中心发货</span>
+            <span class="muted">待{{ '总仓' if is_transfer else '配送中心' }}发货</span>
             {% else %}<span class="status-pill ok">已收齐</span>{% endif %}
           </td>
           {% endif %}
@@ -219,7 +254,7 @@
 
 {# —— 门店入库流水（storefront 视角）：直接读门店仓 stock_movements —— #}
 {% if not is_dc_view %}
-<h3>门店入库流水</h3>
+<h3>{{ '分仓入库流水' if is_transfer else '门店入库流水' }}</h3>
 {% if store_inflows %}
 <table class="data-table">
   <thead>
@@ -238,8 +273,7 @@
   </tbody>
 </table>
 {% else %}
-<p class="empty">暂无门店入库流水（收货后会自动写入）</p>
-{% endif %}
+<p class="empty">暂无门店入库流水（收货后会自动写入）</p>{% endif %}
 {% endif %}
 
 {# —— 发货历史（如有）—— #}
@@ -312,14 +346,16 @@
 
   {# —— P1-4: 取消按钮 —— #}
   {% if order.status == 'pending' or order.status == 'approved' %}
-  <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认取消该订单?">
+  <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认取消该{{ doc_label }}?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input name="reason" placeholder="取消原因（必填）" required />
-    <button type="submit" class="btn-action danger">取消订单</button>
+    <button type="submit" class="btn-action danger">取消{{ doc_label }}</button>
   </form>
   {% endif %}
 
-  {% if is_dc_view %}
+  {% if is_transfer %}
+  <a class="btn-action ghost" href="{{ url_for('dc_transfer.transfer_list') }}">返回调货列表</a>
+  {% elif is_dc_view %}
   <a class="btn-action ghost" href="{{ url_for('store_ordering.shipment_list') }}">返回出库清单</a>
   {% endif %}
 </div>

@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# 权限点目录（25 点：order 5 / stock 6 / item 6 / report 3 / admin 5）
+# 权限点目录（26 点：order 6 / stock 6 / item 6 / report 3 / admin 5）
 #   category  : 分组（UI 矩阵分域）
 #   risk      : 'normal' | 'sensitive' | 'critical'（UI 高亮 + 测试断言）
 #   description: 中文可读
@@ -25,6 +25,7 @@ PERMISSION_CATALOG: dict[str, dict[str, str]] = {
     "order.approve":           {"category": "order",  "risk": "critical",  "description": "审批订货单（DC 侧 review）"},
     "order.ship":              {"category": "order",  "risk": "sensitive", "description": "DC 发货 / 门店整单交付确认"},
     "order.receive":           {"category": "order",  "risk": "sensitive", "description": "门店收货确认"},
+    "transfer.create":         {"category": "order",  "risk": "sensitive", "description": "总仓发起调货（创建发往分仓的调货单）"},
     "order.cancel.any":        {"category": "order",  "risk": "critical",  "description": "取消任意订货单（越权撤单，非 owner 场景）"},
     # stock.*
     "stock.outbound":          {"category": "stock",  "risk": "sensitive", "description": "出库执行（扣账）"},
@@ -69,6 +70,7 @@ ROLE_PACKAGES: dict[str, frozenset[str]] = {
         "order.approve", "order.ship", "item.edit", "item.create",
         "item.price.view", "report.cost.view",
         "stock.stocktake.approve",  # 终裁①：由 admin 上移至 manager
+        "transfer.create",          # 总仓调货发起（manager 起，见 2026-10-19 设计）
     }),
     "admin": frozenset({
         "order.create", "order.receive", "stock.outbound", "stock.outbound.rollback",
@@ -78,6 +80,7 @@ ROLE_PACKAGES: dict[str, frozenset[str]] = {
         "item.price.view", "report.cost.view",
         "stock.stocktake.approve",
         "item.price.edit",  # 终裁②：item.delete 已移出，不含
+        "transfer.create",
     }),
     "viewer": frozenset({"item.view", "report.view", "report.export"}),
     "finance": frozenset({"item.view", "report.view", "report.export", "report.cost.view"}),
@@ -90,7 +93,7 @@ LADDER_ROLE_CODES: tuple[str, ...] = ("staff", "manager", "admin")
 
 # 权限数契约（播种断言 / 测试核对基准）
 BUILTIN_PACKAGE_SIZES: dict[str, int] = {
-    "staff": 10, "manager": 17, "admin": 18, "viewer": 3, "finance": 4,
+    "staff": 10, "manager": 18, "admin": 19, "viewer": 3, "finance": 4,
 }
 
 # 角色显示名 + rank（rank=None 表示旁支，不参与阶梯）
@@ -299,6 +302,10 @@ ROUTE_MATRIX: dict[str, str] = {
     "stocktake.edit": perm("stock.stocktake"),
     "stocktake.submit_edit": perm("stock.stocktake"),
     "stocktake.approve": perm("stock.stocktake.approve"),  # 终裁①：收紧 manager+
+    # ---- dc_transfer（总仓调货，2026-10-19）----
+    # 列表对总仓（发送单）与分仓（接收单）都开放，仓库类型由装饰器限定。
+    "dc_transfer.transfer_list": LOGIN,
+    "dc_transfer.transfer_new": f"{DC_PREFIX}{perm('transfer.create')}",
     # ---- store_ordering ----
     "store_ordering.catalog": LOGIN,
     "store_ordering.add_to_cart": perm("order.create"),

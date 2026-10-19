@@ -1339,6 +1339,37 @@ stateDiagram-v2
 
 `is_multiple_of` 用**相对容差**（`abs(qty − round(qty/step)·step) ≤ max(1e-9, step·1e-9)`）判定，不用 `%`——浮点二进制误差会让 `0.3 / 0.1` 判成 False。`normalize_order_multiple` 把脏值（None/非数字/≤0）一律回落成 1，避免配置错误把某个品项永久锁死。
 
+### 10.3.1 总仓调货（2026-10-19）
+
+**不新建单据体系**：调货单是 `store_orders` 里 `flow_type='dc_transfer'` 的一行，方向列复用 —— `dc_warehouse_code` = 发货总仓、`store_warehouse_code` = 收货分仓。明细、批次发货、部分收货、状态历史、库存流水全部复用订货实现（`blueprints/store_ordering_pure.py`），新增代码只在 `blueprints/dc_transfer{,_pure}.py`（列表 + 建单 + 状态派生）。
+
+```mermaid
+stateDiagram-v2
+    [*] --> approved: 总仓 manager 发起（transfer.create，免审批）
+    approved --> approved: 部分发货（累计 shipped_quantity）
+    approved --> shipped: 全部发齐
+    approved --> cancelled: 取消（仅未发货）
+    approved --> delivered: 分批发货 + 逐批收完
+    shipped --> delivered: 分仓收齐
+    delivered --> [*]
+    cancelled --> [*]
+```
+
+**两个视角、两套状态**（同一张单，派生而非落库）：
+
+- 发送单（总仓）：`awaiting_ship → partial_shipped → shipped → completed`（+ `cancelled`）
+- 接收单（分仓）：`awaiting_ship → pending_receive → partial_received → received`（+ `cancelled`）
+
+状态**不能只看主状态**：分批发货期间主状态停在 `approved`，只看 `status` 会把「已发 5 待收 5」显示成「待发货」。接收状态逐行用 `order_item_receivable_qty()` 派生，与收货门禁同源（列表上的「待收 N」= 详情页收货上限）。
+
+**与订货流程的差异**：① 无 `pending` 审批（创建即 `approved`，`approved_by` 记发起人）；② 单号 `DT-`；③ 运费恒 0、详情页不显示金额；④ 库存流水用 `总仓调货出库/入库`（已同步 `reports_health_pure` 的 `INBOUND_ACTIONS`/`CONSUME_ACTIONS` 与 `restock` 入库历史，漏改会静默漏算）；⑤ `compute_store_order_report` 排除调货单；⑥ `cancel_order` 新增「已发货不可取消」守卫（对订货单同样生效，修掉「部分发货后作废导致在途货悬空」的旧缺口）。
+
+**权限**：新增 `transfer.create`（manager/admin 包，26 点 / `manager 18`、`admin 19`）。建单要求 DC 类型 + 该权限；列表对 DC / 门店分别开放，发货与收货复用 `store_ordering` 的既有路由与角色守卫。
+
+**列表口径**：分仓「我的订单」（`store_orders_list`）只列 `flow_type='store_order'`——调货单的 `approved` 语义是「待发货」而非「已审批」，混排会让分仓看不懂状态；调货单统一走「调货接收」入口。管理员订单板（`admin_orders`）保留全量，新增「类型」列并按 `flow_type` 切换状态文案（待发货 / 已发出 / 已完成）。
+
+详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
+
 ### 10.4 Canonical 扇出流程
 
 ```mermaid

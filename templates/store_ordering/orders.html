@@ -54,6 +54,7 @@
   <thead>
     <tr>
       <th>订单号</th>
+      <th>类型</th>
       <th>状态</th>
       <th>门店</th>
       <th>配送中心</th>
@@ -71,10 +72,33 @@
       'delivered': '已送达',
       'cancelled': '已取消',
     } %}
+    {# 调货单与订货单共用主状态，但 approved/shipped/delivered 的业务语义
+       不同（待发货 / 已发出 / 已完成），列表里必须分开显示。 #}
+    {% set transfer_status_labels = {
+      'pending': '待审批',
+      'approved': '待发货',
+      'rejected': '已拒绝',
+      'shipped': '已发出',
+      'delivered': '已完成',
+      'cancelled': '已取消',
+    } %}
     {% for o in orders %}
     <tr>
       <td>{{ o.order_no }}</td>
-      <td><span class="status-pill {{ o.status }}">{{ status_labels[o.status] or o.status }}</span></td>
+      <td>
+        {% if o.flow_type == 'dc_transfer' %}
+        <span class="status-pill approved">总仓调货</span>
+        {% else %}
+        <span class="muted">门店订货</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if o.flow_type == 'dc_transfer' %}
+        <span class="status-pill {{ o.status }}">{{ transfer_status_labels[o.status] or o.status }}</span>
+        {% else %}
+        <span class="status-pill {{ o.status }}">{{ status_labels[o.status] or o.status }}</span>
+        {% endif %}
+      </td>
       <td>{{ fmt_warehouse(o.store_warehouse_name, o.store_warehouse_code) }}</td>
       <td>{{ fmt_warehouse(o.dc_warehouse_name, o.dc_warehouse_code) }}</td>
       <td>{{ o.created_at }}</td>

@@ -427,7 +427,7 @@ def test_builtin_package_sizes():
     actual = {code: len(ROLE_PACKAGES[code]) for code in BUILTIN_ROLE_CODES}
     assert actual == BUILTIN_PACKAGE_SIZES
     assert BUILTIN_PACKAGE_SIZES == {
-        "staff": 10, "manager": 17, "admin": 18, "viewer": 3, "finance": 4}
+        "staff": 10, "manager": 18, "admin": 19, "viewer": 3, "finance": 4}
 
 
 def test_no_empty_builtin_package():
