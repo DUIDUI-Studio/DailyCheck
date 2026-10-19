@@ -464,6 +464,10 @@ CREATE TABLE IF NOT EXISTS store_orders (
     order_no TEXT NOT NULL UNIQUE,
     store_warehouse_code TEXT NOT NULL,
     dc_warehouse_code TEXT NOT NULL,
+    -- 单据流向：store_order = 门店发起订货（默认）；dc_transfer = 总仓发起调货。
+    -- 调货单复用同一套明细 / 发货批次 / 收货流水 / 状态历史，仅流向与审批
+    -- 环节不同（调货无 pending 审批，创建即 approved）。见 docs/2026-10-19-dc-transfer-design.md
+    flow_type TEXT NOT NULL DEFAULT 'store_order',
     status TEXT NOT NULL DEFAULT 'pending',
     requested_by INTEGER NOT NULL,
     expected_delivery_date TEXT,
@@ -951,6 +955,22 @@ def init_master_db() -> None:
                         "shipping_fee REAL NOT NULL DEFAULT 0"
                     )
 
+                # 2026-10-19: store_orders.flow_type（单据流向）。
+                # 老库一律按门店订货单回填；调货单为新写入，无需数据迁移。
+                if "flow_type" not in so_cols:
+                    conn.execute(
+                        "ALTER TABLE store_orders ADD COLUMN "
+                        "flow_type TEXT NOT NULL DEFAULT 'store_order'"
+                    )
+
+                # 索引必须建在 ALTER 之后：legacy master 的 store_orders 没有
+                # flow_type 列，若把该 CREATE INDEX 写进 MASTER_SCHEMA，
+                # executescript 会在补列之前执行并直接报 no such column。
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_store_orders_flow "
+                    "ON store_orders(flow_type, status, created_at DESC)"
+                )
+
                 # v3.1: shipping_rules 表（全局运费规则，admin 配置）。
                 conn.execute(
                     """CREATE TABLE IF NOT EXISTS shipping_rules (
@@ -1120,7 +1140,7 @@ def init_master_db() -> None:
 def _seed_permissions_and_roles(conn: sqlite3.Connection) -> None:
     """幂等播种：权限点目录 + 5 内置角色 + 角色-权限包。
 
-    - permissions:      INSERT OR IGNORE（来源 PERMISSION_CATALOG，25 点）
+    - permissions:      INSERT OR IGNORE（来源 PERMISSION_CATALOG，26 点）
     - roles:            INSERT OR IGNORE（5 内置，is_builtin=1，tenant_id=1）
     - role_permissions: INSERT OR IGNORE（来源 ROLE_PACKAGES）
     - permission_routes: Phase 3 不播种（Phase B 由路由覆盖测试填充，见 ADR-004）

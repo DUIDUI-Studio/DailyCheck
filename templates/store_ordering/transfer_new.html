@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}新建总仓调货单{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>新建总仓调货单</h2>
+  <span class="muted">发货仓：<strong>{{ dc_code }}</strong></span>
+</div>
+
+<p class="muted">
+  调货单由总仓直接发起，<b>创建即进入待发货状态，无需分仓申请、也无需审批</b>；
+  提交后可在单据详情页安排发货，分仓收货后单据自动完成。
+  仅列出<b>主数据启用且有库存</b>的品项；实际发货时仍会按当时库存二次校验。
+</p>
+
+{% if not stores %}
+<p class="empty">还没有可分仓的目标门店，请先在「账号 / 仓库管理」中创建门店仓库。</p>
+{% elif item_count == 0 %}
+<p class="empty">总仓当前没有可调拨的品项（需已绑定主数据、主数据启用、库存 &gt; 0）。</p>
+{% else %}
+<form method="post" action="{{ url_for('dc_transfer.transfer_new') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <div class="grid cols-2" style="margin-bottom:14px">
+    <label>
+      <span>收货分仓</span>
+      <select name="to_warehouse_code" required>
+        <option value="">请选择分仓</option>
+        {% for s in stores %}
+        <option value="{{ s.code }}">{{ s.name }} ({{ s.code }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>备注</span>
+      <input name="note" placeholder="选填，如：补货 / 调拨原因" maxlength="200" />
+    </label>
+  </div>
+
+  {% for cat_code, items in groups.items() %}
+  <h3 style="margin-top:18px">{{ cat_code }}</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>品项</th>
+        <th>单位</th>
+        <th>总仓库存</th>
+        <th>调货数量</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for it in items %}
+      <tr>
+        <td>{{ it.canonical_name }}</td>
+        <td>{{ it.unit }}</td>
+        <td>{{ it.quantity | fmt_qty }}</td>
+        <td>
+          {# 字段名 items[canonical_id]：服务端按键解析，空/0 视为不调拨。
+             上限 = 当前总仓库存，前端先挡一次，服务端发货时另有硬校验。 #}
+          <input
+            type="number"
+            name="items[{{ it.canonical_id }}]"
+            min="0"
+            step="0.01"
+            max="{{ it.quantity }}"
+            placeholder="0"
+            style="width:110px"
+          />
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+
+  <div class="order-actions" style="margin-top:18px">
+    <button type="submit" class="btn-action primary">创建调货单</button>
+    <a class="btn-action ghost" href="{{ url_for('dc_transfer.transfer_list') }}">返回列表</a>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

@@ -30,6 +30,12 @@ from blueprints.procurement_pure import (
 
 WAREHOUSE_TYPE_DC: str = "distribution_center"
 
+# 单据流向（store_orders.flow_type）：
+#   store_order —— 门店发起订货（默认，走 pending 审批）
+#   dc_transfer —— 总仓主动发起的调货（无审批，创建即 approved）
+FLOW_STORE_ORDER: str = "store_order"
+FLOW_DC_TRANSFER: str = "dc_transfer"
+
 ORDER_STATUS_PENDING: str = "pending"
 ORDER_STATUS_APPROVED: str = "approved"
 ORDER_STATUS_REJECTED: str = "rejected"
@@ -49,6 +55,7 @@ EVENT_ORDER_SHIPPED: str = "store_order_shipped"
 EVENT_ORDER_DELIVERED: str = "store_order_delivered"
 EVENT_ORDER_RECEIVED: str = "store_order_received"
 EVENT_ORDER_CANCELLED: str = "store_order_cancelled"
+EVENT_TRANSFER_CREATED: str = "dc_transfer_created"
 
 ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
     ORDER_STATUS_PENDING: (ORDER_STATUS_APPROVED, ORDER_STATUS_REJECTED, ORDER_STATUS_CANCELLED),
@@ -58,6 +65,26 @@ ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
 
 SHIPMENT_ACTION: str = "门店订货出库"
 RECEIPT_ACTION: str = "门店订货入库"
+
+# 调货单专用流水动作。必须与 reports_health_pure 的 INBOUND_ACTIONS /
+# CONSUME_ACTIONS 白名单以及 restock 入库历史保持同步，否则调拨造成的
+# 库存增减会被健康报表静默漏算。
+TRANSFER_SHIPMENT_ACTION: str = "总仓调货出库"
+TRANSFER_RECEIPT_ACTION: str = "总仓调货入库"
+
+
+def shipment_action_for(order: dict[str, Any]) -> str:
+    """库存流水动作：调货单与门店订货单分开记账，便于报表区分。"""
+    if order.get("flow_type") == FLOW_DC_TRANSFER:
+        return TRANSFER_SHIPMENT_ACTION
+    return SHIPMENT_ACTION
+
+
+def receipt_action_for(order: dict[str, Any]) -> str:
+    """库存流水动作：调货单入库走 ``总仓调货入库``。"""
+    if order.get("flow_type") == FLOW_DC_TRANSFER:
+        return TRANSFER_RECEIPT_ACTION
+    return RECEIPT_ACTION
 
 #: 起订倍数「不限」的取值。items.order_multiple 默认即此值。
 ORDER_MULTIPLE_UNLIMITED: float = 1.0
@@ -153,20 +180,24 @@ def get_dc_item_order_multiple(
 # Order number generation
 # ---------------------------------------------------------------------------
 
-def generate_order_no(master_conn: sqlite3.Connection) -> str:
-    """Generate SO-YYYYMMDD-XXXX order number, daily auto-increment."""
+def generate_order_no(master_conn: sqlite3.Connection, prefix: str = "SO") -> str:
+    """Generate ``{prefix}-YYYYMMDD-XXXX`` order number, daily auto-increment.
+
+    调货单传 ``prefix="DT"``，与订货单（SO）分号段但共用同一张表的
+    ``order_no`` 唯一约束，因此序号必须按完整前缀查重，不能只按日期。
+    """
     master_conn.row_factory = sqlite3.Row
     today = datetime.now().strftime("%Y%m%d")
-    prefix = f"SO-{today}-"
+    no_prefix = f"{prefix}-{today}-"
     row = master_conn.execute(
         "SELECT order_no FROM store_orders WHERE order_no LIKE ? ORDER BY order_no DESC LIMIT 1",
-        (f"{prefix}%",),
+        (f"{no_prefix}%",),
     ).fetchone()
     if row is None:
         seq = 1
     else:
         seq = int(row["order_no"].rsplit("-", 1)[1]) + 1
-    return f"{prefix}{seq:04d}"
+    return f"{no_prefix}{seq:04d}"
 
 
 # ---------------------------------------------------------------------------
@@ -862,8 +893,8 @@ def compute_store_order_report(
     """
     master_conn.row_factory = sqlite3.Row
 
-    where_parts = ["1=1"]
-    params: list[Any] = []
+    where_parts = ["so.flow_type = ?"]
+    params: list[Any] = [FLOW_STORE_ORDER]
     if start_date:
         where_parts.append("so.created_at >= ?")
         params.append(f"{start_date} 00:00:00")
@@ -1384,6 +1415,7 @@ def list_orders(
     store_warehouse_code: str | None = None,
     dc_warehouse_code: str | None = None,
     status: str | None = None,
+    flow_type: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 200,
@@ -1402,6 +1434,9 @@ def list_orders(
     if status:
         where_parts.append("status = ?")
         params.append(status)
+    if flow_type:
+        where_parts.append("flow_type = ?")
+        params.append(flow_type)
     if start_date:
         where_parts.append("created_at >= ?")
         params.append(f"{start_date} 00:00:00")
@@ -1724,6 +1759,7 @@ def _ship_order_partial_impl(
         raise ValueError("本批发货数量全部为空，请至少填写一项")
 
     dc_code = order["dc_warehouse_code"]
+    ship_action = shipment_action_for(order)
     dc_conn = open_warehouse_db(dc_code)
     try:
         dc_conn.row_factory = sqlite3.Row
@@ -1762,8 +1798,8 @@ def _ship_order_partial_impl(
                    (item_id, action, delta, note, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
                 (
-                    dc_item_id, SHIPMENT_ACTION, -qty,
-                    f"{SHIPMENT_ACTION} #{order['order_no']} partial {qty:g}", ts,
+                    dc_item_id, ship_action, -qty,
+                    f"{ship_action} #{order['order_no']} partial {qty:g}", ts,
                 ),
             )
         dc_conn.commit()
@@ -2018,6 +2054,7 @@ def receive_order_item(
 
     # 2. open storefront warehouse and update stock + write movement.
     store_code = order["store_warehouse_code"]
+    recv_action = receipt_action_for(order)
     canonical_id = int(target_item["canonical_id"])
     canon = master_conn.execute(
         "SELECT name, category_code, unit FROM canonical_items WHERE id=?",
@@ -2102,8 +2139,8 @@ def receive_order_item(
                (item_id, action, delta, note, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (
-                store_item["id"], RECEIPT_ACTION, qty,
-                f"{RECEIPT_ACTION} #{order['order_no']}", ts,
+                store_item["id"], recv_action, qty,
+                f"{recv_action} #{order['order_no']}", ts,
             ),
         )
         store_conn.commit()
@@ -2231,6 +2268,15 @@ def cancel_order(
     ).fetchone()
     if received is not None and int(received["n"]) > 0:
         raise ValueError("订单已有收货记录，无法取消")
+    # 同理：只要发过货（含部分发货），总仓库存已扣、货在途，作废单据会让
+    # 在途货物失去账面对应。调货单同样适用（2026-10-19）。
+    shipped = master_conn.execute(
+        "SELECT COALESCE(SUM(shipped_quantity), 0) AS q "
+        "FROM store_order_items WHERE order_id=?",
+        (order_id,),
+    ).fetchone()
+    if shipped is not None and parse_qty(shipped["q"]) > 0:
+        raise ValueError("订单已有发货记录，无法取消")
     ts = now()
     master_conn.execute(
         """UPDATE store_orders
@@ -2290,31 +2336,40 @@ def notify_order_event(
 ) -> int:
     """Fan out an order event to the right users. Returns number of rows written."""
     master_conn.row_factory = sqlite3.Row
-    if event_type == EVENT_ORDER_SUBMITTED:
+    # 调货单与订货单共用事件通道，但对外文案必须区分，否则分仓会收到
+    # 「订货单已发出」这种与自己没有订货关系、无法据此操作的通知。
+    is_transfer = order.get("flow_type") == FLOW_DC_TRANSFER
+    doc_label = "总仓调货单" if is_transfer else "订货单"
+    if event_type == EVENT_TRANSFER_CREATED:
+        # 总仓发起调货 → 通知分仓经理/管理员准备接收。
+        user_ids = _recipients_for_store_users(master_conn, order)
+        user_ids = _exclude_self(user_ids, actor_user_id)
+        summary = f"总仓调货单 {order['order_no']} 已发起，请准备接收"
+    elif event_type == EVENT_ORDER_SUBMITTED:
         user_ids = _recipients_for_dc_reviewers(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"门店订货单 {order['order_no']} 已提交"
     elif event_type == EVENT_ORDER_APPROVED:
         user_ids = _recipients_for_store_users(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
-        summary = f"订货单 {order['order_no']} 已审批通过"
+        summary = f"{doc_label} {order['order_no']} 已审批通过"
     elif event_type == EVENT_ORDER_REJECTED:
         user_ids = _recipients_for_store_users(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
-        summary = f"订货单 {order['order_no']} 已被拒绝"
+        summary = f"{doc_label} {order['order_no']} 已被拒绝"
     elif event_type == EVENT_ORDER_SHIPPED:
         user_ids = _recipients_for_store_users(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
-        summary = f"订货单 {order['order_no']} 已出库配送"
+        summary = f"{doc_label} {order['order_no']} 已出库配送"
     elif event_type == EVENT_ORDER_DELIVERED:
         user_ids = _recipients_for_store_users(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
-        summary = f"订货单 {order['order_no']} 已送达"
+        summary = f"{doc_label} {order['order_no']} 已送达"
     elif event_type == EVENT_ORDER_RECEIVED:
         # 部分收货通知发给 DC 审批人 + 平台管理员，让 DC 知道门店收到多少
         user_ids = _recipients_for_dc_reviewers(master_conn, order)
         user_ids = _exclude_self(user_ids, actor_user_id)
-        summary = f"订货单 {order['order_no']} 部分收货"
+        summary = f"{doc_label} {order['order_no']} 部分收货"
     elif event_type == EVENT_ORDER_CANCELLED:
         # 取消通知发给对侧：门店取消 → DC 审批人；DC 取消 → 门店用户。
         # 简化做法：双侧都发给 requester + dc reviewers（去重 + 排自己）。

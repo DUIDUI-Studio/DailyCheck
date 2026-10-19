@@ -12,8 +12,8 @@
 
 ## 0. 一览
 
-- 蓝图 20 个（已装配 19 / 未装配 1）
-- 路由 **168** 条（按鉴权强度：平台超管 49 · 登录 45 · 权限点 31 · 角色 30 · 公开 6 · 配送中心 6 · 任一权限 1）
+- 蓝图 21 个（已装配 20 / 未装配 1）
+- 路由 **170** 条（按鉴权强度：平台超管 49 · 登录 46 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · 任一权限 1）
 - 数据表 **59** 张，`WAREHOUSE_SCHEMA_VERSION = 3`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -41,6 +41,7 @@
 | `procurement` | `procurement.py` | 4 | 在役 |
 | `agent_tokens` | `agent_tokens.py` | 3 | 在役 |
 | `notifications` | `notifications.py` | 3 | 在役 |
+| `dc_transfer` | `dc_transfer.py` | 2 | 在役 |
 | `ops` | `ops.py` | 1 | 在役 |
 
 ## 2. 路由 × 鉴权（唯一事实来源：`permissions_manifest.ROUTE_MATRIX`）
@@ -94,6 +95,13 @@
 | `core.delete_category` | POST | `/categories/<int:category_id>/delete` | 角色 | staff |
 | `core.land` | GET | `/land` | 登录 |  |
 | `core.summary` | GET | `/summary` | 登录 |  |
+
+### `dc_transfer`
+
+| endpoint | 方法 | 规则 | 鉴权 | 明细 |
+|---|---|---|---|---|
+| `dc_transfer.transfer_list` | GET | `/` | 登录 |  |
+| `dc_transfer.transfer_new` | GET,POST | `/new` | 配送中心 | perm:transfer.create |
 
 ### `feedback`
 

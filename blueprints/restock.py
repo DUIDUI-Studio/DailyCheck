@@ -57,9 +57,9 @@ def restock_list():
                   i.name AS item_name, i.unit, sm.delta AS quantity,
                   'store_order' AS source
            FROM stock_movements sm JOIN items i ON i.id = sm.item_id
-           WHERE sm.action = ?
+           WHERE sm.action IN (?, ?)
            ORDER BY sm.id DESC LIMIT 100""",
-        ("门店订货入库",),
+        ("门店订货入库", "总仓调货入库"),
     ).fetchall()
     combined = sorted(
         [dict(r) for r in manual] + [dict(r) for r in store_order],

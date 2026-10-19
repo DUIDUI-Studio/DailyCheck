@@ -23,6 +23,7 @@ from flask import (
     url_for,
 )
 
+from blueprints import dc_transfer_pure as dtp
 from blueprints import store_ordering_pure as sop
 from blueprints import wecom_notify_pure as wecom_notify
 from blueprints._helpers import parse_qty
@@ -582,6 +583,7 @@ def order_detail(order_id: int) -> str:
     # Surfaced only on the storefront view so store users can see the inbound
     # inventory moves triggered by their receiving.
     store_inflows: list[dict[str, Any]] = []
+    receipt_action = sop.receipt_action_for(order)
     if not is_dc_view:
         try:
             wh_db = sop.open_warehouse_db(order["store_warehouse_code"])
@@ -594,7 +596,7 @@ def order_detail(order_id: int) -> str:
                    WHERE sm.action = ?
                      AND sm.note LIKE ?
                    ORDER BY sm.id DESC LIMIT 50""",
-                (sop.RECEIPT_ACTION, f"%{order['order_no']}%"),
+                (receipt_action, f"%{order['order_no']}%"),
             ).fetchall():
                 d = dict(r)
                 d["delta"] = parse_qty(d["delta"])
@@ -618,6 +620,22 @@ def order_detail(order_id: int) -> str:
         except Exception:
             store_inflows = []
 
+    # 调货单（flow_type=dc_transfer）与订货单共用详情页，但状态语义是两套：
+    # 发送单看发货进度、接收单看收货进度（均由明细派生，主状态不足以表达
+    # 部分发货 / 部分收货）。这里算好传给模板，避免模板侧再算一遍。
+    transfer_ctx = None
+    if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+        progress = dtp.transfer_progress(order)
+        doc_state = dtp.document_state(order)
+        rcv_state = dtp.receipt_state(order)
+        transfer_ctx = {
+            "progress": progress,
+            "doc_state": doc_state,
+            "doc_state_label": dtp.DOC_STATE_LABELS[doc_state],
+            "rcv_state": rcv_state,
+            "rcv_state_label": dtp.RCV_STATE_LABELS[rcv_state],
+        }
+
     return render_template(
         "store_ordering/order_detail.html",
         order=order,
@@ -625,6 +643,7 @@ def order_detail(order_id: int) -> str:
         dc_items_info=dc_items_info,
         is_dc_view=is_dc_view,
         store_inflows=store_inflows,
+        transfer=transfer_ctx,
         can_review=(
             wh_type == sop.WAREHOUSE_TYPE_DC
             and role in ("manager", "admin")

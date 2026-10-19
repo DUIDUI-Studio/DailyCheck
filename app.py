@@ -91,6 +91,7 @@ def create_app() -> Flask:
     from blueprints.auth import bp as auth_bp
     from blueprints.canonical import bp as canonical_bp
     from blueprints.core import bp as core_bp
+    from blueprints.dc_transfer import bp as dc_transfer_bp
     from blueprints.feedback import bp as feedback_bp
     from blueprints.forecast import _start_scheduler
     from blueprints.forecast import bp as forecast_bp
@@ -125,6 +126,7 @@ def create_app() -> Flask:
     app.register_blueprint(agent_tokens_bp)
     app.register_blueprint(canonical_bp)
     app.register_blueprint(store_ordering_bp)
+    app.register_blueprint(dc_transfer_bp)
     app.register_blueprint(feedback_bp)
     app.register_blueprint(ops_bp)
 
