@@ -146,6 +146,30 @@ CREATE TABLE IF NOT EXISTS procurement_config (
     min_absolute REAL NOT NULL DEFAULT 0
 );
 
+-- 补货看板（/forecast）策略参数。单行表，列名与
+-- blueprints/replenishment_pure.PolicyParams 字段一一对应，
+-- load_params() 按 dataclass 字段名反射读取。
+-- 默认值口径：门店每周订货 1 次（review=7）、DC 到货 2-3 天（lead=3）。
+CREATE TABLE IF NOT EXISTS replenishment_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    window_days INTEGER NOT NULL DEFAULT 56,
+    continuous_min_ratio REAL NOT NULL DEFAULT 0.30,
+    recent_weight REAL NOT NULL DEFAULT 2.0,
+    stale_after_days INTEGER NOT NULL DEFAULT 21,
+    store_review_days INTEGER NOT NULL DEFAULT 7,
+    store_lead_days INTEGER NOT NULL DEFAULT 1,
+    dc_review_days INTEGER NOT NULL DEFAULT 7,
+    dc_lead_days INTEGER NOT NULL DEFAULT 3,
+    service_a REAL NOT NULL DEFAULT 0.95,
+    service_b REAL NOT NULL DEFAULT 0.90,
+    service_c REAL NOT NULL DEFAULT 0.85,
+    abc_a_cum REAL NOT NULL DEFAULT 0.80,
+    abc_b_cum REAL NOT NULL DEFAULT 0.95,
+    overstock_days REAL NOT NULL DEFAULT 45.0,
+    order_cost REAL NOT NULL DEFAULT 80.0,
+    holding_rate REAL NOT NULL DEFAULT 0.22
+);
+
 CREATE TABLE IF NOT EXISTS procurement_cache (
     item_id INTEGER NOT NULL,
     warehouse_code TEXT NOT NULL,
@@ -1194,6 +1218,12 @@ def init_master_db() -> None:
                     conn.execute(
                         "INSERT INTO procurement_config (id, cover_days, min_absolute) VALUES (1, 14, 0)"
                     )
+
+                # Seed single-row replenishment_config (补货看板策略参数).
+                # 只在缺行时插入：已有参数不覆盖，避免升级时静默重置用户调过的值。
+                row = conn.execute("SELECT 1 FROM replenishment_config WHERE id=1").fetchone()
+                if row is None:
+                    conn.execute("INSERT INTO replenishment_config (id) VALUES (1)")
 
                 # Phase 3: 权限点目录 + 5 内置角色 + 角色-权限包（幂等播种）。
                 # 必须在 flock 块内——gunicorn 多 worker 并发启动时防重复播种竞态。

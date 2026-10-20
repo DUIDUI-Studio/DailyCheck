@@ -194,6 +194,7 @@ ROUTE_MATRIX: dict[str, str] = {
     "feedback.dispatch_feedback": PLATFORM,
     # ---- forecast ----
     "forecast.forecast_index": PLATFORM,        # 清除死装饰器
+    "forecast.forecast_board_json": PLATFORM,   # 与页面同源，同一守卫
     "forecast.forecast_item": f"{ROLE_PREFIX}manager",
     "forecast.forecast_product": f"{ROLE_PREFIX}manager",
     "forecast.forecast_recompute": f"{ROLE_PREFIX}manager",
