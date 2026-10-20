@@ -25,7 +25,12 @@ SMALL_NUMBER_PASS = 20
 
 # 回复里的数字：支持千分位与小数，前后不能紧贴字母数字
 # （否则 ``PP017``、``wh_000`` 里的数字会被当成业务数据）。
-_NUMBER_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?![\w])")
+# ``*`` / ``×`` 也加进排除集：``40*30`` 是规格，不是库存量。
+_NUMBER_RE = re.compile(r"(?<![\w.*×])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?![\w*×])")
+
+# 规格表达式：``标签纸40*30``、``20 × 30``、``A4 规格 21x29``。
+# 这类数字属于品名/规格，不参与库存与金额对账，否则天天误报。
+_SPEC_RE = re.compile(r"\d+(?:\.\d+)?\s*[*×xX]\s*\d+(?:\.\d+)?")
 
 # 年份不该被当成库存量。1900-2100 之外的值仍然照查。
 _YEAR_RANGE = range(1900, 2101)
@@ -47,11 +52,15 @@ def _number_variants(value: float) -> set[str]:
 
 
 def collect_numbers(payload: Any, _depth: int = 0) -> set[str]:
-    """递归收集工具返回里所有数值的字符串写法。
+    """递归收集工具返回里出现过的所有数字。
 
-    只认真正的数字类型；字符串里的数字**不收集**——``"note": "共 12 个品项"``
-    这种是工具自己写的说明文字，不该成为「可信出处」，否则模型随便编一句
-    说明就能给自己的数字找到靠山。
+    数字字段直接收；**字符串字段也收**（复用 ``extract_numbers``）。
+
+    为什么字符串也算出处：工具返回的文字是我们自己生成的，里面的数字都有
+    依据——``"name": "标签纸40*30"`` 的规格、``"note": "共 12 个品项"`` 的
+    计数，都是事实。反过来，如果只认数字类型，模型照抄品名里的规格就会被
+    判成幻觉，天天触发无谓的校正（实测踩过：``标签纸40*30`` 的 30 被当成
+    编造的库存量）。
     """
     if _depth > 12:  # 防御异常深的嵌套，工具返回不会这么深
         return set()
@@ -60,6 +69,8 @@ def collect_numbers(payload: Any, _depth: int = 0) -> set[str]:
         return set()
     if isinstance(payload, (int, float)):
         out |= _number_variants(float(payload))
+    elif isinstance(payload, str):
+        out |= set(extract_numbers(payload))
     elif isinstance(payload, dict):
         for value in payload.values():
             out |= collect_numbers(value, _depth + 1)
@@ -70,12 +81,20 @@ def collect_numbers(payload: Any, _depth: int = 0) -> set[str]:
 
 
 def extract_numbers(text: str) -> list[str]:
-    """从回复文本里提取数字，返回规范化后的字符串（去千分位逗号）。"""
+    """从回复文本里提取数字，返回规范化后的字符串（去千分位逗号）。
+
+    规格表达式（``40*30``）整段跳过——它描述的是商品尺寸，不是业务数据。
+    """
+    text = text or ""
+    spec_spans = [match.span() for match in _SPEC_RE.finditer(text)]
+
     found: list[str] = []
-    for match in _NUMBER_RE.finditer(text or ""):
+    for match in _NUMBER_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in spec_spans):
+            continue
         raw = match.group(1)
         # 百分数不是库存量也不是金额，跳过（"缺 50%" 不该被当成数字 50 去对账）
-        tail = (text or "")[match.end() : match.end() + 1]
+        tail = text[match.end() : match.end() + 1]
         if tail in {"%", "％"}:
             continue
         normalized = raw.replace(",", "")
