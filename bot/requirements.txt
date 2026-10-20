@@ -1,0 +1,13 @@
+# 企业微信库存助手（bot/）的运行时依赖。
+#
+# ⚠️ 生产上必须装在**独立 venv**（`/root/dailycheck-bot-venv`），不要装进主站
+# 的 `.venv`：主站不需要 aiohttp / websockets，混装会平白扩大主站的依赖面，
+# 也让蓝绿两实例多一层无谓的耦合。
+#
+# 装法：
+#   /usr/bin/python3 -m venv /root/dailycheck-bot-venv
+#   /root/dailycheck-bot-venv/bin/python -m pip install -r bot/requirements.txt
+aiohttp>=3.9
+websockets>=12.0
+pyee>=11.0
+wecom-aibot-python-sdk==1.0.2

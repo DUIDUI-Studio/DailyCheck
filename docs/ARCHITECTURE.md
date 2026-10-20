@@ -647,6 +647,69 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 ---
 
+### 3.12 企业微信库存助手（自然语言查库存，2026-10-21 起）
+
+**问题**：门店和研发的同事要看库存得登录系统翻页面，而他们真正想知道的往往只是一句话——「这个东西还有多少」。在企微群里 @ 一下就能问，是成本最低的形态。
+
+**先排除两条走不通的路**：
+
+| 方案 | 结论 |
+|---|---|
+| 微信群个人机器人 | 官方无接口。只能 iPad 协议 / PC Hook，违反协议、会封号、还要常驻一台设备 → **不采用** |
+| 企微群机器人 webhook | **只发不收**（§3.9 就是这种），群里 @ 它没有任何回调 → 做不了问答 |
+
+可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
+
+**为什么不走 MCP**：MCP 那 22 个工具里有 9 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
+
+**链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
+
+```
+员工在企微提问 → 腾讯企微服务器
+  → WSS 长连接（VPS 主动建立 wss://openws.work.weixin.qq.com:443）
+  → bot/serve.py 剥 @ 前缀
+  → bot/agent.py 调 MiniMax（function calling，最多 3 轮）
+  → bot/tools.py 只读查 SQLite（跨 6 个仓）
+  → reply_stream 分段覆盖推送
+  → 员工看到打字机效果
+```
+
+**三层只读防护**（任一层单独都够用）：
+
+1. **工具集**：`bot/tools.py` 只有 SELECT，不 import 任何写 service
+2. **数据库**：`file:...?mode=ro` 打开，SQLite 层直接拒绝 UPDATE / DELETE / INSERT（`tests/bot/test_tools.py::TestReadOnlyBoundary` 守着）
+3. **提示词**：只作第三层，**不作为安全依据**
+
+**价格语义**：`items.selling_price` 是本仓售价；`price_follow_canonical=1` 时改取 `canonical_items.selling_price`（Q6 预留开关，生产当前全 0）。两者都为 0 时返回 `null` 并标「售价未维护」，**绝不报 0 元**——把未维护当 0 是最容易让员工误判的坑。成本价 `unit_cost` 一并返回（Eric 2026-10-21 明确「售价和成本两个接口都预留」）。
+
+**数字对账**（`bot/verify_pure.py`）：模型不改库，但会**算错数**（把六个仓自己加一遍）。回复生成后，把工具返回的数值收成可信集合，扫回复里 > 20 且无出处的数字；命中就用一次无工具的小调用只订正数字（超时 8s，失败保留原答）。`BOT_VERIFY_NUMBERS=0` 一键关闭。工具结果超长时**砍列表尾部而不是硬截断**——半截 JSON 会让模型瞎猜，也会让对账丢掉整份可信数据。
+
+**性能取舍**（实测 61s → 首字 1.4-3.8s）：真流式（SSE 逐行解析）+ 同轮工具并行 + 轮次 5→3 + **仓清单写进提示词**（省掉模型为查编码多跑的一整轮 2-3s）。剩余瓶颈是模型首 token 的 2s 固定开销，压不下去。
+
+**配置**（全部 env，不进 git）：
+
+| env | 必填 | 作用 |
+|---|---|---|
+| `WECOM_BOT_ID` / `WECOM_BOT_SECRET` | 是 | 智能机器人 API 模式凭证 |
+| `DAILYCHECK_DB_DIR` | 是 | 库目录，生产 `/root/DailyCheck/db` |
+| `LLM_API_KEY` | 是 | MiniMax key（缺省回退读 WorkBuddy MCP 配置） |
+| `LLM_BASE_URL` / `LLM_MODEL` | 否 | 缺省 `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` |
+| `BOT_VERIFY_NUMBERS` | 否 | `0` 关闭数字对账 |
+
+**部署**：独立 systemd unit `dailycheck-bot.service`，**不在蓝绿流程里**——它不接 HTTP 流量、不与两实例共享进程，重启不影响订货。⚠️ 长连接是**单连接**：同一 BotID 只能有一个进程在线，本地调试前必须先停生产进程，否则互相挤掉。
+
+**已知坑（都踩过）**：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| `853000 invalid bot_id or secret` | 本机代理转发 WSS 时破坏订阅帧（REST 接口不受影响，所以 `get_token` 成功却订阅失败是典型信号） | `force_direct_connection()` 给 `websockets.connect` 注入 `proxy=None` |
+| `40008 invalid message type` | 长连接被动回复**只接受 `stream`** | `reply_stream(frame, stream_id, content, finish=True)` |
+| 模型编出「一共 30 项」 | 数据里只有 15 条，属真幻觉 | 数字对账命中 → 订正为「这些项」 |
+
+**测试**（`tests/bot/`，99 用例）：工具层（只读边界拒绝三种写 / 仓名容错 / 跨仓汇总 / 售价缺失语义 / 停用品项不可见 / 主数据停用不可见）、数字对账（多精度变体容差 / 阈值边界 / 年份与百分数排除 / 顺序去重）、结果裁剪（保持合法 JSON / 砍不动时明确报错）、凭证装载与 @ 前缀剥离。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态
@@ -1201,6 +1264,8 @@ flowchart TB
 ---
 
 ## 9. MCP 架构
+
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（22 个工具里 9 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
 
 ### 9.1 进程拓扑
 
