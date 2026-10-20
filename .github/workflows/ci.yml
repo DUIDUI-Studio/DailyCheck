@@ -57,10 +57,11 @@ jobs:
         run: python scripts/check_known_failures.py /tmp/pytest-output.txt
 
   agent-framework-reports:
-    # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
+    # Phase MVE: 四报告门禁（独立 status check，让 ruleset 可独立勾选）
     # 详见 docs/agent-framework/v0.1.md §三
-    # 上游 test 失败则跳过（test 失败即阻断，无需跑 reports）
-    needs: test
+    # 与 test 并行（2026-10-20 owner 拍板）：本 job 自己跑一遍 pytest 生成报告 02，
+    # 不消费 test 的产物（全 workflow 无 download-artifact），串行纯属浪费墙钟。
+    # 拦截力不变：ruleset 要求两个 check 同时绿；deploy 仍 needs: test。
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
