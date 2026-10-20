@@ -23,12 +23,18 @@ class TestCollectNumbers:
         # 小数会带上多精度写法，所以用包含而不是全等
         assert {"5.67", "1.2", "0", "4.47"} <= trusted
 
-    def test_字符串里的数字不算出处(self):
-        # note 是工具自己写的说明文字，不能给模型的数字当靠山
+    def test_字符串里的数字也算出处(self):
+        # 品名规格与计数都是工具自己生成的，属事实，不该让模型照抄时被判幻觉
         payload = {"note": "共 12 个品项", "total_items": 127}
         trusted = collect_numbers(payload)
         assert "127" in trusted
-        assert "12" not in trusted
+        assert "12" in trusted
+
+    def test_品名里的规格不算业务数字(self):
+        # 实测踩过：标签纸40*30 的 30 被当成编造的库存量，触发无谓校正
+        trusted = collect_numbers({"name": "标签纸40*30", "quantity": 5})
+        assert "30" not in trusted
+        assert "5" in trusted
 
     def test_布尔值不被当成数字(self):
         assert collect_numbers({"ok": True, "below_safety": False}) == set()
@@ -66,6 +72,14 @@ class TestExtractNumbers:
 
     def test_百分数跳过(self):
         assert extract_numbers("缺 50%") == []
+
+    def test_规格表达式整段跳过(self):
+        assert extract_numbers("标签纸40*30") == []
+        assert extract_numbers("20 × 30 的盒子") == []
+        assert extract_numbers("21x29 规格") == []
+
+    def test_规格后面的业务数字仍然提取(self):
+        assert extract_numbers("标签纸40*30 缺 5") == ["5"]
 
     def test_空文本(self):
         assert extract_numbers("") == []
@@ -106,6 +120,11 @@ class TestFindUntraceable:
         # SMALL_NUMBER_PASS=20 表示 20 及以下放行
         assert find_untraceable("20 箱", set()) == []
         assert find_untraceable("21 箱", set()) == ["21"]
+
+    def test_品名规格不触发误报(self):
+        # 回归：标签纸40*30 的 30 曾被判成无出处数字
+        trusted = collect_numbers({"name": "标签纸40*30", "quantity": 5})
+        assert find_untraceable("标签纸40*30 缺 5", trusted) == []
 
     def test_自定义阈值(self):
         assert find_untraceable("21 箱", set(), min_value=100) == []
