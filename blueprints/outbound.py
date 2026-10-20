@@ -102,8 +102,9 @@ def outbound_submit():
     for item_id, qty in rows:
         cur = db.execute(
             """INSERT INTO outbound_requests
-               (item_id, requested_quantity, reason, status, rolled_back, created_at)
-               VALUES (?, ?, ?, '出库', 0, ?)""",
+               (item_id, requested_quantity, reason, status, rolled_back,
+                created_at, source_type)
+               VALUES (?, ?, ?, '出库', 0, ?, 'manual')""",
             (item_id, qty, reason, now()),
         )
         req_id = int(cur.lastrowid)

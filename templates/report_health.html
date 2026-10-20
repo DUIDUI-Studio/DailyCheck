@@ -270,10 +270,147 @@
 </div>
 {% endif %}
 
+{% if loss and loss.state != 'absent' %}
+<h3>品项误差台账 · 归因{% if loss.lookback_days %}（回看 {{ loss.lookback_days }} 天）{% endif %}</h3>
+
+{% if loss.state == 'unknown' %}
+<p class="muted">归因模块不可用（数据链路异常），本次不展示损耗判定。历史台账保留在库中，恢复后自动重算。</p>
+{% else %}
+
+<div class="health-biz" style="margin-bottom:10px">
+  <div class="card" style="padding:10px">
+    <div class="kpi-label">误差条目</div>
+    <div style="font-size:19px;font-weight:500">{{ loss.totals.count }}</div>
+    <div class="muted" style="font-size:12px">可计价 ¥{{ "{:,.2f}".format(loss.totals.value) }}</div>
+  </div>
+  <div class="card" style="padding:10px">
+    <div class="kpi-label">无法计价</div>
+    <div style="font-size:19px;font-weight:500">{{ loss.totals.unknown_count }}</div>
+    <div class="muted" style="font-size:12px">
+      {% if loss.blind_spots %}涉及 {{ loss.blind_spots | length }} 个无成本品项{% else %}无盲区{% endif %}
+    </div>
+  </div>
+  <div class="card" style="padding:10px">
+    <div class="kpi-label">已自愈（冲销对）</div>
+    <div style="font-size:19px;font-weight:500">{{ loss.totals.self_reversed_count }}</div>
+    <div class="muted" style="font-size:12px">¥{{ "{:,.2f}".format(loss.totals.self_reversed_value) }} 不计入损耗率</div>
+  </div>
+</div>
+
+{% set cause_color = {'recipe': '#BA7517', 'human': '#378ADD', 'process': '#888780', 'unattributed': '#B4B2A9'} %}
+{% set cause_total = loss.by_cause.values() | map(attribute='count') | sum %}
+{% if cause_total %}
+<div style="display:flex;height:20px;border-radius:10px;overflow:hidden;margin:6px 0 8px">
+  {% for key, label in [('recipe','配方'), ('human','人为'), ('process','流程'), ('unattributed','待判定')] %}
+  {% set slot = loss.by_cause.get(key) %}
+  {% if slot %}
+  <div title="{{ label }} {{ slot.count }} 条 / ¥{{ '{:,.2f}'.format(slot.value) }}"
+       style="width:{{ (slot.count / cause_total * 100) | round(1) }}%;background:{{ cause_color[key] }}"></div>
+  {% endif %}
+  {% endfor %}
+</div>
+<div class="muted" style="font-size:12px;margin-bottom:10px">
+  {% for key, label in [('recipe','配方'), ('human','人为'), ('process','流程'), ('unattributed','待判定')] %}
+  {% set slot = loss.by_cause.get(key) %}
+  {% if slot %}· {{ label }} {{ slot.count }} 条 / ¥{{ "{:,.2f}".format(slot.value) }}{% if slot.unknown %}（{{ slot.unknown }} 条无成本）{% endif %} {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>SKU</th><th>品项</th><th>层</th><th>发生日</th><th>误差量</th><th>金额</th>
+    <th>主因</th><th>原因码</th><th>置信度</th><th>判定依据</th>
+  </tr>
+  {% for r in loss.top_rows %}
+  <tr {% if r.self_reversed %}style="opacity:.55"{% endif %}>
+    <td>{{ r.item_sku }}</td>
+    <td>{{ r.item_name }}</td>
+    <td title="{{ {'L1':'配方偏差','L2':'旁路消耗','L3':'账实损耗'}.get(r.layer, r.layer) }}">{{ r.layer }}</td>
+    <td>{{ r.event_at[:10] }}</td>
+    <td>{{ r.err_qty | fmt_qty }} {{ r.unit }}</td>
+    <td>{% if r.value_state == 'unknown' %}<span class="risk-muted" title="该品项 unit_cost=0，仅计量不计价">—</span>{% else %}¥{{ "{:,.2f}".format(r.err_value) }}{% endif %}</td>
+    <td style="color:{{ cause_color.get(r.cause_primary, '#444441') }}">
+      {{ loss.labels.get(r.cause_primary, r.cause_primary) }}
+    </td>
+    <td style="font-size:12px">{{ r.cause_code }}</td>
+    <td>{{ "%.2f" | format(r.confidence) }}</td>
+    <td style="min-width:260px">
+      <details>
+        <summary style="cursor:pointer;font-size:12px;color:var(--brand-ink)">展开</summary>
+        <div style="font-size:12px;line-height:1.6;margin-top:6px">{{ r.reason_text }}</div>
+        <div class="muted" style="font-size:11px;margin-top:4px">
+          溯源：{{ r.source_table }}#{{ r.source_id }}{% if r.run_id %} · 批次 #{{ r.run_id }}{% endif %}{% if r.batch_id %} · 盘点批次 #{{ r.batch_id }}{% endif %}
+        </div>
+      </details>
+    </td>
+  </tr>
+  {% endfor %}
+  {% if not loss.top_rows %}
+  <tr><td colspan="10" class="muted">窗口内无误差条目</td></tr>
+  {% endif %}
+</table>
+</div>
+
+{% if loss.self_reversed %}
+<p class="muted" style="margin-top:10px;font-size:12px">
+  已自愈误差（盘盈盘亏冲销对，保留用于追踪录入质量，<strong>不计入损耗率</strong>）：
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th>SKU</th><th>品项</th><th>发生日</th><th>误差量</th><th>金额（已冲销）</th><th>原因码</th><th>判定依据</th></tr>
+  {% for r in loss.self_reversed %}
+  <tr style="opacity:.7">
+    <td>{{ r.item_sku }}</td>
+    <td>{{ r.item_name }}</td>
+    <td>{{ r.event_at[:10] }}</td>
+    <td>{{ r.err_qty | fmt_qty }} {{ r.unit }}</td>
+    <td>¥{{ "{:,.2f}".format(r.err_value) }}</td>
+    <td style="font-size:12px">{{ r.cause_code }}</td>
+    <td style="font-size:12px;min-width:240px">{{ r.reason_text }}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+
+<h3 style="margin-top:14px">品项风险排行</h3>
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>SKU</th><th>品项</th><th>误差事件</th><th>暴露次数</th><th>误差率</th>
+    <th>盘亏次数</th><th>盘点次数</th><th>盘亏率</th><th>可计价金额</th><th>主因</th>
+  </tr>
+  {% for it in loss.item_rates[:15] %}
+  <tr>
+    <td>{{ it.sku }}</td>
+    <td>{{ it.name }}</td>
+    <td>{{ it.events }}</td>
+    <td>{{ it.exposure }}</td>
+    <td>{{ it.err_rate if it.err_rate is not none else '—' }}{% if it.err_rate is not none %}%{% endif %}</td>
+    <td>{{ it.losses if it.losses is defined else '—' }}</td>
+    <td>{{ it.inspections if it.inspections else '—' }}</td>
+    <td class="{{ 'risk-red' if it.loss_rate and it.loss_rate >= 50 else '' }}">{{ it.loss_rate if it.loss_rate is not none else '—' }}{% if it.loss_rate is not none %}%{% endif %}</td>
+    <td>{{ '¥' ~ "{:,.2f}".format(it.value) if it.value else '—' }}</td>
+    <td>{{ it.dominant_label }}{% if it.dominant_share %} ({{ it.dominant_share }}%){% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<p class="muted" style="font-size:11px;margin-top:4px">
+  误差率 = 误差事件 ÷（出库 + 生产投料 + 盘点）· 盘亏率 = 盘亏次数 ÷ 盘点次数 · 分母为 0 显示「—」
+</p>
+
+{% endif %}
+{% endif %}
+
 <p class="muted" style="margin-top:14px;font-size:12px">
 口径备注：呆滞 = FIFO 流水重放账龄 &gt; {{ constants.stale }} 天的部分 ·
 超储 = 近 {{ constants.dos }} 天有消耗且可售天数（{{ constants.dos_win }} 天窗口日均）&gt; {{ constants.dos }} 天 ·
 超耗 = 实际领料超 BOM 计划 {{ constants.bom_pct }}% ·
-ABC 按窗口消耗金额累计 80/95% 分档 · 呆滞/超储不受页面时间窗口影响
+ABC 按窗口消耗金额累计 80/95% 分档 · 呆滞/超储不受页面时间窗口影响 ·
+品项归因：置信度 ≥0.8 的判定必含机制证据（BOM 系数为 0 / 原因为空 / 不在配方 / 无成本），
+未命中规则的一律标「待判定」且置信度 0，不硬猜
 </p>
 {% endblock %}

@@ -269,14 +269,19 @@ def submit():
         )
         planned = grams_to_stock(batch_recipe_qty, gpu)  # 库存单位
         raw = request.form.get(f"actual_{b['item_id']}", "").strip()
+        # planned_default 区分「真填了实际用量」和「系统拿计划量兜底」。
+        # 不记录这个标记，L1 配方偏差就会被 98%+ 的兜底行稀释成噪声
+        # （docs/2026-10-20-production-loss-design.md §0）。
+        planned_default = 1 if raw == "" else 0
         actual = parse_qty(raw) if raw != "" else planned  # 表单已传库存单位
         if actual < 0:
             flash(f"原料 {b['item_name']} 实际消耗不能为负")
             return redirect(url_for("production.session", product_id=product_id))
-        plan.append((int(b["item_id"]), b["item_name"], float(b["stock"]), planned, actual))
+        plan.append((int(b["item_id"]), b["item_name"], float(b["stock"]),
+                     planned, actual, planned_default))
 
     # 硬性拦截: 库存不足
-    for item_id, name, stock, planned, actual in plan:
+    for _item_id, name, stock, _planned, actual, _pd in plan:
         if actual > stock:
             flash(f"原料 {name} 库存不足（需 {actual}，现有 {stock}）")
             return redirect(url_for("production.session", product_id=product_id))
@@ -290,19 +295,27 @@ def submit():
     )
     run_id = int(cur.lastrowid)
 
-    for item_id, name, stock, planned, actual in plan:
-        db.execute(
+    for item_id, _name, _stock, planned, actual, planned_default in plan:
+        cur_pri = db.execute(
             """INSERT INTO production_run_items
-               (run_id, item_id, planned_qty, actual_qty) VALUES (?, ?, ?, ?)""",
-            (run_id, item_id, planned, actual),
+               (run_id, item_id, planned_qty, actual_qty, planned_default)
+               VALUES (?, ?, ?, ?, ?)""",
+            (run_id, item_id, planned, actual, planned_default),
         )
+        pri_id = int(cur_pri.lastrowid)
         # 双写 outbound_requests 让 /outbound 出库记录页面也能看到生产领料
         # reason 标识生产 run id 以便回退时定位
-        db.execute(
+        cur_ob = db.execute(
             """INSERT INTO outbound_requests
-               (item_id, requested_quantity, reason, status, rolled_back, created_at)
-               VALUES (?, ?, ?, '出库', 0, ?)""",
+               (item_id, requested_quantity, reason, status, rolled_back,
+                created_at, source_type)
+               VALUES (?, ?, ?, '出库', 0, ?, 'production')""",
             (item_id, actual, f"生产领料(run=#{run_id})", now()),
+        )
+        # 显式外键，归因引擎不再靠 reason 字符串解析（脆弱且不可索引）
+        db.execute(
+            "UPDATE production_run_items SET outbound_req_id = ? WHERE id = ?",
+            (int(cur_ob.lastrowid), pri_id),
         )
         db.execute(
             "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
