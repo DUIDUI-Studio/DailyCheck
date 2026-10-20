@@ -7,3 +7,12 @@ starlette>=0.40
 uvicorn>=0.30
 anyio>=4.0
 click>=8.1
+
+# --- 企业微信库存助手（bot/）---
+# 运行时用独立 venv（见 bot/requirements.txt），但这里必须登记：
+# CI 只装本文件，而 tests/bot/test_agent.py 要 import bot.agent（依赖 aiohttp），
+# 缺了会在收集阶段直接 ERROR。几个包都很小，装进主站 venv 不影响运行。
+aiohttp>=3.9
+websockets>=12.0
+pyee>=11.0
+wecom-aibot-python-sdk==1.0.2
