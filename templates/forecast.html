@@ -165,7 +165,7 @@
   <div class="fc-decide-stats">
     <div>
       <span class="fc-big">{{ kpi.action_items }}</span>
-      <span class="fc-small">需订品项</span>
+      <span class="fc-small" title="断货风险 + 本周到点，即本周需要下单的全部品项">本周下单品项</span>
     </div>
     <div>
       <span class="fc-big">{{ kpi.critical_count }}</span>
@@ -243,16 +243,20 @@
 
 {# ── L2 该订什么 ────────────────────────────────────────────────── #}
 <h3 class="fc-h3">该订什么<span class="fc-h3-note">
-  {% if scope_is_dc %}配送中心向供应商采购{% elif scope_is_store %}{{ scope_label }}向 DC 订货{% else %}按紧急度排序，先断货风险后本周需订{% endif %}
+  {% if scope_is_dc %}配送中心向供应商采购{% elif scope_is_store %}{{ scope_label }}向 DC 订货{% else %}按紧急度排序：断货风险优先，其次本周到点{% endif %}
   · <a href="#view" class="fc-h3-link">切换视角</a>
 </span></h3>
 
 {% if actions %}
 <div class="fc-tabs" role="tablist" aria-label="行动清单筛选">
-  <button type="button" class="cat-chip is-active" data-status="__all" role="tab" aria-selected="true">全部 {{ actions | length }}</button>
-  <button type="button" class="cat-chip" data-status="critical" role="tab" aria-selected="false">断货风险 {{ status_counts.get('critical', 0) }}</button>
-  <button type="button" class="cat-chip" data-status="due" role="tab" aria-selected="false">本周需订 {{ status_counts.get('due', 0) }}</button>
-  <button type="button" class="cat-chip" data-status="over_rounding" role="tab" aria-selected="false">取整超储 {{ kpi.over_rounding_count }}</button>
+  <button type="button" class="cat-chip is-active" data-status="__all" role="tab" aria-selected="true"
+          title="断货风险 + 本周到点，即本周需要下单的全部品项">本周下单 {{ actions | length }}</button>
+  <button type="button" class="cat-chip" data-status="critical" role="tab" aria-selected="false"
+          title="库存撑不到到货（含在途），必须立即下单">断货风险 {{ status_counts.get('critical', 0) }}</button>
+  <button type="button" class="cat-chip" data-status="due" role="tab" aria-selected="false"
+          title="库存还能撑过到货期，但已到订货周期。提前期长的仓，多数待订项会先进入断货风险，因此该数可能为 0">本周到点 {{ status_counts.get('due', 0) }}</button>
+  <button type="button" class="cat-chip" data-status="over_rounding" role="tab" aria-selected="false"
+          title="按最小包装取整后，订一次就会超过目标水位的品项">取整超储 {{ kpi.over_rounding_count }}</button>
 </div>
 
 <div class="table-scroll fc-scroll">
@@ -303,7 +307,7 @@
     </tbody>
   </table>
 </div>
-<p class="fc-footnote">表格可上下滚动（共 {{ actions | length }} 行）；「可支撑」低于到货提前期为断货风险，低于「提前期＋订货周期」为本周需订。</p>
+<p class="fc-footnote">表格可上下滚动（共 {{ actions | length }} 行）；「可支撑」低于到货提前期为断货风险，低于「提前期＋订货周期」为本周到点。两者都要在本周下单，合计即上方「本周下单」的数目。{% if actions and status_counts.get('due', 0) == 0 %} 本视角暂无「本周到点」的品项 —— 待订项已全部进入断货风险。{% endif %}</p>
 {% else %}
 <p class="muted">本期无建议订货品项。</p>
 {% endif %}
