@@ -1312,7 +1312,9 @@ def plan_item(
 
 STATUS_LABELS = {
     STATUS_CRITICAL: "断货风险",
-    STATUS_DUE: "本周需订",
+    # 「本周需订」会被读成「本周要订的全部」，而断货风险项同样要本周下单，
+    # 提前期长的仓 due 常为 0 → 误读成「有风险却不用采购」。改叫「本周到点」。
+    STATUS_DUE: "本周到点",
     STATUS_HEALTHY: "正常",
     STATUS_OVERSTOCK: "积压",
     STATUS_DEAD: "无库存无消耗",
