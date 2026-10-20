@@ -14,7 +14,7 @@
 
 - 蓝图 21 个（已装配 20 / 未装配 1）
 - 路由 **170** 条（按鉴权强度：平台超管 49 · 登录 46 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · 任一权限 1）
-- 数据表 **59** 张，`WAREHOUSE_SCHEMA_VERSION = 3`
+- 数据表 **60** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
 
@@ -333,24 +333,24 @@
 
 ## 3. 数据层
 
-- `WAREHOUSE_SCHEMA_VERSION = 3`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
-- 表 59 张：
+- `WAREHOUSE_SCHEMA_VERSION = 4`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
+- 表 60 张：
 
 - `adjustment_requests` · `agent_tokens` · `approval_policies` · `audit_log`
 - `canonical_categories` · `canonical_claim_requests` · `canonical_conflicts` · `canonical_item_aliases`
 - `canonical_items` · `canonical_publish_event_items` · `canonical_publish_event_warehouses` · `canonical_publish_events`
 - `categories` · `daily_revenue` · `feedback_comments` · `feedback_tickets`
-- `forecast_runs` · `ic_recipe_items` · `ic_recipes` · `item_publish_event_items`
-- `item_publish_event_warehouses` · `item_publish_events` · `items` · `login_throttle`
-- `notification_prefs` · `notifications` · `outbound_requests` · `permission_routes`
-- `permissions` · `procurement_cache` · `procurement_config` · `product_bom`
-- `production_run_items` · `production_runs` · `products` · `recipe_items`
-- `recipe_publish_event_warehouses` · `recipe_publish_events` · `recipe_versions` · `recipe_versions_new`
-- `recipes` · `restock_requests` · `role_permissions` · `roles`
-- `shipping_rules` · `stock_movements` · `stocktake_batches` · `stocktakes`
-- `store_order_cart_items` · `store_order_carts` · `store_order_deliveries` · `store_order_items`
-- `store_order_receipts` · `store_order_status_history` · `store_orders` · `tenants`
-- `users` · `warehouse_users` · `warehouses`
+- `forecast_runs` · `ic_recipe_items` · `ic_recipes` · `item_loss_ledger`
+- `item_publish_event_items` · `item_publish_event_warehouses` · `item_publish_events` · `items`
+- `login_throttle` · `notification_prefs` · `notifications` · `outbound_requests`
+- `permission_routes` · `permissions` · `procurement_cache` · `procurement_config`
+- `product_bom` · `production_run_items` · `production_runs` · `products`
+- `recipe_items` · `recipe_publish_event_warehouses` · `recipe_publish_events` · `recipe_versions`
+- `recipe_versions_new` · `recipes` · `restock_requests` · `role_permissions`
+- `roles` · `shipping_rules` · `stock_movements` · `stocktake_batches`
+- `stocktakes` · `store_order_cart_items` · `store_order_carts` · `store_order_deliveries`
+- `store_order_items` · `store_order_receipts` · `store_order_status_history` · `store_orders`
+- `tenants` · `users` · `warehouse_users` · `warehouses`
 
 ## 4. MCP 工具域
 

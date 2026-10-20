@@ -898,6 +898,62 @@ CREATE TABLE IF NOT EXISTS recipe_items (
 
 CREATE INDEX IF NOT EXISTS idx_recipe_items_recipe ON recipe_items(recipe_id);
 CREATE INDEX IF NOT EXISTS idx_ic_recipe_items_ic_recipe ON ic_recipe_items(ic_recipe_id);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- 品项级误差台账（v4，2026-10-20）
+-- 设计：docs/2026-10-20-production-loss-design.md §9
+--
+-- 一行 = 一个品项在某一层（L0~L3）的一次误差事件 + 一条归因判定。
+-- `item_sku` 而非 `item_id` 是刻意的：db/clone.py / db/import_items.py 重建
+-- 库时 items.id 会变，历史误差条目会整体错位；sku 是 UNIQUE NOT NULL 的
+-- 业务长期键（5 仓实测 516 行、0 空、0 重复）。
+-- 名称/单位/成本一律快照，不实时 join —— 品项改名或调价后判定理由仍可复现。
+-- `value_state` 区分「金额已核算」与「该品项无成本、仅计量」，
+-- 后者绝不能以 0 元混进金额合计。
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS item_loss_ledger (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    warehouse_code    TEXT NOT NULL,
+    item_sku          TEXT NOT NULL,
+    canonical_sku     TEXT,
+    item_name         TEXT NOT NULL,
+    category_name     TEXT,
+    unit              TEXT NOT NULL DEFAULT '',
+    unit_cost         REAL NOT NULL DEFAULT 0,
+
+    layer             TEXT NOT NULL,
+    source_table      TEXT NOT NULL,
+    source_id         INTEGER NOT NULL,
+    run_id            INTEGER,
+    batch_id          INTEGER,
+    event_at          TEXT NOT NULL,
+
+    err_qty           REAL NOT NULL,
+    err_value         REAL NOT NULL,
+    delta_sign        INTEGER NOT NULL DEFAULT -1,
+
+    cause_primary     TEXT NOT NULL,
+    cause_secondary   TEXT,
+    cause_code        TEXT NOT NULL,
+    confidence        REAL NOT NULL DEFAULT 0,
+    evidence_json     TEXT NOT NULL DEFAULT '{}',
+    reason_text       TEXT NOT NULL DEFAULT '',
+
+    self_reversed     INTEGER NOT NULL DEFAULT 0,
+    value_state       TEXT NOT NULL DEFAULT 'deployed',
+    resolved          INTEGER NOT NULL DEFAULT 0,
+    resolved_by       TEXT,
+    resolved_at       TEXT,
+    detected_at       TEXT NOT NULL,
+
+    UNIQUE (warehouse_code, layer, source_table, source_id, cause_code)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_sku
+    ON item_loss_ledger(warehouse_code, item_sku);
+CREATE INDEX IF NOT EXISTS idx_ledger_event
+    ON item_loss_ledger(event_at);
+CREATE INDEX IF NOT EXISTS idx_ledger_cause
+    ON item_loss_ledger(cause_primary);
 """
 
 
@@ -1334,7 +1390,10 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 #   v1 → canonical 列（canonical_id / is_alias / canonical_status / ...）
 #   v2 → items.is_active（方案 P0-10 单仓品项启停，2026-10-09）
 #   v3 → items.order_multiple（门店订货起订倍数，2026-10-18）
-WAREHOUSE_SCHEMA_VERSION = 3
+#   v4 → 生产损耗归因：production_run_items.planned_default / outbound_req_id、
+#        outbound_requests.source_type（+ 存量回填）、item_loss_ledger 表
+#        （docs/2026-10-20-production-loss-design.md，2026-10-20）
+WAREHOUSE_SCHEMA_VERSION = 4
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
@@ -1447,6 +1506,63 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_categories_canonical_code "
             "ON categories(canonical_code)"
+        )
+        # ─────────────────────────────────────────────────────────────────
+        # v4（2026-10-20）：生产损耗品项级归因所需的两列。
+        # 设计见 docs/2026-10-20-production-loss-design.md §2.2 / §2.3。
+        #
+        # planned_default：区分「操作员真填了实际用量」和「系统拿计划量兜底」。
+        # production.py 原来 raw == "" 时直接 actual = planned，导致
+        # production_run_items 里 98.99%（wh_003 881/890）的行 planned == actual，
+        # L1 配方偏差指标因此完全失真。**历史行回填 1（保守）**——旧数据无法
+        # 区分，一律按「不可判」处理，宁可少算也不虚报超耗。
+        #
+        # outbound_req_id：显式外键到双写的出库行，替代 reason 字符串解析
+        # （'生产领料(run=#N)'）。历史行**不在此回填**：该函数每个请求都会跑，
+        # 塞大表 UPDATE 风险过高；查询侧用 reason 解析兜底（见
+        # reports_loss_pure._load_run_items 的说明）。
+        # ─────────────────────────────────────────────────────────────────
+        pri_cols = {
+            r[1] for r in conn.execute(
+                "PRAGMA table_info(production_run_items)").fetchall()
+        }
+        if "planned_default" not in pri_cols:
+            conn.execute(
+                "ALTER TABLE production_run_items "
+                "ADD COLUMN planned_default INTEGER NOT NULL DEFAULT 1"
+            )
+        if "outbound_req_id" not in pri_cols:
+            conn.execute(
+                "ALTER TABLE production_run_items ADD COLUMN outbound_req_id INTEGER"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pruni_outbound "
+            "ON production_run_items(outbound_req_id)"
+        )
+        # outbound_requests.source_type：结构化出库来源，替代 reason LIKE 猜测。
+        # 回填三条 UPDATE 全部带 `WHERE source_type IS NULL`，可重复执行。
+        # 顺序敏感：先匹生产领料，再匹盘点盘亏，其余才归 manual。
+        ob_cols = {
+            r[1] for r in conn.execute(
+                "PRAGMA table_info(outbound_requests)").fetchall()
+        }
+        if "source_type" not in ob_cols:
+            conn.execute("ALTER TABLE outbound_requests ADD COLUMN source_type TEXT")
+        conn.execute(
+            "UPDATE outbound_requests SET source_type = 'production' "
+            "WHERE source_type IS NULL AND reason LIKE '生产领料(run=#%'"
+        )
+        conn.execute(
+            "UPDATE outbound_requests SET source_type = 'stocktake_loss' "
+            "WHERE source_type IS NULL AND reason LIKE '盘点审核%盘亏'"
+        )
+        conn.execute(
+            "UPDATE outbound_requests SET source_type = 'manual' "
+            "WHERE source_type IS NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_source "
+            "ON outbound_requests(source_type)"
         )
         conn.commit()
         # Stamp the db so future calls short-circuit on the version read.

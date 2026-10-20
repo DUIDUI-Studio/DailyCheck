@@ -15,6 +15,7 @@ from datetime import datetime
 from flask import Blueprint, g, render_template, request
 
 import reports_health_pure as hp
+import reports_loss_pure as lp
 from db import get_master_db, get_warehouse_db
 from permissions import current_permissions, require_login, require_permission, require_role
 
@@ -407,6 +408,9 @@ def _build_health_context(range_param: str, sort_key: str) -> dict:
     stocktake = hp.compute_stocktake_quality(db, now)
     production = hp.compute_production(db, cutoff)
     sku_rows = hp.build_sku_table(db, stale_dos, abc, cutoff, sort_key)
+    # 品项级误差台账：归因窗口固定 LOSS_LOOKBACK_DAYS，与页面 range 解耦
+    # （冲销对可能跨月，用 7 天窗口会把盘盈盘亏拆散，判不出来）。
+    loss = lp.build_ledger_context(db, wh_code or "_unassigned", now)
 
     stale_rows = [r for r in sku_rows if r["stale_qty"] > 1e-9]
     overstock_rows = [r for r in sku_rows
@@ -441,6 +445,7 @@ def _build_health_context(range_param: str, sort_key: str) -> dict:
         "fulfill": fulfill,
         "stocktake": stocktake,
         "production": production,
+        "loss": loss,
         "stale_rows": stale_rows,
         "overstock_rows": overstock_rows,
         "stale_value": stale_value,
@@ -555,6 +560,53 @@ def health_export():
         for r in prod["categories"]:
             w.writerow([r["name"], r["consumed"], r["share"],
                         r["overuse_pct"] if r["overuse_pct"] is not None else "—"])
+
+    # 段 6:品项误差台账（归因）
+    # evidence_json 压缩成一行导出：外部拿到"0.90 置信度"必须能复核，
+    # 否则这个数字和拍脑袋没区别。
+    loss = ctx.get("loss") or {}
+    w.writerow([])
+    w.writerow([f"品项误差台账（回看 {loss.get('lookback_days', '—')} 天）"])
+    tot = loss.get("totals") or {}
+    if tot:
+        w.writerow(["误差条数", tot.get("count", "—")])
+        w.writerow(["可计价金额", tot.get("value", "—")])
+        w.writerow(["无法计价条数", tot.get("unknown_count", "—")])
+        w.writerow(["已自愈条数（冲销对）", tot.get("self_reversed_count", "—")])
+        w.writerow(["已自愈金额（不计入损耗率）", tot.get("self_reversed_value", "—")])
+    w.writerow(["SKU", "品项", "品类", "层", "发生时间", "误差量", "单位",
+                "金额", "主因", "原因码", "置信度", "已自愈", "判定理由",
+                "溯源表", "溯源ID", "证据"])
+    for r in loss.get("top_rows", []):
+        w.writerow([
+            r["item_sku"], r["item_name"], r["category_name"] or "", r["layer"],
+            r["event_at"], r["err_qty"], r["unit"],
+            r["err_value"] if r["value_state"] != "unknown" else "—",
+            (loss.get("labels") or {}).get(r["cause_primary"], r["cause_primary"]),
+            r["cause_code"], r["confidence"],
+            "是" if r["self_reversed"] else "否", r["reason_text"],
+            r["source_table"], r["source_id"], r["evidence_json"],
+        ])
+    for r in loss.get("self_reversed", []):
+        w.writerow([
+            r["item_sku"], r["item_name"], r["category_name"] or "", r["layer"],
+            r["event_at"], r["err_qty"], r["unit"], r["err_value"],
+            (loss.get("labels") or {}).get(r["cause_primary"], r["cause_primary"]),
+            r["cause_code"], r["confidence"], "是（不计入损耗率）",
+            r["reason_text"], r["source_table"], r["source_id"],
+            r["evidence_json"],
+        ])
+    w.writerow([])
+    w.writerow(["SKU", "品项", "误差事件", "暴露次数", "误差率%",
+                "盘亏次数", "盘点次数", "盘亏率%", "可计价金额", "主因", "主因占比%"])
+    for it in loss.get("item_rates", []):
+        w.writerow([
+            it["sku"], it["name"], it["events"], it["exposure"],
+            it["err_rate"] if it["err_rate"] is not None else "—",
+            "", it["inspections"],
+            it["loss_rate"] if it["loss_rate"] is not None else "—",
+            it["value"], it["dominant_label"], it["dominant_share"],
+        ])
 
     filename = f"health-{_dtmod.datetime.now().strftime('%Y-%m-%d')}-{ctx['range']}.csv"
     return current_app.response_class(

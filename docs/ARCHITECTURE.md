@@ -894,6 +894,7 @@ flowchart TB
         WecomNotifyPure["wecom_notify_pure.py<br/>企微群机器人推送<br/>（对外通道，§3.9）"]
         PublishRecipePure["publish_recipe_pure.py"]
         ReportsHealthPure["reports_health_pure.py<br/>FIFO 账龄重放 / DOS / ABC / BOM 超耗"]
+        ReportsLossPure["reports_loss_pure.py<br/>品项级误差归因 / 冲销对识别 / 误差概率"]
     end
 
     Entry --> Shared
@@ -1667,6 +1668,29 @@ with app.test_client() as c, c.session_transaction() as s:
 - **提交点接线必须有路由级用例**：`tests/test_wecom_notify_hook.py` 直接调悬挂挂钩函数，覆盖不到「视图里那一行有没有被删」；`tests/test_wecom_notify_route_wiring.py` 从 HTTP 入口断言「恰好调用 1 次 / 独立连接可见订单（commit 先于通知）/ 被拦提交不推送 / 通知异常不下沉」，删除 `submit_order_route` 中的 `_notify_wecom_new_order(order)` 即实战红（2026-10-17 补，QA 阻断项）。
 
 - **开关粒度**：v1 是「一个事件一个 webhook」。要做多群 / 多事件时在 `WEBHOOK_EVENT_MAP` 登记新的 config 属性，不要在视图里写 `if 群A ... else 群B`。
+
+### 13.11 品项级误差归因口径（2026-10-20 起）
+
+设计见 [`docs/2026-10-20-production-loss-design.md`](2026-10-20-production-loss-design.md)，实现在 `reports_loss_pure.py`。
+这一层的错判代价比普通报表高（会把「录入错误」报成「本月损耗 216 万」），所以立五条硬规矩：
+
+- **机制证据优先于统计证据**：`confidence >= 0.8` 的判定必须至少含一条机制证据
+  （BOM `qty_per_unit=0`、出库 `reason` 为空、品项不在任何 BOM、`unit_cost=0`）。
+  仅靠「数值接近 / 方向一致」这类统计信号时置信度封顶 0.65，切进「待复核」队列。
+  起因：PP091 出库 2208.18 与盘亏 2208.06 相差 0.005%，按数值匹配会判成「重复计量」，
+  实际是先盘盈 +2208.35、次日盘亏 −2208.06 的冲销对，净影响仅 +0.29 桶。
+- **冲销对识别必须排除盘点自身产生的流水**：盘盈写 `action='库存调整'`、盘亏写 `action='出库'`
+  （note 均以 `盘点审核` 开头）。`reports_loss_pure._FLOW_ACTIONS` 刻意不含 `库存调整`，
+  且查询带 `note NOT LIKE '盘点%'` —— 漏掉任一条，每对盘盈盘亏都会因「中间存在流水」而配不上，
+  216 万会一直挂在损耗榜首。回归用例 `test_reversal_pair_ignores_stocktake_own_movements` 钉住，
+  并做过变异验证（删过滤条件即变红）。
+- **台账以 `items.sku` 为键，不用 `items.id`**：`db/clone.py` / `db/import_items.py` 重建库时
+  `id` 会变，历史误差条目会整体错位；`sku` 是 `UNIQUE NOT NULL` 的业务长期键（5 仓 516 行、0 空、0 重复）。
+  品名/单位/成本一律快照落表，不实时 join —— 改名或调价后判定理由必须仍可复现。
+- **无法计价的误差不许显示为 0 元**：`unit_cost=0` 的品项落 `value_state='unknown'`，
+  页面显示「—」，`summarize` 单列 `unknown_count` / `blind_spots`，金额合计只累加可计价行。
+- **误差率分母必须含盘点次数**：L3 盘亏事件是盘点产生的，分母漏掉盘点会算出 120% 这种荒谬值（实测 PP056）。
+  `err_rate = events / (出库 + 生产投料 + 盘点)`，分母为 0 返回 `None`（页面显示「—」）。
 
 ---
 
