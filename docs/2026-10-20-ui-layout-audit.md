@@ -405,7 +405,11 @@ templates/
 | 表格横滚 | 未包装表已自动补 `.table-scroll`；`users` 页因自带 `.users-table-wrap` 正确跳过 |
 | 文字竖排扫描 | 27 组全量扫描（h1–h4/span/strong/label/td/th/a/button），**0 命中** |
 | pytest（导航/母板） | `test_nav_integration.py` + `test_base_nav_isadmin.py` → **59 passed** |
-| pytest（全量） | 见下节结论 |
+| pytest（全量） | `tests/ --ignore=tests/mcp_server` → **14 failed / 1839 passed**；14 条全部在 `tests/known_failures.txt` 登记清单内（清单 16 条 − 2 条 mcp_server），**失败集零净增** |
+
+**验证环境**：macOS / Google Chrome（Playwright `channel=chrome`）/ 视口 360×780、768×1024、1440×900。
+另有一条独立失败 `test_blue_green_implementation.py::test_config_db_dir_env_override` 由验证时注入的
+`DAILYCHECK_DB_DIR` 环境变量引起，不设该变量时单项通过，非代码缺陷。
 
 > 验证脚本为一次性临时脚本（`/tmp/dc_render.py`、`/tmp/dc_shots.py`），未入库。
 > DB 用 `/tmp/dc-ui-audit-db` 副本，未触碰工作树 `db/`。
