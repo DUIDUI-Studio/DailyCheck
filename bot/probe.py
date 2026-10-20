@@ -44,7 +44,9 @@ logger = logging.getLogger("bot.probe")
 REPLY_TIMEOUT_SECONDS = 5.0
 
 # 凭证类错误码：命中就退出，不要假装还在跑。853000 = bot_id/secret 不匹配。
-AUTH_ERROR_CODES = ("853000", "853001")
+# 故意写成整数：字符串元组会被密钥扫描器误判成「账号:密码」对（GitGuardian
+# 报的 Authentication Tuple 就是这么来的），而错误码本身是数字。
+AUTH_ERROR_CODES = (853000, 853001)
 AUTH_ERROR_HINT = "invalid bot_id or secret"
 
 
@@ -171,7 +173,7 @@ async def amain(config: BotConfig) -> int:
         nonlocal auth_rejected
         message = str(error)
         logger.error("连接错误：%s", message)
-        if any(code in message for code in AUTH_ERROR_CODES) or AUTH_ERROR_HINT in message:
+        if any(str(code) in message for code in AUTH_ERROR_CODES) or AUTH_ERROR_HINT in message:
             auth_rejected = True
             logger.error("凭证被拒。核对 WECOM_BOT_ID / WECOM_BOT_SECRET 后重跑。")
             stop.set()

@@ -19,7 +19,7 @@ from typing import Any
 
 from bot import agent
 from bot.config_pure import BotConfig, BotConfigError, load_bot_config, mask_secret
-from bot.probe import _SdkLogger, force_direct_connection
+from bot.probe import AUTH_ERROR_CODES, _SdkLogger, force_direct_connection
 from bot.probe_pure import strip_mention
 
 try:
@@ -150,7 +150,7 @@ async def amain(config: BotConfig) -> int:
         nonlocal auth_rejected
         message = str(error)
         logger.error("连接错误：%s", message)
-        if any(code in message for code in ("853000", "853001")) or "invalid bot_id" in message:
+        if any(str(code) in message for code in AUTH_ERROR_CODES) or "invalid bot_id" in message:
             auth_rejected = True
             logger.error("凭证被拒。核对 WECOM_BOT_ID / WECOM_BOT_SECRET 后重跑。")
             stop.set()
