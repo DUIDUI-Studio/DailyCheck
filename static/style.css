@@ -74,6 +74,10 @@ h2, h3 {
 .kpi-card.kpi-warn { border-color: #f59e0b; background: #fffbeb; }
 .kpi-card.kpi-warn .kpi-value { color: #92400e; }
 @media (max-width: 720px) { .kpi-row { grid-template-columns: 1fr 1fr; } }
+/* 中屏（iPad 竖屏 ~768px）此前直接从 5 列掉到 2 列，卡片过宽、行数翻倍；补 3 列档。 */
+@media (min-width: 721px) and (max-width: 1099px) {
+  .kpi-row { grid-template-columns: repeat(3, 1fr); }
+}
 .cols-3 { grid-template-columns: 1fr; }
 
 .card small { font-size: 14px; font-weight: 400; }
@@ -385,16 +389,20 @@ td.inline form { margin: 0; display: inline-flex; }
 .warn-row { background: #fef9c3; }
 .danger-row { background: #fef9c3; }
 
+/* 表格布局（2026-10-20 修复）：此前用 display:block 换取 overflow-x 横滚。
+   实测（Chrome / 768px 受控用例）block 化的真实后果是：
+     ① 表格不再吃 width:100%，收缩到内容自然宽度（464px vs 容器 739px），右侧留白；
+     ② table-layout:fixed 失效（bom-table 的定宽列依赖它）；
+     ③ border-radius 圆角裁切失效。
+   列对齐本身不会错位 —— thead/tbody 仍被放进同一个匿名表。
+   现恢复 table 布局；横滚交给 .table-scroll 包装层（base.html 脚本负责补包）。 */
 table {
   width: 100%;
   border-collapse: collapse;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 14px;
-  overflow: hidden;
-  display: block;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+  display: table;
 }
 
 thead, tbody, tr { width: 100%; }
@@ -1117,6 +1125,14 @@ code {
   height: 500px;
   overflow-y: auto;
 }
+/* 手机单列后 sticky 失去意义，且固定 500px 高度会吃掉半屏 —— 改为流式面板。 */
+@media (max-width: 720px) {
+  .recipe-pane {
+    position: static;
+    height: auto;
+    max-height: 260px;
+  }
+}
 .recipe-pane h3 { margin: 0 0 4px; font-size: 16px; }
 .recipe-pane .recipe-hint { margin: 0 0 12px; font-size: 12px; }
 .recipe-list { list-style: none; margin: 0; padding: 0; }
@@ -1711,6 +1727,10 @@ table.bom-table td .bom-temp-price {
 .rc-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text); }
 
 .recipe-card__summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+/* 窄屏两列会把数值挤成竖排换行，降到单列。 */
+@media (max-width: 560px) {
+  .recipe-card__summary { grid-template-columns: 1fr; }
+}
 .rc-sum {
   background: linear-gradient(180deg, #f8fafc, #f1f5f9);
   border: 1px solid #eef2f6;
@@ -1821,6 +1841,10 @@ table.bom-table td .bom-temp-price {
 }
 @media (max-width: 480px) {
   .info-card-grid { grid-template-columns: 1fr; }
+}
+/* nowrap + ellipsis 在窄屏会把字段截成「…」，中屏起允许换行。 */
+@media (max-width: 960px) {
+  .info-card-grid > div { white-space: normal; }
 }
 .info-card-totals {
   display: flex;
@@ -2056,6 +2080,9 @@ button.btn-table:focus-visible {
   opacity: 0;
   pointer-events: none;
   transition: opacity 200ms ease, transform 200ms ease;
+  /* 长提示（品项名 + 数量）在窄屏会撑出视口，限宽并允许折行。 */
+  max-width: calc(100vw - 32px);
+  text-align: center;
 }
 .ajax-flash.is-show {
   opacity: 1;

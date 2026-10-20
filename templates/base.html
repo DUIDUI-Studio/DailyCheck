@@ -10,7 +10,7 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=21" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=22" />
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
@@ -193,6 +193,24 @@
         navigator.serviceWorker.register("/sw.js");
       });
     }
+  </script>
+  <script>
+    /* 表格横滚兜底（2026-10-20）：table 恢复 display:table 后自身不能再
+       overflow-x 横滚（原来靠 display:block 换来，代价是 width:100% 与
+       table-layout:fixed 失效）。这里给 main 内尚未包装的表格补一层
+       .table-scroll；父级已有横滚的跳过，避免双层滚动。 */
+    document.addEventListener("DOMContentLoaded", function () {
+      document.querySelectorAll("main table").forEach(function (t) {
+        var p = t.parentElement;
+        if (!p || p.classList.contains("table-scroll")) return;
+        var ox = getComputedStyle(p).overflowX;
+        if (ox === "auto" || ox === "scroll") return;
+        var w = document.createElement("div");
+        w.className = "table-scroll";
+        p.insertBefore(w, t);
+        w.appendChild(t);
+      });
+    });
   </script>
 </body>
 </html>
