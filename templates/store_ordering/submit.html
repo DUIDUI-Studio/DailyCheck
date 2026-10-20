@@ -86,7 +86,7 @@
   </tfoot>
 </table>
 
-<form method="post" class="grid cols-1" style="margin-top:16px;max-width:480px;">
+<form method="post" enctype="multipart/form-data" class="grid cols-1" style="margin-top:16px;max-width:480px;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>
     <span>期望到货日期</span>
@@ -95,6 +95,13 @@
   <label>
     <span>备注</span>
     <textarea name="note" rows="3">{{ note }}</textarea>
+  </label>
+  {# 付款凭证（Issue #135）：随订单一起提交，DC/财务审批时在订单详情页查看。 #}
+  <label>
+    <span>付款凭证</span>
+    <input type="file" name="payment_proofs" multiple
+           accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf" />
+    <small class="muted">支持 JPG / PNG / WEBP / PDF，最多 3 个，单个不超过 8MB。审批时可查看。</small>
   </label>
   <button type="submit" class="btn" {% if errors.unbound or errors.unorderable or errors.multiples %}disabled{% endif %}>发送</button>
 </form>

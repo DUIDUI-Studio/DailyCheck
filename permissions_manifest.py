@@ -318,6 +318,8 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.submit_order_route": perm("order.create"),
     "store_ordering.store_orders_list": LOGIN,
     "store_ordering.order_detail": LOGIN,
+    # 付款凭证：可见性与订单详情一致，视图内部再走 _order_viewable 校验。
+    "store_ordering.payment_proof_download": LOGIN,
     "store_ordering.review_list": f"{DC_PREFIX}{ROLE_PREFIX}staff",
     "store_ordering.review_order_route": f"{DC_PREFIX}{perm('order.approve')}",
     "store_ordering.shipment_list": f"{DC_PREFIX}{ROLE_PREFIX}staff",

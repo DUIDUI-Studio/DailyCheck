@@ -88,6 +88,29 @@
   </div>
 </div>
 
+{# —— 付款凭证（Issue #135）：门店提交订单时上传，审批时在此核对 —— #}
+<h3>付款凭证</h3>
+{% if payment_proofs %}
+<div class="proof-grid">
+  {% for p in payment_proofs %}
+  <a class="proof-item"
+     href="{{ url_for('store_ordering.payment_proof_download', order_id=order.id, proof_id=p.id) }}"
+     target="_blank" rel="noopener">
+    {% if p.mime_type.startswith('image/') %}
+    <img class="proof-thumb" loading="lazy"
+         src="{{ url_for('store_ordering.payment_proof_download', order_id=order.id, proof_id=p.id) }}"
+         alt="{{ p.original_name }}" />
+    {% else %}
+    <span class="proof-pdf">PDF</span>
+    {% endif %}
+    <span class="proof-name">{{ p.original_name }}</span>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<p class="empty">该订单未上传付款凭证</p>
+{% endif %}
+
 <h3>{{ doc_label }}明细</h3>
 
 {# —— 明细表：按视角分支 —— #}

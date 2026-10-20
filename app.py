@@ -22,7 +22,9 @@ def create_app() -> Flask:
     # Only mark the session cookie Secure in production — dev runs plain HTTP,
     # where a Secure cookie would never be sent back by the browser.
     app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION
-    app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB uploads
+    # 16MB：付款凭证单文件上限 8MB、最多 3 个（Issue #135）。
+    # 超过该值 Flask 直接返回 413，不会进视图，故给足余量。
+    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
     # DRY_RUN 模式（Phase 1 蓝绿 PoC）：绿环境启动时设 DRY_RUN=true，
     # db.get_master_db / get_warehouse_db 返 DryRunConnection，

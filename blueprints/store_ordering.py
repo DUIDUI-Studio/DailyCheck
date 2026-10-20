@@ -19,11 +19,14 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_file,
     session,
     url_for,
 )
 
+import config as config_module
 from blueprints import dc_transfer_pure as dtp
+from blueprints import payment_proofs_pure as ppp
 from blueprints import store_ordering_pure as sop
 from blueprints import wecom_notify_pure as wecom_notify
 from blueprints._helpers import parse_qty
@@ -427,6 +430,58 @@ def _notify_wecom_new_order(order: dict[str, Any] | None) -> None:
         logger.warning("wecom_notify_hook_failed: order_no=%s", order_no, exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# 付款凭证（Issue #135）
+# ---------------------------------------------------------------------------
+
+def _collect_payment_proofs() -> list[Any]:
+    """取表单里实际选了文件的字段，空 input 会被浏览器提交成空 filename。"""
+    return [f for f in request.files.getlist("payment_proofs") if f and f.filename]
+
+
+def _validate_payment_proofs(files: list[Any]) -> str | None:
+    """提交前静态校验，返回首个错误；不通过就不建单（避免留下无凭证的单）。"""
+    if not files:
+        return None
+    if len(files) > ppp.MAX_FILES_PER_ORDER:
+        return f"付款凭证最多上传 {ppp.MAX_FILES_PER_ORDER} 个文件"
+    for f in files:
+        declared = getattr(f, "content_length", None) or 0
+        # 浏览器不一定传 content_length：缺失时先只校验扩展名（传 1 占位），
+        # 真实大小在落盘后兜底（见 _save_payment_proofs）。
+        err = ppp.validate_upload(f.filename, declared or 1)
+        if err:
+            return f"{f.filename}：{err}"
+    return None
+
+
+def _save_payment_proofs(master: sqlite3.Connection, order_id: int, files: list[Any]) -> None:
+    """写盘 + 落库。单文件失败只记日志，不回滚已成立的订单。"""
+    if not files:
+        return
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    skipped = 0
+    for f in files:
+        try:
+            meta = ppp.store_upload(f.stream, f.filename, config_module.PAYMENT_PROOF_DIR, order_id)
+            if meta["size_bytes"] > ppp.MAX_FILE_BYTES:
+                ppp.proof_path(
+                    config_module.PAYMENT_PROOF_DIR, order_id, meta["stored_name"],
+                ).unlink(missing_ok=True)
+                skipped += 1
+                continue
+            ppp.insert_proof(master, order_id, meta, g.user["id"], ts)
+        except Exception:
+            logger.warning(
+                "payment_proof_save_failed order_id=%s file=%s",
+                order_id, getattr(f, "filename", "?"), exc_info=True,
+            )
+            skipped += 1
+    master.commit()
+    if skipped:
+        flash(f"有 {skipped} 个付款凭证未能保存，请在订单详情页核对后重新提交")
+
+
 @bp.route("/cart/submit", methods=["GET", "POST"])
 @require_permission("order.create")
 @_storefront_or_admin
@@ -459,12 +514,16 @@ def submit_order_route() -> str:
     if request.method == "POST":
         expected_date = _parse_date_input(request.form.get("expected_delivery_date")) or _tomorrow()
         note = (request.form.get("note") or "").strip()
+        uploads = _collect_payment_proofs()
+        proof_error = _validate_payment_proofs(uploads)
         if expected_date < _today():
             flash("期望到货日期不能早于今天")
         elif unorderable:
             flash("以下品项已被下架，请移除后再提交：" + "、".join(
                 u["canonical_name"] for u in unorderable
             ))
+        elif proof_error:
+            flash(proof_error)
         else:
             validation = sop.validate_cart_for_submit(master, cart)
             if not validation["ok"]:
@@ -478,6 +537,10 @@ def submit_order_route() -> str:
                     master, cart["id"], g.user["id"],
                     _date_input(expected_date), note or None,
                 )
+                # 凭证在订单落库后写：需要 order_id 才能建目录。
+                # 单个文件失败只记日志，不回滚订单 —— 单已经下了，
+                # 凭证缺失可让门店在补传入口补（本期先提示重传）。
+                _save_payment_proofs(master, order["id"], uploads)
                 sop.notify_order_event(master, sop.EVENT_ORDER_SUBMITTED, order, g.user["id"])
                 # 站内通知之后补一条对外通道（企微群）；后台线程发送，
                 # 失败不影响本次提交 —— 见 _notify_wecom_new_order。
@@ -665,6 +728,35 @@ def order_detail(order_id: int) -> str:
             (wh_type == "storefront" and role in ("manager", "admin"))
             or is_admin
         ),
+        # 付款凭证（Issue #135）：门店提交时上传，DC/财务审批时在详情页查看。
+        payment_proofs=ppp.list_proofs(master, order_id),
+    )
+
+
+@bp.route("/orders/<int:order_id>/payment-proofs/<int:proof_id>")
+@require_login
+def payment_proof_download(order_id: int, proof_id: int):
+    """凭证预览/下载。可见性与订单详情页完全一致（_order_viewable）。"""
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    if order is None:
+        abort(404)
+    if not _order_viewable(order):
+        abort(403)
+    proof = ppp.get_proof(master, order_id, proof_id)
+    if proof is None:
+        abort(404)
+    try:
+        path = ppp.proof_path(config_module.PAYMENT_PROOF_DIR, order_id, proof["stored_name"])
+    except ValueError:
+        abort(404)
+    if not path.is_file():
+        abort(404)
+    return send_file(
+        path,
+        mimetype=proof["mime_type"],
+        as_attachment=False,
+        download_name=proof["original_name"],
     )
 
 
