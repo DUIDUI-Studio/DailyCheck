@@ -83,7 +83,7 @@ PP045 ¥20.50 / PP046 ¥17.80。
 
 ## 报告 4/4
 
-见 `reports/pr-<num>/04-local-deploy-preview.md`（开 PR 后重命名目录并补充提交）：
+见 `reports/pr-129/04-local-deploy-preview.md`（开 PR 后重命名目录并补充提交）：
 真实进程启动日志 + `/health` 200 + 健康页归因区块渲染断言 + T11 冒烟的 pre-existing 判定证据。
 
 ## Checklist

@@ -7,7 +7,7 @@
 
 | 字段 | 值 |
 |------|-----|
-| PR | 见 PR 链接（本文件在开 PR 后重命名为 `reports/pr-<num>/`） |
+| PR | #129 |
 | 分支 | feat/item-loss-attribution |
 | 基线 | origin/main @ 4c15d26 |
 | compose 文件 | 未使用（本次无容器/端口/依赖变更） |
