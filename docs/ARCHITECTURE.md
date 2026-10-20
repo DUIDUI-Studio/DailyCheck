@@ -57,7 +57,7 @@
 flowchart TB
     subgraph Browser["浏览器 / PWA"]
         PWA["Service Worker<br/>离线缓存 + manifest"]
-        MobileCSS["mobile-first CSS<br/>(1612 行)"]
+        MobileCSS["mobile-first CSS<br/>(2171 行)"]
     end
 
     subgraph FlaskProc["Flask 进程 (gunicorn -w 2)"]
@@ -1451,7 +1451,7 @@ ALTER，不要另写映射）。
 flowchart LR
     subgraph Client["浏览器 / 手机"]
         HTML["Jinja2 模板<br/>(mobile-first)"]
-        CSS["static/style.css<br/>1612 行"]
+        CSS["static/style.css<br/>2171 行"]
         SW["static/sw.js<br/>Service Worker (72 行)"]
         Manifest["static/manifest.webmanifest<br/>zh-CN / standalone"]
         Icons["static/icons/icon-192.png<br/>icon-512.png"]
@@ -1504,6 +1504,26 @@ flowchart LR
   `{% if is_admin or g.role.role in ('manager','admin') %}`——同一 nav-group 内
   按链接级可见性过滤的既有先例（同「门店订货」组内 `品项管理` 的写法），
   侧栏与 `/land` 两载体条件逐字一致，双向不变量由 `tests/test_reports_health.py::TestNavCarriers` 钉住。
+
+**响应式布局契约（2026-10-20 排版审计后确立，改样式前必读）**：
+
+- **断点**：480 / 560 / 600 / 640 / 720 / 760 / 960 / 1100 px。721–1099 是中屏档
+  （iPad 竖屏 768），历史上多次漏覆盖，新增 grid 容器务必为该档显式定义。
+- **表格必须保持 `display: table`**。历史上用 `table { display: block; overflow-x: auto }`
+  换横滚，实测代价是 ① 丢 `width:100%`（收缩到内容自然宽度）② `table-layout:fixed` 失效
+  ③ 圆角裁切失效。**列对齐不受影响**（thead/tbody 仍进同一匿名表），勿再以「表头错位」为由回退。
+- **横滚的唯一载体是 `.table-scroll`**：`base.html` 在 `DOMContentLoaded` 给 `main` 内未包装的
+  表格自动补一层 `.table-scroll`，父级已有 `overflow-x: auto/scroll` 的跳过。新增页面直接写裸
+  `<table>` 即可，不需要手工包裹。
+- **`style.css:156` 的 `input, select, button { width: 100% }` 是全局陷阱**：任何 flex/grid
+  头栏里的 button 都会被撑满、挤掉同级文本（`/users` 抽屉标题曾因此被压成竖排，实测 h3 仅 29px 宽）。
+  容器内的按钮一律显式 `width: auto` + `flex: 0 0 auto`。
+- **固定层 z-index 层级**：`.mobile-nav` = 100 → `.users-drawer` = 120 → 顶层模态 = 999
+  → `.ajax-flash` = 9999。抽屉类浮层在 `<main>` 内、DOM 早于 mobile-nav，**必须高于 100**。
+- **`position: sticky` + 固定高度只用于双列布局**（如 `.recipe-pane` 的 500px）；
+  单列降级时必须同步解除（`≤720px` 改 `static` + `height:auto`），否则手机上吃掉半屏。
+- 改 `static/*` 后按约定 bump 模板里的 `?v=`（本次 `style.css?v=22` / `login.html?v=13` /
+  `users.html` 的 `users-admin.css?v=3`）。
 
 ---
 

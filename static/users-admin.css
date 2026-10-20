@@ -170,7 +170,9 @@
 .users-drawer {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  /* 高于 .mobile-nav(style.css: z-index 100)：drawer 在 <main> 内、
+     DOM 早于 mobile-nav，同层级时底栏会压在抽屉上且可点击。 */
+  z-index: 120;
   pointer-events: none;
 }
 .users-drawer.is-open {
@@ -203,6 +205,15 @@
 .users-drawer.is-open .users-drawer-panel {
   transform: translateX(0);
 }
+/* 手机竖屏：360px 面板只留 8% 视口做遮罩，改为全宽抽屉；
+   100vh 在移动端浏览器地址栏遮挡下会裁掉底部，换 100dvh。 */
+@media (max-width: 480px) {
+  .users-drawer-panel {
+    width: 100%;
+    max-width: 100%;
+    height: 100dvh;
+  }
+}
 .users-drawer-head {
   display: flex;
   align-items: center;
@@ -221,6 +232,11 @@
   cursor: pointer;
   color: #6b7280;
   border-radius: 6px;
+  /* 全局 button{width:100%}（style.css:156）在 flex 头栏里会把关闭按钮撑满，
+     把标题挤成竖排（实测 h3 只剩 29px 宽、两字上下排）。 */
+  width: auto;
+  flex: 0 0 auto;
+  line-height: 1;
 }
 .users-drawer-close:hover {
   background: #f3f4f6;
