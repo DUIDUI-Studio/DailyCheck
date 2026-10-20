@@ -13,8 +13,8 @@
 ## 0. 一览
 
 - 蓝图 21 个（已装配 20 / 未装配 1）
-- 路由 **171** 条（按鉴权强度：平台超管 50 · 登录 46 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · 任一权限 1）
-- 数据表 **61** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
+- 路由 **172** 条（按鉴权强度：平台超管 50 · 登录 47 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · 任一权限 1）
+- 数据表 **62** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
 
@@ -23,7 +23,7 @@
 | 蓝图 | 文件 | 路由数 | 装配 |
 |---|---|---|---|
 | `recipe_cost` | `recipe_cost.py` | 23 | 在役 |
-| `store_ordering` | `store_ordering.py` | 22 | 在役 |
+| `store_ordering` | `store_ordering.py` | 23 | 在役 |
 | `canonical` | `canonical.py` | 20 | 在役 |
 | `stocktake` | `stocktake.py` | 12 | 在役 |
 | `users` | `users.py` | 12 | 在役 |
@@ -304,6 +304,7 @@
 | `store_ordering.manage_dc_items` | GET,POST | `/dc/items` | 配送中心 | role:manager |
 | `store_ordering.manage_shipping_rule` | GET,POST | `/admin/shipping` | 角色 | admin |
 | `store_ordering.order_detail` | GET | `/orders/<int:order_id>` | 登录 |  |
+| `store_ordering.payment_proof_download` | GET | `/orders/<int:order_id>/payment-proofs/<int:proof_id>` | 登录 |  |
 | `store_ordering.receive_order_route` | POST | `/orders/<int:order_id>/receive` | 权限点 | order.receive |
 | `store_ordering.remove_cart_item_route` | POST | `/cart/remove/<int:cart_item_id>` | 权限点 | order.create |
 | `store_ordering.review_list` | GET | `/review` | 配送中心 | role:staff |
@@ -335,7 +336,7 @@
 ## 3. 数据层
 
 - `WAREHOUSE_SCHEMA_VERSION = 4`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
-- 表 61 张：
+- 表 62 张：
 
 - `adjustment_requests` · `agent_tokens` · `approval_policies` · `audit_log`
 - `canonical_categories` · `canonical_claim_requests` · `canonical_conflicts` · `canonical_item_aliases`
@@ -350,9 +351,9 @@
 - `recipe_versions_new` · `recipes` · `replenishment_config` · `restock_requests`
 - `role_permissions` · `roles` · `shipping_rules` · `stock_movements`
 - `stocktake_batches` · `stocktakes` · `store_order_cart_items` · `store_order_carts`
-- `store_order_deliveries` · `store_order_items` · `store_order_receipts` · `store_order_status_history`
-- `store_orders` · `tenants` · `users` · `warehouse_users`
-- `warehouses`
+- `store_order_deliveries` · `store_order_items` · `store_order_payment_proofs` · `store_order_receipts`
+- `store_order_status_history` · `store_orders` · `tenants` · `users`
+- `warehouse_users` · `warehouses`
 
 ## 4. MCP 工具域
 

@@ -123,6 +123,11 @@ BACKUP_WAREHOUSE_DIR = BASE_DIR / "backups" / "warehouses"
 # Where Q7 措施⑦ routes dry-run copies so they never reach db/warehouses/.
 DRYRUN_COPY_DIR = Path("/tmp/dc_dryrun")
 
+# 付款凭证（Issue #135）：门店提交订单时上传，财务审批时查看。
+# 文件按 <dir>/<order_id>/<uuid>.<ext> 存放；蓝绿两实例共用 BASE_DIR，
+# 因此凭证天然共享。目录不进 git（见 .gitignore）。
+PAYMENT_PROOF_DIR = BASE_DIR / "uploads" / "payment_proofs"
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 安全库存自动计算（2026-10-09 Eric 拍板，方案 P0-12）

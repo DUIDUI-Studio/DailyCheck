@@ -622,6 +622,31 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 ---
 
+### 3.11 付款凭证（随订单提交上传，Issue #135）
+
+**问题**：财务审批订货单时看不到付款凭据，只能线下问门店；提交页原本没有任何附件入口。
+
+**链路**：`templates/store_ordering/submit.html`（`enctype="multipart/form-data"` + `name="payment_proofs"` 多选）→ `blueprints/store_ordering.py::submit_order_route` → `_validate_payment_proofs`（建单前）→ `sop.submit_order()` 落单 → `_save_payment_proofs`（建单后，需要 `order_id` 建目录）→ `blueprints/payment_proofs_pure.py` 落盘 + 写 `store_order_payment_proofs`。查看走 `GET /store-ordering/orders/<id>/payment-proofs/<proof_id>`。
+
+**四道边界**（都在 `payment_proofs_pure.py`，可直接单测）：
+
+| 边界 | 规则 | 落地 |
+|---|---|---|
+| 类型 | 只收 JPG / JPEG / PNG / WEBP / PDF | `ALLOWED_EXTENSIONS`；MIME 由扩展名映射，不信任客户端 `Content-Type` |
+| 大小 | 单文件 ≤ 8MB；全局 `MAX_CONTENT_LENGTH` 由 4MB 提到 16MB | `validate_upload` + `app.py` |
+| 数量 | 每单 ≤ 3 个 | `MAX_FILES_PER_ORDER` |
+| 命名 | 落盘名 = `uuid4().hex + ext`，原名只进 `original_name` | `store_upload`；`proof_path` 再兜一次目录穿越 |
+
+**文件落点**：`config.PAYMENT_PROOF_DIR = BASE_DIR/uploads/payment_proofs/<order_id>/<uuid>.<ext>`，目录不进 git。表里只存 `stored_name` 不存绝对路径——蓝绿两实例共用 `BASE_DIR`，凭证天然共享；将来换目录也不用改库。
+
+**权限**：上传复用 `order.create`（能下单的人才能带凭证）；查看复用订单详情的 `_order_viewable`（本店 / 本单 DC / admin），`ROUTE_MATRIX` 登记为 `LOGIN` + 视图内二次校验。**不单独设凭证权限点**：凭据是订单的一部分，单开一个点会让「能看订单却看不了凭证」变成一种新故障。
+
+**失败语义**：类型 / 数量 / 大小校验在**建单前**，不通过就不建单（避免留下无凭证的单）；落盘失败在建单后，只记 WARNING + flash 提示，**不回滚订单**——单已经下了，凭证缺失可补，退单不是。
+
+**测试**（`tests/test_order_payment_proofs.py`，15 用例）：纯函数（扩展名四形态 / 空文件 / 超限 / 原名保留 / uuid 命名 / 跨目录穿越被拒）、表操作（insert/list/count/get 按订单隔离，跨单取同 id 返回 None）、视图 helper（multipart 字段名接线 / 4 个文件被拒 / 落盘 + 落库闭环）、HTTP（本店 200 且字节一致 / 他店 403 / 跨店 admin 200 / 未知 proof 404 / 未登录 302）。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态

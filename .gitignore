@@ -8,6 +8,9 @@ static/icons/icon-192.tmp
 access.log
 error.log
 health_check.log
+
+# 用户上传（付款凭证等，Issue #135）——运行时数据，不进 git
+uploads/
 .inventory.db.original.backup
 
 # SQLite databases are runtime state, not source. They get re-created

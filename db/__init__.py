@@ -604,6 +604,28 @@ CREATE INDEX IF NOT EXISTS idx_store_order_receipts_item
     ON store_order_receipts(order_item_id, created_at DESC);
 
 -- ============================================================
+-- 付款凭证（Issue #135）
+-- 门店提交订单时随单上传，财务/DC 审批时查看。
+-- 文件落 config.PAYMENT_PROOF_DIR/<order_id>/<uuid>.<ext>，表里只存文件名，
+-- 不存绝对路径 —— 蓝绿两实例共用 BASE_DIR，换机器/换目录不影响已有记录。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS store_order_payment_proofs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    stored_name TEXT NOT NULL,          -- 磁盘文件名（uuid.ext），杜绝路径穿越
+    original_name TEXT NOT NULL,        -- 上传时的原始文件名，仅用于展示
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    uploaded_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
+    FOREIGN KEY (uploaded_by) REFERENCES users(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_store_order_payment_proofs_order
+    ON store_order_payment_proofs(order_id, created_at);
+
+-- ============================================================
 -- 权限精细化（Permission Granularity）—— Phase 3
 -- 5 张表：permissions / roles / role_permissions / permission_routes /
 --         approval_policies。全部 CREATE TABLE IF NOT EXISTS：对存量
