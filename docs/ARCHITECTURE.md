@@ -1410,6 +1410,39 @@ flowchart TB
 - 修复前用户反馈：库存健康页展示了已经被主数据停用的品项；admin 判定：应被品项主数据同步。
 - 测试：`tests/test_reports_health.py::TestIssue121CanonicalDisabledExcluded`（5 个 case，覆盖五个口径 + is_active 守门员回归）。
 
+### 10.99 补货看板（`/forecast`，2026-10-20 重构）
+
+**为什么重做**：旧页面是「单仓前 50 条品项的日均 + 预测总量」，用 `outbound_requests`
+当消耗。该表混有盘点盘亏记录，回测（`scripts/forecast_backtest.py`，298 个观测）
+显示旧口径 **WAPE 191.9%、系统性高估 145%** —— 拿它算补货量会稳定积压。
+
+**分层**（与「为什么」绑定，改动前先读）：
+
+| 层 | 文件 | 职责 | 铁律 |
+|---|---|---|---|
+| 模型 | `blueprints/replenishment_pure.py` | 需求估计 / 安全库存 / 目标水位 / 建议量 / ABC / 周转率 | **纯函数，不打 DB、不 import flask**；全部参数走 `PolicyParams` |
+| 装配 | `blueprints/replenishment_data.py` | 跨仓取数、三口径融合、视图装配 | 只做 I/O 与聚合，业务公式一律回 pure 层 |
+| 路由 | `blueprints/forecast.py` | `/forecast`（HTML）、`/forecast/board.json` | 两个入口共用 `build_board()`，不许各算一套 |
+
+**三口径**：产量（`production_runs.output_qty`）× 单耗 / 领料（`stock_movements`）/
+盘点（`C = I_期初 + 入库 − I_期末`）。`production_run_items.actual_qty` **不是**独立信号
+——它与「生产消耗」动账是同一本账，当第二信号用等于同一份数据算两遍。
+
+**数据**：`master.db` 新增单行表 `replenishment_config`，列名与 `PolicyParams`
+字段一一对应，`load_params()` 按 dataclass 字段名反射读取（加参数只改 dataclass +
+ALTER，不要另写映射）。
+
+**三处容易写错的地方**：
+
+1. `is_orderable=0` 是**门店自采**（不再由 DC 统配备货），不是"暂时下不了单"。
+   DC 侧这类品项整行退出补货计算，否则会把门店消耗算成 DC 采购。
+2. 周转率的分母是**时点**库存，`turns ≡ 365 ÷ 可支撑天数`；目标值由 `Σ(target×cost)`
+   逐行累加（DC 3+7、门店 1+7，同一套政策反推），不套行业基准。
+3. 聚合指标会骗人：某店聚合覆盖 34 天却要订 16 个品项 —— 天数被呆滞品拉高，
+   底层快销品已跌破再订货点。**看板必须同时给聚合与明细**。
+
+设计说明：`docs/2026-10-20-replenishment-board.md`（11 章，含回测与口径取舍）。
+
 ---
 
 ## 11. PWA / 移动端

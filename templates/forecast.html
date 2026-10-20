@@ -1,50 +1,1233 @@
 {% extends "base.html" %}
-{% block title %}预测看板{% endblock %}
+{% block title %}补货看板{% endblock %}
+
+{#
+  补货看板（2026-10-20 重构）
+  ────────────────────────────────────────────────────────────────
+  信息层级（从上到下 = 从「结论」到「证据」）：
+    L0 决策条    —— 本周订不订、订多少（一句话 + 3 个数字）
+    L1 资金/风险 —— 5 个全局 KPI + 4 个风险指标
+    L2 行动清单  —— 「该订什么」逐品项，带安全库存/目标库存/覆盖天数
+    L3 品类总览  —— 各品类总货量（金额口径）+ 覆盖天数 + 建议采购额
+    L4 仓库分布  —— 仓库卡片 + 仓库×品类矩阵
+    L5 方法说明  —— 公式、参数、为什么这样选（可折叠）
+    L6 全品项明细 —— 全部 456 行（可折叠，供核对）
+
+  布局逻辑：先给判断，再给范围，再给单据，最后给依据。品牌负责人
+  在日常巡检里只需要看 L0/L2；要解释数字时才往下展开 L5。
+#}
+
 {% block content %}
-<h1>预测看板</h1>
-<p>未来 {{ horizon }} 天预测，基于过去 30 天加权日均消耗。</p>
+<div class="fc-head">
+  <div>
+    <h2>补货看板</h2>
+    <p class="fc-sub">
+      数据截至 {{ generated_at }} · 需求窗口 {{ params.window_days }} 天 ·
+      门店每周订货 1 次（提前期 {{ params.store_lead_days }} 天）·
+      DC 采购到货 {{ params.dc_lead_days }} 天 · 服务水位 A{{ (params.service_a * 100) | round | int }}% / B{{ (params.service_b * 100) | round | int }}% / C{{ (params.service_c * 100) | round | int }}%
+    </p>
+  </div>
+  <form method="post" action="{{ url_for('forecast.forecast_recompute') }}" class="fc-recompute">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="btn-secondary">记录一次重算</button>
+  </form>
+</div>
 
-<form method="post" action="{{ url_for('forecast.forecast_recompute') }}" style="margin: 12px 0;">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-  <button type="submit">手动重算</button>
-</form>
-
-<table class="forecast-table">
-  <thead>
-    <tr>
-      <th>品项</th>
-      <th>当前库存</th>
-      <th>日均</th>
-      <th>{{ horizon }}天预测</th>
-      <th>状态</th>
-      <th>详情</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for item in items %}
-    <tr>
-      <td>{{ item.name }}</td>
-      <td>{{ '%.2f'|format(item.current_qty) }}</td>
-      <td>{{ '%.2f'|format(item.daily_avg) }}</td>
-      <td>{{ '%.2f'|format(item.forecast_total) }}</td>
-      <td>
-        {% if item.data_status == 'cold_start' %}
-          <span class="badge cold">数据积累中</span>
-        {% else %}
-          <span class="badge ok">OK</span>
-        {% endif %}
-      </td>
-      <td><a href="{{ url_for('forecast.forecast_item', item_id=item.id) }}?horizon_days={{ horizon }}">JSON</a></td>
-    </tr>
+{# ── 视角：看谁的订单 ────────────────────────────────────────────────
+   这一条决定「该订什么」是站在谁的位置看：
+     · 全链    = 所有仓汇总（DC 采购 + 门店订货，两层不可相加）
+     · 配送中心 = DC 向供应商采购的量，需求取全部门店消耗之和
+     · 某门店   = 该店向 DC 订货的量（自采部分自行采购）
+   切换会重算整页，不只是过滤表格 —— 否则 KPI 会和表对不上。        #}
+<div class="fc-view" id="view">
+  <div class="fc-view-head">
+    <span class="fc-view-label">看谁的订单</span>
+    <span class="fc-view-sub">
+      {% if scope_is_dc %}配送中心视角 · 需求 = {{ store_demand | length }} 家门店消耗之和
+      {% elif scope_is_store %}单店视角 · 只看 {{ scope_label }} 向 DC 订的量
+      {% else %}全链汇总 · DC 采购与门店订货是两个层级{% endif %}
+    </span>
+  </div>
+  <div class="fc-view-tabs" role="tablist" aria-label="视角">
+    {% for s in scopes %}
+    <a class="fc-view-tab {% if s.key == scope %}is-active{% endif %}"
+       href="{{ url_for('forecast.forecast_index', scope=s.key, supply=supply, lead=params.dc_lead_days, review=params.dc_review_days, window=params.window_days, overstock=params.overstock_days) }}"
+       role="tab" aria-selected="{{ 'true' if s.key == scope else 'false' }}">
+      <span class="fc-view-name">
+        {{ s.label }}
+        {% if s.is_dc %}<span class="fc-view-tag">DC</span>{% endif %}
+      </span>
+      <span class="fc-view-meta">
+        {% if s.action_items %}{{ s.action_items }} 项 · ¥{{ s.suggested_value | fmt_money }}
+        {% else %}本期无需订货{% endif %}
+      </span>
+    </a>
     {% endfor %}
-  </tbody>
-</table>
+  </div>
+  <p class="fc-view-note">切换后整页重算：结论、KPI、品类、明细都跟着变，不只是过滤这张表。</p>
+</div>
+
+{# ── 供应方式筛选：统配 / 自采 ──────────────────────────────────────
+   两种方式的建议额是两个不同的预算：统配由 DC 备货，自采由门店自行采购。
+   筛选发生在聚合之前，所以切换后 KPI、品类、仓库、明细会一起变。            #}
+<nav class="fc-scope" role="tablist" aria-label="供应方式">
+  <span class="fc-scope-label">供应方式</span>
+  {% for m in supply_modes %}
+  <a href="{{ url_for('forecast.forecast_index', supply=m.key, scope=scope, lead=params.dc_lead_days, review=params.dc_review_days, window=params.window_days, overstock=params.overstock_days) }}"
+     class="fc-scope-chip {% if supply == m.key %}is-active{% endif %}"
+     role="tab" aria-selected="{{ 'true' if supply == m.key else 'false' }}">
+    <span class="fc-scope-name">{{ m.label }}</span>
+    <span class="fc-scope-meta">
+      {% if m.key == 'self' %}门店自采{{ m.action_items }} 项 · ¥{{ m.suggested_value | fmt_money }}
+      {% elif m.key == 'central' %}DC 备货{{ m.action_items }} 项 · ¥{{ m.suggested_value | fmt_money }}
+      {% else %}{{ m.item_count }} 品项 · 建议 ¥{{ m.suggested_value | fmt_money }}{% endif %}
+    </span>
+  </a>
+  {% endfor %}
+</nav>
+<p class="fc-scope-note">
+  {% if supply == 'self' %}
+  当前只看<strong>门店自采</strong>：这些品项已不归配送中心备货，建议量是<strong>门店自行采购</strong>的量，不进 DC 采购单。
+  {% elif supply == 'central' %}
+  当前只看<strong>统配</strong>：由配送中心备货、门店向 DC 订货。这是 DC 的采购范围。
+  {% elif kpi.central_count and kpi.self_count %}
+  <strong>全部</strong>把两种供应方式并在一起看。注意：统配 ¥{{ kpi.central_value | fmt_money }} 与自采 ¥{{ kpi.self_value | fmt_money }} 是<strong>两笔不同的预算</strong>，不能当成一张采购单。
+  {% elif kpi.self_count %}
+  本视角内<strong>只有门店自采</strong>（¥{{ kpi.self_value | fmt_money }}），没有需要 DC 统配的品项。
+  {% elif kpi.central_count %}
+  本视角内<strong>只有统配</strong>（¥{{ kpi.central_value | fmt_money }}），没有门店自采品项。
+  {% else %}
+  本视角内没有需要订货的品项。
+  {% endif %}
+</p>
+
+{# ── 参数探测条：只影响本次渲染，不落库 ────────────────────────────── #}
+<div class="cat-bar fc-chips" role="tablist" aria-label="到货提前期假设">
+  <span class="fc-chips-label">DC 到货</span>
+  {% for lead in [2, 3, 4] %}
+  <a href="{{ url_for('forecast.forecast_index', supply=supply, scope=scope, lead=lead, review=params.dc_review_days, window=params.window_days, overstock=params.overstock_days) }}"
+     class="cat-chip {% if params.dc_lead_days == lead %}is-active{% endif %}"
+     role="tab" aria-selected="{{ 'true' if params.dc_lead_days == lead else 'false' }}">{{ lead }} 天</a>
+  {% endfor %}
+  <span class="fc-chips-sep"></span>
+  <span class="fc-chips-label">订货周期</span>
+  {% for rv in [7, 14] %}
+  <a href="{{ url_for('forecast.forecast_index', supply=supply, scope=scope, lead=params.dc_lead_days, review=rv, window=params.window_days, overstock=params.overstock_days) }}"
+     class="cat-chip {% if params.dc_review_days == rv %}is-active{% endif %}"
+     role="tab" aria-selected="{{ 'true' if params.dc_review_days == rv else 'false' }}">{{ rv }} 天</a>
+  {% endfor %}
+</div>
+
+{# ── L0 决策条 ──────────────────────────────────────────────────── #}
+<section class="fc-decide">
+  <div class="fc-decide-main">
+    <p class="fc-decide-label">本周补货结论</p>
+    <p class="fc-decide-text">
+      {% if kpi.action_items %}
+        {% if scope_is_dc %}
+        配送中心需向供应商采购 <strong>{{ kpi.action_items }}</strong> 个品项，合计
+        <strong>¥{{ kpi.suggested_value | fmt_money }}</strong>。
+        需求量取自 <strong>{{ store_demand | length }}</strong> 家门店的消耗汇总，
+        已扣掉在途与在单。
+        {% elif scope_is_store %}
+        {{ scope_label }}{% if supply == 'self' %}需自采{% else %}需向 DC 订货{% endif %}
+        <strong>{{ kpi.action_items }}</strong> 个品项，合计
+        <strong>¥{{ kpi.suggested_value | fmt_money }}</strong>{% if supply == 'all' and kpi.self_count and kpi.central_count %}
+        （统配 {{ kpi.central_count }} 项 ¥{{ kpi.central_value | fmt_money }}、自采 {{ kpi.self_count }} 项 ¥{{ kpi.self_value | fmt_money }}）{% endif %}。
+        {% elif supply == 'self' %}
+        门店需自采 <strong>{{ kpi.action_items }}</strong> 个品项，合计
+        <strong>¥{{ kpi.suggested_value | fmt_money }}</strong> —— 这部分已不归配送中心备货。
+        {% elif supply == 'central' %}
+        需对 <strong>{{ kpi.action_items }}</strong> 个统配品项下单，合计
+        <strong>¥{{ kpi.suggested_value | fmt_money }}</strong>，
+        其中 DC 直采 <strong>¥{{ (warehouses[0].suggested_value if warehouses else 0) | fmt_money }}</strong>、
+        门店向 DC 订货 <strong>¥{{ (kpi.suggested_value - (warehouses[0].suggested_value if warehouses else 0)) | fmt_money }}</strong>。
+        {% else %}
+        统配 <strong>{{ kpi.central_count }}</strong> 项需下单 <strong>¥{{ kpi.central_value | fmt_money }}</strong>；
+        门店自采 <strong>{{ kpi.self_count }}</strong> 项合计 <strong>¥{{ kpi.self_value | fmt_money }}</strong>。
+        两者是不同预算，建议分开走。
+        {% endif %}
+      {% elif scope_is_dc and supply == 'self' %}
+      配送中心没有自采品项 —— 自采是门店自己安排的，不在 DC 采购范围内。
+      {% elif scope_is_store %}
+      {{ scope_label }}本周期没有需要订货的品项。
+      {% else %}
+      本周期没有需要下单的品项。
+      {% endif %}
+    </p>
+    <p class="fc-decide-note">
+      {{ scope_label }}平均可支撑 <strong>{{ kpi.coverage_days if kpi.coverage_days is not none else '—' }}</strong> 天，
+      安全库存目标 ¥{{ kpi.ss_value | fmt_money }}。
+      {% if kpi.excess_value > 0 %}另有 ¥{{ kpi.excess_value | fmt_money }} 库存已超出目标水位（覆盖 &gt; {{ params.overstock_days | int }} 天），建议暂缓同类补货。{% endif %}
+      {% if supply == 'self' %}本页只统计门店自采品项，DC 的备货范围不在此列。{% endif %}
+    </p>
+  </div>
+  <div class="fc-decide-stats">
+    <div>
+      <span class="fc-big">{{ kpi.action_items }}</span>
+      <span class="fc-small">需订品项</span>
+    </div>
+    <div>
+      <span class="fc-big">{{ kpi.critical_count }}</span>
+      <span class="fc-small">断货风险</span>
+    </div>
+    <div>
+      <span class="fc-big">{{ kpi.overstock_count }}</span>
+      <span class="fc-small">积压品项</span>
+    </div>
+    {% if supply == 'all' and kpi.self_count %}
+    <div>
+      <span class="fc-big">{{ kpi.self_count }}</span>
+      <span class="fc-small">门店自采</span>
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+{# ── L1 全局 KPI ────────────────────────────────────────────────── #}
+<div class="kpi-row fc-kpis">
+  <div class="kpi-card">
+    <div class="kpi-label">{% if scope == 'all' %}全链库存金额{% else %}{{ scope_label }}库存金额{% endif %}</div>
+    <div class="kpi-value">¥{{ kpi.stock_value | fmt_money }}</div>
+    <div class="kpi-sub">{{ kpi.item_count }} 个品项 · {{ kpi.warehouse_count }} 个仓</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">月消耗金额</div>
+    <div class="kpi-value">¥{{ kpi.monthly_value | fmt_money }}</div>
+    <div class="kpi-sub">按近 {{ params.window_days }} 天速率折算</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">库存可支撑天数</div>
+    <div class="kpi-value">{{ kpi.coverage_days if kpi.coverage_days is not none else '—' }}</div>
+    <div class="kpi-sub">库存金额 ÷ 日均消耗金额</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">安全库存目标</div>
+    <div class="kpi-value">¥{{ kpi.ss_value | fmt_money }}</div>
+    <div class="kpi-sub">z·σ·√(L+R) 折算金额</div>
+  </div>
+  <div class="kpi-card kpi-warn">
+    <div class="kpi-label">
+      {% if scope_is_store %}本期门店需订{% elif scope_is_dc %}本期 DC 采购{% elif supply == 'self' %}本期门店自采{% elif supply == 'central' %}本期统配采购{% else %}本期建议采购{% endif %}
+    </div>
+    <div class="kpi-value">¥{{ kpi.suggested_value | fmt_money }}</div>
+    <div class="kpi-sub">{{ kpi.action_items }} 个品项 · {{ supply_label }}</div>
+  </div>
+</div>
+
+{# 风险带 #}
+<div class="fc-risk">
+  <div class="fc-risk-item tone-danger">
+    <span class="fc-risk-num">{{ kpi.critical_count }}</span>
+    <span class="fc-risk-label">断货风险<span>覆盖 &lt; 到货提前期</span></span>
+  </div>
+  <div class="fc-risk-item tone-warn">
+    <span class="fc-risk-num">{{ kpi.overstock_count }}</span>
+    <span class="fc-risk-label">积压品项<span>覆盖 &gt; {{ params.overstock_days | int }} 天</span></span>
+  </div>
+  <div class="fc-risk-item tone-info">
+    <span class="fc-risk-num">¥{{ kpi.idle_value | fmt_money }}</span>
+    <span class="fc-risk-label">呆滞库存<span>{{ kpi.no_signal_count }} 个品项无消耗记录</span></span>
+  </div>
+  <div class="fc-risk-item tone-muted">
+    <span class="fc-risk-num">¥{{ kpi.round_up_value | fmt_money }}</span>
+    <span class="fc-risk-label">整包装取整放大<span>占建议额 {{ ((kpi.round_up_value / kpi.suggested_value * 100) if kpi.suggested_value else 0) | round | int }}%</span></span>
+  </div>
+  {% if supply != 'self' and kpi.self_count %}
+  <div class="fc-risk-item tone-info">
+    <span class="fc-risk-num">{{ kpi.self_count }}</span>
+    <span class="fc-risk-label">门店自采<span>{% if scope_is_store %}¥{{ kpi.self_value | fmt_money }} 需自行安排{% else %}¥{{ kpi.self_value | fmt_money }} 不计入 DC 采购{% endif %}</span></span>
+  </div>
+  {% endif %}
+</div>
+
+{# ── L2 该订什么 ────────────────────────────────────────────────── #}
+<h3 class="fc-h3">该订什么<span class="fc-h3-note">
+  {% if scope_is_dc %}配送中心向供应商采购{% elif scope_is_store %}{{ scope_label }}向 DC 订货{% else %}按紧急度排序，先断货风险后本周需订{% endif %}
+  · <a href="#view" class="fc-h3-link">切换视角</a>
+</span></h3>
+
+{% if actions %}
+<div class="fc-tabs" role="tablist" aria-label="行动清单筛选">
+  <button type="button" class="cat-chip is-active" data-status="__all" role="tab" aria-selected="true">全部 {{ actions | length }}</button>
+  <button type="button" class="cat-chip" data-status="critical" role="tab" aria-selected="false">断货风险 {{ status_counts.get('critical', 0) }}</button>
+  <button type="button" class="cat-chip" data-status="due" role="tab" aria-selected="false">本周需订 {{ status_counts.get('due', 0) }}</button>
+  <button type="button" class="cat-chip" data-status="over_rounding" role="tab" aria-selected="false">取整超储 {{ kpi.over_rounding_count }}</button>
+</div>
+
+<div class="table-scroll fc-scroll">
+  <table class="grid-table fc-table" id="action-table">
+    <thead>
+      <tr>
+        {% if scope == 'all' %}<th>仓库</th>{% endif %}
+        <th>品项</th>
+        <th>品类</th>
+        <th class="num">现有</th>
+        <th class="num">可支撑</th>
+        <th class="num">安全库存</th>
+        <th class="num">目标库存</th>
+        <th class="num">建议订货</th>
+        <th class="num">金额</th>
+        <th class="fc-status-col">状态 · ABC</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in actions %}
+      <tr data-status="{{ r.status }}" data-over-rounding="{{ 1 if r.over_rounding else 0 }}">
+        {% if scope == 'all' %}<td class="fc-wh">{{ r.warehouse_name }}</td>{% endif %}
+        <td>
+          <span class="fc-item">{{ r.name }}</span>
+          <span class="fc-sku">{{ r.sku }} · {{ r.unit }}</span>
+        </td>
+        <td class="fc-cat">{{ r.category }}</td>
+        <td class="num">{{ r.quantity | fmt_qty }}</td>
+        <td class="num">
+          {% if r.cover_days is not none %}
+          <span class="fc-cover {% if r.cover_days < r.lead_days %}is-danger{% elif r.cover_days < r.lead_days + r.review_days %}is-warn{% endif %}">
+            {{ r.cover_days }} 天
+          </span>
+          {% else %}—{% endif %}
+        </td>
+        <td class="num">{{ r.safety_stock | fmt_qty }}</td>
+        <td class="num">{{ r.target | fmt_qty }}</td>
+        <td class="num fc-suggest">{{ r.suggested_qty | fmt_qty }}</td>
+        <td class="num">¥{{ r.suggested_value | fmt_money }}</td>
+        <td class="fc-status-col">
+          <span class="fc-badge tone-{{ status_tone.get(r.status, 'muted') }}">{{ status_labels.get(r.status, r.status) }}</span>
+          {% if supply == 'all' and r.supply == 'self' %}<span class="fc-badge tone-info" title="已改为门店自采：DC 不再统配备货，建议量由门店自行采购">自采</span>{% endif %}
+          {% if r.over_rounding %}<span class="fc-badge tone-muted" title="按最小包装取整后，可支撑天数超过 {{ params.overstock_days | int }} 天">取整</span>{% endif %}
+          <span class="fc-abc fc-abc-{{ r.abc | lower }}" title="ABC 分层（按年消耗金额）">{{ r.abc }}</span>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="fc-footnote">表格可上下滚动（共 {{ actions | length }} 行）；「可支撑」低于到货提前期为断货风险，低于「提前期＋订货周期」为本周需订。</p>
+{% else %}
+<p class="muted">本期无建议订货品项。</p>
+{% endif %}
+
+{% if supply != 'self' and self_items %}
+<div class="fc-blocked">
+  <p class="fc-blocked-head">
+    <strong>{{ self_items | length }} 个品项由门店自采（合计 ¥{{ kpi.self_value | fmt_money }}）</strong>
+    <span>这些品项在 DC 的「品项可订管理」里是「不可订」（<code>is_orderable=0</code>），业务上已经<b>不再由配送中心统配备货</b>，改由门店自行采购。{% if scope_is_store %}这就是 {{ scope_label }} 要自己安排的采购量。{% else %}看板照常算出该补多少，但这笔钱不进 DC 采购单，仅供门店对照。{% endif %}</span>
+  </p>
+  <ul class="fc-blocked-list">
+    {% for r in self_items[:8] %}
+    <li>
+      {% if scope == 'all' %}<span class="fc-wh">{{ r.warehouse_name }}</span>{% endif %}
+      <span class="fc-item">{{ r.name }}</span>
+      <span class="fc-sku">{{ r.sku }}</span>
+      <span class="fc-blocked-gap">建议 {{ r.suggested_qty | fmt_qty }} {{ r.unit }} · ¥{{ r.suggested_value | fmt_money }}</span>
+    </li>
+    {% endfor %}
+    {% if self_items | length > 8 %}<li class="muted">…另有 {{ self_items | length - 8 }} 项</li>{% endif %}
+  </ul>
+  {% if dc_leftover and not scope_is_store %}
+  <p class="fc-leftover">
+    DC 仍有这些自采品项的结存，不再补货，可安排清库：
+    {% for x in dc_leftover %}<b>{{ x.name }}</b> {{ x.quantity | fmt_qty }} {{ x.unit }}（¥{{ x.value | fmt_money }}）{% if not loop.last %}、{% endif %}{% endfor %}
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+
+{# ── L3 品类总货量 ────────────────────────────────────────────────
+   默认只看品类汇总；点品类名展开到品项级（库存 / 可支撑 / 状态）。
+   展开行是同一个 <table> 里的隐藏行，所以列宽天然对齐，不需要另建布局。  #}
+<h3 class="fc-h3">
+  各品类总货量
+  <span class="fc-h3-note">金额口径 · 点品类名展开到品项</span>
+  <button type="button" class="fc-cat-expand" id="cat-expand-all">全部展开</button>
+</h3>
+
+{% set max_cat = (categories | map(attribute='stock_value') | max) or 1 %}
+<div class="table-scroll">
+  <table class="grid-table fc-table">
+    <thead>
+      <tr>
+        <th>品类</th>
+        <th class="fc-bar-col">库存金额占比</th>
+        <th class="num">库存金额</th>
+        <th class="num">月消耗</th>
+        <th class="num">可支撑</th>
+        <th class="num">安全库存</th>
+        <th class="num">建议采购</th>
+        <th class="num">品项</th>
+        <th>状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in categories %}
+      <tr class="fc-cat-row">
+        <td>
+          <button type="button" class="fc-cat-toggle" aria-expanded="false"
+                  aria-controls="cat-items-{{ loop.index }}">
+            <span class="fc-caret" aria-hidden="true">▸</span>
+            <strong>{{ c.name }}</strong>
+          </button>
+        </td>
+        <td class="fc-bar-col">
+          <div class="fc-bar"><span style="width: {{ (c.stock_value / max_cat * 100) | round(1) }}%"></span></div>
+        </td>
+        <td class="num">¥{{ c.stock_value | fmt_money }}</td>
+        <td class="num">¥{{ c.monthly_value | fmt_money }}</td>
+        <td class="num">
+          {% if c.coverage_days is not none %}
+          <span class="fc-cover {% if c.coverage_days > params.overstock_days %}is-info{% elif c.coverage_days < 10 %}is-warn{% endif %}">{{ c.coverage_days }} 天</span>
+          {% else %}—{% endif %}
+        </td>
+        <td class="num">¥{{ c.ss_value | fmt_money }}</td>
+        <td class="num">{% if c.suggested_value %}¥{{ c.suggested_value | fmt_money }}{% else %}—{% endif %}</td>
+        <td class="num">{{ c.sku_count }}</td>
+        <td class="fc-statuses">
+          {% if c.critical_count %}<span class="fc-badge tone-danger">断货 {{ c.critical_count }}</span>{% endif %}
+          {% if c.action_count %}<span class="fc-badge tone-warn">需订 {{ c.action_count }}</span>{% endif %}
+          {% if c.overstock_count %}<span class="fc-badge tone-info">积压 {{ c.overstock_count }}</span>{% endif %}
+          {% if c.no_signal_count %}<span class="fc-badge tone-muted">无信号 {{ c.no_signal_count }}</span>{% endif %}
+        </td>
+      </tr>
+      <tr class="fc-subrow">
+        <td colspan="9">
+          分单位库存：
+          {% for u in c.unit_totals %}{{ u.qty | fmt_qty }} {{ u.unit }}{% if not loop.last %} · {% endif %}{% endfor %}
+          {% if not c.unit_totals %}<span class="muted">—</span>{% endif %}
+          {% if c.value_coverage < 1 %}<span class="muted">（该品类 {{ ((1 - c.value_coverage) * 100) | round | int }}% 的品项缺单价，金额偏低）</span>{% endif %}
+        </td>
+      </tr>
+
+      {# 展开后的品项明细：按紧急度排序（rows 已排好序），只展示本品类 #}
+      <tr class="fc-cat-items" id="cat-items-{{ loop.index }}" style="display: none;">
+        <td colspan="9">
+          <div class="fc-cat-panel">
+            <table class="grid-table fc-subtable">
+              <thead>
+                <tr>
+                  <th>品项</th>
+                  <th>状态</th>
+                  <th class="num">现有库存</th>
+                  <th class="num">可支撑</th>
+                  <th class="num">日均消耗</th>
+                  <th class="num">安全库存</th>
+                  <th class="num">目标库存</th>
+                  <th class="num">建议订货</th>
+                  <th class="num">金额</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for r in rows if r.category == c.name %}
+                <tr>
+                  <td>
+                    <span class="fc-item">{{ r.name }}</span>
+                    <span class="fc-sku">{{ r.sku }} · {{ r.unit }}{% if scope == 'all' %} · {{ r.warehouse_name }}{% endif %}</span>
+                  </td>
+                  <td class="fc-statuses">
+                    <span class="fc-badge tone-{{ status_tone.get(r.status, 'muted') }}">{{ status_labels.get(r.status, r.status) }}</span>
+                    {% if r.supply == 'self' %}<span class="fc-badge tone-info" title="门店自采：DC 不再统配备货">自采</span>{% endif %}
+                    {% if r.over_rounding %}<span class="fc-badge tone-muted" title="整包装取整后覆盖天数超过 {{ params.overstock_days | int }} 天">取整</span>{% endif %}
+                  </td>
+                  <td class="num">{{ r.quantity | fmt_qty }}</td>
+                  <td class="num">
+                    {% if r.cover_days is not none %}
+                    <span class="fc-cover {% if r.cover_days < r.lead_days %}is-danger{% elif r.cover_days < r.lead_days + r.review_days %}is-warn{% endif %}">{% if r.cover_days > 999 %}999+{% else %}{{ r.cover_days }}{% endif %} 天</span>
+                    {% else %}—{% endif %}
+                  </td>
+                  <td class="num">{{ r.rate | fmt_qty }}</td>
+                  <td class="num">{{ r.safety_stock | fmt_qty }}</td>
+                  <td class="num">{{ r.target | fmt_qty }}</td>
+                  <td class="num fc-suggest">{% if r.suggested_qty %}{{ r.suggested_qty | fmt_qty }}{% else %}—{% endif %}</td>
+                  <td class="num">{% if r.suggested_value %}¥{{ r.suggested_value | fmt_money }}{% else %}—{% endif %}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{# ── L4 分布：全链看各仓，DC 视角看各门店需求 ───────────────────── #}
+{% if scope == 'all' %}
+<h3 class="fc-h3">各仓库货量分布<span class="fc-h3-note">DC 承担大部分采购；门店以周订货补货</span></h3>
+
+<div class="grid cols-4 fc-whcards">
+  {% for w in warehouses %}
+  {% set tv = w.turnover %}
+  <section class="card fc-whcard">
+    <p>
+      {{ w.name }}
+      {% if w.is_dc %}<span class="fc-badge tone-info">配送中心</span>{% endif %}
+    </p>
+    <strong>¥{{ w.stock_value | fmt_money }}</strong>
+    <div class="fc-whmeta">
+      <span>需订 {{ w.action_count }}</span>
+      <span>建议 ¥{{ w.suggested_value | fmt_money }}</span>
+    </div>
+
+    {# 周转率 = 年化消耗 ÷ 时点库存，与「可支撑天数」互为倒数；
+       偏差判定相对本仓自己的政策水位，不是行业基准 #}
+    <div class="fc-whturn" title="{{ tv.note }}">
+      <span class="fc-whturn-label">库存周转</span>
+      <span class="fc-whturn-val">
+        {%- if tv.turns is none %}—{% elif tv.turns >= 100 %}99+{% else %}{{ '%.1f' % tv.turns }}{% endif -%}
+      </span>
+      <span class="fc-whturn-unit">次/年</span>
+      <span class="fc-badge tone-{{ tv.tone }}">{{ tv.verdict }}</span>
+    </div>
+    <div class="fc-whturn-sub">
+      <span>可支撑 {{ w.coverage_days if w.coverage_days is not none else '—' }} 天</span>
+      {% if tv.target_turns %}<span>目标 {{ tv.target_turns }} 次/年</span>{% endif %}
+      {% if w.idle_value %}<span title="零消耗但有结存的库存，会把周转率拖慢">呆滞 ¥{{ w.idle_value | fmt_money }}</span>{% endif %}
+    </div>
+
+    <div class="fc-whbar">
+      {% set tot = kpi.stock_value or 1 %}
+      <span style="width: {{ (w.stock_value / tot * 100) | round(1) }}%"></span>
+    </div>
+  </section>
+  {% endfor %}
+</div>
+
+<p class="fc-footnote">
+  库存周转率 = 年化消耗金额 ÷ <strong>时点</strong>库存金额，与上面的「可支撑天数」互为倒数（365 ÷ 天数）。
+  「偏高 / 偏紧」是相对<strong>本仓自己的补货政策</strong>判断：目标库存 = 日均消耗 ×（提前期 + 复盘周期）+ 安全库存，
+  DC 与门店的 L+R 不同，目标也不同。这是时点口径，不与财报的存货周转率对账。
+  {% if kpi.turnover.turns is not none %}当前视角整体 {{ '%.1f' % kpi.turnover.turns }} 次/年。{% endif %}
+</p>
+
+{% set max_cell = namespace(v=1) %}
+{% for code, cats in matrix.items() %}{% for cat, val in cats.items() %}{% if val > max_cell.v %}{% set max_cell.v = val %}{% endif %}{% endfor %}{% endfor %}
+
+<div class="table-scroll">
+  <table class="grid-table fc-matrix">
+    <thead>
+      <tr>
+        <th>仓库 \ 品类</th>
+        {% for name in category_names %}<th class="num">{{ name }}</th>{% endfor %}
+        <th class="num">合计</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in warehouses %}
+      <tr>
+        <td>{{ w.name }}</td>
+        {% for name in category_names %}
+        {% set val = matrix.get(w.code, {}).get(name, 0) %}
+        <td class="num fc-heat" style="--heat: {{ (val / max_cell.v) | round(2) }}">
+          {% if val %}{{ (val / 1000) | round(1) }}k{% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        {% endfor %}
+        <td class="num"><strong>{{ (w.stock_value / 1000) | round(1) }}k</strong></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="fc-footnote">矩阵单位：千元。数量维度不可跨品类相加（桶/箱/袋/条混用），故统一用金额。</p>
+
+{% elif scope_is_dc %}
+{# DC 视角：货量分布不重要（就一个仓），要看的是「需求从哪来」 #}
+<h3 class="fc-h3">各门店需求分布<span class="fc-h3-note">DC 的补货量就是这些需求加总后扣掉现有库存</span></h3>
+<div class="fc-demand">
+  {% for st in store_demand %}
+  <div class="fc-demand-row">
+    <span class="fc-demand-name">{{ st.name }}</span>
+    <span class="fc-demand-bar"><span style="width: {{ (st.share * 100) | round(1) }}%"></span></span>
+    <span class="fc-demand-val">¥{{ st.monthly_value | fmt_money }}<em>{{ (st.share * 100) | round(0) | int }}%</em></span>
+  </div>
+  {% endfor %}
+</div>
+<p class="fc-footnote">按月消耗金额折算（近 {{ params.window_days }} 天速率 × 单价）。门店自采的品项不计入 DC 需求。</p>
+{% endif %}
+
+{# ── L4.5 三口径对账：产量 / 领料 / 盘点 ────────────────────────── #}
+<h3 class="fc-h3">
+  生产 · 领料 · 盘点 三口径对账
+  <span class="fc-h3-note">同一批品项、同一窗口，金额口径对比；差值＝账面没记到的损耗</span>
+</h3>
+
+{% if not channels.trusted_items %}
+{# 这个视角内没有可用的盘点周期（DC 不做周盘）：硬摆一排 ¥0.00 会被读成
+   「没有消耗」，那是错的 —— 领料是有的，只是缺另一条腿对不上账。       #}
+<p class="fc-recon-empty">
+  该视角内没有可用的盘点数据（{{ scope_label }} 未做周期盘点），三口径对账不适用。
+  领料口径本身仍然有效，{{ channels.signal_items }} 个品项在用；缺的只是「盘点实测」这条校验腿。
+  {% if scope_is_dc %}建议给配送中心也开周盘，否则 DC 侧的需求修正系数只能固定在 1.0。{% endif %}
+</p>
+{% else %}
+<div class="fc-recon-strip">
+  <div class="fc-recon-item">
+    <span class="fc-recon-k">领料/出库口径</span>
+    <span class="fc-recon-v">¥{{ channels.issue_value | fmt_money }}</span>
+    <span class="fc-recon-s">按账面扣减折算的月耗</span>
+  </div>
+  <div class="fc-recon-arrow">→</div>
+  <div class="fc-recon-item">
+    <span class="fc-recon-k">盘点实测口径</span>
+    <span class="fc-recon-v">¥{{ channels.count_value | fmt_money }}</span>
+    <span class="fc-recon-s">期初 + 入库 − 期末，{{ channels.trusted_items }} 个品项</span>
+  </div>
+  <div class="fc-recon-arrow">→</div>
+  <div class="fc-recon-item {% if channels.gap_value > 0 %}tone-warn{% else %}tone-info{% endif %}">
+    <span class="fc-recon-k">未记录偏差</span>
+    <span class="fc-recon-v">
+      {% if channels.gap_pct is not none %}{{ (channels.gap_pct * 100) | round(1) }}%{% else %}—{% endif %}
+    </span>
+    <span class="fc-recon-s">
+      金额差 ¥{{ channels.gap_value | fmt_money }}；
+      品项中位偏差 {{ ((channels.median_gap or 0) * 100) | round(1) }}%
+    </span>
+  </div>
+</div>
+
+<p class="fc-footnote">
+  盘点覆盖 {{ (channels.coverage * 100) | round | int }}%（{{ channels.count_items }}/{{ channels.signal_items }} 个有需求信号的品项）；
+  {{ channels.drift_items }}/{{ channels.gap_items }} 个品项的领料口径与盘点口径相差超过 10%；
+  {{ channels.suspect_items }} 个品项因盘点数据跳变（录入异常）已回退领料口径。
+  {% if channels.production_items %}
+  产量口径可推算 {{ channels.production_items }} 个品项的用量（月耗 ¥{{ channels.production_value | fmt_money }}），用于交叉校验与兜底。
+  {% endif %}
+</p>
+
+<div class="table-scroll">
+  <table class="grid-table fc-table">
+    <thead>
+      <tr>
+        <th>品类</th>
+        <th class="num">领料口径月耗</th>
+        <th class="num">盘点口径月耗</th>
+        <th class="num">金额差</th>
+        <th class="num">偏差率</th>
+        <th class="num">品项中位偏差</th>
+        <th class="num">按盘点定水位</th>
+        <th class="num">漂移品项</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in channels.recon %}
+      <tr>
+        <td><strong>{{ r.name }}</strong></td>
+        <td class="num">¥{{ r.issue_value | fmt_money }}</td>
+        <td class="num">{% if r.count_value %}¥{{ r.count_value | fmt_money }}{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="num">{% if r.count_value %}¥{{ r.gap_value | fmt_money }}{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="num">
+          {% if r.gap_pct is not none %}
+          <span class="fc-cover {% if r.gap_pct < -0.10 %}is-warn{% endif %}">{{ (r.gap_pct * 100) | round(1) }}%</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td class="num">
+          {% if r.median_gap is not none %}{{ (r.median_gap * 100) | round(1) }}%{% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td class="num">{{ r.count_items }}/{{ r.sku_count }}</td>
+        <td class="num">{% if r.drift_items %}{{ r.drift_items }}{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{# ── L5 方法与口径 ──────────────────────────────────────────────── #}
+<details class="fc-method">
+  <summary>计算口径与模型选择（安全库存 / 再订货点 / 经济批量）</summary>
+
+  <div class="fc-method-grid">
+    <div class="fc-method-block">
+      <h4>1. 需求速率：三口径融合，不只靠库存消耗</h4>
+      <p>
+        三路信号回答三个不同问题：<strong>领料/出库口径</strong>（高频、有偏）＝「账面扣了多少」；
+        <strong>产量口径</strong>（产量 × 标准单耗）＝「按生产量本来该用多少」；
+        <strong>盘点口径</strong>（期初实盘 + 入库 − 期末实盘，低频、无偏）＝「实际消失了多少」。
+        本期放行：盘点 {{ fuse_counts.get('count', 0) }} 项、领料 {{ fuse_counts.get('issue', 0) }} 项。
+      </p>
+      <p>
+        逐日序列仍取近 {{ params.window_days }} 天（含零消耗日）。连续消耗品项用
+        近远半段加权均值（{{ params.recent_weight | int }} : 1），间歇消耗品项用
+        <strong>Croston 分解</strong>（平均单次用量 ÷ 平均间隔天数）。
+      </p>
+      <p class="fc-why">
+        融合按「可信度优先」而不是加权平均：<strong>盘点定水平、领料定日形状</strong>
+        （按比例保形缩放，不是加常数）。三路偏差是<strong>系统性</strong>的 ——
+        损耗永远不进领料记录，领料速率只会偏低。对系统性偏差做加权平均，
+        只会得到一个稳定偏低的数，反而更危险。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>2. 偏差识别：逐项校验</h4>
+      <p>
+        <strong>① 口径背离</strong>：同一品项 |领料速率 ÷ 盘点速率 − 1| &gt; 10% 记漂移，
+        本期 {{ channels.drift_items }}/{{ channels.gap_items }} 项超线。
+        <strong>② 数量级校验</strong>：盘点速率超领料速率 10 倍（或低于 1/10）判为录入异常，
+        整条盘点通道弃用并回退领料口径 —— 实测有一例「盘盈 +2208.35 / 次日盘亏 −2208.06」
+        的冲销对（净影响仅 +0.29 桶），夹在中间的区间会算出 2208 桶/天的消耗。
+        <strong>③ 负消耗剔除</strong>：盘点区间算出负消耗（入库漏记/盘点错）整段丢弃，
+        不截断到 0，避免把「数据坏了」伪装成「没消耗」。
+      </p>
+      <p class="fc-why">
+        为什么不靠单区间跳变阈值：本数据集大量品项是间歇消耗，中位区间速率为 0，
+        按中位数倍数设阈值会把真实的大额领用一起删掉。跨口径数量级校验更稳。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>3. 盘点校正：把「账面」换成「实盘」</h4>
+      <p class="fc-formula">C = I<sub>期初实盘</sub> + 入库 − I<sub>期末实盘</sub> &nbsp;·&nbsp; k = C ÷ 领料量</p>
+      <p>
+        每周盘点给出真实水位，两期相减即为这段期间的真实消失量，完全不依赖领料记录。
+        k 是口径修正系数（品类级见上方对账表），没有盘点覆盖的品项用<strong>同品类 k</strong>
+        兜底，且 k 夹在 [0.5, 2.0] 之外一律不外推。
+      </p>
+      <p class="fc-why">
+        校正后的速率会同步放大 σ（保形缩放），否则只抬均值不抬波动，安全库存会被算小 ——
+        那正是「账面偏低 → 订得偏少 → 又断货」的闭环。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>4. 为什么产量不能直接当需求</h4>
+      <p>
+        实测核对：<code>production_run_items.actual_qty</code> 与「生产消耗」动账
+        <strong>是同一本账</strong> —— 逐品项集合完全一致、数量一致（差异来自回退）。
+        把它当「独立的第二信号」会重复计算同一份数据。真正独立的是
+        <code>production_runs.output_qty</code>（产量）：成品不做库存管理，生产即销售，
+        产量可以当销量代理。
+      </p>
+      <p class="fc-why">
+        用产量口径反而<strong>消除</strong>了「生产入库↔出库」的时滞：原料需求由产量驱动，
+        不由销量驱动 —— 成品什么时候卖掉，不影响原料什么时候该订。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>5. 安全库存（周期盘点口径）</h4>
+      <p class="fc-formula">SS = z · σ<sub>日</sub> · √(L + R)</p>
+      <p>
+        σ<sub>日</sub> 为日消耗标准差；L 为到货提前期（DC {{ params.dc_lead_days }} 天 /
+        门店 {{ params.store_lead_days }} 天）；R 为订货复盘周期（{{ params.dc_review_days }} 天）。
+        z 按 ABC 分层：A {{ (params.service_a * 100) | round | int }}%、B {{ (params.service_b * 100) | round | int }}%、C {{ (params.service_c * 100) | round | int }}%。
+      </p>
+      <p class="fc-why">
+        为什么用 L+R 而不是 L：门店一周只能订一次货，库存水位每周才被修正一次，
+        风险敞口是「到货期 + 这一整周的复盘间隔」。用 √L 会把安全库存低估约
+        2.8 倍（L=1, R=7 时 √8/√1≈2.83），这正是「周订货制却按日补货算安全库存」
+        的典型错配。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>6. 目标库存与订货量</h4>
+      <p class="fc-formula">S = d̄ · (L + R) + SS &nbsp;&nbsp;·&nbsp;&nbsp; Q = max(0, S − 在手 − 在途)</p>
+      <p>
+        即 (R, S) 定期订货、订至目标水位。在途包含<strong>已下单未收货的门店订单</strong>
+        与未到货的补货申请 —— 漏掉在途是重复下单的头号原因。
+        最后按最小包装向上取整。
+      </p>
+      <p class="fc-why">
+        为什么不用「再订货点 + 固定批量」：ROP 假设可以随时补货、每次订固定批量，
+        与「每周集中订一次」的实际流程不符。订至目标水位把「这一周会消耗多少」
+        一次性算进订单，避免周中反复补单。再订货点仍然可读：它就是 S 减去
+        d̄·R 的位置，表里的「可支撑天数 &lt; L+R」等价于「已跌破再订货点」。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>7. 经济订货批量（参考）</h4>
+      <p class="fc-formula">EOQ = √(2 · K · D<sub>年</sub> / (h · 单价))</p>
+      <p>
+        K = ¥{{ params.order_cost | fmt_money }}/单，h = {{ (params.holding_rate * 100) | round | int }}%/年。
+        本项目每周订货是<strong>业务硬约束</strong>，EOQ 不直接决定订货量，
+        只用来判断「这一单是否已经大到不经济」与「取整放大是否离谱」。
+      </p>
+      <p class="fc-why">
+        为什么只做参考：4 家门店的订单量由门店需求决定，拆单省下的持有成本
+        抵不过多跑一趟的固定成本；EOQ 真正的用处是暴露长尾品项按整桶/整箱
+        起订造成的过度备货（本期取整放大 ¥{{ kpi.round_up_value | fmt_money }}，
+        占建议额 {{ ((kpi.round_up_value / kpi.suggested_value * 100) if kpi.suggested_value else 0) | round | int }}%）。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>8. DC 需求取「下游拉动」</h4>
+      <p>
+        DC 的日需求 = 该品项在<strong>全部门店的日消耗序列之和</strong>（按 canonical_id
+        对齐），只有 DC 独有品项才用本仓出库史。本期 {{ source_counts.get('downstream', 0) }}
+        个品项走拉动口径、{{ source_counts.get('own', 0) }} 个走本仓口径。
+      </p>
+      <p class="fc-why">
+        为什么：DC 是整周成批发货，直接用发货记录估日需求会得到巨大 σ。
+        实测同一品项用本仓出库史算出的安全库存是 107 袋（12 天用量），
+        改用门店消耗汇总后降到合理量级 —— 批量的「峰」是可预测的，不该进安全库存。
+      </p>
+    </div>
+
+    <div class="fc-method-block">
+      <h4>9. 数据口径与已知缺口</h4>
+      <p>
+        消耗 = <strong>生产消耗 + 出库</strong>（门店）／<strong>出库 + 门店订货出库 + 总仓调货出库</strong>（DC），
+        并剔除 note 含「盘亏／盘盈／盘点」的盘点调整行。
+      </p>
+      <p class="fc-why">
+        为什么要剔除盘点：盘点盈亏是账实差异不是需求。生产数据里
+        新天地店的盘亏累计 2965、真实消耗仅 334，混在一起会让日均虚高近 10 倍 ——
+        旧版预测看板正是踩了这个坑。
+      </p>
+      <p class="fc-gap">
+        缺口提示：{{ kpi.item_count }} 个品项中 {{ kpi.no_signal_count }} 个在窗口内没有任何消耗记录，
+        已单独标为「无消耗记录」而<strong>不是</strong>按 0 消耗处理（0 会被误读成「不用订」）。
+        {% if kpi.value_coverage < 1 %}
+        另有 {{ ((1 - kpi.value_coverage) * 100) | round | int }}% 的品项缺单价，金额类指标偏低。
+        {% endif %}
+        {% if data_quality.skipped_warehouses %}
+        未纳入计算的仓：{% for w in data_quality.skipped_warehouses %}{{ w.name }}{% if not loop.last %}、{% endif %}{% endfor %}（库文件缺失）。
+        {% endif %}
+        {% if data_quality.failed_warehouses %}
+        读取失败：{% for w in data_quality.failed_warehouses %}{{ w.name }}{% if not loop.last %}、{% endif %}{% endfor %}。
+        {% endif %}
+        {% if data_quality.excluded_warehouses %}
+        {% for w in data_quality.excluded_warehouses %}{{ w.name }}{% if not loop.last %}、{% endif %}{% endfor %}不参与补货计算（研发类仓库，只做配方试制）。
+        {% endif %}
+      </p>
+    </div>
+  </div>
+</details>
+
+{# ── L6 全品项明细 ──────────────────────────────────────────────── #}
+<details class="fc-detail">
+  <summary>全品项明细（{{ rows | length }} 行，含无消耗记录品项）</summary>
+  <p class="fc-footnote">
+    为保证页面体积可控，表格只渲染前 {{ detail_limit }} 行（按紧急度、库存金额排序）。
+    完整数据见 <a href="{{ url_for('forecast.forecast_board_json') }}">board.json</a>。
+  </p>
+  <div class="fc-tabs" role="tablist" aria-label="明细筛选">
+    <button type="button" class="cat-chip is-active" data-dstatus="__all" role="tab" aria-selected="true">全部</button>
+    {% for st in status_order %}
+    <button type="button" class="cat-chip" data-dstatus="{{ st }}" role="tab" aria-selected="false">{{ status_labels.get(st, st) }} {{ status_counts.get(st, 0) }}</button>
+    {% endfor %}
+  </div>
+  <div class="table-scroll">
+    <table class="grid-table fc-table" id="detail-table">
+      <thead>
+        <tr>
+          <th>仓库</th>
+          <th>品项</th>
+          <th>品类</th>
+          <th class="num">库存</th>
+          <th class="num">日均</th>
+          <th class="num">可支撑</th>
+          <th class="num">安全库存</th>
+          <th class="num">目标</th>
+          <th class="num">建议</th>
+          <th class="num">EOQ</th>
+          <th>需求口径</th>
+          <th>状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows[:detail_limit] %}
+        <tr data-dstatus="{{ r.status }}">
+          <td class="fc-wh">{{ r.warehouse_name }}</td>
+          <td>
+            <span class="fc-item">{{ r.name }}</span>
+            <span class="fc-sku">{{ r.sku }} · {{ r.unit }}</span>
+          </td>
+          <td class="fc-cat">{{ r.category }}</td>
+          <td class="num">{{ r.quantity | fmt_qty }}</td>
+          <td class="num">
+            {% if r.rate > 0 %}{{ r.rate | fmt_qty }}{% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td class="num">{{ (r.cover_days | fmt_qty) if r.cover_days is not none else '—' }}</td>
+          <td class="num">{{ r.safety_stock | fmt_qty }}</td>
+          <td class="num">{{ r.target | fmt_qty }}</td>
+          <td class="num">{{ r.suggested_qty | fmt_qty if r.suggested_qty else '—' }}</td>
+          <td class="num">{{ (r.eoq | fmt_qty) if r.eoq else '—' }}</td>
+          <td class="fc-cat">
+            {% if r.demand_source == 'downstream' %}门店拉动{% elif r.method == 'continuous' %}本仓连续{% elif r.method == 'intermittent' %}本仓间歇{% else %}—{% endif %}
+          </td>
+          <td><span class="fc-badge tone-{{ status_tone.get(r.status, 'muted') }}">{{ status_labels.get(r.status, r.status) }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</details>
 
 <style>
-  .forecast-table { width: 100%; border-collapse: collapse; }
-  .forecast-table th, .forecast-table td { padding: 6px 10px; border-bottom: 1px solid #ddd; text-align: left; }
-  .badge { padding: 2px 8px; border-radius: 4px; font-size: 12px; }
-  .badge.cold { background: #fef3c7; color: #92400e; }
-  .badge.ok { background: #d1fae5; color: #065f46; }
+  /* 补货看板局部样式：沿用全局 teal 设计语言，不引入新色板 */
+  .fc-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  .fc-head h2 { margin: 0 0 4px; }
+  .fc-sub { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .fc-recompute { margin: 0; }
+
+  .fc-chips { margin: 12px 0 4px; }
+  .fc-chips-label { font-size: 12px; color: var(--muted); align-self: center; }
+  .fc-chips-sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 4px; }
+
+  /* L0 决策条 */
+  .fc-decide {
+    display: flex; gap: 18px; align-items: center; justify-content: space-between;
+    background: linear-gradient(120deg, rgba(15,118,110,.07), rgba(14,116,144,.05));
+    border: 1px solid rgba(15,118,110,.22);
+    border-radius: 16px; padding: 16px 18px; margin: 14px 0;
+    flex-wrap: wrap;
+  }
+  .fc-decide-main { flex: 1 1 420px; min-width: 260px; }
+  .fc-decide-label { margin: 0 0 4px; font-size: 12px; color: var(--brand-ink); font-weight: 600; letter-spacing: .04em; }
+  .fc-decide-text { margin: 0; font-size: 15px; line-height: 1.7; color: var(--text); }
+  .fc-decide-text strong { color: var(--brand-ink); font-size: 17px; }
+  .fc-decide-note { margin: 6px 0 0; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .fc-decide-stats { display: flex; gap: 22px; padding-left: 4px; }
+  .fc-decide-stats > div { text-align: center; }
+  .fc-big { display: block; font-size: 26px; font-weight: 700; color: var(--brand-ink); line-height: 1.1; }
+  .fc-small { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  .fc-kpis .kpi-card .kpi-value { font-size: 22px; }
+  .fc-kpis .kpi-card.kpi-warn .kpi-value { color: #92400e; }
+
+  /* 风险带 */
+  .fc-risk { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 10px; margin: 12px 0 18px; }
+  @media (max-width: 720px) { .fc-risk { grid-template-columns: 1fr 1fr; } }
+  .fc-risk-item {
+    display: flex; align-items: center; gap: 10px;
+    background: #fff; border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px;
+    border-left-width: 3px;
+  }
+  .fc-risk-num { font-size: 19px; font-weight: 700; color: #0f172a; white-space: nowrap; }
+  .fc-risk-label { font-size: 12px; color: var(--text); line-height: 1.3; }
+  .fc-risk-label span { display: block; font-size: 11px; color: var(--muted); }
+  .tone-danger { border-left-color: #b91c1c; }
+  .tone-warn { border-left-color: #b45309; }
+  .tone-info { border-left-color: #0e7490; }
+  .tone-muted { border-left-color: #94a3b8; }
+  .tone-ok { border-left-color: #15803d; }
+
+  .fc-h3 { margin: 22px 0 10px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .fc-h3-note { font-size: 12px; font-weight: 400; color: var(--muted); }
+
+  .fc-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+
+  .fc-table { font-size: 13px; }
+  .fc-table th { white-space: nowrap; }
+  .fc-table td.num, .fc-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  /* 行动清单限高内部滚动：66 行全展开会把品类/仓库分布顶到 3000px 以下，
+     看板就退化成一张长表了。表头 sticky 保证滚动时列义不丢。 */
+  .fc-scroll { max-height: 460px; overflow: auto; border: 1px solid var(--border); border-radius: 12px; }
+  .fc-scroll thead th { position: sticky; top: 0; z-index: 1; background: #f9fafb; }
+  .fc-status-col { min-width: 132px; white-space: nowrap; }
+  .fc-wh { color: var(--muted); white-space: nowrap; font-size: 12px; }
+  .fc-cat { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .fc-item { display: block; font-weight: 500; }
+  .fc-sku { display: block; font-size: 11px; color: var(--muted); }
+  .fc-suggest { font-weight: 700; color: var(--brand-ink); }
+
+  .fc-cover { font-variant-numeric: tabular-nums; }
+  .fc-cover.is-danger { color: #b91c1c; font-weight: 600; }
+  .fc-cover.is-warn { color: #b45309; font-weight: 600; }
+  .fc-cover.is-info { color: #0e7490; }
+
+  .fc-badge {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 11px; line-height: 1.7; white-space: nowrap;
+    background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0;
+  }
+  .fc-badge.tone-danger { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+  .fc-badge.tone-warn { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+  .fc-badge.tone-info { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
+  .fc-badge.tone-ok { background: #f0fdf4; color: #166534; border-color: #bbf7d0; }
+  .fc-badge.tone-muted { background: #f8fafc; color: #64748b; border-color: #e2e8f0; }
+
+  .fc-abc { display: inline-block; margin-left: 4px; font-size: 11px; font-weight: 700; color: #94a3b8; }
+  .fc-abc-a { color: #0f766e; }
+  .fc-abc-b { color: #0e7490; }
+
+  .fc-bar-col { width: 22%; min-width: 120px; }
+  .fc-bar { height: 8px; border-radius: 999px; background: #eef2f6; overflow: hidden; }
+  .fc-bar > span { display: block; height: 100%; background: linear-gradient(90deg, #0f766e, #0e7490); border-radius: 999px; }
+
+  .fc-subrow td { font-size: 11.5px; color: var(--muted); padding-top: 0; border-bottom: 1px solid #eef2f6; }
+  .fc-statuses { white-space: nowrap; }
+  .fc-statuses .fc-badge { margin-right: 3px; }
+
+  /* 品类展开：默认折叠，点品类名看品项构成 */
+  .fc-cat-toggle {
+    display: inline-flex; align-items: center; gap: 6px; width: 100%;
+    padding: 0; border: 0; border-radius: 0; background: none; cursor: pointer;
+    font: inherit; color: inherit; text-align: left;
+  }
+  .fc-cat-toggle:hover strong { color: var(--primary); }
+  .fc-caret {
+    display: inline-block; width: 12px; font-size: 10px; color: var(--muted);
+    transition: transform .15s ease;
+  }
+  .fc-cat-toggle.is-open .fc-caret { transform: rotate(90deg); color: var(--primary); }
+  .fc-cat-row:hover { background: #fafcfc; }
+
+  .fc-cat-expand {
+    /* 全站 button 默认 width:100%，会把这一行撑成两行并把文字居中 */
+    width: auto; white-space: nowrap;
+    margin-left: auto; padding: 2px 9px; font-size: 11.5px;
+    border: 1px solid var(--border); border-radius: 999px;
+    background: #fff; color: var(--primary); cursor: pointer; font-family: inherit;
+  }
+  .fc-cat-expand:hover { border-color: var(--primary); background: #f0fdfa; }
+
+  .fc-cat-panel {
+    max-height: 340px; overflow: auto;
+    margin: 2px 0 10px; padding: 0 10px 8px;
+    background: #fbfdfd; border: 1px solid #e8eef0; border-radius: 10px;
+  }
+  .fc-subtable { width: 100%; font-size: 12px; border-collapse: collapse; }
+  .fc-subtable th {
+    position: sticky; top: 0; z-index: 1;
+    background: #f6faf9; color: var(--muted); font-weight: 600;
+    padding: 6px 8px; text-align: left; white-space: nowrap;
+  }
+  .fc-subtable th.num, .fc-subtable td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .fc-subtable td { padding: 5px 8px; border-top: 1px solid #eef2f6; }
+  .fc-subtable tr:first-child td { border-top: 0; }
+  .fc-subtable .fc-sku { display: block; }
+
+  .fc-whcards { margin-bottom: 14px; }
+  .fc-whcard { padding: 12px 14px; }
+  .fc-whcard strong { font-size: 20px; }
+  .fc-whmeta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  /* 周转率独立成条：虚线分隔 + 大号数字，让它读起来是"算出来的结果"而不是
+     又一行元信息。数字用 tabular-nums，四个仓竖排对比时小数点能对齐。 */
+  .fc-whturn {
+    display: flex; align-items: baseline; gap: 5px; flex-wrap: wrap;
+    margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border);
+  }
+  .fc-whturn-label { font-size: 11px; color: var(--muted); }
+  .fc-whturn-val {
+    font-size: 18px; font-weight: 700; color: var(--brand-ink);
+    font-variant-numeric: tabular-nums; line-height: 1.1;
+  }
+  .fc-whturn-unit { font-size: 11px; color: var(--muted); }
+  .fc-whturn .fc-badge { margin-left: auto; }
+  .fc-whturn-sub {
+    display: flex; gap: 4px 12px; flex-wrap: wrap;
+    margin-top: 4px; font-size: 11px; color: var(--muted);
+  }
+  .fc-whturn-sub > span { white-space: nowrap; }
+  .fc-whbar { height: 5px; border-radius: 999px; background: #eef2f6; margin-top: 8px; overflow: hidden; }
+  .fc-whbar > span { display: block; height: 100%; background: #0f766e; }
+
+  .fc-matrix .fc-heat { background: rgba(15, 118, 110, calc(var(--heat) * 0.20)); }
+  .fc-footnote { font-size: 11.5px; color: var(--muted); margin: -4px 0 16px; }
+  .fc-scope {
+    display: flex; align-items: stretch; gap: 8px; flex-wrap: wrap;
+    margin: 0 0 6px; padding: 10px 12px;
+    background: #fff; border: 1px solid var(--border); border-radius: 12px;
+  }
+  .fc-scope-label {
+    font-size: 12px; color: var(--muted); align-self: center;
+    padding-right: 4px; white-space: nowrap;
+  }
+  .fc-scope-chip {
+    display: flex; flex-direction: column; gap: 1px;
+    padding: 6px 14px; border-radius: 9px; text-decoration: none;
+    border: 1px solid var(--border); background: #f8fafc; color: var(--text);
+    transition: border-color .15s, background .15s;
+  }
+  .fc-scope-chip:hover { border-color: var(--primary); }
+  .fc-scope-chip.is-active {
+    background: rgba(15, 118, 110, .09); border-color: var(--primary);
+    box-shadow: inset 0 0 0 1px var(--primary);
+  }
+  .fc-scope-name { font-size: 13.5px; font-weight: 700; }
+  .fc-scope-chip.is-active .fc-scope-name { color: var(--primary); }
+  .fc-scope-meta { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .fc-scope-note {
+    font-size: 12px; color: var(--muted); margin: 0 0 12px; line-height: 1.55;
+  }
+  .fc-scope-note strong { color: var(--text); }
+
+  /* 视角选择：看谁的订单。比供应方式更靠前，因为整个页面都跟着它变。 */
+  .fc-view {
+    margin: 18px 0 4px; padding: 12px 14px 14px;
+    background: linear-gradient(180deg, #f8fafc, #fff);
+    border: 1px solid var(--border); border-radius: 14px;
+  }
+  .fc-view-head {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .fc-view-label {
+    font-size: 12px; font-weight: 700; letter-spacing: .04em;
+    color: var(--primary); text-transform: none;
+  }
+  .fc-view-sub { font-size: 11.5px; color: var(--muted); }
+  .fc-view-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .fc-view-tab {
+    flex: 1 1 150px; min-width: 132px;
+    display: flex; flex-direction: column; gap: 2px;
+    padding: 8px 12px; border-radius: 10px; text-decoration: none;
+    border: 1px solid var(--border); background: #fff; color: var(--text);
+    transition: border-color .15s, background .15s, box-shadow .15s;
+  }
+  .fc-view-tab:hover { border-color: var(--primary); background: #f0fdfa; }
+  .fc-view-tab.is-active {
+    background: #fff; border-color: var(--primary);
+    box-shadow: inset 0 0 0 1px var(--primary), 0 1px 2px rgba(15,118,110,.10);
+  }
+  .fc-view-name { font-size: 13.5px; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+  .fc-view-tab.is-active .fc-view-name { color: var(--primary); }
+  .fc-view-tag {
+    font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 5px;
+    background: rgba(15,118,110,.10); color: var(--primary);
+  }
+  .fc-view-meta { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .fc-view-tab.is-active .fc-view-meta { color: var(--primary); }
+  .fc-view-note { margin: 8px 0 0; font-size: 11px; color: var(--muted); }
+  .fc-h3-link { color: var(--primary); text-decoration: none; border-bottom: 1px dashed currentColor; }
+  .fc-h3-link:hover { border-bottom-style: solid; }
+
+  /* DC 视角下的门店需求条 */
+  .fc-demand { display: flex; flex-direction: column; gap: 7px; margin: 4px 0 10px; }
+  .fc-demand-row {
+    display: grid; grid-template-columns: 110px minmax(0, 1fr) 170px;
+    align-items: center; gap: 10px; font-size: 13px;
+  }
+  .fc-demand-name { font-weight: 600; }
+  .fc-demand-bar {
+    display: block; height: 9px; border-radius: 5px;
+    background: #eef2f4; overflow: hidden;
+  }
+  .fc-demand-bar > span {
+    display: block; height: 100%; border-radius: 5px;
+    background: linear-gradient(90deg, #0f766e, #14b8a6);
+  }
+  .fc-demand-val {
+    text-align: right; font-variant-numeric: tabular-nums; font-weight: 600;
+  }
+  .fc-demand-val em { font-style: normal; font-weight: 500; color: var(--muted); margin-left: 6px; font-size: 11.5px; }
+  @media (max-width: 720px) {
+    .fc-demand-row { grid-template-columns: 84px minmax(0, 1fr) 108px; }
+  }
+
+  .fc-blocked {
+    background: #fffbeb; border: 1px solid #fcd34d; border-radius: 12px;
+    padding: 12px 14px; margin: 0 0 18px;
+  }
+  .fc-blocked-head { margin: 0 0 8px; font-size: 13px; line-height: 1.55; }
+  .fc-blocked-head strong { display: block; color: #92400e; margin-bottom: 2px; }
+  .fc-blocked-head span { color: var(--text); }
+  .fc-blocked-head code { font-size: 11.5px; background: rgba(180, 83, 9, .10); padding: 1px 5px; border-radius: 4px; }
+  .fc-blocked-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
+  .fc-blocked-list li { display: inline-flex; align-items: baseline; gap: 5px; }
+  .fc-blocked-gap { color: #b45309; font-variant-numeric: tabular-nums; }
+  .fc-leftover { margin: 8px 0 0; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .fc-leftover b { color: var(--text); }
+
+  .fc-recon-empty {
+    margin: 0 0 12px; padding: 12px 14px; font-size: 12.5px; line-height: 1.7;
+    color: var(--muted); background: #f8fafc;
+    border: 1px dashed var(--border); border-radius: 12px;
+  }
+  /* 三口径对账条 */
+  .fc-recon-strip {
+    display: flex; align-items: stretch; gap: 12px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 16px; margin-bottom: 8px;
+  }
+  .fc-recon-item { flex: 1 1 200px; display: flex; flex-direction: column; gap: 2px;
+    border-left: 3px solid var(--border); padding-left: 12px; }
+  .fc-recon-item.tone-warn { border-left-color: #b45309; }
+  .fc-recon-item.tone-info { border-left-color: #0e7490; }
+  .fc-recon-k { font-size: 11.5px; color: var(--muted); }
+  .fc-recon-v { font-size: 21px; font-weight: 700; color: #0f172a; font-variant-numeric: tabular-nums; }
+  .fc-recon-s { font-size: 11px; color: var(--muted); }
+  .fc-recon-arrow { align-self: center; color: var(--muted); font-size: 16px; }
+
+  .fc-method, .fc-detail {
+    margin: 18px 0; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 16px; padding: 0 16px 12px;
+  }
+  .fc-method > summary, .fc-detail > summary {
+    cursor: pointer; padding: 14px 0 10px; font-weight: 600; color: var(--brand-ink);
+    font-size: 15px; list-style: none;
+  }
+  .fc-method > summary::-webkit-details-marker, .fc-detail > summary::-webkit-details-marker { display: none; }
+  .fc-method > summary::before, .fc-detail > summary::before { content: "▸ "; color: var(--muted); }
+  .fc-method[open] > summary::before, .fc-detail[open] > summary::before { content: "▾ "; }
+
+  .fc-method-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 20px; }
+  @media (max-width: 860px) { .fc-method-grid { grid-template-columns: 1fr; } }
+  .fc-method-block h4 { margin: 0 0 6px; font-size: 13px; color: #12263a; }
+  .fc-method-block p { margin: 0 0 6px; font-size: 12.5px; line-height: 1.75; color: var(--muted); }
+  .fc-formula {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    background: #f8fafb; border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; color: #12263a !important; font-size: 12.5px !important;
+  }
+  .fc-why { border-left: 2px solid rgba(15,118,110,.35); padding-left: 10px; }
+  .fc-gap { color: #92400e !important; }
 </style>
+
+<script>
+  (function () {
+    "use strict";
+
+    function bindTabs(barSelector, rowSelector, attr) {
+      var bar = document.querySelector(barSelector);
+      if (!bar) return;
+      var chips = bar.querySelectorAll(".cat-chip");
+      var rows = document.querySelectorAll(rowSelector);
+      bar.addEventListener("click", function (e) {
+        var btn = e.target.closest(".cat-chip");
+        if (!btn) return;
+        var want = btn.getAttribute(attr);
+        chips.forEach(function (c) {
+          var on = c === btn;
+          c.classList.toggle("is-active", on);
+          c.setAttribute("aria-selected", on ? "true" : "false");
+        });
+        rows.forEach(function (row) {
+          var v = row.getAttribute(attr);
+          var show = want === "__all" || v === want;
+          if (want === "over_rounding") {
+            show = row.getAttribute("data-over-rounding") === "1";
+          }
+          row.style.display = show ? "" : "none";
+        });
+      });
+    }
+
+    bindTabs(".fc-tabs[aria-label='行动清单筛选']", "#action-table tbody tr", "data-status");
+    bindTabs(".fc-tabs[aria-label='明细筛选']", "#detail-table tbody tr", "data-dstatus");
+
+    // 品类展开：默认折叠，点品类名展开到品项明细。
+    // 展开行是同一张表里的 <tr>，所以列宽自动对齐，不需要另做布局。
+    var catToggles = Array.prototype.slice.call(document.querySelectorAll(".fc-cat-toggle"));
+
+    function setCat(btn, open) {
+      btn.classList.toggle("is-open", open);
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      var panel = document.getElementById(btn.getAttribute("aria-controls"));
+      if (panel) panel.style.display = open ? "" : "none";
+    }
+
+    catToggles.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        setCat(btn, btn.getAttribute("aria-expanded") !== "true");
+      });
+    });
+
+    var expandAll = document.getElementById("cat-expand-all");
+    if (expandAll) {
+      expandAll.addEventListener("click", function () {
+        var anyClosed = catToggles.some(function (b) {
+          return b.getAttribute("aria-expanded") !== "true";
+        });
+        catToggles.forEach(function (b) { setCat(b, anyClosed); });
+        expandAll.textContent = anyClosed ? "全部收起" : "全部展开";
+      });
+    }
+  })();
+</script>
 {% endblock %}
