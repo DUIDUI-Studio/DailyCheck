@@ -60,6 +60,10 @@ _DISPATCH = {
     "list_low_stock": tools.list_low_stock,
     "list_warehouses": tools.list_warehouses,
     "list_warehouse_items": tools.list_warehouse_items,
+    "list_store_overview": tools.list_store_overview,
+    "get_item_consumption": tools.get_item_consumption,
+    "list_orders": tools.list_orders,
+    "get_project_help": tools.get_project_help,
 }
 
 HISTORY_TURNS = 6

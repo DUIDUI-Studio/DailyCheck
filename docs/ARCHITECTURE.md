@@ -680,6 +680,20 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 2. **数据库**：`file:...?mode=ro` 打开，SQLite 层直接拒绝 UPDATE / DELETE / INSERT（`tests/bot/test_tools.py::TestReadOnlyBoundary` 守着）
 3. **提示词**：只作第三层，**不作为安全依据**
 
+**工具集（10 个只读函数）**。v1 只有 6 个（搜索 / 详情 / 价格 / 低库存 / 仓清单 / 仓内品项），2026-10-21 按实际提问补了 4 个：
+
+| 工具 | 补它的原因 |
+|---|---|
+| `list_store_overview` | 员工问「各门店库存状况」，原来只能逐个仓调 `list_warehouse_items`，模型查一两个就开始编，剩下几家直接答「没出现在清单里」。**必须一次返回全部** |
+| `get_item_consumption` | 「最近消耗了多少」原来完全答不了。数据在 `stock_movements`，**只算负向动作**（出库 / 门店订货出库 / 总仓调货出库），补货入库和出库回退是正数，混进来会把消耗抵消掉 |
+| `list_orders` | 订单在 `master.db` 的 `store_orders`，原来没接。返回带 `{BASE}/store-ordering/orders/<id>` 链接——群里只给订单号等于没给 |
+| `get_project_help` | 「你能干什么」由模型自由发挥时格式每次都不一样。改成固定文案（`bot/help_text.py`）原样转发 |
+
+两个数据侧的坑写在这里，免得下次又踩：
+
+- **研发仓（`warehouse_type=rd`）不存实物库存，但系统给它设了安全库存**，于是 136 个品项全是 0、常年霸占缺货榜首。概览里必须标注类型并排在最后，否则员工会以为公司全线缺货。
+- 概览**刻意不给跨单位总量**：箱、个、包相加没有业务含义，报出去只会被读成「库存很多」。
+
 **价格语义**：`items.selling_price` 是本仓售价；`price_follow_canonical=1` 时改取 `canonical_items.selling_price`（Q6 预留开关，生产当前全 0）。两者都为 0 时返回 `null` 并标「售价未维护」，**绝不报 0 元**——把未维护当 0 是最容易让员工误判的坑。成本价 `unit_cost` 一并返回（Eric 2026-10-21 明确「售价和成本两个接口都预留」）。
 
 **数字对账**（`bot/verify_pure.py`）：模型不改库，但会**算错数**（把六个仓自己加一遍）。回复生成后，把工具返回的数字收成可信集合，扫回复里 > 20 且无出处的数字；命中就用一次无工具的小调用只订正数字（超时 10s，失败保留原答）。`BOT_VERIFY_NUMBERS=0` 一键关闭。
@@ -699,6 +713,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `LLM_API_KEY` | 是 | MiniMax key（缺省回退读 WorkBuddy MCP 配置） |
 | `LLM_BASE_URL` / `LLM_MODEL` | 否 | 缺省 `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` |
 | `BOT_VERIFY_NUMBERS` | 否 | `0` 关闭数字对账 |
+| `BOT_PUBLIC_BASE_URL` | 否 | 消息里链接的域名，缺省 `https://kjtang.cn`。**不能用 127.0.0.1**，群里点不开 |
 
 **部署**：独立 systemd unit `dailycheck-bot.service`，**不在蓝绿流程里**——它不接 HTTP 流量、不与两实例共享进程，重启不影响订货。⚠️ 长连接是**单连接**：同一 BotID 只能有一个进程在线，本地调试前必须先停生产进程，否则互相挤掉。
 

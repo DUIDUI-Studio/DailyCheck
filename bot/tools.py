@@ -78,12 +78,24 @@ def list_warehouses() -> list[dict[str, Any]]:
 
 
 def _warehouse_map() -> dict[str, dict[str, Any]]:
-    """code -> {name, db_path}。一次查全，供跨仓遍历用。"""
+    """code -> {name, db_path, warehouse_type}。一次查全，供跨仓遍历用。
+
+    ``warehouse_type`` 是后加的列（旧库没有），所以带一次回退：宁可拿不到
+    类型，也不能让整个查询挂掉。
+    """
     master = db_dir() / "master.db"
     if not master.exists():
         return {}
     with _connect_ro(master) as conn:
-        rows = conn.execute("SELECT code, name, db_path FROM warehouses ORDER BY code").fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT code, name, db_path, COALESCE(warehouse_type, '') AS warehouse_type "
+                "FROM warehouses ORDER BY code"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = conn.execute(
+                "SELECT code, name, db_path, '' AS warehouse_type FROM warehouses ORDER BY code"
+            ).fetchall()
     return {r["code"]: dict(r) for r in rows}
 
 
@@ -428,3 +440,254 @@ def list_low_stock(warehouse_code: str | None = None, limit: int = 15) -> dict[s
         "alerts": alerts[:limit],
         "note": "shortage 是距安全库存的缺口，不是建议采购量",
     }
+
+
+# ---------------------------------------------------------------------------
+# 门店概览 / 消耗 / 订单 / 帮助（2026-10-21 增补）
+# ---------------------------------------------------------------------------
+
+# 算作「消耗」的动作。必须排除「补货入库」和「出库回退」——那两个是正数，
+# 混进来会把消耗量抵消掉，员工看到的就是一个偏小的假数。
+CONSUME_ACTIONS = ("出库", "门店订货出库", "总仓调货出库")
+
+DEFAULT_PUBLIC_BASE = "https://kjtang.cn"
+
+
+def public_base() -> str:
+    """对外可点的链接前缀。群里点得开必须是公网域名，不能用 127.0.0.1。"""
+    return (os.environ.get("BOT_PUBLIC_BASE_URL") or DEFAULT_PUBLIC_BASE).rstrip("/")
+
+
+# 仓库类型的展示名。研发中心不存实物库存，但系统里给它设了安全库存，
+# 结果它常年霸占预警榜首——概览里必须标出来，否则员工会以为公司全线缺货。
+_TYPE_LABEL = {
+    "storefront": "门店",
+    "distribution_center": "配送中心",
+    "rd": "研发（不存实物库存）",
+}
+_TYPE_ORDER = {"storefront": 0, "distribution_center": 1, "rd": 2}
+
+
+def list_store_overview() -> dict[str, Any]:
+    """各仓/门店的库存概览：品项数、缺货数、低于安全库存数、有货品项数。
+
+    员工问「各门店库存状况」时用这个。**必须一次返回全部**——如果让模型
+    逐个仓去调 ``list_warehouse_items``，实测它只查一两个就开始编，最后
+    落下几家的答案是「没出现在清单里」。
+
+    刻意**不给跨单位的总量**：箱、个、包直接相加没有业务含义，报出去只会
+    让人误读成「库存很多」。要看量得落到具体品项。
+    """
+    rows: list[dict[str, Any]] = []
+    for code, meta in _warehouse_map().items():
+        path = _resolve_path(meta["db_path"])
+        if not path.exists():
+            continue
+        try:
+            with _connect_ro(path) as conn:
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS item_count, "
+                    f"COALESCE(SUM(CASE WHEN COALESCE(quantity, 0) <= 0 THEN 1 ELSE 0 END), 0) AS out_of_stock, "
+                    f"COALESCE(SUM(CASE WHEN COALESCE(quantity, 0) > 0 THEN 1 ELSE 0 END), 0) AS in_stock, "
+                    f"COALESCE(SUM(CASE WHEN COALESCE(safety_stock, 0) > 0 "
+                    f"AND COALESCE(quantity, 0) < safety_stock THEN 1 ELSE 0 END), 0) AS below_safety "
+                    f"FROM items WHERE {VISIBLE_CLAUSE}"
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+        wh_type = meta.get("warehouse_type") or ""
+        rows.append(
+            {
+                "warehouse_code": code,
+                "warehouse_name": meta["name"],
+                "warehouse_type": wh_type,
+                "type_label": _TYPE_LABEL.get(wh_type, wh_type or "未标注"),
+                "item_count": row["item_count"],
+                "in_stock": row["in_stock"],
+                "out_of_stock": row["out_of_stock"],
+                "below_safety": row["below_safety"],
+            }
+        )
+
+    # 门店排前面（员工最常问的），研发排最后（数字没有参考意义）
+    rows.sort(key=lambda r: (_TYPE_ORDER.get(r["warehouse_type"], 9), -r["below_safety"]))
+    return {
+        "ok": True,
+        "warehouses": rows,
+        "count": len(rows),
+        "note": (
+            "in_stock=有货品项数，out_of_stock=零库存，below_safety=低于安全库存（含零库存）；"
+            "research 类仓（研发）不存实物库存，它的缺货数字没有参考意义"
+        ),
+    }
+
+
+def get_item_consumption(
+    sku_or_name: str, days: int = 30, warehouse_code: str | None = None
+) -> dict[str, Any]:
+    """某品项最近 N 天的消耗量，按仓给出，基于库存流水 ``stock_movements``。
+
+    「消耗」只算负向动作（见 ``CONSUME_ACTIONS``）。**不按 0 起算**：如果这个仓
+    近期没有任何流水，如实返回 0 条流水，而不是拿当前库存倒推一个数。
+    """
+    days = max(1, min(int(days or 30), 365))
+    wh_map = _warehouse_map()
+    resolved = resolve_warehouse_code(warehouse_code)
+    targets = {resolved: wh_map[resolved]} if resolved else wh_map
+
+    placeholders = ",".join("?" for _ in CONSUME_ACTIONS)
+    since = f"-{days} day"
+    by_warehouse: list[dict[str, Any]] = []
+    total = 0.0
+    matched_name = ""
+    matched_sku = ""
+    matched_unit = ""
+
+    for code, meta in targets.items():
+        path = _resolve_path(meta["db_path"])
+        if not path.exists():
+            continue
+        try:
+            with _connect_ro(path) as conn:
+                item = conn.execute(
+                    f"SELECT id, sku, name, unit FROM items "
+                    f"WHERE {VISIBLE_CLAUSE} AND (sku = ? OR name LIKE ?) "
+                    f"ORDER BY (sku = ?) DESC, name LIMIT 1",
+                    (sku_or_name, f"%{sku_or_name}%", sku_or_name),
+                ).fetchone()
+                if item is None:
+                    continue
+                matched_name = matched_name or item["name"]
+                matched_sku = matched_sku or item["sku"]
+                matched_unit = matched_unit or item["unit"]
+
+                row = conn.execute(
+                    f"SELECT COALESCE(SUM(-m.delta), 0) AS consumed, COUNT(*) AS moves, "
+                    f"MAX(m.created_at) AS last_at "
+                    f"FROM stock_movements m "
+                    f"WHERE m.item_id = ? AND m.action IN ({placeholders}) "
+                    f"AND m.created_at >= date('now', ?)",
+                    (item["id"], *CONSUME_ACTIONS, since),
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+
+        consumed = round(row["consumed"] or 0, 3)
+        total += consumed
+        by_warehouse.append(
+            {
+                "warehouse_code": code,
+                "warehouse_name": meta["name"],
+                "consumed": consumed,
+                "movement_count": row["moves"],
+                "last_movement_at": row["last_at"],
+            }
+        )
+
+    if not by_warehouse:
+        return {
+            "ok": False,
+            "error": "not_found",
+            "message": f"没有找到「{sku_or_name}」的消耗记录，建议先调 search_items 确认品名",
+        }
+
+    active = [w for w in by_warehouse if w["movement_count"] > 0]
+    return {
+        "ok": True,
+        "query": sku_or_name,
+        "sku": matched_sku,
+        "name": matched_name,
+        "unit": matched_unit,
+        "days": days,
+        "total_consumed": round(total, 3),
+        "by_warehouse": by_warehouse,
+        "note": (
+            f"只统计出库类流水，不含补货入库与出库回退；{len(active)}/{len(by_warehouse)} 个仓在近 {days} 天有记录"
+        ),
+    }
+
+
+_ORDER_STATUS_LABEL = {
+    "pending": "待审批",
+    "approved": "已审批待发货",
+    "shipped": "已发货",
+    "delivered": "已送达",
+    "cancelled": "已取消",
+}
+
+
+def list_orders(status: str | None = None, days: int = 7, limit: int = 20) -> dict[str, Any]:
+    """查门店订单（含可直接点的链接）。
+
+    ``status`` 留空 = 最近的订单全查。员工问「哪些订单还没处理」时传
+    ``approved``（已审批待发货就是「没处理」的口径），不要自己猜别的状态。
+    """
+    master = db_dir() / "master.db"
+    if not master.exists():
+        return {"ok": False, "error": "db_missing", "message": "master.db 不存在"}
+
+    days = max(1, min(int(days or 7), 365))
+    limit = max(1, min(int(limit or 20), 50))
+    base = public_base()
+    names = {c: m["name"] for c, m in _warehouse_map().items()}
+
+    sql = (
+        "SELECT o.id, o.order_no, o.store_warehouse_code, o.dc_warehouse_code, "
+        "o.status, o.created_at, o.expected_delivery_date, "
+        "(SELECT COUNT(*) FROM store_order_items i WHERE i.order_id = o.id) AS item_count "
+        "FROM store_orders o WHERE o.created_at >= date('now', ?) "
+    )
+    params: list[Any] = [f"-{days} day"]
+    if status:
+        sql += "AND o.status = ? "
+        params.append(status)
+    sql += "ORDER BY o.created_at DESC LIMIT ?"
+    params.append(limit)
+
+    try:
+        with _connect_ro(master) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            counts = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM store_orders "
+                "WHERE created_at >= date('now', ?) GROUP BY status",
+                (f"-{days} day",),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return {"ok": False, "error": "query_failed", "message": str(exc)}
+
+    orders = [
+        {
+            "order_no": r["order_no"],
+            "store": names.get(r["store_warehouse_code"], r["store_warehouse_code"]),
+            "status": r["status"],
+            "status_label": _ORDER_STATUS_LABEL.get(r["status"], r["status"]),
+            "created_at": r["created_at"],
+            "expected_delivery_date": r["expected_delivery_date"],
+            "item_count": r["item_count"],
+            "url": f"{base}/store-ordering/orders/{r['id']}",
+        }
+        for r in rows
+    ]
+
+    return {
+        "ok": True,
+        "days": days,
+        "filter_status": status,
+        "count": len(orders),
+        "orders": orders,
+        "status_summary": {
+            _ORDER_STATUS_LABEL.get(r["status"], r["status"]): r["n"] for r in counts
+        },
+        "list_url": f"{base}/store-ordering/orders",
+    }
+
+
+def get_project_help() -> dict[str, Any]:
+    """系统的能力介绍。员工问「你能干什么」「怎么用」「有哪些功能」时返回。
+
+    文案是固定的（``bot/help_text.py``），不交给模型自由发挥——这类回答会被
+    反复触发，格式飘了体验就很差。
+    """
+    from bot.help_text import build_help
+
+    return {"ok": True, "text": build_help(public_base()), "delivery": "原文转发给用户，不要改写"}
