@@ -116,6 +116,7 @@
       <a href="{{ url_for('users.list_users') }}">账号管理</a>
       <a href="{{ url_for('agent_tokens.list_tokens') }}">Agent Token</a>
       <a href="{{ url_for('ops.ops_dashboard') }}">运维看板</a>
+      <a href="{{ url_for('owner_approvals.list_approvals') }}">待拍板</a>
       <a href="{{ url_for('items.items_list') }}">品类与品项</a>
       {% endif %}
       {% if is_admin or is_rd %}

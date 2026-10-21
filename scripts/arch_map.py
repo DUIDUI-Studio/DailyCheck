@@ -38,6 +38,7 @@ AUTH_LABEL = {
     "public": "公开",
     "login": "登录",
     "platform": "平台超管",
+    "agent": "Agent 令牌",
 }
 PREFIX_LABEL = (
     ("perm:", "权限点"),

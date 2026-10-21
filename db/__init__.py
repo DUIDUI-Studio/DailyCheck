@@ -739,6 +739,32 @@ CREATE TABLE IF NOT EXISTS feedback_comments (
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_comments_ticket
     ON feedback_comments(ticket_id, id);
+
+-- Owner 拍板队列（2026-10-21）。
+-- 闭环：Prod Agent 命中红线 → 登记一行 pending → 企微推反馈通知群 →
+-- owner 在 /ops/approvals 点批准/拒绝 → Prod Agent 下次巡检读到 approved 并 merge
+-- → 回写 consumed_at / consume_result。
+-- 一个 PR 只留一行：返工后重新登记走 ON CONFLICT 重置回 pending，
+-- 历史决定由 admin_audit.log 留痕，不在这张表里堆多版本。
+CREATE TABLE IF NOT EXISTS owner_approvals (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_number      INTEGER NOT NULL,
+    pr_title       TEXT    NOT NULL DEFAULT '',
+    pr_url         TEXT    NOT NULL DEFAULT '',
+    risk_kind      TEXT    NOT NULL DEFAULT '',
+    reason         TEXT    NOT NULL DEFAULT '',
+    status         TEXT    NOT NULL DEFAULT 'pending',
+    decided_by     TEXT,
+    decided_at     TEXT,
+    decision_note  TEXT,
+    consumed_at    TEXT,
+    consume_result TEXT,
+    notified_at    TEXT,
+    created_at     TEXT    NOT NULL,
+    UNIQUE (pr_number)
+);
+CREATE INDEX IF NOT EXISTS idx_owner_approvals_status
+    ON owner_approvals(status, id DESC);
 """
 
 # v3 P0 增量：ALTER 必须在 MASTER_SCHEMA 之外，否则 executescript 在已迁移的

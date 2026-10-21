@@ -118,6 +118,7 @@ PLATFORM_ONLY_PERMS: frozenset[str] = frozenset({
 PUBLIC = "public"        # 无需登录
 LOGIN = "login"          # 仅登录（+ 选仓）
 PLATFORM = "platform"    # 仅平台超管（@require_platform_admin 语义）
+AGENT = "agent"          # Bearer 共享令牌（机器调用：无 session、无 CSRF）
 PERM_PREFIX = "perm:"     # perm:<code>
 ANY_PREFIX = "any:"       # any:<code1>|<code2>
 ROLE_PREFIX = "role:"     # role:<code>（兼容层：保留 require_role，不迁移）
@@ -175,6 +176,18 @@ ROUTE_MATRIX: dict[str, str] = {
     # ---- ops（运维交付看板：托管 dc-dashboard-refresh.timer 的渲染产物）----
     # 内容含部署阶段耗时 / 会话 token 用量，属内部运维信息 → 仅平台超管。
     "ops.ops_dashboard": PLATFORM,
+    # ---- owner_approvals（待拍板队列：Prod Agent 登记红线 PR，owner 一键批）----
+    # 页面与按钮同档：能看队列的人就是能拍板的人，不拆两级。
+    # 三个 /api/ops/approvals* 端点不走本矩阵 —— 它们用 Bearer 共享令牌，
+    # 见 blueprints/owner_approvals.py:_agent_authorized。
+    "owner_approvals.list_approvals": PLATFORM,
+    "owner_approvals.decide": PLATFORM,
+    # 机器侧三个端点：Bearer 共享令牌（config.OPS_AGENT_TOKEN）。
+    # AGENT 是独立意图 —— 它们既不是 public（有鉴权），也不是 platform
+    # （没有 session），混进任何一边都会让矩阵读起来是错的。
+    "owner_approvals.api_register": AGENT,
+    "owner_approvals.api_list": AGENT,
+    "owner_approvals.api_consume": AGENT,
     # ---- feedback（用户问题提单 → 管理员判定 → 派发开发闭环）----
     # 用户侧：任意登录用户可提交/看自己的单子（含被忽略的，让他知道被处理过）。
     "feedback.my_feedback": LOGIN,
