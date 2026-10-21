@@ -37,12 +37,21 @@ from db import init_master_db
 from . import replenishment_pure as R
 from .canonical_pure import store_selectable_clause
 
-# 盘点盈亏不是需求 —— note 形如 "盘点审核#24盘亏 (req#1545)"。
-_LOSS_FILTER = (
-    "COALESCE(note,'') NOT LIKE '%盘亏%' "
-    "AND COALESCE(note,'') NOT LIKE '%盘盈%' "
-    "AND COALESCE(note,'') NOT LIKE '%盘点%'"
-)
+
+def _loss_filter(prefix: str = "") -> str:
+    """盘点盈亏不是需求 —— note 形如 "盘点审核#24盘亏 (req#1545)"。
+
+    `prefix` 用于 JOIN 场景（`"m."`），避免两处各写一份口径、改一处漏一处。
+    """
+    col = f"{prefix}note" if prefix else "note"
+    return (
+        f"COALESCE({col},'') NOT LIKE '%盘亏%' "
+        f"AND COALESCE({col},'') NOT LIKE '%盘盈%' "
+        f"AND COALESCE({col},'') NOT LIKE '%盘点%'"
+    )
+
+
+_LOSS_FILTER = _loss_filter()
 
 _STORE_CONSUME_ACTIONS = "('生产消耗','出库')"
 _DC_CONSUME_ACTIONS = "('出库','门店订货出库','总仓调货出库')"
@@ -560,9 +569,7 @@ def store_stock_and_consumption(
                         FROM stock_movements m
                         JOIN items i ON i.id = m.item_id
                         WHERE m.action IN {_STORE_CONSUME_ACTIONS}
-                          AND COALESCE(m.note,'') NOT LIKE '%盘亏%'
-                          AND COALESCE(m.note,'') NOT LIKE '%盘盈%'
-                          AND COALESCE(m.note,'') NOT LIKE '%盘点%'
+                          AND {_loss_filter("m.")}
                           AND date(m.created_at) >= ? AND date(m.created_at) <= ?
                           AND {visible} AND i.canonical_id IS NOT NULL
                         GROUP BY i.canonical_id""",

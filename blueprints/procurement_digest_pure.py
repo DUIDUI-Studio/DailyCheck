@@ -173,6 +173,14 @@ def _store_cell(
     return out
 
 
+def _sum_known(store_rows: Sequence[dict]) -> float | None:
+    """只累加有数的门店；一个都没有时返回 None（渲染成「—」）。"""
+    known = [s["qty"] for s in store_rows if s["qty"] is not None]
+    if not known:
+        return None if store_rows else 0.0
+    return sum(known)
+
+
 def build_digest(
     *,
     day: date,
@@ -252,10 +260,10 @@ def build_digest(
             "cover_days": row.get("cover_days"),
             "value": value,
             "stores": store_rows,
-            # 合计只累加「有数」的门店；某店整库读取失败（qty=None）不能当 0 计入
-            "store_total": sum(
-                s["qty"] for s in store_rows if s["qty"] is not None
-            ),
+            # 合计只累加「有数」的门店。**全部门店都读不出来时合计必须是 None**
+            # 而不是 0：否则「各店 —」和「合计 0」在同一行自相矛盾，
+            # 而 0 恰恰会被读成「确实没货」（M6/N2 的同一个错误）。
+            "store_total": _sum_known(store_rows),
             "has_canonical": cid_key is not None,
         })
 

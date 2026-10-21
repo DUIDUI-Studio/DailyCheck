@@ -55,6 +55,10 @@ MAX_SEND_ATTEMPTS = 3
 # 又不至于把 sentinel 卡成 pending 太久。
 SMTP_TIMEOUT_SECONDS = 15.0
 
+# 进程内「今天已经发成功」的兜底集合。sentinel 写不下（db 目录只读 / 磁盘满）
+# 时，仅靠文件会每 60s tick 重发一封；这里记一笔就能在本进程内止住。
+_CONFIRMED_SENT: set[str] = set()
+
 _POLL_SECONDS = 60
 
 
@@ -242,7 +246,12 @@ def _write_sentinel(path: Path, payload: dict) -> bool:
 
 @contextmanager
 def _day_lock(day: date):
-    """当日跨进程互斥锁（flock），非阻塞：拿不到就 yield False。
+    """当日跨进程互斥锁（flock），非阻塞。yield 一个状态串：
+
+    * ``"ok"``    拿到锁
+    * ``"busy"``  另一个进程正在发
+    * ``"error"`` 锁文件打不开（目录不存在 / 只读）—— 这是永久性故障，
+      不能伪装成「另一个 worker 正在发」，否则运维永远查不到。
 
     为什么必须加锁：sentinel 的状态机是「读 → 判断 → 写」，只有 O_EXCL 的
     首次创建是原子的；失败重试与 pending 接管这两条路径都是读改写，两个
@@ -253,18 +262,20 @@ def _day_lock(day: date):
     path = _lock_path(day)
     fd: int | None = None
     acquired = False
+    reason = "busy"
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
+            reason = "ok"
         except OSError:
-            acquired = False
+            reason = "busy"
     except OSError as exc:
         logger.warning("procurement_digest_lock_failed: %s", type(exc).__name__)
-        acquired = False
+        reason = "error"
     try:
-        yield acquired
+        yield reason
     finally:
         if fd is not None:
             if acquired:
@@ -292,6 +303,8 @@ def _claim(day: date) -> tuple[bool, str, int]:
     * attempts 用尽 → attempts_exhausted
     """
     path = _sentinel_path(day)
+    if str(path) in _CONFIRMED_SENT:
+        return False, "already_sent", 0
     state = _read_sentinel(path) if path.exists() else {}
     status = str(state.get("status") or "")
     prior = int(state.get("attempts") or 0)
@@ -312,11 +325,14 @@ def _claim(day: date) -> tuple[bool, str, int]:
         return False, "attempts_exhausted", prior
 
     attempt = prior + 1
-    _write_sentinel(path, {
+    # 状态写不下就别发：写不进去意味着下一次 tick 会以为「从没发过」，
+    # 于是每 60s 重发一封（全天约 900 封）。宁可这周不发，也不刷爆收件人。
+    if not _write_sentinel(path, {
         "status": "pending",
         "claimed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "attempts": attempt,
-    })
+    }):
+        return False, "state_unwritable", attempt
     return True, ("retry" if status else "claimed"), attempt
 
 
@@ -386,17 +402,25 @@ def send_digest(
     day = today or date.today()
     path = _sentinel_path(day)
 
-    with _day_lock(day) as locked:
-        if not locked:
-            logger.warning("procurement_digest_skip: reason=in_progress date=%s", day)
-            return {"sent": False, "reason": "in_progress", "date": day.isoformat()}
+    with _day_lock(day) as lock_state:
+        if lock_state != "ok":
+            reason = "lock_failed" if lock_state == "error" else "in_progress"
+            logger.warning("procurement_digest_skip: reason=%s date=%s", reason, day)
+            return {"sent": False, "reason": reason, "date": day.isoformat()}
 
         if force:
             attempt = int(_read_sentinel(path).get("attempts") or 0) + 1
         else:
             allowed, why, attempt = _claim(day)
             if not allowed:
-                logger.warning("procurement_digest_skip: reason=%s date=%s", why, day)
+                # already_sent / attempts_exhausted 是「当天正常收尾」，
+                # 整天 60s 一次刷 WARNING 会把真正的问题淹掉。
+                level = (
+                    logging.DEBUG
+                    if why in ("already_sent", "attempts_exhausted")
+                    else logging.WARNING
+                )
+                logger.log(level, "procurement_digest_skip: reason=%s date=%s", why, day)
                 return {"sent": False, "reason": why, "date": day.isoformat()}
 
         try:
@@ -432,6 +456,7 @@ def send_digest(
 
         # sentinel 写失败不改变「已经发出去了」的事实，但必须让调用方看见：
         # 状态没落盘，下一次 tick 可能再发一封。
+        _CONFIRMED_SENT.add(str(path))
         persisted = _write_sentinel(path, {
             "status": "sent",
             "attempts": attempt,

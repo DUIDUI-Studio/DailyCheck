@@ -274,3 +274,16 @@ def test_render_html_empty_digest_has_no_table():
 
 def test_module_exposes_dc_type_constant():
     assert P.DC_TYPE == "distribution_center"
+
+
+def test_all_stores_unknown_total_is_dash_not_zero():
+    """N2 回归：各店都是「—」时，合计不能显示 0 —— 那是同一个 M6 错误。"""
+    digest = _digest(
+        [_row()],
+        store_stock={},
+        stores=[{"code": "s1", "name": "一号店"}, {"code": "s2", "name": "二号店"}],
+        failed_store_codes=["s1", "s2"],
+    )
+    item = digest["items"][0]
+    assert item["store_total"] is None
+    assert "合计 —" in render_text(digest)

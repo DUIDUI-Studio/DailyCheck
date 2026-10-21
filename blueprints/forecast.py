@@ -268,6 +268,7 @@ _DIGEST_FAILURE_STATUS = {
     "in_progress": 409,
     "attempts_exhausted": 409,
     "lock_failed": 500,
+    "state_unwritable": 500,
     "build_failed": 500,
     "send_failed": 502,
 }

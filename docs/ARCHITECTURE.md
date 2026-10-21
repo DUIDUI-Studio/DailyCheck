@@ -811,11 +811,14 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 * 状态文件 `<master.db 目录>/procurement-digest-YYYY-MM-DD.json`（`status` / `attempts` / `claimed_at`）；
 * 互斥用 `<同名>.lock` 上的 `fcntl.flock(LOCK_EX|LOCK_NB)`，把「判定 → 投递 → 写结果」整段串起来。**只有 O_EXCL 首次创建是原子的**，失败重试与 pending 接管都是「读改写」，不加锁就会两个 worker 各发一封（审核 R1 的 M2 就是这条）。
+* **状态写不下就不发**：`_write_sentinel` 失败时直接 `state_unwritable` 返回。写不进去意味着下一次 tick 会以为「从没发过」，在 `hour >= H` 的全天窗口里就是每 60s 一封（约 900 封）。另加进程内 `_CONFIRMED_SENT` 兜底，覆盖「发成功但状态文件随后丢失」。
 * 失败写 `status=failed` 并累计 `attempts`，最多 3 次——一次网络抖动不该让整周没有报告，也不该无限重试把自己打成垃圾邮件源。`pending` 超过 5 分钟视为「进程发送途中被杀」，接管时 **attempts 必须 +1**，否则这条最危险的路径可以无限接管、上限永远不生效（R1 的 M3）。
 * **发送窗口是 `hour >= DIGEST_HOUR`，不是严格相等**：发布/蓝绿切换就是 restart gunicorn，08:0x 重启会让本周邮件永久不发且无人知道。放宽后靠 sentinel 防重复：发过就 `already_sent`，整天重入也只发一封（R1 的 M5）。
 * `force=True`（手动补发）忽略「今天已发」，但**仍过同一把锁与同一个 attempts 计数**——否则双击按钮或与自动 tick 撞点就是两封信。
 
-**失败语义**：与 §3.9 一致——`send_digest()` 绝不抛异常，`sent: false` + `reason` 表达原因。`POST /forecast/digest/send` 的状态码区分 `not_configured`(503) / `send_failed`(502) / `already_sent`、`in_progress`、`attempts_exhausted`(409) / `build_failed`、`lock_failed`(500)；`GET /forecast/digest` 是预览页，只有 200 与装配失败 500 两种。前端**只能认响应体 `sent`**，不能拿 200 当成功（`ajax-form` 钩子会把 3xx 改写成 200 的历史坑，见 §13）。
+**失败语义**：与 §3.9 一致——`send_digest()` 绝不抛异常，`sent: false` + `reason` 表达原因。`POST /forecast/digest/send` 的状态码区分 `not_configured`(503) / `send_failed`(502) / `already_sent`、`in_progress`、`attempts_exhausted`(409) / `build_failed`、`lock_failed`、`state_unwritable`(500)；`GET /forecast/digest` 是预览页，只有 200 与装配失败 500 两种。
+
+⚠️ 手动补发走浏览器会话（`@require_platform_admin` + 全局 `CSRFProtect`），运维脚本裸 `curl -X POST` 会得到 **400**（缺 csrf_token），要带 `X-CSRFToken` 或从预览页点按钮。前端**只能认响应体 `sent`**，不能拿 200 当成功（`ajax-form` 钩子会把 3xx 改写成 200 的历史坑，见 §13）。
 
 **三个「数」的区分**（同一封信里不能自相矛盾）：
 
@@ -827,7 +830,7 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 只按列出部分报总额，收件人照单下单就会少订被截掉的那部分——这是 R1 的 H1，采购单的核心数字不能错三分之一。
 
-**「—」与 0 的区别**：门店库整库读取失败时，该店在这一列显示「—」而不是 0，并在数据说明里记名。0 表示「这家店确实没这个品项」，两者混同会让采购员按假缺货下单（R1 的 M6）。同理，空清单的三种成因（真无需求 / 未找到 DC / 门店库缺失）在**邮件主题**上就能区分，不允许数据故障伪装成「本周不用买」（R1 的 M4）。
+**「—」与 0 的区别**：门店库整库读取失败时，该店在这一列显示「—」而不是 0，**合计行同样显示「—」**（全部门店都未知时合计不能是 0），并在数据说明里记名。0 表示「这家店确实没这个品项」，两者混同会让采购员按假缺货下单（R1 的 M6）。同理，空清单的三种成因（真无需求 / 未找到 DC / 门店库缺失）在**邮件主题**上就能区分，不允许数据故障伪装成「本周不用买」（R1 的 M4）。
 
 **配置**（`config.py`，全部 env 注入，不进 git）：
 
@@ -842,7 +845,7 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 `_env_int()` 对非法值回退默认而不是抛——config 是 import 期求值，一个手滑的 `DIGEST_MAIL_PORT=` 不该让整个 app 起不来。
 
-**测试**（`tests/test_procurement_digest_pure.py` 22 + `tests/test_procurement_digest.py` 22 + `tests/test_procurement_digest_route.py` 8 = 52 用例）：纯渲染（四个决策数字都在 / 截断后总额仍按全量 / 失败店显示「—」/ 空清单三态可在主题区分 / 品项名 HTML 转义 / 缺 `orderable` fail-closed）、取数（真实临时 sqlite：盘点盈亏剔除 / 回退扣减 / **窗口两端 [today-6, today] 钉死** / 坏店记名 / 负消耗截 0）、装配（DC 缺失与未绑主数据的告警）、投递（未配置不发 / 只发一次 / 失败可重试至上限 / 接管 attempts+1 / flock 争用返回 in_progress / force 仍过锁 / 结果里不含密码）、路由（非超管 403 / 503、502 分流 / GET 405）。
+**测试**（`tests/test_procurement_digest_pure.py` 23 + `tests/test_procurement_digest.py` 25 + `tests/test_procurement_digest_route.py` 8 = 56 用例）：纯渲染（四个决策数字都在 / 截断后总额仍按全量 / 失败店显示「—」/ 空清单三态可在主题区分 / 品项名 HTML 转义 / 缺 `orderable` fail-closed）、取数（真实临时 sqlite：盘点盈亏剔除 / 回退扣减 / **窗口两端 [today-6, today] 钉死** / 坏店记名 / 负消耗截 0）、装配（DC 缺失与未绑主数据的告警）、投递（未配置不发 / 只发一次 / 失败可重试至上限 / 接管 attempts+1 / flock 争用返回 in_progress / 锁文件打不开返回 lock_failed / 状态写不下拒发 / force 仍过锁 / 结果里不含密码）、路由（非超管 403 / 503、502 分流 / GET 405）。
 
 ---
 

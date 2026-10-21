@@ -487,3 +487,40 @@ def test_force_still_respects_lock(sendable):
 def test_send_result_reports_state_persistence(sendable):
     result = D.send_digest(today=sendable["day"])
     assert result["state_persisted"] is True
+
+
+def test_unwritable_state_blocks_sending(sendable, monkeypatch):
+    """N1 回归：sentinel 写不下就不发。
+
+    写不进去意味着下次 tick 会以为「从没发过」→ 每 60s 重发一封。
+    宁可这周不发，也不能刷爆收件人。
+    """
+    monkeypatch.setattr(D, "_write_sentinel", lambda path, payload: False)
+    result = D.send_digest(today=sendable["day"])
+    assert result["sent"] is False
+    assert result["reason"] == "state_unwritable"
+    assert sendable["sent"] == []
+
+
+def test_lock_file_unopenable_reports_lock_failed(sendable, monkeypatch):
+    """N3 回归：锁文件打不开是永久故障，不能伪装成 in_progress。"""
+    import config as config_module
+
+    # master.db 指向不存在的目录 → 锁文件 os.open 直接失败
+    monkeypatch.setattr(config_module, "MASTER_DB", "/nonexistent-dir/dc/master.db",
+                        raising=False)
+    result = D.send_digest(today=sendable["day"])
+    assert result["sent"] is False
+    assert result["reason"] == "lock_failed"
+
+
+def test_in_process_guard_prevents_resend_when_state_lost(sendable, monkeypatch):
+    """sentinel 事后不可读时，本进程内的兜底集合仍能止住第二次投递。"""
+    day = sendable["day"]
+    assert D.send_digest(today=day)["sent"] is True
+
+    # 模拟状态文件丢失（磁盘满 / 被清理）
+    D._sentinel_path(day).unlink()
+    again = D.send_digest(today=day)
+    assert again["reason"] == "already_sent"
+    assert len(sendable["sent"]) == 1
