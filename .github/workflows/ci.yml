@@ -56,6 +56,16 @@ jobs:
       - name: Zero-new-failure gate
         run: python scripts/check_known_failures.py /tmp/pytest-output.txt
 
+      # 红线 1「清单只许收缩不许扩张」此前只有文字、没有执行器：
+      # 往 known_failures.txt 加一条，CI 照样全绿。这里补上机器守卫。
+      - name: Known-failures list must only shrink (red line 1)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          BASE="${BASE_SHA}"
+          if [ -z "$BASE" ]; then BASE="HEAD~1"; fi
+          python scripts/check_known_failures_shrink.py --base "$BASE"
+
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
     # 详见 docs/agent-framework/v0.1.md §三
@@ -68,6 +78,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # 变异验证要校验「变异点落在本 PR 改动文件内」，需要 base sha 可达
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -95,10 +107,25 @@ jobs:
         run: |
           bash scripts/agent_framework/preview.sh "${PR_NUM}" || echo "[warn] preview exit non-zero"
 
+      # 变异验证：PR body 声明「注入什么变异后哪个测试必须变红」，这里真的注入并
+      # 断言测试变红，产物 reports/mutation.json 供 check_reports 读。
+      # 未声明不阻断（避免为过门禁编造变异），但产物缺失/没看守住都会显形。
+      - name: Mutation verification (declared in PR body)
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p /tmp/pr
+          echo "$PR_BODY" > /tmp/pr/body.md
+          PR_BODY_FILE=/tmp/pr/body.md python scripts/agent_framework/mutation_check.py
+
       - name: Check four reports gate
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p /tmp/pr
           echo "$PR_BODY" > /tmp/pr/body.md

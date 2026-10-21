@@ -31,6 +31,28 @@ DailyCheck PR 模板（2026-10-15 重写 v2，与门禁脚本对齐 + 生产侧�
 - [ ] bash -n / dry-run 冒烟通过（若改动 shell 脚本）
 - [ ] 未提交运行时文件（db/、backups/、logs/、.venv/、.workbuddy/ 等）
 
+## 变异验证
+
+<!--
+把「我改坏过、测试真变红了」变成机器证据：CI 由
+scripts/agent_framework/mutation_check.py 真注入变异、断言指定测试变红、
+再用哈希校验还原。
+
+- 格式：JSON 数组，字段 id / file / find / replace / test（expect 只支持 fail）
+- 约束：find 在文件里必须**恰好出现 1 次**；file 必须在本次 PR 改动范围内
+- 无逻辑变更（纯文档/纯配置/纯样式）→ 保留空数组 [] 即可，Checklist 会显示「未声明」
+- 手工跑过但这里没写 = 没做。没有机器产物，它与自述无法区分
+
+示例（请替换成真实内容）：
+  {"id": "M1", "file": "scripts/xxx.py",
+   "find": "原代码片段", "replace": "改坏后的片段",
+   "test": "tests/test_xxx.py::test_yyy"}
+-->
+
+```json
+[]
+```
+
 ## 生产侧事项
 
 <!-- ⚠️ 必填。写给 Prod Agent 的 merge 判定与部署参考。 -->

@@ -32,7 +32,10 @@
 1. 确认分支、确认改动范围
 2. `ruff check` 仅改动文件零告警
 3. pytest **零新增失败**：对比 `tests/known_failures.txt` 基线逐行比对（清单**只许收缩不许扩张**）
-4. 关键断言做**变异验证**：把修复临时还原成 bug 版，确认新测试真实 FAIL（防恒真式假绿）
+4. 关键断言做**变异验证**：把修复临时还原成 bug 版，确认新测试真实 FAIL（防恒真式假绿）。
+   **必须**在 PR body 的「## 变异验证」段用 JSON 声明，CI 由 `mutation_check.py`
+   真注入、断言测试变红、落 `reports/mutation.json`。手工跑一遍**不算**——
+   没有机器可读产物，它和「我验过了」一句自述无法区分。
 5. shell 脚本改动：`bash -n` + dry-run 冒烟
 6. 触及架构子系统必须同步 `docs/ARCHITECTURE.md`（pre-commit hook 强制；helper：`scripts/arch_touched_sections.py`）
 
@@ -62,6 +65,30 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 | `deploy` | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：备份 cron + 异地副本 + 真实部署演练） |
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
+
+### ④′ 证据强度分级（2026-10-21 Eric 授权新增）
+
+门禁的价值不在「看起来绿」，而在「绿是不是算出来的」。每项必须能说清证据来源：
+
+| 门禁项 | 证据来源 | 强度 |
+|-------|---------|------|
+| pytest 零新增 | `check_known_failures.py` 读真实 pytest 输出 | **强·可机验** |
+| ruff / bandit | `ci-summary.json` 真实计数 | **强·可机验** |
+| 红线 1「清单只许收缩」 | `check_known_failures_shrink.py` 与 base 提交逐条比对，新增即红 | **强·可机验** |
+| 变异验证 | `mutation_check.py` 真注入变异 + 断言测试变红 + 哈希校验还原 | **强·可机验** |
+| 未提交运行时文件 | 与 PR diff 比对（含 `reports/mutation.json` 等产物） | **强·可机验** |
+| 架构文档同步 | 与 PR diff 比对（pre-commit 为主，CI 只交叉提示不硬拦） | 中·提示 |
+| 报告 01 段落 / R 表 | 只查标题存在与字面无 ❌ | **弱·形式** |
+| 报告 04 段落 | 只查两个标题 | **弱·形式** |
+
+铁律两条：
+
+1. **不得把「弱·形式」写成「已验」**。弱项在 Checklist 表里必须显示为 `⚠️` 或 `—`，
+   不得用 ✅ 掩盖——把未验证的声明混进一片绿色里，比不报更坏
+   （同 `docs/ARCHITECTURE.md` §3 看板铁律：把「没记录」说成「没发生」）。
+2. **变异未声明不阻断，但必须显眼**。改了 `scripts/*.py` 却没声明变异时，Checklist
+   出 `⚠️` 而非 `✅` 或 `—`；Prod Agent 的 merge 判定要读这一行，不能只看「全绿」。
+   不阻断的理由：硬性要求会催生「为过门禁随便编一条变异」，那比不声明更有害。
 
 ## 三、Push 政策（2026-10-15 Eric 放开）
 

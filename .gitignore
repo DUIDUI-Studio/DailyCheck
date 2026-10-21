@@ -67,3 +67,6 @@ reports/**/*.html
 reports/.dashboard/*.db
 reports/.dashboard/*.db-shm
 reports/.dashboard/*.db-wal
+# 门禁运行时产物（每次 CI 重新生成，内容取决于当次 diff，入库没有意义且会腐烂）
+reports/mutation.json
+reports/ci-summary.json
