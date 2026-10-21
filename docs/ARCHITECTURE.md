@@ -729,6 +729,55 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 ---
 
+### 3.13 Owner 拍板队列（红线 PR 不再静默挂着，2026-10-21 起）
+
+**问题**：Prod Agent 命中红线后只做一件事——开一张 GitHub issue，然后 PR 就停在那里。owner 不主动刷 GitHub 就永远不知道有东西等他拍板。2026-10-20 的 #137（CI 门禁并行）就这样挂了 8 小时，直到会话里被追问才被发现。
+
+诊断结论是**缺推送**，不是缺审批界面：issue 里写得清清楚楚，问题在没人告诉他。所以本方案的重心是「把信号推到人眼前」，不是「把 GitHub 搬进站内」。
+
+**闭环四步**：
+
+```
+Prod Agent 判红线 → POST /api/ops/approvals 登记（Bearer）
+  → 落 owner_approvals 表（status=pending）
+  → 同步推企微「反馈通知群」（WECOM_FEEDBACK_WEBHOOK）
+  → owner 点消息里的链接 → /ops/approvals 点「批准」
+  → 表里 status=approved
+  → Prod Agent 巡检 GET /api/ops/approvals → 拿到 approved → merge
+  → POST /api/ops/approvals/<pr>/consume 回写 merged
+```
+
+**为什么用「登记制」而不是站内反查 GitHub**：
+
+判定的第一现场在 Prod Agent——它读 PR diff、对照红线清单，只有它知道这次为什么被拦。站内反过来猜（open PR + CI 状态 + 评论措辞）等于把判据复制一份，两份迟早不一致；而且 GitHub 匿名配额 60 次/小时，PR 一多这页就挂，偏偏它是用来兜底的。代价是 Prod Agent 必须改一行（见「生产侧事项」），但这本来就该是它的职责。
+
+**为什么不在这里直接 merge**：merge → 部署链路（release / 蓝绿）由 Prod Agent 持有，应用侧不该拿到 GitHub 写权限。站内只记录「owner 说可以」，执行权和执行结果留在 Agent 那边。
+
+**状态机**（`status` 记的是 owner 的**决定**，不是进展）：
+
+| status | 含义 | 谁能写 |
+|---|---|---|
+| `pending` | 等 owner 拍板 | 登记 / 返工重登记 |
+| `approved` | 批了，等 Agent 执行 | 站内按钮 |
+| `rejected` | 驳了，等 Agent 收尾 | 站内按钮 |
+
+「已执行」不是独立状态，是 `consumed_at` 非空。这样「当初批了还是驳了」不会因为执行完就被覆盖掉。`UNIQUE(pr_number)` + upsert：PR 返工后重新登记会整行重置回 `pending` 并清空上一轮决定——同一个 PR 只保留最新一轮，历史决定在 `admin_audit.log`。
+
+**两套鉴权，刻意不统一**：
+
+| 端点 | 鉴权 | 理由 |
+|---|---|---|
+| `GET /ops/approvals`、`POST /ops/approvals/<pr>/decide` | session + `@require_platform_admin` + CSRF | 人在浏览器里点 |
+| `POST/GET /api/ops/approvals*` | `Authorization: Bearer <OPS_AGENT_TOKEN>`，**CSRF 豁免** | 机器调，没有 session，也拿不到 csrf_token |
+
+共用一套要么给机器发 cookie，要么给浏览器关 CSRF——两个都是错的。`OPS_AGENT_TOKEN` 为空时三个 API **一律 403**（不是放行），令牌比对用 `hmac.compare_digest`。
+
+**为什么发反馈通知群**：owner 指定「那个群是企微这边的管理员」。群里本来就只有管理员，且反馈单也要他们处理，同一批人同一个群，不新建通道。
+
+**测试**（`tests/test_owner_approvals.py`，39 用例）：纯函数（畸形 payload / `bool` 与 `float` 挡掉 / `javascript:` URL 丢弃 / 长度截断 / 空令牌不放行）、鉴权（无令牌 401 / 错令牌 403 / 未配置 403 / CSRF 豁免仅限 API）、状态机（重复同状态幂等不刷新 `decided_at` / 改判被拒 / 返工重登记回到 pending）、消费（回写 `consumed_at` 后 Agent 不再取到，`status` 仍是 approved）。两组变异验证：`_agent_authorized` 改恒真 → 3 红；去掉 `csrf.exempt` → 1 红。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态

@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}待拍板{% endblock %}
+{% block content %}
+<div class="list-head">
+  <h2>待拍板</h2>
+  <a class="btn-sm" href="{{ url_for('ops.ops_dashboard') }}">运维看板</a>
+</div>
+
+<p class="muted">
+  Prod Agent 判定某个 PR 触碰红线后会登记到这里，同时推一条企业微信到反馈通知群。
+  你在这里点一下，它下次巡检就按这个结论执行。
+</p>
+
+{% if not agent_enabled %}
+<div class="oa-warn">
+  未配置 <code>OPS_AGENT_TOKEN</code>：Prod Agent 既不能登记，也读不到你的决定。
+  本页当前只能查看历史记录。
+</div>
+{% endif %}
+
+<h3>等你拍板 <span class="oa-count">{{ pending|length }}</span></h3>
+{% for item in pending %}
+<div class="oa-card">
+  <div class="oa-head">
+    <span class="oa-pr">PR #{{ item.pr_number }}</span>
+    {% if item.risk_kind %}<span class="oa-kind">{{ item.risk_kind }}</span>{% endif %}
+  </div>
+  {% if item.pr_title %}<div class="oa-title">{{ item.pr_title }}</div>{% endif %}
+  {% if item.reason %}<div class="oa-reason">{{ item.reason }}</div>{% endif %}
+  <div class="oa-meta">
+    {{ item.created_at }}
+    {% if item.pr_url %} · <a href="{{ item.pr_url }}" target="_blank" rel="noopener">在 GitHub 打开</a>{% endif %}
+  </div>
+  <form method="post" action="{{ url_for('owner_approvals.decide', pr=item.pr_number) }}" class="oa-actions">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="text" name="note" maxlength="200" placeholder="备注（可选）">
+    <button type="submit" name="decision" value="approved" class="btn oa-approve">批准</button>
+    <button type="submit" name="decision" value="rejected" class="btn oa-reject">驳回</button>
+  </form>
+</div>
+{% else %}
+<p class="muted">没有待拍板项。</p>
+{% endfor %}
+
+<h3>已决定</h3>
+{% if decided %}
+<table class="oa-table">
+  <thead>
+    <tr><th>PR</th><th>结论</th><th>谁</th><th>时间</th><th>执行</th></tr>
+  </thead>
+  <tbody>
+    {% for item in decided %}
+    <tr>
+      <td class="oa-td-pr">
+        {% if item.pr_url %}<a href="{{ item.pr_url }}" target="_blank" rel="noopener">#{{ item.pr_number }}</a>{% else %}#{{ item.pr_number }}{% endif %}
+      </td>
+      <td><span class="oa-status oa-st-{{ item.status }}">{{ item.status_label }}</span></td>
+      <td>{{ item.decided_by or '—' }}</td>
+      <td class="oa-td-time">{{ item.decided_at or '—' }}</td>
+      <td class="oa-td-time">
+        {% if item.executed %}{{ item.consume_result or '已执行' }}{% else %}待执行{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">还没有拍板记录。</p>
+{% endif %}
+
+<style>
+  .oa-warn {
+    margin: 12px 0 18px; padding: 10px 14px; border-left: 3px solid #c9a227;
+    background: #fffbeb; border-radius: 0 6px 6px 0; font-size: 14px;
+  }
+  .oa-warn code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; }
+  .oa-count {
+    display: inline-block; min-width: 20px; padding: 0 7px; margin-left: 6px;
+    background: #0f766e; color: #fff; border-radius: 10px;
+    font-size: 13px; line-height: 20px; text-align: center;
+  }
+  .oa-card {
+    border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px;
+    margin-bottom: 12px; background: #fff;
+  }
+  .oa-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .oa-pr { font-weight: 600; font-size: 15px; color: #0f766e; }
+  .oa-kind {
+    font-size: 12px; padding: 1px 8px; border-radius: 10px;
+    background: #fef3c7; color: #92400e;
+  }
+  .oa-title { font-size: 14px; margin-bottom: 4px; }
+  .oa-reason {
+    font-size: 13px; color: #4b5563; background: #f9fafb;
+    padding: 8px 10px; border-radius: 6px; margin-bottom: 8px;
+    white-space: pre-wrap;
+  }
+  .oa-meta { font-size: 12px; color: #6b7280; margin-bottom: 10px; }
+  .oa-meta a { color: #0f766e; }
+  .oa-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .oa-actions input[type="text"] {
+    flex: 1 1 180px; min-width: 140px; padding: 6px 10px; font-size: 13px;
+    border: 1px solid #d1d5db; border-radius: 6px;
+  }
+  .oa-approve { border-color: #0f766e; color: #0f766e; }
+  .oa-reject { border-color: #dc2626; color: #dc2626; }
+  .oa-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .oa-table th, .oa-table td {
+    text-align: left; padding: 8px 10px; border-bottom: 1px solid #eef0f2;
+  }
+  .oa-table th { color: #6b7280; font-weight: 500; }
+  .oa-td-pr a { color: #0f766e; }
+  .oa-td-time { color: #6b7280; white-space: nowrap; }
+  .oa-status { font-size: 12px; padding: 1px 8px; border-radius: 10px; }
+  .oa-st-approved { background: #ecfdf5; color: #047857; }
+  .oa-st-rejected { background: #fef2f2; color: #b91c1c; }
+  .oa-st-pending { background: #fef3c7; color: #92400e; }
+</style>
+{% endblock %}

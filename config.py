@@ -179,3 +179,17 @@ FEEDBACK_GITHUB_TOKEN = os.environ.get("FEEDBACK_GITHUB_TOKEN", "").strip()
 FEEDBACK_GITHUB_REPO = os.environ.get(
     "FEEDBACK_GITHUB_REPO", "ericmr1981/DailyCheck"
 ).strip()
+
+# ─────────────────────────────────────────────────────────────────────
+# Owner 拍板队列（2026-10-21）
+#
+# Prod Agent 命中红线后，不再只开一张 GitHub issue 等人发现，而是登记到
+# owner_approvals 表 → 推企微反馈通知群 → owner 在 /ops/approvals 一键批。
+# 见 blueprints/owner_approvals_pure.py 与 docs/ARCHITECTURE.md §3.12。
+#
+# - OPS_AGENT_TOKEN：Prod Agent 调登记/消费接口用的共享令牌。
+#   **为空 = 两个 API 全部 403**（默认关闭，宁可页面上没数据，
+#   也不能让未鉴权的请求往队列里塞东西）。站内页面不受影响。
+#   放在 /etc/dailycheck/ops-agent.env，与用户 token、MCP token 互不复用。
+# ─────────────────────────────────────────────────────────────────────
+OPS_AGENT_TOKEN = os.environ.get("OPS_AGENT_TOKEN", "").strip()

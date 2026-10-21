@@ -7,10 +7,16 @@ is bound in blueprints/auth.py's before_request hook from session.
 from __future__ import annotations
 
 from flask import Flask, request
+from flask_wtf import CSRFProtect
 
 from cli import register_cli
 from config import IS_PRODUCTION, SECRET_KEY
 from db import close_dbs, init_master_db
+
+# 模块级实例：蓝图需要 `csrf.exempt` 来豁免 Bearer 鉴权的 Agent 接口
+# （见 blueprints/owner_approvals.py），所以不能只在 create_app 内部临时构造。
+# 真正的 init_app 在 create_app 里，模块级这里不做任何绑定。
+csrf = CSRFProtect()
 
 
 def create_app() -> Flask:
@@ -49,9 +55,7 @@ def create_app() -> Flask:
         force = app.config.get("WTF_CSRF_FORCE_ENABLED", False)
         app.config["WTF_CSRF_ENABLED"] = force or not app.config.get("TESTING", False)
 
-    from flask_wtf import CSRFProtect
-
-    CSRFProtect(app)
+    csrf.init_app(app)
 
     # 全局 IP 限速（P0-4）。内存滑动窗口，per-app 实例（app.extensions），
     # gunicorn 多 worker 各自计数、重启清零（v1 约定，见 rate_limit_pure）。
@@ -102,6 +106,7 @@ def create_app() -> Flask:
     from blueprints.notifications import bp as notifications_bp
     from blueprints.ops import bp as ops_bp
     from blueprints.outbound import bp as outbound_bp
+    from blueprints.owner_approvals import bp as owner_approvals_bp
     from blueprints.procurement import bp as procurement_bp
     from blueprints.production import bp as production_bp
     from blueprints.recipe_cost import bp as recipe_cost_bp
@@ -131,6 +136,7 @@ def create_app() -> Flask:
     app.register_blueprint(dc_transfer_bp)
     app.register_blueprint(feedback_bp)
     app.register_blueprint(ops_bp)
+    app.register_blueprint(owner_approvals_bp)
 
     # PWA endpoints (manifest + service worker) stay at root paths.
     from blueprints.auth import pwa_bp

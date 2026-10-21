@@ -12,9 +12,9 @@
 
 ## 0. 一览
 
-- 蓝图 21 个（已装配 20 / 未装配 1）
-- 路由 **172** 条（按鉴权强度：平台超管 50 · 登录 47 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · 任一权限 1）
-- 数据表 **62** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
+- 蓝图 22 个（已装配 21 / 未装配 1）
+- 路由 **177** 条（按鉴权强度：平台超管 52 · 登录 47 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
 
@@ -37,6 +37,7 @@
 | `restock` | `restock.py` | 6 | 在役 |
 | `adjustment` | `adjustment.py` | 5 | **未装配** |
 | `forecast` | `forecast.py` | 5 | 在役 |
+| `owner_approvals` | `owner_approvals.py` | 5 | 在役 |
 | `import_items` | `import_items.py` | 4 | 在役 |
 | `procurement` | `procurement.py` | 4 | 在役 |
 | `agent_tokens` | `agent_tokens.py` | 3 | 在役 |
@@ -182,6 +183,16 @@
 | `outbound.outbound_start` | POST | `/outbound/start` | 登录 |  |
 | `outbound.outbound_submit` | POST | `/outbound/submit` | 权限点 | stock.outbound |
 | `outbound.rollback` | POST | `/outbound/<int:req_id>/rollback` | 权限点 | stock.outbound.rollback |
+
+### `owner_approvals`
+
+| endpoint | 方法 | 规则 | 鉴权 | 明细 |
+|---|---|---|---|---|
+| `owner_approvals.api_consume` | POST | `/api/ops/approvals/<int:pr>/consume` | Agent 令牌 |  |
+| `owner_approvals.api_list` | GET | `/api/ops/approvals` | Agent 令牌 |  |
+| `owner_approvals.api_register` | POST | `/api/ops/approvals` | Agent 令牌 |  |
+| `owner_approvals.decide` | POST | `/ops/approvals/<int:pr>/decide` | 平台超管 |  |
+| `owner_approvals.list_approvals` | GET | `/ops/approvals` | 平台超管 |  |
 
 ### `procurement`
 
@@ -336,7 +347,7 @@
 ## 3. 数据层
 
 - `WAREHOUSE_SCHEMA_VERSION = 4`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
-- 表 62 张：
+- 表 63 张：
 
 - `adjustment_requests` · `agent_tokens` · `approval_policies` · `audit_log`
 - `canonical_categories` · `canonical_claim_requests` · `canonical_conflicts` · `canonical_item_aliases`
@@ -345,15 +356,15 @@
 - `forecast_runs` · `ic_recipe_items` · `ic_recipes` · `item_loss_ledger`
 - `item_publish_event_items` · `item_publish_event_warehouses` · `item_publish_events` · `items`
 - `login_throttle` · `notification_prefs` · `notifications` · `outbound_requests`
-- `permission_routes` · `permissions` · `procurement_cache` · `procurement_config`
-- `product_bom` · `production_run_items` · `production_runs` · `products`
-- `recipe_items` · `recipe_publish_event_warehouses` · `recipe_publish_events` · `recipe_versions`
-- `recipe_versions_new` · `recipes` · `replenishment_config` · `restock_requests`
-- `role_permissions` · `roles` · `shipping_rules` · `stock_movements`
-- `stocktake_batches` · `stocktakes` · `store_order_cart_items` · `store_order_carts`
-- `store_order_deliveries` · `store_order_items` · `store_order_payment_proofs` · `store_order_receipts`
-- `store_order_status_history` · `store_orders` · `tenants` · `users`
-- `warehouse_users` · `warehouses`
+- `owner_approvals` · `permission_routes` · `permissions` · `procurement_cache`
+- `procurement_config` · `product_bom` · `production_run_items` · `production_runs`
+- `products` · `recipe_items` · `recipe_publish_event_warehouses` · `recipe_publish_events`
+- `recipe_versions` · `recipe_versions_new` · `recipes` · `replenishment_config`
+- `restock_requests` · `role_permissions` · `roles` · `shipping_rules`
+- `stock_movements` · `stocktake_batches` · `stocktakes` · `store_order_cart_items`
+- `store_order_carts` · `store_order_deliveries` · `store_order_items` · `store_order_payment_proofs`
+- `store_order_receipts` · `store_order_status_history` · `store_orders` · `tenants`
+- `users` · `warehouse_users` · `warehouses`
 
 ## 4. MCP 工具域
 
