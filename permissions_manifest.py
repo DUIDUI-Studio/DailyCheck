@@ -208,6 +208,10 @@ ROUTE_MATRIX: dict[str, str] = {
     # ---- forecast ----
     "forecast.forecast_index": PLATFORM,        # 清除死装饰器
     "forecast.forecast_board_json": PLATFORM,   # 与页面同源，同一守卫
+    # 周度采购建议邮件（Issue #145）：预览 = 全量采购数据 + 成本金额，
+    # 手动发送 = 对外发信（不可撤回），两者都是平台级动作，不进仓库角色包。
+    "forecast.forecast_digest_preview": PLATFORM,
+    "forecast.forecast_digest_send": PLATFORM,
     "forecast.forecast_item": f"{ROLE_PREFIX}manager",
     "forecast.forecast_product": f"{ROLE_PREFIX}manager",
     "forecast.forecast_recompute": f"{ROLE_PREFIX}manager",

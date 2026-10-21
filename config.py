@@ -193,3 +193,47 @@ FEEDBACK_GITHUB_REPO = os.environ.get(
 #   放在 /etc/dailycheck/ops-agent.env，与用户 token、MCP token 互不复用。
 # ─────────────────────────────────────────────────────────────────────
 OPS_AGENT_TOKEN = os.environ.get("OPS_AGENT_TOKEN", "").strip()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 周度采购建议邮件（企业微信邮箱 SMTP，2026-10-21 起）
+#
+# 每周二把「配送中心本周该采什么、采多少、各门店还有多少、近 7 天用了
+# 多少」发到指定邮箱。见 blueprints/procurement_digest.py 与
+# docs/ARCHITECTURE.md §3.13。
+#
+# - 全部凭证由服务器 env 注入（生产写 /etc/dailycheck/app.env），**不进
+#   git**：SMTP 授权码等同账号密码。
+# - DIGEST_MAIL_TO / USER / PASSWORD 任一为空 = 功能关闭：调度线程照常跑
+#   但直接跳过并留一条 WARNING，绝不半途发一封缺附件缺数据的残邮件。
+# - 企业微信邮箱（腾讯 exmail）默认 smtp.exmail.qq.com:465（SSL）。
+#   465 走 SMTP_SSL，其它端口走明文 + STARTTLS。
+# - DIGEST_WEEKDAY 用 Python 口径：0=周一 … 6=周日，默认 1=周二。
+# - DIGEST_HOUR 为服务器本地小时（生产 CST）。整点内每 60s 轮询一次，
+#   由每日 sentinel 文件保证当天只发一封。
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _env_int(name: str, default: int) -> int:
+    """env 取整数：非法值回退默认，**绝不在 import 期抛**。
+
+    config 是 import 期求值，一个手滑的 `DIGEST_MAIL_PORT=465 ` 或空串
+    就能让整个 app 起不来 —— 邮件是锦上添花，不值得这个代价。
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+DIGEST_MAIL_HOST = (os.environ.get("DIGEST_MAIL_HOST") or "smtp.exmail.qq.com").strip()
+DIGEST_MAIL_PORT = _env_int("DIGEST_MAIL_PORT", 465)
+DIGEST_MAIL_USER = (os.environ.get("DIGEST_MAIL_USER") or "").strip()
+DIGEST_MAIL_PASSWORD = os.environ.get("DIGEST_MAIL_PASSWORD") or ""
+DIGEST_MAIL_FROM = (os.environ.get("DIGEST_MAIL_FROM") or "").strip() or DIGEST_MAIL_USER
+DIGEST_MAIL_TO = (os.environ.get("DIGEST_MAIL_TO") or "").strip()
+DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 1)
+DIGEST_HOUR = _env_int("DIGEST_HOUR", 8)

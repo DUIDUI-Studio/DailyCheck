@@ -507,6 +507,90 @@ def _store_open_orders() -> dict[tuple[str, int], float]:
     return out
 
 
+def store_stock_and_consumption(
+    days: int = 7, today: date | None = None
+) -> tuple[dict[int, dict[str, float]], dict[int, float], list[dict]]:
+    """门店侧按 canonical_id 汇总的「当前库存」与「近 N 天实际消耗」。
+
+    返回 ``(stock_by_cid, consumed_by_cid, stores)``：
+
+    * ``stock_by_cid[canonical_id][store_code] = 数量``
+    * ``consumed_by_cid[canonical_id] = 近 N 天全部门店消耗合计``
+    * ``stores = [{"code", "name"}, ...]``（门店顺序，供邮件列固定列序）
+
+    为什么单独取一遍而不是从 `build_board()` 的 rows 里凑
+    ---------------------------------------------------
+    看板行里的 ``rate`` 是**加窗估计的日均**（含近期加权），不是「最近 7 天
+    实际消耗」。Issue #145 要的是后者 —— 用 ``rate * 7`` 会在消耗波动时给出
+    明显偏离现实的数字（门店消耗是周内脉冲式的），所以这里直接按日聚合动账。
+    另外看板 rows 只含库存，不含「按 canonical 维度跨店合并」的口径。
+
+    口径与看板一致：门店消耗 = 「生产消耗」+「出库」，剔除盘点盈亏/盘点调整，
+    扣掉回退（正 delta）。可见性用 `store_selectable_clause`，与看板同源。
+    """
+    day = today or date.today()
+    span = max(1, int(days))
+    start = (day - timedelta(days=span - 1)).strftime("%Y-%m-%d")
+    end = day.strftime("%Y-%m-%d")
+
+    stock_by_cid: dict[int, dict[str, float]] = defaultdict(dict)
+    consumed_by_cid: dict[int, float] = defaultdict(float)
+    stores: list[dict] = []
+
+    visible = store_selectable_clause("i")
+    for wh in list_warehouses():
+        if wh["warehouse_type"] != "storefront":
+            continue
+        stores.append({"code": wh["code"], "name": wh["name"]})
+        try:
+            with closing(sqlite3.connect(wh["db_path"])) as conn:
+                conn.row_factory = sqlite3.Row
+                stock_rows = conn.execute(
+                    f"""SELECT i.canonical_id AS cid, SUM(i.quantity) AS qty
+                        FROM items i
+                        WHERE {visible} AND i.canonical_id IS NOT NULL
+                        GROUP BY i.canonical_id"""
+                ).fetchall()
+                move_rows = conn.execute(
+                    f"""SELECT i.canonical_id AS cid, SUM(-m.delta) AS qty
+                        FROM stock_movements m
+                        JOIN items i ON i.id = m.item_id
+                        WHERE m.action IN {_STORE_CONSUME_ACTIONS}
+                          AND COALESCE(m.note,'') NOT LIKE '%盘亏%'
+                          AND COALESCE(m.note,'') NOT LIKE '%盘盈%'
+                          AND COALESCE(m.note,'') NOT LIKE '%盘点%'
+                          AND date(m.created_at) >= ? AND date(m.created_at) <= ?
+                          AND i.canonical_id IS NOT NULL
+                        GROUP BY i.canonical_id""",
+                    (start, end),
+                ).fetchall()
+                rollback_rows = conn.execute(
+                    f"""SELECT i.canonical_id AS cid, SUM(m.delta) AS qty
+                        FROM stock_movements m
+                        JOIN items i ON i.id = m.item_id
+                        WHERE m.action IN {_ROLLBACK_ACTIONS}
+                          AND date(m.created_at) >= ? AND date(m.created_at) <= ?
+                          AND i.canonical_id IS NOT NULL
+                        GROUP BY i.canonical_id""",
+                    (start, end),
+                ).fetchall()
+        except sqlite3.Error:
+            # 单仓坏库不影响其它门店汇总；邮件里会带上「哪些仓缺数」的告警
+            # （由调用方结合 build_board 的 data_quality 给出）。
+            continue
+
+        for r in stock_rows:
+            stock_by_cid[int(r["cid"])][wh["code"]] = float(r["qty"] or 0.0)
+        for r in move_rows:
+            consumed_by_cid[int(r["cid"])] += float(r["qty"] or 0.0)
+        for r in rollback_rows:
+            consumed_by_cid[int(r["cid"])] -= abs(float(r["qty"] or 0.0))
+
+    # 回退超过消耗会算出负数（历史数据错账）。截到 0：邮件里「近 7 天消耗 -3」
+    # 只会让人怀疑数字，不会提供任何决策价值。
+    return dict(stock_by_cid), {cid: max(0.0, qty) for cid, qty in consumed_by_cid.items()}, stores
+
+
 # ---------------------------------------------------------------------------
 # 装配
 # ---------------------------------------------------------------------------

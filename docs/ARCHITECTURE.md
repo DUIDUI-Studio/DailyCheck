@@ -778,6 +778,54 @@ Prod Agent 判红线 → POST /api/ops/approvals 登记（Bearer）
 
 ---
 
+### 3.14 周度采购建议邮件（每周二发企业微信邮箱，Issue #145）
+
+**需求**：补货看板（§3.11 的 `/forecast`，数据层 `replenishment_data`）算出来的东西只有主动打开页面才看得到。而「每周该向供应商订什么」是**周期性决策**，需要主动推送：哪些要采、采多少、这些品项在各门店还剩多少、最近 7 天消耗了多少。渠道是**企业微信邮箱（SMTP）**，不是群机器人——这是一份给人存档、转发、打印的采购单。
+
+**分层**（与看板同一条取数链，不重写公式）：
+
+```
+replenishment_data.build_board()           ← 看板与邮件共用（同一份数）
+        │  rows: 逐 (仓, 品项) 计划
+        ▼
+procurement_digest_pure.pick_purchase_rows()   ← DC + 可订 + 有建议量 + critical/due
+        │
+procurement_digest_pure.build_digest()         ← 补各门店库存 / 近 7 天消耗 / 汇总
+        │
+   ┌────┴────┐
+   ▼         ▼
+render_text  render_html  →  procurement_digest.send_mail()（SMTP）
+   ▲
+   └── GET /forecast/digest（预览，与定时任务同链）
+```
+
+**三条口径红线**：
+
+1. **只取 DC 行**。门店行是「向 DC 订货」，DC 行才是「向供应商采购」。混在一张单里会让采购量翻倍——这是 2026-10-20 引入 `scope` 时的原话，邮件里同样适用。
+2. **`is_orderable=0` 不进采购单**。该标记含义是「该品项已改门店自采，DC 不再统配」，不是「暂时下不了单」。把它算进 DC 采购 = 替门店多订一批。
+3. **「近 7 天消耗」必须是实际动账聚合，不是 `rate × 7`**。`rate` 是加窗估计的日均（含近期加权），用于定安全库存；而邮件里问的是「这周到底用了多少」。门店消耗是脉冲式的，两者在长尾品项上能差一个数量级。实现是 `replenishment_data.store_stock_and_consumption()`：按 `date(created_at)` 聚合 `生产消耗` + `出库`，剔除 note 含盘亏/盘盈/盘点的调整行，扣掉回退，负值截 0。
+
+**调度与去重**：`procurement_digest.start_scheduler()` 起一条独立 daemon 线程（与看板 03:00 日批互不影响），默认周二 08:00（`DIGEST_WEEKDAY=1` / `DIGEST_HOUR=8`，服务器本地时间），60s 轮询。gunicorn 每个 worker 都有自己的线程，因此「今天发过没」**必须落盘**：`<master.db 目录>/procurement-digest-YYYY-MM-DD.json`，用 `O_CREAT|O_EXCL` 原子抢占。失败写 `status=failed` 并累计 `attempts`，同一小时内允许重试，最多 3 次——一次网络抖动不该让整周没有报告，但也不该无限重试把自己打成垃圾邮件源。`pending` 超过 5 分钟视为「进程发送途中被杀」，允许接管。
+
+**失败语义**：与 §3.9 一致——`send_digest()` 绝不抛异常，`sent: false` + `reason` 表达原因；`GET/POST /forecast/digest*` 的 HTTP 状态码区分 `not_configured`(503) / `send_failed`(502) / `already_sent`、`in_progress`、`attempts_exhausted`(409)。前端**只能认响应体 `sent`**，不能拿 200 当成功（`ajax-form` 钩子会把 3xx 改写成 200 的历史坑，见 §13）。
+
+**配置**（`config.py`，全部 env 注入，不进 git）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DIGEST_MAIL_HOST` | `smtp.exmail.qq.com` | 企业微信邮箱 SMTP |
+| `DIGEST_MAIL_PORT` | `465` | 465 走 `SMTP_SSL`，其余端口明文 + STARTTLS |
+| `DIGEST_MAIL_USER` / `DIGEST_MAIL_PASSWORD` | 空 | 任一为空 = 功能关闭 |
+| `DIGEST_MAIL_FROM` | = USER | 发件人 |
+| `DIGEST_MAIL_TO` | 空 | 收件人，支持逗号/分号/空格分隔多个 |
+| `DIGEST_WEEKDAY` / `DIGEST_HOUR` | `1` / `8` | Python 口径 0=周一 |
+
+`_env_int()` 对非法值回退默认而不是抛——config 是 import 期求值，一个手滑的 `DIGEST_MAIL_PORT=` 不该让整个 app 起不来。
+
+**测试**（`tests/test_procurement_digest_pure.py` 18 + `tests/test_procurement_digest.py` 16 + `tests/test_procurement_digest_route.py` 8）：纯渲染（四个决策数字都在 / 门店缺数不填 0 蒙混 / 品项名 HTML 转义）、取数（真实临时 sqlite：盘点盈亏剔除 / 回退扣减 / 窗口外不计 / 负消耗截 0）、装配（DC 缺失与未绑主数据的告警）、投递（未配置不发 / 只发一次 / 失败可重试至上限 / force 补发 / pending 互斥 / 结果里不含密码）、路由（非超管 403 / 503、502 分流 / GET 405）。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态

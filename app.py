@@ -143,6 +143,10 @@ def create_app() -> Flask:
     app.register_blueprint(pwa_bp)
 
     _start_scheduler()
+    # 周度采购建议邮件（Issue #145）：独立的 weekly 调度线程，与看板的
+    # 03:00 日批互不影响；未注入 SMTP 凭证时是空转（立即 return）。
+    from blueprints.procurement_digest import start_scheduler as _start_digest_scheduler
+    _start_digest_scheduler()
 
     register_cli(app)
     from blueprints._helpers import (
