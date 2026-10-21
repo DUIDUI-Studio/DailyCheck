@@ -112,7 +112,7 @@ def test_store_stock_and_consumption_aggregates_and_excludes_stocktake(
     s2.commit()
     s2.close()
 
-    stock, consumed, stores = store_stock_and_consumption(days=7)
+    stock, consumed, stores, failed = store_stock_and_consumption(days=7)
 
     assert [s["code"] for s in stores] == ["s1", "s2"]
     assert stock[101] == {"s1": 5.0, "s2": 2.0}
@@ -129,8 +129,44 @@ def test_store_stock_and_consumption_clamps_negative_to_zero(multi_warehouse):
     s1.commit()
     s1.close()
 
-    _stock, consumed, _stores = store_stock_and_consumption(days=7)
+    _stock, consumed, _stores, failed = store_stock_and_consumption(days=7)
+    assert failed == []
     assert consumed[101] == 0.0
+
+
+def test_consumption_window_is_exactly_seven_days(multi_warehouse):
+    """窗口 = [today-6, today]：第 7 天前（days_ago=7）必须排除。
+
+    这条是「近 7 天」这个需求核心数字的边界断言 —— 没有它，把 `span - 1`
+    写成 `span`（窗口变 8 天）不会有任何用例变红。
+    """
+    from blueprints.replenishment_data import store_stock_and_consumption
+
+    s1 = sqlite3.connect(multi_warehouse["s1"])
+    item = _insert_item(s1, sku="A1", name="番茄酱", canonical_id=101, qty=1.0)
+    _insert_move(s1, item, "出库", -10.0, 6)   # 第 7 天（含）
+    _insert_move(s1, item, "出库", -20.0, 7)   # 第 8 天（不含）
+    _insert_move(s1, item, "出库", -40.0, 0)   # 今天（含）
+    s1.commit()
+    s1.close()
+
+    _stock, consumed, _stores, _failed = store_stock_and_consumption(days=7)
+    assert consumed[101] == pytest.approx(50.0)
+
+
+def test_failed_store_is_reported_not_silently_zero(multi_warehouse):
+    """整库读不出来必须记名上报，否则邮件里那一列 0 会被读成「确实没货」。"""
+    from blueprints.replenishment_data import store_stock_and_consumption
+
+    # 用坏 SQL 制造读取失败：把 s2 的 items 表删掉
+    s2 = sqlite3.connect(multi_warehouse["s2"])
+    s2.execute("DROP TABLE items")
+    s2.commit()
+    s2.close()
+
+    _stock, _consumed, stores, failed = store_stock_and_consumption(days=7)
+    assert [s["code"] for s in stores] == ["s1", "s2"]  # 列序不受影响
+    assert failed == ["s2"]
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +218,14 @@ def test_mask_address_keeps_domain_only():
     assert D.mask_address("no-at-sign") == "***"
 
 
-def test_is_due_only_on_configured_weekday_and_hour(monkeypatch):
+def test_is_due_opens_a_catchup_window_after_the_hour(monkeypatch):
+    """到点之后整天都算窗口：08:xx 重启 gunicorn 也能补发，sentinel 防重复。"""
     _set_mail_config(monkeypatch)
     settings = D.digest_settings()
-    assert D.is_due(datetime(2026, 10, 27, 8, 0), settings) is True   # 周二 08:00
-    assert D.is_due(datetime(2026, 10, 27, 9, 0), settings) is False  # 小时不对
-    assert D.is_due(datetime(2026, 10, 26, 8, 0), settings) is False  # 周一
+    assert D.is_due(datetime(2026, 10, 27, 8, 0), settings) is True    # 周二 08:00
+    assert D.is_due(datetime(2026, 10, 27, 9, 30), settings) is True   # 当周补发窗口
+    assert D.is_due(datetime(2026, 10, 27, 7, 59), settings) is False  # 还没到点
+    assert D.is_due(datetime(2026, 10, 26, 8, 0), settings) is False   # 周一
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +273,7 @@ def test_collect_digest_joins_store_data(monkeypatch):
         replenishment_data,
         "store_stock_and_consumption",
         lambda days=7, today=None: ({101: {"s1": 5.0}}, {101: 28.0},
-                                    [{"code": "s1", "name": "一号店"}]),
+                                    [{"code": "s1", "name": "一号店"}], []),
     )
     monkeypatch.setattr(replenishment_data, "load_params", lambda: None)
 
@@ -263,7 +301,7 @@ def test_collect_digest_warns_when_dc_missing(monkeypatch):
     monkeypatch.setattr(
         replenishment_data,
         "store_stock_and_consumption",
-        lambda days=7, today=None: ({}, {}, []),
+        lambda days=7, today=None: ({}, {}, [], []),
     )
     monkeypatch.setattr(replenishment_data, "load_params", lambda: None)
 
@@ -294,10 +332,12 @@ def sendable(multi_warehouse, monkeypatch):
         D,
         "collect_digest",
         lambda today=None, limit=None: {
-            "items": [], "item_count": 0, "truncated": 0, "total_value": 0.0,
+            "items": [], "item_count": 0, "item_count_total": 0,
+            "truncated": 0, "total_value": 0.0, "listed_value": 0.0,
             "day": today or date.today(), "date_label": "2026-10-27（周二）",
             "generated_at": "2026-10-27 08:00", "dc_name": "中央配送中心",
-            "window_days": 7, "stores": [], "warnings": [], "dc_configured": True,
+            "window_days": 7, "stores": [], "warnings": [],
+            "dc_configured": True, "failed_stores": [],
         },
     )
     return {"sent": sent, "day": date(2026, 10, 27)}
@@ -380,3 +420,70 @@ def test_send_digest_masks_recipients_in_result(sendable):
     result = D.send_digest(today=sendable["day"])
     assert result["recipients"] == ["o***@corp.example"]
     assert "secret" not in json.dumps(result)
+
+
+def test_concurrent_send_is_rejected_while_lock_held(sendable):
+    """M2 回归：另一个进程持锁时不得再发一封（生产 4 条调度线程同 tick）。
+
+    flock 绑定打开文件描述，同进程再开一个 fd 也能复现争用。
+    """
+    import fcntl
+    import os as os_module
+
+    day = sendable["day"]
+    fd = os_module.open(D._lock_path(day), os_module.O_CREAT | os_module.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        blocked = D.send_digest(today=day)
+        assert blocked["sent"] is False
+        assert blocked["reason"] == "in_progress"
+        assert sendable["sent"] == []
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os_module.close(fd)
+
+    # 锁释放后能正常发，且只发一封
+    assert D.send_digest(today=day)["sent"] is True
+    assert len(sendable["sent"]) == 1
+
+
+def test_stale_pending_takeover_counts_as_new_attempt(sendable, monkeypatch):
+    """M3 回归：接管「发送途中被杀」必须 +1，否则上限永远不生效。"""
+    day = sendable["day"]
+    path = D._sentinel_path(day)
+    stale = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    path.write_text(json.dumps({
+        "status": "pending", "claimed_at": stale, "attempts": 2,
+    }))
+
+    def _boom(*args, **kwargs):
+        raise OSError("smtp down")
+
+    monkeypatch.setattr(D, "send_mail", _boom)
+    assert D.send_digest(today=day)["reason"] == "send_failed"
+
+    state = json.loads(path.read_text())
+    assert state["attempts"] == 3          # 接管算一次，不是沿用 2
+    assert D.send_digest(today=day)["reason"] == "attempts_exhausted"
+
+
+def test_force_still_respects_lock(sendable):
+    """L1 回归：手动补发也要过锁 —— 双击按钮不能变成两封信。"""
+    import fcntl
+    import os as os_module
+
+    day = sendable["day"]
+    fd = os_module.open(D._lock_path(day), os_module.O_CREAT | os_module.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        result = D.send_digest(today=day, force=True)
+        assert result["reason"] == "in_progress"
+        assert sendable["sent"] == []
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os_module.close(fd)
+
+
+def test_send_result_reports_state_persistence(sendable):
+    result = D.send_digest(today=sendable["day"])
+    assert result["state_persisted"] is True

@@ -509,14 +509,17 @@ def _store_open_orders() -> dict[tuple[str, int], float]:
 
 def store_stock_and_consumption(
     days: int = 7, today: date | None = None
-) -> tuple[dict[int, dict[str, float]], dict[int, float], list[dict]]:
+) -> tuple[dict[int, dict[str, float]], dict[int, float], list[dict], list[str]]:
     """门店侧按 canonical_id 汇总的「当前库存」与「近 N 天实际消耗」。
 
-    返回 ``(stock_by_cid, consumed_by_cid, stores)``：
+    返回 ``(stock_by_cid, consumed_by_cid, stores, failed_store_codes)``：
 
     * ``stock_by_cid[canonical_id][store_code] = 数量``
     * ``consumed_by_cid[canonical_id] = 近 N 天全部门店消耗合计``
     * ``stores = [{"code", "name"}, ...]``（门店顺序，供邮件列固定列序）
+    * ``failed_store_codes``：整库读取失败的门店 —— 调用方必须把这些店渲染成
+      「—」而不是 0。「这家店没货」和「这家店读不出来」显示成一样的 0，
+      会让采购员按缺货下单，这是比不发邮件更糟的错误。
 
     为什么单独取一遍而不是从 `build_board()` 的 rows 里凑
     ---------------------------------------------------
@@ -536,6 +539,7 @@ def store_stock_and_consumption(
     stock_by_cid: dict[int, dict[str, float]] = defaultdict(dict)
     consumed_by_cid: dict[int, float] = defaultdict(float)
     stores: list[dict] = []
+    failed_stores: list[str] = []
 
     visible = store_selectable_clause("i")
     for wh in list_warehouses():
@@ -560,7 +564,7 @@ def store_stock_and_consumption(
                           AND COALESCE(m.note,'') NOT LIKE '%盘盈%'
                           AND COALESCE(m.note,'') NOT LIKE '%盘点%'
                           AND date(m.created_at) >= ? AND date(m.created_at) <= ?
-                          AND i.canonical_id IS NOT NULL
+                          AND {visible} AND i.canonical_id IS NOT NULL
                         GROUP BY i.canonical_id""",
                     (start, end),
                 ).fetchall()
@@ -570,13 +574,15 @@ def store_stock_and_consumption(
                         JOIN items i ON i.id = m.item_id
                         WHERE m.action IN {_ROLLBACK_ACTIONS}
                           AND date(m.created_at) >= ? AND date(m.created_at) <= ?
-                          AND i.canonical_id IS NOT NULL
+                          AND {visible} AND i.canonical_id IS NOT NULL
                         GROUP BY i.canonical_id""",
                     (start, end),
                 ).fetchall()
         except sqlite3.Error:
-            # 单仓坏库不影响其它门店汇总；邮件里会带上「哪些仓缺数」的告警
-            # （由调用方结合 build_board 的 data_quality 给出）。
+            # 单仓坏库不影响其它门店汇总，但必须**记名**上报：静默跳过会让
+            # 邮件里那一列显示成 0，看起来像「这家店确实没货」——采购员据此
+            # 下单就是错单。这一列要显示「—」并附告警。
+            failed_stores.append(wh["code"])
             continue
 
         for r in stock_rows:
@@ -588,7 +594,12 @@ def store_stock_and_consumption(
 
     # 回退超过消耗会算出负数（历史数据错账）。截到 0：邮件里「近 7 天消耗 -3」
     # 只会让人怀疑数字，不会提供任何决策价值。
-    return dict(stock_by_cid), {cid: max(0.0, qty) for cid, qty in consumed_by_cid.items()}, stores
+    return (
+        dict(stock_by_cid),
+        {cid: max(0.0, qty) for cid, qty in consumed_by_cid.items()},
+        stores,
+        failed_stores,
+    )
 
 
 # ---------------------------------------------------------------------------

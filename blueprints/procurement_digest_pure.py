@@ -23,7 +23,7 @@
   会直接导致多订一批没人要的货。
 所以入口 `pick_purchase_rows()` 只放行「DC + 可订 + 有建议量 + 到点/断货」。
 
-Spec: docs/ARCHITECTURE.md §3.11 周度采购建议邮件。
+Spec: docs/ARCHITECTURE.md §3.14 周度采购建议邮件。
 """
 from __future__ import annotations
 
@@ -107,12 +107,15 @@ def fmt_cover(days: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def pick_purchase_rows(rows: Iterable[dict], limit: int | None = DEFAULT_LIMIT) -> tuple[list[dict], int]:
-    """从看板 rows 挑出「本周该由 DC 向供应商采购」的行。
+def pick_purchase_rows(rows: Iterable[dict]) -> list[dict]:
+    """从看板 rows 挑出「本周该由 DC 向供应商采购」的行（**不截断**）。
 
-    返回 (截断后的行, 被截掉的条数)。排序：断货风险优先，其次建议金额降序。
-    缺 `suggested_qty` / `warehouse_type` 的行直接跳过 —— 宁可少列，
-    也不把来路不明的行塞进采购单。
+    排序：断货风险优先，其次建议金额降序。
+
+    三条过滤都是 fail-closed：`warehouse_type` 缺省 / `orderable` 缺省 /
+    数量解析不出来一律不放行。少列一项只是清单短一行，多列一项就会让
+    采购员订错货、订多余的货 —— 两种错误的代价不对称，所以宁可漏。
+    截断交给 `build_digest`，因为主题与摘要要用**全量**合计（见下方注释）。
     """
     picked: list[dict] = []
     for row in rows or ():
@@ -122,7 +125,9 @@ def pick_purchase_rows(rows: Iterable[dict], limit: int | None = DEFAULT_LIMIT) 
             continue
         if row.get("status") not in ACTION_STATUSES:
             continue
-        if not row.get("orderable", True):
+        # fail-closed：只有明确 True 才放行。缺字段意味着上游改过结构，
+        # 此时按「可订」放行会把门店自采品项算进 DC 采购单（本需求红线之一）。
+        if row.get("orderable") is not True:
             continue
         try:
             qty = float(row.get("suggested_qty") or 0.0)
@@ -137,23 +142,33 @@ def pick_purchase_rows(rows: Iterable[dict], limit: int | None = DEFAULT_LIMIT) 
         -float(r.get("suggested_value") or 0.0),
         str(r.get("name") or ""),
     ))
-
-    if limit is None or limit <= 0:
-        return picked, 0
-    return picked[:limit], max(0, len(picked) - limit)
+    return picked
 
 
-def _store_cell(stores: Sequence[dict], stock: dict | None) -> list[dict]:
-    """把某品项在各门店的库存整理成 [{name, qty}]，缺数按 0。"""
+def _store_cell(
+    stores: Sequence[dict],
+    stock: dict | None,
+    failed_codes: frozenset[str] | set[str] = frozenset(),
+) -> list[dict]:
+    """把某品项在各门店的库存整理成 [{name, qty}]。
+
+    三种「没有数」必须区分，否则采购员会把故障读成缺货：
+
+    * 有数据 → 具体数字；
+    * 该店库读得出来、但这个品项不在店里 → 0（确实没有）；
+    * 该店整库读取失败 → ``None``，渲染成「—」（不知道，别当成 0 下单）。
+    """
     out: list[dict] = []
     for store in stores:
         code = str(store.get("code") or "")
-        qty = 0.0
-        if isinstance(stock, dict):
+        qty: float | None = 0.0
+        if isinstance(stock, dict) and code in stock:
             try:
                 qty = float(stock.get(code) or 0.0)
             except (TypeError, ValueError):
                 qty = 0.0
+        elif code in failed_codes:
+            qty = None
         out.append({"name": str(store.get("name") or code or "未命名门店"), "qty": qty})
     return out
 
@@ -165,26 +180,43 @@ def build_digest(
     store_stock: dict[int, dict[str, float]] | None = None,
     consumption_7d: dict[int, float] | None = None,
     stores: Sequence[dict] | None = None,
+    failed_store_codes: Sequence[str] | None = None,
     dc_name: str = "配送中心",
     window_days: int = 7,
     limit: int | None = DEFAULT_LIMIT,
     warnings: Sequence[str] | None = None,
     generated_at: datetime | None = None,
+    dc_configured: bool = True,
 ) -> dict:
     """装配成可直接渲染的 digest dict（纯函数，输入什么就渲染什么）。
 
     `rows` 是看板 `build_board()` 的 `rows`（含所有仓、所有状态）；
     这里只挑 DC 的采购动作行，再为每行补齐门店库存与 7 天消耗。
+
+    **合计口径**：`item_count_total` / `total_value` 一律按**未截断的全量**
+    计算。邮件只列前 `limit` 行，但主题和摘要必须说本周到底要花多少钱 ——
+    拿「列出来的那 20 行」当总数，收件人照着下单就会少订剩下的部分。
     """
     store_stock = store_stock or {}
     consumption_7d = consumption_7d or {}
     stores = list(stores or ())
+    failed_codes = frozenset(str(c) for c in (failed_store_codes or ()))
 
-    picked, truncated = pick_purchase_rows(rows, limit=limit)
-
-    items: list[dict] = []
+    picked = pick_purchase_rows(rows)
+    item_count_total = len(picked)
     total_value = 0.0
     for row in picked:
+        try:
+            total_value += float(row.get("suggested_value") or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+    listed = picked if limit is None or limit <= 0 else picked[:limit]
+    truncated = item_count_total - len(listed)
+
+    items: list[dict] = []
+    listed_value = 0.0
+    for row in listed:
         cid = row.get("canonical_id")
         try:
             cid_key = int(cid) if cid is not None else None
@@ -193,7 +225,9 @@ def build_digest(
         stock = store_stock.get(cid_key) if cid_key is not None else None
         # 未绑主数据（canonical_id 为空）就没有跨店汇总的键 —— 不能拿 0 冒充满
         # 库存，那会让「这家店确实没货」和「这品项根本对不上店」看起来一样。
-        store_rows = _store_cell(stores, stock) if cid_key is not None else []
+        store_rows = (
+            _store_cell(stores, stock, failed_codes) if cid_key is not None else []
+        )
         consumed = 0.0
         if cid_key is not None:
             try:
@@ -201,7 +235,7 @@ def build_digest(
             except (TypeError, ValueError):
                 consumed = 0.0
         value = float(row.get("suggested_value") or 0.0)
-        total_value += value
+        listed_value += value
         items.append({
             "name": str(row.get("name") or ""),
             "sku": str(row.get("sku") or ""),
@@ -218,7 +252,10 @@ def build_digest(
             "cover_days": row.get("cover_days"),
             "value": value,
             "stores": store_rows,
-            "store_total": sum(s["qty"] for s in store_rows),
+            # 合计只累加「有数」的门店；某店整库读取失败（qty=None）不能当 0 计入
+            "store_total": sum(
+                s["qty"] for s in store_rows if s["qty"] is not None
+            ),
             "has_canonical": cid_key is not None,
         })
 
@@ -229,9 +266,14 @@ def build_digest(
         "dc_name": dc_name,
         "window_days": int(window_days),
         "items": items,
+        # 列出条数与全量条数分开：主题/摘要说「本周要买多少」时用全量
         "item_count": len(items),
+        "item_count_total": item_count_total,
         "truncated": truncated,
         "total_value": round(total_value, 2),
+        "listed_value": round(listed_value, 2),
+        "dc_configured": bool(dc_configured),
+        "failed_stores": sorted(failed_codes),
         "stores": [{"code": str(s.get("code") or ""), "name": str(s.get("name") or "")} for s in stores],
         "warnings": [w for w in (warnings or ()) if w],
     }
@@ -243,22 +285,34 @@ def build_digest(
 
 
 def build_subject(digest: dict) -> str:
-    """邮件主题。空清单也要能一眼看出「这周不用买」。"""
+    """邮件主题 —— 通知栏里唯一可见的一行，必须是「本周到底要买多少」。
+
+    三种「0 项」必须能区分，否则一次数据故障会被读成「本周安全」：
+    真无需求 / 未配置 DC / 有告警的数据不全。
+    """
     label = digest.get("date_label") or ""
-    count = int(digest.get("item_count") or 0)
-    if count <= 0:
-        return f"【采购建议】{label} 无需采购"
-    return (
-        f"【采购建议】{label} {count} 项"
-        f" · 参考金额 ¥{fmt_money(digest.get('total_value'))}"
-    )
+    total = int(digest.get("item_count_total") or 0)
+    if total > 0:
+        listed = int(digest.get("item_count") or 0)
+        suffix = f"（列出 {listed}）" if listed < total else ""
+        return (
+            f"【采购建议】{label} {total} 项{suffix}"
+            f" · 参考金额 ¥{fmt_money(digest.get('total_value'))}"
+        )
+    if digest.get("dc_configured") is False:
+        return f"【采购建议】{label} 未生成：未找到配送中心仓"
+    if digest.get("failed_stores"):
+        return f"【采购建议】{label} 数据不全：{len(digest['failed_stores'])} 个门店库读取失败"
+    return f"【采购建议】{label} 无需采购"
 
 
 def _store_line(item: dict) -> str:
     stores = item.get("stores") or []
     if not stores:
         return "未绑定主数据，无法跨店汇总"
-    return "、".join(f"{s['name']} {fmt_qty(s['qty'])}" for s in stores)
+    body = "、".join(f"{s['name']} {fmt_qty(s['qty'])}" for s in stores)
+    # 合计只累加有数的店（「—」不参与），避免把故障店当 0 拉低总数
+    return f"{body}（合计 {fmt_qty(item.get('store_total'))}）"
 
 
 def render_text(digest: dict) -> str:
@@ -273,20 +327,23 @@ def render_text(digest: dict) -> str:
     ]
 
     items = digest.get("items") or []
+    total = int(digest.get("item_count_total") or 0)
     if not items:
-        lines.append("本周没有需要采购的品项（无断货风险 / 无到点补货）。")
+        lines.append(_empty_reason(digest))
     else:
         lines.append(
-            f"本周需采购 {digest.get('item_count', 0)} 项，"
+            f"本周需采购 {total} 项，"
             f"参考金额 ¥{fmt_money(digest.get('total_value'))}。"
         )
         lines.append("")
         for idx, item in enumerate(items, start=1):
             unit = item.get("unit") or ""
+            on_order = float(item.get("dc_on_order") or 0.0)
+            on_order_text = f"（在途 {fmt_qty(on_order)}）" if on_order > 0 else ""
             lines.append(
                 f"{idx}. {item.get('name') or item.get('sku')}"
                 f"　建议采购 {fmt_qty(item.get('suggested_qty'))} {unit}"
-                f"｜DC 库存 {fmt_qty(item.get('dc_stock'))}"
+                f"｜DC 库存 {fmt_qty(item.get('dc_stock'))}{on_order_text}"
                 f"｜近 7 天消耗 {fmt_qty(item.get('consumption_7d'))}"
                 f"｜{item.get('status_label')}"
                 f"｜可覆盖 {fmt_cover(item.get('cover_days'))}"
@@ -295,7 +352,8 @@ def render_text(digest: dict) -> str:
         if digest.get("truncated"):
             lines.append("")
             lines.append(
-                f"另有 {digest['truncated']} 项已省略，完整清单见系统「补货看板」。"
+                f"另有 {digest['truncated']} 项（合计 ¥{fmt_money(float(digest.get('total_value') or 0) - float(digest.get('listed_value') or 0))}）"
+                f"未在本邮件内列出，完整清单见系统「补货看板」。"
             )
 
     warnings = digest.get("warnings") or []
@@ -308,6 +366,15 @@ def render_text(digest: dict) -> str:
     lines.append("")
     lines.append("本邮件由系统每周二自动发送；如需调整收件人或发送时间请联系管理员。")
     return "\n".join(lines)
+
+
+def _empty_reason(digest: dict) -> str:
+    """空清单的三种成因分开说 —— 别让数据故障看起来像「本周不用买」。"""
+    if digest.get("dc_configured") is False:
+        return "未找到配送中心仓，本次采购建议未生成（这是配置问题，不是「本周不用买」）。"
+    if digest.get("failed_stores"):
+        return "部分门店库读取失败，本次数据不完整，请先恢复后再看采购建议。"
+    return "本周没有需要采购的品项（无断货风险 / 无到点补货）。"
 
 
 def _html_escape(value: Any) -> str:
@@ -331,7 +398,13 @@ def render_html(digest: dict) -> str:
         stores = item.get("stores") or []
         if stores:
             store_text = "<br>".join(
-                f"{_html_escape(s['name'])} <b>{fmt_qty(s['qty'])}</b>" for s in stores
+                f"{_html_escape(s['name'])} " + (
+                    '<b>—</b>' if s["qty"] is None else f"<b>{fmt_qty(s['qty'])}</b>"
+                ) for s in stores
+            )
+            store_text += (
+                f'<div style="color:#94a3b8;font-size:11px;margin-top:2px">'
+                f"合计 {fmt_qty(item.get('store_total'))}</div>"
             )
         else:
             store_text = '<span style="color:#94a3b8">未绑定主数据</span>'
@@ -345,7 +418,10 @@ def render_html(digest: dict) -> str:
             f'font-size:14px;font-weight:600;color:#0f172a;white-space:nowrap">'
             f"{fmt_qty(item.get('suggested_qty'))} {_html_escape(item.get('unit'))}</td>"
             f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:right;'
-            f'font-size:13px;color:#334155;white-space:nowrap">{fmt_qty(item.get("dc_stock"))}</td>'
+            f'font-size:13px;color:#334155;white-space:nowrap">{fmt_qty(item.get("dc_stock"))}'
+            + (f'<div style="color:#94a3b8;font-size:11px">在途 {fmt_qty(item.get("dc_on_order"))}</div>'
+               if float(item.get("dc_on_order") or 0.0) > 0 else "")
+            + "</td>"
             f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:right;'
             f'font-size:13px;color:#334155;white-space:nowrap">{fmt_qty(item.get("consumption_7d"))}</td>'
             f'<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;'
@@ -358,9 +434,14 @@ def render_html(digest: dict) -> str:
 
     if items:
         summary = (
-            f"本周需采购 <b>{digest.get('item_count', 0)}</b> 项，"
+            f"本周需采购 <b>{digest.get('item_count_total', 0)}</b> 项，"
             f"参考金额 <b>¥{fmt_money(digest.get('total_value'))}</b>"
         )
+        if digest.get("truncated"):
+            summary += (
+                f'<span style="color:#64748b;font-size:13px">（下表按金额列出前 '
+                f'{digest.get("item_count", 0)} 项，合计 ¥{fmt_money(digest.get("listed_value"))}）</span>'
+            )
         table = (
             '<table style="width:100%;border-collapse:collapse;margin-top:12px">'
             '<thead><tr style="background:#f8fafc">'
@@ -377,10 +458,12 @@ def render_html(digest: dict) -> str:
         if digest.get("truncated"):
             table += (
                 f'<p style="color:#64748b;font-size:12px;margin:8px 0 0">'
-                f"另有 {digest['truncated']} 项已省略，完整清单见系统「补货看板」。</p>"
+                f"另有 {digest['truncated']} 项（合计 ¥"
+                f"{fmt_money(float(digest.get('total_value') or 0) - float(digest.get('listed_value') or 0))}）"
+                f"未列出，完整清单见系统「补货看板」。</p>"
             )
     else:
-        summary = "本周没有需要采购的品项（无断货风险 / 无到点补货）。"
+        summary = _empty_reason(digest)
         table = ""
 
     warnings = digest.get("warnings") or []
@@ -405,7 +488,7 @@ def render_html(digest: dict) -> str:
         f'<p style="font-size:14px;margin:0 0 4px">{summary}</p>'
         f"{table}{warning_html}"
         '<p style="color:#94a3b8;font-size:11px;margin-top:20px;border-top:1px solid #e2e8f0;padding-top:10px">'
-        "本邮件由 DailyCheck 每周二自动发送。采购数量已按起订单位取整；"
+        "本邮件由 DailyCheck 每周二自动发送。采购数量已按整单位向上取整（未含供应商起订量约束）；"
         "门店自采品项（DC 不统配）不在本清单内。</p>"
         "</div>"
     )

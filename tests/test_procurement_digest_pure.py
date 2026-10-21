@@ -97,26 +97,29 @@ def test_pick_only_dc_orderable_action_rows():
         _row(name="正常", status=STATUS_HEALTHY),
         _row(name="零建议", suggested=0.0),
     ]
-    picked, truncated = pick_purchase_rows(rows)
+    picked = pick_purchase_rows(rows)
     assert [r["name"] for r in picked] == ["该采"]
-    assert truncated == 0
 
 
-def test_pick_sorts_critical_before_due_and_truncates():
+def test_pick_sorts_critical_before_due():
     rows = [
         _row(name="到点大额", status=STATUS_DUE, value=9999.0),
         _row(name="断货小额", status=STATUS_CRITICAL, value=10.0),
         _row(name="到点小额", status=STATUS_DUE, value=1.0),
     ]
-    picked, truncated = pick_purchase_rows(rows, limit=2)
-    assert [r["name"] for r in picked] == ["断货小额", "到点大额"]
-    assert truncated == 1
+    picked = pick_purchase_rows(rows)
+    assert [r["name"] for r in picked] == ["断货小额", "到点大额", "到点小额"]
 
 
 def test_pick_ignores_malformed_qty():
-    rows = [_row(name="坏数", suggested="不是数")]
-    picked, _ = pick_purchase_rows(rows)
-    assert picked == []
+    assert pick_purchase_rows([_row(name="坏数", suggested="不是数")]) == []
+
+
+def test_pick_is_fail_closed_when_orderable_missing():
+    """缺 orderable 字段 = 结构变了，此时按「可订」放行会订错货。"""
+    row = _row()
+    row.pop("orderable")
+    assert pick_purchase_rows([row]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -157,12 +160,23 @@ def test_digest_marks_unbound_canonical_and_keeps_store_cells_empty():
 
 
 def test_digest_store_missing_in_map_defaults_to_zero():
+    """该店库读得出来、但没这个品项 → 0（确实没货）。"""
     digest = _digest(
         [_row()],
         store_stock={101: {"s1": 5.0}},
         stores=[{"code": "s1", "name": "一号店"}, {"code": "s3", "name": "三号店"}],
     )
     assert [s["qty"] for s in digest["items"][0]["stores"]] == [5.0, 0.0]
+
+
+def test_failed_store_renders_dash_not_zero():
+    """M6 回归：整库读取失败必须显示「—」，显示 0 会让采购员按缺货下单。"""
+    digest = _digest([_row()], store_stock={101: {"s1": 5.0}}, failed_store_codes=["s2"])
+    item = digest["items"][0]
+    assert [s["qty"] for s in item["stores"]] == [5.0, None]
+    assert item["store_total"] == pytest.approx(5.0)  # 只累加有数的店
+    assert "二号店 —" in render_text(digest)
+    assert "—" in render_html(digest)
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +197,15 @@ def test_subject_for_empty_digest_says_no_purchase():
     assert "无需采购" in build_subject(digest)
 
 
+def test_subject_distinguishes_data_failure_from_no_purchase():
+    """M4 回归：数据故障不能在主题里伪装成「本周不用买」。"""
+    no_dc = build_subject(_digest([], dc_configured=False))
+    assert "未生成" in no_dc and "无需采购" not in no_dc
+
+    failed = build_subject(_digest([], failed_store_codes=["s2"]))
+    assert "数据不全" in failed and "无需采购" not in failed
+
+
 def test_render_text_contains_all_four_answers():
     digest = _digest([_row(qty=3.0)])
     text = render_text(digest)
@@ -197,8 +220,30 @@ def test_render_text_empty_and_truncated_notice():
     assert "本周没有需要采购的品项" in empty
 
     rows = [_row(name=f"品{i}") for i in range(3)]
-    truncated = render_text(_digest(rows, limit=1))
-    assert "另有 2 项已省略" in truncated
+    text = render_text(_digest(rows, limit=1))
+    # 主题说「另有 2 项」，且金额要说清被省略的那部分值多少钱
+    assert "另有 2 项" in text
+    assert "¥200.00）" in text
+
+
+def test_truncation_keeps_total_totals_not_listed_totals():
+    """H1 回归：主题与摘要的总数/总额必须是**全量**，不能是被截断后的部分。"""
+    rows = [_row(name=f"品{i}") for i in range(30)]
+    digest = _digest(rows, limit=20)
+
+    assert digest["item_count"] == 20
+    assert digest["item_count_total"] == 30
+    assert digest["truncated"] == 10
+    assert digest["total_value"] == pytest.approx(3000.0)   # 30 × 100
+    assert digest["listed_value"] == pytest.approx(2000.0)  # 20 × 100
+
+    subject = build_subject(digest)
+    assert "30 项" in subject and "列出 20" in subject
+    assert "3,000.00" in subject
+
+    text = render_text(digest)
+    assert "本周需采购 30 项" in text
+    assert "3,000.00" in text
 
 
 def test_render_text_includes_warnings():

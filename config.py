@@ -200,12 +200,13 @@ OPS_AGENT_TOKEN = os.environ.get("OPS_AGENT_TOKEN", "").strip()
 #
 # 每周二把「配送中心本周该采什么、采多少、各门店还有多少、近 7 天用了
 # 多少」发到指定邮箱。见 blueprints/procurement_digest.py 与
-# docs/ARCHITECTURE.md §3.13。
+# docs/ARCHITECTURE.md §3.14。
 #
 # - 全部凭证由服务器 env 注入（生产写 /etc/dailycheck/app.env），**不进
 #   git**：SMTP 授权码等同账号密码。
-# - DIGEST_MAIL_TO / USER / PASSWORD 任一为空 = 功能关闭：调度线程照常跑
-#   但直接跳过并留一条 WARNING，绝不半途发一封缺附件缺数据的残邮件。
+# - DIGEST_MAIL_TO / USER / PASSWORD 任一为空 = 功能关闭：`is_due()` 直接
+#   返回 False（调度线程空转、不刷日志），手动 `POST /forecast/digest/send`
+#   会返回 503 + `sent:false` 并留一条 WARNING。绝不半途发一封缺数据的残邮件。
 # - 企业微信邮箱（腾讯 exmail）默认 smtp.exmail.qq.com:465（SSL）。
 #   465 走 SMTP_SSL，其它端口走明文 + STARTTLS。
 # - DIGEST_WEEKDAY 用 Python 口径：0=周一 … 6=周日，默认 1=周二。

@@ -267,7 +267,7 @@ _DIGEST_FAILURE_STATUS = {
     "already_sent": 409,
     "in_progress": 409,
     "attempts_exhausted": 409,
-    "claim_failed": 500,
+    "lock_failed": 500,
     "build_failed": 500,
     "send_failed": 502,
 }

@@ -67,3 +67,8 @@ reports/**/*.html
 reports/.dashboard/*.db
 reports/.dashboard/*.db-shm
 reports/.dashboard/*.db-wal
+
+# 周度采购建议邮件的当日 sentinel / 锁（运行期状态，不进仓库）
+db/procurement-digest-*.json
+db/procurement-digest-*.lock
+db/procurement-digest-*.json.tmp
