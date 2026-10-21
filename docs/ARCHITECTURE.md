@@ -1768,6 +1768,19 @@ flowchart TB
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
 
+**不变量登记册**（2026-10-21 立）：`docs/agent-framework/invariants.md` 由
+`scripts/gen_invariants.py --write` 从测试 docstring 的 `Invariant:` 标记**生成**，禁手改。
+动机是登记册类文档一定会腐烂——手写条目没人更新，三个月后没人敢信。所以让事实锚在
+**可执行的守卫**上，三种腐烂方式被结构性堵住：① 标记只能写在测试函数 docstring 里
+（写在注释或普通字符串里扫不到），「登记了但没人守」在结构上不可能发生；
+② `--check` 保证生成物与代码一致（改了标记忘了重生成即红）；③ `--check --base`
+对比基线 ID 集合，守卫测试被删导致 ID **静默消失**即红，退役须写进
+`invariants-retired.txt` 并给原因与替代项。
+
+首批三条都来自真实事故：`I-01`「今日」判据显式走 CST（#117）、`I-02` 计数为 0 须先
+自证采集链路活着（#120）、`I-03` 会话分类白名单宁多报不漏报（#118）。只登**真出过事**的，
+不登「最佳实践」——后者会让登记册膨胀成没人读的文档。
+
 ---
 
 ## 13. 关键约定与坑

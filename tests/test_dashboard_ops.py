@@ -356,6 +356,8 @@ def test_kpi_today_boundary_is_tz_independent(monkeypatch):
 
     钉死时刻 + 切进程 TZ 后，本用例在任何真实时间下都有区分度——不依赖
     「恰好在这个窗口跑 CI」这种运气。
+
+    Invariant: I-01 | 「今日」判据必须显式走 CST，不依赖进程本地时区 | source=#117
     """
     # 钉死：UTC 2026-10-18 16:30 = CST 2026-10-19 00:30（正落在出问题的窗口内）
     frozen_utc = datetime(2026, 10, 18, 16, 30, tzinfo=timezone.utc)
@@ -431,6 +433,8 @@ def test_classify_session_uses_whitelist():
     """分类是白名单式：只有确定的自动前缀算 auto，其余非空一律 manual。
 
     宁可多报不漏报——漏报人工接管会让「闭环成立」变成假结论。
+
+    Invariant: I-03 | 会话分类用白名单，非自动前缀一律算人工（宁多报不漏报） | source=#118
     """
     for s in ("hermes-96", "pipeline-110", "webhook-ci-pr84", "release-84"):
         assert ops_parse.classify_session(s) == "auto", s
@@ -566,6 +570,8 @@ def test_events_zero_without_instrumentation_is_not_reported_as_clean(tmp_path):
     ⚠️ 必须用**不含 pipeline-event 行**的样本（AUDIT_SAMPLE）：
     LOOP_AUDIT_SAMPLE 自带 2 条事件，events 非空 → 永远走不到「0 起」分支，
     而这个分支正是要区分「真无异常」与「没人在记」的地方。
+
+    Invariant: I-02 | 计数为 0 必须先自证采集链路活着，否则不得渲染成「无异常」 | source=#120
     """
     recs = ops_parse.parse_audit_text(AUDIT_SAMPLE)
     assert not ops_parse.build_loop_integrity(recs)["events"], "样本必须无事件行"

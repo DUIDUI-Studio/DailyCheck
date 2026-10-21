@@ -29,6 +29,7 @@ DailyCheck PR 模板（2026-10-15 重写 v2，与门禁脚本对齐 + 生产侧�
 - [ ] 相关测试已补/已更新；关键断言经变异验证（还原 bug → 测试真实 FAIL）
 - [ ] 触及架构子系统已同步 `docs/ARCHITECTURE.md`（pre-commit arch 门禁强制）
 - [ ] bash -n / dry-run 冒烟通过（若改动 shell 脚本）
+- [ ] 若修 P0/P1 缺陷：守卫测试已加 `Invariant:` 标记，或已说明「无法固化为不变量：原因」（`docs/agent-framework/invariants.md` 由 `gen_invariants.py --write` 生成，禁手改）
 - [ ] 未提交运行时文件（db/、backups/、logs/、.venv/、.workbuddy/ 等）
 
 ## 生产侧事项

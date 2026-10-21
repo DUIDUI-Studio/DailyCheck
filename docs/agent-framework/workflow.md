@@ -35,6 +35,11 @@
 4. 关键断言做**变异验证**：把修复临时还原成 bug 版，确认新测试真实 FAIL（防恒真式假绿）
 5. shell 脚本改动：`bash -n` + dry-run 冒烟
 6. 触及架构子系统必须同步 `docs/ARCHITECTURE.md`（pre-commit hook 强制；helper：`scripts/arch_touched_sections.py`）
+7. 修 **P0/P1 缺陷**（真出过事、造成实际损失或静默假信号）时，在守卫测试的
+   docstring 加一条 `Invariant:` 标记（格式见 `scripts/gen_invariants.py`），
+   或在本 PR 说明「无法固化为不变量：原因」。
+   `docs/agent-framework/invariants.md` 由这些标记生成，**禁手改**——
+   不在 `--write` 流程内的手写条目会被 `--check` 判为不一致。
 
 ### ③ 提 PR（模板强制）
 

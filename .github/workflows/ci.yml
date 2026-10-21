@@ -56,6 +56,20 @@ jobs:
       - name: Zero-new-failure gate
         run: python scripts/check_known_failures.py /tmp/pytest-output.txt
 
+      # 不变量登记册是生成物（scripts/gen_invariants.py --write），事实来源是
+      # 测试 docstring 里的 Invariant: 标记。这里保证两件事：
+      #   ① 改了标记却没重生成 → 红
+      #   ② 守卫测试被删导致 ID 静默消失 → 红（除非写进 invariants-retired.txt）
+      - name: Invariants registry in sync
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            python scripts/gen_invariants.py --check --base "$BASE_SHA"
+          else
+            python scripts/gen_invariants.py --check
+          fi
+
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
     # 详见 docs/agent-framework/v0.1.md §三
