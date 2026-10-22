@@ -574,3 +574,217 @@ def test_check_suite_idempotent_on_duplicate_delivery(tmp_path, monkeypatch):
     assert b"duplicate" in resp2.data
     assert _inbox_line_count(tmp_path / "inbox.jsonl") == 1
 
+
+
+# ============================================================
+# 10. status 事件（Gitea 的 CI 完成通道，v3 - 2026-10-22 迁移）
+#     Gitea 没有 check_suite，用 status 代替；payload 不含 PR 关联信息，
+#     receiver 需按 sha 反查 open PR 并核对两个必需 check 是否全绿。
+# ============================================================
+def _make_status_payload(
+    *,
+    state: str = "success",
+    context: str = "CI / test (pull_request)",
+    sha: str = "ab" * 20,
+    repo: str = "eric/dailycheck",
+    status_id: int = 555,
+) -> bytes:
+    """构造 Gitea status 事件 payload（字段按实测 webhook 结构裁剪）。"""
+    return json.dumps(
+        {
+            "state": state,
+            "context": context,
+            "sha": sha,
+            "id": status_id,
+            "description": "Successful in 21m14s",
+            "target_url": "http://172.28.129.216:3000/eric/dailycheck/actions/runs/11",
+            "repository": {"full_name": repo},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _stub_gitea(monkeypatch, *, prs, statuses):
+    """桩掉 Gitea API：/pulls 与 /commits/{sha}/status 两个调用。"""
+
+    def fake_get(path, token):
+        if "/pulls?" in path:
+            return prs
+        if path.endswith("/status"):
+            return {"state": "unknown", "statuses": statuses}
+        raise AssertionError(f"未预期的 Gitea 调用: {path}")
+
+    monkeypatch.setattr(webhook_receiver, "_gitea_get", fake_get)
+    monkeypatch.setattr(webhook_receiver, "_gitea_token", lambda: "stub-token")
+
+
+def _pr_obj(number=77, sha="ab" * 20, branch="feat/x", title="feat: 示例"):
+    return {
+        "number": number,
+        "title": title,
+        "html_url": f"http://172.28.129.216:3000/eric/dailycheck/pulls/{number}",
+        "state": "open",
+        "draft": False,
+        "head": {"sha": sha, "ref": branch},
+        "base": {"ref": "main"},
+        "user": {"login": "eric"},
+    }
+
+
+def test_status_all_checks_green_queued(tmp_path, monkeypatch):
+    """status success + 两个必需 check 全绿 + 有 open PR → 202 落盘。
+
+    落盘记录的 event 字段仍是 check_suite（向下游保持契约），
+    source_event 记录真实来源 status。
+    """
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    sha = "ab" * 20
+    _stub_gitea(
+        monkeypatch,
+        prs=[_pr_obj(number=77, sha=sha)],
+        statuses=[
+            {"context": "CI / test (pull_request)", "status": "success"},
+            {"context": "CI / agent-framework-reports (pull_request)", "status": "success"},
+            {"context": "CI / deploy (pull_request)", "status": "skipped"},
+        ],
+    )
+    client = webhook_receiver.app.test_client()
+    payload = _make_status_payload(sha=sha)
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "status",
+            "X-GitHub-Delivery": "del-st-1",
+            "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
+        },
+    )
+    assert resp.status_code == 202
+    assert b"queued" in resp.data
+    rec = _read_first_line(tmp_path / "inbox.jsonl")
+    assert rec["delivery_id"] == "del-st-1"
+    assert rec["event"] == "check_suite"  # 下游契约不变
+    assert rec["source_event"] == "status"
+    assert rec["action"] == "completed"
+    assert rec["pr_number"] == 77
+    assert rec["pr_head_sha"] == sha
+    assert rec["pr_base_ref"] == "main"
+    assert rec["pr_author"] == "eric"
+    assert rec["check_conclusion"] == "success"
+    assert rec["check_suite_id"] == 555
+    assert rec["status_context"] == "CI / test (pull_request)"
+
+
+def test_status_other_check_pending_ignored(tmp_path, monkeypatch):
+    """两个必需 check 未全绿（另一个还 pending）→ 200 ignored checks_pending，不落盘。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    sha = "cd" * 20
+    _stub_gitea(
+        monkeypatch,
+        prs=[_pr_obj(number=78, sha=sha)],
+        statuses=[
+            {"context": "CI / test (pull_request)", "status": "success"},
+            {"context": "CI / agent-framework-reports (pull_request)", "status": "pending"},
+        ],
+    )
+    client = webhook_receiver.app.test_client()
+    payload = _make_status_payload(sha=sha)
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "status",
+            "X-GitHub-Delivery": "del-st-2",
+            "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
+        },
+    )
+    assert resp.status_code == 200
+    assert b"checks_pending" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_status_failure_state_ignored(tmp_path, monkeypatch):
+    """state != success → ignored（不触发 merge 判定）。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    _stub_gitea(monkeypatch, prs=[], statuses=[])
+    client = webhook_receiver.app.test_client()
+    for state in ("failure", "pending", "error"):
+        payload = _make_status_payload(state=state)
+        resp = client.post(
+            "/webhook",
+            data=payload,
+            headers={
+                "X-GitHub-Event": "status",
+                "X-GitHub-Delivery": f"del-st-{state}",
+                "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
+            },
+        )
+        assert resp.status_code == 200
+        assert b"ignored" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_status_no_pr_ignored(tmp_path, monkeypatch):
+    """无关联 open PR（如 main 上的 CI）→ ignored no_pr。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    _stub_gitea(monkeypatch, prs=[], statuses=[])
+    client = webhook_receiver.app.test_client()
+    payload = _make_status_payload()
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "status",
+            "X-GitHub-Delivery": "del-st-3",
+            "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
+        },
+    )
+    assert resp.status_code == 200
+    assert b"no_pr" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_status_non_required_context_ignored(tmp_path, monkeypatch):
+    """非必需 check 的 status（别的 status 提供者）→ ignored context。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    _stub_gitea(monkeypatch, prs=[], statuses=[])
+    client = webhook_receiver.app.test_client()
+    payload = _make_status_payload(context="someone-else/lint")
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "status",
+            "X-GitHub-Delivery": "del-st-4",
+            "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
+        },
+    )
+    assert resp.status_code == 200
+    assert b"context" in resp.data
+    assert not (tmp_path / "inbox.jsonl").exists()
+
+
+def test_pull_request_synchronized_accepted(tmp_path, monkeypatch):
+    """Gitea 的 action 拼作 "synchronized"（GitHub 是 "synchronize"）→ 必须放行。"""
+    monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
+    monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
+    client = webhook_receiver.app.test_client()
+    payload = _make_pr_payload(action="synchronized", number=79)
+    resp = client.post(
+        "/webhook",
+        data=payload,
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Delivery": "del-sync-1",
+            "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
+        },
+    )
+    assert resp.status_code == 202
+    rec = _read_first_line(tmp_path / "inbox.jsonl")
+    assert rec["action"] == "synchronized"
+    assert rec["pr_number"] == 79

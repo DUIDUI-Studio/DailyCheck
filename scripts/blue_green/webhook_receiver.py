@@ -8,10 +8,21 @@
 #
 # 设计铁律（与 production-readiness 配套）：
 #   1. HMAC-SHA256 验签 (X-Hub-Signature-256 + WEBHOOK_SECRET env)，拒伪 + 拒重放
-#   2. 仅处理 pull_request + check_suite event（issue 由 DailyCheck 自己的 automation 处理）
-#   3. action 白名单分事件：pull_request ∈ {opened, synchronize, reopened}；
-#      check_suite = completed 且「有 PR 关联 + conclusion=success」才落盘
-#      —— check_suite 通道 = 「CI 全绿 → 秒级唤醒 Prod Agent 判定 merge」快通道
+#   2. 仅处理 pull_request + status event（issue 由 DailyCheck 自己的 automation 处理）
+#   3. action 白名单分事件：pull_request ∈ {opened, synchronize, synchronized, reopened}
+#      —— 注意 Gitea 的 synchronize 拼作 "synchronized"（多一个 d），两个都收
+#      status = state 为 success 且「两个必需 check 全绿」才落盘
+#      —— status 通道 = 「CI 全绿 → 秒级唤醒 Prod Agent 判定 merge」快通道
+#
+# Gitea 适配（2026-10-22，GitHub 账号停用后迁至 hub1 自托管 Gitea 28.1）：
+#   - Gitea 同时发 GitHub 兼容头：X-GitHub-Event / X-GitHub-Delivery /
+#     X-Hub-Signature-256（格式与 GitHub 完全一致 `sha256=<hex>`）→ 验签与幂等逻辑不用改
+#   - 事件名差异：Gitea 没有 check_suite，改用 status（每次 commit status 变化触发一次）；
+#     status 的 payload 没有 PR 关联字段，需按 sha 反查 open PR 并核对全部必需 check
+#   - PR 细分事件（pull_request_sync / pull_request_comment）仍以
+#     X-GitHub-Event: pull_request 发送，细分类别在 X-GitHub-Event-Type 里
+#   - Gitea 默认禁止向内网投递 webhook，需 app.ini 配
+#     [webhook] ALLOWED_HOST_LIST = 172.28.129.215,172.28.129.216
 #   4. 幂等按 GitHub delivery_id（GitHub 会重试 6 次，receiver 必须幂等）
 #   5. 反压：inbox 行数 ≥ MAX_INBOX_LINES 返回 503，GitHub 暂停重试
 #   6. 仅监听 127.0.0.1（不暴露公网，由 nginx 在 443 做 TLS 终结 + proxy_pass）
@@ -35,6 +46,8 @@ import hmac
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request
@@ -52,14 +65,32 @@ MAX_INBOX_LINES = int(os.environ.get("MAX_INBOX_LINES", "1000"))
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8443"))
 
+# ---- Gitea 侧（status 事件需要反查 PR 与 check 汇总）----
+GITEA_URL = os.environ.get("GITEA_URL", "http://172.28.129.216:3000").rstrip("/")
+GITEA_TOKEN_FILE = os.environ.get("GITEA_TOKEN_FILE", "/root/.gitea-token")
+GITEA_TOKEN = os.environ.get("GITEA_TOKEN")  # 直接给值则优先，否则读文件
+GITEA_REPO = os.environ.get("GITEA_REPO", "eric/dailycheck")
+GITEA_TIMEOUT = int(os.environ.get("GITEA_TIMEOUT", "10"))
+
+# 必需通过的 check context（Gitea 形如 `CI / test (pull_request)`，按子串匹配）
+REQUIRED_CHECK_KEYS = {
+    "test": ("/ test (", "test (pull_request)"),
+    "agent-framework-reports": ("agent-framework-reports",),
+}
+
 # 仅处理的事件 + 分事件 action 白名单
 #   pull_request —— PR 生命周期触点（开 / 更新 / 重开）
 #   check_suite  —— CI 完成触点（仅 completed；且仅「有 PR 关联 + success」
 #                   才落盘，见 handler 内 4.5 业务过滤）→ 秒级唤醒快通道
-ALLOWED_EVENTS = frozenset({"pull_request", "check_suite"})
+# 三事件并存：
+#   pull_request —— PR 生命周期（GitHub / Gitea 共用，Gitea 的 synchronize 拼作 synchronized）
+#   check_suite  —— GitHub 的 CI 完成事件（保留：迁移期兼容 + 既有测试覆盖）
+#   status       —— Gitea 的 CI 完成事件（替代 check_suite）
+ALLOWED_EVENTS = frozenset({"pull_request", "check_suite", "status"})
 ALLOWED_ACTIONS_BY_EVENT: dict[str, frozenset[str]] = {
-    "pull_request": frozenset({"opened", "synchronize", "reopened"}),
+    "pull_request": frozenset({"opened", "synchronize", "synchronized", "reopened"}),
     "check_suite": frozenset({"completed"}),
+    "status": frozenset(),  # status 事件无 action 字段，走独立分支
 }
 
 # ============================================================
@@ -194,6 +225,100 @@ def _build_check_suite_record(delivery_id: str, action: str, data: dict) -> dict
 
 
 # ============================================================
+# Gitea 查询（status 事件反查 PR 与 check 汇总）
+# ============================================================
+def _gitea_token() -> str | None:
+    """取 API token：环境变量优先，否则读文件。取不到返回 None（不抛，降级为忽略）。"""
+    if GITEA_TOKEN:
+        return GITEA_TOKEN.strip()
+    try:
+        with open(GITEA_TOKEN_FILE, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _gitea_get(path: str, token: str) -> object:
+    """GET Gitea API，返回解析后的 JSON。失败抛异常，由调用方兜底。"""
+    req = urllib.request.Request(
+        f"{GITEA_URL}/api/v1{path}",
+        headers={"Authorization": f"token {token}", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=GITEA_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _is_required_check(context: str) -> bool:
+    """判断某个 status context 是否属于两个必需 check 之一。"""
+    return any(
+        any(k in context for k in keys) for keys in REQUIRED_CHECK_KEYS.values()
+    )
+
+
+def _resolve_pr_for_sha(sha: str, token: str) -> dict | None:
+    """按 head sha 反查 open PR（Gitea 的 status 事件 payload 不带 PR 信息）。"""
+    if not sha:
+        return None
+    prs = _gitea_get(f"/repos/{GITEA_REPO}/pulls?state=open&limit=50", token)
+    if not isinstance(prs, list):
+        return None
+    for pr in prs:
+        head = pr.get("head") or {}
+        if head.get("sha") == sha:
+            return pr
+    return None
+
+
+def _all_required_checks_green(sha: str, token: str) -> bool:
+    """两个必需 check 是否都已 success（context 按子串匹配，兼容事件后缀）。"""
+    data = _gitea_get(f"/repos/{GITEA_REPO}/commits/{sha}/status", token)
+    statuses = (data or {}).get("statuses") or []
+    seen: dict[str, bool] = {name: False for name in REQUIRED_CHECK_KEYS}
+    for st in statuses:
+        ctx = str(st.get("context") or "")
+        for name, keys in REQUIRED_CHECK_KEYS.items():
+            if any(k in ctx for k in keys):
+                seen[name] = seen.get(name, False) or st.get("status") == "success"
+    return all(seen.values())
+
+
+def _build_status_record(delivery_id: str, data: dict, pr: dict) -> dict:
+    """status 事件 → inbox 记录。
+
+    字段形状与 check_suite 记录**完全对齐**，且 event 字段仍写 "check_suite"，
+    使下游 watcher / 订阅模板无需改动即可继续工作（Gitea 侧的真实事件名记在
+    source_event 里供排查）。
+    """
+    repo = data.get("repository") or {}
+    repo_full_name = repo.get("full_name") or GITEA_REPO
+    pr_number = pr.get("number")
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    user = pr.get("user") or {}
+    return {
+        "delivery_id": delivery_id,
+        "event": "check_suite",  # 向下游保持既有契约
+        "source_event": "status",
+        "action": "completed",
+        "received_at_ms": int(time.time() * 1000),
+        "pr_number": pr_number,
+        "pr_title": pr.get("title", ""),
+        "pr_url": pr.get("html_url", ""),
+        "pr_state": pr.get("state", ""),
+        "pr_draft": bool(pr.get("draft", False)),
+        "pr_head_sha": head.get("sha", ""),
+        "pr_base_ref": base.get("ref", ""),
+        "pr_author": user.get("login", ""),
+        "repo_full_name": repo_full_name,
+        "repo_visibility": repo.get("visibility", repo.get("private", None)),
+        "check_conclusion": "success",
+        "check_head_branch": head.get("ref", ""),
+        "check_suite_id": data.get("id"),
+        "status_context": data.get("context", ""),
+    }
+
+
+# ============================================================
 # 路由
 # ============================================================
 @app.post("/webhook")
@@ -217,17 +342,18 @@ def webhook():
     except json.JSONDecodeError:
         abort(400, "invalid json")
 
-    # 4. action 过滤（按事件类型分白名单）
+    # 4. action 过滤（按事件类型分白名单；status 事件无 action，跳过）
     action = data.get("action")
-    if action not in ALLOWED_ACTIONS_BY_EVENT[event]:
+    if event != "status" and action not in ALLOWED_ACTIONS_BY_EVENT[event]:
         return jsonify(
             {"status": "ignored", "reason": "action", "event": event, "action": action}
         ), 200
 
-    # 4.5 check_suite 业务过滤：只转发「有 PR 关联 + CI 全绿」的完成事件
-    #     - 无关联 PR（如 main push 的 CI）→ Prod Agent 无事可做，不落盘
-    #     - conclusion != success（失败/取消/中性等）→ 不触发 merge 判定
-    #       （失败不需要即时动作；由兜底轮询 / 人工处理）
+    # 4.5 status 业务过滤：只转发「必需 check 全绿且有关联 PR」的那一刻
+    #     - state != success → 不触发（失败由兜底轮询/人工处理）
+    #     - 非必需 check（其它 status 提供者）→ 忽略
+    #     - 无关联 open PR（如 main push 的 CI）→ Prod Agent 无事可做，不落盘
+    #     - 两个必需 check 未全部 success → 等下一个 status 事件再来
     if event == "check_suite":
         check_suite = data.get("check_suite") or {}
         if not (check_suite.get("pull_requests") or []):
@@ -240,6 +366,34 @@ def webhook():
                     "conclusion": check_suite.get("conclusion"),
                 }
             ), 200
+
+    status_pr: dict | None = None
+    if event == "status":
+        if data.get("state") != "success":
+            return jsonify(
+                {"status": "ignored", "reason": "state", "state": data.get("state")}
+            ), 200
+        context = str(data.get("context") or "")
+        if not _is_required_check(context):
+            return jsonify(
+                {"status": "ignored", "reason": "context", "context": context}
+            ), 200
+        sha = str(data.get("sha") or "")
+        token = _gitea_token()
+        if not token:
+            # 拿不到 token 时不静默丢弃：返回 503 让 Gitea 重试，故障必须可见
+            abort(503, "GITEA_TOKEN not configured")
+        try:
+            status_pr = _resolve_pr_for_sha(sha, token)
+            if not status_pr:
+                return jsonify({"status": "ignored", "reason": "no_pr"}), 200
+            if not _all_required_checks_green(sha, token):
+                return jsonify(
+                    {"status": "ignored", "reason": "checks_pending", "sha": sha[:8]}
+                ), 200
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as exc:
+            # 反查失败：让 Gitea 重试，避免快通道静默丢失
+            abort(503, f"gitea lookup failed: {type(exc).__name__}")
 
     # 5. delivery_id 幂等
     delivery_id = request.headers.get("X-GitHub-Delivery", "")
@@ -258,8 +412,10 @@ def webhook():
     # 7. 提取关键字段 + 写 inbox（按事件类型分叉构造，字段形状对齐）
     if event == "pull_request":
         record = _build_pull_request_record(delivery_id, action, data)
-    else:  # check_suite
+    elif event == "check_suite":
         record = _build_check_suite_record(delivery_id, action, data)
+    else:  # status（status_pr 已在 4.5 解出）
+        record = _build_status_record(delivery_id, data, status_pr or {})
     _append_inbox(record)
 
     return jsonify({
