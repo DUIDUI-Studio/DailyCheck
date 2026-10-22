@@ -7,6 +7,8 @@ name: CI
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: "1"
+  PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+  PIP_TRUSTED_HOST: mirrors.aliyun.com
 
 on:
   pull_request:
