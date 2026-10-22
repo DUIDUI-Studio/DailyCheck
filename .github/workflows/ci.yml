@@ -21,10 +21,8 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Python（镜像自带 3.12 + pip）
+        run: python3 --version && python3 -m pip --version
 
       - name: Install dependencies
         run: |
@@ -69,10 +67,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Python（镜像自带 3.12 + pip）
+        run: python3 --version && python3 -m pip --version
 
       - name: Install dependencies
         run: |
