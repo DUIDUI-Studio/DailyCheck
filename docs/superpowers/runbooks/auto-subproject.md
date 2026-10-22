@@ -34,7 +34,8 @@ when the runbook fails and reports a blocker.
 - **Coverage target is path-based, not percentage** (PRD §3.4). Cover every
   PRD-locked formula, every "must-automate" scenario, and every error/fallback
   path. UI-decorator Jinja edits are exempt.
-- **Stop at draft PR.** Never `gh pr create` without `--draft`. Never merge.
+- **Stop at draft PR.** Never open a PR without `draft: true`. Never merge.
+  （Gitea：`POST /api/v1/repos/{o}/{r}/pulls`，body 带 `"draft": true`）
   Never push to `main`. Never `--force` anything. Never skip hooks.
 - **E2E honesty.** If Playwright cannot run (missing browser, auth not
   configured, etc.), do not fake the screenshot. Mark the E2E step as
@@ -135,7 +136,9 @@ Sections, in this order:
 
 ```bash
 git push -u origin HEAD
-gh pr create --draft --title "<type>(<scope>): <topic>" \
+curl -X POST -H "Authorization: token $T" -H "Content-Type: application/json" \
+  -d '{"head":"<branch>","base":"main","draft":true,"title":"<type>(<scope>): <topic>"}' \
+  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/pulls \
   --body-file docs/superpowers/prs/YYYY-MM-DD-<topic>.md
 ```
 

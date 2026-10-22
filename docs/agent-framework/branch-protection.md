@@ -40,8 +40,11 @@ GitHub Actions 的 job / step 名必须完全匹配才能在保护规则里搜�
 
 ```bash
 # 临时建一个空 PR，CI 跑过后看 status check 列表
-gh pr create --draft --title "test branch protection"
-gh pr checks
+curl -X POST -H "Authorization: token $T" -H "Content-Type: application/json" \
+  -d '{"head":"test-protection","base":"main","title":"test branch protection"}' \
+  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/pulls
+curl -s -H "Authorization: token $T" \
+  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/commits/<sha>/status
 
 # 应该看到：
 #   CI / test           pass

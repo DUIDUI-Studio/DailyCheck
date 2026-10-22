@@ -58,6 +58,15 @@ jobs:
       - name: Zero-new-failure gate
         run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt
 
+      # 把 pytest 原始输出交给 reports job 复用，避免全量重跑（2 vCPU 上省约 20 分钟）
+      - name: Upload pytest output for reports job
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: /tmp/pytest-output.txt
+          retention-days: 7
+
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
     # 详见 docs/agent-framework/v0.1.md §三
@@ -70,6 +79,14 @@ jobs:
         uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
+
+      # 下载失败不阻塞：generate_reports.sh 检测不到文件会自动重跑 pytest
+      - name: Download pytest output from test job
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pytest-output
+          path: /tmp/ci-pytest
 
       - name: Python（镜像自带 3.12 + pip）
         run: python3 --version && python3 -m pip --version
