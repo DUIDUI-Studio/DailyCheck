@@ -1,5 +1,21 @@
 # DailyCheck Webhook 部署操作手册
 
+> **⚠️ 2026-10-22 迁移提示（GitHub → 自托管 Gitea）**
+>
+> 本文记录的 receiver / inbox / watcher 链路设计**仍然有效**，但事件来源已换：
+>
+> - 事件头：Gitea 同时发 `X-GitHub-Event`（GitHub 兼容）与 `X-Gitea-Event`；签名头
+>   `X-Hub-Signature-256: sha256=<hex>` 与 GitHub **格式完全一致**，验签代码不用改
+> - **没有 `check_suite` 事件**，改用 `status` 事件（payload 含 `state`/`context`/`sha`，
+>   但没有 PR 关联信息，需按 sha 反查 open PR）
+> - PR 事件被细分：`pull_request`（open/close/reopen）+ `pull_request_sync`（推送新 commit），
+>   评论走 `issue_comment` 且带 `X-GitHub-Event-Type: pull_request_comment`
+> - **Gitea 默认禁止向内网地址投递 webhook**，需在 `app.ini` 配
+>   `[webhook] ALLOWED_HOST_LIST = 172.28.129.215,172.28.129.216`
+> - 内网直连：hub1 `172.28.129.216` → receiver `172.28.129.215:8443`，不走公网
+
+
+
 > **目的**：Dev Agent 提完 PR 后，GitHub repo 自动通过 webhook 通知 VPS 上的 receiver，receiver 写入 `inbox.jsonl`，`dc-inbox-watcher` 订阅 inbox **≤5s** 触发 Prod Agent 入口跑 merge 决策。
 >
 > **目标读者**：owner / Prod Agent 手动部署。脚本走不走通不在 Dev 自动化范围（基础设施变更需 owner 拍板）。

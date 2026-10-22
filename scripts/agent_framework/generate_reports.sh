@@ -31,15 +31,23 @@ BANDIT_OUTPUT="/tmp/bandit-output-af.txt"
 # ============================================================
 # 报告 02：测试
 # ============================================================
-echo "[generate_reports] running pytest ..."
+# 优先复用 test job 的 pytest 输出（CI 里由 artifact 传下来）。
+# 文件不存在 / 为空 → 回退到本地重跑，保证单独运行本脚本仍可用。
+REUSE_FILE="${PYTEST_REUSE_FILE:-/tmp/ci-pytest/pytest-output.txt}"
 
-python3 -m pytest \
-  --basetemp=/tmp/pytest-dc-af \
-  -q --tb=no \
-  --ignore=tests/mcp_server \
-  > "${PYTEST_OUTPUT}" 2>&1
-
-PYTEST_EXIT=$?
+if [[ -s "${REUSE_FILE}" ]]; then
+  echo "[generate_reports] 复用 test job 的 pytest 输出：${REUSE_FILE}（跳过重跑）"
+  cp "${REUSE_FILE}" "${PYTEST_OUTPUT}"
+  PYTEST_EXIT=0
+else
+  echo "[generate_reports] running pytest ..."
+  python3 -m pytest \
+    --basetemp=/tmp/pytest-dc-af \
+    -q --tb=no \
+    --ignore=tests/mcp_server \
+    > "${PYTEST_OUTPUT}" 2>&1
+  PYTEST_EXIT=$?
+fi
 
 # 提取数字（pytest -q 输出形如 "5 failed, 800 passed in 30.5s"）
 PYTEST_SUMMARY="$(tail -5 "${PYTEST_OUTPUT}")"
