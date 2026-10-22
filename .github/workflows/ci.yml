@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -67,7 +67,7 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
 
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
 
