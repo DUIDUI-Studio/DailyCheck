@@ -16,15 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: builtin:checkout
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Python 版本（镜像自带 3.12）
+        run: python3 --version
 
       - name: Install dependencies
         run: |
@@ -65,14 +63,12 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: builtin:checkout
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Python 版本（镜像自带 3.12）
+        run: python3 --version
 
       - name: Install dependencies
         run: |
@@ -120,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: builtin:checkout
         with:
           persist-credentials: false
 
