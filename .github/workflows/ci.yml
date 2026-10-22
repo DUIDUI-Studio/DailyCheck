@@ -6,7 +6,6 @@
 name: CI
 
 env:
-  PIP_BREAK_SYSTEM_PACKAGES: "1"
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   PIP_TRUSTED_HOST: mirrors.aliyun.com
 
@@ -31,8 +30,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt -q
-          pip install pytest "ruff==0.16.10" -q
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -r requirements.txt -q
+          /opt/venv/bin/pip install pytest "ruff==0.16.10" -q
 
       - name: Ruff (changed .py files only)
         run: |
@@ -43,7 +43,7 @@ jobs:
           fi
           if [ -n "$FILES" ]; then
             echo "ruff checking: $FILES"
-            ruff check $FILES
+            /opt/venv/bin/ruff check $FILES
           else
             echo "no python files changed, skip"
           fi
@@ -51,12 +51,12 @@ jobs:
       - name: Pytest (full suite, mcp_server excluded — container-gated, see header)
         run: |
           set +e
-          python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
+          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
             --ignore=tests/mcp_server > /tmp/pytest-output.txt
           tail -3 /tmp/pytest-output.txt
 
       - name: Zero-new-failure gate
-        run: python scripts/check_known_failures.py /tmp/pytest-output.txt
+        run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
@@ -76,8 +76,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt -q
-          pip install pytest "ruff==0.16.10" radon bandit -q
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -r requirements.txt -q
+          /opt/venv/bin/pip install pytest "ruff==0.16.10" radon bandit -q
 
       - name: Generate reports 02 + 03
         env:
@@ -86,6 +87,7 @@ jobs:
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
           # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
+          export PATH=/opt/venv/bin:$PATH
           bash scripts/agent_framework/generate_reports.sh || echo "[warn] generate_reports exit non-zero"
 
       - name: Generate report 04 (local deploy preview)
@@ -101,7 +103,7 @@ jobs:
         run: |
           mkdir -p /tmp/pr
           echo "$PR_BODY" > /tmp/pr/body.md
-          PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" python scripts/agent_framework/check_reports.py
+          PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" /opt/venv/bin/python scripts/agent_framework/check_reports.py
 
       - name: Upload reports as artifact
         if: always()
