@@ -5,6 +5,10 @@
 # 仍收录其 2 条，本地/容器全量跑时同样受门禁约束）。商业化前须归零并恢复 CI 覆盖。
 name: CI
 
+env:
+  PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+  PIP_TRUSTED_HOST: mirrors.aliyun.com
+
 on:
   pull_request:
   push:
@@ -16,21 +20,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Python（镜像自带 3.12 + pip）
+        run: python3 --version && python3 -m pip --version
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -q
-          pip install pytest "ruff==0.16.10" -q
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -r requirements.txt -q
+          /opt/venv/bin/pip install pytest "ruff==0.16.10" -q
 
       - name: Ruff (changed .py files only)
         run: |
@@ -41,7 +43,7 @@ jobs:
           fi
           if [ -n "$FILES" ]; then
             echo "ruff checking: $FILES"
-            ruff check $FILES
+            /opt/venv/bin/ruff check $FILES
           else
             echo "no python files changed, skip"
           fi
@@ -49,12 +51,21 @@ jobs:
       - name: Pytest (full suite, mcp_server excluded — container-gated, see header)
         run: |
           set +e
-          python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
+          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
             --ignore=tests/mcp_server > /tmp/pytest-output.txt
           tail -3 /tmp/pytest-output.txt
 
       - name: Zero-new-failure gate
-        run: python scripts/check_known_failures.py /tmp/pytest-output.txt
+        run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt
+
+      # 把 pytest 原始输出交给 reports job 复用，避免全量重跑（2 vCPU 上省约 20 分钟）
+      - name: Upload pytest output for reports job
+        if: always()
+        uses: http://172.28.129.216:3000/actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: /tmp/pytest-output.txt
+          retention-days: 7
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
@@ -65,20 +76,26 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # 下载失败不阻塞：generate_reports.sh 检测不到文件会自动重跑 pytest
+      - name: Download pytest output from test job
+        uses: http://172.28.129.216:3000/actions/download-artifact@v4
+        continue-on-error: true
         with:
-          python-version: "3.12"
+          name: pytest-output
+          path: /tmp/ci-pytest
+
+      - name: Python（镜像自带 3.12 + pip）
+        run: python3 --version && python3 -m pip --version
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -q
-          pip install pytest "ruff==0.16.10" radon bandit -q
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install -r requirements.txt -q
+          /opt/venv/bin/pip install pytest "ruff==0.16.10" radon bandit -q
 
       - name: Generate reports 02 + 03
         env:
@@ -87,6 +104,7 @@ jobs:
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
           # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
+          export PATH=/opt/venv/bin:$PATH
           bash scripts/agent_framework/generate_reports.sh || echo "[warn] generate_reports exit non-zero"
 
       - name: Generate report 04 (local deploy preview)
@@ -102,11 +120,11 @@ jobs:
         run: |
           mkdir -p /tmp/pr
           echo "$PR_BODY" > /tmp/pr/body.md
-          PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" python scripts/agent_framework/check_reports.py
+          PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" /opt/venv/bin/python scripts/agent_framework/check_reports.py
 
       - name: Upload reports as artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: http://172.28.129.216:3000/actions/upload-artifact@v4
         with:
           name: agent-framework-reports
           path: reports/
@@ -120,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
 

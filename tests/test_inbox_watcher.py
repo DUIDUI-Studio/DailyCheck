@@ -46,7 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "pro
 import inbox_rotate  # noqa: E402
 import inbox_watcher  # noqa: E402
 
-REPO = "ericmr1981/DailyCheck"
+# 跟随实现：迁移到 Gitea 后 DEFAULT_REPO 变成 eric/dailycheck。
+# 写死具体值会让「平台切换」变成一次测试维护；取模块常量则永不脱节。
+REPO = inbox_watcher.DEFAULT_REPO
 
 
 # ============================================================

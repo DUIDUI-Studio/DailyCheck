@@ -52,7 +52,7 @@
    （test + agent-framework-reports）全绿的 PR 进入你的判定队列。
 2. merge 判定（workflow.md §四）：读 PR 的「报告 1/4」与「生产侧事项」，
    用你的生产视角独立评估。有异议 → 不 merge，PR 评论打回 + 开 Issue 转 Dev；
-   无异议 → gh pr merge <n> --merge。
+   无异议 → POST /api/v1/repos/{o}/{r}/pulls/<n>/merge（body {"Do":"merge"}）。
 3. merge 后按 workflow.md §五 蓝绿流程部署（up → verify 八项 → **绿转正** → 灰度 →
    观察窗）；「生产侧事项」声明无需蓝绿部署的（如纯文档）可跳过。
    注意：绿实例的 `DRY_RUN=true` 只允许存在于验证期，承接流量前必须按
