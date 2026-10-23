@@ -203,7 +203,7 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 - **去重语义**：全文件扫描 + `handled_ids` 状态集合（原子写 `inbox_watcher_state.json`）—— 重启 / rotate 换 inode / 停机期间新增等任何时序下，每条 `delivery_id` 至多触发一次、未触发过的必然补触发
 - **机械过滤**（纵深防御）：仅 `repo_full_name == ericmr1981/DailyCheck` 且 action 属白名单（unit 显式传 `--actions opened,synchronize,reopened,completed`，`completed` 供 check_suite 事件使用）的条目触发；draft 等业务语义交 Prod Agent 判定，本脚本不预判
 - **失败重试**：触发非 0 退出 / 超时 → 指数退避（1s→60s 封顶）+ WARNING 留痕，绝不静默丢弃。退避到期**不再依赖 inbox 文件签名变化**（Issue #51 修复）：主循环条件为 `sig != last_sig or retry_due(state)`，inbox 无新行时退避条目也会自行重试；`retry_due` / `_next_at` 与 `load()` 归一化共用 `state.sane_ahead` 上界（= `retry_max + 300s` 时钟余量）。下方兜底轮询继续保底
-- **兜底轮询（2026-10-16 实装，§3.9）**：Prod 侧 Hermes cron 每 30 分钟跑 `dailycheck_pr_poll.py`（repo 同源 `deploy/scripts/`）直接查 `gh pr list --state open`——webhook 快通道整体故障时的保底发现通道；无 open PR 零 stdout（agent 回 `[SILENT]` 无投递），有 PR 走同一 `dailycheck-prod-agent` skill 判定
+- **兜底轮询（2026-10-16 实装，§3.9）**：Prod 侧 Hermes cron 每 30 分钟跑 `dailycheck_pr_poll.py`（repo 同源 `deploy/scripts/`）直接查 Gitea `GET /api/v1/repos/eric/dailycheck/pulls?state=open`——webhook 快通道整体故障时的保底发现通道；无 open PR 零 stdout（agent 回 `[SILENT]` 无投递），有 PR 走同一 `dailycheck-prod-agent` skill 判定
 - **CI 完成快通道（2026-10-16 增）**：`check_suite`（CI 全绿）事件走同一 inbox → watcher 链路，`dc-notify-prod-agent.sh` 按事件类型路由订阅（check_suite → `dailycheck-ci`，其余 → `dailycheck-pr`）——CI 一绿即触发 Prod Agent 判定 merge（此前 merge 环节需等兜底轮询接棒，最坏 ≤30 分钟）。中间态（suite 绿但两必需 check 未齐）由 Prod Agent 回 `[SILENT]` 抑制投递。⚠️ webhook 通道的 `[SILENT]` 抑制 = gateway `gateway/platforms/webhook.py` 的**本地补丁**（上游出厂仅 cron 投递支持），Hermes 重装/升级后需重打，见手册 §3.8 步骤 3.5
 - **归档（防反压挂死）**：`scripts/prod_agent/inbox_rotate.py` + 每日 timer 把 >7 天旧行迁到 `inbox.archive.jsonl`（rename+重建+收敛回填，与 receiver 并发不丢行）—— inbox 是反压闸门（≥1000 行 receiver 返 503），只增不减会挂死新通知
 - **部署**：`deploy/systemd/dc-inbox-watcher.service`（Restart=always / 5s）+ `dc-inbox-rotate.{service,timer}`（每日 00:30）。⚠️ 两个要点（2026-10-16 实测）：unit 的 `ProtectHome` 必须 ≤ `read-only`（`=true` 屏蔽整个 `/root` → `203/EXEC` 无限重启）；触发命令走 Hermes 时必须用 venv 绝对路径 `/root/hermes-agent/.venv/bin/hermes`（`#!/usr/bin/env python3` wrapper 在 watcher 的 PATH 下会解析到 DailyCheck venv，缺 yaml）。手册见 `docs/2026-10-15-webhook-setup.md` §3.8/§3.9
@@ -702,7 +702,9 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 工具结果超长时**砍列表尾部而不是硬截断**——半截 JSON 会让模型瞎猜，也会让对账丢掉整份可信数据。
 
-**性能取舍**（实测 61s → 首字 1.4-3.8s）：真流式（SSE 逐行解析）+ 同轮工具并行 + 轮次 5→3 + **仓清单写进提示词**（省掉模型为查编码多跑的一整轮 2-3s）。剩余瓶颈是模型首 token 的 2s 固定开销，压不下去。
+**性能取舍**（实测 61s → 首字 1.4-3.8s）：真流式（SSE 逐行解析）+ 同轮工具并行 + 轮次 5→3 + **仓清单写进提示词**（省掉模型为查编码多跑的一整轮 2-3s）。剩余瓶颈是模型首 token 的固定开销。
+
+⚠️ **首 token 是运气，不是常量**：同一句话、同一份提示词，生产实测 1.0s 与 16s 都出现过（2026-10-21 `XuLiMing` 问订单汇总耗 22.3s，其中 16s 全在等首 token）。所以不能用「平均首字」判断代码好坏——必须同 prompt 当场复测基准。等待期靠**滚动状态**兜住感知：5s「正在查数据…」/10s「数据有点多，还在查…」/15s「快好了，稍等…」，三次封顶。⚠️ `reply_stream` 是**累积覆盖**语义，滚动状态和正文推送是两个协程，必须用 `asyncio.Lock` 串行化，否则状态文案会把已经流出的正文盖掉。
 
 **配置**（全部 env，不进 git）：
 
@@ -724,6 +726,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `853000 invalid bot_id or secret` | 本机代理转发 WSS 时破坏订阅帧（REST 接口不受影响，所以 `get_token` 成功却订阅失败是典型信号） | `force_direct_connection()` 给 `websockets.connect` 注入 `proxy=None` |
 | `40008 invalid message type` | 长连接被动回复**只接受 `stream`** | `reply_stream(frame, stream_id, content, finish=True)` |
 | 模型编出「一共 30 项」 | 数据里只有 15 条，属真幻觉 | 数字对账命中 → 订正为「这些项」 |
+| **认证成功、心跳正常，但员工发消息毫无反应** | 长连接被腾讯侧掐断（`no close frame received or sent`），断连窗口内到达的消息**直接丢失**——长连接模式企微不存离线消息，也没有补拉接口。心搏 `lastsnd` 仍每 30s 归零，**看着完全健康** | 只能重启进程/重连恢复。排查口诀：`journalctl` 里搜不到「提问」就是消息没到进程，先看有无断连记录，**不要先怀疑凭证和配置** |
 
 **测试**（`tests/bot/`，99 用例）：工具层（只读边界拒绝三种写 / 仓名容错 / 跨仓汇总 / 售价缺失语义 / 停用品项不可见 / 主数据停用不可见）、数字对账（多精度变体容差 / 阈值边界 / 年份与百分数排除 / 顺序去重）、结果裁剪（保持合法 JSON / 砍不动时明确报错）、凭证装载与 @ 前缀剥离。
 

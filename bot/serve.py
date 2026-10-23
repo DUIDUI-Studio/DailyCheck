@@ -12,6 +12,7 @@ LLM 回来后再逐段追加，最后 ``finish=True`` 收尾。员工看到的�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -37,6 +38,15 @@ FALLBACK_TEXT = "我这边出了点问题，稍后再问一次试试。"
 TIMEOUT_TEXT = "这个问题查得有点久，换个具体点的说法试试？比如直接说品项名。"
 # 流式推送节流：模型每秒可能吐几十个 delta，逐条推会把长连接打满。
 STREAM_THROTTLE_SECONDS = 0.6
+# 首 token 等多久是运气：实测同一句话 1.0s 到 16s 都出现过（模型侧波动，
+# 不是我们代码慢）。这期间界面一直显示同一句「正在查…」，员工会以为卡死。
+# 每 5 秒换一句，三次封顶——再多就成了噪音。
+PROGRESS_TICK_SECONDS = 5.0
+PROGRESS_TEXTS = (
+    "正在查数据…",
+    "数据有点多，还在查…",
+    "快好了，稍等…",
+)
 EMPTY_TEXT = (
     "你只 @ 了我一下，没带问题。\n"
     "可以这样问：「冷冻芒果酱还有多少」「哪些快断货了」「新天地店有什么」"
@@ -72,6 +82,21 @@ async def _push(client: WSClient, frame: dict, message_id: str, text: str, finis
         logger.error("推送被拒 errcode=%s errmsg=%s", ack.get("errcode"), ack.get("errmsg"))
 
 
+async def _progress_ticker(push: Any, stop: asyncio.Event) -> None:
+    """首 token 之前的滚动状态。一旦有正文或阶段提示就永久停下。
+
+    流式推送是「累积覆盖」语义，所以这里每次推的都是一句独立的短文案，
+    不会污染后面正式回答的内容。
+    """
+    for text in PROGRESS_TEXTS:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=PROGRESS_TICK_SECONDS)
+            return  # 已经开吐正文（或流程结束），不必再刷状态
+        except asyncio.TimeoutError:
+            pass
+        await push(text)
+
+
 async def _handle_text(client: WSClient, frame: dict) -> None:
     body = frame.get("body") or {}
     msgid = str(body.get("msgid") or "stream")
@@ -86,23 +111,36 @@ async def _handle_text(client: WSClient, frame: dict) -> None:
         return
 
     started = time.monotonic()
+    # 推送串行化：滚动状态和正文推送是两个协程，并发调 reply_stream 会让
+    # 「正在查数据…」盖掉已经流出来的正文（累积覆盖语义）。
+    push_lock = asyncio.Lock()
+
+    async def push(text: str, finish: bool = False) -> None:
+        async with push_lock:
+            await _push(client, frame, msgid, text, finish)
+
     # 先占位，把感知延迟压到最低
-    await _push(client, frame, msgid, THINKING_TEXT, finish=False)
+    await push(THINKING_TEXT)
+
+    stop_ticker = asyncio.Event()
+    ticker = asyncio.create_task(_progress_ticker(push, stop_ticker))
 
     last_push = 0.0
 
     async def on_delta(text: str) -> None:
         """模型每吐一段就推一次，但要节流 —— 每秒几十次 HTTP 会把连接打满。"""
         nonlocal last_push
+        stop_ticker.set()
         now = time.monotonic()
         if now - last_push < STREAM_THROTTLE_SECONDS:
             return
         last_push = now
-        await _push(client, frame, msgid, text, finish=False)
+        await push(text)
 
     async def on_progress(text: str) -> None:
         """工具跑完、等模型组织语言时推一句状态，别让界面干等着。"""
-        await _push(client, frame, msgid, text, finish=False)
+        stop_ticker.set()
+        await push(text)
 
     try:
         reply = await agent.answer_stream(
@@ -113,17 +151,20 @@ async def _handle_text(client: WSClient, frame: dict) -> None:
         )
     except agent.LLMError as exc:
         logger.error("LLM 失败（%.1fs）：%s", time.monotonic() - started, exc)
-        await _push(
-            client, frame, msgid, TIMEOUT_TEXT if "超时" in str(exc) else FALLBACK_TEXT, finish=True
-        )
+        await push(TIMEOUT_TEXT if "超时" in str(exc) else FALLBACK_TEXT, finish=True)
         return
     except Exception as exc:  # noqa: BLE001
         logger.exception("回答问题失败：%s", exc)
-        await _push(client, frame, msgid, FALLBACK_TEXT, finish=True)
+        await push(FALLBACK_TEXT, finish=True)
         return
+    finally:
+        stop_ticker.set()
+        ticker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
 
     reply = (reply or "").strip() or "没查到相关内容。"
-    await _push(client, frame, msgid, reply, finish=True)
+    await push(reply, finish=True)
 
     _remember(userid, question, reply)
     logger.info(

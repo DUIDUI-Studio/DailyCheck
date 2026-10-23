@@ -40,7 +40,7 @@
 
 - 新建 PR 自动带出 `.github/PULL_REQUEST_TEMPLATE.md`
 - body 必含 h2 级「**## 报告 1/4：需求对齐**」+「**## Checklist**」+「**## 生产侧事项**」；R 表占位为「❌ 待填」，**全部消解为 ✅ 门禁才绿**
-- ⚠️ 已知坑一：CI 用**事件时刻的 body 快照**（`github.event.pull_request.body`）。事后 `gh pr edit` 补内容后，必须**推空 commit 触发新事件**，rerun 无效
+- ⚠️ 已知坑一：CI 用**事件时刻的 body 快照**（`github.event.pull_request.body`）。事后改 body（Gitea：`PATCH /api/v1/repos/{owner}/{repo}/pulls/{n}`）后，必须**推空 commit 触发新事件**，rerun 无效
 - ⚠️ 已知坑二：「报告 1/4」段之后（直到「报告 2/4」标题，实践中 = 全文）**不许出现字面 ❌ 字符**——门禁靠它识别未消解状态，正文叙述里写 ❌（哪怕只是举例）也会被判定未消解。写「红叉」「未消解状态」等文字替代
 - 本地自检捷径：`PR_BODY_FILE=/tmp/body.md python scripts/agent_framework/check_reports.py`
 
@@ -53,13 +53,13 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 - **允许 Dev 声明风险**：可以写"本次触及 X，生产验证时该类变更常见的失败模式是 Y 类"，这是提示不是指令。
 - Prod Agent 对 PR 内容本身有异议（设计/风险/范围）：**不 merge**，在 PR 评论打回并开 Issue 转 Dev；merge 判定权含否决权。
 
-### ④ CI 门禁（分支保护 ruleset "Main" 强制）
+### ④ CI 门禁（Gitea 分支保护 `main` 强制）
 
 | check | 内容 | 全绿标准 |
 |-------|------|---------|
-| `test` | pytest 全量 + 零新增门禁 | `check_known_failures.py` exit 0（失败集 ⊆ known_failures.txt） |
-| `agent-framework-reports` | 四报告齐全性 | 报告 01（body 段落）+ 02（pytest gate）+ 03（ruff/bandit）+ 04（CI 自动生成） |
-| `deploy` | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：备份 cron + 异地副本 + 真实部署演练） |
+| `CI / test (pull_request)` | pytest 全量 + 零新增门禁 | `check_known_failures.py` exit 0（失败集 ⊆ known_failures.txt） |
+| `CI / agent-framework-reports (pull_request)` | 四报告齐全性 | 报告 01（body 段落）+ 02（pytest gate）+ 03（ruff/bandit）+ 04（CI 自动生成） |
+| `CI / deploy (pull_request)` | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：备份 cron + 异地副本 + 真实部署演练） |
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
 
@@ -69,9 +69,34 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 - 仍需 owner 单独确认的操作：`--force` / `--force-with-lease`、删除远程分支、改分支保护规则。
 - pre-push hook（`core.hooksPath` 指向的脚本）恒 `exit 1`，推分支用 `git push --no-verify`——这不属于绕过，是既定姿势。
 
+## 三″、平台命令对照（2026-10-22 迁至自托管 Gitea）
+
+CI/CD 已从 GitHub 迁到 hub1 上的 Gitea 28.1（`http://172.28.129.216:3000`，VPC 内网）。
+agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <token>`）。
+
+| 动作 | 原 GitHub 命令 | 现在（Gitea API） |
+|---|---|---|
+| 列 open PR | `gh pr list --state open` | `GET /api/v1/repos/{o}/{r}/pulls?state=open` |
+| 看单个 PR | `gh pr view N` | `GET /api/v1/repos/{o}/{r}/pulls/N` |
+| 建 PR | `gh pr create --draft` | `POST /api/v1/repos/{o}/{r}/pulls`，body `{head, base, title, body}` |
+| 改 PR body | `gh pr edit N --body` | `PATCH /api/v1/repos/{o}/{r}/pulls/N`，body `{"body": "..."}` |
+| 查 check 状态 | `gh pr checks` | `GET /api/v1/repos/{o}/{r}/commits/{sha}/status` |
+| merge | `gh pr merge N --merge` | `POST /api/v1/repos/{o}/{r}/pulls/N/merge`，body `{"Do":"merge"}` |
+| 发评论 | `gh pr comment N` | `POST /api/v1/repos/{o}/{r}/issues/N/comments` |
+| 开 issue | `gh issue create` | `POST /api/v1/repos/{o}/{r}/issues` |
+
+三个必知差异：
+
+1. **status context 带事件后缀**。Gitea 的 check 名叫 `CI / test (pull_request)`，不是裸 `test`。
+   分支保护的 `status_check_contexts` 必须写全名，否则永远判定「未全绿」，merge 被拒
+   （实测报错 `Not all required status checks successful`）。
+2. **`github.event.pull_request.body` 仍然可用**。workflow 语法完全兼容，PR body 门禁无需改造（已实测跑绿）。
+3. **没有 `check_suite` 事件**。Gitea 用 `status` 事件代替（每次 commit status 变化触发一次），
+   payload 里没有 PR 关联信息，需按 `sha` 反查 open PR。
+
 ## 四、Merge 政策（2026-10-15 Eric 二次拍板：Prod merge，替代同日早先的候选 A）
 
-**Prod Agent 在 CI 全绿后判定并执行 merge**（`gh pr merge <num> --merge`），merge 与部署由同一角色贯通。
+**Prod Agent 在 CI 全绿后判定并执行 merge**（Gitea：`POST /api/v1/repos/{owner}/{repo}/pulls/{num}/merge`，body `{"Do":"merge"}`），merge 与部署由同一角色贯通。
 
 Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 

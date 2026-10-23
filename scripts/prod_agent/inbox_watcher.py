@@ -72,8 +72,11 @@ from pathlib import Path
 # ============================================================
 # 默认值（可被 CLI 覆盖）
 # ============================================================
-DEFAULT_REPO = "ericmr1981/DailyCheck"
-DEFAULT_ACTIONS = "opened,synchronize,reopened"
+# Gitea 迁移（2026-10-22）：repo 名与 action 白名单都要换
+#   - GitHub 是 ericmr1981/DailyCheck，Gitea 是 eric/dailycheck
+#   - Gitea 把 synchronize 拼作 synchronized（多一个 d），两个都收
+DEFAULT_REPO = os.environ.get("DC_REPO_FULL_NAME", "eric/dailycheck")
+DEFAULT_ACTIONS = "opened,synchronize,synchronized,reopened"
 DEFAULT_POLL_INTERVAL = 0.5  # 秒；≤5s 触发验收的主要来源
 DEFAULT_TRIGGER_TIMEOUT = 30.0  # 秒；单次触发命令超时
 DEFAULT_RETRY_BASE = 1.0  # 秒；首次失败退避
