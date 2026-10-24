@@ -151,12 +151,19 @@ jobs:
           VPS_USERNAME: ${{ secrets.VPS_USERNAME }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
-          echo "$VPS_SSH_KEY" > vps_key
-          chmod 600 vps_key
-          SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $VPS_PORT -i vps_key $VPS_USERNAME@$VPS_HOST"
+          # 私钥写在工作区之外（2026-10-24 首次演练暴露，Issue #9）：
+          # 原先把 key 落在仓库根目录，tar 打包时把它一起带走 → 解包到
+          # /root/releases/<ts>/vps_key → rsync 进生产 /root/DailyCheck/vps_key。
+          # 现在放到 mktemp 的临时文件，并用 trap 保证退出即删。
+          SSH_KEY=$(mktemp "${TMPDIR:-/tmp}/ci-deploy-key.XXXXXX")
+          printf '%s\n' "$VPS_SSH_KEY" > "$SSH_KEY"
+          chmod 600 "$SSH_KEY"
+          trap 'rm -f "$SSH_KEY"' EXIT
+          SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $VPS_PORT -i $SSH_KEY $VPS_USERNAME@$VPS_HOST"
 
           # Build tar locally — 严格排除数据/运行时文件（*.db 覆盖所有库文件，
-          # 但保留 db/ Python 包），部署永不触碰生产数据
+          # 但保留 db/ Python 包），部署永不触碰生产数据。
+          # vps_key 仍是排除项：防的是分支上残留的旧版本脚本 / 本地遗留文件。
           tar --exclude='.git' \
               --exclude='__pycache__' \
               --exclude='*.log' \
@@ -168,6 +175,8 @@ jobs:
               --exclude='node_modules' \
               --exclude='issue-reports' \
               --exclude='graphify-out' \
+              --exclude='vps_key' \
+              --exclude='*.pem' \
               -czf /tmp/dailycheck.tar.gz .
 
           # 解压到带时间戳的 release 目录，由 deploy_vps.sh 完成切换/迁移/回滚
