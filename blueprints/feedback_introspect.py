@@ -149,6 +149,84 @@ def _relative(path: Any, base_dir: Any) -> str:
         return text
 
 
+# ---------------------------------------------------------------------------
+# 代码片段（喂给 LLM 预分析，不进 Issue 正文）
+# ---------------------------------------------------------------------------
+
+SNIPPET_SOURCE_LINES = 120      # 视图函数一般 20~80 行，120 行足够覆盖装饰器与主体
+SNIPPET_TEMPLATE_LINES = 80     # 模板只取开头：Jinja 模板动辄上千行，全贴会撑爆上下文
+SNIPPET_TOTAL_MAX_CHARS = 7000  # 与 feedback_analysis_pure 的提示词预算对齐
+_SNIPPET_SUFFIXES = frozenset({".py", ".html"})
+
+
+def collect_snippets(clues: Any, base_dir: Any = None) -> str:
+    """把定位到的源文件/模板读成带行号的片段，供 LLM 分析。
+
+    为什么读真代码：只给 ``blueprints/items.py:120`` 这种坐标，模型只能靠文件名
+    猜行为，产出的是「请检查空值处理」这类放之四海皆准的废话；给它真实的
+    20 行代码，它才能说「第 118 行的 ``for row in rows`` 没判空，空库会抛
+    IndexError」。二审要有人愿意签字，靠的就是这种可核对的结论。
+
+    ⚠️ 只读仓库内的 ``.py`` / ``.html``，路径必须 resolve 后仍落在仓库根之下 ——
+    ``page_path`` 来自用户输入，虽然 ``clean_path`` 已挡过一层，这里再挡一次
+    路径穿越（``/../../etc/passwd`` 经模板名走不到，但别赌）。
+
+    全程 fail-soft：读不到就返回空串，分析照跑。
+    """
+    clues = clues if isinstance(clues, dict) else {}
+    if not clues.get("matched"):
+        return ""
+    base = Path(str(base_dir or getattr(config, "BASE_DIR", "") or "."))
+    parts: list[str] = []
+    budget = SNIPPET_TOTAL_MAX_CHARS
+
+    source = str(clues.get("source") or "").strip()
+    if source:
+        chunk = _read_snippet(
+            base, source, int(clues.get("line") or 0), SNIPPET_SOURCE_LINES, budget)
+        if chunk:
+            parts.append(chunk)
+            budget -= len(chunk)
+
+    template = str(clues.get("template") or "").strip()
+    if template and budget > 500:
+        chunk = _read_snippet(
+            base, f"templates/{template}", 0, SNIPPET_TEMPLATE_LINES, budget)
+        if chunk:
+            parts.append(chunk)
+
+    return "\n\n".join(parts)
+
+
+def _read_snippet(base: Path, rel_path: str, start_line: int, span: int, budget: int) -> str:
+    """读 ``base/rel_path`` 的 ``span`` 行（带行号），失败返回空串。"""
+    if budget <= 0:
+        return ""
+    try:
+        target = (base / rel_path).resolve()
+        if target.suffix.lower() not in _SNIPPET_SUFFIXES:
+            return ""
+        target.relative_to(base.resolve())  # 逃出仓库根 → ValueError
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError):
+        return ""
+    if not lines:
+        return ""
+    start = max(1, int(start_line or 1))
+    head = max(1, start - 3)  # 带 3 行上下文：装饰器与函数签名通常就在上面
+    chunk = lines[head - 1: head - 1 + span]
+    rendered: list[str] = [f"--- {rel_path}:{head} ---"]
+    used = len(rendered[0])
+    for offset, text in enumerate(chunk):
+        row = f"{head + offset}\t{text}"
+        if used + len(row) + 1 > budget:
+            rendered.append("…（超预算截断）")
+            break
+        rendered.append(row)
+        used += len(row) + 1
+    return "\n".join(rendered) if len(rendered) > 1 else ""
+
+
 def recent_commits(
     repo_root: Any,
     rel_paths: list[str],

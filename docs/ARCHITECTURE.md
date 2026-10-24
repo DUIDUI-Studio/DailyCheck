@@ -481,25 +481,34 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 
 前九节的链路都是「系统 → 用户」的下行推送；本节补的是**上行通道**：用户在任意页面遇到问题，就地提一条，管理员收到提醒后判定「忽略」或「派发开发」，派发即生成一张 Gitea Issue 进入标准开发闭环（开发 → PR → CI → merge → 部署）。
 
+**二审制**（2026-10-25 起）：一审只回答「这条值不值得修」；认为值得则**先由 LLM 按 Issue 处理标准做预分析**（读真实代码片段 → 根因假设 / 可疑位置 / 可核对验收项 / 信息缺口），把结果摆给管理员做**二审**，确认或改写后再派发。理由：一审时管理员要在还没定位到代码的情况下亲手写出可执行的任务单，正文质量取决于他当天写得多细；拆开后模型负责「拟稿」，人只负责「这个判断对不对」——判断比撰写便宜，也更容易保持一致。
+
 **为什么不复用 `notifications` 表**：站内通知是「一人一行」的扇出（`user_id` 维度、只读即可），而反馈单需要状态机、管理员评论、以及到 Issue 的单向绑定。两套语义混在一张表里，`read_at` 与 `status` 会互相污染。因此**新建两张表**，`notifications` 只承担「提醒超管有新单」这一个扇出动作。
 
 **数据模型**（`master.db`，见 `db/__init__.py` 的 `MASTER_SCHEMA`）：
 
 | 表 | 作用 | 关键列 |
 |---|---|---|
-| `feedback_tickets` | 反馈单主体 | `ticket_no`（`FB-YYYYMMDD-NNNN`，UNIQUE）、`user_id`、`warehouse_code`、`page_path`、`category`、`title`、`body`、`status`、`issue_number` / `issue_url`、`handled_by` / `handled_at` |
+| `feedback_tickets` | 反馈单主体 | `ticket_no`（`FB-YYYYMMDD-NNNN`，UNIQUE）、`user_id`、`warehouse_code`、`page_path`、`category`、`title`、`body`、`status`、`issue_number` / `issue_url`、`handled_by` / `handled_at`；二审追加 `analysis_text`（分析 JSON）、`analysis_error`、`analysis_model`（`template` = 未调模型的兜底）、`analysis_at`、`analysis_page_path`（本次分析依据的页面）、`draft_title` / `draft_body`（二审编辑器初值，管理员改过的版本优先） |
 | `feedback_comments` | 管理员处理评论 | `ticket_id`、`user_id`、`body`、`is_admin`、`dispatched_at`（非空 = 这条评论触发了派发） |
 
 落 master.db 而非仓库库：反馈描述的是「这套系统用起来哪里不对」，跨仓可见才符合运维语义。
 
-**状态机**（三态，两个终态，**不可回退**）：
+**状态机**（五态，两个终态）：
 
 ```
-open ──┬── 忽略 ────────→ ignored       （管理员认为不重要；终态）
-       └── 评论+派发 ──→ dispatched    （已建 Issue；终态，实际关闭以 Issue 为准）
+open ─（一审通过）→ analyzing ─（分析完成）→ analyzed ─（二审确认）→ dispatched
+  │                     └─（分析失败）→ open（可重试 / 模板兜底）
+  ├─（任一非终态）────────────────────────────────→ ignored
+  └─ 忽略同样可从 analyzing / analyzed 发起
 ```
 
-刻意**不设「已解决」态**：真解决了是 Issue closed，再在站内标记一次只会造出第二套真相。
+- **一审**（`/analyze`）= 「值得修」，触发后台分析；`mode=template` 是**不调模型的显式降级**，直接产模板草稿进二审。
+- **分析中**（`analyzing`）不可派发；页面限次自动刷新（4 次 × 7s）而不是无限 reload —— 进程重启会让状态永远停在 `analyzing`，无限刷新就成了自己咬尾巴的页面。
+- **失败退回 `open`** 而不是停在 `analyzing`：停住后这张单既不能派发也没人能推，只能人工改库。退回待处理至少还是红点，点进去能看到失败原因和「重新分析 / 换模板草稿」两个出口。
+- **二审**（`/dispatch`）只接受 `analyzed`。允许从 `open` 直接派发等于给了一条绕过复核的暗道，而这条暗道一定会被用（谁都想快点结束）。真要跳过模型就点「跳过分析，用模板生成草稿」，一步之遥但状态机完整。
+- 刻意**不设「已解决」态**：真解决了是 Issue closed，再在站内标记一次只会造出第二套真相。
+- 管理员待办角标（`count_open()`）口径是 **`status ∈ {open, analyzing, analyzed}`**，不是 `status='open'` —— 只数 open 会让角标在二审阶段静默清零，而闭环恰恰卡在那儿。收件箱排序同理：**待二审 > 分析中 > 待一审**。
 
 **路由**（`blueprints/feedback.py`，逻辑在 `feedback_pure.py`）：
 
@@ -512,11 +521,12 @@ open ──┬── 忽略 ────────→ ignored       （管理�
 | `GET /feedback/<id>` | 登录 | 详情。**非本人且非超管一律 404**（不用 403：403 会泄露 id 存在） |
 | `GET /admin/feedback` | 平台超管 | 收件箱，`?status=open\|ignored\|dispatched` 筛选，待处理置顶 |
 | `GET /admin/feedback/<id>` | 平台超管 | 处理页：原文 + 评论历史 + 判定操作 |
-| `POST /admin/feedback/<id>/ignore` | 平台超管 | 标记忽略（仅 `open` 生效） |
-| `POST /admin/feedback/<id>/comment` | 平台超管 | 仅存评论，不派发 |
-| `POST /admin/feedback/<id>/dispatch` | 平台超管 | 存评论 + 建 Issue，置 `dispatched` |
+| `POST /admin/feedback/<id>/ignore` | 平台超管 | 标记忽略（任一非终态生效） |
+| `POST /admin/feedback/<id>/comment` | 平台超管 | 仅存评论，不分析不派发 |
+| `POST /admin/feedback/<id>/analyze` | 平台超管 | **一审**：存意见 → 置 `analyzing` → 起后台分析；`mode=template` 直接产模板草稿进二审 |
+| `POST /admin/feedback/<id>/dispatch` | 平台超管 | **二审**：校验并落草稿 → 建 Issue，置 `dispatched`（仅 `analyzed` 生效） |
 
-`ROUTE_MATRIX` 已登记全部 10 条（用户侧 `LOGIN`、管理侧 `PLATFORM`），未开权限点：派发会对外建 Issue 并触发部署，与 `admin.user.manage` 同档，属平台级动作，不进任何仓库角色包。
+`ROUTE_MATRIX` 已登记全部 11 条（用户侧 `LOGIN`、管理侧 `PLATFORM`），未开权限点：派发会对外建 Issue 并触发部署，与 `admin.user.manage` 同档，属平台级动作，不进任何仓库角色包。
 
 **悬浮窗提交**（Issue #108，`templates/_feedback_widget.html` + `static/feedback-widget.js`）：
 
@@ -547,6 +557,26 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 - **回填链接不复用 `html_url`**：Gitea 的 `html_url` 由实例 `ROOT_URL` 决定，生产指向内网 `172.28.129.216:3000`，办公端打不开（2026-10-24 实测 `000`）。`issue_url()` 按 `FEEDBACK_GITEA_WEB_BASE`（默认 Tailscale 地址）自己拼；该键为空才退回 `html_url`。API 走内网、人点链接走 Tailscale —— 两个地址是刻意分开的（VPS 到 Tailscale 那个地址实测不通）。
 - **Gitea 两处与 GitHub 不同**：① 建单的 `labels` 收**标签 id** 不收名字；② 同名标签不去重（重复 POST 同样 201），所以必须先 GET 查再建，不能靠 409/422 判幂等。
 - 正文含 **闭环要求** 一节，明确「开发 → PR → CI 全绿 → merge → 部署」，避免开发侧拿到一张只有一句话的 issue 无从下手。
+
+**LLM 预分析**（`blueprints/feedback_llm.py` 网络 + 线程，`feedback_analysis_pure.py` 提示词/解析，2026-10-25 追加）：
+
+一审通过后跑一次模型，产出**二审页要看的那张分析卡**，并把渲染好的 Issue 正文草稿一并落库。四层分工刻意拆开：
+
+| 模块 | 职责 | 是否出网 |
+|---|---|---|
+| `feedback_analysis_pure` | 提示词构造 / 模型输出解析 / 兜底分析 / Issue 草稿渲染 | 否（纯函数，可单测） |
+| `feedback_llm` | OpenAI 兼容 `/v1/chat/completions` + daemon 线程编排 | 是 |
+| `feedback_introspect.collect_snippets()` | 读真实代码片段喂模型 | 否（只读文件） |
+| `feedback_issue_body.build_issue_body(analysis_section=...)` | 正文骨架（四要素 / 闭环要求不变） | 否 |
+
+四条设计约束：
+
+1. **分析与正文分层，正文骨架不交给模型**。模型只回一段结构化 JSON（`verdict` / `severity` / `summary` / `root_cause` / `affected` / `reproduce` / `acceptance` / `gaps` / `notes`），正文仍由 `build_issue_body()` 渲染，分析作为 `## 分析（机器预判，非最终结论）` 一节插入。让模型自由写整篇正文，结构会漂、幻觉路径会混进「代码线索」，比没有更坏。
+2. **必须读真代码，只给坐标等于给废话**。`collect_snippets()` 按线索读源文件（函数前 3 行起 120 行，带行号）与模板（前 80 行），总预算 7KB。只给 `blueprints/items.py:120`，模型只能回「请检查空值处理」这类放之四海皆准的话；给它 20 行真代码，它才能说「第 118 行的 `for row in rows` 没判空」。只读仓库内 `.py` / `.html`，`resolve()` 后必须仍在仓库根之下（`page_path` 来自用户输入，多挡一次路径穿越）。
+3. **后台线程 + 状态落库，成功失败都可追溯**。线程内开**独立 sqlite 连接**（请求的 `g.master_db` 在请求结束时就关了），先复查状态仍为 `analyzing`（期间可能已被忽略/重跑，结果作废），成功走 `save_analysis()` 落 `analysis_text` + 模型名 + 草稿，失败走 `fail_analysis()` 退回 `open` + `analysis_error`。**模型挂了不等于这条反馈不值得修**：降级分析照样进二审，只是 `analysis_model='template'`，页面明确写「这次没有调用模型」——不能让管理员把模板话术当成模型结论去签字。
+4. **DRY_RUN 实例不跑分析**。线程用的是裸连接，绕过了 `DryRunConnection` 包装器，写库不会被拦 —— 所以在 `launch()` 里直接拒绝（状态由调用方退回），否则绿实例会真写库并白烧 token。
+
+失败语义同 §3.10 既有口径：`LLMError` 只记 HTTP 状态码或异常类型名，**key 绝不进日志**；单次失败不自动重试（线程里重试要么拖长占单时间，要么撞限流），由管理员点「重新分析」控制节奏。
 
 **Issue 精确化**（`blueprints/feedback_introspect.py`，2026-10-17 追加）：
 
@@ -606,8 +636,12 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | env | 缺省 | 作用 |
 |-----|------|------|
 | `WECOM_FEEDBACK_WEBHOOK` | 空串 | 反馈专用群机器人；**空 = 不推企微**（站内通知照发） |
-| `FEEDBACK_GITHUB_TOKEN` | 空串 | 建 Issue 的 PAT（`repo` scope）；**空 = 不建 Issue**（降级为只存评论） |
-| `FEEDBACK_GITHUB_REPO` | `ericmr1981/DailyCheck` | `owner/name` |
+| `FEEDBACK_GITEA_TOKEN` | 空串 | 建 Issue 的 token（`write:issue`）；**空 = 不建 Issue**（降级为只存草稿 + 提示手动建单）。旧键 `FEEDBACK_GITHUB_TOKEN` 作兼容回退 |
+| `FEEDBACK_GITEA_REPO` | `eric/dailycheck` | `owner/name` |
+| `FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_WEB_BASE` | 内网 API / Tailscale 展示基址 | **API 与给人点的链接刻意分开**（Gitea 的 `html_url` 是实例 ROOT_URL，办公端不可达） |
+| `FEEDBACK_LLM_API_KEY` | 空串 | 二审预分析用的模型 key；**空 = 不调模型**（一审降级为模板兜底分析）。回退 `LLM_API_KEY` |
+| `FEEDBACK_LLM_BASE_URL` / `FEEDBACK_LLM_MODEL` | `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` | OpenAI 兼容端点与模型名；回退 `LLM_BASE_URL` / `LLM_MODEL`（生产与企微库存助手共用一套凭证） |
+| `FEEDBACK_LLM_TIMEOUT` | `90` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长 |
 | `PUBLIC_BASE_URL` | `https://kjtang.cn` | 消息与 Issue 正文里的域名（复用 §3.9 同一项） |
 
 `WECOM_FEEDBACK_WEBHOOK` 与 `WECOM_STORE_ORDER_WEBHOOK` **刻意分开**：反馈消息与订单消息频率、受众不同，合用一个 webhook 就无法单独静音其中一路。

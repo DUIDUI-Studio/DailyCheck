@@ -2,14 +2,21 @@
 
 两条使用路径：
 1. 普通用户（任意登录用户）：提交问题、看自己提交过的单子。
-2. 平台超管：收件箱 → 详情 → 判定。
-   - 不重要 → 忽略（终态）
-   - 有意义 → 写评论 + 发送 → 建 Gitea Issue（终态，进开发闭环）
+2. 平台超管：收件箱 → 详情 → **一审** → LLM 预分析 → **二审** → 派发。
+   - 一审（`/analyze`）：判定「值得修」，触发后台分析（或跳过分析用模板草稿）
+   - 二审（`/dispatch`）：审模型产出的 Issue 草稿，可改，确认后建 Gitea Issue
+   - 任一环节都能「忽略」（终态）
 
-纯逻辑在 ``feedback_pure``；外部通道在 ``feedback_notify``（企微）、
+为什么加二审（2026-10-25）：一审时管理员只有一个输入框，要在「还没定位到
+代码」的情况下写出可执行的 Issue 正文，结果正文质量取决于他当天写得多细。
+拆成两步后，模型先按 Issue 处理标准产出根因假设 / 可核对验收项，人只做
+「这个判断对不对」的复核 —— 判断比撰写便宜得多。
+
+纯逻辑在 ``feedback_pure``；分析在 ``feedback_analysis_pure``（纯）与
+``feedback_llm``（网络 + 线程）；外部通道在 ``feedback_notify``（企微）、
 ``feedback_dispatch``（Gitea）。本模块只做「鉴权 + 组装 + 重定向」。
 
-Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）。
+Spec: docs/ARCHITECTURE.md §3.10（反馈闭环 / 二审制）。
 """
 from __future__ import annotations
 
@@ -34,8 +41,17 @@ from permissions import require_login, require_platform_admin
 
 from . import feedback_dispatch as dispatch
 from . import feedback_introspect as introspect
+from . import feedback_llm as llm
 from . import feedback_notify as notify
+from .feedback_analysis_pure import (
+    analysis_to_json,
+    analysis_view,
+    build_draft,
+    fallback_analysis,
+)
 from .feedback_pure import (
+    STATUS_ANALYZED,
+    STATUS_ANALYZING,
     STATUS_DISPATCHED,
     STATUS_IGNORED,
     STATUS_OPEN,
@@ -45,15 +61,19 @@ from .feedback_pure import (
     build_admin_user_ids,
     count_open,
     create_ticket,
+    fail_analysis,
     get_ticket,
     list_comments,
     list_for_admin,
     list_for_user,
+    mark_analyzing,
     mark_comment_dispatched,
     mark_ignored,
     normalize_category,
+    normalize_draft,
+    save_analysis,
+    save_draft,
     summarize,
-    validate_comment,
 )
 from .notifications_pure import SUMMARY_MAX_LEN, emit_event
 
@@ -251,13 +271,14 @@ def admin_inbox():
         active_status=status,
         open_count=open_count,
         dispatch_enabled=dispatch.dispatch_enabled(),
+        llm_enabled=llm.llm_enabled(),
     )
 
 
 @bp.route("/admin/feedback/<int:ticket_id>", methods=["GET"])
 @require_platform_admin
 def admin_feedback_detail(ticket_id: int):
-    """管理员处理页：原文 + 历史评论 + 判定操作。"""
+    """管理员处理页：原文 + 历史评论 + 一审 / 二审操作。"""
     with get_master_db() as db:
         ticket = get_ticket(db, ticket_id)
         if ticket is None:
@@ -269,30 +290,188 @@ def admin_feedback_detail(ticket_id: int):
             "SELECT username FROM users WHERE id=?", (ticket["user_id"],)
         ).fetchone()
     ticket["submitter"] = submitter["username"] if submitter is not None else None
-    # 判定区给管理员一个「派发后正文会带什么代码线索」的预览。只在待处理时算：
-    # 终态单子不再派发，没必要为它跑一次 git。collect 全程 fail-soft。
+
+    status = str(ticket.get("status") or "")
+    analysis = analysis_view(ticket)
     clues: dict = {}
-    if ticket.get("status") == STATUS_OPEN:
-        clues = introspect.collect(current_app._get_current_object(), ticket.get("page_path"))
+    draft: dict = {}
+    if status in (STATUS_OPEN, STATUS_ANALYZED):
+        # 一审要「这段线索会进正文」的预览；二审要「模型看到的是哪段代码」——
+        # 二审按分析时实际用的页面回显，否则页面纠正过的会被打回原路径。
+        if status == STATUS_ANALYZED:
+            locate_from = ticket.get("analysis_page_path") or ticket.get("page_path")
+        else:
+            locate_from = ticket.get("page_path")
+        clues = introspect.collect(current_app._get_current_object(), locate_from)
+
+    if status == STATUS_ANALYZED:
+        # 二审编辑器初值。管理员上次改过的正文优先 —— 让二次打开看到自己写的
+        # 版本，而不是又变回模型原稿。
+        default_title, default_body = build_draft(
+            ticket, comments, clues, analysis, base_url=_base_url())
+        draft = {
+            "title": ticket.get("draft_title") or default_title,
+            "body": ticket.get("draft_body") or default_body,
+        }
+
     return render_template(
         "admin/feedback_detail.html",
         ticket=ticket,
         comments=comments,
         is_admin_view=True,
         dispatch_enabled=dispatch.dispatch_enabled(),
+        llm_enabled=llm.llm_enabled(),
         code_clues=clues,
+        analysis=analysis,
+        draft=draft,
     )
 
 
 @bp.route("/admin/feedback/<int:ticket_id>/ignore", methods=["POST"])
 @require_platform_admin
 def ignore_feedback(ticket_id: int):
-    """判定「不重要」：标记已读忽略（终态，不可回退）。"""
+    """判定「不重要」：标记已读忽略（终态，不可回退）。
+
+    一审、分析中、二审前都能点 —— 看完模型分析才决定不做是最正常的判断路径，
+    只允许 open 忽略等于逼管理员先派发再关闭。
+    """
     with get_master_db() as db:
         if get_ticket(db, ticket_id) is None:
             abort(404)
         changed = mark_ignored(db, ticket_id, g.user["id"])
     flash("已标记忽略。" if changed else "该反馈已处理过，未做改动。")
+    return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+
+@bp.route("/admin/feedback/<int:ticket_id>/analyze", methods=["POST"])
+@require_platform_admin
+def analyze_feedback(ticket_id: int):
+    """一审：确认值得修 → 起后台分析（或 `mode=template` 直接用模板草稿）。
+
+    ``mode=template`` 是**不调模型的显式降级**：模型没配 / 挂了 / 管理员急着
+    派单时用。它照样生成一版草稿并进二审 —— 二审这道闸不能被绕过，
+    差别只是草稿里没有模型结论，页面上也会明确标「未调用模型」。
+
+    重复触发是安全的：``mark_analyzing`` 只在 open/analyzed 时生效，
+    连点两次第二次拿不到状态变更，直接提示「已在分析中」。
+    """
+    mode = (request.form.get("mode") or "llm").strip().lower()
+    with get_master_db() as db:
+        ticket = get_ticket(db, ticket_id)
+        if ticket is None:
+            abort(404)
+        if ticket.get("issue_number"):
+            flash(f"这张反馈已派发为 Issue #{ticket['issue_number']}，无需再分析。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        # 一审意见是可选的：写得细，分析更准；不写也能分析（缺口会进正文）。
+        comment = (request.form.get("comment") or "").strip()
+        if comment:
+            try:
+                add_comment(db, ticket_id, g.user["id"], comment, is_admin=True)
+            except ValueError as exc:
+                flash(f"一审意见未保存：{exc}")
+                return redirect(url_for(
+                    "feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        override = introspect.clean_path(request.form.get("page_override", ""))
+        if not mark_analyzing(db, ticket_id, override or None):
+            flash("这张反馈已在分析中或已终结，未重复触发。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        if mode == "template":
+            # 降级也走同一条落库路径（save_analysis），所以二审页拿到的
+            # 结构与正常分析完全一致，只是 source=template。
+            refreshed = get_ticket(db, ticket_id) or ticket
+            comments = list_comments(db, ticket_id)
+            clues = introspect.collect(
+                current_app._get_current_object(),
+                refreshed.get("analysis_page_path") or refreshed.get("page_path"),
+            )
+            analysis = fallback_analysis(
+                refreshed, comments, clues, reason="管理员选择跳过模型分析")
+            title, body = build_draft(
+                refreshed, comments, clues, analysis, base_url=_base_url())
+            save_analysis(
+                db, ticket_id, analysis_to_json(analysis), llm.MODEL_TEMPLATE_LABEL,
+                title, body)
+            flash("已用模板生成草稿，请在下方二审后派发。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+    started = llm.launch(current_app._get_current_object(), ticket_id)
+    if not started:
+        # 只有 DRY_RUN 会走到这里（正常路径线程已起）。状态已被 mark_analyzing
+        # 置成 analyzing，必须退回，否则这张单会永远卡在「分析中」。
+        with get_master_db() as db:
+            fail_analysis(db, ticket_id, "DRY_RUN 实例不执行分析，请直接在正式实例处理")
+        flash("当前是 DRY_RUN 实例，不执行分析。请到正式实例处理这张反馈。")
+        return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+    flash("已开始分析，页面会自动刷新；通常 10~30 秒出结果。")
+    return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+
+@bp.route("/admin/feedback/<int:ticket_id>/dispatch", methods=["POST"])
+@require_platform_admin
+def dispatch_feedback(ticket_id: int):
+    """二审：确认（可编辑过的）Issue 草稿，建 Gitea Issue 并终结本单。
+
+    顺序是刻意的：**先把草稿落库，再调外部 API**。Gitea 挂了最多是没建单，
+    管理员在二审页改过的字一个都不会丢；重建时正文直接从库里取回。
+
+    只接受 ``analyzed`` 状态的单子。理由：二审的意义就是「先有草稿、再看一眼」，
+    允许从 ``open`` 直接派发等于给了一条绕过复核的暗道，而这条暗道一定会被用
+    （谁都想快点结束）。真需要跳过模型时走 ``/analyze?mode=template``，
+    一步之遥但状态机仍然完整。
+    """
+    with get_master_db() as db:
+        ticket = get_ticket(db, ticket_id)
+        if ticket is None:
+            abort(404)
+        if ticket.get("issue_number"):
+            flash(f"这张反馈已派发为 Issue #{ticket['issue_number']}，未重复建单。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+        if str(ticket.get("status") or "") != STATUS_ANALYZED:
+            flash("请先点「通过，开始分析」（或「跳过分析，用模板生成草稿」）进入二审。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        try:
+            title, body = normalize_draft(
+                request.form.get("draft_title") or ticket.get("draft_title") or "",
+                request.form.get("draft_body") or ticket.get("draft_body") or "",
+            )
+        except ValueError as exc:
+            flash(f"未派发：{exc}")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        # 二审时补一句意见也要留痕（不写进正文 —— 正文已被管理员定稿）。
+        comment = (request.form.get("comment") or "").strip()
+        comment_id = None
+        if comment:
+            try:
+                comment_id = add_comment(
+                    db, ticket_id, g.user["id"], comment, is_admin=True)
+            except ValueError as exc:
+                flash(f"二审意见未保存：{exc}")
+                return redirect(url_for(
+                    "feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        save_draft(db, ticket_id, title, body)
+
+        if not dispatch.dispatch_enabled():
+            flash("草稿已保存，但派发通道未配置（FEEDBACK_GITEA_TOKEN 为空），请手动建 Issue。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        issue = dispatch.create_issue(title, body)
+        if issue is None:
+            flash("草稿已保存，但创建 Gitea Issue 失败（详见服务端日志），请手动建单。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+
+        attach_issue(db, ticket_id, issue["number"], issue["url"], g.user["id"])
+        if comment_id is not None:
+            mark_comment_dispatched(db, comment_id)
+
+    flash(f"已派发为 Issue #{issue['number']}，开发闭环已启动。")
     return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
 
@@ -310,66 +489,6 @@ def save_comment(ticket_id: int):
             flash(f"评论未保存：{exc}")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
     flash("评论已保存。")
-    return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
-
-
-@bp.route("/admin/feedback/<int:ticket_id>/dispatch", methods=["POST"])
-@require_platform_admin
-def dispatch_feedback(ticket_id: int):
-    """写评论 + 建 Gitea Issue，把这张反馈交给开发闭环。
-
-    顺序是刻意的：**先落评论，再建 Issue**。外部 API 挂了也只是没建单，
-    管理员写的处理意见一个字都不会丢（Issue 正文正是从这些评论生成的）。
-    """
-    with get_master_db() as db:
-        ticket = get_ticket(db, ticket_id)
-        if ticket is None:
-            abort(404)
-        if ticket.get("issue_number"):
-            flash(f"这张反馈已派发为 Issue #{ticket['issue_number']}，未重复建单。")
-            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
-        try:
-            text = validate_comment(request.form.get("comment", ""))
-        except ValueError as exc:
-            flash(f"未派发：{exc}")
-            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
-
-        comment_id = add_comment(db, ticket_id, g.user["id"], text, is_admin=True)
-        comments = list_comments(db, ticket_id)
-        submitter = db.execute(
-            "SELECT username FROM users WHERE id=?", (ticket["user_id"],)
-        ).fetchone()
-        ticket["submitter"] = submitter["username"] if submitter is not None else None
-
-        if not dispatch.dispatch_enabled():
-            flash("评论已保存，但派发通道未配置（FEEDBACK_GITEA_TOKEN 为空），请手动建 Issue。")
-            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
-
-        # 代码定位在发请求前做：正文的精确度主要靠这一段，而不是靠用户措辞。
-        # collect 内部全程 fail-soft，失败只是少一段线索，不会让派发失败。
-        #
-        # 定位来源优先级：管理员在「实际页面」里手填的 > 用户提交时所在页面。
-        # 前者是有意纠正（Issue #93：用户停在仓库选择页提的反馈，自动路径完全
-        # 无关），后者只是「点反馈那一刻在哪」。clean_path 会把外部 URL 洗成空，
-        # 所以非法输入自然回落，不需要额外校验。
-        override = introspect.clean_path(request.form.get("page_override", ""))
-        if override and override != str(ticket.get("page_path") or ""):
-            ticket["page_path_override"] = override
-        locate_from = ticket.get("page_path_override") or ticket.get("page_path")
-        clues = introspect.collect(current_app._get_current_object(), locate_from)
-        issue = dispatch.create_issue(
-            dispatch.build_issue_title(ticket),
-            dispatch.build_issue_body(
-                ticket, comments, base_url=_base_url(), code_clues=clues),
-        )
-        if issue is None:
-            flash("评论已保存，但创建 Gitea Issue 失败（详见服务端日志），请手动建单。")
-            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
-
-        attach_issue(db, ticket_id, issue["number"], issue["url"], g.user["id"])
-        mark_comment_dispatched(db, comment_id)
-
-    flash(f"已派发为 Issue #{issue['number']}，开发闭环已启动。")
     return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
 
@@ -412,6 +531,8 @@ __all__ = [
     "bp",
     "EVENT_FEEDBACK_SUBMITTED",
     "STATUS_OPEN",
+    "STATUS_ANALYZING",
+    "STATUS_ANALYZED",
     "STATUS_IGNORED",
     "STATUS_DISPATCHED",
 ]

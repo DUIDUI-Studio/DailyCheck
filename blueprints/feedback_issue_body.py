@@ -46,8 +46,9 @@ def build_issue_body(
     comments: list[dict[str, Any]] | None = None,
     base_url: str = "",
     code_clues: dict[str, Any] | None = None,
+    analysis_section: str = "",
 ) -> str:
-    """Issue 正文：一句结论 + 原文 + 管理员判定 + 代码线索 + 验收标准 + 范围边界。
+    """Issue 正文：一句结论 + 原文 + 管理员判定 + 分析 + 代码线索 + 验收标准 + 范围边界。
 
     正文不是「需求描述」，是**验收契约**。开发侧（人或 agent）拿到一单要能做
     四件事：定位到代码、判定做完了、知道哪些不许碰、确认这不是产品决策。
@@ -56,6 +57,11 @@ def build_issue_body(
     所以正文的精确度主要来自 ``code_clues``（由 ``feedback_introspect`` 从
     ``page_path`` 反射生成），而不是来自用户措辞的精细程度 —— 用户和管理员
     写得粗糙是常态，不该指望他们补。
+
+    ``analysis_section`` 是**已渲染好的** LLM 预分析文本（见
+    ``feedback_analysis_pure.render_analysis``）。传字符串而不传分析字典是为了
+    保持依赖单向：``feedback_analysis_pure`` 依赖本模块，反过来 import 会成环。
+    为空时整节省略 —— 跳过分析直接派发的单子不该出现一个空标题段。
     """
     ticket = ticket if isinstance(ticket, dict) else {}
     clues = code_clues if isinstance(code_clues, dict) else {}
@@ -112,6 +118,18 @@ def build_issue_body(
     lines += ["", "## 代码线索（自动生成）", ""]
     lines += _render_clue_lines(clues)
 
+    section = str(analysis_section or "").strip()
+    if section:
+        lines += [
+            "",
+            "## 分析（机器预判，非最终结论）",
+            "",
+            "以下由模型在一审后生成，用于缩短定位时间。**与代码现状冲突时以代码为准**，",
+            "不要为了符合这段分析去改写正确的实现。",
+            "",
+            section,
+        ]
+
     gaps = detect_gaps(ticket, notes, clues)
     lines += ["", "## 信息缺口", ""]
     if gaps:
@@ -127,7 +145,7 @@ def build_issue_body(
         "## 验收标准（逐项核对）",
         "",
     ]
-    lines += _render_acceptance(clues)
+    lines += render_acceptance(clues)
 
     lines += [
         "",
@@ -264,7 +282,7 @@ def _render_clue_lines(clues: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_acceptance(clues: dict[str, Any]) -> list[str]:
+def render_acceptance(clues: dict[str, Any]) -> list[str]:
     """验收标准：每条都必须能被第三方复核，不写「体验变好」这类无法判定的词。
 
     第一条**不绑定具体页面路径**：路径来自「提交时所在页面」，可能与真实现象

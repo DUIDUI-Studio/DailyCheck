@@ -390,6 +390,18 @@ def test_create_issue_returns_none_when_number_missing(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _to_second_review(client, ticket_id, **extra):
+    """一审（``mode=template``，不调模型）→ 单子进入二审 ``analyzed``。
+
+    2026-10-25 起派发只接受二审状态，所以所有派发用例都要先过这一步。
+    用模板模式而不是模拟 LLM：这里验的是状态机与派发，不是模型。
+    """
+    data = {"mode": "template"}
+    data.update(extra)
+    return client.post(f"/admin/feedback/{ticket_id}/analyze", data=data,
+                       follow_redirects=True)
+
+
 def _master_rows(sql, params=()):
     import config
 
@@ -529,14 +541,16 @@ def test_dispatch_without_token_keeps_comment_and_status(logged_client, monkeypa
     client.post("/feedback", data={"title": "要修的问题", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
 
+    _to_second_review(client, ticket_id, comment="确认是 bug，需要修")
     resp = client.post(f"/admin/feedback/{ticket_id}/dispatch",
-                       data={"comment": "确认是 bug，需要修"},
+                       data={"draft_body": "", "draft_title": ""},
                        follow_redirects=True)
     assert resp.status_code == 200
     assert "手动建 Issue" in resp.get_data(as_text=True)
 
     ticket = _master_rows("SELECT status, issue_number FROM feedback_tickets")[0]
-    assert ticket["status"] == "open"
+    # 二审没成功派发 → 停在 analyzed，草稿已落库，不会被退回一审。
+    assert ticket["status"] == "analyzed"
     assert ticket["issue_number"] is None
     comments = _master_rows("SELECT body, dispatched_at FROM feedback_comments")
     assert len(comments) == 1
@@ -556,8 +570,9 @@ def test_dispatch_success_marks_ticket_and_comment(logged_client, monkeypatch):
     client.post("/feedback", data={"title": "要修的问题", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
 
+    _to_second_review(client, ticket_id)
     resp = client.post(f"/admin/feedback/{ticket_id}/dispatch",
-                       data={"comment": "已派发修复"},
+                       data={"comment": "已派发修复", "draft_body": "", "draft_title": ""},
                        follow_redirects=True)
     assert resp.status_code == 200
     assert "Issue #88" in resp.get_data(as_text=True)
@@ -585,12 +600,16 @@ def test_dispatch_twice_does_not_create_second_issue(logged_client, monkeypatch)
     client.post("/feedback", data={"title": "重复点", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
 
-    client.post(f"/admin/feedback/{ticket_id}/dispatch", data={"comment": "第一次"})
+    _to_second_review(client, ticket_id)
+    client.post(f"/admin/feedback/{ticket_id}/dispatch",
+                data={"comment": "第一次", "draft_body": "", "draft_title": ""})
     resp = client.post(f"/admin/feedback/{ticket_id}/dispatch",
-                       data={"comment": "第二次"}, follow_redirects=True)
+                       data={"comment": "第二次", "draft_body": "", "draft_title": ""},
+                       follow_redirects=True)
 
     assert len(calls) == 1
     assert "未重复建单" in resp.get_data(as_text=True)
+    # 第二次被拦在「已派发」之前，不该再落一条评论。
     assert len(_master_rows("SELECT id FROM feedback_comments")) == 1
 
 
@@ -612,18 +631,28 @@ def test_save_comment_does_not_dispatch(logged_client, monkeypatch):
     assert _master_rows("SELECT status FROM feedback_tickets")[0][0] == "open"
 
 
-def test_dispatch_requires_comment(logged_client, monkeypatch):
+def test_dispatch_requires_draft_body(logged_client, monkeypatch):
+    """空正文不许派发：一张没有正文的 Issue 开发侧完全无从下手。
+
+    二审制下「处理意见」是可选的（一审已经记录过判定），必须拦的是正文 ——
+    正文才是要发给开发的契约。
+    """
     import config as config_module
 
     monkeypatch.setattr(config_module, "FEEDBACK_GITEA_TOKEN", "tok")
+    monkeypatch.setattr(
+        feedback_dispatch, "create_issue",
+        lambda *a, **k: pytest.fail("正文为空不应建 Issue"))
+
     client, _ = logged_client
-    client.post("/feedback", data={"title": "空评论", "body": "详情"})
+    client.post("/feedback", data={"title": "空正文", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
+    _to_second_review(client, ticket_id)
 
     resp = client.post(f"/admin/feedback/{ticket_id}/dispatch",
-                       data={"comment": "  "}, follow_redirects=True)
+                       data={"draft_title": "标题", "draft_body": "   "},
+                       follow_redirects=True)
     assert "未派发" in resp.get_data(as_text=True)
-    assert _master_rows("SELECT id FROM feedback_comments") == []
     assert _master_rows("SELECT issue_number FROM feedback_tickets")[0][0] is None
 
 
@@ -672,9 +701,12 @@ def test_admin_detail_page_renders_actions_for_open_ticket(logged_client):
     client.post("/feedback", data={"title": "待处理", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
     html = client.get(f"/admin/feedback/{ticket_id}").get_data(as_text=True)
-    assert "发送并派发开发" in html
+    assert "通过，开始分析" in html
+    assert "跳过分析，用模板生成草稿" in html
+    assert "先存意见（不分析）" in html
     assert "不重要，忽略" in html
-    assert "先存评论" in html
+    # 一审页不该出现派发按钮：派发只在二审（analyzed）出现。
+    assert "确认派发" not in html
 
 
 def test_admin_detail_hides_actions_for_closed_ticket(logged_client):
@@ -683,7 +715,8 @@ def test_admin_detail_hides_actions_for_closed_ticket(logged_client):
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
     client.post(f"/admin/feedback/{ticket_id}/ignore")
     html = client.get(f"/admin/feedback/{ticket_id}").get_data(as_text=True)
-    assert "发送并派发开发" not in html
+    assert "确认派发" not in html
+    assert "通过，开始分析" not in html
     assert "已忽略" in html
 
 

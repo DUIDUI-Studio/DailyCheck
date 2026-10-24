@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 22 个（已装配 21 / 未装配 1）
-- 路由 **179** 条（按鉴权强度：平台超管 54 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **180** 条（按鉴权强度：平台超管 55 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -27,8 +27,8 @@
 | `canonical` | `canonical.py` | 20 | 在役 |
 | `stocktake` | `stocktake.py` | 12 | 在役 |
 | `users` | `users.py` | 12 | 在役 |
+| `feedback` | `feedback.py` | 11 | 在役 |
 | `items` | `items.py` | 11 | 在役 |
-| `feedback` | `feedback.py` | 10 | 在役 |
 | `production` | `production.py` | 10 | 在役 |
 | `forecast` | `forecast.py` | 7 | 在役 |
 | `reports` | `reports.py` | 7 | 在役 |
@@ -110,6 +110,7 @@
 |---|---|---|---|---|
 | `feedback.admin_feedback_detail` | GET | `/admin/feedback/<int:ticket_id>` | 平台超管 |  |
 | `feedback.admin_inbox` | GET | `/admin/feedback` | 平台超管 |  |
+| `feedback.analyze_feedback` | POST | `/admin/feedback/<int:ticket_id>/analyze` | 平台超管 |  |
 | `feedback.dispatch_feedback` | POST | `/admin/feedback/<int:ticket_id>/dispatch` | 平台超管 |  |
 | `feedback.ignore_feedback` | POST | `/admin/feedback/<int:ticket_id>/ignore` | 平台超管 |  |
 | `feedback.my_feedback` | GET | `/feedback` | 登录 |  |

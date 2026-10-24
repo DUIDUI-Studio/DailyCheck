@@ -204,6 +204,8 @@ ROUTE_MATRIX: dict[str, str] = {
     "feedback.admin_feedback_detail": PLATFORM,
     "feedback.ignore_feedback": PLATFORM,
     "feedback.save_comment": PLATFORM,
+    # 一审（触发 LLM 预分析）。与派发同档：分析会读仓库源码并调外部模型。
+    "feedback.analyze_feedback": PLATFORM,
     "feedback.dispatch_feedback": PLATFORM,
     # ---- forecast ----
     "forecast.forecast_index": PLATFORM,        # 清除死装饰器

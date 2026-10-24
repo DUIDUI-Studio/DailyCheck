@@ -267,7 +267,7 @@ def test_admin_detail_shows_clue_preview(logged_client):
     client, _ = logged_client
     _submit(client)
     html = client.get(f"/admin/feedback/{_ticket_id()}").get_data(as_text=True)
-    assert "派发后 Issue 会自动带上这段代码线索" in html
+    assert "分析会读这段代码" in html
     assert "items.py" in html
     assert 'data-fill-template' in html
 

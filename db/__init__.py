@@ -695,9 +695,11 @@ CREATE INDEX IF NOT EXISTS idx_approval_policies_lookup
 -- 用户反馈 / 问题提单（2026-10-17）
 -- 系统级数据 → master.db：反馈描述的是「这套系统用起来哪里不对」，
 -- 与具体仓库的业务数据无关，跨仓可见才符合运维语义。
--- status 生命周期：open →（管理员判定）
---            ├─ ignored        认为不重要，已读忽略（终态）
---            └─ dispatched     已加评论并派发成 Gitea Issue（终态，等 PR 关闭）
+-- status 生命周期（2026-10-25 起为二审制）：
+--   open ─（一审通过）→ analyzing ─（分析完成）→ analyzed ─（二审确认）→ dispatched
+--            │                      └─（分析失败）→ open（可重试 / 模板兜底）
+--            └─（管理员判定不重要）→ ignored
+--   两个终态：ignored / dispatched。真解决了以 Gitea Issue closed 为准，不设「已解决」态。
 -- 详见 docs/ARCHITECTURE.md §3.10（反馈闭环）。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS feedback_tickets (
@@ -709,13 +711,21 @@ CREATE TABLE IF NOT EXISTS feedback_tickets (
     category       TEXT NOT NULL DEFAULT 'other',  -- bug|usability|data|other
     title          TEXT NOT NULL,
     body           TEXT NOT NULL,
-    status         TEXT NOT NULL DEFAULT 'open',   -- open|ignored|dispatched
+    status         TEXT NOT NULL DEFAULT 'open',   -- open|analyzing|analyzed|ignored|dispatched
     issue_number   INTEGER,                        -- Gitea Issue 编号（派发后写入）
     issue_url      TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     handled_by     INTEGER,                        -- 处理人 user_id
     handled_at     TEXT,
+    -- 二审制（2026-10-25）：一审通过后的 LLM 预分析结果与 Issue 草稿。
+    analysis_text      TEXT,   -- 分析 JSON（结构见 feedback_analysis_pure 文档）
+    analysis_error     TEXT,   -- 最近一次分析失败原因（退回 open 时写入，供重试判断）
+    analysis_model     TEXT,   -- 产出该分析的模型；'template' = 未调模型的兜底
+    analysis_at        TEXT,
+    analysis_page_path TEXT,   -- 本次分析依据的页面（管理员纠正过的实际页面）
+    draft_title        TEXT,   -- 二审编辑器初值（管理员改过的版本优先）
+    draft_body         TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (handled_by) REFERENCES users(id)
 );
@@ -1259,6 +1269,28 @@ def init_master_db() -> None:
                     "CREATE INDEX IF NOT EXISTS idx_agent_tokens_prefix "
                     "ON agent_tokens(token_prefix)"
                 )
+
+                # 2026-10-25 反馈二审制：feedback_tickets 补分析 / 草稿列。
+                # 全部可空且无默认值 —— 存量单子自然处于「没分析过」，
+                # 不需要回填（`NOT NULL` + 默认值会让老单看起来像分析失败）。
+                fb_cols = {
+                    r[1] for r in conn.execute(
+                        "PRAGMA table_info(feedback_tickets)"
+                    ).fetchall()
+                }
+                for col in (
+                    "analysis_text",
+                    "analysis_error",
+                    "analysis_model",
+                    "analysis_at",
+                    "analysis_page_path",
+                    "draft_title",
+                    "draft_body",
+                ):
+                    if fb_cols and col not in fb_cols:
+                        conn.execute(
+                            f"ALTER TABLE feedback_tickets ADD COLUMN {col} TEXT"
+                        )
 
                 # Seed single-row procurement_config if missing (id=1 is the only row).
                 row = conn.execute("SELECT 1 FROM procurement_config WHERE id=1").fetchone()
