@@ -88,7 +88,7 @@ def check_report_02_and_03() -> dict:
 def check_report_01_present() -> bool:
     """报告 01：Dev Agent 在 PR body 必填。
 
-    由 GitHub Actions 通过 ${{ github.event.pull_request.body }} 传入。
+    由 CI（Gitea Actions）通过 ${{ github.event.pull_request.body }} 传入。
     本地运行也可手动指定：PR_BODY_FILE=path/to/pr_body.md
     """
     pr_body = ""

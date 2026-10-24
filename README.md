@@ -56,4 +56,4 @@ DAILYCHECK_SECRET_KEY=dev-key-change-me flask --app app run --host 0.0.0.0 --por
 
 ## 生产部署
 
-通过 GitHub Actions（`.github/workflows/deploy.yml`）push 到 VPS，详情见 `CLAUDE.md`。
+CI 由 hub1 上的 **Gitea Actions** 执行（`.github/workflows/ci.yml`），合并后由 Prod Agent 走蓝绿流程部署到 VPS，详情见 `CLAUDE.md`。

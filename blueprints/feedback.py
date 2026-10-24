@@ -4,10 +4,10 @@
 1. 普通用户（任意登录用户）：提交问题、看自己提交过的单子。
 2. 平台超管：收件箱 → 详情 → 判定。
    - 不重要 → 忽略（终态）
-   - 有意义 → 写评论 + 发送 → 建 GitHub Issue（终态，进开发闭环）
+   - 有意义 → 写评论 + 发送 → 建 Gitea Issue（终态，进开发闭环）
 
 纯逻辑在 ``feedback_pure``；外部通道在 ``feedback_notify``（企微）、
-``feedback_dispatch``（GitHub）。本模块只做「鉴权 + 组装 + 重定向」。
+``feedback_dispatch``（Gitea）。本模块只做「鉴权 + 组装 + 重定向」。
 
 Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）。
 """
@@ -316,7 +316,7 @@ def save_comment(ticket_id: int):
 @bp.route("/admin/feedback/<int:ticket_id>/dispatch", methods=["POST"])
 @require_platform_admin
 def dispatch_feedback(ticket_id: int):
-    """写评论 + 建 GitHub Issue，把这张反馈交给开发闭环。
+    """写评论 + 建 Gitea Issue，把这张反馈交给开发闭环。
 
     顺序是刻意的：**先落评论，再建 Issue**。外部 API 挂了也只是没建单，
     管理员写的处理意见一个字都不会丢（Issue 正文正是从这些评论生成的）。

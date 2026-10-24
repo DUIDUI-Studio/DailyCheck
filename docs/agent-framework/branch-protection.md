@@ -1,76 +1,80 @@
-# Branch Protection 接入指引
+# Branch Protection 现状与变更方式（Gitea）
 
-> 框架 v0.1 强制项：CI 通过 + 四报告齐全才可 merge。
-> 这一道闸在 GitHub repo settings 配，需要 owner 手动点。
+> 2026-10-22 仓库迁至自托管 Gitea（`eric/dailycheck`），分支保护随之迁移。
+> 2026-10-24 用 API 实测核对过线上配置，本文记录**实际生效值**，不是待办清单。
 
-## 设置步骤
+## 1. 当前生效配置（`main`）
 
-### 1. 进入 repo Settings → Branches
-
-`https://github.com/ericmr1981/DailyCheck/settings/branches`
-
-### 2. 添加 / 编辑 `main` 分支规则
-
-点 **Add rule**（如已有 main 规则则 Edit）：
-
-| 设置项 | 值 | 说明 |
-|--------|----|----|
-| Branch name pattern | `main` | |
-| Require a pull request before merging | ✅ | 强制走 PR |
-| Require approvals | 1 | 至少 1 审批（Phase 1 保留人工 review 一道闸；Phase 3 可改 0） |
-| Dismiss stale pull request approvals | ✅ | 新 push 清空旧 approve |
-| Require status checks to pass before merging | ✅ | **关键** |
-| Require branches to be up to date | ✅ | 防止 base 漂移 |
-| **Required status checks**（搜索并添加） | `agent-framework-reports` | **本框架新加的 check** |
-| | `CI / test (pull_request)` | 兼容旧 CI |
-| Require conversation resolution | ✅ | 阻断未解决 review 评论 |
-| Require linear history | ✅ | 强制 rebase 或 squash，禁 merge commit |
-| Include administrators | ❌（默认） | 管理员不受限；如需严格可勾 |
-| Allow force pushes | ❌ | 阻断 force push |
-| Allow deletions | ❌ | 阻断删 main |
-
-### 3. 关键 status check 名
-
-**`agent-framework-reports`** — 由 `scripts/agent_framework/check_reports.py` 决定 pass/fail。
-GitHub Actions 的 job / step 名必须完全匹配才能在保护规则里搜到。
-
-如果设置时搜不到这个 check，先推一次 PR 让 workflow 跑一次，check 出现后再回来添加。
-
-### 4. 验证
+实测方式：
 
 ```bash
-# 临时建一个空 PR，CI 跑过后看 status check 列表
-curl -X POST -H "Authorization: token $T" -H "Content-Type: application/json" \
-  -d '{"head":"test-protection","base":"main","title":"test branch protection"}' \
-  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/pulls
 curl -s -H "Authorization: token $T" \
-  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/commits/<sha>/status
-
-# 应该看到：
-#   CI / test           pass
-#   agent-framework-reports  pass  ← 新 check
+  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/branch_protections/main
 ```
 
-## Phase 升级路径
+| 字段 | 实际值 | 含义 |
+|------|--------|------|
+| `enable_push` | `false` | **禁止直推 main**，只能走分支 + PR |
+| `enable_push_whitelist` | `false` | 无白名单（管理员也受同一约束） |
+| `enable_status_check` | `true` | 必需状态检查开启 |
+| `status_check_contexts` | `CI / test (pull_request)`<br>`CI / agent-framework-reports (pull_request)` | 两个必需 check，**必须带 `(pull_request)` 后缀** |
+| `required_approvals` | `0` | 不强制人工审批（merge 判定由 Prod Agent 承担，见 workflow.md §四） |
+| `enable_force_push` | `false` | 禁止 force push |
 
-| Phase | require_approvals | agent-framework-reports | 其他 status check |
-|-------|-------------------|------------------------|------------------|
-| 1 | 1 | ✅ 必过 | CI/test 必过 |
-| 2 | 1 | ✅ 必过 | CI/test + agent-framework-reports |
-| 3 | 0 | ✅ 必过 | 同上（人工 review 由"看报告"替代） |
-| 4 | 0 | ✅ 必过 | + Monitor Agent 异常告警 |
+## 2. 为什么 check 名必须带后缀
 
-## 故障排查
+Gitea Actions 上报的 context 是 `<workflow 名> / <job 名> (<事件>)`，本仓库是
+`CI / test (pull_request)`。只写 `test` 或 `agent-framework-reports` 都会**永远判定未全绿**，
+merge 时返回 `Not all required status checks successful` —— 这是迁移时最容易踩的一脚。
+
+查某个 commit 的实际 context 列表：
+
+```bash
+curl -s -H "Authorization: token $T" \
+  "http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/commits/<sha>/status" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['state']);[print(' -',s['context'],s['status']) for s in d['statuses']]"
+```
+
+## 3. 变更方式（需 owner 拍板）
+
+改分支保护属红线（workflow.md §四 第 3 条），**先问 owner 再动**。改完用 §1 的 GET 复核。
+
+```bash
+# 例：把必需 check 改成两个（字段名以 swagger 的 EditBranchProtectionOption 为准）
+cat > /tmp/bp.json <<'JSON'
+{
+  "enable_push": false,
+  "enable_status_check": true,
+  "status_check_contexts": [
+    "CI / test (pull_request)",
+    "CI / agent-framework-reports (pull_request)"
+  ],
+  "required_approvals": 0,
+  "enable_force_push": false
+}
+JSON
+curl -s -X PATCH \
+  -H "Authorization: token $T" -H "Content-Type: application/json" \
+  --data-binary @/tmp/bp.json \
+  http://172.28.129.216:3000/api/v1/repos/eric/dailycheck/branch_protections/main
+```
+
+## 4. 故障排查
 
 | 现象 | 原因 | 解法 |
 |------|------|------|
-| status check 搜不到 `agent-framework-reports` | workflow 还没跑过 | 推任意 commit 触发一次，再回来添加 |
-| check 名字对但保护规则不生效 | workflow 文件改动后 check 名变了 | 更新规则中的 check 名 |
-| 管理员绕过 | Include administrators 未勾 | 勾上 |
-| PR 一直灰显"需要 approval" | approval 数不足 | Phase 1 仍需 1 人审批；可让任意 maintainer 点 Approve |
+| PR 全绿但合并按钮灰 | context 名不匹配（少了 `(pull_request)` 后缀） | 按 §2 查实际 context，再按 §3 改 |
+| 推 main 报 `403 user cannot commit to repo` | 直推受保护分支 | 建分支 + PR（这是设计行为，不是权限故障） |
+| 保护规则改了没生效 | 改的是错的 branch_name，或 PATCH 用了创建接口 | 用 `PATCH .../branch_protections/main`，改完 GET 复核 |
 
-## 当前状态（2026-10-13）
+## 5. 与 GitHub 时代的差异
 
-- ⏳ **待 Eric 在 GitHub repo settings 操作**
-- 框架已落地（PR 模板 / 脚本 / CI workflow 改造）
-- branch protection 是唯一需要手动点的部分
+| 项 | GitHub | Gitea |
+|---|---|---|
+| 配置入口 | Settings → Branches（勾选式） | API `branch_protections`（见 §3）；Web 在 Settings → Branches |
+| 必需 check 名 | job 名（如 `test`） | `<workflow> / <job> (pull_request)` |
+| 管理员豁免 | Include administrators 可选 | `enable_push_whitelist=false` 即管理员也禁直推 |
+| force push | Allow force pushes | `enable_force_push=false` |
+
+> 历史注记：本文件在 GitHub 时代是「待 owner 手动点」的操作指引（2026-10-13）。
+> 迁移后保护规则已由 API 配好并通过实测核对，故改写为现状 + 变更方式。

@@ -39,7 +39,8 @@
 ### ③ 提 PR（模板强制）
 
 - 新建 PR 自动带出 `.github/PULL_REQUEST_TEMPLATE.md`
-- body 必含 h2 级「**## 报告 1/4：需求对齐**」+「**## Checklist**」+「**## 生产侧事项**」；R 表占位为「❌ 待填」，**全部消解为 ✅ 门禁才绿**
+- body 必含 h2 级「**## 报告 1/4：需求对齐**」+「**## Checklist**」+「**## 生产侧事项**」；R 表占位为「⬜ 待填」，**全部消解为 ✅ 门禁才绿**
+  （占位符**不能**用未消解记号字符：门禁按字面切段，模板会因此自带红色。2026-10-24 已修，`tests/test_pr_template_gate.py` 锁死）
 - ⚠️ 已知坑一：CI 用**事件时刻的 body 快照**（`github.event.pull_request.body`）。事后改 body（Gitea：`PATCH /api/v1/repos/{owner}/{repo}/pulls/{n}`）后，必须**推空 commit 触发新事件**，rerun 无效
 - ⚠️ 已知坑二：「报告 1/4」段之后（直到「报告 2/4」标题，实践中 = 全文）**不许出现字面 ❌ 字符**——门禁靠它识别未消解状态，正文叙述里写 ❌（哪怕只是举例）也会被判定未消解。写「红叉」「未消解状态」等文字替代
 - 本地自检捷径：`PR_BODY_FILE=/tmp/body.md python scripts/agent_framework/check_reports.py`
@@ -67,7 +68,8 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 
 - **普通 `git push`（新分支/已有分支推进）不再需要 owner 事先确认。**
 - 仍需 owner 单独确认的操作：`--force` / `--force-with-lease`、删除远程分支、改分支保护规则。
-- pre-push hook（`core.hooksPath` 指向的脚本）恒 `exit 1`，推分支用 `git push --no-verify`——这不属于绕过，是既定姿势。
+- pre-push hook（`core.hooksPath` → `~/.workbuddy/git-hooks`）2026-10-19 起是**黑名单**：只拦「删除远程分支」和「非快进覆盖」，新分支/快进照常放行。
+  仍建议 `git push --no-verify`（避开 hook 里的网络调用），但不再强制。
 
 ## 三″、平台命令对照（2026-10-22 迁至自托管 Gitea）
 
@@ -81,7 +83,7 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 | 建 PR | `gh pr create --draft` | `POST /api/v1/repos/{o}/{r}/pulls`，body `{head, base, title, body}` |
 | 改 PR body | `gh pr edit N --body` | `PATCH /api/v1/repos/{o}/{r}/pulls/N`，body `{"body": "..."}` |
 | 查 check 状态 | `gh pr checks` | `GET /api/v1/repos/{o}/{r}/commits/{sha}/status` |
-| merge | `gh pr merge N --merge` | `POST /api/v1/repos/{o}/{r}/pulls/N/merge`，body `{"Do":"merge"}` |
+| merge | `gh pr merge N --merge` | `POST /api/v1/repos/{o}/{r}/pulls/N/merge`，body `{"do":"merge"}`（**小写**，swagger 的 required 字段名就是 `do`） |
 | 发评论 | `gh pr comment N` | `POST /api/v1/repos/{o}/{r}/issues/N/comments` |
 | 开 issue | `gh issue create` | `POST /api/v1/repos/{o}/{r}/issues` |
 
@@ -94,9 +96,40 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 3. **没有 `check_suite` 事件**。Gitea 用 `status` 事件代替（每次 commit status 变化触发一次），
    payload 里没有 PR 关联信息，需按 `sha` 反查 open PR。
 
+### 三″.1 地址与凭据（选错地址会直接 000）
+
+| 你在哪 | API 根 | 判断方法 |
+|---|---|---|
+| 生产 VPS / 蓝绿实例（与 hub1 同 VPC `172.28.129.0/20`） | `http://172.28.129.216:3000/api/v1` | `ip -4 addr \| grep 172.28.129` 有输出 |
+| 本机（Tailscale） | `http://hub01:3000/api/v1` | `tailscale status` 能看到 `hub01` |
+| 公网 | **不可用**（ufw 关闭） | — |
+
+- Token 两个、各专用，不要混用：**Dev Agent** 用于代码/PR/issue；**Prod Agent** 用于合并与部署判定。
+- 本机 token 在 `~/.config/gitea-token`；生产在 `/etc/dailycheck/gitea-token`（0600 root，
+  `dc-webhook-receiver.service` 通过 `GITEA_TOKEN_FILE=` 指向它，已实测可调 API）。
+  ⚠️ `dailycheck_pr_poll.py` 的**默认**路径仍是 `/root/.gitea-token`（该文件不存在）——
+  直接跑 poller 会认证失败，必须显式 `GITEA_TOKEN_FILE=/etc/dailycheck/gitea-token`。
+  排查「快通道 / 轮询没反应」时先看这两处路径。
+- **权限不足返回 403，不是 401**。看到 403 先查 token scope，别急着判定 token 失效。
+- 分支保护 `main`：禁止直推（`enable_push=false`），必需 check =
+  `CI / test (pull_request)` + `CI / agent-framework-reports (pull_request)`。
+
+### 三″.2 五个高频坑（都实测过）
+
+1. **别从旧分支开 PR**。GitHub 时代的旧分支自带旧 `ci.yml`（其中一步要去 github.com 下载 Python），
+   在 hub1 上会超时重试，CI 能跑 1.5 小时。开 PR 前先 `git rebase origin/main`。
+2. **runner 并发 = 1**。单 PR 的 CI 约 25–40 分钟，同时开多个大改动只会互相排队。
+   别把 CI 当第一道关，本地先跑 ruff + pytest。
+3. **`GET /pulls/{N}/merge` 是陷阱**：对已合并的 PR 也返回 204。判断是否已合并用
+   `GET /pulls/{N}` 的 `state` + `merged` 字段。
+4. **CI 卡在 `Checkout code` 7 分钟后失败 = 基础设施问题**（runner 与 Gitea 连通性），
+   报 owner，不要改代码。
+5. **登录后被踢回登录页** = `ROOT_URL` 与访问协议不一致导致 Cookie 带 `Secure` 被丢弃，
+   报 owner 改 `app.ini`，不要自己动。
+
 ## 四、Merge 政策（2026-10-15 Eric 二次拍板：Prod merge，替代同日早先的候选 A）
 
-**Prod Agent 在 CI 全绿后判定并执行 merge**（Gitea：`POST /api/v1/repos/{owner}/{repo}/pulls/{num}/merge`，body `{"Do":"merge"}`），merge 与部署由同一角色贯通。
+**Prod Agent 在 CI 全绿后判定并执行 merge**（Gitea：`POST /api/v1/repos/{owner}/{repo}/pulls/{num}/merge`，body `{"do":"merge"}`），merge 与部署由同一角色贯通。
 
 Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 

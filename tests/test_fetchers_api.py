@@ -147,7 +147,7 @@ def test_pagination_fetches_next_page_when_full(monkeypatch):
 
     items = fetchers._api_get_all("/repos/x/pulls")
 
-    assert calls == [1, 2, 3]  # 满页就一直翻到上限
+    assert calls == list(range(1, fetchers.API_MAX_PAGES + 1))  # 满页就一直翻到上限
     assert len(items) == fetchers.API_PER_PAGE * fetchers.API_MAX_PAGES
 
 
@@ -168,54 +168,62 @@ def test_pagination_stops_on_short_page(monkeypatch):
 # ============================================================
 # 认证与限速
 # ============================================================
-def test_api_get_anonymous_headers(monkeypatch):
+def test_api_get_without_token_fails_closed(monkeypatch):
+    """Gitea 仓库是 private，没有匿名兜底 —— 无 token 必须抛错，不能返回空列表。
+
+    空列表会被上层读成「今天 0 个合并」，正是 GitHub 时代踩过的假信号。
+    """
+    monkeypatch.delenv("GITEA_TOKEN", raising=False)
+    monkeypatch.setattr(fetchers, "TOKEN_FILES", ())  # 断掉文件兜底
+
+    with pytest.raises(fetchers.FetchError) as exc:
+        fetchers._api_get("/repos/x/pulls")
+    assert "token" in str(exc.value).lower()
+
+
+def test_api_get_uses_token_header(monkeypatch):
     captured: dict = {}
 
     def fake_urlopen(req, timeout=None):
         captured["req"] = req
         return _FakeResp(b"[]")
 
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITEA_TOKEN", "dummy-token")
     monkeypatch.setattr(fetchers.urllib.request, "urlopen", fake_urlopen)
 
     assert fetchers._api_get("/repos/x/pulls") == []
-    req = captured["req"]
-    assert req.get_header("Authorization") is None  # 匿名可用，不带凭据
-    assert req.get_header("User-agent")  # GitHub 强制要求 UA
+    assert captured["req"].get_header("Authorization") == "token dummy-token"
 
 
-def test_api_get_uses_token_when_present(monkeypatch):
-    captured: dict = {}
+def test_api_get_403_hint_points_at_scope(monkeypatch):
+    """Gitea 权限不足回 403（不是 401）—— 提示必须指向 scope，别让人去怀疑 token 失效。"""
 
-    def fake_urlopen(req, timeout=None):
-        captured["req"] = req
-        return _FakeResp(b"[]")
-
-    monkeypatch.setenv("GH_TOKEN", "dummy-token")
-    monkeypatch.setattr(fetchers.urllib.request, "urlopen", fake_urlopen)
-
-    fetchers._api_get("/repos/x/pulls")
-
-    assert captured["req"].get_header("Authorization") == "Bearer dummy-token"
-
-
-def test_api_get_rate_limited_raises_with_hint(monkeypatch):
     def fake_urlopen(req, timeout=None):
         raise _http_error(403)
 
+    monkeypatch.setenv("GITEA_TOKEN", "dummy-token")
     monkeypatch.setattr(fetchers.urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(fetchers.FetchError) as exc:
         fetchers._api_get("/repos/x/pulls")
 
     msg = str(exc.value)
-    assert "rate_limit_remaining=0" in msg
-    assert "reset_in=" in msg
-    assert "GH_TOKEN" in msg  # 给出可执行的下一步，而不是只说「失败了」
+    assert "403" in msg
+    assert "scope" in msg
+
+
+def test_norm_ts_converts_cst_to_utc():
+    """Gitea 时间戳带 +08:00，必须真正换算成 UTC。
+
+    截前 19 位再补 Z 会把 CST 当 UTC，交付周期整整差 8 小时。
+    """
+    assert fetchers._norm_ts("2026-10-24T10:22:41+08:00") == "2026-10-24T02:22:41Z"
+    assert fetchers._norm_ts("2026-10-17T12:42:47Z") == "2026-10-17T12:42:47Z"
+    assert fetchers._norm_ts(None) is None
 
 
 def test_api_get_non_array_payload_rejected(monkeypatch):
+    monkeypatch.setenv("GITEA_TOKEN", "dummy-token")
     def fake_urlopen(req, timeout=None):
         return _FakeResp(b'{"message": "Not Found"}')
 
@@ -226,6 +234,7 @@ def test_api_get_non_array_payload_rejected(monkeypatch):
 
 
 def test_api_get_unreachable_raises_fetch_error(monkeypatch):
+    monkeypatch.setenv("GITEA_TOKEN", "dummy-token")
     def fake_urlopen(req, timeout=None):
         raise urllib.error.URLError("dns fail")
 

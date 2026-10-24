@@ -127,13 +127,13 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    GitHub["GitHub Actions<br/>(.github/workflows/ci.yml)"]
+    Gitea["Gitea Actions<br/>(hub1 · .github/workflows/ci.yml)"]
     VPS["VPS 112.124.18.246:33756 root<br/>/root/DailyCheck"]
     Gunicorn["gunicorn -w 2 --threads 4<br/>-b 127.0.0.1:8090 app:app<br/>(**非 wdg-systemd**)"]
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    GitHub -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
+    Gitea -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -175,13 +175,13 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
 
 ### 3.5 PR Webhook 接收器（2026-10-15 实装）
 
-Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver` → `inbox.jsonl` → `dc-inbox-watcher`（≤5s 触发）→ Prod Agent 入口 → 跑 merge 决策**。秒级通知，替代 30 分钟轮询。
+Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver` → `inbox.jsonl` → `dc-inbox-watcher`（≤5s 触发）→ Prod Agent 入口 → 跑 merge 决策**。秒级通知，替代 30 分钟轮询。
 
 **组件**（`scripts/blue_green/webhook_receiver.py`，Flask 127.0.0.1:8443）：
 - **HMAC-SHA256 验签**（`X-Hub-Signature-256` + `WEBHOOK_SECRET` env）—— 拒伪 + 拒重放，constant-time 防时序攻击
-- **事件过滤**：`pull_request`（action 仅 `{opened, synchronize, reopened}`，`closed` / `edited` / `labeled` 等跳过）+ `check_suite`（action 仅 `completed`，且仅「有 PR 关联 + conclusion=success」落盘 —— CI 全绿秒级唤醒快通道，2026-10-16 增）
-- **幂等**：按 `X-GitHub-Delivery` 去重（GitHub 会重试 6 次，receiver 必须幂等否则 inbox 写脏）
-- **反压**：`inbox_size ≥ MAX_INBOX_LINES`（默认 1000）返回 503，GitHub 暂停重试（指数退避 1s/2s/.../1h）
+- **事件过滤**：`pull_request`（action 仅 `{opened, synchronize, synchronized, reopened}`——Gitea 的 synchronize 拼作 **synchronized**，两个都收）+ CI 完成事件（GitHub 是 `check_suite` completed+success；Gitea 没有该事件，改用 `status`：state=success 且按 sha 反查到 open PR、两个必需 check 全绿才落盘 —— 秒级唤醒快通道）
+- **幂等**：按 `X-GitHub-Delivery` / `X-Gitea-Delivery` 去重（两端都会重试，receiver 必须幂等否则 inbox 写脏）
+- **反压**：`inbox_size ≥ MAX_INBOX_LINES`（默认 1000）返回 503，投递方暂停重试（指数退避 1s/2s/.../1h）
 - **inbox 落盘**：每行 JSON，append-only，含 `delivery_id / event / action / pr_number / pr_title / pr_head_sha / pr_base_ref / pr_author / repo_full_name / received_at_ms`；`check_suite` 记录追加 `check_conclusion / check_head_branch / check_suite_id`（payload 没有的字段如 pr_title / pr_author 填空串，字段形状与 pull_request 记录对齐）
 
 **部署**（owner / Prod Agent 手动，不进 Dev 自动化）：
@@ -190,10 +190,10 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 - 证书：hook **独立**阿里云免费 DV 证书（单域名，`/etc/nginx/ssl/hook.kjtang.cn.{pem,key}`，90 天轮换）——免费证书不能给主证书加 SAN，主站证书不动
 - systemd：`deploy/systemd/dc-webhook-receiver.service`（监听 127.0.0.1:8443，单 worker，gunicorn，Restart=always 5s）
 - nginx：`deploy/nginx/hook.kjtang.cn.conf` 部署为**独立文件** `/etc/nginx/sites-enabled/hook.kjtang.cn`（与蓝绿 `switch.sh` 解耦：布局守卫只检查 dailycheck 文件；443 TLS 终结 + proxy_pass，limit_req 30r/s 防滥刷；`limit_req_zone` 只能放 http 上下文，勿放 `server{}` 内）
-- WEBHOOK_SECRET：32 字节强密码，写 `/etc/dailycheck/webhook-secret`（600 root），**不出现 git 仓库 / 文档 / prompt**（仅 systemd unit `EnvironmentFile=` 引用 + GitHub repo webhook 设置）
-- GitHub repo：Settings → Webhooks → Add，URL `https://hook.kjtang.cn/webhook`，Secret 同上，Events 勾 **"Pull requests" + "Check suites"**（后者 = CI 完成快通道，2026-10-16 增）
+- WEBHOOK_SECRET：32 字节强密码，写 `/etc/dailycheck/webhook-secret`（600 root），**不出现 git 仓库 / 文档 / prompt**（仅 systemd unit `EnvironmentFile=` 引用 + Gitea repo webhook 设置）
+- Gitea repo：Settings → Webhooks → 添加（类型 **Gitea**），URL `https://hook.kjtang.cn/webhook`，Secret 同上，Events 勾 **pull_request + pull_request_sync + pull_request_comment + status**（`status` = CI 完成快通道；Gitea 没有 Check suites）
 
-**生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（50-70 分钟手动部署；DNS / **443 放行核验** / 申请 hook 独立证书 / systemd / nginx reload / GitHub 配 webhook + 端到端验证）。
+**生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（50-70 分钟手动部署；DNS / **443 放行核验** / 申请 hook 独立证书 / systemd / nginx reload / Gitea 配 webhook + 端到端验证）。
 
 **测试**：`tests/test_webhook_receiver.py`（19 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点 / check_suite 六态（success 落盘 + check_* 字段 / 非 success 拒绝 / 无 PR 拒绝 / 非 completed 拒绝 / action 白名单分叉 / 幂等）；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 / 删 conclusion 过滤 / 删 no_pr 过滤 / 白名单误加 opened 各自对应测试 FAIL）。
 
@@ -219,7 +219,7 @@ Dev Agent 提完 PR 后，**GitHub repo → webhook → VPS `dc-webhook-receiver
 - **核心包** `scripts/dailycheck_dashboard/`（dev 端，可 commit）：
   - `__main__.py`：CLI 三子命令 — `render`（拉数据 + 渲染 + 落 db）/ `history`（列最近 N 快照）/ `diff`（最近两次 KPI 对比）
   - `db.py`：SQLite 封装（`snapshots` 主表 + `issues_snapshot` / `prs_snapshot` / `worktrees_snapshot` 三个子表 + `schema_version` 幂等迁移；autocommit 模式 + WAL + `synchronous=NORMAL`）
-  - `fetchers.py`：**GitHub REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`per_page=100` 最多 3 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 REST 的 `/pulls` 只有 open/closed，「已合并」只能从 `merged_at` 判）+ git worktree 解析（porcelain 格式）+ inbox 统计。**不用 gh CLI**：仓库是 public，匿名即可读（60 次/小时，每轮约 3 次请求 = 12 次/小时）；生产 `gh` 的 `hosts.yml` 认证早已失效，而 gh 没认证就彻底不可用 —— 2026-10-17 正是它把「拉不到」变成了「今日 0 个合并」。环境里若存在 `GH_TOKEN` / `GITHUB_TOKEN` 会自动带上（配额 5000/h），代码无需再改
+  - `fetchers.py`：**Gitea REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`limit=50` 最多 6 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 `/pulls` 的 state 只有 open/closed，「已合并」靠 `merged`/`merged_at` 判）。**不用 gh CLI**（Gitea 没有 gh）。地址按运行位置取（生产 `172.28.129.216:3000`、本机 `hub01:3000`），可用 `GITEA_API_BASE` 覆盖。仓库 private，**没有匿名兜底**：token 依次取 `GITEA_TOKEN` → `/root/.gitea-token` → `~/.config/gitea-token`，全无则抛 `FetchError`（宁可显性失败，也不返回空列表被读成「今日 0 个合并」）。⚠️ Gitea 时间戳带 `+08:00`，`_norm_ts` 必须真正换算成 UTC（截断补 `Z` 会让交付周期差 8 小时）
   - `render.py`：HTML 渲染（`string.Template` 内嵌 CSS，零三方依赖，KPI 卡片差异行用 `↑N` / `↓N` / `→` 三态箭头）
   - **零三方依赖**：纯 stdlib（`sqlite3` / `subprocess` / `json` / `urllib` / `pathlib` / `string.Template`）
 - **触发 listener** `deploy/scripts/dailycheck_dashboard_on_pr.py`（VPS 端，systemd 拉起）：订阅 `inbox.jsonl`，收到 PR 事件（`{opened,synchronize,reopened}`）→ 调 `python -m scripts.dailycheck_dashboard render --trigger-kind pr_xxx --trigger-event-id <delivery_id>`。**与 `dc-inbox-watcher` 完全独立、互不干扰**（各自一份 handled_ids state-file；同一 inbox.jsonl 多读者，写者只有 receiver）。⚠️ 该脚本是 `scripts/prod_agent/inbox_watcher.py` 的**同源孪生副本**（退避语义、状态归一化规则共享，默认参数与触发方式有意不同）——**任一侧改动必须同步另一侧**，历史上出现过「一侧修、另一侧漏」的单侧漂移（Issue #51 → #66）。⚠️ **孪生口径已收口（2026-10-17，Issue #66 收口 #51）**：规则 7（损坏状态归一化 + 留痕 + `sane_ahead` 上界）现已**两侧同时落地**——本侧首发，孪生侧 `inbox_watcher.py` 随同一 PR 补齐（`_sane_next` / `_normalize_failure` / `_str_set` / `_next_at` / `_attempts` / `retry_due` / `state.sane_ahead`，主循环 gating 同为 `sig != last_sig or retry_due(state)`）。收口背景（按**实测**记录）：Issue #51 的修复分支（`6b70183`）只有 `retry_due` + `_next_at`，**不含** `_normalize_failure` / `_sane_next` / `_str_set` / `sane_ahead`——8 种条目级损坏形态与 3 种容器级形态**全部零 WARNING**，即「合并 #51 并不等于孪生侧收口」；故 owner 于 2026-10-17 拍板由 #66 统一收口，**#51 已关闭（not planned，留收口说明）**，本 PR 为该缺陷族唯一落点。⚠️ **修复前的风险口径（不得低估）**：在役 `dc-inbox-watcher` 对**非数值 / 溢出** `next` 是**抛异常崩溃**（`next="x"` → `ValueError`、`next=10**309` → `OverflowError`；`state.save()` 不执行 → 条目永久留在状态文件 → `Restart=always` 永久崩溃循环），「静默锁死」只描述**有限但越界**（如 `1e308`）这一种形态——两者现已同时关闭
@@ -327,7 +327,7 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 **「今日」是严格语义**：`今日部署` / `验证到切流` / `今日 Token` / `今日合并 PR` 只统计当天事件。今天没部署就显示 `0 次` / `—`，**不回退成历史值**，副标题补「最近一次 #PR · 日期」以免 0 被读成「数据没跑」。兜底会把「今天一次没部署」渲染成「今天部署了 12 次」——这跟「PR 列表拉不到却显示 0 个合并」是同一类错误，只是方向相反（2026-10-18 生产实测命中，当天零部署而卡片显示 12 次）。「部署卡顿」跨历史统计，但标签里写明范围「近 N 次中」。
 
-**「拉不到」不等于「没有」**：`fetch_prs` 失败时 `pr_data_ok=False`，两张 PR 相关 KPI 出 `—` + 「GitHub 拉取失败」，**不出 0** —— 把「拉不到」渲染成「今日 0 个合并」是错误事实，比空着更糟。同理其余源失败一律进 `ops_unavailable`，页面底部列出不可用源。
+**「拉不到」不等于「没有」**：`fetch_prs` 失败时 `pr_data_ok=False`，两张 PR 相关 KPI 出 `—` + 「Gitea 拉取失败」，**不出 0** —— 把「拉不到」渲染成「今日 0 个合并」是错误事实，比空着更糟。同理其余源失败一律进 `ops_unavailable`，页面底部列出不可用源。
 
 **数据源演进（2026-10-18）**：首版走 `gh` CLI，上线当天即发现生产 `/root/.config/gh/hosts.yml` 的 token 失效，两张 PR KPI 长期 `—`。改 REST 匿名后实测拿到 63 条真实 PR（编号 1–105，中间 42 个缺号是历史删除，并非漏抓）+ 41 条 Issue。**不引入新密钥**：仓库 public，匿名配额（60/h）对 15 分钟一轮的渲染绰绰有余；`GH_TOKEN` 存在则自动升级到 5000/h，留作将来仓库转私有时的开关。
 
@@ -475,7 +475,7 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 
 ### 3.10 用户反馈闭环（问题提单 → 管理员判定 → 开发任务，2026-10-17 起）
 
-前九节的链路都是「系统 → 用户」的下行推送；本节补的是**上行通道**：用户在任意页面遇到问题，就地提一条，管理员收到提醒后判定「忽略」或「派发开发」，派发即生成一张 GitHub Issue 进入标准开发闭环（开发 → PR → CI → merge → 部署）。
+前九节的链路都是「系统 → 用户」的下行推送；本节补的是**上行通道**：用户在任意页面遇到问题，就地提一条，管理员收到提醒后判定「忽略」或「派发开发」，派发即生成一张 Gitea Issue 进入标准开发闭环（开发 → PR → CI → merge → 部署）。
 
 **为什么不复用 `notifications` 表**：站内通知是「一人一行」的扇出（`user_id` 维度、只读即可），而反馈单需要状态机、管理员评论、以及到 Issue 的单向绑定。两套语义混在一张表里，`read_at` 与 `status` 会互相污染。因此**新建两张表**，`notifications` 只承担「提醒超管有新单」这一个扇出动作。
 
@@ -534,12 +534,13 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 两条提醒都跑在**业务事务之外**（企微走 daemon 线程），任一失败不回滚已落库的单子，也不阻断用户的成功页。
 
-**Issue 派发**（`blueprints/feedback_dispatch.py` 只管 GitHub API，正文渲染在 `feedback_issue_body.py`；`urllib` 直调 REST）：
+**Issue 派发**（`blueprints/feedback_dispatch.py` 只管 Gitea API，正文渲染在 `feedback_issue_body.py`；`urllib` 直调 REST）：
 
 - **先落评论，再建 Issue**。顺序是刻意的：外部 API 挂了最多是没建单，管理员写的处理意见一个字都不丢 —— Issue 正文正是由这些评论渲染的。
 - **幂等**：`attach_issue()` 的 `WHERE issue_number IS NULL` 保证重复点「发送」不会造第二张单；已派发的单子点派发只回一句「未重复建单」。
 - **标签**：`user-feedback`（`0e8a16`）。先 `POST /labels` 尽力创建（`422` = 已存在，算成功），建不出来就不带标签建单 —— 标签是给自动化识别用的增强，不是前提。
-- **降级**：`FEEDBACK_GITHUB_TOKEN` 为空 → 只存评论 + 明确提示「请手动建 Issue」，**绝不伪装成功**；HTTP 失败同理（页面原话「创建 GitHub Issue 失败，请手动建单」）。
+- **降级**：`FEEDBACK_GITEA_TOKEN` 为空 → 只存评论 + 明确提示「请手动建 Issue」，**绝不伪装成功**；HTTP 失败同理。
+- **Gitea 两处与 GitHub 不同**：① 建单的 `labels` 收**标签 id** 不收名字；② 同名标签不去重（重复 POST 同样 201），所以必须先 GET 查再建，不能靠 409/422 判幂等。
 - 正文含 **闭环要求** 一节，明确「开发 → PR → CI 全绿 → merge → 部署」，避免开发侧拿到一张只有一句话的 issue 无从下手。
 
 **Issue 精确化**（`blueprints/feedback_introspect.py`，2026-10-17 追加）：
@@ -734,9 +735,9 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 ### 3.13 Owner 拍板队列（红线 PR 不再静默挂着，2026-10-21 起）
 
-**问题**：Prod Agent 命中红线后只做一件事——开一张 GitHub issue，然后 PR 就停在那里。owner 不主动刷 GitHub 就永远不知道有东西等他拍板。2026-10-20 的 #137（CI 门禁并行）就这样挂了 8 小时，直到会话里被追问才被发现。
+**问题**：Prod Agent 命中红线后只做一件事——开一张 Gitea issue，然后 PR 就停在那里。owner 不主动刷 Gitea 就永远不知道有东西等他拍板。2026-10-20 的 #137（CI 门禁并行）就这样挂了 8 小时，直到会话里被追问才被发现。
 
-诊断结论是**缺推送**，不是缺审批界面：issue 里写得清清楚楚，问题在没人告诉他。所以本方案的重心是「把信号推到人眼前」，不是「把 GitHub 搬进站内」。
+诊断结论是**缺推送**，不是缺审批界面：issue 里写得清清楚楚，问题在没人告诉他。所以本方案的重心是「把信号推到人眼前」，不是「把代码托管平台搬进站内」。
 
 **闭环四步**：
 
@@ -750,11 +751,11 @@ Prod Agent 判红线 → POST /api/ops/approvals 登记（Bearer）
   → POST /api/ops/approvals/<pr>/consume 回写 merged
 ```
 
-**为什么用「登记制」而不是站内反查 GitHub**：
+**为什么用「登记制」而不是站内反查 Gitea**：
 
-判定的第一现场在 Prod Agent——它读 PR diff、对照红线清单，只有它知道这次为什么被拦。站内反过来猜（open PR + CI 状态 + 评论措辞）等于把判据复制一份，两份迟早不一致；而且 GitHub 匿名配额 60 次/小时，PR 一多这页就挂，偏偏它是用来兜底的。代价是 Prod Agent 必须改一行（见「生产侧事项」），但这本来就该是它的职责。
+判定的第一现场在 Prod Agent——它读 PR diff、对照红线清单，只有它知道这次为什么被拦。站内反过来猜（open PR + CI 状态 + 评论措辞）等于把判据复制一份，两份迟早不一致；而且反查要额外持有读权限、每开一次页面就打一轮 API，偏偏它是用来兜底的。代价是 Prod Agent 必须改一行（见「生产侧事项」），但这本来就该是它的职责。
 
-**为什么不在这里直接 merge**：merge → 部署链路（release / 蓝绿）由 Prod Agent 持有，应用侧不该拿到 GitHub 写权限。站内只记录「owner 说可以」，执行权和执行结果留在 Agent 那边。
+**为什么不在这里直接 merge**：merge → 部署链路（release / 蓝绿）由 Prod Agent 持有，应用侧不该拿到 Gitea 写权限。站内只记录「owner 说可以」，执行权和执行结果留在 Agent 那边。
 
 **状态机**（`status` 记的是 owner 的**决定**，不是进展）：
 
@@ -1748,7 +1749,7 @@ flowchart TB
 - **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：失败数 = CI 口径 + 2（2026-10-15 实测 16 failed / 1006 passed；passed 数随新增用例变化，引用旧值须换算）。
 - 「零新增对比法」比对的是**失败集逐行**，不是 passed 总数；引用总数时必须带口径，否则跨环境对比会误判。
 
-**CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`）**：
+**CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`；2026-10-22 起由 hub1 上的 Gitea Actions 执行）**：
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
 - `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
 - **防假绿（2026-10-11 起）**：门禁对 pytest 收集错误 / 空输出 / 0 passed 一律拒绝放行（收集错误不产生 FAILED 行，坏依赖曾致门禁空过假绿）。测试三方依赖（如 openpyxl）必须进 requirements.txt。
@@ -1793,7 +1794,7 @@ flowchart TB
 ### 13.3 时区不一致（**生产 bug**）
 
 - **dev 容器 = UTC**（`/etc/timezone`）
-- **CI = UTC**（GitHub runner 默认；2026-10-18 实证：`test_dashboard_ops` 两个用例在 CI 判红、本地 CST 全绿）
+- **CI = UTC**（Gitea Actions runner 默认同为 UTC；2026-10-18 实证：`test_dashboard_ops` 两个用例在 CI 判红、本地 CST 全绿）
 - **prod 进程 = CST+8**（unit 未设 TZ）
 - `datetime.now()` = 进程时区；`datetime('now')` SQL = UTC
 - **时间类 bug 在 dev 不可复现、生产必现**；反方向也成立——**依赖进程本地时区的代码在 prod「侥幸正确」，在 CI/dev 判红**
