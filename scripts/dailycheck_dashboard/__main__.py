@@ -30,7 +30,7 @@ DEFAULT_HTML_DIR = Path("/var/lib/dailycheck-dashboard/snapshots")
 DEFAULT_HTML_LATEST = Path("/var/lib/dailycheck-dashboard/latest.html")
 DEFAULT_INBOX = Path("/var/lib/dailycheck-prod-agent/inbox.jsonl")
 DEFAULT_REPO_DIR = Path("/root/DailyCheck")
-DEFAULT_REPO = "ericmr1981/DailyCheck"
+DEFAULT_REPO = "eric/dailycheck"   # 2026-10-22 起仓库迁至自托管 Gitea
 
 # 运维事实的三个源（任一路径不存在 → 该区块降级，不影响其余章节）
 DEFAULT_AUDIT_LOG = Path("/var/lib/dailycheck-deploy/audit.log")
@@ -101,7 +101,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         prs = []
         # 拉不到 ≠ 没有：KPI 必须显示「—」而不是 0（gh 未认证时曾把「今日 0 个合并」当真）
         pr_data_ok = False
-        ops_unavailable.append("GitHub PR 列表")
+        ops_unavailable.append("Gitea PR 列表")
 
     try:
         worktrees = fetchers.fetch_worktrees(repo_dir)

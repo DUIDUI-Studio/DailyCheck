@@ -1,4 +1,4 @@
-"""反馈派发：把管理员的处理评论变成一张 GitHub Issue，交给开发闭环。
+"""反馈派发：把管理员的处理评论变成一张 Gitea Issue，交给开发闭环。
 
 设计约定：
 - **绝不抛异常**。派发失败时路由必须能降级（保留评论、提示人工建单），
@@ -11,6 +11,7 @@
   调用方（路由与测试）继续按 ``feedback_dispatch.build_issue_body`` 访问，
   避免为一次纯重构改动所有引用点。
 
+平台：自托管 Gitea（2026-10-22 GitHub 账号封禁后迁移）。
 Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）。
 """
 from __future__ import annotations
@@ -34,7 +35,6 @@ from .feedback_issue_body import (  # noqa: F401 - 对外 re-export
 
 logger = logging.getLogger(__name__)
 
-GITHUB_API = "https://api.github.com"
 DISPATCH_TIMEOUT_SECONDS = 10.0
 # 反馈派发的标记标签：Hermes 侧据此识别「这是用户反馈，不是普通 issue」。
 FEEDBACK_LABEL = "user-feedback"
@@ -44,15 +44,15 @@ FEEDBACK_LABEL_DESC = "用户在站内提交的使用问题，由管理员确认
 
 def dispatch_enabled() -> bool:
     """token 为空 = 未启用派发（降级为「只存评论」）。"""
-    return bool(str(getattr(config, "FEEDBACK_GITHUB_TOKEN", "") or "").strip())
+    return bool(str(getattr(config, "FEEDBACK_GITEA_TOKEN", "") or "").strip())
 
 
 def repo_slug() -> str:
-    return str(getattr(config, "FEEDBACK_GITHUB_REPO", "") or "").strip() or "ericmr1981/DailyCheck"
+    return str(getattr(config, "FEEDBACK_GITEA_REPO", "") or "").strip() or "eric/dailycheck"
 
 
 # ---------------------------------------------------------------------------
-# GitHub API
+# Gitea API
 # ---------------------------------------------------------------------------
 
 def create_issue(
@@ -65,21 +65,24 @@ def create_issue(
     label 处理：先尽力确保标签存在（已存在不算错），确保不了就不带标签建单 ——
     标签是「给自动化识别用」的增强，不是创建 Issue 的前提。
     """
-    token = str(getattr(config, "FEEDBACK_GITHUB_TOKEN", "") or "").strip()
+    token = str(getattr(config, "FEEDBACK_GITEA_TOKEN", "") or "").strip()
     if not token:
         logger.warning("feedback_dispatch_skip: no token configured")
         return None
     repo = repo_slug()
-    labels: list[str] = []
+    label_ids: list[int] = []
     if label:
-        if _ensure_label(token, repo, label):
-            labels = [label]
+        lid = _ensure_label(token, repo, label)
+        if lid:
+            label_ids = [lid]
         else:
             logger.warning("feedback_dispatch_label_unavailable: label=%s", label)
 
+    # ⚠️ Gitea 的 CreateIssueOption.labels 收的是**标签 id**，不是名字
+    #    （GitHub 收名字）。传名字会 422，且失败信息里看不到原因。
     payload: dict[str, Any] = {"title": title, "body": body}
-    if labels:
-        payload["labels"] = labels
+    if label_ids:
+        payload["labels"] = label_ids
     data = _post_json(token, f"/repos/{repo}/issues", payload)
     if not isinstance(data, dict):
         return None
@@ -91,22 +94,36 @@ def create_issue(
     return {"number": number, "url": url}
 
 
-def _ensure_label(token: str, repo: str, name: str) -> bool:
-    """确保标签存在。201=新建成功，422=已存在（也算成功），其余算失败。"""
+def _ensure_label(token: str, repo: str, name: str) -> int | None:
+    """确保标签存在，返回其 id；失败返回 None（不影响建单）。
+
+    ⚠️ 必须「先查再建」：Gitea 不约束标签同名，重复 POST 同样返回 201 并
+    再生成一个同名标签（2026-10-24 实测：连发两次 → 出现 #5/#6 两个
+    user-feedback）。靠 409/422 判幂等在 Gitea 上不成立。
+    """
+    try:
+        code, data = _request(token, f"/repos/{repo}/labels?limit=50", None, method="GET")
+    except Exception:
+        logger.warning("feedback_dispatch_label_error: label=%s", name)
+        return None
+    if code == 200 and isinstance(data, list):
+        for item in data:
+            if item.get("name") == name and isinstance(item.get("id"), int):
+                return item["id"]
     payload = {
         "name": name,
         "color": FEEDBACK_LABEL_COLOR,
         "description": FEEDBACK_LABEL_DESC,
     }
     try:
-        code, _ = _request(token, f"/repos/{repo}/labels", payload)
+        code, data = _request(token, f"/repos/{repo}/labels", payload)
     except Exception:  # 兜底：标签失败不影响建单
         logger.warning("feedback_dispatch_label_error: label=%s", name)
-        return False
-    if code in (200, 201, 422):
-        return True
+        return None
+    if code in (200, 201) and isinstance(data, dict) and isinstance(data.get("id"), int):
+        return data["id"]
     logger.warning("feedback_dispatch_label_http: label=%s status=%s", name, code)
-    return False
+    return None
 
 
 def _post_json(token: str, path: str, payload: dict[str, Any]) -> Any:
@@ -124,25 +141,23 @@ def _post_json(token: str, path: str, payload: dict[str, Any]) -> Any:
 
 
 def _request(
-    token: str, path: str, payload: dict[str, Any]
+    token: str, path: str, payload: dict[str, Any] | None, method: str = "POST"
 ) -> tuple[int, Any]:
-    """发一次 GitHub API 请求，返回 ``(status_code, parsed_json)``。
+    """发一次 Gitea API 请求，返回 ``(status_code, parsed_json)``。
 
     只抛网络层异常（由调用方吞掉并只记类型名）。HTTP 错误码在这里
     变成返回值而不是异常，因为 422（标签已存在）是**预期分支**，不是错误。
     """
     request = urllib.request.Request(
-        GITHUB_API + path,
-        data=json.dumps(payload).encode("utf-8"),
+        str(getattr(config, "FEEDBACK_GITEA_API", "") or "").rstrip("/") + path,
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
         headers={
-            # Go 之外的 UA 也必须带：GitHub 对无 UA 的请求直接 403。
             "User-Agent": "DailyCheck-feedback-dispatch",
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
+            "Accept": "application/json",
+            "Authorization": f"token {token}",
             "Content-Type": "application/json",
         },
-        method="POST",
+        method=method,
     )
     try:
         with urllib.request.urlopen(request, timeout=DISPATCH_TIMEOUT_SECONDS) as resp:

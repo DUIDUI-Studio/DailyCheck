@@ -6,29 +6,34 @@
   - 外部字段命名风格不一（驼峰 / 下划线 / 大写 state），这里统一规范化
   - 超时统一 30s；网络/限速错让调用方决定退避
 
-GitHub 改用 REST API，不再走 gh CLI：
-  仓库是 public，匿名即可读（60 次/小时；每轮渲染约 3 次请求，15 分钟一跑
-  只占 12 次/小时）。生产上 `/root/.config/gh/hosts.yml` 的认证早已失效，
-  而 gh CLI 没有认证就彻底不可用 —— 之前正是它把「拉不到」变成了
-  「今日 0 个合并」。REST 匿名没有这个前提；环境里若存在 GH_TOKEN /
-  GITHUB_TOKEN 会自动带上，配额抬到 5000/h，代码无需再改。
+Gitea REST API（2026-10-22 GitHub 账号封禁后迁至自托管）：
+  仓库从 github.com/ericmr1981/DailyCheck 整体迁到 hub1 上的 `eric/dailycheck`，
+  数据源随之切换。地址按运行位置选（见 docs/agent-framework/workflow.md §三″）：
+    - 生产 VPS / 蓝绿实例（与 hub1 同 VPC）→ http://172.28.129.216:3000/api/v1
+    - 本机（Tailscale）→ http://hub01:3000/api/v1
+  默认取生产地址，本机/CI 用 `GITEA_API_BASE` 覆盖。
+
+  认证：Gitea 仓库是 private，**必须带 token**（GitHub 时代是 public 可匿名，
+  这里没有匿名兜底）。token 依次取 `GITEA_TOKEN` 环境变量、
+  `/root/.gitea-token`、`~/.config/gitea-token`；全都没有直接抛 FetchError，
+  而不是静默返回空列表 —— 空列表会被上层读成「今天 0 个合并」。
 """
 from __future__ import annotations
 
 import json
 import os
 import subprocess
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 FETCH_TIMEOUT = 30.0
 
 
 class FetchError(RuntimeError):
-    """数据拉取失败（gh 不在 PATH / 网络断 / 仓库路径错）。"""
+    """数据拉取失败（网络断 / 无 token / 仓库路径错）。"""
 
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: float = FETCH_TIMEOUT) -> str:
@@ -53,62 +58,86 @@ def _run(cmd: list[str], cwd: Path | None = None, timeout: float = FETCH_TIMEOUT
 
 
 # ============================================================
-# GitHub（REST API）
+# Gitea（REST API）
 # ============================================================
-API_BASE = "https://api.github.com"
+# 默认生产地址（VPS 与 hub1 同 VPC）。本机走 Tailscale 时用环境变量覆盖。
+DEFAULT_API_BASE = "http://172.28.129.216:3000/api/v1"
+DEFAULT_REPO = "eric/dailycheck"
+TOKEN_FILES = (Path("/root/.gitea-token"), Path.home() / ".config" / "gitea-token")
 API_TIMEOUT = 30.0
-API_PER_PAGE = 100
-# 原 gh --limit 200 的口径；3 页留余量，避免仓库长大后静默截断
-API_MAX_PAGES = 3
+# Gitea 的 limit 默认上限就是 50（可被服务端调小），按 50 翻页最稳
+API_PER_PAGE = 50
+# 原 gh --limit 200 的口径；留余量，避免仓库长大后静默截断
+API_MAX_PAGES = 6
+
+
+def api_base() -> str:
+    """Gitea API 根地址；`GITEA_API_BASE` 可覆盖（本机 / CI 用）。"""
+    return (os.environ.get("GITEA_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+
+
+def repo_slug() -> str:
+    return (os.environ.get("GITEA_REPO") or DEFAULT_REPO).strip().strip("/")
+
+
+def _token() -> str:
+    """token 解析：环境变量 → 生产文件 → 本机文件。全空则抛错（不静默降级）。"""
+    env = (os.environ.get("GITEA_TOKEN") or "").strip()
+    if env:
+        return env
+    for path in TOKEN_FILES:
+        try:
+            tok = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if tok:
+            return tok
+    raise FetchError(
+        "Gitea token 不可用：GITEA_TOKEN 未设且 token 文件均不可读"
+        f"（找过 {'、'.join(str(p) for p in TOKEN_FILES)}）"
+    )
 
 
 def _api_headers() -> dict[str, str]:
-    """匿名是主路径；有 token 就带上（不改变调用方行为，只抬配额）。"""
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+    """Gitea 用 `Authorization: token <token>`（Bearer 也接受，token 更明确）。"""
+    return {
+        "Accept": "application/json",
         "User-Agent": "dailycheck-dashboard",
+        "Authorization": f"token {_token()}",
     }
-    token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
 
 
 def _api_get(path: str, params: dict[str, str] | None = None) -> list[dict]:
-    """GET 一页 JSON 数组；任何异常都收敛成 FetchError（带限速残留）。"""
+    """GET 一页 JSON 数组；任何异常都收敛成 FetchError。"""
     query = urllib.parse.urlencode(params or {})
-    url = f"{API_BASE}{path}" + (f"?{query}" if query else "")
-    req = urllib.request.Request(url, headers=_api_headers())
+    url = f"{api_base()}{path}" + (f"?{query}" if query else "")
+    try:
+        req = urllib.request.Request(url, headers=_api_headers())
+    except FetchError:
+        raise
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        # 限速只会发生在匿名模式下；把余量和重置时间写进错误，排查不用再猜
-        remaining = exc.headers.get("X-RateLimit-Remaining", "?")
-        reset = (exc.headers.get("X-RateLimit-Reset") or "").strip()
-        hint = f" rate_limit_remaining={remaining}"
-        if reset.isdigit():
-            hint += f" reset_in={max(0, int(reset) - int(time.time()))}s"
-        if exc.code in (403, 429):
-            hint += "（匿名 60/h，可用 GH_TOKEN 抬到 5000/h）"
-        raise FetchError(f"GitHub API {exc.code} {path}{hint}") from exc
+        # Gitea 权限不足返回 403（不是 401）——先看 scope，别怀疑 token 失效
+        hint = "（403=scope 不足，不是 token 失效）" if exc.code == 403 else ""
+        raise FetchError(f"Gitea API {exc.code} {path}{hint}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise FetchError(f"GitHub API unreachable: {exc}") from exc
+        raise FetchError(f"Gitea API unreachable ({api_base()}): {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise FetchError(f"GitHub API bad JSON: {exc}") from exc
+        raise FetchError(f"Gitea API bad JSON: {exc}") from exc
     if not isinstance(payload, list):
-        raise FetchError(f"GitHub API 返回非数组: {path}")
+        raise FetchError(f"Gitea API 返回非数组: {path}")
     return payload
 
 
 def _api_get_all(path: str, params: dict[str, str] | None = None) -> list[dict]:
-    """按 per_page=100 翻页，最多 API_MAX_PAGES 页。"""
+    """按 limit=50 翻页，最多 API_MAX_PAGES 页。"""
     items: list[dict] = []
     for page in range(1, API_MAX_PAGES + 1):
         chunk = _api_get(
             path,
-            {**(params or {}), "per_page": str(API_PER_PAGE), "page": str(page)},
+            {**(params or {}), "limit": str(API_PER_PAGE), "page": str(page)},
         )
         items.extend(chunk)
         if len(chunk) < API_PER_PAGE:
@@ -116,15 +145,17 @@ def _api_get_all(path: str, params: dict[str, str] | None = None) -> list[dict]:
     return items
 
 
-def fetch_issues(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
+def fetch_issues(repo: str | None = None) -> list[dict]:
     """所有 Issue（state=all），snake_case 规范化。
 
-    ⚠️ REST 的 /issues 会把 PR 一起返回（PR 也是 issue），必须按
-    `pull_request` 字段剔除，否则 PR 会被当成 Issue 重复统计。
+    ⚠️ Gitea 的 /issues 同样会把 PR 一起返回（PR 也是 issue），必须按
+    `pull_request` 字段剔除。实测 `type=issues` 参数在本实例上并未过滤掉 PR，
+    所以客户端过滤这条不能省。
     """
+    repo = repo or repo_slug()
     items = _api_get_all(
         f"/repos/{repo}/issues",
-        {"state": "all", "sort": "updated", "direction": "desc"},
+        {"state": "all", "sort": "recentupdate", "direction": "desc"},
     )
     return [
         {
@@ -140,16 +171,17 @@ def fetch_issues(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
     ]
 
 
-def fetch_prs(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
+def fetch_prs(repo: str | None = None) -> list[dict]:
     """所有 PR（state=all），snake_case 规范化。
 
     created_at / merged_at 只到日（落库口径不变）；
-    created_ts / merged_ts 保留完整 ISO 8601，供交付周期（创建→合并）计算，
+    created_ts / merged_ts 保留完整 ISO 8601 **UTC**，供交付周期（创建→合并）计算，
     不写进 prs_snapshot（避免改 db schema）。
     """
+    repo = repo or repo_slug()
     items = _api_get_all(
         f"/repos/{repo}/pulls",
-        {"state": "all", "sort": "updated", "direction": "desc"},
+        {"state": "all", "sort": "recentupdate"},
     )
     return [
         {
@@ -167,31 +199,50 @@ def fetch_prs(repo: str = "ericmr1981/DailyCheck") -> list[dict]:
 
 
 def _pr_state(it: dict) -> str:
-    """REST /pulls 的 state 只有 open/closed；「已合并」只能从 merged_at 判。
+    """Gitea /pulls 的 state 只有 open/closed；「已合并」看 merged / merged_at。
 
-    下游 render / compute_summary 都按 gh 的三个大写值（OPEN/CLOSED/MERGED）
-    分支，所以这里必须映射回同一套语义。
+    下游 render / compute_summary 都按 OPEN/CLOSED/MERGED 三个大写值分支，
+    所以这里必须映射回同一套语义。
     """
-    if it.get("merged_at"):
+    if it.get("merged_at") or it.get("merged") is True:
         return "MERGED"
     return (it.get("state") or "").upper()
 
 
 def _norm_ts(ts: str | None) -> str | None:
-    """GitHub 的 '2026-10-17T12:42:47Z'（可能带毫秒）→ 秒级 UTC ISO。"""
+    """ISO 8601 → 秒级 **UTC**（`YYYY-MM-DDTHH:MM:SSZ`）。
+
+    ⚠️ GitHub 返回 `...Z`（UTC），Gitea 返回 `...+08:00`（服务器本地时区）。
+    直接截前 19 位再补 Z 会把 CST 当 UTC，交付周期整整差 8 小时 —— 必须真正解析。
+    解析失败时退回「截断 + Z」以保持旧行为的可用性，但不静默丢时间。
+    """
     if not ts:
         return None
-    return ts[:19] + "Z"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts[:19] + "Z"
+    if dt.tzinfo is None:  # 无时区标记 → 按 UTC 解释（与旧口径一致）
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ============================================================
 # Git（worktree + HEAD）
 # ============================================================
 def fetch_head_shas(repo_dir: Path) -> tuple[str | None, str | None]:
-    """返回 (HEAD, origin/main)；任一不可用则对应字段为 None。"""
+    """返回 (HEAD, 远端 main)；任一不可用则对应字段为 None。
+
+    远端名不写死：迁 Gitea 后本机仍是 `gitea` remote、生产是 `origin`，
+    按 origin → gitea → refs/remotes 顺序取第一个可用的，避免为改个名字就断数。
+    """
     head = _try_rev_parse(repo_dir, "HEAD")
-    origin_main = _try_rev_parse(repo_dir, "origin/main")
-    return head, origin_main
+    remote_main = None
+    for ref in ("origin/main", "gitea/main", "main"):
+        remote_main = _try_rev_parse(repo_dir, ref)
+        if remote_main:
+            break
+    return head, remote_main
 
 
 def _try_rev_parse(repo_dir: Path, ref: str) -> str | None:

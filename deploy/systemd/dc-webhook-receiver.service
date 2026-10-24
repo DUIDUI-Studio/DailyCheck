@@ -13,7 +13,7 @@
 #   5. systemctl enable --now dc-webhook-receiver.service
 #   6. curl http://127.0.0.1:8443/health  # 探活
 #   7. tail -F /var/log/dailycheck/webhook-receiver.log  # 跟日志
-#   8. 配置 GitHub repo Webhook：URL=https://hook.kjtang.cn/webhook
+#   8. 配置 Gitea repo Webhook（类型 Gitea）：URL=https://hook.kjtang.cn/webhook
 #      Secret=<同 /etc/dailycheck/webhook-secret>
 #      Events: 只勾 "Pull requests"
 #
@@ -21,7 +21,7 @@
 # 是兜底（崩溃自动拉起，inbox 文件已落盘不丢事件）。
 
 [Unit]
-Description=DailyCheck GitHub PR Webhook Receiver (Flask, behind nginx 443)
+Description=DailyCheck Gitea PR Webhook Receiver (Flask, behind nginx 443)
 After=network.target
 # 不依赖 dailycheck.service / nginx.service —— receiver 是独立基础设施，
 # nginx 挂了 receiver 仍能起（虽然 443 不可达）；receiver 挂了 nginx 仍能
@@ -34,7 +34,7 @@ Group=root
 
 WorkingDirectory=/root/DailyCheck
 Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-# 必填：与 GitHub repo webhook secret 完全一致（32 字节强密码）
+# 必填：与 Gitea repo webhook secret 完全一致（32 字节强密码）
 EnvironmentFile=/etc/dailycheck/webhook-secret
 # inbox / processed 路径（默认；可被 EnvironmentFile 覆盖）
 Environment=INBOX_PATH=/var/lib/dailycheck-prod-agent/inbox.jsonl

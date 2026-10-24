@@ -11,7 +11,7 @@ Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）.
   非 ValueError）—— 那是服务端瞬时故障，不是用户输入问题，端点须回 5xx 可重试，
   不能被 ``except ValueError → 400`` 误吞（2026-10-18 复盘 F6）。
 - 状态机极简（三态）：open → ignored | dispatched，均为终态，不可回退。
-  不引入「已解决」态：真解决了是 GitHub Issue closed，以那为准，别造两套真相。
+  不引入「已解决」态：真解决了是 Gitea Issue closed，以那为准，别造两套真相。
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def normalize_category(value: Any) -> str:
 def normalize_page_path(value: Any) -> str:
     """只接受站内相对路径（``/items`` 形态）；其余一律丢弃。
 
-    这是安全边界而非洁癖：该字段会进企微 markdown 与 GitHub Issue 正文，
+    这是安全边界而非洁癖：该字段会进企微 markdown 与 Issue 正文，
     若允许 ``http://evil`` 或 ``javascript:`` 进来，就是一条注入通道。
     """
     text = str(value or "").strip()
@@ -253,7 +253,7 @@ def attach_issue(
     issue_url: str,
     admin_id: int | None = None,
 ) -> bool:
-    """把反馈单与 GitHub Issue 绑定并置为 ``dispatched``（终态）。
+    """把反馈单与 Gitea Issue 绑定并置为 ``dispatched``（终态）。
 
     幂等：已有 ``issue_number`` 时不覆盖、不再派发（防止重复点「发送」造重复单）。
     """
