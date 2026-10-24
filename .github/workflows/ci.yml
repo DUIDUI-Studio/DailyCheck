@@ -170,6 +170,9 @@ jobs:
 
           # 解压到带时间戳的 release 目录，由 deploy_vps.sh 完成切换/迁移/回滚
           REL=$($SSH 'echo /root/releases/$(date +%Y%m%d-%H%M%S)')
-          $SSH "mkdir -p $REL && cat > /tmp/dailycheck.tar.gz"
-          cat /tmp/dailycheck.tar.gz | $SSH "tar -xzf /tmp/dailycheck.tar.gz -C $REL && rm -f /tmp/dailycheck.tar.gz"
+          $SSH "mkdir -p $REL"
+          # tar 必须从 stdin 读（-）：上一版写成读远端 /tmp/dailycheck.tar.gz，
+          # 而那行 `cat > /tmp/...` 在 CI 里 stdin 是空的，只创建了 0 字节文件，
+          # 导致远端 tar 报 "unexpected end of file"。2026-10-24 首次真实演练暴露。
+          cat /tmp/dailycheck.tar.gz | $SSH "tar -xzf - -C $REL"
           $SSH "bash -s $REL" < scripts/deploy_vps.sh
