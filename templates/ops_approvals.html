@@ -29,7 +29,7 @@
   {% if item.reason %}<div class="oa-reason">{{ item.reason }}</div>{% endif %}
   <div class="oa-meta">
     {{ item.created_at }}
-    {% if item.pr_url %} · <a href="{{ item.pr_url }}" target="_blank" rel="noopener">在 GitHub 打开</a>{% endif %}
+    {% if item.pr_url %} · <a href="{{ item.pr_url }}" target="_blank" rel="noopener">在 Gitea 打开</a>{% endif %}
   </div>
   <form method="post" action="{{ url_for('owner_approvals.decide', pr=item.pr_number) }}" class="oa-actions">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

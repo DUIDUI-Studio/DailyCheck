@@ -178,8 +178,13 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://kjtang.cn").rstrip(
 #   绝不伪装成功。
 # - FEEDBACK_GITEA_REPO：owner/name。默认主仓 `eric/dailycheck`。
 # - FEEDBACK_GITEA_API：API 根。默认生产内网地址；本机用 Tailscale 地址覆盖。
+# - FEEDBACK_GITEA_WEB_BASE：**给人点**的链接基址。
+#   Gitea 返回的 html_url 用的是实例 ROOT_URL（生产指向内网 172.28.129.216，
+#   办公端不可达），所以回填站内的链接另按此基址拼，不复用 html_url。
+#   为空 = 退回 html_url（老部署行为不变）。
 # ─────────────────────────────────────────────────────────────────────
 _GITEA_API_DEFAULT = "http://172.28.129.216:3000/api/v1"
+_GITEA_WEB_DEFAULT = "http://100.70.210.104:3000"
 WECOM_FEEDBACK_WEBHOOK = os.environ.get("WECOM_FEEDBACK_WEBHOOK", "").strip()
 FEEDBACK_GITEA_TOKEN = (
     os.environ.get("FEEDBACK_GITEA_TOKEN", "").strip()
@@ -191,6 +196,9 @@ FEEDBACK_GITEA_REPO = (
 )
 FEEDBACK_GITEA_API = (
     os.environ.get("FEEDBACK_GITEA_API", "").strip() or _GITEA_API_DEFAULT
+).rstrip("/")
+FEEDBACK_GITEA_WEB_BASE = (
+    os.environ.get("FEEDBACK_GITEA_WEB_BASE", "").strip() or _GITEA_WEB_DEFAULT
 ).rstrip("/")
 
 # ─────────────────────────────────────────────────────────────────────
