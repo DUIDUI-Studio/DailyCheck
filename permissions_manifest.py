@@ -337,7 +337,13 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.order_detail": LOGIN,
     # 付款凭证：可见性与订单详情一致，视图内部再走 _order_viewable 校验。
     "store_ordering.payment_proof_download": LOGIN,
+    # Issue #19（2026-10-24）：订单管理（admin_orders）与订货审批（review_list）
+    # 合并为同一页面实现，两条 URL 只是同一页面的别名，故意图一致。
+    # admin_orders 原为 role:admin；合并后 DC staff 也能访问该 URL，但视图
+    # 把数据范围硬锁在当前配送中心（忽略 ?dc= / ?store=），可见数据集不扩大
+    # ——tests/test_store_ordering_board.py 锁死「DC 看不到别家 DC 的单」。
     "store_ordering.review_list": f"{DC_PREFIX}{ROLE_PREFIX}staff",
+    "store_ordering.admin_orders": f"{DC_PREFIX}{ROLE_PREFIX}staff",
     "store_ordering.review_order_route": f"{DC_PREFIX}{perm('order.approve')}",
     "store_ordering.shipment_list": f"{DC_PREFIX}{ROLE_PREFIX}staff",
     "store_ordering.manage_dc_items": f"{DC_PREFIX}{ROLE_PREFIX}manager",
@@ -353,7 +359,6 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.receive_order_route": perm("order.receive"),
     "store_ordering.manage_shipping_rule": f"{ROLE_PREFIX}admin",
     "store_ordering.admin_report": f"{ROLE_PREFIX}admin",
-    "store_ordering.admin_orders": f"{ROLE_PREFIX}admin",
     # ---- users（全平台超管）----
     "users.list_users": PLATFORM,
     "users.create_user": PLATFORM,
