@@ -393,7 +393,7 @@ def _ticket_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 渲染（企微 markdown / GitHub Issue 正文共用）
+# 渲染（企微 markdown / Gitea Issue 正文共用）
 # ---------------------------------------------------------------------------
 
 def summarize(title: str, limit: int = 60) -> str:

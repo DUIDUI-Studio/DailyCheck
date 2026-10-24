@@ -49,7 +49,7 @@
 
 {% if not dispatch_enabled %}
 <p class="feedback-warn">
-  派发通道未配置（``FEEDBACK_GITHUB_TOKEN`` 为空）。可以先存评论；要真正建 Issue
+  派发通道未配置（<code>FEEDBACK_GITEA_TOKEN</code> 为空）。可以先存评论；要真正建 Issue
   需在服务器 env 注入该变量后重启。
 </p>
 {% endif %}
@@ -108,7 +108,7 @@
      所以做成「一键插入」而不是必填项。 #}
   <button type="button" class="btn-sm" data-fill-template>插入结构模板</button>
   <button type="submit" {% if not dispatch_enabled %}disabled{% endif %}>
-    发送并派发开发（建 GitHub Issue）
+    发送并派发开发（建 Gitea Issue）
   </button>
   {# 同一份文字两种去向：formaction 让「存评论」复用上面的 textarea，
      避免为「仅保存」再放一个输入框（两个框的内容一定会有人填错）。 #}

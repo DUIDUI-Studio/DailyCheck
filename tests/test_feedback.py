@@ -301,9 +301,35 @@ def test_create_issue_success_attaches_label(monkeypatch):
 
     monkeypatch.setattr(feedback_dispatch, "_request", fake_request)
     out = feedback_dispatch.create_issue("标题", "正文")
-    assert out == {"number": 42, "url": "http://hub01:3000/eric/dailycheck/issues/42"}
+    base = feedback_dispatch.config.FEEDBACK_GITEA_WEB_BASE
+    assert out == {"number": 42, "url": f"{base}/eric/dailycheck/issues/42"}
     issue_payload = seen[-1][2]
     assert issue_payload["labels"] == [5], "Gitea 的 labels 必须是 id 列表"
+
+
+def test_create_issue_url_ignores_internal_html_url(monkeypatch):
+    """回填链接不得用 html_url —— 生产 Gitea 的 ROOT_URL 是内网地址，办公端打不开。"""
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_TOKEN", "tok")
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_WEB_BASE", "http://hub01:3000")
+
+    def fake_request(token, path, payload=None, method="POST"):
+        if method == "GET":
+            return 200, [{"id": 5, "name": feedback_dispatch.FEEDBACK_LABEL}]
+        return 201, {
+            "number": 9,
+            "html_url": "http://172.28.129.216:3000/eric/dailycheck/issues/9",
+        }
+
+    monkeypatch.setattr(feedback_dispatch, "_request", fake_request)
+    out = feedback_dispatch.create_issue("标题", "正文")
+    assert out == {"number": 9, "url": "http://hub01:3000/eric/dailycheck/issues/9"}
+
+
+def test_issue_url_falls_back_to_html_url_when_web_base_empty(monkeypatch):
+    """WEB_BASE 未配置时退回 Gitea 的 html_url（老部署行为不变）。"""
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_WEB_BASE", "")
+    assert feedback_dispatch.issue_url(
+        3, {"html_url": "http://x/y/issues/3"}) == "http://x/y/issues/3"
 
 
 def test_ensure_label_reuses_existing_instead_of_creating_duplicate(monkeypatch):

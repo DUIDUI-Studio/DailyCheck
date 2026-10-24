@@ -342,7 +342,7 @@ def dispatch_feedback(ticket_id: int):
         ticket["submitter"] = submitter["username"] if submitter is not None else None
 
         if not dispatch.dispatch_enabled():
-            flash("评论已保存，但派发通道未配置（FEEDBACK_GITHUB_TOKEN 为空），请手动建 Issue。")
+            flash("评论已保存，但派发通道未配置（FEEDBACK_GITEA_TOKEN 为空），请手动建 Issue。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
         # 代码定位在发请求前做：正文的精确度主要靠这一段，而不是靠用户措辞。
@@ -363,7 +363,7 @@ def dispatch_feedback(ticket_id: int):
                 ticket, comments, base_url=_base_url(), code_clues=clues),
         )
         if issue is None:
-            flash("评论已保存，但创建 GitHub Issue 失败（详见服务端日志），请手动建单。")
+            flash("评论已保存，但创建 Gitea Issue 失败（详见服务端日志），请手动建单。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
         attach_issue(db, ticket_id, issue["number"], issue["url"], g.user["id"])

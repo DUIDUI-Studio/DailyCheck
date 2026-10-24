@@ -51,6 +51,24 @@ def repo_slug() -> str:
     return str(getattr(config, "FEEDBACK_GITEA_REPO", "") or "").strip() or "eric/dailycheck"
 
 
+def web_base() -> str:
+    """给人点的链接基址。"""
+    return str(getattr(config, "FEEDBACK_GITEA_WEB_BASE", "") or "").strip().rstrip("/")
+
+
+def issue_url(number: int, data: dict[str, Any] | None = None) -> str:
+    """站内回填的 Issue 链接。
+
+    ⚠️ 不能直接信 ``html_url``：它由 Gitea 实例的 ROOT_URL 决定，生产指向内网
+    172.28.129.216:3000，办公端打不开（2026-10-24 实测）。所以按
+    ``FEEDBACK_GITEA_WEB_BASE`` 自己拼；该键为空时才退回 html_url。
+    """
+    base = web_base()
+    if base:
+        return f"{base}/{repo_slug()}/issues/{number}"
+    return str((data or {}).get("html_url") or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Gitea API
 # ---------------------------------------------------------------------------
@@ -87,11 +105,10 @@ def create_issue(
     if not isinstance(data, dict):
         return None
     number = data.get("number")
-    url = str(data.get("html_url") or "").strip()
     if not isinstance(number, int):
         logger.warning("feedback_dispatch_failed: reason=no_issue_number")
         return None
-    return {"number": number, "url": url}
+    return {"number": number, "url": issue_url(number, data)}
 
 
 def _ensure_label(token: str, repo: str, name: str) -> int | None:
