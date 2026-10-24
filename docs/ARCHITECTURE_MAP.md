@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 22 个（已装配 21 / 未装配 1）
-- 路由 **177** 条（按鉴权强度：平台超管 52 · 登录 47 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **179** 条（按鉴权强度：平台超管 54 · 登录 47 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -30,13 +30,13 @@
 | `items` | `items.py` | 11 | 在役 |
 | `feedback` | `feedback.py` | 10 | 在役 |
 | `production` | `production.py` | 10 | 在役 |
+| `forecast` | `forecast.py` | 7 | 在役 |
 | `reports` | `reports.py` | 7 | 在役 |
 | `auth / pwa` | `auth.py` | 6 | 在役 |
 | `core` | `core.py` | 6 | 在役 |
 | `outbound` | `outbound.py` | 6 | 在役 |
 | `restock` | `restock.py` | 6 | 在役 |
 | `adjustment` | `adjustment.py` | 5 | **未装配** |
-| `forecast` | `forecast.py` | 5 | 在役 |
 | `owner_approvals` | `owner_approvals.py` | 5 | 在役 |
 | `import_items` | `import_items.py` | 4 | 在役 |
 | `procurement` | `procurement.py` | 4 | 在役 |
@@ -124,6 +124,8 @@
 | endpoint | 方法 | 规则 | 鉴权 | 明细 |
 |---|---|---|---|---|
 | `forecast.forecast_board_json` | GET | `/forecast/board.json` | 平台超管 |  |
+| `forecast.forecast_digest_preview` | GET | `/forecast/digest` | 平台超管 |  |
+| `forecast.forecast_digest_send` | POST | `/forecast/digest/send` | 平台超管 |  |
 | `forecast.forecast_index` | GET | `/forecast` | 平台超管 |  |
 | `forecast.forecast_item` | GET | `/forecast/item/<int:item_id>` | 角色 | manager |
 | `forecast.forecast_product` | GET | `/forecast/product/<int:product_id>` | 角色 | manager |

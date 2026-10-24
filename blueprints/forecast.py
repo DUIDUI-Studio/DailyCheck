@@ -21,6 +21,7 @@ import threading
 import time
 from contextlib import closing
 from datetime import datetime, timezone
+from html import escape as html_escape
 from pathlib import Path
 
 from flask import Blueprint, g, jsonify, render_template, request
@@ -210,6 +211,73 @@ def forecast_board_json():
     supply = request.args.get("supply", "all")
     scope = request.args.get("scope", "all")
     return jsonify(build_board(params=params, supply=supply, scope=scope))
+
+
+@bp.route("/forecast/digest", methods=["GET"])
+@require_platform_admin
+def forecast_digest_preview():
+    """采购建议邮件的 HTML 预览（Issue #145）。
+
+    与定时任务**同一条装配链**（`procurement_digest.collect_digest`），
+    所以页面上看到的数字就是邮件里的数字 —— 否则「预览」只会制造新的口径。
+    在浏览器里打开即可核对收件内容，不需要真的发一封信。
+    """
+    from .procurement_digest import collect_digest
+    from .procurement_digest_pure import build_subject, render_html
+
+    try:
+        digest = collect_digest()
+    except Exception:  # 装配失败给可读页面，不把 traceback 抛给浏览器
+        _logger.exception("procurement digest preview failed")
+        return _html_response(
+            "<p style=\"font-family:sans-serif;padding:24px\">"
+            "采购建议生成失败，请查看服务端日志。</p>",
+            status=500,
+        )
+    html = (
+        f'<div style="font-family:sans-serif;font-size:12px;color:#64748b;'
+        f'padding:12px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0">'
+        f"预览 · 邮件主题：{html_escape(build_subject(digest))}</div>"
+        + render_html(digest)
+    )
+    return _html_response(html)
+
+
+@bp.route("/forecast/digest/send", methods=["POST"])
+@require_platform_admin
+def forecast_digest_send():
+    """立即发送一次采购建议邮件（手动补发 / 配置验证）。
+
+    返回体里的 `sent` 是**唯一**成功判据：`{'sent': false, 'reason': ...}`
+    绝不返回 200 让前端误判（历史教训：ajax 钩子把 3xx 改写成 200 假成功）。
+    """
+    from .procurement_digest import send_digest
+
+    result = send_digest(force=True)
+    status = 200 if result.get("sent") else _DIGEST_FAILURE_STATUS.get(
+        str(result.get("reason") or ""), 502
+    )
+    return jsonify(result), status
+
+
+# 未配置 / 已在发 / 发失败 的错误码分开：前端与运维脚本都要能区分
+# 「凭证没配」（503，需要人去注入 env）和「SMTP 拒收」（502，查日志）。
+_DIGEST_FAILURE_STATUS = {
+    "not_configured": 503,
+    "already_sent": 409,
+    "in_progress": 409,
+    "attempts_exhausted": 409,
+    "lock_failed": 500,
+    "state_unwritable": 500,
+    "build_failed": 500,
+    "send_failed": 502,
+}
+
+
+def _html_response(body: str, status: int = 200):
+    from flask import Response
+
+    return Response(body, status=status, mimetype="text/html")
 
 
 @bp.route("/forecast/recompute", methods=["POST"])

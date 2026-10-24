@@ -37,12 +37,21 @@ from db import init_master_db
 from . import replenishment_pure as R
 from .canonical_pure import store_selectable_clause
 
-# 盘点盈亏不是需求 —— note 形如 "盘点审核#24盘亏 (req#1545)"。
-_LOSS_FILTER = (
-    "COALESCE(note,'') NOT LIKE '%盘亏%' "
-    "AND COALESCE(note,'') NOT LIKE '%盘盈%' "
-    "AND COALESCE(note,'') NOT LIKE '%盘点%'"
-)
+
+def _loss_filter(prefix: str = "") -> str:
+    """盘点盈亏不是需求 —— note 形如 "盘点审核#24盘亏 (req#1545)"。
+
+    `prefix` 用于 JOIN 场景（`"m."`），避免两处各写一份口径、改一处漏一处。
+    """
+    col = f"{prefix}note" if prefix else "note"
+    return (
+        f"COALESCE({col},'') NOT LIKE '%盘亏%' "
+        f"AND COALESCE({col},'') NOT LIKE '%盘盈%' "
+        f"AND COALESCE({col},'') NOT LIKE '%盘点%'"
+    )
+
+
+_LOSS_FILTER = _loss_filter()
 
 _STORE_CONSUME_ACTIONS = "('生产消耗','出库')"
 _DC_CONSUME_ACTIONS = "('出库','门店订货出库','总仓调货出库')"
@@ -505,6 +514,99 @@ def _store_open_orders() -> dict[tuple[str, int], float]:
             key = (str(r["store_code"]), int(r["canonical_id"]))
             out[key] = out.get(key, 0.0) + qty
     return out
+
+
+def store_stock_and_consumption(
+    days: int = 7, today: date | None = None
+) -> tuple[dict[int, dict[str, float]], dict[int, float], list[dict], list[str]]:
+    """门店侧按 canonical_id 汇总的「当前库存」与「近 N 天实际消耗」。
+
+    返回 ``(stock_by_cid, consumed_by_cid, stores, failed_store_codes)``：
+
+    * ``stock_by_cid[canonical_id][store_code] = 数量``
+    * ``consumed_by_cid[canonical_id] = 近 N 天全部门店消耗合计``
+    * ``stores = [{"code", "name"}, ...]``（门店顺序，供邮件列固定列序）
+    * ``failed_store_codes``：整库读取失败的门店 —— 调用方必须把这些店渲染成
+      「—」而不是 0。「这家店没货」和「这家店读不出来」显示成一样的 0，
+      会让采购员按缺货下单，这是比不发邮件更糟的错误。
+
+    为什么单独取一遍而不是从 `build_board()` 的 rows 里凑
+    ---------------------------------------------------
+    看板行里的 ``rate`` 是**加窗估计的日均**（含近期加权），不是「最近 7 天
+    实际消耗」。Issue #145 要的是后者 —— 用 ``rate * 7`` 会在消耗波动时给出
+    明显偏离现实的数字（门店消耗是周内脉冲式的），所以这里直接按日聚合动账。
+    另外看板 rows 只含库存，不含「按 canonical 维度跨店合并」的口径。
+
+    口径与看板一致：门店消耗 = 「生产消耗」+「出库」，剔除盘点盈亏/盘点调整，
+    扣掉回退（正 delta）。可见性用 `store_selectable_clause`，与看板同源。
+    """
+    day = today or date.today()
+    span = max(1, int(days))
+    start = (day - timedelta(days=span - 1)).strftime("%Y-%m-%d")
+    end = day.strftime("%Y-%m-%d")
+
+    stock_by_cid: dict[int, dict[str, float]] = defaultdict(dict)
+    consumed_by_cid: dict[int, float] = defaultdict(float)
+    stores: list[dict] = []
+    failed_stores: list[str] = []
+
+    visible = store_selectable_clause("i")
+    for wh in list_warehouses():
+        if wh["warehouse_type"] != "storefront":
+            continue
+        stores.append({"code": wh["code"], "name": wh["name"]})
+        try:
+            with closing(sqlite3.connect(wh["db_path"])) as conn:
+                conn.row_factory = sqlite3.Row
+                stock_rows = conn.execute(
+                    f"""SELECT i.canonical_id AS cid, SUM(i.quantity) AS qty
+                        FROM items i
+                        WHERE {visible} AND i.canonical_id IS NOT NULL
+                        GROUP BY i.canonical_id"""
+                ).fetchall()
+                move_rows = conn.execute(
+                    f"""SELECT i.canonical_id AS cid, SUM(-m.delta) AS qty
+                        FROM stock_movements m
+                        JOIN items i ON i.id = m.item_id
+                        WHERE m.action IN {_STORE_CONSUME_ACTIONS}
+                          AND {_loss_filter("m.")}
+                          AND date(m.created_at) >= ? AND date(m.created_at) <= ?
+                          AND {visible} AND i.canonical_id IS NOT NULL
+                        GROUP BY i.canonical_id""",
+                    (start, end),
+                ).fetchall()
+                rollback_rows = conn.execute(
+                    f"""SELECT i.canonical_id AS cid, SUM(m.delta) AS qty
+                        FROM stock_movements m
+                        JOIN items i ON i.id = m.item_id
+                        WHERE m.action IN {_ROLLBACK_ACTIONS}
+                          AND date(m.created_at) >= ? AND date(m.created_at) <= ?
+                          AND {visible} AND i.canonical_id IS NOT NULL
+                        GROUP BY i.canonical_id""",
+                    (start, end),
+                ).fetchall()
+        except sqlite3.Error:
+            # 单仓坏库不影响其它门店汇总，但必须**记名**上报：静默跳过会让
+            # 邮件里那一列显示成 0，看起来像「这家店确实没货」——采购员据此
+            # 下单就是错单。这一列要显示「—」并附告警。
+            failed_stores.append(wh["code"])
+            continue
+
+        for r in stock_rows:
+            stock_by_cid[int(r["cid"])][wh["code"]] = float(r["qty"] or 0.0)
+        for r in move_rows:
+            consumed_by_cid[int(r["cid"])] += float(r["qty"] or 0.0)
+        for r in rollback_rows:
+            consumed_by_cid[int(r["cid"])] -= abs(float(r["qty"] or 0.0))
+
+    # 回退超过消耗会算出负数（历史数据错账）。截到 0：邮件里「近 7 天消耗 -3」
+    # 只会让人怀疑数字，不会提供任何决策价值。
+    return (
+        dict(stock_by_cid),
+        {cid: max(0.0, qty) for cid, qty in consumed_by_cid.items()},
+        stores,
+        failed_stores,
+    )
 
 
 # ---------------------------------------------------------------------------

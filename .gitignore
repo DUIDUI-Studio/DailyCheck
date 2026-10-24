@@ -68,6 +68,11 @@ reports/.dashboard/*.db
 reports/.dashboard/*.db-shm
 reports/.dashboard/*.db-wal
 
+# 周度采购建议邮件的当日 sentinel / 锁（运行期状态，不进仓库）
+db/procurement-digest-*.json
+db/procurement-digest-*.lock
+db/procurement-digest-*.json.tmp
+
 # 凭据 / 私钥：绝不入仓库
 # Issue #9（2026-10-24）—— CI 部署私钥先被写进工作区根目录、被打进 release 包，
 # 又被一次 `chore: auto-commit after health check` 提交进历史。这里把这一类文件
