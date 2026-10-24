@@ -23,8 +23,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import yaml
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 DEPLOY_SH = REPO_ROOT / "scripts" / "deploy_vps.sh"
@@ -32,10 +30,15 @@ GITIGNORE = REPO_ROOT / ".gitignore"
 
 
 def _deploy_run_script() -> str:
-    """取出 ci.yml 里 deploy job 所有 step 的 run 脚本，拼成一段文本。"""
-    data = yaml.safe_load(CI_YML.read_text(encoding="utf-8"))
-    steps = data["jobs"]["deploy"]["steps"]
-    return "\n".join(step.get("run", "") for step in steps)
+    """取出 ci.yml 里 deploy job 的脚本段。
+
+    deploy 是 jobs 里的最后一个 job，取它到文件末尾即可。这里不引 yaml：
+    CI 只装 ``requirements.txt``，里面没有 pyyaml——本地装了、CI 没装的依赖
+    会让这些用例在本地绿、CI 红（2026-10-24 本文件首版就踩了这个坑）。
+    """
+    text = CI_YML.read_text(encoding="utf-8")
+    idx = text.index("\n  deploy:")
+    return text[idx:]
 
 
 def test_ci_writes_key_outside_workspace() -> None:
