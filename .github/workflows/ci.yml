@@ -37,9 +37,15 @@ jobs:
       - name: Ruff (changed .py files only)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" -- '*.py')
+            # 三点 diff（merge-base）只算「本分支引入的改动」。用两点会把 base
+            # 之后 main 上别人合入的改动也列进来 —— 2026-10-24 PR #22 实测：
+            # 分支落后 main 一个提交，于是列出了已被删除的
+            # tests/test_store_ordering_board.py，ruff 报 E902 整步失败。
+            # --diff-filter=d 再兜一层：本分支自己删掉的 .py 不喂给 ruff。
+            FILES=$(git diff --name-only --diff-filter=d \
+              "${{ github.event.pull_request.base.sha }}...HEAD" -- '*.py')
           else
-            FILES=$(git diff --name-only "HEAD~1" -- '*.py')
+            FILES=$(git diff --name-only --diff-filter=d "HEAD~1" -- '*.py')
           fi
           if [ -n "$FILES" ]; then
             echo "ruff checking: $FILES"
@@ -79,6 +85,10 @@ jobs:
         uses: http://172.28.129.216:3000/eric/actions-checkout@v4
         with:
           persist-credentials: false
+          # 红线检查与 generate_reports.sh 都要 `git diff BASE_SHA..HEAD`，
+          # 默认 fetch-depth=1 时 base commit 不在本地，diff 会失败 —— 而
+          # generate_reports.sh 那条是 `|| true`，失败被静默吞掉。
+          fetch-depth: 0
 
       # 下载失败不阻塞：generate_reports.sh 检测不到文件会自动重跑 pytest
       - name: Download pytest output from test job
@@ -121,6 +131,19 @@ jobs:
           mkdir -p /tmp/pr
           echo "$PR_BODY" > /tmp/pr/body.md
           PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" /opt/venv/bin/python scripts/agent_framework/check_reports.py
+
+      # 红线机验（2026-10-24 新增）：workflow.md §四 的 6 条红线此前全是自述，
+      # PR #13 改了 .github/workflows/ci.yml（红线 2）被自行合并，没人拦得住。
+      # 这里把「改了什么」变成判据：命中红线且 PR body 无 owner 授权 → 本 job 红。
+      - name: Redline check（命中红线须 owner 授权）
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          mkdir -p /tmp/pr
+          echo "$PR_BODY" > /tmp/pr/body.md
+          /opt/venv/bin/python scripts/agent_framework/check_redlines.py \
+            --base "${BASE_SHA}" --body-file /tmp/pr/body.md
 
       - name: Upload reports as artifact
         if: always()
