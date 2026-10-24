@@ -10,8 +10,18 @@ Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）.
 - 例外：**单号生成重试耗尽** raise ``TicketNoExhaustedError``（RuntimeError 子类，
   非 ValueError）—— 那是服务端瞬时故障，不是用户输入问题，端点须回 5xx 可重试，
   不能被 ``except ValueError → 400`` 误吞（2026-10-18 复盘 F6）。
-- 状态机极简（三态）：open → ignored | dispatched，均为终态，不可回退。
-  不引入「已解决」态：真解决了是 Gitea Issue closed，以那为准，别造两套真相。
+- 状态机（2026-10-25 起改为二审制）：
+
+      open ──┬── 忽略 ────────────────────→ ignored      （终态）
+             └── 一审通过 ──→ analyzing ──┬── 分析完成 → analyzed ──┬── 二审派发 → dispatched（终态）
+                                          └── 分析失败 → open ──────┴── 忽略 → ignored（终态）
+
+  一审（`open → analyzing`）由管理员点「通过，开始分析」触发；`analyzing →
+  analyzed` 由后台 LLM 线程落库，失败则退回 `open` 并留 `analysis_error`
+  供重试 —— **失败不会假装成功，也不会把单子卡死在一个不可操作的状态里**。
+  二审（`analyzed → dispatched`）用管理员编辑过的正文建 Issue。
+
+  仍然**不设「已解决」态**：真解决了是 Gitea Issue closed，以那为准。
 """
 from __future__ import annotations
 
@@ -29,19 +39,34 @@ CATEGORIES: dict[str, str] = {
 DEFAULT_CATEGORY = "other"
 
 STATUS_OPEN = "open"
+STATUS_ANALYZING = "analyzing"
+STATUS_ANALYZED = "analyzed"
 STATUS_IGNORED = "ignored"
 STATUS_DISPATCHED = "dispatched"
-ALL_STATUSES = frozenset({STATUS_OPEN, STATUS_IGNORED, STATUS_DISPATCHED})
+ALL_STATUSES = frozenset({
+    STATUS_OPEN, STATUS_ANALYZING, STATUS_ANALYZED,
+    STATUS_IGNORED, STATUS_DISPATCHED,
+})
+# 「还没走完」的状态：可以忽略、可以重新分析、计入管理员待办角标。
+PENDING_STATUSES = (STATUS_OPEN, STATUS_ANALYZING, STATUS_ANALYZED)
 STATUS_LABELS: dict[str, str] = {
     STATUS_OPEN: "待处理",
+    STATUS_ANALYZING: "分析中",
+    STATUS_ANALYZED: "待二次审批",
     STATUS_IGNORED: "已忽略",
     STATUS_DISPATCHED: "已派发开发",
 }
+# 收件箱排序优先级：等二审的排在等一审的前面 —— 二审是最后一道闸，
+# 卡在那里等于整条闭环停了。
+_STATUS_ORDER = {STATUS_ANALYZED: 0, STATUS_ANALYZING: 1, STATUS_OPEN: 2}
 
 TITLE_MAX_LEN = 120
 BODY_MAX_LEN = 4000
 COMMENT_MAX_LEN = 2000
 PAGE_PATH_MAX_LEN = 200
+# 二审正文可以被管理员改，但要挡住「清空后派发」（空正文的任务单没人能执行）。
+DRAFT_BODY_MAX_LEN = 12000
+DRAFT_BODY_MIN_LEN = 40
 
 _LIST_LIMIT = 200
 _TICKET_NO_ATTEMPTS = 5
@@ -117,6 +142,28 @@ def validate_comment(body: Any) -> str:
     if len(text) > COMMENT_MAX_LEN:
         raise ValueError(f"评论超过 {COMMENT_MAX_LEN} 字")
     return text
+
+
+def normalize_draft(title: Any, body: Any) -> tuple[str, str]:
+    """二审派发前校验 Issue 标题与正文；非法 raise ValueError。
+
+    正文下限刻意低（40 字）：真正的把关是「管理员看过并点了确认」，
+    这里只挡「清空后误点派发」这类手滑 —— 一张空正文的 issue 会让开发侧
+    完全无从下手，而拒绝派发只会让管理员补几个字。
+    """
+    t = str(title or "").strip()
+    b = str(body or "").strip()
+    if not t:
+        raise ValueError("Issue 标题不能为空")
+    if len(t) > TITLE_MAX_LEN:
+        raise ValueError(f"Issue 标题超过 {TITLE_MAX_LEN} 字")
+    if not b:
+        raise ValueError("Issue 正文不能为空")
+    if len(b) < DRAFT_BODY_MIN_LEN:
+        raise ValueError(f"Issue 正文少于 {DRAFT_BODY_MIN_LEN} 字，请补充或在下方重新分析")
+    if len(b) > DRAFT_BODY_MAX_LEN:
+        raise ValueError(f"Issue 正文超过 {DRAFT_BODY_MAX_LEN} 字")
+    return t, b
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +281,111 @@ def mark_comment_dispatched(db: sqlite3.Connection, comment_id: int) -> bool:
 
 
 def mark_ignored(db: sqlite3.Connection, ticket_id: int, admin_id: int) -> bool:
-    """标记忽略（终态）。只对 ``open`` 生效，已处理过的返回 False。"""
+    """标记忽略（终态）。只要还没进终态就能忽略，已终态的返回 False。
+
+    允许从 ``analyzing`` / ``analyzed`` 忽略是必要的：管理员可能在看到分析结果
+    后才判断「这条不值得做」，此时只让 open 可忽略等于逼他先派发再关闭。
+    """
+    now = _now()
+    placeholders = ", ".join("?" for _ in PENDING_STATUSES)
+    cur = db.execute(
+        f"""UPDATE feedback_tickets
+            SET status=?, handled_by=?, handled_at=?, updated_at=?
+            WHERE id=? AND status IN ({placeholders})""",
+        (STATUS_IGNORED, int(admin_id), now, now, int(ticket_id), *PENDING_STATUSES),
+    )
+    db.commit()
+    return cur.rowcount > 0
+
+
+def mark_analyzing(
+    db: sqlite3.Connection,
+    ticket_id: int,
+    page_path: str | None = None,
+) -> bool:
+    """一审通过：``open`` / ``analyzed`` → ``analyzing``（可重跑）。
+
+    幂等性靠状态而不是锁：只有这两个状态能进 ``analyzing``，所以
+    「连点两次通过」第二次必然返回 False，不会起两个后台分析线程去抢同一张单。
+    重跑时清掉上一次的错误信息 —— 留着旧报错会让人以为这次也失败了。
+
+    ``page_path`` 是管理员在一审页纠正过的「实际页面」（``None`` = 没改，
+    沿用提交时页面）。**单独存一列而不是覆盖 ``page_path``**：原始值要保留
+    （正文里两种都要写，见 ``build_issue_body``），且分析结果与所用页面的
+    对应关系必须可追溯 —— 拿错页面分析出来的结论，事后得能查出来。
+    """
     now = _now()
     cur = db.execute(
         """UPDATE feedback_tickets
-           SET status=?, handled_by=?, handled_at=?, updated_at=?
+           SET status=?, analysis_error=NULL, updated_at=?,
+               analysis_page_path=COALESCE(?, analysis_page_path)
+           WHERE id=? AND status IN (?, ?)""",
+        (STATUS_ANALYZING, now, normalize_page_path(page_path) or None,
+         int(ticket_id), STATUS_OPEN, STATUS_ANALYZED),
+    )
+    db.commit()
+    return cur.rowcount > 0
+
+
+def save_analysis(
+    db: sqlite3.Connection,
+    ticket_id: int,
+    analysis_text: str,
+    model: str,
+    draft_title: str = "",
+    draft_body: str = "",
+) -> bool:
+    """分析完成：``analyzing`` → ``analyzed``，落原始分析 + 预填草稿。
+
+    ``draft_title`` / ``draft_body`` 是二审编辑器的初值。落库而不是每次渲染
+    现算：管理员可能在二审页改了几行再走开，下次打开要能看到自己改过的版本，
+    而不是又变回模型原稿。
+    """
+    now = _now()
+    cur = db.execute(
+        """UPDATE feedback_tickets
+           SET status=?, analysis_text=?, analysis_error=NULL,
+               analysis_model=?, analysis_at=?,
+               draft_title=?, draft_body=?, updated_at=?
            WHERE id=? AND status=?""",
-        (STATUS_IGNORED, int(admin_id), now, now, int(ticket_id), STATUS_OPEN),
+        (STATUS_ANALYZED, str(analysis_text or ""), str(model or ""),
+         now, str(draft_title or "")[:TITLE_MAX_LEN], str(draft_body or ""),
+         now, int(ticket_id), STATUS_ANALYZING),
+    )
+    db.commit()
+    return cur.rowcount > 0
+
+
+def fail_analysis(db: sqlite3.Connection, ticket_id: int, error: str) -> bool:
+    """分析失败：``analyzing`` → 退回 ``open``，留错误原因供重试。
+
+    为什么退回 ``open`` 而不是停在 ``analyzing``：停住的话这张单既不能派发
+    也没人能推动，只能人工改库。退回待处理至少在收件箱里还是红点，点进去
+    能看到失败原因和「重试 / 直接派发（模板兜底）」两个出口。
+    """
+    now = _now()
+    cur = db.execute(
+        """UPDATE feedback_tickets
+           SET status=?, analysis_error=?, updated_at=?
+           WHERE id=? AND status=?""",
+        (STATUS_OPEN, str(error or "")[:500], now, int(ticket_id), STATUS_ANALYZING),
+    )
+    db.commit()
+    return cur.rowcount > 0
+
+
+def save_draft(db: sqlite3.Connection, ticket_id: int, title: str, body: str) -> bool:
+    """落二审草稿（派发前先本地保存，再调外部 API）。
+
+    与「先落评论再建 Issue」同一个理由：Gitea 挂了最多是没建单，
+    管理员在二审页改的内容一个字都不会丢。
+    """
+    now = _now()
+    cur = db.execute(
+        """UPDATE feedback_tickets
+           SET draft_title=?, draft_body=?, updated_at=?
+           WHERE id=? AND issue_number IS NULL""",
+        (str(title or "")[:TITLE_MAX_LEN], str(body or ""), now, int(ticket_id)),
     )
     db.commit()
     return cur.rowcount > 0
@@ -279,7 +424,9 @@ def attach_issue(
 
 _COLUMNS = (
     "id, ticket_no, user_id, warehouse_code, page_path, category, title, body, "
-    "status, issue_number, issue_url, created_at, updated_at, handled_by, handled_at"
+    "status, issue_number, issue_url, created_at, updated_at, handled_by, handled_at, "
+    "analysis_text, analysis_error, analysis_model, analysis_at, "
+    "analysis_page_path, draft_title, draft_body"
 )
 
 
@@ -318,6 +465,8 @@ def list_for_admin(
         "SELECT t.id, t.ticket_no, t.user_id, t.warehouse_code, t.page_path, "
         "t.category, t.title, t.body, t.status, t.issue_number, t.issue_url, "
         "t.created_at, t.updated_at, t.handled_by, t.handled_at, "
+        "t.analysis_text, t.analysis_error, t.analysis_model, t.analysis_at, "
+        "t.draft_title, t.draft_body, "
         "u.username AS submitter "
         "FROM feedback_tickets t LEFT JOIN users u ON u.id = t.user_id"
     )
@@ -325,7 +474,11 @@ def list_for_admin(
     if status in ALL_STATUSES:
         sql += " WHERE t.status=?"
         params.append(status)
-    sql += " ORDER BY CASE t.status WHEN 'open' THEN 0 ELSE 1 END, t.created_at DESC, t.id DESC LIMIT ?"
+    sql += (
+        " ORDER BY CASE t.status"
+        " WHEN 'analyzed' THEN 0 WHEN 'analyzing' THEN 1 WHEN 'open' THEN 2"
+        " ELSE 3 END, t.created_at DESC, t.id DESC LIMIT ?"
+    )
     params.append(_LIST_LIMIT)
     rows = db.execute(sql, params).fetchall()
     out: list[dict[str, Any]] = []
@@ -337,10 +490,16 @@ def list_for_admin(
 
 
 def count_open(db: sqlite3.Connection) -> int:
-    """待处理数量（导航角标用）。"""
+    """管理员待办数量（导航角标用）。
+
+    口径是「**还没走完**」而不是「状态=open」：等二审的单子（``analyzed``）
+    和正在分析的单子同样是待办 —— 只数 open 会让收件箱在二审阶段静默清零，
+    而闭环恰恰卡在那儿。
+    """
+    placeholders = ", ".join("?" for _ in PENDING_STATUSES)
     row = db.execute(
-        "SELECT COUNT(*) AS n FROM feedback_tickets WHERE status=?",
-        (STATUS_OPEN,),
+        f"SELECT COUNT(*) AS n FROM feedback_tickets WHERE status IN ({placeholders})",
+        PENDING_STATUSES,
     ).fetchone()
     return int(row["n"]) if row is not None else 0
 
@@ -389,6 +548,15 @@ def _ticket_dict(row: sqlite3.Row) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "handled_by": row["handled_by"] if "handled_by" in keys else None,
         "handled_at": row["handled_at"] if "handled_at" in keys else None,
+        "analysis_text": row["analysis_text"] if "analysis_text" in keys else None,
+        "analysis_error": row["analysis_error"] if "analysis_error" in keys else None,
+        "analysis_model": row["analysis_model"] if "analysis_model" in keys else None,
+        "analysis_at": row["analysis_at"] if "analysis_at" in keys else None,
+        "analysis_page_path": (
+            row["analysis_page_path"] if "analysis_page_path" in keys else None
+        ),
+        "draft_title": row["draft_title"] if "draft_title" in keys else None,
+        "draft_body": row["draft_body"] if "draft_body" in keys else None,
     }
 
 

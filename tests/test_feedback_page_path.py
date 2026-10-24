@@ -32,6 +32,18 @@ def _submit(client, page_path="/inventory"):
     })
 
 
+def _to_second_review(client, **extra):
+    """一审（模板兜底，不调模型）→ 单子进入二审 ``analyzed``。
+
+    2026-10-25 起派发只接受二审状态：``page_override`` 也归属一审（分析用什么
+    页面），因此本文件里所有派发用例都先过这一步。
+    """
+    data = {"mode": "template"}
+    data.update(extra)
+    client.post(f"/admin/feedback/{_ticket_id()}/analyze", data=data,
+                follow_redirects=True)
+
+
 def _ticket_id():
     import config
 
@@ -203,10 +215,11 @@ def test_dispatch_uses_page_override(logged_client, monkeypatch):
     monkeypatch.setattr(feedback_dispatch, "create_issue", fake_create_issue)
     monkeypatch.setattr(feedback_dispatch, "dispatch_enabled", lambda: True)
 
-    resp = client.post(f"/admin/feedback/{_ticket_id()}/dispatch", data={
-        "comment": "确认是前端体验问题，修一下。",
-        "page_override": "/inventory",
-    }, follow_redirects=True)
+    _to_second_review(client, comment="确认是前端体验问题，修一下。",
+                      page_override="/inventory")
+    resp = client.post(f"/admin/feedback/{_ticket_id()}/dispatch",
+                       data={"draft_body": "", "draft_title": ""},
+                       follow_redirects=True)
     assert resp.status_code == 200
     body = captured["body"]
     assert "实际页面（管理员指定）" in body
@@ -228,10 +241,10 @@ def test_dispatch_ignores_external_page_override(logged_client, monkeypatch):
     monkeypatch.setattr(feedback_dispatch, "create_issue", fake_create_issue)
     monkeypatch.setattr(feedback_dispatch, "dispatch_enabled", lambda: True)
 
-    client.post(f"/admin/feedback/{_ticket_id()}/dispatch", data={
-        "comment": "确认是 bug。",
-        "page_override": "https://evil.example/x",
-    }, follow_redirects=True)
+    _to_second_review(client, comment="确认是 bug。",
+                      page_override="https://evil.example/x")
+    client.post(f"/admin/feedback/{_ticket_id()}/dispatch",
+                data={"draft_body": "", "draft_title": ""}, follow_redirects=True)
     assert "evil.example" not in captured["body"]
 
 

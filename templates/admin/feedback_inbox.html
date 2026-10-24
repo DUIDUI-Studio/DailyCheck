@@ -2,14 +2,18 @@
 {% block title %}反馈收件箱{% endblock %}
 {% block content %}
 <div class="list-head">
-  <h2>反馈收件箱{% if open_count %}<small class="muted">（{{ open_count }} 待处理）</small>{% endif %}</h2>
+  <h2>反馈收件箱{% if open_count %}<small class="muted">（{{ open_count }} 待办）</small>{% endif %}</h2>
 </div>
 
 <div class="pill-group">
   <a class="pill {% if not active_status %}pill--active{% endif %}"
      href="{{ url_for('feedback.admin_inbox') }}">全部</a>
   <a class="pill {% if active_status == 'open' %}pill--active{% endif %}"
-     href="{{ url_for('feedback.admin_inbox', status='open') }}">待处理</a>
+     href="{{ url_for('feedback.admin_inbox', status='open') }}">待一审</a>
+  <a class="pill {% if active_status == 'analyzing' %}pill--active{% endif %}"
+     href="{{ url_for('feedback.admin_inbox', status='analyzing') }}">分析中</a>
+  <a class="pill {% if active_status == 'analyzed' %}pill--active{% endif %}"
+     href="{{ url_for('feedback.admin_inbox', status='analyzed') }}">待二审</a>
   <a class="pill {% if active_status == 'ignored' %}pill--active{% endif %}"
      href="{{ url_for('feedback.admin_inbox', status='ignored') }}">已忽略</a>
   <a class="pill {% if active_status == 'dispatched' %}pill--active{% endif %}"
@@ -18,7 +22,13 @@
 
 {% if not dispatch_enabled %}
 <p class="feedback-warn">
-  派发通道未配置（<code>FEEDBACK_GITEA_TOKEN</code> 为空）：仍可忽略 / 存评论，但「发送并派发」不会建 Issue。
+  派发通道未配置（<code>FEEDBACK_GITEA_TOKEN</code> 为空）：仍可忽略 / 分析 / 存意见，但「确认派发」不会建 Issue。
+</p>
+{% endif %}
+{% if not llm_enabled %}
+<p class="feedback-warn">
+  模型未配置（<code>FEEDBACK_LLM_API_KEY</code> / <code>LLM_API_KEY</code> 为空）：
+  一审「开始分析」会降级为模板草稿，不调用模型。
 </p>
 {% endif %}
 

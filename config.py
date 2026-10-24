@@ -202,6 +202,41 @@ FEEDBACK_GITEA_WEB_BASE = (
 ).rstrip("/")
 
 # ─────────────────────────────────────────────────────────────────────
+# 反馈的 LLM 预分析（2026-10-25，二审制）
+#
+# 一审通过后先把反馈 + 管理员判定 + 代码线索 + 真实代码片段喂给模型，产出
+# 「按 Issue 处理标准」的结构化分析（根因假设 / 受影响位置 / 验收标准 /
+# 信息缺口），再交管理员二审决定派发。分析只是**建议**，派发与否仍由人定。
+# 见 blueprints/feedback_llm.py、feedback_analysis_pure.py 与 ARCHITECTURE §3.10。
+#
+# - FEEDBACK_LLM_API_KEY：**为空 = 不调模型**。一审降级为「模板兜底分析」
+#   （规则推导 + 现有 verify/acceptance 渲染），状态照样进二审，不假装分析过。
+# - 三个键都支持回退到通用 LLM_* （生产 /etc/dailycheck/bot.env 里企微库存
+#   助手的同一套凭证），这样不用为反馈单独申请 key。
+# - FEEDBACK_LLM_TIMEOUT：单次调用总超时（秒）。分析跑在后台线程里，
+#   超时只影响这张单的等待时长，不阻塞任何请求。
+# ─────────────────────────────────────────────────────────────────────
+_LLM_BASE_DEFAULT = "https://api.minimaxi.com"
+_LLM_MODEL_DEFAULT = "MiniMax-M3.1-Flash"
+FEEDBACK_LLM_API_KEY = (
+    os.environ.get("FEEDBACK_LLM_API_KEY", "").strip()
+    or os.environ.get("LLM_API_KEY", "").strip()
+)
+FEEDBACK_LLM_BASE_URL = (
+    os.environ.get("FEEDBACK_LLM_BASE_URL", "").strip()
+     or os.environ.get("LLM_BASE_URL", "").strip()
+     or _LLM_BASE_DEFAULT
+).rstrip("/")
+FEEDBACK_LLM_MODEL = (
+    os.environ.get("FEEDBACK_LLM_MODEL", "").strip()
+    or os.environ.get("LLM_MODEL", "").strip()
+    or _LLM_MODEL_DEFAULT
+)
+FEEDBACK_LLM_TIMEOUT = float(
+    os.environ.get("FEEDBACK_LLM_TIMEOUT", "").strip() or 90
+)
+
+# ─────────────────────────────────────────────────────────────────────
 # Owner 拍板队列（2026-10-21）
 #
 # Prod Agent 命中红线后，不再只开一张 GitHub issue 等人发现，而是登记到
