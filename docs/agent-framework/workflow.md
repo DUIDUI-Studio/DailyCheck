@@ -105,8 +105,11 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 | 公网 | **不可用**（ufw 关闭） | — |
 
 - Token 两个、各专用，不要混用：**Dev Agent** 用于代码/PR/issue；**Prod Agent** 用于合并与部署判定。
-- 本机 token 在 `~/.config/gitea-token`；生产放在 `/root/.gitea-token`（`chmod 600`）。
-  ⚠️ 生产上这个文件 2026-10-24 检查时**缺失**，导致 poller 与 status 快通道拿不到凭据 —— 排查「快通道没反应」时先看它。
+- 本机 token 在 `~/.config/gitea-token`；生产在 `/etc/dailycheck/gitea-token`（0600 root，
+  `dc-webhook-receiver.service` 通过 `GITEA_TOKEN_FILE=` 指向它，已实测可调 API）。
+  ⚠️ `dailycheck_pr_poll.py` 的**默认**路径仍是 `/root/.gitea-token`（该文件不存在）——
+  直接跑 poller 会认证失败，必须显式 `GITEA_TOKEN_FILE=/etc/dailycheck/gitea-token`。
+  排查「快通道 / 轮询没反应」时先看这两处路径。
 - **权限不足返回 403，不是 401**。看到 403 先查 token scope，别急着判定 token 失效。
 - 分支保护 `main`：禁止直推（`enable_push=false`），必需 check =
   `CI / test (pull_request)` + `CI / agent-framework-reports (pull_request)`。
