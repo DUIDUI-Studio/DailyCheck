@@ -146,6 +146,31 @@ Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 5. owner 在需求中标注「需拍板」的变更
 6. **改本工作流文档自身 / merge 政策**（防止角色自我扩权）
 
+### 红线的执行方式（2026-10-24 起，从自述改为机验）
+
+上表此前全靠自觉。2026-10-24 实测发现 PR #13 改了 `.github/workflows/ci.yml`
+（红线 2）被 Prod Agent 自行合并，无人拦截 —— 因为 `check_reports.py` 只看 PR
+body 格式，完全不看改动文件路径。
+
+现在红线 1/2/3/5/6 由 `scripts/agent_framework/check_redlines.py` 机验，跑在
+`agent-framework-reports` job 内。命中且无授权 → 该 check 红 → Prod Agent 合不动。
+
+| 红线 | 判据 | 机验 |
+|------|------|------|
+| 1 扩张 `known_failures.txt` | `git diff --numstat` 新增行 > 0（只删不算） | 是 |
+| 2 改 `.github/workflows/*` | 改动路径前缀 | 是 |
+| 3 改分支保护 | 改 `branch-protection.md`；ruleset 本体在 Gitea 服务端，仓库内无文件 | 部分 |
+| 4 删/弱化 `ARCHITECTURE.md` 铁律 | 需判断语义 | **否，靠 review** |
+| 5 owner 标注「需拍板」 | 正文含该字样却无授权声明 | 是 |
+| 6 改 workflow.md / 本套指令 | 改动路径精确匹配 | 是 |
+
+**豁免**：PR body 写一行 `Owner-Authorization: <日期> <谁> <授权内容>`。这是自述、
+无法证伪，但能让越线留下痕迹，事后可审计谁引用过哪条授权。
+
+**刻意不机验红线 4**：`ARCHITECTURE.md` 每次子系统改动都要同步，按路径拦会制造
+大量噪音，反而训练出「先绕过再说」的习惯 —— 噪音比漏拦更伤门禁。
+
+
 设计依据（Eric 2026-10-15 口述）：Dev 在 PR 里只给**规范流程级**的部署信息（§三′），不替 Prod 写操作脚本——避免 Prod Agent 完全参照 Dev 的视角执行而发现不了 Dev 自己的盲区。merge 判定权交给生产端，使「合不合」由最终承担生产风险的一方决定；质量权威仍是 CI 门禁，owner 拍板仍是红线兜底。
 
 > 历史注记：2026-10-15 早先曾拍板候选 A（Dev 自行 merge + 红线上报），同日改为本政策。

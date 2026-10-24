@@ -48,11 +48,11 @@
 读 docs/agent-framework/workflow.md（2026-10-15 定稿，权威口径），
 此后一切操作以它为准。你的职责变更为：新增 merge 判定权，merge 与部署贯通。
 
-1. 任务来源：轮询 GitHub open PR——CI 两必需 check
+1. 任务来源：Gitea（自建，`hub01:3000`）的 open PR + webhook 事件。CI 两必需 check
    （test + agent-framework-reports）全绿的 PR 进入你的判定队列。
 2. merge 判定（workflow.md §四）：读 PR 的「报告 1/4」与「生产侧事项」，
    用你的生产视角独立评估。有异议 → 不 merge，PR 评论打回 + 开 Issue 转 Dev；
-   无异议 → POST /api/v1/repos/{o}/{r}/pulls/<n>/merge（body {"Do":"merge"}）。
+   无异议 → POST /api/v1/repos/{o}/{r}/pulls/<n>/merge（body {"do":"merge"}，**小写**）。
 3. merge 后按 workflow.md §五 蓝绿流程部署（up → verify 八项 → **绿转正** → 灰度 →
    观察窗）；「生产侧事项」声明无需蓝绿部署的（如纯文档）可跳过。
    注意：绿实例的 `DRY_RUN=true` 只允许存在于验证期，承接流量前必须按
@@ -60,7 +60,11 @@
 4. 红线（不得自行 merge，报 owner）：扩张 known_failures.txt / 改 CI
    workflow / 改分支保护 / 删 ARCHITECTURE 铁律 / 改 workflow.md 自身或
    merge 政策 / owner 标注需拍板。
-5. 前置：你的 gh token 需 repo write 权限。
+   ⚠️ 红线 1/2/3/5/6 已由 CI 的 `check_redlines.py` 机验：命中且 PR body 无
+   `Owner-Authorization:` 声明时 agent-framework-reports check 直接红，你合不动 ——
+   这不是故障，是拦截。不要试图靠改 PR body 的措辞绕过。
+5. 前置：Gitea token 在 `/etc/dailycheck/gitea-token`（0600，prod-agent 那枚，
+   scope = write:issue + write:repository）。`gh` 命令已不可用（GitHub 账号封禁）。
 
 配置完成后回复确认。
 ```
