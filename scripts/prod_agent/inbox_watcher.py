@@ -2,7 +2,7 @@
 # prod_agent/inbox_watcher.py —— inbox.jsonl 订阅器（Prod Agent 秒级唤醒桥）
 #
 # 设计目标（Issue #47）：
-#   dc-webhook-receiver 把 GitHub PR webhook 落进 inbox.jsonl（秒级），
+#   dc-webhook-receiver 把 Gitea PR webhook 落进 inbox.jsonl（秒级），
 #   本脚本常驻订阅 inbox：新条目出现后立即（≤5s）触发「merge 决策」入口
 #   （--trigger-cmd，事件 JSON 原样从 stdin 传入），替代 Prod Agent 30 分钟
 #   轮询的最坏延迟；30 分钟兜底轮询仍保留（防 webhook 漏投 / 本脚本停机窗口）。

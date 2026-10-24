@@ -72,3 +72,16 @@ reports/.dashboard/*.db-wal
 db/procurement-digest-*.json
 db/procurement-digest-*.lock
 db/procurement-digest-*.json.tmp
+
+# 凭据 / 私钥：绝不入仓库
+# Issue #9（2026-10-24）—— CI 部署私钥先被写进工作区根目录、被打进 release 包，
+# 又被一次 `chore: auto-commit after health check` 提交进历史。这里把这一类文件
+# 全部挡在索引外，任何 `git add -A` / `git add .` 都不会再收进来。
+vps_key
+*.pem
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.p12
+*.pfx

@@ -163,22 +163,35 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://kjtang.cn").rstrip(
 # 用户反馈闭合通道（2026-10-17）
 #
 # 用户在页面提交「使用问题」→ 企微群机器人推一条 → 管理员判定：
-#   忽略（终态） / 加评论并发起 GitHub Issue（终态，进开发闭环）。
+#   忽略（终态） / 加评论并发起 Issue（终态，进开发闭环）。
 # 见 blueprints/feedback_pure.py 与 docs/ARCHITECTURE.md §3.10。
+#
+# 2026-10-22 GitHub 账号封禁 → 建单目标改为自托管 Gitea（`eric/dailycheck`）。
+# 旧的 FEEDBACK_GITHUB_* 保留为兼容回退：新键为空时自动沿用旧值，
+# 老部署不用改 env 也不会直接失去派单能力（旧 token 失效则降级为只存评论）。
 #
 # - WECOM_FEEDBACK_WEBHOOK：反馈专用 webhook，**为空 = 不推企微**
 #   （站内通知仍然照发，不提消息通道就丢数据）。
 #   独立于订货单 webhook，方便「反馈消息太吵」时单独静音。
-# - FEEDBACK_GITHUB_TOKEN：建 Issue 用的 PAT（repo scope）。
+# - FEEDBACK_GITEA_TOKEN：建 Issue 用的 token（write:issue）。
 #   **为空 = 不建 Issue**：路由降级为只存评论 + 提示管理员去手动建单，
 #   绝不伪装成功。
-# - FEEDBACK_GITHUB_REPO：owner/name。默认主仓。
+# - FEEDBACK_GITEA_REPO：owner/name。默认主仓 `eric/dailycheck`。
+# - FEEDBACK_GITEA_API：API 根。默认生产内网地址；本机用 Tailscale 地址覆盖。
 # ─────────────────────────────────────────────────────────────────────
+_GITEA_API_DEFAULT = "http://172.28.129.216:3000/api/v1"
 WECOM_FEEDBACK_WEBHOOK = os.environ.get("WECOM_FEEDBACK_WEBHOOK", "").strip()
-FEEDBACK_GITHUB_TOKEN = os.environ.get("FEEDBACK_GITHUB_TOKEN", "").strip()
-FEEDBACK_GITHUB_REPO = os.environ.get(
-    "FEEDBACK_GITHUB_REPO", "ericmr1981/DailyCheck"
-).strip()
+FEEDBACK_GITEA_TOKEN = (
+    os.environ.get("FEEDBACK_GITEA_TOKEN", "").strip()
+    or os.environ.get("FEEDBACK_GITHUB_TOKEN", "").strip()  # 兼容旧 env
+)
+FEEDBACK_GITEA_REPO = (
+    os.environ.get("FEEDBACK_GITEA_REPO", "").strip()
+    or "eric/dailycheck"
+)
+FEEDBACK_GITEA_API = (
+    os.environ.get("FEEDBACK_GITEA_API", "").strip() or _GITEA_API_DEFAULT
+).rstrip("/")
 
 # ─────────────────────────────────────────────────────────────────────
 # Owner 拍板队列（2026-10-21）

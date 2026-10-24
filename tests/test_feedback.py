@@ -282,35 +282,54 @@ def test_build_issue_title_and_body():
 
 
 def test_create_issue_returns_none_without_token(monkeypatch):
-    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITHUB_TOKEN", "")
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_TOKEN", "")
     assert feedback_dispatch.create_issue("t", "b") is None
 
 
 def test_create_issue_success_attaches_label(monkeypatch):
-    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITHUB_TOKEN", "tok")
+    """标签必须先查再建，建单时传**标签 id**（Gitea 不接受名字）。"""
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_TOKEN", "tok")
     seen = []
 
-    def fake_request(token, path, payload):
-        seen.append((path, payload))
+    def fake_request(token, path, payload=None, method="POST"):
+        seen.append((method, path, payload))
+        if method == "GET":
+            return 200, []                       # 尚无标签
         if path.endswith("/labels"):
-            return 201, {"name": feedback_dispatch.FEEDBACK_LABEL}
-        return 201, {"number": 42, "html_url": "https://github.com/o/r/issues/42"}
+            return 201, {"id": 5, "name": feedback_dispatch.FEEDBACK_LABEL}
+        return 201, {"number": 42, "html_url": "http://hub01:3000/eric/dailycheck/issues/42"}
 
     monkeypatch.setattr(feedback_dispatch, "_request", fake_request)
     out = feedback_dispatch.create_issue("标题", "正文")
-    assert out == {"number": 42, "url": "https://github.com/o/r/issues/42"}
-    issue_payload = seen[-1][1]
-    assert issue_payload["labels"] == [feedback_dispatch.FEEDBACK_LABEL]
+    assert out == {"number": 42, "url": "http://hub01:3000/eric/dailycheck/issues/42"}
+    issue_payload = seen[-1][2]
+    assert issue_payload["labels"] == [5], "Gitea 的 labels 必须是 id 列表"
+
+
+def test_ensure_label_reuses_existing_instead_of_creating_duplicate(monkeypatch):
+    """已有同名标签时不得再 POST —— Gitea 重复建同名标签同样返回 201。"""
+    posts = []
+
+    def fake_request(token, path, payload=None, method="POST"):
+        if method == "GET":
+            return 200, [{"id": 9, "name": feedback_dispatch.FEEDBACK_LABEL}]
+        posts.append(path)
+        return 201, {"id": 99}
+
+    monkeypatch.setattr(feedback_dispatch, "_request", fake_request)
+    assert feedback_dispatch._ensure_label("tok", "eric/dailycheck",
+                                           feedback_dispatch.FEEDBACK_LABEL) == 9
+    assert posts == [], f"不该重复建标签，实际 POST 了 {posts}"
 
 
 def test_create_issue_survives_missing_label(monkeypatch):
     """标签建不出来（403 等）时仍要建单 —— 标签只是自动化识别的增强。"""
-    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_TOKEN", "tok")
 
-    def fake_request(token, path, payload):
-        if path.endswith("/labels"):
+    def fake_request(token, path, payload=None, method="POST"):
+        if path.startswith("/repos/") and "/labels" in path:
             raise OSError("boom")
-        return 201, {"number": 7, "html_url": "https://github.com/o/r/issues/7"}
+        return 201, {"number": 7, "html_url": "http://hub01:3000/eric/dailycheck/issues/7"}
 
     monkeypatch.setattr(feedback_dispatch, "_request", fake_request)
     out = feedback_dispatch.create_issue("标题", "正文")
@@ -318,23 +337,26 @@ def test_create_issue_survives_missing_label(monkeypatch):
 
 
 def test_create_issue_returns_none_on_http_error(monkeypatch):
-    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_TOKEN", "tok")
     monkeypatch.setattr(
         feedback_dispatch, "_request",
-        lambda token, path, payload: (422, None))
+        lambda token, path, payload=None, method="POST": (422, None))
     assert feedback_dispatch.create_issue("t", "b") is None
 
 
 def test_create_issue_returns_none_when_number_missing(monkeypatch):
-    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(feedback_dispatch.config, "FEEDBACK_GITEA_TOKEN", "tok")
 
-    def fake_request(token, path, payload):
+    def fake_request(token, path, payload=None, method="POST"):
+        if method == "GET":
+            return 200, []
         if path.endswith("/labels"):
-            return 201, {}
-        return 201, {"html_url": "https://github.com/o/r/issues/1"}
+            return 201, {"id": 5}
+        return 201, {"html_url": "http://hub01:3000/eric/dailycheck/issues/1"}
 
     monkeypatch.setattr(feedback_dispatch, "_request", fake_request)
     assert feedback_dispatch.create_issue("t", "b") is None
+
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +498,7 @@ def test_dispatch_without_token_keeps_comment_and_status(logged_client, monkeypa
     """派发通道没配：评论必须保住，状态不能假装成功。"""
     import config as config_module
 
-    monkeypatch.setattr(config_module, "FEEDBACK_GITHUB_TOKEN", "")
+    monkeypatch.setattr(config_module, "FEEDBACK_GITEA_TOKEN", "")
     client, _ = logged_client
     client.post("/feedback", data={"title": "要修的问题", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]
@@ -498,11 +520,11 @@ def test_dispatch_without_token_keeps_comment_and_status(logged_client, monkeypa
 def test_dispatch_success_marks_ticket_and_comment(logged_client, monkeypatch):
     import config as config_module
 
-    monkeypatch.setattr(config_module, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(config_module, "FEEDBACK_GITEA_TOKEN", "tok")
     monkeypatch.setattr(
         feedback_dispatch, "create_issue",
         lambda title, body, label=None: {
-            "number": 88, "url": "https://github.com/o/r/issues/88"})
+            "number": 88, "url": "http://hub01:3000/eric/dailycheck/issues/88"})
 
     client, _ = logged_client
     client.post("/feedback", data={"title": "要修的问题", "body": "详情"})
@@ -524,12 +546,12 @@ def test_dispatch_success_marks_ticket_and_comment(logged_client, monkeypatch):
 def test_dispatch_twice_does_not_create_second_issue(logged_client, monkeypatch):
     import config as config_module
 
-    monkeypatch.setattr(config_module, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(config_module, "FEEDBACK_GITEA_TOKEN", "tok")
     calls = []
 
     def fake_create(title, body, label=None):
         calls.append(title)
-        return {"number": 88, "url": "https://github.com/o/r/issues/88"}
+        return {"number": 88, "url": "http://hub01:3000/eric/dailycheck/issues/88"}
 
     monkeypatch.setattr(feedback_dispatch, "create_issue", fake_create)
 
@@ -549,7 +571,7 @@ def test_dispatch_twice_does_not_create_second_issue(logged_client, monkeypatch)
 def test_save_comment_does_not_dispatch(logged_client, monkeypatch):
     import config as config_module
 
-    monkeypatch.setattr(config_module, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(config_module, "FEEDBACK_GITEA_TOKEN", "tok")
     monkeypatch.setattr(
         feedback_dispatch, "create_issue",
         lambda *a, **k: pytest.fail("仅保存评论不应建 Issue"))
@@ -567,7 +589,7 @@ def test_save_comment_does_not_dispatch(logged_client, monkeypatch):
 def test_dispatch_requires_comment(logged_client, monkeypatch):
     import config as config_module
 
-    monkeypatch.setattr(config_module, "FEEDBACK_GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(config_module, "FEEDBACK_GITEA_TOKEN", "tok")
     client, _ = logged_client
     client.post("/feedback", data={"title": "空评论", "body": "详情"})
     ticket_id = _master_rows("SELECT id FROM feedback_tickets")[0]["id"]

@@ -275,8 +275,8 @@ def _render_kpis(
         c_merged = card(str(merged_today), "个", "今日合并 PR", f"近 7 天样本 {len(cycles)} 个")
         c_cycle = card(_fmt_sec(median_cycle), "", "交付周期（中位）", "创建 → 合并")
     else:
-        c_merged = card("—", "", "今日合并 PR", "GitHub 拉取失败", "hot")
-        c_cycle = card("—", "", "交付周期（中位）", "GitHub 拉取失败", "hot")
+        c_merged = card("—", "", "今日合并 PR", "Gitea 拉取失败", "hot")
+        c_cycle = card("—", "", "交付周期（中位）", "Gitea 拉取失败", "hot")
 
     return (
         '<div class="ops-kpis">'

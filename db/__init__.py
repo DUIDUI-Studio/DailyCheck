@@ -697,7 +697,7 @@ CREATE INDEX IF NOT EXISTS idx_approval_policies_lookup
 -- 与具体仓库的业务数据无关，跨仓可见才符合运维语义。
 -- status 生命周期：open →（管理员判定）
 --            ├─ ignored        认为不重要，已读忽略（终态）
---            └─ dispatched     已加评论并派发成 GitHub Issue（终态，等 PR 关闭）
+--            └─ dispatched     已加评论并派发成 Gitea Issue（终态，等 PR 关闭）
 -- 详见 docs/ARCHITECTURE.md §3.10（反馈闭环）。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS feedback_tickets (
@@ -710,7 +710,7 @@ CREATE TABLE IF NOT EXISTS feedback_tickets (
     title          TEXT NOT NULL,
     body           TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'open',   -- open|ignored|dispatched
-    issue_number   INTEGER,                        -- GitHub Issue 编号（派发后写入）
+    issue_number   INTEGER,                        -- Gitea Issue 编号（派发后写入）
     issue_url      TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,

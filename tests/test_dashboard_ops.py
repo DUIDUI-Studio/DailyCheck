@@ -279,7 +279,7 @@ def test_render_shows_dash_not_zero_when_pr_fetch_failed():
     html = render.render(_sample_input(
         prs=[], pr_data_ok=False, ops_unavailable=["GitHub PR 列表"],
     ))
-    assert "GitHub 拉取失败" in html
+    assert "Gitea 拉取失败" in html
     value = re.search(
         r'<div class="ov">([^<]*)</div><div class="ok">今日合并 PR</div>', html
     ).group(1)

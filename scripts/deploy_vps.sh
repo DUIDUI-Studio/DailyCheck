@@ -26,7 +26,11 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
 RSYNC_EXCLUDES=(--exclude '*.db' --exclude 'backups/' --exclude '.venv/'
                 --exclude '*.log' --exclude '.git/' --exclude 'node_modules/'
-                --exclude '.workbuddy/' --exclude '.claude/')
+                --exclude '.workbuddy/' --exclude '.claude/'
+                # 凭据类文件永不进应用目录（Issue #9：CI 私钥曾被 rsync 带进
+                # /root/DailyCheck/vps_key）。注意 rsync --delete 不会删除排除项，
+                # 所以第 3 步另有显式 rm 清理历史残留。
+                --exclude 'vps_key' --exclude '*.pem')
 
 log() { echo "[deploy] $*"; }
 die() { echo "[deploy] FAIL: $*" >&2; exit 1; }
@@ -77,10 +81,13 @@ CODE_BACKUP="$BACKUP_DIR/code.tar.gz"
 tar --exclude='./*.db' --exclude='./backups' --exclude='./.venv' \
     --exclude='./node_modules' --exclude='./.git' --exclude='./.claude' \
     --exclude='./.workbuddy' --exclude='./issue-reports' --exclude='./graphify-out' \
+    --exclude='./vps_key' --exclude='./*.pem' \
     -czf "$CODE_BACKUP" -C "$APP_DIR" .
 
 # 3) rsync 切换代码（--delete 清理已删除文件；*.db/log/venv 等排除项保护数据不被覆盖或删除）
 log "3/5 rsync 新代码 $SRC → $APP_DIR"
+# rsync --delete 不处理排除项，历史残留（Issue #9 的 vps_key）得显式清
+rm -f "$APP_DIR/vps_key"
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$SRC/" "$APP_DIR/"
 
 # 4) schema 迁移（失败即回滚）

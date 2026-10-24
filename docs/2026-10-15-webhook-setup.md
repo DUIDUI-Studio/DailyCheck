@@ -16,7 +16,7 @@
 
 
 
-> **目的**：Dev Agent 提完 PR 后，GitHub repo 自动通过 webhook 通知 VPS 上的 receiver，receiver 写入 `inbox.jsonl`，`dc-inbox-watcher` 订阅 inbox **≤5s** 触发 Prod Agent 入口跑 merge 决策。
+> **目的**：Dev Agent 提完 PR 后，Gitea repo 自动通过 webhook 通知 VPS 上的 receiver，receiver 写入 `inbox.jsonl`，`dc-inbox-watcher` 订阅 inbox **≤5s** 触发 Prod Agent 入口跑 merge 决策。
 >
 > **目标读者**：owner / Prod Agent 手动部署。脚本走不走通不在 Dev 自动化范围（基础设施变更需 owner 拍板）。
 >
@@ -36,8 +36,8 @@
 
 ```
 Dev Agent (本地)                                VPS (112.124.18.246)
-   ↓ gh pr create                          ┌────────────────────────┐
-GitHub Repo (ericmr1981/DailyCheck)        │  nginx :443            │
+   ↓ POST /pulls（Gitea API）              ┌────────────────────────┐
+Gitea Repo (hub1:3000 eric/dailycheck)     │  nginx :443            │
    ↓ Webhook: pull_request                 │   server_name hook.*   │
    ↓ POST + HMAC-SHA256 签名               │   proxy_pass ───────┐  │
    ↓                                        │   limit_req 防滥刷  │  │
@@ -216,26 +216,35 @@ curl -sI --resolve hook.kjtang.cn:443:127.0.0.1 https://hook.kjtang.cn/health
 nginx -T 2>/dev/null | grep -c 'server_name hook.kjtang.cn'   # 期望：2（443 + 80 两个 server）
 ```
 
-### 3.6 配 GitHub repo Webhook（3 分钟）
+### 3.6 配 Gitea repo Webhook（3 分钟）
 
-1. 打开 https://github.com/ericmr1981/DailyCheck/settings/hooks
-2. 「Add webhook」
-3. Payload URL: `https://hook.kjtang.cn/webhook`
-4. Content type: `application/json`
-5. Secret: 粘贴步骤 3.3 里的 `$WEBHOOK_SECRET` 值
-6. SSL verification: Enable（默认）
-7. 「Which events would you like to trigger this webhook?」
-   - 选择 "Let me select individual events"
-   - **勾 "Pull requests" + "Check suites"**（2026-10-16 起两个都勾：前者 = PR 生命周期触点，后者 = CI 完成快通道 §3.10；不要 issue、不要 push 等）
-8. Active: ✓
-9. 「Add webhook」
+**入口**：`http://172.28.129.216:3000/eric/dailycheck/settings/hooks`（VPS）
+或 `http://hub01:3000/eric/dailycheck/settings/hooks`（本机 Tailscale）。
+
+1. 「添加 Webhook」→ 类型选 **Gitea**（不是 Gogs，也不是 Slack 等）
+2. 目标 URL：`https://hook.kjtang.cn/webhook`
+3. HTTP 方法：`POST`；POST 内容类型：`application/json`
+4. 密钥：粘贴步骤 3.3 的 `$WEBHOOK_SECRET`
+5. 触发条件选「自定义事件」并**只勾这 4 个**：
+   - `pull_request`（开/关/重开/改标题）
+   - `pull_request_sync`（推新 commit —— 对应 GitHub 的 synchronize）
+   - `pull_request_comment`（PR 评论）
+   - `status`（commit 状态变化 = CI 完成快通道，§3.10）
+6. 勾「激活」→ 添加
+
+> ⚠️ 当前实例上这个 hook 是**一次配好、事件清单已含上述 4 项**的既有配置（hook #3）。
+> 重建时照上表勾，别照 GitHub 的「Pull requests + Check suites」——Gitea 没有 Check suites。
+>
+> ⚠️ Gitea 默认拒绝向内网地址投递 webhook。本链路走公网 `hook.kjtang.cn`，不受限；
+> 若改成内网直投，需在 `app.ini` 配 `[webhook] ALLOWED_HOST_LIST`。
 
 ### 3.7 端到端验证（5 分钟）
 
-1. 打开 https://github.com/ericmr1981/DailyCheck/settings/hooks
-2. 找到刚加的 webhook → 「Recent Deliveries」→ 应至少有 1 条 **ping** delivery（GitHub 添加时自动发）；若 ping 失败（红叉），先修通 ping（通常是 443 可达性，见 §2）再做下一步
-3. 让 Dev Agent 提一个测试 PR（或手动在 GitHub UI 上开一个空 PR）
-4. 回到 webhook 详情页 → 应看到一条 `pull_request` delivery 记录，HTTP response 202
+1. 打开 `http://172.28.129.216:3000/eric/dailycheck/settings/hooks` → 点进 hook #3
+2. 「最近投递」应至少有 1 条 **ping/测试**记录；失败先修 443 可达性（见 §2）
+3. 让 Dev Agent 提一个测试 PR（或 Web UI 上开一个空 PR）
+4. 「最近投递」应出现 `pull_request` 记录，HTTP 响应 **202**；
+   若为 **401** = 签名不对（secret 不一致）；**503** = inbox 满（反压生效，属预期）
 5. 验证 inbox 落盘：
    ```bash
    tail -1 /var/lib/dailycheck-prod-agent/inbox.jsonl | python3 -m json.tool
@@ -350,7 +359,7 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 
 ### 3.9 部署兜底轮询（10 分钟，Issue #47 / #51）
 
-webhook 快通道（§3.3-3.8）的保底通道：Prod 侧 Hermes cron **每 30 分钟**直接查 `gh pr list --state open`——快通道整体故障（receiver 挂 / watcher 卡 / gateway 重启窗口 / GitHub 投递失败 / §3.8 的 retry-gating）时仍能在 ≤30 分钟发现新 PR。
+webhook 快通道（§3.3-3.8）的保底通道：Prod 侧 Hermes cron **每 30 分钟**直接查 Gitea `GET /api/v1/repos/eric/dailycheck/pulls?state=open`——快通道整体故障（receiver 挂 / watcher 卡 / gateway 重启窗口 / GitHub 投递失败 / §3.8 的 retry-gating）时仍能在 ≤30 分钟发现新 PR。
 
 脚本 `deploy/scripts/dailycheck_pr_poll.py`（与 Prod 部署版逐字一致），静默语义（skill `no-agent-cron-script-pattern`）：**无 open PR → 零 stdout**（agent 回 `[SILENT]`，无投递）；有 open PR → 输出清单（agent 走 dailycheck-prod-agent skill 判定）；查询失败 → ⚠️ 告警输出（保底通道自身故障必须可见，不得静默）。
 
@@ -382,18 +391,18 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 - 该 job 是 webhook 快通道的**冗余保底**，不是替代——两条通道独立，都指向同一 `dailycheck-prod-agent` skill 判定流程（merge 判定幂等）。
 - **轻提醒（2026-10-16 增）**：prod 的该 job 与 `dailycheck-pr` / `dailycheck-ci` 两订阅的 deliver 均为 `feishu:<chat_id>`（有实质动作时直推 ≤3 行轻提醒；静默 tick 仍被 [SILENT] 抑制，依赖 §3.8 步骤 2c 两补丁）；配 Hermes `config.yaml` `cron.wrap_response: false` 去掉 cron 包装头。⚠️ 本文档第 3 步命令里的 `--deliver local` 是最初创建参数，prod 现状已改为 feishu（以本条为准）。
 
-### 3.10 CI 完成快通道（2026-10-16 增，check_suite）
+### 3.10 CI 完成快通道（2026-10-16 增；2026-10-22 改为 Gitea `status` 事件）
 
 **目标**：CI 全绿 → **秒级**触发 Prod Agent 判定 merge（此前 merge 环节靠 §3.9 兜底轮询接棒，最坏 ≤30 分钟延迟）。
 
-**链路**：GitHub `check_suite`（completed + success + 有 PR 关联）→ receiver（§3.6 同一 webhook，Events 补勾 "Check suites"）→ inbox.jsonl → watcher（§3.8，unit `--actions` 含 `completed`）→ `dc-notify-prod-agent.sh`（按 `event` 路由 `dailycheck-ci` 订阅）→ Prod Agent（全绿即 merge；中间态回 `[SILENT]` 静默不打扰）。
+**链路**：Gitea `status`（state=success + 两个必需 check 全绿）→ receiver（§3.6 同一 webhook，Events 勾 `status`）→ inbox.jsonl → watcher（§3.8，unit `--actions` 含 `completed`）→ `dc-notify-prod-agent.sh`（按 `event` 路由 `dailycheck-ci` 订阅）→ Prod Agent（全绿即 merge；中间态回 `[SILENT]` 静默不打扰）。
 
 **部署变更点**（相对 §3.3-3.9 的增量，代码已在本 repo）：
 
 | # | 位置 | 变更 |
 |---|------|------|
-| 1 | GitHub webhook Events | 补勾 "Check suites"（§3.6 步骤 7） |
-| 2 | `scripts/blue_green/webhook_receiver.py` | 支持 check_suite：`completed` + `conclusion=success` + 有 PR 关联才落盘（其余 200 ignored） |
+| 1 | Gitea webhook Events | 勾 `status`（§3.6 步骤 5） |
+| 2 | `scripts/blue_green/webhook_receiver.py` | 支持 `status`：state=success 且按 sha 反查到 open PR、且两个必需 check 全绿才落盘（其余 200 ignored） |
 | 3 | `deploy/systemd/dc-inbox-watcher.service` | `--actions opened,synchronize,reopened,completed` |
 | 4 | `deploy/scripts/dc-notify-prod-agent.sh` | 按 `event` 字段路由订阅（check_suite → dailycheck-ci；其余 → dailycheck-pr）；exec 行 venv 绝对路径（同 §3.8 步骤 1） |
 | 5 | Hermes 侧 | 订阅 `dailycheck-ci`（§3.8 步骤 2）+ gateway `webhook.py` [SILENT] 补丁（§3.8 步骤 2c） |
@@ -401,10 +410,11 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 **验证**（真 PR 的 CI 全绿后）：
 
 ```bash
-# 1. GitHub 侧：webhook Recent Deliveries 出现 check_suite 类型 delivery，202
+# 1. Gitea 侧：webhook 最近投递出现 status 类型 delivery，202
 # 2. receiver 侧：
 tail -1 /var/lib/dailycheck-prod-agent/inbox.jsonl | python3 -m json.tool
-#    期望："event": "check_suite"、"check_conclusion": "success"、含 pr_number
+#    期望：含 pr_number；event 字段仍是 "check_suite"（迁移期兼容写法，
+#          下游 watcher/路由不用改），但 webhook 投递类型是 status
 # 3. watcher 侧：
 journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 # 4. Prod Agent 侧：merge 时间戳 − CI 完成时间 < 1 分钟（对比旧链路 ≤30 分钟）
@@ -412,7 +422,7 @@ journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
 
 **注意**：
 
-- 一个 PR 的 CI 过程通常产生**多个 check_suite**（每个 workflow 一个 + 第三方 App 如 GitGuardian），每个 success 的 suite 完成都会触发一次判定——前面 suite 完成时两必需 check 未齐 → Prod Agent 回 `[SILENT]`（**不产生飞书消息**）；最后一个凑齐全绿的 suite 才触发 merge + 一行轻提醒。多跑几次判定是幂等且静默的，属预期。
+- 一个 PR 的 CI 过程通常产生**多次 status 事件**（每个 workflow 的每个 check 各一次），每次 success 都会触发一次判定——前面 suite 完成时两必需 check 未齐 → Prod Agent 回 `[SILENT]`（**不产生飞书消息**）；最后一个凑齐全绿的 suite 才触发 merge + 一行轻提醒。多跑几次判定是幂等且静默的，属预期。
 - `conclusion=failure` 的 suite **不转发**（无 merge 动作可做；失败由 Dev 侧修复，兜底轮询照常看板）。
 - [SILENT] 抑制依赖两处本地补丁（§3.8 步骤 2c：gateway `webhook.py` + cron `scheduler.py`，均含「标记丢右括号」截断容错）；补丁缺失时会往飞书发字面 "[SILENT]" 消息——见 §5 风险表。
 

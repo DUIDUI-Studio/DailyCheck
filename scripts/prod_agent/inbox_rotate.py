@@ -3,7 +3,7 @@
 #
 # 设计目标（Issue #47）：
 #   inbox 是反压闸门：行数 ≥ MAX_INBOX_LINES（receiver 默认 1000）后 receiver
-#   对 GitHub 返回 503。inbox 只增不减 → 长期必达上限 → 新 PR 通知被拒。
+#   对投递方返回 503。inbox 只增不减 → 长期必达上限 → 新 PR 通知被拒。
 #   本脚本把「超过 N 天」的旧行归档到 inbox.archive.jsonl，让 inbox 行数回落。
 #
 # 不丢行语义（核心设计，与 receiver 的并发关系）：
