@@ -764,31 +764,119 @@ def payment_proof_download(order_id: int, proof_id: int):
 # DC review / ship
 # ---------------------------------------------------------------------------
 
+# Issue #19（2026-10-24）：订单管理（`/admin/orders`，平台视角）与订货审批
+# （`/review`，配送中心视角）原本是两个模块、两张模板、两套筛选，导航里并列
+# 出现，用户反馈「功能重复」。现合并为**同一个页面实现** `order_board.html`，
+# 两条 URL 是同一页面的别名：`/review` 保住 DC 导航、审批动作回跳与旧书签，
+# `/admin/orders` 保住平台视角语义。
+#
+# 数据范围仍按身份裁剪，不做权限放宽：平台管理员看全部并可跨仓筛选；非管理员
+# 强制限定在当前配送中心，且**忽略** query 里的 ?dc= / ?store=（否则改一个参数
+# 就能枚举别家配送中心的订单）。
+_ORDER_STATUS_TABS: tuple[tuple[str, str], ...] = (
+    ("", "全部"),
+    (sop.ORDER_STATUS_PENDING, "待审批"),
+    (sop.ORDER_STATUS_APPROVED, "待出库"),
+    (sop.ORDER_STATUS_SHIPPED, "已发货"),
+    (sop.ORDER_STATUS_DELIVERED, "已送达"),
+    (sop.ORDER_STATUS_REJECTED, "已拒绝"),
+    (sop.ORDER_STATUS_CANCELLED, "已取消"),
+)
+
+
+def _render_order_board() -> str:
+    """合并后的订单页：审批 + 订单管理同一份实现、同一张模板（Issue #19）。"""
+    master = get_master_db()
+    is_admin = _is_admin()
+    status = request.args.get("status", "").strip()
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+
+    if is_admin:
+        store = request.args.get("store", "").strip()
+        dc = request.args.get("dc", "").strip()
+    else:
+        store = ""
+        dc = _current_warehouse_code() or ""
+
+    # 非管理员且拿不到当前仓库 code 时必须给空集，绝不能退化成「不加 dc 过滤」——
+    # 那会把全平台订单吐给一个范围不明的登录用户。
+    scope_ok = bool(is_admin or dc)
+    orders = (
+        sop.list_orders(
+            master,
+            store_warehouse_code=store or None,
+            dc_warehouse_code=dc or None,
+            status=status or None,
+            start_date=start_date or None,
+            end_date=end_date or None,
+        )
+        if scope_ok
+        else []
+    )
+    # 调货单在列表里按收货进度展示状态，与「我的订单」同源（见 admin_orders 旧注释）。
+    orders = dtp.enrich_transfers(master, orders)
+    counts = (
+        sop.count_orders_by_status(
+            master,
+            store_warehouse_code=store or None,
+            dc_warehouse_code=dc or None,
+        )
+        if scope_ok
+        else {}
+    )
+
+    # 页签必须留在当前 URL 上：从 /review 进来的用户点页签不该被弹到 /admin/orders。
+    endpoint = (
+        "store_ordering.admin_orders"
+        if request.path.rstrip("/").endswith("/admin/orders")
+        else "store_ordering.review_list"
+    )
+    total = sum(counts.values())
+    tabs = [
+        {
+            "code": code,
+            "label": label,
+            "count": total if code == "" else counts.get(code, 0),
+            "url": url_for(
+                endpoint,
+                status=code or None,
+                store=store or None,
+                dc=dc or None,
+                start_date=start_date or None,
+                end_date=end_date or None,
+            ),
+            "active": status == code,
+        }
+        for code, label in _ORDER_STATUS_TABS
+    ]
+
+    return render_template(
+        "store_ordering/order_board.html",
+        orders=orders,
+        status=status,
+        store=store,
+        dc=dc,
+        start_date=start_date,
+        end_date=end_date,
+        stores=_list_stores(master) if is_admin else [],
+        dcs=_list_dcs(master) if is_admin else [],
+        is_admin_view=is_admin,
+        tabs=tabs,
+    )
+
+
 @bp.route("/review")
 @require_login
 @require_warehouse_type("distribution_center")
 @require_role("staff")
 def review_list() -> str:
-    """Combined DC dashboard: pending (待审批) + approved (待出库) orders.
+    """订货审批 —— 合并后订单页的配送中心入口（Issue #19）。
 
-    Both sections render in a single page so the operator only needs to look
-    in one place. Outbound staff can reach `/orders/<id>/ship` from the
-    待出库 table; managers use the inline approve/reject forms on the
-    待审批 table.
+    保留 URL 的原因：DC 侧栏入口、审批/驳回动作后的回跳、旧书签都指向它。
+    页面实现与 `/admin/orders` 完全相同，差异只在数据范围（硬锁本 DC）和标题。
     """
-    master = get_master_db()
-    dc_code = _current_warehouse_code()
-    pending = sop.list_orders(
-        master, dc_warehouse_code=dc_code, status=sop.ORDER_STATUS_PENDING
-    )
-    approved = sop.list_orders(
-        master, dc_warehouse_code=dc_code, status=sop.ORDER_STATUS_APPROVED
-    )
-    return render_template(
-        "store_ordering/review.html",
-        pending_orders=pending,
-        approved_orders=approved,
-    )
+    return _render_order_board()
 
 
 @bp.route("/orders/<int:order_id>/review", methods=["POST"])
@@ -1273,34 +1361,12 @@ def admin_report() -> str:
 
 @bp.route("/admin/orders")
 @require_login
-@require_role("admin")
+@require_warehouse_type("distribution_center")
+@require_role("staff")
 def admin_orders() -> str:
-    """Platform admin order board."""
-    master = get_master_db()
-    status = request.args.get("status", "").strip() or None
-    store = request.args.get("store", "").strip() or None
-    dc = request.args.get("dc", "").strip() or None
-    start_date = request.args.get("start_date", "").strip() or None
-    end_date = request.args.get("end_date", "").strip() or None
-    orders = sop.list_orders(
-        master,
-        store_warehouse_code=store,
-        dc_warehouse_code=dc,
-        status=status,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    # 与「本店订单」同源：调货单按收货进度展示状态，主状态不足以表达。
-    orders = dtp.enrich_transfers(master, orders)
-    return render_template(
-        "store_ordering/orders.html",
-        orders=orders,
-        status=status or "",
-        store=store or "",
-        dc=dc or "",
-        start_date=start_date or "",
-        end_date=end_date or "",
-        stores=_list_stores(master),
-        dcs=_list_dcs(master),
-        is_admin_view=True,
-    )
+    """订单管理 —— 合并后订单页的平台入口（Issue #19）。
+
+    与 `/review` 渲染同一页面、同一份实现。数据范围由 `_render_order_board`
+    按身份裁剪：平台管理员看全部并可跨仓筛选；非管理员只看到本配送中心。
+    """
+    return _render_order_board()

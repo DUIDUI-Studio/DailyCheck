@@ -396,7 +396,8 @@ def test_land_page_staff_sees_modules_without_admin(staff_client):
         ("storefront", "staff", False, "订货目录 / 我的订单", "品项管理"),
         ("storefront", "admin", False, "订货目录 / 我的订单", "品项管理"),
         # Issue #122：平台管理员（任意仓库类型）能审批订单 → 描述补「订货审批」。
-        ("storefront", "staff", True, "订货目录 / 我的订单 / 订单管理 / 品项管理 / 订货审批 / 总仓调货", None),
+        # Issue #19：订单管理与订货审批合并成一个页面，admin 卡描述里不再并列两项。
+        ("storefront", "staff", True, "订货目录 / 我的订单 / 订单管理 / 品项管理 / 总仓调货", None),
         # Issue #122：DC 角色（任何 role）能进「订货审批」，描述补该子项。
         ("distribution_center", "staff", False, "订货目录 / 订货审批 / 总仓调货", "品项管理"),
         ("distribution_center", "manager", False, "订货目录 / 品项管理 / 订货审批 / 总仓调货", None),

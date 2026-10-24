@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 22 个（已装配 21 / 未装配 1）
-- 路由 **179** 条（按鉴权强度：平台超管 54 · 登录 47 · 权限点 31 · 角色 30 · 配送中心 7 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **179** 条（按鉴权强度：平台超管 54 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -306,7 +306,7 @@
 | endpoint | 方法 | 规则 | 鉴权 | 明细 |
 |---|---|---|---|---|
 | `store_ordering.add_to_cart` | POST | `/cart/add` | 权限点 | order.create |
-| `store_ordering.admin_orders` | GET | `/admin/orders` | 角色 | admin |
+| `store_ordering.admin_orders` | GET | `/admin/orders` | 配送中心 | role:staff |
 | `store_ordering.admin_report` | GET | `/admin/report` | 角色 | admin |
 | `store_ordering.cancel_order_route` | POST | `/orders/<int:order_id>/cancel` | 任一权限 | order.create|order.cancel.any |
 | `store_ordering.cart_add_batch` | POST | `/cart/add-batch` | 权限点 | order.create |

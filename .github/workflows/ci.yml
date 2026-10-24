@@ -37,9 +37,15 @@ jobs:
       - name: Ruff (changed .py files only)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" -- '*.py')
+            # 三点 diff（merge-base）只算「本分支引入的改动」。用两点会把 base
+            # 之后 main 上别人合入的改动也列进来 —— 2026-10-24 PR #22 实测：
+            # 分支落后 main 一个提交，于是列出了已被删除的
+            # tests/test_store_ordering_board.py，ruff 报 E902 整步失败。
+            # --diff-filter=d 再兜一层：本分支自己删掉的 .py 不喂给 ruff。
+            FILES=$(git diff --name-only --diff-filter=d \
+              "${{ github.event.pull_request.base.sha }}...HEAD" -- '*.py')
           else
-            FILES=$(git diff --name-only "HEAD~1" -- '*.py')
+            FILES=$(git diff --name-only --diff-filter=d "HEAD~1" -- '*.py')
           fi
           if [ -n "$FILES" ]; then
             echo "ruff checking: $FILES"

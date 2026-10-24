@@ -108,9 +108,12 @@ EOF
 echo "[generate_reports] running ruff ..."
 
 if [[ -n "${BASE_SHA}" ]]; then
-  CHANGED_PY=$(git diff --name-only "${BASE_SHA}"..HEAD -- '*.py' 2>/dev/null || true)
+  # 三点 diff（merge-base）：只算本分支引入的改动。两点会把 base 之后 main 上
+  # 别人合入的改动也列进来（据此跑 ruff 会报已删除文件的 E902）。
+  # --diff-filter=d 排除本分支自己删掉的 .py。
+  CHANGED_PY=$(git diff --name-only --diff-filter=d "${BASE_SHA}"...HEAD -- '*.py' 2>/dev/null || true)
 else
-  CHANGED_PY=$(git diff --name-only HEAD~1 -- '*.py' 2>/dev/null || true)
+  CHANGED_PY=$(git diff --name-only --diff-filter=d HEAD~1 -- '*.py' 2>/dev/null || true)
 fi
 
 RUFF_BASELINE_LINES=0
