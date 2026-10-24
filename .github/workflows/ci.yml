@@ -145,6 +145,19 @@ jobs:
           /opt/venv/bin/python scripts/agent_framework/check_redlines.py \
             --base "${BASE_SHA}" --body-file /tmp/pr/body.md
 
+      # 开工规范机验（2026-10-24 新增，Issue #26）：分支前缀 / issue 号一致性 /
+      # 无号分支必须声明。此前这些规矩只活在 Dev Agent 的本地记忆里，换 session 就丢。
+      - name: PR hygiene check（分支命名 + issue 关联）
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.head_ref }}
+        run: |
+          mkdir -p /tmp/pr
+          echo "$PR_BODY" > /tmp/pr/body.md
+          /opt/venv/bin/python scripts/agent_framework/check_pr_hygiene.py \
+            --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file /tmp/pr/body.md
+
       - name: Upload reports as artifact
         if: always()
         uses: http://172.28.129.216:3000/actions/upload-artifact@v4

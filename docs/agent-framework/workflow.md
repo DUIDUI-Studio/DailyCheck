@@ -36,6 +36,70 @@
 5. shell 脚本改动：`bash -n` + dry-run 冒烟
 6. 触及架构子系统必须同步 `docs/ARCHITECTURE.md`（pre-commit hook 强制；helper：`scripts/arch_touched_sections.py`）
 
+### ②′ 开工规范（Dev Agent，2026-10-24 起）
+
+> 这一节约束「接到 issue 到第一次 commit 之间」。此前只有一句「确认分支、确认改动范围」，没有判据——规矩实际只活在个人记忆里，换 session、换 agent 就丢。标 **[机验]** 的进 CI（`check_pr_hygiene.py`），其余靠 review，但都是硬要求。
+
+#### 认领与定范围
+
+| # | 规则 |
+|---|------|
+| A1 | 开工前确认没人正在做：`git worktree list` + `git branch -r --list '*issue-<N>*'` + 读 issue 最后一条评论 |
+| A2 | **先复现再改**。复现了贴证据；按 A/B/C 试过仍复现不了 → 在 issue 回帖说明，不猜着改 |
+| A3 | 一个 PR 收不了就拆子 issue，不在一个 PR 里堆 |
+
+#### 工作区隔离（硬要求）
+
+| # | 规则 |
+|---|------|
+| B1 | 一律独立 worktree，**禁止在主工作树提交**：`git worktree add /tmp/dc-<N> -b <branch> origin/main` |
+| B2 | 起点固定 `origin/main`，不用本地分支、不用 `HEAD` |
+| B3 | 建完立刻验 upstream：`git rev-parse --abbrev-ref @{u}` 不得是 `github-legacy/*`。本仓 `origin` = Gitea、`github-legacy` 已废弃，无参数 `git push` 会推错地方（2026-10-24 实际发生） |
+| B4 | 分支命名 `{fix\|feat\|chore\|docs\|ci\|test\|refactor\|perf}/issue-<N>-<slug>` **[机验 H1]** |
+| B5 | 一个 issue 一个分支：分支号必须与 body 的 `Closes #N` 或 `Part-Of: #N` 一致 **[机验 H2]**；不带号的杂活必须写 `No-Issue: <理由>` **[机验 H3]** |
+| B6 | 开工先跑一次全量测试并记下失败数（本地基线 14 条 known），否则分不清后面的红是不是自己造成的 |
+
+#### 分支卫生
+
+| # | 规则 |
+|---|------|
+| C1 | push 显式写 `git push origin <branch>`，不依赖 upstream —— worktree 的 upstream 可能指错 |
+| C2 | 生命周期内至少 merge 一次 `origin/main`。落后越久，冲突与 diff 误判越容易撞上（Issue #24）；落后 >30 个提交时 CI 给提示 **[机验 H4，只提示不拦]** |
+
+#### PR 颗粒度
+
+判据不是「小」，是**能单独 revert 而不牵连其他修复**：
+
+| # | 规则 |
+|---|------|
+| D1 | 一个 PR 只解一个 issue；多 issue 仅当**根因相同**才合并 |
+| D2 | 顺手发现的其他 bug **另开 issue**，不在本 PR 修 |
+| D3 | 行为变更与纯重构不混 —— 混了 review 看不出哪一行改了行为 |
+| D4 | 门禁要求的文档同步（`ARCHITECTURE.md`）**必须**混；文档「改进」不能混 |
+| D5 | （不采用）规模阈值（如 >8 文件 / >400 行须写 `Scope-Justification`）。阈值容易误伤，逼人为了过门禁硬拆 PR，反而破坏 D1-D4 真正要判的东西。owner 2026-10-24 明确排除 |
+| D6 | 例外条款：**同根因的多点修改算一个 PR**，防止「一个 bug 修三处要开三个 PR」 |
+
+反面教材：PR #22 把「红线机验 + CI diff 修复 + 文档三处」混成一个 PR，合并后无法单独回滚，而 Prod Agent 提的两条缺陷正好藏在这个混合体里（Issue #24 / #26）。
+
+#### 收尾
+
+| # | 规则 |
+|---|------|
+| F1 | PR body 三段齐全 + `Closes #N` **[机验]** |
+| F2 | 止于 PR，不 merge |
+| F3 | 在 issue 留一句结论（不是关单，是留痕） |
+| F4 | worktree 用完删掉。2026-10-24 已积累 50+ 个 worktree、大半 `prunable` —— 每个 `git worktree list` 都变成噪音 |
+
+#### 为什么不把这些全做成机验
+
+| 条目 | 原因 |
+|------|------|
+| A1 / A2 | 是否真复现、有没有人认领，要读 issue 语义，判据不成立 |
+| B1-B3 / B6 | CI 只看到 checkout 出来那份树，看不到本地 worktree 与 upstream |
+| C1 | push 姿势发生在 CI 之外 |
+| D1-D6 | 「是否一个可独立回滚单元」是语义判断，只能靠 review |
+| F2 / F3 / F4 | merge 权与本地清理都在 CI 之外 |
+
 ### ③ 提 PR（模板强制）
 
 - 新建 PR 自动带出 `.github/PULL_REQUEST_TEMPLATE.md`
