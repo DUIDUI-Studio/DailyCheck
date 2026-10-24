@@ -96,6 +96,30 @@ def test_pending_marker_with_auth_passes(checker):
     assert hits == []
 
 
+def test_pending_marker_needs_owner_wording(checker):
+    """Prod Agent 红线清单写的是「需要 owner 拍板」，与 workflow.md 的「需拍板」不同字面。
+
+    Issue #24 缺陷 2：`"需要 owner 拍板"` 不含 `"需 owner 拍板"`（需 后面是要，不是空格），
+    旧 markers 两处措辞都漏拦。
+    """
+    assert checker.detect_pending_marker("本项属需要 owner 拍板的事项。") == "需要 owner 拍板"
+
+
+def test_pending_marker_major_change_wording(checker):
+    assert checker.detect_pending_marker("重大变更：调整 CI 流水线。") == "重大变更"
+
+
+def test_negated_pending_marker_is_not_pending(checker):
+    """否定语境不算需拍板。
+
+    否则一个正常 PR 写「本次无重大变更」也会红，作者为了过 CI 只能编一行
+    授权声明 —— 正是门禁想消除的习惯性绕过。
+    """
+    assert checker.detect_pending_marker("本次无重大变更，不涉及红线。") == ""
+    assert checker.detect_pending_marker("这不是重大变更。") == ""
+    assert checker.detect_pending_marker("本次改造不涉及需要 owner 拍板的事项。") == ""
+
+
 # ── 授权声明的识别 ───────────────────────────────────────────────────
 
 
@@ -178,3 +202,84 @@ def test_main_allows_redline_change_with_auth(git_repo, tmp_path, monkeypatch):
     module = _load_checker()
     exit_code = module.main(["--base", "HEAD~1", "--body-file", str(body)])
     assert exit_code == 0
+
+
+# ── 分支落后 main：三点 diff 与两点 diff 的分歧 ──────────────────────
+
+
+def _git_out(repo: Path, *args: str) -> str:
+    """在 fixture 造的仓库里跑 git 并取 stdout。"""
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(repo.parent),
+        },
+    ).stdout.strip()
+
+
+def test_lagging_branch_does_not_false_positive(git_repo, tmp_path, monkeypatch):
+    """分支落后 main 时，别人改的红线文件不该算在本 PR 头上。
+
+    Issue #24 缺陷 1：脚本原先用 `base..head`（两点）。CI 传的 base 是 base
+    分支当时的 tip、head 是 PR head，两者不是祖先关系，两点 diff 会把 main
+    上别人合入的改动一起列出来。实测 main `a67c49a` vs 落后分支 `556cade`：
+    两点列出 7 个文件（ci.yml / workflow.md / session-bootstrap.md 全在里面），
+    三点为空 —— 该分支实际没改任何文件，却会被判命中 3 条红线。
+    """
+    repo, run = git_repo
+
+    # main 前进一步：别人改了 ci.yml（红线 2）
+    wf = repo / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text("on: push\n", encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "main tip: 别人改 ci.yml")
+    main_tip = _git_out(repo, "rev-parse", "HEAD")
+
+    # 本分支从同一个 base 分出，只改 README，不碰红线
+    run("checkout", "-b", "feature", "HEAD~1")
+    (repo / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "feature: 只改 README")
+
+    body = tmp_path / "body.md"
+    body.write_text("## 报告 1/4\n只改文档，不涉及红线。\n", encoding="utf-8")
+
+    monkeypatch.chdir(repo)
+    module = _load_checker()
+    exit_code = module.main(["--base", main_tip, "--body-file", str(body)])
+    assert exit_code == 0, "落后分支不该因 main 上别人的红线改动被拦"
+
+
+def test_own_redline_change_still_blocked_when_base_ahead(git_repo, tmp_path, monkeypatch):
+    """改三点 diff 不能把该拦的漏掉：分支自己改红线仍须 exit 1。"""
+    repo, run = git_repo
+
+    # main 前进一步：别人改了 README（非红线）
+    (repo / "README.md").write_text("base\nmain tip\n", encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "main tip: 别人改 README")
+    main_tip = _git_out(repo, "rev-parse", "HEAD")
+
+    # 本分支从旧 base 分出，自己改了 ci.yml
+    run("checkout", "-b", "feature", "HEAD~1")
+    wf = repo / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text("on: push\n", encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "feature: 改 ci.yml")
+
+    body = tmp_path / "body.md"
+    body.write_text("## 报告 1/4\n改 CI。\n", encoding="utf-8")
+
+    monkeypatch.chdir(repo)
+    module = _load_checker()
+    exit_code = module.main(["--base", main_tip, "--body-file", str(body)])
+    assert exit_code == 1

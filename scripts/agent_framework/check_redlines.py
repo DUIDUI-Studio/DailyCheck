@@ -63,7 +63,20 @@ REDLINE_PATHS: tuple[tuple[str, str, str, str], ...] = (
 KNOWN_FAILURES_PATH = "tests/known_failures.txt"
 
 # 红线 5：owner 在需求里标注「需拍板」的变更。
-PENDING_MARKERS = ("需拍板", "需 owner 拍板", "needs-owner")
+# 措辞取自三处实际在用文本：workflow.md §四（「需拍板」）、dailycheck-prod-agent
+# skill 的红线清单（「需要 owner 拍板」「重大变更」）、英文等价写法。
+PENDING_MARKERS = (
+    "需拍板",
+    "需 owner 拍板",
+    "需要 owner 拍板",
+    "重大变更",
+    "needs-owner",
+)
+
+# 否定语境：正文写「无重大变更」「不涉及重大变更」时不是「需拍板」。
+# 不排除就会逼作者补一行授权来消红，正好训练出习惯性绕过（Issue #24）。
+_NEGATION_CHARS = ("不", "无", "非", "没", "未")
+_NEGATION_WINDOW = 3
 
 AUTH_FIELD = "Owner-Authorization:"
 
@@ -105,6 +118,26 @@ def has_authorization(pr_body: str) -> str:
     return ""
 
 
+def detect_pending_marker(pr_body: str) -> str:
+    """返回正文里命中的「需拍板」标记；没有则空串。
+
+    否定语境（「无重大变更」「不涉及重大变更」）不算 —— 否则正常 PR 为了消红
+    只能补一行自己编的授权，反而把门禁训练成形式主义。
+    """
+    lowered = pr_body.lower()
+    for marker in PENDING_MARKERS:
+        index = pr_body.find(marker)
+        if index < 0:
+            index = lowered.find(marker)
+        if index < 0:
+            continue
+        window = pr_body[max(0, index - _NEGATION_WINDOW):index]
+        if any(ch in window for ch in _NEGATION_CHARS):
+            continue
+        return marker
+    return ""
+
+
 def classify(
     changed_files: list[str],
     known_failures_added: int,
@@ -137,16 +170,15 @@ def classify(
             hits.append(Hit(rule=rule, detail=detail, evidence=path))
 
     # 红线 5：正文自述「需拍板」却没有任何授权声明
-    lowered = pr_body.lower()
-    if any(marker in pr_body or marker in lowered for marker in PENDING_MARKERS):
-        if not has_authorization(pr_body):
-            hits.append(
-                Hit(
-                    rule="R5",
-                    detail="PR 自述「需拍板」但未见 owner 授权声明",
-                    evidence="正文含需拍板标记",
-                )
+    pending = detect_pending_marker(pr_body)
+    if pending and not has_authorization(pr_body):
+        hits.append(
+            Hit(
+                rule="R5",
+                detail="PR 自述「需拍板」但未见 owner 授权声明",
+                evidence=f"正文含「{pending}」",
             )
+        )
 
     return hits
 
@@ -164,14 +196,24 @@ def _git(*args: str) -> str:
 
 
 def changed_files_between(base: str, head: str) -> list[str]:
-    """基线到 HEAD 之间改动的文件（含新增/修改/删除/重命名）。"""
-    output = _git("diff", "--name-only", f"{base}..{head}")
+    """本 PR 相对分叉点改动的文件（含新增/修改/删除/重命名）。
+
+    必须用三点 diff（`base...head` = merge-base(base, head)..head），不能用两点：
+    CI 传的 base 是 base 分支当时的 tip，head 是 checkout 出来的 PR head，两者
+    通常不是祖先关系。两点 diff 会把 base 分支上别人合入的改动一起列进来 ——
+    于是「分支建于上次合并之前」的 PR 会无端命中自己没碰过的红线（Issue #24）。
+    """
+    output = _git("diff", "--name-only", f"{base}...{head}")
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
 def known_failures_added_between(base: str, head: str) -> int:
-    """known_failures.txt 的新增行数；文件没动或只删行则返回 0。"""
-    out = _git("diff", "--numstat", f"{base}..{head}", "--", KNOWN_FAILURES_PATH)
+    """known_failures.txt 的新增行数；文件没动或只删行则返回 0。
+
+    与 `changed_files_between` 同样用三点 diff，两处口径必须一致，否则会出现
+    「文件列表按本 PR 算、行数按全量算」的自相矛盾。
+    """
+    out = _git("diff", "--numstat", f"{base}...{head}", "--", KNOWN_FAILURES_PATH)
     if not out.strip():
         return 0
     # numstat 格式：added<TAB>deleted<TAB>path（二进制为 "-"）
