@@ -14,8 +14,11 @@ import re
 
 import pytest
 
-# Issue #122 验收：/store-ordering/review 是导航可达的入口
+# Issue #122 验收：/store-ordering/review 是导航可达的入口（DC 视角）
 REVIEW_PATH = "/store-ordering/review"
+# Issue #19（2026-10-24）：订单管理与订货审批合并为同一页面，admin 的入口是
+# /admin/orders，DC 的是 /review —— 两条 URL 渲染同一张模板。
+ADMIN_ORDERS_PATH = "/store-ordering/admin/orders"
 
 
 def _sidebar_links(body: str) -> set[str]:
@@ -48,13 +51,21 @@ class TestNavHasReviewEntry:
             f"DC {role} /land 缺 {REVIEW_PATH}；侧栏 / /land 链接集必须一致。完整：{land}"
         )
 
-    def test_platform_admin_sees_review_in_sidebar_and_land(self, nav_client_factory):
-        """平台管理员全权可见（任意仓库类型），入口可见；/land 同步回归保险。"""
+    def test_platform_admin_sees_order_board_in_sidebar_and_land(self, nav_client_factory):
+        """平台管理员全权可见（任意仓库类型）。
+
+        Issue #19 合并后 admin 的订单入口是 /admin/orders（同一页面、平台视角）；
+        #122 的验收点「审批入口导航可达」由它满足，故此处断言该 URL 而非 /review。
+        """
         client, _ = nav_client_factory("storefront", "staff", is_admin=True)
         sidebar = _sidebar_links(client.get("/dashboard").get_data(as_text=True))
         land = _land_links(client.get("/land").get_data(as_text=True))
-        assert REVIEW_PATH in sidebar
-        assert REVIEW_PATH in land
+        assert ADMIN_ORDERS_PATH in sidebar
+        assert ADMIN_ORDERS_PATH in land
+        # 合并后同一页面：点进去就是订单板（待审批页签在）。
+        resp = client.get(ADMIN_ORDERS_PATH)
+        assert resp.status_code == 200
+        assert "待审批" in resp.get_data(as_text=True)
 
     @pytest.mark.parametrize("role", ["staff", "manager"])
     def test_storefront_user_does_not_see_review(self, nav_client_factory, role):

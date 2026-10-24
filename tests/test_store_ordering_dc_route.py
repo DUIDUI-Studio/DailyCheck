@@ -208,13 +208,18 @@ def test_shipment_list_and_ship(dc_env):
     assert resp.status_code == 302
     assert "/store-ordering/review" in resp.headers.get("Location", "")
 
-    # The combined review page lists approved orders under
-    # 「已审批 · 待出库」.
+    # Issue #19：合并后的订单页用状态页签承载「待审批 / 待出库 / …」，
+    # 不再是「已审批 · 待出库」这样的分节标题。
     resp = client.get("/store-ordering/review")
     assert resp.status_code == 200
     body = resp.data.decode()
-    assert "已审批 · 待出库" in body
+    assert "待出库" in body  # 页签存在
     assert "SO-" in body
+
+    # 页签过滤到「待出库」后，刚审批的那张单仍在该页可见。
+    resp = client.get("/store-ordering/review?status=approved")
+    assert resp.status_code == 200
+    assert "SO-" in resp.data.decode()
 
     resp = client.post(
         f"/store-ordering/orders/{dc_env['order_id']}/ship",

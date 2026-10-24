@@ -1466,6 +1466,34 @@ def list_orders(
     return [dict(r) for r in rows]
 
 
+def count_orders_by_status(
+    master_conn: sqlite3.Connection,
+    *,
+    store_warehouse_code: str | None = None,
+    dc_warehouse_code: str | None = None,
+) -> dict[str, int]:
+    """Return {status: count} over exactly the same scope as list_orders.
+
+    过滤下推到 SQL 的 GROUP BY，不把订单全表捞回来在应用层数——Issue #19 的
+    合并订单页要在页签上显示各状态计数。
+    """
+    master_conn.row_factory = sqlite3.Row
+    where_parts: list[str] = []
+    params: list[Any] = []
+    if store_warehouse_code:
+        where_parts.append("store_warehouse_code = ?")
+        params.append(store_warehouse_code)
+    if dc_warehouse_code:
+        where_parts.append("dc_warehouse_code = ?")
+        params.append(dc_warehouse_code)
+    where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    rows = master_conn.execute(
+        f"SELECT status, COUNT(*) AS n FROM store_orders {where} GROUP BY status",
+        params,
+    ).fetchall()
+    return {str(r["status"]): int(r["n"]) for r in rows}
+
+
 def get_order_dc_code(
     master_conn: sqlite3.Connection,
     order_id: int,

@@ -1604,6 +1604,9 @@ stateDiagram-v2
 
 **列表口径（2026-10-19 修正）**：门店侧**不设独立调货入口**——调货单对门店就是一张待收货的订单，直接列在「本店订单」（`store_orders_list`）里；模板按 `flow_type` 显示「类型」列，状态用**收货进度**（待发货 / 待收货 / 部分收货 / 已收货）而非主状态——分批发货期间主状态停在 `approved`，直接展示会变成门店看不懂的「已审批」。`dc_transfer.transfer_list` 对门店 302 回订单列表；只有总仓／平台管理员有「总仓调货」入口。管理员订单板（`admin_orders`）同源处理。
 
+**订单板合并（2026-10-24，Issue #19）**：`admin_orders`（`/admin/orders`，平台视角）与 `review_list`（`/review`，配送中心视角）原是两个模块、两张模板（`orders.html` / `review.html`）两套筛选，导航里并列出现，用户反馈「功能重复」。现合并为**一份实现 + 一张模板**：视图 `_render_order_board()`（`blueprints/store_ordering.py`）同时服务两个端点，模板 `templates/store_ordering/order_board.html`（状态页签 = 全部 / 待审批 / 待出库 / 已发货 / 已送达 / 已拒绝 / 已取消，计数来自 `store_ordering_pure.count_orders_by_status()` 的 SQL `GROUP BY status`——不在应用层捞全表再数）；原 `review.html` 已删除。
+数据范围按身份裁剪、**逻辑上不放宽**：`is_admin` → 全量且 `?dc=` / `?store=` 生效；非管理员 → `dc_warehouse_code` 硬锁当前仓库，且**忽略** query 里的 `?dc=` / `?store=`（否则改一个参数就能枚举别家配送中心的订单）。权限意图两侧统一为 `dc>role:staff`（admin 由装饰器直通）——`admin_orders` 因此从 `role:admin` 改为 `dc>role:staff`，DC staff 可访问该 URL，但可见数据集仍是本 DC。`tests/test_store_ordering_board.py` 逐条锁死：同页面两 URL / 范围锁定 / 越权参数无效 / 导航单入口（admin 与 DC 各一条断言）/ admin 全量与跨仓筛选 / 门店 403 / 页签计数与过滤。导航（`base.html` + `land.html`）只保留一项：admin 落 `/admin/orders`「订单管理」，DC 落 `/review`「订货审批」；`/shipments` 仍是 302 到 `/review` 的旧别名。
+
 详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
 
 ### 10.4 Canonical 扇出流程
