@@ -128,12 +128,14 @@ flowchart LR
 ```mermaid
 flowchart LR
     Gitea["Gitea Actions<br/>(hub1 · .github/workflows/ci.yml)"]
+    ProdAgent["Prod Agent (VPS)<br/>scripts/blue_green/deploy_pipeline.sh"]
     VPS["VPS 112.124.18.246:33756 root<br/>/root/DailyCheck"]
     Gunicorn["gunicorn -w 2 --threads 4<br/>-b 127.0.0.1:8090 app:app<br/>(**非 wdg-systemd**)"]
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    Gitea -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
+    Gitea -->|CI 门禁 + status webhook<br/>（不再触发部署）| ProdAgent
+    ProdAgent -->|蓝绿部署（§3.4）| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -148,7 +150,7 @@ flowchart LR
 | **进程管理器** | systemd in container | gunicorn -D（无 systemd） |
 | **Flask reload** | `--debug` 自动 reload | 无 |
 | **MCP 进程** | systemd unit | **未部署**（MCP 只在 dev 跑） |
-| **部署方式** | mount + edit | `ci.yml` test 通过后走 `scripts/deploy_vps.sh`：sqlite 热备全库 + 代码备份 → rsync 切换（`*.db`/log/venv 永不触碰）→ `flask migrate up` → systemd 重启 → `/health` 探活 → 失败自动回滚代码并重启。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑）。**凭据类文件（`vps_key`/`*.pem`）双向排除**：CI 侧面把私钥写到 `mktemp` 临时文件（不在打包目录内），打包与 rsync 两侧各自再排除一次，切换前显式 `rm -f $APP_DIR/vps_key` 清历史残留——rsync `--delete` 不处理排除项（Issue #9，2026-10-24） |
+| **部署方式** | mount + edit | **Prod Agent 蓝绿部署**（§3.4：`deploy_pipeline.sh` → up/verify/promote/switch/观察窗；2026-10-25 起 deploy-first：验证通过后 FF-only merge）。`scripts/deploy_vps.sh` 保留为**应急手动路径**（sqlite 热备 + rsync + migrate + 重启 + 探活 + 失败回滚），CI 不再调用（`f293746` 移除 deploy job）。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑）。**凭据类文件（`vps_key`/`*.pem`）双向排除**：打包与 rsync 两侧各自再排除一次，切换前显式 `rm -f $APP_DIR/vps_key` 清历史残留——rsync `--delete` 不处理排除项（Issue #9，2026-10-24） |
 | **备份/DR** | 无 | `scripts/backup_all.sh`（cron 每日，integrity_check + tar + 可选异地）+ `scripts/verify_restore.sh`（每周还原演练）+ `docs/runbook-dr.md`（RPO=24h/RTO=1h） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
