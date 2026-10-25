@@ -22,7 +22,7 @@
 4. **best-effort，永不抛错**。Gitea 挂了 / token 过期 / 网络不通都只写日志，
    因为这是部署收尾路径 —— 让「回写失败」把一次成功部署变成红，本末倒置。
 
-## 两条通道各管什么
+## 三条通道各管什么
 
 - **PR 评论**：人可读的留档 + 事件文件丢了也能回读的持久化副本。首行固定
   标记 `<!-- deploy-report:v1 -->`。
@@ -30,6 +30,10 @@
   每行一个自包含事件，带 `next` 字段（动作授权枚举）与 `report_comment`
   （回指 PR 评论 id），agent 不需要解析自然语言，也不需要去猜该干什么。
   同时它也是 `autofix` 熔断的计数来源 —— 状态不存在别处。
+- **唤醒队列**（`DAILYCHECK_PROD_AGENT_INBOX`）：Hermes 的 `inbox.jsonl`。
+  事件文件只解决「事实留下」，不解决「agent 什么时候知道」。这一条把它接到
+  已有的 `inbox → watcher → webhook 订阅` 快通道上（≤5s 唤醒），否则 agent
+  仍要等到下一轮兜底轮询才看得见。
 
 ## 用法
 
@@ -47,6 +51,7 @@
     FEEDBACK_GITEA_REPO           默认 eric/dailycheck
     DAILYCHECK_GITEA_WEB_BASE     给人点的链接基址
     DAILYCHECK_DEPLOY_EVENT_LOG   默认 /var/lib/dailycheck-deploy/events.jsonl
+    DAILYCHECK_PROD_AGENT_INBOX   默认 /var/lib/dailycheck-prod-agent/inbox.jsonl
     DAILYCHECK_DEPLOY_REPORT      0 = 整体关闭回写
     DAILYCHECK_CURL               curl 可执行文件（测试注入，默认 curl）
 """
@@ -81,6 +86,7 @@ DEFAULT_TOKEN_FILE = "/etc/dailycheck/gitea-token"
 DEFAULT_API = "http://172.28.129.216:3000/api/v1"
 DEFAULT_REPO = "eric/dailycheck"
 DEFAULT_EVENT_LOG = "/var/lib/dailycheck-deploy/events.jsonl"
+DEFAULT_PROD_AGENT_INBOX = "/var/lib/dailycheck-prod-agent/inbox.jsonl"
 LOG_TAIL_LINES = 40
 COMMENT_MAX = 50000
 
@@ -325,6 +331,70 @@ def append_event(event: dict[str, Any]) -> bool:
         return False
 
 
+def inbox_path() -> Path:
+    return Path(_env("DAILYCHECK_PROD_AGENT_INBOX", DEFAULT_PROD_AGENT_INBOX))
+
+
+def push_inbox_event(
+    pr: int,
+    sha: str,
+    tr: dict[str, Any],
+    align: dict[str, Any],
+    nxt: str,
+    comment_id: int = 0,
+    log_path: str = "",
+) -> bool:
+    """把部署结果投进 prod-agent 的唤醒队列（Hermes ``inbox.jsonl``）。
+
+    **为什么不只写 events.jsonl**：文件写了没人读，等于没写。Hermes 侧已经有
+    ``inbox.jsonl → dc-inbox-watcher → dc-notify-prod-agent → webhook 订阅``
+    这条现成链路（≤5s 唤醒 agent），复用它的唤醒机制比新增常驻服务或 cron 便宜
+    得多，也不会多一处需要跟着 PR 节奏走的配置。
+
+    **为什么字段全部平铺**：订阅 prompt 只做 ``{key}`` 字面替换，嵌套对象取不到。
+    把 ``next`` / ``verdict`` / ``log`` 摊到顶层，prompt 才能直接引用。
+
+    **为什么成功也投**：agent 需要知道 ``deployed`` 锚点已推进。不投的话，兜底
+    轮询的 catchup 会对着旧锚点反复判 behind，白白多跑一轮部署。
+    """
+    now_ms = int(datetime.now().timestamp() * 1000)
+    web = _web_base()
+    repo = _repo()
+    payload = {
+        "delivery_id": f"deploy-{pr}-{(sha or 'nosha')[:12]}-{tr.get('rc')}",
+        "event": "deploy_result",
+        # 复用 completed：dc-inbox-watcher 的 --actions 白名单里已有它，为一个新
+        # action 去改 systemd unit 不划算；「部署结束」本身也是 completed 语义。
+        # 真正的分流在 dc-notify-prod-agent，它按 event 字段路由，不看 action。
+        "action": "completed",
+        "received_at_ms": now_ms,
+        "repo_full_name": repo,
+        "pr_number": int(pr),
+        "pr_head_sha": sha,
+        "pr_url": f"{web}/{repo}/pulls/{pr}" if web else "",
+        "pr_base_ref": "main",
+        "deploy_rc": int(tr.get("rc") or 0),
+        "deploy_stage": str(tr.get("stage") or ""),
+        "deploy_kind": str(tr.get("kind") or ""),
+        "deploy_scope": str(tr.get("scope") or ""),
+        "deploy_verdict": str(align.get("verdict") or ""),
+        "deploy_next": nxt,
+        "deploy_reason": redact(str(tr.get("reason") or ""))[:400],
+        "deploy_report_comment": int(comment_id or 0),
+        "deploy_log": log_path,
+    }
+    p = inbox_path()
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        return True
+    except OSError as exc:
+        print(f"[deploy-report] WARN inbox 投递失败（{p}）：{exc}", file=sys.stderr)
+        return False
+
+
 # ── 渲染 ──────────────────────────────────────────────────────────────────
 
 _VERDICT_LABEL = {
@@ -477,6 +547,16 @@ def cmd_write(args: argparse.Namespace) -> int:
     })
     if appended:
         print(f"[deploy-report] 事件已投递 next={nxt}", file=sys.stderr)
+
+    # 唤醒队列与审计流是两个通道，各自独立失败：
+    # events 保事实，inbox 负责「叫醒」。inbox 写不进去时 agent 仍可在下一轮
+    # 兜底轮询里从 events / PR 评论补上，反之亦然。
+    pushed = push_inbox_event(
+        args.pr, args.sha, tr, align, nxt, comment_id,
+        str(Path(args.log).resolve()) if args.log else "",
+    )
+    if pushed:
+        print(f"[deploy-report] 已唤醒 prod-agent next={nxt}", file=sys.stderr)
     return 0
 
 
