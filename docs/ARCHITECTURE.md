@@ -475,6 +475,8 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 
 **deploy-first 合并助手（2026-10-25 起）**：`scripts/blue_green/deploy_merge.py`（stdlib）负责 FF-only 合并前的 PR 校验与合并后复核；Gitea 配置复用 `deploy_report.py` 口径（`FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_REPO` / `DAILYCHECK_GITEA_TOKEN_FILE` / `DAILYCHECK_CURL`）。退出码 0/30/31/32/64，stdout 单行 JSON（`pr` / `sha` / `merged` / `merged_sha` / `reason`）。30 = 非快进（main 在验证期间被改动），31 = PR 前置不匹配，32 = API/token 失败。
 
+`deploy_pipeline.sh` 新增 `--candidate`：部署前 fetch `refs/pull/<pr>/head`，校验 `FETCH_HEAD == sha`、PR open/非 draft/base=main、且 sha 包含当前 `origin/main`，然后 `checkout --detach <sha>`。任一不满足 exit 25，不触碰蓝绿；失败清理把工作树恢复为 `origin/main`。
+
 **PR 兜底轮询**（`scripts/prod_agent/pr_poll.py`，2026-10-25 迁移）：
 
 webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人管」的通道，所以它自身的失败必须是可见的。

@@ -10,11 +10,14 @@
 #   --dry-run               只跑子脚本的 --dry-run，不 acquire / 不 release / 不碰流量
 #   --heartbeat-interval N  后台心跳间隔秒（默认 120，须明显小于锁 TTL 1800s）
 #   --sim-user / --sim-pass verify check 2 的探针账号（缺省沿用 env，再缺省自动生成）
+#   --candidate             候选模式：fetch PR head、校验包含 main、checkout 后再部署
+#   --merge-pr              观察窗通过后 FF-only 合并 PR（需与 --candidate 同用）
 #
 # 退出码:
 #   0  全链成功（deployed 锚点已推进）    64 参数/用法错误
 #   10 锁被占用（另一部署在跑）           11 acquire 失败
 #   20 up 失败   21 verify 失败   22 promote 失败   23 switch 失败   24 观察窗异常（已回滚）
+#   25 candidate 前置不满足               26 FF 合并失败（已回滚蓝）
 #
 # 为什么存在（2026-10-17 一天内四次同型故障）:
 #   在此之前编排由「Prod Agent 会话读 SKILL.md 现场拼命令」承担，漏洞是结构性的：
@@ -69,6 +72,10 @@ RELEASED=0
 DS_READY=0
 HB_PID=""
 FAIL_STAGE=""
+CANDIDATE=0
+MERGE_PR=0
+TREE_MOVED=0
+ORIG_REF=""
 
 log()  { printf '[pipeline] %s\n' "$*"; }
 die()  { local code=$1; shift; log "ERROR: $*"; exit "${code}"; }
@@ -97,9 +104,12 @@ usage() {
   --dry-run               只跑子脚本 --dry-run，不碰锁与流量
   --heartbeat-interval N  后台心跳间隔秒（默认 120）
   --sim-user / --sim-pass verify 探针账号（缺省沿用 env，再缺省自动生成）
+  --candidate             候选模式：fetch PR head、校验包含 main、checkout 后再部署
+  --merge-pr              观察窗通过后 FF-only 合并 PR（需与 --candidate 同用）
 
 退出码: 0 成功 / 64 参数错 / 10 锁被占 / 11 acquire 失败
         20 up / 21 verify / 22 promote / 23 switch / 24 观察窗异常（已回滚）
+        25 candidate 前置不满足 / 26 FF 合并失败（已回滚蓝）
 EOF
 }
 
@@ -113,6 +123,8 @@ while [[ $# -gt 0 ]]; do
     --sim-pass)           SIM_PASS="${2:-}"; shift 2 ;;
     --skip-verify)        SKIP_VERIFY=1; shift ;;
     --dry-run)            DRY_RUN=1; shift ;;
+    --candidate)          CANDIDATE=1; shift ;;
+    --merge-pr)           MERGE_PR=1; shift ;;
     -h|--help)            usage; exit 0 ;;
     -*)                   die 64 "未知选项: $1" ;;
     *)
@@ -136,6 +148,7 @@ elif [[ ! "${SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
   die 64 "SHA 无法解析且不像 commit sha：${SHA}"
 fi
 [[ -n "${SESSION}" ]] || SESSION="pipeline-${PR}"
+[[ "${MERGE_PR}" -eq 1 && "${CANDIDATE}" -eq 0 ]] && die 64 "--merge-pr 需要同时给 --candidate"
 
 log "PR #${PR} sha=${SHA:0:12} session=${SESSION} dry-run=${DRY_RUN} observe=${OBSERVE_MIN}min"
 log "log=${LOG}"
@@ -188,6 +201,9 @@ cleanup() {
   if [[ -n "${HB_PID}" ]] && kill -0 "${HB_PID}" 2>/dev/null; then
     kill -TERM "${HB_PID}" 2>/dev/null || true
     wait "${HB_PID}" 2>/dev/null || true
+  fi
+  if [[ "${TREE_MOVED}" -eq 1 && ${rc} -ne 0 ]]; then
+    _restore_main || true
   fi
   if [[ "${RELEASED}" -eq 0 && "${DS_READY}" -eq 1 ]]; then
     if [[ ${rc} -eq 0 ]]; then
@@ -256,6 +272,62 @@ run_stage() {
   return 0
 }
 
+# ---------------------------------------------------------------- 候选模式
+_merge_helper() {
+  local merger="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
+  "${PY}" "${merger}" "$@"
+}
+
+_restore_main() {
+  if git -C "${REPO_ROOT}" fetch --quiet origin main \
+     && git -C "${REPO_ROOT}" checkout --quiet -B main origin/main; then
+    TREE_MOVED=0
+    log "✓ 工作树已恢复到 origin/main"
+    return 0
+  fi
+  log "WARN: 恢复 origin/main 失败 —— 工作树可能不在已知好版本（${REPO_ROOT}）"
+  return 1
+}
+
+_prepare_candidate() {
+  log "→ candidate 前置校验 PR #${PR} sha=${SHA:0:12}"
+  if ! git -C "${REPO_ROOT}" fetch --quiet origin "refs/pull/${PR}/head"; then
+    log "✗ fetch refs/pull/${PR}/head 失败"
+    return 1
+  fi
+  local fetched
+  fetched="$(git -C "${REPO_ROOT}" rev-parse FETCH_HEAD 2>/dev/null || true)"
+  if [[ "${fetched}" != "${SHA}" ]]; then
+    log "✗ FETCH_HEAD=${fetched:0:12} 与传入 sha=${SHA:0:12} 不一致"
+    return 1
+  fi
+  if ! git -C "${REPO_ROOT}" fetch --quiet origin main; then
+    log "✗ fetch origin main 失败"
+    return 1
+  fi
+  if ! git -C "${REPO_ROOT}" merge-base --is-ancestor origin/main "${SHA}"; then
+    log "✗ 候选分支未包含 origin/main —— 先 rebase/merge main 再部署"
+    return 1
+  fi
+  if ! _merge_helper check --pr "${PR}" --sha "${SHA}" >>"${LOG}" 2>&1; then
+    log "✗ Gitea PR 前置校验失败（closed / draft / head sha 不符）"
+    return 1
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "dry-run：候选前置校验通过，不 checkout"
+    return 0
+  fi
+  ORIG_REF="$(git -C "${REPO_ROOT}" symbolic-ref --short -q HEAD \
+    || git -C "${REPO_ROOT}" rev-parse HEAD)"
+  if ! git -C "${REPO_ROOT}" checkout --quiet --detach "${SHA}"; then
+    log "✗ checkout ${SHA:0:12} 失败"
+    return 1
+  fi
+  TREE_MOVED=1
+  log "✓ candidate checkout ${SHA:0:12}（原 ref: ${ORIG_REF}）"
+  return 0
+}
+
 # ---------------------------------------------------------------- 观察窗
 observe_window() {
   local minutes=$1
@@ -309,6 +381,10 @@ observe_window() {
 # ---------------------------------------------------------------- 主链
 DRY_FLAG=""
 [[ "${DRY_RUN}" -eq 1 ]] && DRY_FLAG="--dry-run"
+
+if [[ "${CANDIDATE}" -eq 1 ]]; then
+  run_stage 25 candidate _prepare_candidate
+fi
 
 run_stage 20 up bash "${SCRIPT_DIR}/up.sh" "${PR}" "${SHA}" ${DRY_FLAG}
 
