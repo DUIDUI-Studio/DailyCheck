@@ -10,12 +10,15 @@
    ``1a1f9e2 chore: auto-commit after health check`` 已经这么干过一次，
    而 ``--delete`` 不处理排除项，光加 exclude 清不掉已经躺在生产目录的那份。
 
-本文件锁死四道防线，任何一道被回退都会打红：
+本文件锁死剩余防线，任何一道被回退都会打红：
 
-* CI 不把私钥写进打包工作区（临时文件 + trap 清理）；
 * CI 打包、rsync 切换、回滚代码备份三处排除清单都含 ``vps_key``；
 * 部署脚本在切换前显式删除历史残留；
 * ``.gitignore`` 挡住私钥类文件，``git add -A`` 收不进来。
+
+2026-10-25 起 ``ci.yml`` 的 deploy job 已移除（部署归 Prod Agent 蓝绿体系），
+CI 侧不再有私钥落盘路径；原先针对该 job 的两条用例随之删除，``deploy_vps.sh``
+作为应急手动路径仍由下方用例守护。
 """
 
 from __future__ import annotations
@@ -24,42 +27,8 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CI_YML = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 DEPLOY_SH = REPO_ROOT / "scripts" / "deploy_vps.sh"
 GITIGNORE = REPO_ROOT / ".gitignore"
-
-
-def _deploy_run_script() -> str:
-    """取出 ci.yml 里 deploy job 的脚本段。
-
-    deploy 是 jobs 里的最后一个 job，取它到文件末尾即可。这里不引 yaml：
-    CI 只装 ``requirements.txt``，里面没有 pyyaml——本地装了、CI 没装的依赖
-    会让这些用例在本地绿、CI 红（2026-10-24 本文件首版就踩了这个坑）。
-    """
-    text = CI_YML.read_text(encoding="utf-8")
-    idx = text.index("\n  deploy:")
-    return text[idx:]
-
-
-def test_ci_writes_key_outside_workspace() -> None:
-    """私钥必须落在工作区之外，且退出即删。"""
-    script = _deploy_run_script()
-
-    # 反面：把 secret 重定向到工作区里的相对路径（vps_key / ./vps_key 都算）
-    assert not re.search(r">\s*\./?vps_key\b", script), (
-        "ci.yml 又把私钥写回了工作区根目录（Issue #9 的原始写法），"
-        "打包会把它一起带走"
-    )
-    assert "mktemp" in script, "私钥应写到 mktemp 临时文件，不要落在仓库目录里"
-    assert "trap" in script, "临时私钥必须用 trap 在退出时删除"
-
-
-def test_ci_tar_excludes_vps_key() -> None:
-    """即使工作区里有残留的 vps_key，打包也不能带走。"""
-    script = _deploy_run_script()
-    assert "--exclude='vps_key'" in script or '--exclude="vps_key"' in script, (
-        "ci.yml 的 tar 打包缺 vps_key 排除项"
-    )
 
 
 def test_deploy_rsync_excludes_credentials() -> None:

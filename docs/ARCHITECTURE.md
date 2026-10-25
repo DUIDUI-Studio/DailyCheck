@@ -128,12 +128,14 @@ flowchart LR
 ```mermaid
 flowchart LR
     Gitea["Gitea Actions<br/>(hub1 · .github/workflows/ci.yml)"]
+    ProdAgent["Prod Agent (VPS)<br/>scripts/blue_green/deploy_pipeline.sh"]
     VPS["VPS 112.124.18.246:33756 root<br/>/root/DailyCheck"]
     Gunicorn["gunicorn -w 2 --threads 4<br/>-b 127.0.0.1:8090 app:app<br/>(**非 wdg-systemd**)"]
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    Gitea -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
+    Gitea -->|CI 门禁 + status webhook<br/>（不再触发部署）| ProdAgent
+    ProdAgent -->|蓝绿部署（§3.4）| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -148,7 +150,7 @@ flowchart LR
 | **进程管理器** | systemd in container | gunicorn -D（无 systemd） |
 | **Flask reload** | `--debug` 自动 reload | 无 |
 | **MCP 进程** | systemd unit | **未部署**（MCP 只在 dev 跑） |
-| **部署方式** | mount + edit | `ci.yml` test 通过后走 `scripts/deploy_vps.sh`：sqlite 热备全库 + 代码备份 → rsync 切换（`*.db`/log/venv 永不触碰）→ `flask migrate up` → systemd 重启 → `/health` 探活 → 失败自动回滚代码并重启。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑）。**凭据类文件（`vps_key`/`*.pem`）双向排除**：CI 侧面把私钥写到 `mktemp` 临时文件（不在打包目录内），打包与 rsync 两侧各自再排除一次，切换前显式 `rm -f $APP_DIR/vps_key` 清历史残留——rsync `--delete` 不处理排除项（Issue #9，2026-10-24） |
+| **部署方式** | mount + edit | **Prod Agent 蓝绿部署**（§3.4：`deploy_pipeline.sh` → up/verify/promote/switch/观察窗；2026-10-25 起 deploy-first：验证通过后 FF-only merge）。`scripts/deploy_vps.sh` 保留为**应急手动路径**（sqlite 热备 + rsync + migrate + 重启 + 探活 + 失败回滚），CI 不再调用（`f293746` 移除 deploy job）。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑）。**凭据类文件（`vps_key`/`*.pem`）双向排除**：打包与 rsync 两侧各自再排除一次，切换前显式 `rm -f $APP_DIR/vps_key` 清历史残留——rsync `--delete` 不处理排除项（Issue #9，2026-10-24） |
 | **备份/DR** | 无 | `scripts/backup_all.sh`（cron 每日，integrity_check + tar + 可选异地）+ `scripts/verify_restore.sh`（每周还原演练）+ `docs/runbook-dr.md`（RPO=24h/RTO=1h） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
@@ -473,6 +475,16 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 - **best-effort**：Gitea 不可达 / token 缺失 / `deploy_report.py` 文件缺失都只 WARN。这是收尾路径 —— 让回写失败把一次成功部署变成红，本末倒置。**评论写失败也照样投事件**：事件是 agent 唯一入口，Gitea 抖动不该让一次部署失败凭空消失。评论与唤醒队列各自独立失败：inbox 写不进去时，agent 仍能在下一轮兜底轮询里从事件文件 / PR 评论补上。`DAILYCHECK_DEPLOY_REPORT=0` 整体关闭（含事件与唤醒）。
 - **配置**：`DAILYCHECK_GITEA_TOKEN_FILE`（默认 `/etc/dailycheck/gitea-token`，0600）、`FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_REPO`（复用 §3.10 口径）、`DAILYCHECK_DEPLOY_EVENT_LOG`（默认 `/var/lib/dailycheck-deploy/events.jsonl`）、`DAILYCHECK_PROD_AGENT_INBOX`（默认 `/var/lib/dailycheck-prod-agent/inbox.jsonl`）、`DAILYCHECK_CURL`（测试注入 fake）。
 
+**deploy-first 合并助手（2026-10-25 起）**：`scripts/blue_green/deploy_merge.py`（stdlib）负责 FF-only 合并前的 PR 校验与合并后复核；Gitea 配置复用 `deploy_report.py` 口径（`FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_REPO` / `DAILYCHECK_GITEA_TOKEN_FILE` / `DAILYCHECK_CURL`）。退出码 0/30/31/32/64，stdout 单行 JSON（`pr` / `sha` / `merged` / `merged_sha` / `reason`）。30 = 非快进（main 在验证期间被改动），31 = PR 前置不匹配，32 = API/token 失败。
+
+`deploy_pipeline.sh` 新增 `--candidate`：部署前 fetch `refs/pull/<pr>/head`，校验 `FETCH_HEAD == sha`、PR open/非 draft/base=main、且 sha 包含当前 `origin/main`，然后 `checkout --detach <sha>`。任一不满足 exit 25，不触碰蓝绿；失败清理把工作树恢复为 `origin/main`。
+
+新增 `--merge-pr`：观察窗通过后、`release success` 之前调 `deploy_merge.py merge`；FF 失败（main 在验证期间被改动）先 `switch.sh blue 100` 回滚，再 exit 26。成功路径 `fetch origin main` + `checkout -B main origin/main`，保证本地树与远端 main 一致。
+
+归因：rc 25（候选前置不满足）与 rc 26（FF 合并失败）均映射 `KIND_ENV` / `SCOPE_OUT` / `NEXT_ENVFIX`，`stage=candidate` / `merge` 写入事件流；两者都不授权改 PR 代码。
+
+`deploy_report.changed_files()` 候选感知：sha 已合入 `origin/main` 时用 `sha^1..sha`；否则用 `merge-base(origin/main, sha)..sha`，保证 deploy-first 下 autofix 能看到整个 PR 的改动。
+
 **PR 兜底轮询**（`scripts/prod_agent/pr_poll.py`，2026-10-25 迁移）：
 
 webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人管」的通道，所以它自身的失败必须是可见的。
@@ -482,8 +494,10 @@ webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人�
 - **静默语义不变**（skill `no-agent-cron-script-pattern`）：全部无事 → 零 stdout（cron 收空 → 不投递）；有 PR / 有部署欠账 → 输出块。**失败一律出声**：token 读不到、HTTP 非 200、返回非数组、单个 PR 的 status 查不到，都必须落成可见告警 —— 尤其「返回对象而不是数组」不能当成「没有 PR」静默放过。
 - **状态码不能跟着响应体一起丢**：响应体不是 JSON（nginx 502 页、Gitea 明文报错）时仍要报出真实 HTTP code —— 告警里 `HTTP 502` 和 `HTTP 0` 的排查方向完全不同。
 
-**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（40 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（10min / 0min → `observe-window-shortened`、30min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
-+ `tests/test_deploy_report.py`（62 用例：归因十态（含 `verify-drift` 优先于 rc、DRY_RUN BLOCKED 判 out-of-scope）/ 需求解析（加粗 `**R-001**` 与下划线标识符 `DRY_RUN` 不得被误洗）/ 对齐四态（含「无需求条目即挡住自动化」）/ **动作授权表逐格覆盖 + autofix 上界 + 「不存在面向人的动作」的穷举守卫** / 脱敏两形态 / 渲染含标记与 `下一步` 行且不漏明文凭据 / CLI write 的 POST 新建·同 sha PATCH 幂等·Gitea 500 仍 rc 0·`DAILYCHECK_DEPLOY_REPORT=0` 关闭·**失败时除 Gitea 外不得打任何外部端点**（守着「不再推企微」）/ **事件流四例**（自包含字段、Gitea 挂了仍投递、半行 JSON 不废熔断计数、开关关闭不投）/ **唤醒队列七例**（字段自包含且平铺、**必须过 watcher 的 repo 与 action 两道静默过滤**、成功也投、inbox 写失败不影响 rc 与事件流、路由脚本必须有 `deploy_result` 分支且保留默认分支）/ **aligned 端到端给 autofix**（真 git 仓库 + 日志命中改动文件，防映射表对而 write 传错参）/ assess 退出码 / **pipeline 集成三例**（verify 失败后 rc 仍为 21 且真发出评论、`deploy_report.py` 缺失只 WARN、开关生效））。
+**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（49 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（10min / 0min → `observe-window-shortened`、30min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
++ `tests/test_deploy_report.py`（66 用例：归因十态（含 `verify-drift` 优先于 rc、DRY_RUN BLOCKED 判 out-of-scope）/ 需求解析（加粗 `**R-001**` 与下划线标识符 `DRY_RUN` 不得被误洗）/ 对齐四态（含「无需求条目即挡住自动化」）/ **动作授权表逐格覆盖 + autofix 上界 + 「不存在面向人的动作」的穷举守卫** / 脱敏两形态 / 渲染含标记与 `下一步` 行且不漏明文凭据 / CLI write 的 POST 新建·同 sha PATCH 幂等·Gitea 500 仍 rc 0·`DAILYCHECK_DEPLOY_REPORT=0` 关闭·**失败时除 Gitea 外不得打任何外部端点**（守着「不再推企微」）/ **事件流四例**（自包含字段、Gitea 挂了仍投递、半行 JSON 不废熔断计数、开关关闭不投）/ **唤醒队列七例**（字段自包含且平铺、**必须过 watcher 的 repo 与 action 两道静默过滤**、成功也投、inbox 写失败不影响 rc 与事件流、路由脚本必须有 `deploy_result` 分支且保留默认分支）/ **aligned 端到端给 autofix**（真 git 仓库 + 日志命中改动文件，防映射表对而 write 传错参）/ assess 退出码 / **pipeline 集成三例**（verify 失败后 rc 仍为 21 且真发出评论、`deploy_report.py` 缺失只 WARN、开关生效））。
++ `tests/test_deploy_merge.py`（14 用例：FF-only 合并助手 —— open/closed/draft/sha 不符/base 非 main 前置、FF 成功 payload 必须是 `{"do":"fast-forward-only"}`、405 → rc 30、500/非 JSON/未标记 merged → rc 32、token 缺失 → rc 32、dry-run 不 POST、输出不含 token；fake curl 响应队列，不触网）。
++ **2026-10-25 deploy-first 新增**：`test_deploy_pipeline.py` 9 例（候选前置 rc 25 不触蓝绿 / checkout 先于 up / dry-run 不 checkout / 失败恢复 `origin/main` / merge 在 switch 后 release 前 / merge 失败切蓝 rc 26 / `--merge-pr` 缺 `--candidate` 用法错）；`test_deploy_report.py` 4 例（rc 25/26 归因、`changed_files` 候选感知）。
 + `tests/test_pr_poll.py`（12 用例：无 open PR 与单飞未初始化均静默 / PR 清单含 head·mergeable·draft / 未过 context 逐条列出且不混入已过项 / 多 PR 全列 / token 缺失·HTTP 非 200·返回非数组·单 PR status 查不到全部**出声** / `main()` 兜住未捕获异常（异常必须变可见告警，不能变成空输出）/ 薄包装的 `TARGET` 指向真实存在的文件）。
 
 ---
@@ -1940,9 +1954,8 @@ flowchart TB
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
 - `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
 - **防假绿（2026-10-11 起）**：门禁对 pytest 收集错误 / 空输出 / 0 passed 一律拒绝放行（收集错误不产生 FAILED 行，坏依赖曾致门禁空过假绿）。测试三方依赖（如 openpyxl）必须进 requirements.txt。
-- `deploy` job `needs: test`：CI 不过不部署（PR 触发不部署）。
-- **生产部署触发（2026-10-11 起）**：仅 `workflow_dispatch` 手动执行，push main **不**自动部署。启用自动部署的前置条件：至少一次手动 `workflow_dispatch` 演练跑通。
-  - 2026-10-24 修订：原列「备份 cron + 异地副本」已移除。备份 cron 早已在运行（每日 03:00，保留 7 天）；部署流程不触碰数据库，`deploy_vps.sh` 自身在切换前即做库快照与代码备份；异地副本属独立容灾议题，与能否启用自动部署无因果关系。
+- **部署 job 已移除（2026-10-25，`f293746`）**：CI 只做门禁与通知；生产部署归 Prod Agent 蓝绿（§3.4/§3.8）。`scripts/deploy_vps.sh` 保留为应急手动路径，CI 不再调用。
+- **artifact 上传不阻塞门禁（2026-10-26）**：Gitea 的 `upload-artifact@v4` 会报 `GHESNotSupportedError`（2026-10-25 PR #48 实测：pytest 与零新增门禁全绿，却被上传步骤判红），两处上传步骤均加 `continue-on-error: true`；reports job 下载失败时由 `generate_reports.sh` 重跑 pytest 兜底。
 - **`agent-framework-reports` 门禁（2026-10-15 起）**：`check_reports.py` 要求 PR body 含 h2「报告 1/4」「Checklist」「生产侧事项」三段且无未消解 ❌；CI 读事件时刻 body 快照，事后补 body 须推空 commit。
 
 **测试的环境无关性（2026-10-15 起，Issue #44）**：用例结果不得取决于「在哪台机器上跑」。最脆的一维是**宿主 systemd**：`switch.sh` 的 DRY_RUN 守卫（PR #42）以 `systemctl show -p MainPID / -p Environment --value <unit>` 取证，于是 dev/CI（**无可用 systemd** —— dev 机没有 `systemctl` 命令；CI 镜像有该命令，但 systemd 未作 PID 1 致取证为空；两者都判「无法判定」→ 仅告警放行）与生产 VPS（`dailycheck-green.service` 固定 `Environment=DRY_RUN=true`，绿未「转正」→ 按设计 `exit 3` 拒跑）结论相反 —— 同一批 `test_blue_green_implementation.py` 用例在 prod 全红、在 dev/CI 全绿（Issue #44 现场 = 跑 `verify.sh` 时 check 1 报 5 个 fail）。**约定**：凡调用 `scripts/blue_green/*.sh` 的用例，必须把宿主 systemd 态**显式钉死**，不许默认「本机没有 systemctl」。`test_blue_green_implementation.py` 用模块级 autouse fixture `_fake_systemctl` 前置 fake `systemctl`（`Environment` 恒 `DRY_RUN=false` =「绿转正后的合法生产态」→ 守卫判 `not_dry_run` 放行），使用例回到「验证切流量动作本身」的原始意图；守卫自身行为由 `test_blue_green_dryrun_guard.py` 专项覆盖（该文件自建按 unit 注入 `Environment` 的 fake）。两处 fake 均只接管 `show`，其余子命令 `exit 0`，故 `journalctl` 等真命令缺失仍能让 `verify.sh` 的失败路径用例保持原语义。
@@ -2139,6 +2152,7 @@ with app.test_client() as c, c.session_transaction() as s:
 ### 部署 / 运维
 
 - [`scripts/blue_green/README.md`](../scripts/blue_green/README.md) — 蓝绿部署操作手册（6 脚本用法 / 验证矩阵 / **「绿转正」标准步骤**，2026-10-15 事故后增补）
+- [`docs/superpowers/specs/2026-10-25-deploy-before-merge-design.md`](superpowers/specs/2026-10-25-deploy-before-merge-design.md) — deploy-first 设计稿（2026-10-25：候选部署 → verify/切流/观察 → FF-only merge）
 
 ### 业务领域
 
