@@ -707,3 +707,56 @@ def test_pipeline_report_can_be_disabled(pipeline_sandbox, tmp_path):
     )
     assert proc.returncode == 21
     assert "已写回" not in proc.stdout
+
+
+# ---------------------------------------------------------------- changed_files
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    )
+
+
+@pytest.fixture()
+def git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "T")
+    (repo / "base.py").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "base.py")
+    _git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def test_changed_files_candidate_uses_merge_base(git_repo):
+    base = _git(git_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(git_repo, "update-ref", "refs/remotes/origin/main", base)
+    _git(git_repo, "checkout", "-qb", "feat")
+    (git_repo / "a.py").write_text("a\n", encoding="utf-8")
+    _git(git_repo, "add", "a.py")
+    _git(git_repo, "commit", "-qm", "a")
+    (git_repo / "b.py").write_text("b\n", encoding="utf-8")
+    _git(git_repo, "add", "b.py")
+    _git(git_repo, "commit", "-qm", "b")
+    head = _git(git_repo, "rev-parse", "HEAD").stdout.strip()
+
+    files = deploy_report.changed_files(str(git_repo), head)
+
+    assert set(files) == {"a.py", "b.py"}, files
+
+
+def test_changed_files_merged_uses_first_parent(git_repo):
+    _git(git_repo, "checkout", "-qb", "feat")
+    (git_repo / "a.py").write_text("a\n", encoding="utf-8")
+    _git(git_repo, "add", "a.py")
+    _git(git_repo, "commit", "-qm", "a")
+    _git(git_repo, "checkout", "main")
+    _git(git_repo, "merge", "--no-ff", "-m", "merge feat", "feat")
+    merge_sha = _git(git_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(git_repo, "update-ref", "refs/remotes/origin/main", merge_sha)
+
+    files = deploy_report.changed_files(str(git_repo), merge_sha)
+
+    assert set(files) == {"a.py"}, files
