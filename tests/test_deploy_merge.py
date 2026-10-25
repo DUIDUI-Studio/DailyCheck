@@ -182,3 +182,7 @@ def test_token_never_appears_in_output(fake):
     fake["respond"]({"code": 200, "body": _pr()})
     proc = _run("check", "--pr", "42", "--sha", SHA)
     assert "test-token" not in proc.stdout + proc.stderr
+
+
+def test_usage_error_returns_64(fake):
+    assert _run("merge", "--pr", "42").returncode == 64

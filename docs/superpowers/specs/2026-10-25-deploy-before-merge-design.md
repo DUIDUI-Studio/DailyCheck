@@ -41,12 +41,12 @@ CI 全绿（PR head sha）
        checkout --detach <sha>
        up → verify 八项 → promote → switch 5/50/100 → 观察窗 30min
        FF-only merge PR（POST /pulls/<N>/merge {"do":"fast-forward-only"}）
-       git checkout main（此时 main == 已验证 sha）
+       git fetch origin main && git checkout -B main origin/main（本地 main 对齐远端）
        release success（deployed.sha = sha）
   → Gitea 按 Closes #N 自动关 issue（发生在验证通过之后）
 ```
 
-失败路径（任一步红）：`switch.sh blue 100`（若已切流）→ `git checkout main` 恢复工作树 → `release failed` → PR 保持 open，`deploy_report` 的 autofix 直接在原 PR 上工作。
+失败路径（任一步红）：`switch.sh blue 100`（若已切流）→ `git fetch origin main && git checkout -B main origin/main` 恢复工作树 → `release failed` → PR 保持 open，`deploy_report` 的 autofix 直接在原 PR 上工作。
 
 ### 3.2 三条硬约束
 
@@ -70,7 +70,7 @@ C1 不放进 CI：放 CI 会要求每个 PR 在 CI 前保持最新，制造频�
 
 新增两个显式开关（默认关闭，保持旧行为可回退）：
 
-- `--candidate`：启用候选模式。前置步骤在 acquire 之后、幂等检查之前：
+- `--candidate`：启用候选模式。前置步骤在 acquire 之后、主链 `up` 之前（幂等检查仍在 acquire 之前，不受影响）：
   1. `git -C "$REPO_ROOT" fetch origin refs/pull/<PR>/head`
   2. 校验 `FETCH_HEAD == SHA`，否则 exit 25
   3. `git fetch origin main` + `git merge-base --is-ancestor origin/main "$SHA"`，否则 exit 25
@@ -80,8 +80,8 @@ C1 不放进 CI：放 CI 会要求每个 PR 在 CI 前保持最新，制造频�
 
 cleanup 扩展：
 
-- `TREE_MOVED=1` 且 `rc != 0` → `git checkout main`（恢复已知好代码），失败只 WARN。
-- 成功路径在 merge 后 `git checkout main`，并断言 `HEAD == SHA`（FF 后 main 就是该 sha）。
+- `TREE_MOVED=1` 且 `rc != 0` → `git fetch origin main && git checkout -B main origin/main`（恢复已知好代码），失败只 WARN。
+- 成功路径在 merge 后 `git fetch origin main && git checkout -B main origin/main`，并断言 `HEAD == SHA`（FF 后远端 main 就是该 sha）。
 - `--dry-run` 下只做 C1/PR 校验，不 checkout、不 merge。
 
 现有 `deploy_state` acquire/release、心跳、F1 漂移守卫、观察窗逻辑不动。
@@ -103,7 +103,7 @@ stdlib-only 的 FF 合并助手，复用 `deploy_report.py` 的 Gitea 配置口�
 - `rc 26`（FF 合并失败）→ `KIND_ENV` / `SCOPE_OUT` / `NEXT_ENVFIX`，理由「main 在验证期间被改动，已回滚，重跑」。
 - `stage="candidate"` / `stage="merge"` 写入事件流与 PR 评论。
 
-`deploy_report.py` 无需结构改动，沿用 `triage()` 的输出。
+`deploy_report.py` 的 `changed_files()` 改为候选感知：若 `SHA` 已合入 `origin/main`，保持 `SHA^1..SHA`（merge commit 语义）；否则用 `merge-base(origin/main, SHA)..SHA`，让「本 PR 改了哪些文件」在 deploy-first 下仍然完整（否则 autofix 只看到最后一个 commit 的改动）。
 
 ### 4.4 文档同步（同一实施 PR）
 

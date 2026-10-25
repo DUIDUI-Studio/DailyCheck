@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# blue_green/deploy_pipeline.sh —— merge 后的端到端部署编排（单命令）
+# blue_green/deploy_pipeline.sh —— 端到端部署编排（单命令；merge 后 / deploy-first 候选）
 #
 # 用法: ./scripts/blue_green/deploy_pipeline.sh <pr-num> <commit-sha> [选项]
 #

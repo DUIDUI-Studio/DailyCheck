@@ -116,7 +116,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--sha", required=True)
         if name == "merge":
             p.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 64 if exc.code == 2 else int(exc.code or 0)
 
     if args.cmd == "check":
         rc, out = cmd_check(args.pr, args.sha)

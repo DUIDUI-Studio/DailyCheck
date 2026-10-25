@@ -7,7 +7,7 @@
 #
 # 默认实现指向 Hermes 的 webhook 订阅（VPS 上的 agent 框架；示例，非指定），
 # 按事件类型路由到三个订阅：
-#   check_suite   → dailycheck-ci      （CI 完成快通道：全绿即触发 merge 判定；
+#   check_suite   → dailycheck-ci      （CI 完成快通道：全绿即触发候选部署判定；
 #                                       prompt 内置 [SILENT] 静默语义，避免中间态打扰）
 #   deploy_result → dailycheck-deploy  （蓝绿部署结束：带 rc/stage/verdict/next，
 #                                       agent 按 next 查表动手，不看日志猜）

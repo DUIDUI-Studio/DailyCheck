@@ -223,6 +223,10 @@ def test_token_never_appears_in_output(fake):
     fake["respond"]({"code": 200, "body": _pr()})
     proc = _run("check", "--pr", "42", "--sha", SHA)
     assert "test-token" not in proc.stdout + proc.stderr
+
+
+def test_usage_error_returns_64(fake):
+    assert _run("merge", "--pr", "42").returncode == 64
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -353,7 +357,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--sha", required=True)
         if name == "merge":
             p.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 64 if exc.code == 2 else int(exc.code or 0)
 
     if args.cmd == "check":
         rc, out = cmd_check(args.pr, args.sha)
@@ -370,7 +377,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `pytest tests/test_deploy_merge.py -v`
-Expected: 13 passed
+Expected: 14 passed
 
 Run: `ruff check scripts/blue_green/deploy_merge.py tests/test_deploy_merge.py`
 Expected: All checks passed
