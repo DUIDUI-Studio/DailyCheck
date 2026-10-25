@@ -733,7 +733,7 @@ def test_merge_runs_after_switch_and_before_release(candidate_sandbox):
     ], calls
     assert calls[0].startswith("merge_helper check")
     assert calls[-1].startswith("merge_helper merge")
-    assert _state(sb)["deployed"] == sb["sha"]
+    assert _state(sb)["deployed"]["sha"] == sb["sha"]
     assert _branch(sb) == "main"
     assert _head(sb) == sb["sha"]
 

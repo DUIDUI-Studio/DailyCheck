@@ -328,6 +328,29 @@ _prepare_candidate() {
   return 0
 }
 
+_merge_candidate() {
+  log "→ FF 合并 PR #${PR}"
+  local out rc
+  out="$(_merge_helper merge --pr "${PR}" --sha "${SHA}" 2>&1)"
+  rc=$?
+  printf '%s\n' "${out}" >>"${LOG}"
+  if [[ ${rc} -ne 0 ]]; then
+    log "✗ FF 合并失败 rc=${rc}：${out}"
+    log "  回滚流量到蓝，main 不动"
+    bash "${SCRIPT_DIR}/switch.sh" blue 100 >>"${LOG}" 2>&1 \
+      || log "WARN: 回滚蓝失败，见 ${LOG}"
+    return 1
+  fi
+  log "✓ FF 合并完成：${out}"
+  _restore_main || true
+  local head
+  head="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  if [[ "${head}" != "${SHA}" ]]; then
+    log "WARN: 合并后本地 HEAD=${head:0:12} != ${SHA:0:12}（远端 main 已正确，下次部署会重新 fetch）"
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------- 观察窗
 observe_window() {
   local minutes=$1
@@ -461,6 +484,11 @@ if [[ "${OBSERVE_MIN}" -lt "${OBSERVE_MIN_REQUIRED}" ]]; then
 fi
 
 observe_window "${OBSERVE_MIN}"
+
+if [[ "${MERGE_PR}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
+  run_stage 26 merge _merge_candidate
+fi
+
 _release success
 
 # ---------------------------------------------------------------- 仪表盘钩子

@@ -803,3 +803,41 @@ def test_candidate_up_failure_restores_main(candidate_sandbox):
     assert proc.returncode == 20
     assert _branch(sb) == "main"
     assert _head(sb) == sb["base"]
+
+
+def test_merge_runs_after_switch_and_before_release(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(
+        sb, "42", sb["sha"], "--candidate", "--merge-pr", "--observe-min", "0",
+        **_cand_env(sb),
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = _calls(sb)
+    names = [c.split()[0] for c in calls]
+    assert names == [
+        "merge_helper", "up.sh", "verify.sh", "promote.sh", "switch.sh", "merge_helper"
+    ], calls
+    assert calls[0].startswith("merge_helper check")
+    assert calls[-1].startswith("merge_helper merge")
+    assert _state(sb)["deployed"]["sha"] == sb["sha"]
+    assert _branch(sb) == "main"
+    assert _head(sb) == sb["sha"]
+
+
+def test_merge_failure_rolls_back_blue(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(
+        sb, "42", sb["sha"], "--candidate", "--merge-pr", "--observe-min", "0",
+        **_cand_env(sb, FAKE_MERGE_RC="30"),
+    )
+
+    assert proc.returncode == 26
+    assert _calls(sb)[-1] == "switch.sh blue 100"
+    assert _state(sb)["deployed"] is None
+    assert _branch(sb) == "main"
+
+
+def test_merge_pr_without_candidate_is_usage_error(sandbox):
+    proc = _pipe(sandbox, "42", SHA, "--merge-pr")
+    assert proc.returncode == 64
