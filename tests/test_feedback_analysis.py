@@ -372,6 +372,86 @@ def test_chat_maps_http_error_to_llm_error(monkeypatch):
     assert "429" in str(exc.value)
 
 
+class _FakeResponse:
+    """最小 urlopen 替身：只要能当上下文管理器 + read 就行。"""
+
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def _stub_reply(monkeypatch, payload):
+    """让 ``urlopen`` 直接吐指定 JSON（全程不出网）。"""
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_API_KEY", "k")
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_BASE_URL", "https://llm.test")
+    monkeypatch.setattr(
+        feedback_llm.urllib.request, "urlopen", lambda *_a, **_k: _FakeResponse(payload))
+
+
+def test_chat_returns_content(monkeypatch):
+    _stub_reply(monkeypatch, {
+        "choices": [{"finish_reason": "stop",
+                     "message": {"role": "assistant", "content": '{"summary": "ok"}'}}],
+    })
+    assert feedback_llm._chat([{"role": "user", "content": "x"}]) == '{"summary": "ok"}'
+
+
+def test_chat_reports_truncation_not_structure_error(monkeypatch):
+    """推理模型吃光 max_tokens 时 message 里**没有 content 键**。
+
+    生产 ticket 9 就是这样降级的：原先按 KeyError 一律报「响应结构不可解析」，
+    把「预算不够」伪装成「上游返回物怪异」，排查被引向错误方向。
+    """
+    _stub_reply(monkeypatch, {
+        "choices": [{"finish_reason": "length",
+                     "message": {"role": "assistant", "reasoning_content": "推推推"}}],
+        "usage": {"completion_tokens_details": {"reasoning_tokens": 1599}},
+    })
+    with pytest.raises(feedback_llm.LLMError) as exc:
+        feedback_llm._chat([{"role": "user", "content": "x"}])
+    msg = str(exc.value)
+    assert "截断" in msg and "max_tokens" in msg
+    assert "1599" in msg, "必须报出实际 reasoning 用量，否则没法判断要不要再抬预算"
+    assert "响应结构不可解析" not in msg
+
+
+def test_chat_reports_empty_content_with_finish_reason(monkeypatch):
+    """content 存在但为空、finish_reason 正常 —— 是另一类问题，不能混报截断。"""
+    _stub_reply(monkeypatch, {
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "  "}}],
+    })
+    with pytest.raises(feedback_llm.LLMError) as exc:
+        feedback_llm._chat([{"role": "user", "content": "x"}])
+    assert "空内容" in str(exc.value) and "stop" in str(exc.value)
+
+
+def test_chat_still_rejects_broken_structure(monkeypatch):
+    """真·结构异常（无 choices / 空列表）仍归到不可解析，语义不能糊掉。"""
+    for payload in ({"error": "boom"}, {"choices": []},
+                    {"choices": [{"message": "not-a-dict"}]}):
+        _stub_reply(monkeypatch, payload)
+        with pytest.raises(feedback_llm.LLMError) as exc:
+            feedback_llm._chat([{"role": "user", "content": "x"}])
+        assert "响应结构不可解析" in str(exc.value), payload
+
+
+def test_output_budget_covers_reasoning_tokens():
+    """守着预算别再被改回「正文够用」的 1600。
+
+    实测同一张单 reasoning 要 3325 tokens 才收敛，4096 都不够。这条用例的存在
+    意义是：下次有人觉得「回复才 1800 字符，1600 够了」时会被挡住。
+    """
+    assert feedback_llm.MAX_OUTPUT_TOKENS >= 8192
+
+
 def test_analyze_parses_model_reply(monkeypatch):
     monkeypatch.setattr(
         feedback_llm, "_chat", lambda _msgs: json.dumps(GOOD, ensure_ascii=False))
