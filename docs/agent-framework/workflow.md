@@ -1,6 +1,6 @@
 # DailyCheck Agent 协作工作流
 
-> 版本：2026-10-15 定稿（Eric 口述对齐 + 实况核对；同日二次修订——push 政策放开、merge 政策改为 Prod 判定）。
+> 版本：2026-10-15 定稿（Eric 口述对齐 + 实况核对；同日二次修订——push 政策放开、merge 政策改为 Prod 判定）。2026-10-25 修订——新增 §四「merge 后删除源分支」与 §三批量清理豁免（Eric 拍板）。
 > 新/旧 agent session 接入本机制的提示词见 [`session-bootstrap.md`](session-bootstrap.md)。
 > 本文档是 Dev / Prod / Owner 三方协作的权威口径；与本文冲突的口头约定以本文为准。
 > 机制细节的演进史见 `docs/agent-framework/v0.1.md`。
@@ -132,6 +132,7 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 
 - **普通 `git push`（新分支/已有分支推进）不再需要 owner 事先确认。**
 - 仍需 owner 单独确认的操作：`--force` / `--force-with-lease`、删除远程分支、改分支保护规则。
+- 豁免（2026-10-25 Eric 拍板）：`scripts/cleanup-merged-branches.sh` 的**批量清理**（只删已合入 main 的分支，merge-base 判定）视为已获授权，脚本内 `--no-verify` 即本次拍板的凭证姿势。单条手动删分支仍需逐次确认。
 - pre-push hook（`core.hooksPath` → `~/.workbuddy/git-hooks`）2026-10-19 起是**黑名单**：只拦「删除远程分支」和「非快进覆盖」，新分支/快进照常放行。
   仍建议 `git push --no-verify`（避开 hook 里的网络调用），但不再强制。
 
@@ -200,6 +201,7 @@ Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 1. 确认 CI 两必需 check 全绿（test + agent-framework-reports）
 2. 读 PR 的「报告 1/4」（根因/取舍/不在范围）与「生产侧事项」，**用自己的生产视角评估**：变更类别、影响面、部署风险是否有未声明项
 3. 有异议 → 不 merge，PR 评论打回 + 开 Issue 转 Dev；无异议 → merge 并按 §五 部署
+4. **merge 后删除源分支**（本地 + 远程，2026-10-25 Eric 拍板）：工作已并入 main，留着分支只会污染列表、误导后续判断。Gitea PR 界面勾选「合并后删除分支」或手动删除；漏删的存量用 `scripts/cleanup-merged-branches.sh` 批量清理（只删已合入 main 的分支，安全）。注意：merge 用的 API `POST /pulls/{num}/merge` 不删分支，删除是独立的 `DELETE /repos/{o}/{r}/branches/{branch}`
 
 红线清单——以下 PR 仍须上报 owner 拍板，Prod Agent 不得自行 merge：
 
