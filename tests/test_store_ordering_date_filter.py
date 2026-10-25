@@ -20,7 +20,11 @@
    —— `/store-ordering/admin/orders`（平台）、`/store-ordering/review`（DC）、
    `/store-ordering/orders`（门店「我的订单」）；三者共用 `list_orders()`，
    但各带不同的范围裁剪，必须逐条验
-6. `count_orders_by_status()` 与 `list_orders()` 口径一致（页签计数不因本次修复漂移）
+6. `count_orders_by_status()` 的计数口径不因本次修复漂移
+
+⚠️ 页签计数**不吃日期条件**（`count_orders_by_status()` 签名没有 start/end，
+`_render_order_board()` 也没传）—— 带日期筛选时列表是区间内订单、页签仍是全时段
+计数。这是**既有行为，本次未改**（改它属产品口径变更），本文件只锁「不改坏」。
 """
 from __future__ import annotations
 
@@ -89,6 +93,7 @@ def _order_nos(orders: list[dict]) -> set[str]:
 @pytest.fixture()
 def seeded_master(tmp_path, monkeypatch):
     """master 里预置五张不同日期的订单 + users / warehouses（JOIN 存在是本 bug 的前提）。"""
+    import config as config_module
     import db as db_module
     from db import init_master_db
 
@@ -96,10 +101,12 @@ def seeded_master(tmp_path, monkeypatch):
     wh_dir = tmp_path / "warehouses"
     wh_dir.mkdir()
 
-    # 只 patch db 模块的全局（init_master_db 在调用期读模块全局，patch 生效）。
-    # config 侧不必动 —— 纯层用例不经 Flask app，不读 config。
+    # 与 tests/conftest.py 的夹具同口径：db 与 config 两侧都 patch。
+    # 纯层用例其实只经 db 侧，但一侧漏 patch 时，将来往这里挂路由用例就会写真实库。
     monkeypatch.setattr(db_module, "MASTER_DB", master_path)
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_dir)
+    monkeypatch.setattr(config_module, "MASTER_DB", master_path)
+    monkeypatch.setattr(config_module, "WAREHOUSE_DB_DIR", wh_dir)
 
     init_master_db()
 
@@ -208,6 +215,22 @@ def test_list_orders_excludes_day_after_end_boundary(seeded_master):
     assert "SO-AFTER" not in _order_nos(orders)
 
 
+def test_list_orders_start_date_only(seeded_master):
+    """只传 `start_date`（不传 `end_date`）—— 单边条件的 SQL 分支同样不得歧义。"""
+    nos = _order_nos(
+        sop.list_orders(seeded_master, dc_warehouse_code="dc_test", start_date=RANGE_START)
+    )
+    assert nos == {"SO-AT-START", "SO-AT-END", "SO-IN-RANGE", "SO-AFTER"}
+
+
+def test_list_orders_end_date_only(seeded_master):
+    """只传 `end_date`（不传 `start_date`）—— 另一半单边分支。"""
+    nos = _order_nos(
+        sop.list_orders(seeded_master, dc_warehouse_code="dc_test", end_date=RANGE_END)
+    )
+    assert nos == {"SO-AT-START", "SO-AT-END", "SO-IN-RANGE", "SO-BEFORE"}
+
+
 def test_list_orders_date_range_combined_with_other_filters(seeded_master):
     """日期区间与其他过滤条件叠加仍正常（不只单条件可用）。"""
     orders = sop.list_orders(
@@ -246,19 +269,29 @@ def test_count_orders_by_status_matches_list_orders_scope(seeded_master):
 
 def _ensure_warehouse(
     conn: sqlite3.Connection,
+    wh_dir,
     code: str,
     name: str,
     wh_type: str,
     ts: str,
 ) -> None:
-    """建仓（已存在则跳过）—— 让 JOIN warehouses 能取到 name，与生产形态一致。"""
+    """建仓（已存在则跳过）—— 让 JOIN warehouses 能取到 name，与生产形态一致。
+
+    `db_path` 必须落在本用例的 `tmp_path/warehouses/` 下（不能写 `/tmp/<code>.db`）：
+    master 里存的是绝对路径，`blueprints/auth.py` 等处直接用它连库 —— 写共享
+    `/tmp` 会让后续用例静默连上跨运行残留的库，污染的是别人的断言。
+    """
     exists = conn.execute("SELECT 1 FROM warehouses WHERE code=?", (code,)).fetchone()
     if exists:
         return
+    from db import init_warehouse_db
+
+    db_file = wh_dir / f"{code}.db"
+    init_warehouse_db(db_file)
     conn.execute(
         "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at)"
         " VALUES ((SELECT COALESCE(MAX(id),0)+1 FROM warehouses), ?, ?, ?, ?, ?)",
-        (code, name, f"/tmp/{code}.db", wh_type, ts),
+        (code, name, str(db_file), wh_type, ts),
     )
 
 
@@ -269,7 +302,12 @@ def _seed_board_orders(client, wh_path):
     （DC 看本 DC / 门店看本店）过滤掉 —— 那样断言会「假绿」：
     页面 200 但一张单都没渲染，测不出任何东西。
     """
-    master_path = wh_path.parent.parent / "master.db"
+    import db as db_module
+
+    # 走夹具 patch 过的 db.MASTER_DB，不靠 `wh_path.parent.parent` 猜目录布局 ——
+    # 布局一变，猜错会静默建出一个空库，报错点落到后面的 SELECT 上，排查成本高。
+    master_path = db_module.MASTER_DB
+    wh_dir = wh_path.parent
     with client.session_transaction() as sess:
         uid = sess["user_id"]
         wh_id = sess["warehouse_id"]
@@ -285,13 +323,13 @@ def _seed_board_orders(client, wh_path):
         # 门店视角：订单挂在**自己的门店**名下，DC 用仓侧固定。
         store_code = my_code
         dc_code = "dc_test"
-        _ensure_warehouse(conn, "dc_test", "测试配送中心", "distribution_center", ts)
+        _ensure_warehouse(conn, wh_dir, "dc_test", "测试配送中心", "distribution_center", ts)
     else:
         # DC 视角：订单挂在本 DC 名下，门店侧固定（并真实建仓，
         # 让 LEFT JOIN warehouses 能取到 name —— 与生产形态一致）。
         dc_code = my_code
         store_code = "store_test"
-        _ensure_warehouse(conn, "store_test", "测试门店", "storefront", ts)
+        _ensure_warehouse(conn, wh_dir, "store_test", "测试门店", "storefront", ts)
 
     _seed_orders(conn, dc_code=dc_code, store_code=store_code, uid=uid)
     conn.commit()
