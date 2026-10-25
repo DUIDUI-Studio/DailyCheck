@@ -6,13 +6,20 @@
 # （退避重试 + WARNING 留痕）。
 #
 # 默认实现指向 Hermes 的 webhook 订阅（VPS 上的 agent 框架；示例，非指定），
-# 按事件类型路由到两个订阅：
-#   check_suite  → dailycheck-ci   （CI 完成快通道：全绿即触发 merge 判定；
-#                                   prompt 内置 [SILENT] 静默语义，避免中间态打扰）
-#   其余          → dailycheck-pr   （PR 生命周期触点：opened / synchronize / reopened）
+# 按事件类型路由到三个订阅：
+#   check_suite   → dailycheck-ci      （CI 完成快通道：全绿即触发 merge 判定；
+#                                       prompt 内置 [SILENT] 静默语义，避免中间态打扰）
+#   deploy_result → dailycheck-deploy  （蓝绿部署结束：带 rc/stage/verdict/next，
+#                                       agent 按 next 查表动手，不看日志猜）
+#   其余           → dailycheck-pr      （PR 生命周期触点：opened / synchronize / reopened）
+#
+# ⚠️ deploy_result 的 action 复用 `completed`，不是笔误：dc-inbox-watcher 的
+#    --actions 白名单里已有它，为一个新 action 去改 systemd unit 不划算。
+#    真正的分流就在这里，按 event 走，不看 action。
 # 前置：
 #   1. Hermes webhook platform 已启用（config.yaml platforms.webhook.enabled=true）
-#   2. 两个订阅已建立（dailycheck-pr / dailycheck-ci），详见部署手册 §3.8
+#   2. 三个订阅已建立（dailycheck-pr / dailycheck-ci / dailycheck-deploy），
+#      详见部署手册 §3.8
 #
 # 若 Prod Agent 侧用别的机制（cron / 消息队列 / 自研入口），只改本脚本实现，
 # watcher 不需要任何改动。
@@ -29,6 +36,8 @@
 #     | /usr/local/bin/dc-notify-prod-agent; echo "rc=$?"
 #   echo '{"delivery_id":"t2","event":"check_suite","action":"completed","pr_number":1,"pr_head_sha":"deadbeef","repo_full_name":"ericmr1981/DailyCheck","check_conclusion":"success"}' \
 #     | /usr/local/bin/dc-notify-prod-agent; echo "rc=$?"
+#   echo '{"delivery_id":"t3","event":"deploy_result","action":"completed","pr_number":1,"pr_head_sha":"deadbeef","repo_full_name":"eric/dailycheck","deploy_rc":21,"deploy_next":"autofix"}' \
+#     | /usr/local/bin/dc-notify-prod-agent; echo "rc=$?"
 
 set -euo pipefail
 
@@ -42,8 +51,9 @@ fi
 event=$(printf '%s' "$payload" | /root/DailyCheck/.venv/bin/python -c \
     'import json, sys; print((json.load(sys.stdin) or {}).get("event", ""))' 2>/dev/null || true)
 case "$event" in
-    check_suite) sub="dailycheck-ci" ;;
-    *)           sub="dailycheck-pr" ;;
+    check_suite)   sub="dailycheck-ci" ;;
+    deploy_result) sub="dailycheck-deploy" ;;
+    *)             sub="dailycheck-pr" ;;
 esac
 
 # —— Prod Agent 入口（示例：Hermes webhook 订阅；替换点）——

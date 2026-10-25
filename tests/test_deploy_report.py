@@ -87,6 +87,9 @@ def fake_curl(tmp_path, monkeypatch):
     monkeypatch.setenv("FEEDBACK_GITEA_REPO", "eric/dailycheck")
     monkeypatch.delenv("DAILYCHECK_GITEA_TOKEN_FILE", raising=False)
     monkeypatch.delenv("DAILYCHECK_DEPLOY_REPORT", raising=False)
+    # 隔离唤醒队列：不隔离的话测试会往真实的 /var/lib/dailycheck-prod-agent
+    # 写事件，在 VPS 上跑就等于伪造了一次部署结果喂给生产 agent。
+    monkeypatch.setenv("DAILYCHECK_PROD_AGENT_INBOX", str(tmp_path / "inbox.jsonl"))
 
     def calls() -> list[dict]:
         if not log.exists():
@@ -413,6 +416,94 @@ def test_event_log_survives_corrupt_line(tmp_path, fake_curl, monkeypatch):
     good = json.dumps({"pr": 29, "sha": "a" * 40, "next": "autofix"})
     path.write_text(good + "\n" + '{"pr": 29, "ne\n', encoding="utf-8")
     assert deploy_report.autofix_count(29, path) == 1
+
+
+# ---------------------------------------------------------------- 唤醒队列
+#
+# 事件文件只解决「事实留下」，不解决「agent 什么时候知道」。下面这几条守的是
+# 唤醒侧的契约 —— 一旦字段名或取值漂了，dc-inbox-watcher 会**静默**跳过事件
+# （它把非白名单条目直接记 handled 不再关注，不报错），部署失败就变成没人知道。
+
+# dc-inbox-watcher.service 的 --actions 实参。改这个集合要同步改 unit。
+_WATCHER_ACTIONS = {"opened", "synchronize", "synchronized", "reopened", "completed"}
+
+
+def _inbox(tmp_path) -> list[dict]:
+    path = tmp_path / "inbox.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def test_write_wakes_prod_agent(tmp_path, fake_curl, monkeypatch):
+    """部署收尾必须把 agent 叫醒，否则它只能等下一轮兜底轮询。"""
+    monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
+    monkeypatch.setenv("FAKE_CURL_POST_BODY", json.dumps({"id": 4242}))
+    monkeypatch.setenv("DAILYCHECK_GITEA_WEB_BASE", "http://hub01:3000")
+    _write(tmp_path, fake_curl)
+    rows = _inbox(tmp_path)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev["event"] == "deploy_result"
+    assert ev["pr_number"] == 29 and ev["pr_head_sha"] == SHA
+    assert ev["deploy_rc"] == 21 and ev["deploy_stage"] == "verify"
+    assert ev["deploy_next"] == "envfix"
+    assert ev["deploy_report_comment"] == 4242
+    assert ev["pr_url"] == "http://hub01:3000/eric/dailycheck/pulls/29"
+    assert ev["deploy_log"], "没日志路径的话 agent 还得自己猜去哪找现场"
+
+
+def test_inbox_event_passes_watcher_filters(tmp_path, fake_curl, monkeypatch):
+    """watcher 只看 repo_full_name 和 action，不匹配就静默丢弃 —— 必须守住。"""
+    monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
+    _write(tmp_path, fake_curl)
+    ev = _inbox(tmp_path)[0]
+    assert ev["repo_full_name"] == "eric/dailycheck"   # == watcher --repo 默认值
+    assert ev["action"] in _WATCHER_ACTIONS            # 否则记 handled 后不再关注
+    assert ev["delivery_id"], "缺 delivery_id 会被 watcher 当畸形行丢掉"
+
+
+def test_inbox_event_is_flat(tmp_path, fake_curl, monkeypatch):
+    """订阅 prompt 只做 {key} 字面替换，嵌套对象取不到 —— 字段必须全平铺。"""
+    monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
+    _write(tmp_path, fake_curl)
+    for k, v in _inbox(tmp_path)[0].items():
+        assert not isinstance(v, (dict, list)), f"{k} 是嵌套结构，prompt 里取不到"
+
+
+def test_success_also_wakes_agent(tmp_path, fake_curl, monkeypatch):
+    """成功也要投：agent 不知道锚点已推进，就会反复判 behind 重复部署。"""
+    monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
+    _write(tmp_path, fake_curl, rc=0)
+    ev = _inbox(tmp_path)[0]
+    assert ev["deploy_rc"] == 0 and ev["deploy_next"] == "none"
+
+
+def test_inbox_failure_does_not_fail_deploy(tmp_path, fake_curl, monkeypatch):
+    """唤醒队列写不进去是环境问题，不该把部署收尾判红。"""
+    monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a dir", encoding="utf-8")
+    monkeypatch.setenv("DAILYCHECK_PROD_AGENT_INBOX", str(blocker / "inbox.jsonl"))
+    rc, _ = _write(tmp_path, fake_curl)
+    assert rc == 0
+    assert _events(tmp_path), "inbox 挂了，事件流仍然必须落盘"
+
+
+def test_notify_adapter_routes_deploy_result():
+    """路由脚本必须给 deploy_result 单独一条订阅。
+
+    落到默认的 dailycheck-pr 不会报错 —— 那个订阅的 prompt 是「判定 merge」，
+    会把一次部署失败当成 PR 更新处理，然后什么都不做。静默错投比投不出去更坏。
+    """
+    script = (Path(__file__).resolve().parents[1]
+              / "deploy" / "scripts" / "dc-notify-prod-agent.sh")
+    content = script.read_text(encoding="utf-8")
+    case_block = content.split("case \"$event\" in", 1)[1].split("esac", 1)[0]
+    assert "deploy_result)" in case_block
+    assert 'sub="dailycheck-deploy"' in case_block
+    # 默认分支必须仍然存在，否则解析失败的事件会直接掉地上
+    assert "*) " in case_block or "*)" in case_block
 
 
 def test_autofix_count_dedupes_by_sha(tmp_path):
