@@ -479,6 +479,8 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 
 新增 `--merge-pr`：观察窗通过后、`release success` 之前调 `deploy_merge.py merge`；FF 失败（main 在验证期间被改动）先 `switch.sh blue 100` 回滚，再 exit 26。成功路径 `fetch origin main` + `checkout -B main origin/main`，保证本地树与远端 main 一致。
 
+归因：rc 25（候选前置不满足）与 rc 26（FF 合并失败）均映射 `KIND_ENV` / `SCOPE_OUT` / `NEXT_ENVFIX`，`stage=candidate` / `merge` 写入事件流；两者都不授权改 PR 代码。
+
 **PR 兜底轮询**（`scripts/prod_agent/pr_poll.py`，2026-10-25 迁移）：
 
 webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人管」的通道，所以它自身的失败必须是可见的。

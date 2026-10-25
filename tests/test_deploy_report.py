@@ -139,6 +139,21 @@ def test_only_code_kind_is_actionable():
     assert tp.triage(23, "switch", "")["code_actionable"] is False
 
 
+@pytest.mark.parametrize(
+    "rc,stage,fragment",
+    [
+        (25, "candidate", "候选模式前置"),
+        (26, "merge", "FF 合并失败"),
+    ],
+)
+def test_triage_deploy_first_exit_codes(rc, stage, fragment):
+    r = tp.triage(rc, stage)
+    assert r["kind"] == tp.KIND_ENV
+    assert r["scope"] == tp.SCOPE_OUT
+    assert fragment in r["reason"]
+    assert tp.next_action(r, {"verdict": tp.VERDICT_UNKNOWN}) == tp.NEXT_ENVFIX
+
+
 # ---------------------------------------------------------------- 需求解析
 
 def test_parse_requirements_from_report_table():
