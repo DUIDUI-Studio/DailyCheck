@@ -238,7 +238,10 @@ class TestAbc:
     def test_production_consumption_counts(self, pdb):
         """生产消耗计入 ABC 消耗口径。"""
         iid = add_item(pdb, "X", cat_id=1)
-        pdb.execute("INSERT INTO products VALUES (1, '蛋糕', '个', '', '')")
+        pdb.execute(
+            "INSERT INTO products (id, name, unit, note, created_at)"
+            " VALUES (1, '蛋糕', '个', '', '')"
+        )
         pdb.execute("INSERT INTO production_runs (product_id, output_qty, created_at)"
                     " VALUES (1, 10, ?)", (ts(2),))
         pdb.execute("INSERT INTO production_run_items (run_id, item_id, planned_qty,"
@@ -271,7 +274,10 @@ class TestOveruse:
         conn.execute("INSERT INTO categories VALUES (1, '原料')")
         conn.execute("INSERT INTO items (id, name, unit_cost, category_id, is_active)"
                      " VALUES (1, '面粉', 1.0, 1, 1)")
-        conn.execute("INSERT INTO products VALUES (1, '面包', '个', '', '')")
+        conn.execute(
+            "INSERT INTO products (id, name, unit, note, created_at)"
+            " VALUES (1, '面包', '个', '', '')"
+        )
         conn.execute("INSERT INTO production_runs (id, product_id, output_qty,"
                      " created_at) VALUES (1, 1, 10, ?)", (ts(2),))
         planned, actual = planned_actual

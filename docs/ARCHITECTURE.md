@@ -1953,7 +1953,7 @@ flowchart TB
 ### 13.1 Schema 迁移
 
 - ✅ 任何新列**只**加到 `migrate_warehouse_db_columns()`，**不**进 `WAREHOUSE_SCHEMA`（tests 断言）
-- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 3）
+- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 5）
 - ✅ master.db 任何 schema 变更同步进 `init_master_db()`，否则 prod 首请求 `no such column`
 - ✅ `init_master_db()` 用 `fcntl.flock` 保护 gunicorn 多 worker
 
@@ -2022,12 +2022,14 @@ with app.test_client() as c, c.session_transaction() as s:
 | 登录页（`auth.login`） | 非 `auth.logout` | `auth` | **401** `{ok:false, reason:auth_required, location, message}` |
 | 登录页 | `auth.logout`（登出成功） | `business` | 200 `{ok:true, ...}` |
 | 选仓页（`auth.warehouse_picker`） | — | `warehouse` | **409** `{ok:false, reason:warehouse_required, location, message}` |
+| 其余业务 PRG，且有 `flash(..., "error")` | — | `business_rule` | **409** `{ok:false, reason:business_rule, message}` |
 | 其余业务 PRG | — | `business` | 200 `{ok:true, location, message}` |
 
 - 分类**只认 Location 去向**（用 `url_for` 解析路径，不硬编码 `/login`），对新增端点天然成立，无需逐端点适配。
 - `logout` 成功也回登录页，但 endpoint 是 `auth.logout` → 判 `business`，不误报「登录过期」。
+- ⚠️ **业务拒绝必须 `flash(msg, "error")`**（2026-10-25 补，见 §13.12）：hook 只按 Location 分类时，「有生产记录的配方删不掉」这类**视图主动拒绝但仍 redirect** 的路径依旧被包成 `ok:true`，前端默认 remove 会把卡片摘掉 → 用户以为删除成功、刷新又回来。`error` category 是"这次 PRG 不是成功"的唯一信号。
 - 前端 `ajax-form.js` 据 `reason` 给准话 + 跳转（auth→登录页、warehouse→选仓页），不再笼统「操作失败」；`feedback-widget.js` 的成功判据仍是 `ticket_no`（401 信封无单号，天然不误判）。
-- 回归：`tests/test_ajax_form.py::test_ajax_expired_session_returns_401_not_false_success`（会话过期必 401）+ `test_redirect_kind_classification_matrix`（分类矩阵）；变异验证：把 `_redirect_kind` 调用改回恒 `business` → 401 用例变红。
+- 回归：`tests/test_ajax_form.py::test_ajax_expired_session_returns_401_not_false_success`（会话过期必 401）+ `test_redirect_kind_classification_matrix`（分类矩阵）；变异验证：把 `_redirect_kind` 调用改回恒 `business` → 401 用例变红。`tests/test_production_recipe_archive.py::test_ajax_delete_rejection_returns_ok_false` 锁 error-flash 分支。
 
 **模板侧**：
 - 行内 form 加 `data-ajax`；删除/回退类给行 `<tr>` / `<div>` 加 `data-row`，点完该行消失。
@@ -2088,6 +2090,23 @@ with app.test_client() as c, c.session_transaction() as s:
   `err_rate = events / (出库 + 生产投料 + 盘点)`，分母为 0 返回 `None`（页面显示「—」）。
 
 ---
+
+### 13.12 生产配方的「删除 vs 隐藏」与原料行删除（2026-10-25 起）
+
+**背景**：门店删除配方时遇到三个连锁故障（韩国街店 wh_004 实测）——删不掉却提示成功、编辑删原料 500、新建报重名。根因各不相同，但都落在同一页。
+
+**产品（配方）不做物理删除，改隐藏**：
+- `products` 有生产记录（`production_runs`）时，`product_delete` 直接拒绝。物理删会连带 `production_runs` / `production_run_items` 一起 CASCADE，历史成本口径永久丢失。
+- 替代方案 `products.is_hidden`（v5 迁移）：隐藏后不进产品列表、不进 `/production/session` 的产品下拉，但 BOM 与生产历史全留，管理员可随时恢复（列表页 `?show_hidden=1`）。
+- 隐藏/恢复 = `POST /production/products/<id>/toggle-hidden`，仅 platform admin。
+
+**原料行的删除是独立路由，不是表单里的 checkbox**：
+- 旧实现用 `bom_delete[]` 与 `bom_row_id[]` 平行数组按索引配对。**checkbox 未勾选就不提交**，数组长度必然短于行数 → 索引整体错位 → 勾第 3 行却删掉第 1 行（静默数据损坏，比 500 更危险）。
+- 现改为每行一个 `POST /production/products/<pid>/bom/<bid>/delete`：删除意图自带 `bom_id`，与任何数组顺序无关；路由内校验 `bom_id` 属于该 `product_id`，不能借 A 产品的 URL 删 B 产品的行。
+- 「保存配方」表单只负责新增/改用量。历史行删除按钮用 HTML5 `form` 属性关联到表格外的 `<form>`（外层已是 `bom-form`，不能再嵌套 form）；未保存的新增行删除只摘 DOM。
+- 保存时撞 `UNIQUE(product_id, item_id)` → 整批 `rollback()` + 指明第几行重复，不再 500 半保存。
+
+回归：`tests/test_production_recipe_archive.py`（9 例，含"只删目标行"与"跨产品行拒绝"）。
 
 ## 14. pre-existing 风险清单
 

@@ -256,6 +256,8 @@ ROUTE_MATRIX: dict[str, str] = {
     "production.product_new": PLATFORM,
     "production.product_edit": PLATFORM,
     "production.product_delete": PLATFORM,
+    "production.product_toggle_hidden": PLATFORM,
+    "production.bom_row_delete": PLATFORM,
     "production.session": LOGIN,
     "production.submit": LOGIN,                 # 终裁⑤：残留 LOGIN + OPEN
     "production.runs_list": LOGIN,

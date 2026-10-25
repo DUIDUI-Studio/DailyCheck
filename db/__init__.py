@@ -1503,7 +1503,9 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 #   v4 → 生产损耗归因：production_run_items.planned_default / outbound_req_id、
 #        outbound_requests.source_type（+ 存量回填）、item_loss_ledger 表
 #        （docs/2026-10-20-production-loss-design.md，2026-10-20）
-WAREHOUSE_SCHEMA_VERSION = 4
+#   v5 → products.is_hidden（配方归档：有生产记录的产品不可删，改隐藏；
+#        列表默认隐藏、管理员可切换，2026-10-25）
+WAREHOUSE_SCHEMA_VERSION = 5
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
@@ -1523,6 +1525,13 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         if conn.execute("PRAGMA user_version").fetchone()[0] >= WAREHOUSE_SCHEMA_VERSION:
             return
         conn.executescript(WAREHOUSE_SCHEMA)
+        # v5: 配方归档位。有生产记录的产品不允许物理删除（历史成本口径要留），
+        # 管理员改为隐藏；新建库由 DDL 直接带列，老库在这里补。
+        product_cols = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
+        if "is_hidden" not in product_cols:
+            conn.execute(
+                "ALTER TABLE products ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0"
+            )
         cols = {r[1] for r in conn.execute("PRAGMA table_info(stocktake_batches)").fetchall()}
         if "status" not in cols:
             conn.execute(
