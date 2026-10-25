@@ -210,9 +210,14 @@ def test_upsert_is_idempotent(tmp_path):
         ops_db.upsert_deploy_events(db_path, events)
     assert len(ops_db.recent_deploy_events(db_path, limit=10)) == 2
 
+    # 日期必须相对「今天」生成。``token_series(days=7)`` 走
+    # ``day >= date('now','-7 day')``，写死日期会在 7 天后必然读不到：
+    # 2026-10-25 实测写 10-17 的两行被 10-18 起的窗口全部滤掉，断言从 2 变 0。
+    # 这是 time-bomb（被测逻辑没坏，是测试自己过期），别再加固定日期。
+    today = datetime.now(timezone.utc).date().isoformat()
     rows = [
-        {"day": "2026-10-17", "source": "cron", "sessions": 1, "input_tok": 10},
-        {"day": "2026-10-17", "source": "webhook", "sessions": 2, "input_tok": 20},
+        {"day": today, "source": "cron", "sessions": 1, "input_tok": 10},
+        {"day": today, "source": "webhook", "sessions": 2, "input_tok": 20},
     ]
     for _ in range(2):
         ops_db.upsert_token_daily(db_path, rows)

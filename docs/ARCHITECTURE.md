@@ -446,7 +446,28 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 
 **会话侧协议**（Prod Agent skill）随之收缩为一行调用 —— 不再有「第 1 步到第 9 步」需要 LLM 记住。
 
+**部署结果回写 PR**（`scripts/blue_green/deploy_report.py` 出网 + `deploy_triage_pure.py` 纯判定，2026-10-25 起）：
+
+退出码 20~24 标了「死在哪个阶段」，但这份信息过去只存在于**跑部署那个终端的滚动缓冲**里：窗口一关证据就没了。于是任何后来者（人或 agent）都答不出「这个 PR 上次部署为什么红」，只能重跑一遍碰运气 —— 而后来的自动化 agent 更糟：它连「该去看 PR」都不知道。
+
+- **挂点选 `cleanup()`（`trap EXIT`）末尾，不是各 `exit` 点**。脚本有十来条退出路径（`die 64/10/11`、`run_stage 20~23`、`observe 24`、幂等跳过、成功），逐条插桩必漏；`cleanup` 本来就拿得到 `$?` 和 `FAIL_STAGE`，是唯一能全覆盖的位置。**回写绝不改退出码** —— 那是上层判断「死在哪」的对外契约。
+- **不建 issue**。部署事故单混进 issue 队列会被巡检 agent 当需求认领，拿一个「nginx 配置漂了」去自动改代码，比没人管更坏。留档用 **PR 评论** —— 没人会抢，且它天然挂在「这次改动」旁边。
+- **⚠️ 面向 agent，不面向人（2026-10-25 修正）**：早期版本在失败时推企微群「喊人处理」。这与本流程的根本设定冲突 —— 整条链路的目的是**减少人的介入**，人在其中的位置是「被告知」或「必要审批」，不是值班执行者；在关键路径上留一个叫人出口，等于把 agent-first 的设计从背后接回人工。现已**彻底移除对外推送**，改为**事件流投递**（见下条）。旧 env `WECOM_DEPLOY_WEBHOOK` / `WECOM_FEEDBACK_WEBHOOK` 对本脚本已无任何效果，且有用例守着「不得再打任何非 Gitea 端点」。人要看就去看 PR —— 那是留档，不是工单。
+- **两个通道，各管一件事**：① **PR 评论** = 人可读留档 + 事件文件丢失时仍可回读的持久化副本；② **事件文件** `DAILYCHECK_DEPLOY_EVENT_LOG`（默认 `/var/lib/dailycheck-deploy/events.jsonl`，JSONL append-only）= agent 的收件箱。每行自包含：`pr / sha / rc / stage / kind / scope / verdict / next / reason / action / report_comment / log`，agent 拿到就知道「发生了什么、该干什么、去哪看现场」，不需要解析自然语言。注释在 `deploy_pipeline.sh` 里取 `${STATE_DIR}/events.jsonl`，所以演练/测试的事件不会混进生产收件箱。
+- **`next` 是动作授权枚举，不是描述**。`deploy_triage_pure.next_action()` 把 verdict + kind 压成**六个穷举值**，消费端只查表、不推理 —— 让每个 agent 自己解释 verdict，迟早解释出不同的动作，其中一个直接去改了不该改的代码：`none`（成功）/ `autofix`（失败在本 PR 影响面内，可在 PR 范围改代码）/ `envfix`（环境/流程问题，修环境，**禁止改 PR 代码**）/ `derive`（PR 没声明目标，先推导并补写目标再重判）/ `audit`（rc=64 调用姿势错）/ `halt`（熔断）。
+- **`autofix` 必须有界**：`MAX_AUTOFIX=3`，计数从**事件流自身**累计（不另存计数器 —— 事件就是状态，多存一份就多一个会和事实脱节的真相源）。到顶落 `halt` 而不是继续试：连续三轮修不好，说明**这个改动方向本身有问题**，正确的动作是重审目标，不是再修一次。
+- **`unverifiable` 不再等于「等人补 PR body」**。agent-first 下它的动作是 `derive`：agent 自己从 PR body 的 `Closes/Fixes` 链接与本次 diff 推导目标，以**追加**方式补写「报告 1/4」节（不改原文），再重跑 `assess` 重判；推导不出来才落 `halt`。人只在 agent 补不出证据时才被告知，而不是被要求来填空。
+- **按 sha 幂等**：同 sha 重跑编辑同一条评论，不同 sha 各留一条。PR 被刷成日志墙就没人看了，等于回到「没有留档」；但多次部署的历史本身是「这次改动修好了没」的证据链，必须留。
+- **归因不猜**。`triage()` 只认能确定的：`verify-drift`（工作树被另一会话换掉）、`[dry_run] BLOCKED`（绿未转正）、锁冲突（10/11）三类**确定与本 PR 代码无关**，直接判 `out-of-scope`，不给模型任何参与机会 —— 让模型从零 judge，等于给它机会把环境问题说成代码问题然后自动改错地方。判不了的写 `unknown`，不编原因。
+- **对齐判定是动作授权，不是描述**。`assess_alignment()` 四态：`aligned`（失败日志指向本 PR 改过的文件 → 可继续，且限本 PR 范围）/ `drifted`（与本 PR 无关 → **禁止改代码**，去修环境或重跑）/ `unverifiable`（读不到需求条目）/ `unknown`（交语义层）。
+- **硬保险**：`unverifiable` 的触发条件是 PR body 里没有可解析的「报告 1/4」R 条目。这把「PR 必须写需求对齐表」从文案规范变成**机器闸门** —— 一个没声明目标的 PR，「失败是否偏离目标」这个问题本身无意义，任何自动判断都是编的。agent 侧动手前应调 `deploy_report.py assess`（**exit 0 才代表 aligned**），不要各自实现一遍规则。
+- **脱敏在两层**：`log_tail()` 抹一遍，`render()` 再抹一遍（不依赖调用方）。挡 `password=xxx` / `password: xxx` 与 `Bearer xxx` / `token xxx` 两种形态 —— 只挡前一种会让 header 形态的凭据漏进评论，而 PR 评论对仓库内所有成员可见。
+- **机器可读契约**：评论首行固定 `<!-- deploy-report:v1 -->`，正文带 commit 短 sha 与 `下一步` 行。消费端按标记 + sha 检索，不解析自然语言。
+- **best-effort**：Gitea 不可达 / token 缺失 / `deploy_report.py` 文件缺失都只 WARN。这是收尾路径 —— 让回写失败把一次成功部署变成红，本末倒置。**评论写失败也照样投事件**：事件是 agent 唯一入口，Gitea 抖动不该让一次部署失败凭空消失。`DAILYCHECK_DEPLOY_REPORT=0` 整体关闭（含事件）。
+- **配置**：`DAILYCHECK_GITEA_TOKEN_FILE`（默认 `/etc/dailycheck/gitea-token`，0600）、`FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_REPO`（复用 §3.10 口径）、`DAILYCHECK_DEPLOY_EVENT_LOG`（默认 `/var/lib/dailycheck-deploy/events.jsonl`）、`DAILYCHECK_CURL`（测试注入 fake）。
+
 **测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（40 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（10min / 0min → `observe-window-shortened`、30min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
++ `tests/test_deploy_report.py`（55 用例：归因十态（含 `verify-drift` 优先于 rc、DRY_RUN BLOCKED 判 out-of-scope）/ 需求解析（加粗 `**R-001**` 与下划线标识符 `DRY_RUN` 不得被误洗）/ 对齐四态（含「无需求条目即挡住自动化」）/ **动作授权表逐格覆盖 + autofix 上界 + 「不存在面向人的动作」的穷举守卫** / 脱敏两形态 / 渲染含标记与 `下一步` 行且不漏明文凭据 / CLI write 的 POST 新建·同 sha PATCH 幂等·Gitea 500 仍 rc 0·`DAILYCHECK_DEPLOY_REPORT=0` 关闭·**失败时除 Gitea 外不得打任何外部端点**（守着「不再推企微」）/ **事件流四例**（自包含字段、Gitea 挂了仍投递、半行 JSON 不废熔断计数、开关关闭不投）/ **aligned 端到端给 autofix**（真 git 仓库 + 日志命中改动文件，防映射表对而 write 传错参）/ assess 退出码 / **pipeline 集成三例**（verify 失败后 rc 仍为 21 且真发出评论、`deploy_report.py` 缺失只 WARN、开关生效））。
 
 ---
 

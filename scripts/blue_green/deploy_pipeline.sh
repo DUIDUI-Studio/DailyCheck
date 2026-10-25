@@ -151,6 +151,38 @@ _release() {
   fi
 }
 
+# 部署结果写回 PR + 投递 agent 事件（2026-10-25）。
+# 为什么挂在 cleanup 而不是各 exit 点：脚本有十来条退出路径（die 64 / 10 / 11 /
+# run_stage 20~23 / observe 24 / 幂等跳过 / 成功），逐条插桩必然漏。cleanup 本
+# 来就拿得到 $? 和 FAIL_STAGE，是唯一能覆盖全部路径的位置。
+# 为什么不用 issue：issue 会被巡检 agent 当需求认领，拿「nginx 配置漂了」去自动
+# 改代码比没人管更坏。PR 评论留档（没人抢），事件流投给 agent —— 人不在这条
+# 链路上，没有「通知谁去处理」这种推送。
+_writeback_pr() {
+  local rc=$1
+  [[ "${DAILYCHECK_DEPLOY_REPORT:-1}" == "0" ]] && return 0
+  [[ -n "${PR}" && -n "${SHA}" ]] || return 0
+  local reporter="${SCRIPT_DIR}/deploy_report.py"
+  if [[ ! -f "${reporter}" ]]; then
+    log "WARN: deploy_report.py 缺失，跳过 PR 回写（不影响部署结果）"
+    return 0
+  fi
+  # 事件文件跟着状态目录走：STATE_DIR 在测试/演练里会被指到临时目录，
+  # 事件也就跟着隔离，不会把演练结果混进生产收件箱。
+  local ev="${DAILYCHECK_DEPLOY_EVENT_LOG:-${STATE_DIR}/events.jsonl}"
+  local flag=""
+  [[ "${DRY_RUN}" -eq 1 ]] && flag="--dry-run"
+  if DAILYCHECK_DEPLOY_EVENT_LOG="${ev}" \
+     "${PY}" "${reporter}" write --pr "${PR}" --sha "${SHA}" --rc "${rc}" \
+       --stage "${FAIL_STAGE:-}" --log "${LOG}" --repo "${REPO_ROOT}" ${flag} \
+       >>"${LOG}" 2>&1; then
+    log "PR #${PR} 部署结果已写回（rc=${rc}）"
+  else
+    log "WARN: PR 回写失败（不影响部署结果）"
+  fi
+  return 0
+}
+
 cleanup() {
   local rc=$?
   if [[ -n "${HB_PID}" ]] && kill -0 "${HB_PID}" 2>/dev/null; then
@@ -164,6 +196,9 @@ cleanup() {
       _release failed "${FAIL_STAGE:-aborted} rc=${rc}"
     fi
   fi
+  # 放最后：release 会再写几行日志，先回写就漏掉它们。且 _writeback_pr 内部
+  # 全程 best-effort —— 回写失败绝不能把一次成功部署变成红。
+  _writeback_pr "${rc}"
 }
 trap cleanup EXIT
 
