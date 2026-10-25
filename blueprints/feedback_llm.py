@@ -29,6 +29,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -69,6 +70,9 @@ logger = logging.getLogger(__name__)
 #   8192 → stop，  reasoning 3325，content 1805 字符（合法 JSON）
 # 推理长度波动很大，所以取 8192 而不是刚刚够的 4096；真被截断时下面的错误
 # 文案会带上实际 reasoning 用量，便于判断要不要再抬。
+#
+# ⚠️ 改这个数必须同时看 ``_timeout()``：预算越大生成越久，8192 下单次实测 108s。
+# 只抬预算不抬超时的后果与「预算不够」完全同形——都落 analysis_model=template。
 MAX_OUTPUT_TOKENS = 8192
 MODEL_TEMPLATE_LABEL = "template"
 
@@ -87,10 +91,16 @@ def _model_name() -> str:
 
 
 def _timeout() -> float:
+    """单次调用总超时（秒）。
+
+    默认 300 而不是 90：8192 输出预算下推理模型真实耗时实测 108s（见
+    ``MAX_OUTPUT_TOKENS`` 上方注释）。90 会让「预算够了」的单子死在超时上，
+    且两种降级在库里长得一样（``analysis_model=template``），排查极易走错方向。
+    """
     try:
-        return max(5.0, float(getattr(config, "FEEDBACK_LLM_TIMEOUT", 90) or 90))
+        return max(5.0, float(getattr(config, "FEEDBACK_LLM_TIMEOUT", 300) or 300))
     except (TypeError, ValueError):
-        return 90.0
+        return 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +146,7 @@ def _chat(messages: list[dict[str, str]]) -> str:
         },
         method="POST",
     )
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(request, timeout=_timeout()) as resp:
             body = resp.read()
@@ -147,6 +158,13 @@ def _chat(messages: list[dict[str, str]]) -> str:
         # 只留状态码：响应体可能回显部分请求头，日志里不能出现凭据片段。
         raise LLMError(f"HTTP {exc.code}") from exc
     except Exception as exc:  # noqa: BLE001 - 网络/超时/SSL 一律归为不可用
+        # 超时单独给文案：默认超时被撞破时，光看 "TimeoutError" 分不清是网络
+        # 不稳还是「模型还没说完，是我们等得不够久」——把上限和已等时长写进去，
+        # 下次再撞一眼就知道该抬哪一头。
+        if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+            raise LLMError(
+                f"调用超时（上限 {_timeout():.0f}s，已等 {time.monotonic() - started:.0f}s）"
+            ) from exc
         raise LLMError(f"调用失败（{type(exc).__name__}）") from exc
 
     try:

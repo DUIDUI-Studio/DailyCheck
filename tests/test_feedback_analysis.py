@@ -452,6 +452,40 @@ def test_output_budget_covers_reasoning_tokens():
     assert feedback_llm.MAX_OUTPUT_TOKENS >= 8192
 
 
+def test_timeout_covers_reasoning_latency(monkeypatch):
+    """超时与输出预算是**一对**，只抬一边等于没修。
+
+    2026-10-25 生产 ticket 11：max_tokens 已抬到 8192，但默认 90s 超时先到，
+    单次真实耗时 108s → TimeoutError → 照样落 ``analysis_model=template``，
+    和「预算不够」在库里长得一模一样。实测值 108s，下限守 240s。
+    """
+    monkeypatch.delattr(feedback_llm.config, "FEEDBACK_LLM_TIMEOUT", raising=False)
+    assert feedback_llm._timeout() >= 240
+
+
+def test_timeout_falls_back_on_garbage_value(monkeypatch):
+    """env 写错不该把分析打死，回到同一个下限。"""
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_TIMEOUT", "abc")
+    assert feedback_llm._timeout() >= 240
+
+
+def test_chat_reports_timeout_with_limit_and_elapsed(monkeypatch):
+    """超时文案要带上限 —— 光看 ``TimeoutError`` 分不清是网络不稳还是等得不够久。"""
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_API_KEY", "k")
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_BASE_URL", "https://llm.test")
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_TIMEOUT", 300.0)
+
+    def boom(*_a, **_k):
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(feedback_llm.urllib.request, "urlopen", boom)
+    with pytest.raises(feedback_llm.LLMError) as exc:
+        feedback_llm._chat([{"role": "user", "content": "x"}])
+    msg = str(exc.value)
+    assert "调用超时" in msg and "300" in msg
+    assert "调用失败" not in msg, "超时不能被归到泛化的「调用失败」里"
+
+
 def test_analyze_parses_model_reply(monkeypatch):
     monkeypatch.setattr(
         feedback_llm, "_chat", lambda _msgs: json.dumps(GOOD, ensure_ascii=False))

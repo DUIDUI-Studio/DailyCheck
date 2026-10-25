@@ -635,6 +635,20 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 `tests/test_feedback_analysis.py` 有四条用例分别守着这三种分支 + `MAX_OUTPUT_TOKENS >= 8192`（防止有人觉得「正文才 1800 字符，1600 够了」又改回去）。
 
+⚠️ **超时与预算是同一个旋钮的两半**（2026-10-25 二次事故修正）
+
+预算抬到 8192 后，同一张单在生产环境的单次真实耗时 **108s**，而 `FEEDBACK_LLM_TIMEOUT` 默认 90s —— 模型还没说完就撞 `TimeoutError`，照样降级，DB 里同样只留 `analysis_model=template` + `gaps` 一句「调用失败（TimeoutError）」。**「预算不够」和「等得不够久」在现场完全同形**，这是本次排查最费时的地方（先疑凭证、再疑网络、最后才回到耗时）。
+
+所以：
+
+- 默认超时 **90s → 300s**（`config.FEEDBACK_LLM_TIMEOUT` 与 `feedback_llm._timeout()` 的兜底值必须同时改，两处都是 300）。300 对 108s 留了近 3 倍余量，覆盖 reasoning 长度波动。
+- 超时**单独报文案**：「调用超时（上限 300s，已等 108s）」，不再混进泛化的「调用失败（TimeoutError）」。上限和已等时长写进去，下次再撞一眼就知道该抬哪一头。
+- 用例守 `_timeout() >= 240`（`test_timeout_covers_reasoning_latency`），防止有人把默认值改回 90。
+- **改一方必须看另一方**：抬 `MAX_OUTPUT_TOKENS` 就要确认超时跟得上；反之缩超时就要确认预算没超。
+
+蓝实例（`dailycheck.service`）的 `EnvironmentFile` 只在**启动时**读取 —— 往 `/etc/dailycheck/wecom-notify.env` 加 `FEEDBACK_LLM_*` 后不 restart 蓝实例，切回蓝就会静默退回「未配置 → 模板兜底」。切流量前先确认目标实例进程 env 里有 key（`tr '\0' '\n' < /proc/<pid>/environ | grep FEEDBACK`）。
+
+
 **Issue 精确化**（`blueprints/feedback_introspect.py`，2026-10-17 追加）：
 
 派发出的 Issue 是交给自动化巡检（`automation-1784861165563`，每 4 小时，`gh issue list --state open` 全量拉取，不依赖标签）执行的任务单。巡检侧对「判断不清或有产品决策属性」的 issue 会跳过并转人工，所以正文的精确度直接决定这单是「自动跑」还是「回到人工」。而精确度**不来自用户措辞**——用户不懂代码、管理员只做判定，这两处粗糙是常态；精确度来自机器能从 `page_path` 反查到什么。
@@ -698,7 +712,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_WEB_BASE` | 内网 API / Tailscale 展示基址 | **API 与给人点的链接刻意分开**（Gitea 的 `html_url` 是实例 ROOT_URL，办公端不可达） |
 | `FEEDBACK_LLM_API_KEY` | 空串 | 二审预分析用的模型 key；**空 = 不调模型**（一审降级为模板兜底分析）。回退 `LLM_API_KEY` |
 | `FEEDBACK_LLM_BASE_URL` / `FEEDBACK_LLM_MODEL` | `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` | OpenAI 兼容端点与模型名；回退 `LLM_BASE_URL` / `LLM_MODEL`（生产与企微库存助手共用一套凭证） |
-| `FEEDBACK_LLM_TIMEOUT` | `90` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长 |
+| `FEEDBACK_LLM_TIMEOUT` | `300` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长。**必须与 `MAX_OUTPUT_TOKENS` 成对调整**：8192 预算下单次实测 108s，90s 会让模型没说完就被掐断 |
 | `PUBLIC_BASE_URL` | `https://kjtang.cn` | 消息与 Issue 正文里的域名（复用 §3.9 同一项） |
 
 `WECOM_FEEDBACK_WEBHOOK` 与 `WECOM_STORE_ORDER_WEBHOOK` **刻意分开**：反馈消息与订单消息频率、受众不同，合用一个 webhook 就无法单独静音其中一路。

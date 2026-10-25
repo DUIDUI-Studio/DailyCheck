@@ -215,6 +215,10 @@ FEEDBACK_GITEA_WEB_BASE = (
 #   助手的同一套凭证），这样不用为反馈单独申请 key。
 # - FEEDBACK_LLM_TIMEOUT：单次调用总超时（秒）。分析跑在后台线程里，
 #   超时只影响这张单的等待时长，不阻塞任何请求。
+#   ⚠️ 必须与 ``MAX_OUTPUT_TOKENS`` 成对看：推理模型的 reasoning 与正文共享
+#   预算，预算抬到 8192 后单次真实耗时实测 **108s**（2026-10-25 生产 ticket 11，
+#   提示词 2012 tokens）。默认值若停在 90，模型还没说完就撞超时，
+#   结果同样是「模板兜底」，且错误文案只写 TimeoutError，看不出差多少。
 # ─────────────────────────────────────────────────────────────────────
 _LLM_BASE_DEFAULT = "https://api.minimaxi.com"
 _LLM_MODEL_DEFAULT = "MiniMax-M3.1-Flash"
@@ -233,7 +237,7 @@ FEEDBACK_LLM_MODEL = (
     or _LLM_MODEL_DEFAULT
 )
 FEEDBACK_LLM_TIMEOUT = float(
-    os.environ.get("FEEDBACK_LLM_TIMEOUT", "").strip() or 90
+    os.environ.get("FEEDBACK_LLM_TIMEOUT", "").strip() or 300
 )
 
 # ─────────────────────────────────────────────────────────────────────
