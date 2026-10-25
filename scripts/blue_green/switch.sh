@@ -318,16 +318,48 @@ BACKUP="${BACKUP_DIR}/dailycheck.$(date +%Y%m%d-%H%M%S).bak"
 _run cp "${NGINX_CONF}" "${BACKUP}"
 echo "[switch] backup: ${BACKUP}"
 
-_run sed -i \
-  -e "s|server 127.0.0.1:${BLUE_PORT} weight=[0-9]*;|${BLUE_LINE}|" \
-  -e "s|server 127.0.0.1:${BLUE_PORT} down;|${BLUE_LINE}|" \
-  -e "s|server 127.0.0.1:${GREEN_PORT} weight=[0-9]*;|${GREEN_LINE}|" \
-  -e "s|server 127.0.0.1:${GREEN_PORT} down;|${GREEN_LINE}|" \
-  -e "s|server 127.0.0.1:${BLUE_MCP_PORT} weight=[0-9]*;|${BLUE_MCP_LINE}|" \
-  -e "s|server 127.0.0.1:${BLUE_MCP_PORT} down;|${BLUE_MCP_LINE}|" \
-  -e "s|server 127.0.0.1:${GREEN_MCP_PORT} weight=[0-9]*;|${GREEN_MCP_LINE}|" \
-  -e "s|server 127.0.0.1:${GREEN_MCP_PORT} down;|${GREEN_MCP_LINE}|" \
-  "${NGINX_CONF}"
+# ============================================================
+# 改写 conf（sed → 临时文件 → mv）
+#
+# **不用 `sed -i`**：GNU 与 BSD 的 -i 参数形态不同 —— macOS 上 `sed -i -e ...`
+# 会把 `-e` 当成备份后缀吞掉，报 `sed: -e: No such file or directory` 且不改文件。
+# 后果不是「macOS 上切流量坏」（生产是 Linux），而是 **7 个蓝绿用例在 macOS 上
+# 恒红、在 Linux CI 上全绿** —— 本地判据长期不可信，历史会话为此用「剥掉 FAILED
+# 前缀再喂零净增门禁」的方式绕过，差点让真实净增混进 main（2026-10-25 实测）。
+# promote.sh 早已改用临时文件法并留了同样的注释，此处对齐。
+#
+# 改写失败**不在这里 exit**：交给紧随其后的 _verify_conf_applied() 兜底（它逐行
+# 比对 4 条 server 行，不一致即回滚拒跑）—— 保持既有失败语义不变。
+# ============================================================
+_rewrite_conf() {
+  local tmp="${NGINX_CONF}.switch-tmp.$$"
+  if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
+    echo "[DRY-RUN] would execute: sed -e ... '${NGINX_CONF}' > '${tmp}' && mv '${tmp}' '${NGINX_CONF}'"
+    return 0
+  fi
+  if ! sed \
+      -e "s|server 127.0.0.1:${BLUE_PORT} weight=[0-9]*;|${BLUE_LINE}|" \
+      -e "s|server 127.0.0.1:${BLUE_PORT} down;|${BLUE_LINE}|" \
+      -e "s|server 127.0.0.1:${GREEN_PORT} weight=[0-9]*;|${GREEN_LINE}|" \
+      -e "s|server 127.0.0.1:${GREEN_PORT} down;|${GREEN_LINE}|" \
+      -e "s|server 127.0.0.1:${BLUE_MCP_PORT} weight=[0-9]*;|${BLUE_MCP_LINE}|" \
+      -e "s|server 127.0.0.1:${BLUE_MCP_PORT} down;|${BLUE_MCP_LINE}|" \
+      -e "s|server 127.0.0.1:${GREEN_MCP_PORT} weight=[0-9]*;|${GREEN_MCP_LINE}|" \
+      -e "s|server 127.0.0.1:${GREEN_MCP_PORT} down;|${GREEN_MCP_LINE}|" \
+      "${NGINX_CONF}" > "${tmp}"; then
+    echo "[switch] WARN: sed 改写失败（交由 conf 应用核验拦截）" >&2
+    rm -f "${tmp}"
+    return 1
+  fi
+  if ! mv "${tmp}" "${NGINX_CONF}"; then
+    echo "[switch] WARN: 改写结果落回失败（交由 conf 应用核验拦截）" >&2
+    rm -f "${tmp}"
+    return 1
+  fi
+  return 0
+}
+
+_rewrite_conf || true
 
 # ============================================================
 # conf 应用核验（2026-10-15 事故加固）：sed 未命中/部分命中时

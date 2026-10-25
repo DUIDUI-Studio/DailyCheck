@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""deploy_report.py —— 把部署结果写回 PR（并可选推企微群）。
+"""deploy_report.py —— 把部署结果写回 PR，并投进 agent 事件流。
 
 ## 为什么需要它
 
@@ -7,29 +7,37 @@
 存在于**跑部署那个终端的滚动缓冲**里：窗口一关，证据就没了。于是任何后来者
 （人或 agent）都无法回答「这个 PR 上次部署为什么红」，只能重新跑一遍碰运气。
 
-本脚本在 `cleanup()`（`trap EXIT`）里被调用，把客观事实落到 PR 评论上。三个
+本脚本在 `cleanup()`（`trap EXIT`）里被调用，把客观事实落到两个通道上。四个
 刻意的设计约束：
 
 1. **只记录事实，不做判断之外的推断**。归因走 `deploy_triage_pure`，它只认
    确定的东西；判不了的写 unknown，不猜。
 2. **绝不建 issue**。部署事故单混进 issue 队列会被巡检 agent 当成需求认领，
-   拿一个「nginx 配置漂了」去自动改代码，比没人管更坏。留档用 PR 评论（没人
-   会抢），喊人用企微群（不会被认领），两个通道各干一件事。
-3. **best-effort，永不抛错**。Gitea 挂了 / token 过期 / 网络不通都只写日志，
+   拿一个「nginx 配置漂了」去自动改代码，比没人管更坏。留档用 PR 评论 ——
+   没人会抢，且它天然挂在「这次改动」旁边。
+3. **面向 agent，不面向人**。这条链路里人不是执行者，所以没有任何「通知谁
+   来处理」的推送：consumer 是 agent 的**事件文件**（JSONL，append-only），
+   agent 自己轮询/被唤醒，不需要有人被喊醒。人也拿不到一个「请去处理」的
+   请求 —— 人该看的时候会去 PR 上看，那是留档，不是工单。
+4. **best-effort，永不抛错**。Gitea 挂了 / token 过期 / 网络不通都只写日志，
    因为这是部署收尾路径 —— 让「回写失败」把一次成功部署变成红，本末倒置。
 
-## 机器可读契约
+## 两条通道各管什么
 
-每条评论第一行是固定标记 `<!-- deploy-report:v1 -->`。消费端（人或 agent）
-按它检索最新一条即可拿到阶段 / 归因 / 对齐结论，不需要解析自然语言。
+- **PR 评论**：人可读的留档 + 事件文件丢了也能回读的持久化副本。首行固定
+  标记 `<!-- deploy-report:v1 -->`。
+- **事件文件**（`DAILYCHECK_DEPLOY_EVENT_LOG`，JSONL）：agent 的收件箱。
+  每行一个自包含事件，带 `next` 字段（动作授权枚举）与 `report_comment`
+  （回指 PR 评论 id），agent 不需要解析自然语言，也不需要去猜该干什么。
+  同时它也是 `autofix` 熔断的计数来源 —— 状态不存在别处。
 
 ## 用法
 
     deploy_report.py write  --pr 29 --sha <sha> --rc 21 --stage verify --log <file>
     deploy_report.py assess --rc 21 --stage verify --log <file> --pr-body <file>
 
-`write` 会读 PR body 做对齐判定，再发评论；`assess` 只输出结论 JSON（供 agent
-侧在动手前调用，避免各自实现一遍规则）。
+`write` 会读 PR body 做对齐判定，再发评论 + 投事件；`assess` 只输出结论 JSON
+（供 agent 侧在动手前调用，避免各自实现一遍规则）。
 
 ## 环境变量
 
@@ -38,7 +46,7 @@
     FEEDBACK_GITEA_API            默认 http://172.28.129.216:3000/api/v1
     FEEDBACK_GITEA_REPO           默认 eric/dailycheck
     DAILYCHECK_GITEA_WEB_BASE     给人点的链接基址
-    WECOM_DEPLOY_WEBHOOK          部署失败推送；空 = 不推。回退 WECOM_FEEDBACK_WEBHOOK
+    DAILYCHECK_DEPLOY_EVENT_LOG   默认 /var/lib/dailycheck-deploy/events.jsonl
     DAILYCHECK_DEPLOY_REPORT      0 = 整体关闭回写
     DAILYCHECK_CURL               curl 可执行文件（测试注入，默认 curl）
 """
@@ -64,6 +72,7 @@ from deploy_triage_pure import (  # noqa: E402
     VERDICT_DRIFTED,
     VERDICT_UNVERIFIABLE,
     assess_alignment,
+    next_action,
     triage,
 )
 
@@ -71,6 +80,7 @@ MARKER = "<!-- deploy-report:v1 -->"
 DEFAULT_TOKEN_FILE = "/etc/dailycheck/gitea-token"
 DEFAULT_API = "http://172.28.129.216:3000/api/v1"
 DEFAULT_REPO = "eric/dailycheck"
+DEFAULT_EVENT_LOG = "/var/lib/dailycheck-deploy/events.jsonl"
 LOG_TAIL_LINES = 40
 COMMENT_MAX = 50000
 
@@ -251,22 +261,68 @@ def find_same_sha_comment(pr: int, sha: str) -> int:
     return hit
 
 
-def push_wecom(text: str) -> bool:
-    hook = _env("WECOM_DEPLOY_WEBHOOK") or _env("WECOM_FEEDBACK_WEBHOOK")
-    if not hook:
-        return False
-    payload = {"msgtype": "markdown", "markdown": {"content": text[:4000]}}
-    with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        tmp_path = fh.name
+def event_log_path() -> Path:
+    return Path(_env("DAILYCHECK_DEPLOY_EVENT_LOG", DEFAULT_EVENT_LOG))
+
+
+def read_events(path: Path | None = None) -> list[dict[str, Any]]:
+    """读事件流。坏行直接跳过 —— 一行写了一半（进程被杀）不该让整条链失效。"""
+    p = path or event_log_path()
+    if not p.is_file():
+        return []
+    out: list[dict[str, Any]] = []
     try:
-        rc, out = _curl(
-            ["-s", "-o", "/dev/null", "--max-time", "10", "-H",
-             "Content-Type: application/json", "--data-binary", f"@{tmp_path}", hook]
-        )
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-    return rc == 0
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                out.append(row)
+    except OSError:
+        return []
+    return out
+
+
+def autofix_count(pr: int, path: Path | None = None) -> int:
+    """同一 PR 已发生过的 autofix 次数，作为熔断计数。
+
+    **按不同 sha 去重**，不按事件条数。同一个 sha 部署失败后重跑是常态（改
+    nginx、放锁、重启实例后再来一次），那些重跑并没有「修」任何东西，把它们
+    算进轮次会让熔断在第二轮就误触发 —— 该继续修的时候停下来重审目标，比
+    修不动了还硬修更浪费时间。
+
+    从事件流里数而不是别处存状态：**事件本身就是状态**。多存一份计数器就多
+    一个会和事实脱节的东西，而 deploy 收尾路径最不需要的就是第二个真相源。
+    """
+    shas: set[str] = set()
+    for e in read_events(path):
+        if int(e.get("pr") or 0) != int(pr) or e.get("next") != "autofix":
+            continue
+        shas.add(str(e.get("sha") or ""))
+    return len(shas)
+
+
+def append_event(event: dict[str, Any]) -> bool:
+    """把事件追加到 agent 收件箱。失败只返回 False，绝不抛错。
+
+    用单次 ``write`` + ``O_APPEND``：并发部署（不同 PR）可能同时写同一个文件，
+    append 是原子的（PIPE_BUF 内），不会互相截断。不做锁 —— 锁在部署收尾
+    路径上是自找的阻塞源。
+    """
+    p = event_log_path()
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        return True
+    except OSError as exc:
+        print(f"[deploy-report] WARN 事件写入失败（{p}）：{exc}", file=sys.stderr)
+        return False
 
 
 # ── 渲染 ──────────────────────────────────────────────────────────────────
@@ -275,7 +331,18 @@ _VERDICT_LABEL = {
     VERDICT_ALIGNED: "契合 — 可继续",
     VERDICT_DRIFTED: "偏离 — 不要改代码",
     VERDICT_UNVERIFIABLE: "无法核对 — 先补 PR 目标",
-    "unknown": "判不了 — 交语义层/人工",
+    "unknown": "判不了 — 交语义层",
+}
+
+# 给 agent 的动作枚举，落到 PR 评论上一行。人是可以顺手看一眼的，但这一行
+# 的收件人不是人 —— 写出来是为了让「这次事故该谁动手」在评论里也是确定的。
+_NEXT_LABEL = {
+    "none": "`none` — 部署成功，无需动作",
+    "autofix": "`autofix` — 在本 PR 范围内改代码修复后重新部署",
+    "envfix": "`envfix` — 修环境/流程后重跑，**不要改本次改动的代码**",
+    "derive": "`derive` — 先推导并补写 PR 目标，再重跑 assess 重判",
+    "audit": "`audit` — 调用方参数错了，修调用姿势",
+    "halt": "`halt` — 熔断，停止自动重试，回去重审目标本身",
 }
 
 
@@ -286,6 +353,7 @@ def render(
     align: dict[str, Any],
     tail: str,
     fetch_error: str = "",
+    nxt: str = "",
 ) -> str:
     ok = tr.get("kind") == KIND_SUCCESS
     head = "部署结果 · 成功" if ok else f"部署结果 · 失败（rc={tr.get('rc')}）"
@@ -301,6 +369,7 @@ def render(
         f"| 阶段 | `{tr.get('stage')}` |",
         f"| 归因 | `{tr.get('kind')}` / `{tr.get('scope')}` |",
         f"| 对齐 | `{verdict}` |",
+        f"| 下一步 | {_NEXT_LABEL.get(nxt, nxt or '—')} |",
         f"| 时间 | {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} |",
         "",
         f"**原因**：{tr.get('reason', '')}",
@@ -338,18 +407,6 @@ def render(
     return "\n".join(lines)[:COMMENT_MAX]
 
 
-def _wecom_text(pr: int, tr: dict[str, Any], align: dict[str, Any]) -> str:
-    verdict = str(align.get("verdict") or "unknown")
-    return "\n".join([
-        f"**部署失败** · PR #{pr}",
-        f"> 阶段：`{tr.get('stage')}`　归因：`{tr.get('kind')}`",
-        f"> 对齐判定：`{verdict}`",
-        f"> {tr.get('reason', '')}"[:600],
-        "",
-        f"下一步：{align.get('action') or '见 PR 评论'}"[:400],
-    ])
-
-
 # ── 动作 ──────────────────────────────────────────────────────────────────
 
 def _assess(pr: int, repo: str, sha: str, rc: int, stage: str, tail: str,
@@ -377,24 +434,49 @@ def cmd_write(args: argparse.Namespace) -> int:
     tr, align, fetch_error = _assess(
         args.pr, args.repo, args.sha, args.rc, args.stage, tail, None, args.base
     )
-    body = render(args.pr, args.sha, tr, align, tail, fetch_error)
+    nxt = next_action(tr, align, autofix_count(args.pr) if args.pr else 0)
+    body = render(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
+
+    comment_id = 0
     existing = find_same_sha_comment(args.pr, args.sha) if args.sha else 0
     if existing:
-        status, _ = gitea("PATCH", f"/repos/{_repo()}/issues/comments/{existing}",
-                          {"body": body})
+        status, resp = gitea("PATCH", f"/repos/{_repo()}/issues/comments/{existing}",
+                             {"body": body})
         verb = "更新"
+        comment_id = existing
     else:
-        status, _ = gitea("POST", f"/repos/{_repo()}/issues/{args.pr}/comments",
-                          {"body": body})
+        status, resp = gitea("POST", f"/repos/{_repo()}/issues/{args.pr}/comments",
+                             {"body": body})
         verb = "写回"
+        try:
+            comment_id = int(json.loads(resp).get("id") or 0)
+        except (ValueError, AttributeError):
+            comment_id = 0
     if status not in (200, 201):
         print(f"[deploy-report] WARN {verb} PR 失败 HTTP {status}", file=sys.stderr)
     else:
         print(f"[deploy-report] 已{verb} PR #{args.pr}", file=sys.stderr)
-    if tr.get("kind") != KIND_SUCCESS:
-        pushed = push_wecom(_wecom_text(args.pr, tr, align))
-        if not pushed:
-            print("[deploy-report] WARN 企微未推送（未配置或失败）", file=sys.stderr)
+
+    # 评论写失败也照样投事件：事件是 agent 唯一的入口，Gitea 抖动不该让一次
+    # 部署失败凭空消失。agent 拿到 next 后能自己回拉 PR 状态补齐上下文。
+    appended = append_event({
+        "v": 1,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "pr": int(args.pr or 0),
+        "sha": args.sha,
+        "rc": int(args.rc),
+        "stage": tr.get("stage", ""),
+        "kind": tr.get("kind", ""),
+        "scope": tr.get("scope", ""),
+        "verdict": align.get("verdict", ""),
+        "next": nxt,
+        "reason": tr.get("reason", ""),
+        "action": align.get("action", ""),
+        "report_comment": comment_id,
+        "log": str(Path(args.log).resolve()) if args.log else "",
+    })
+    if appended:
+        print(f"[deploy-report] 事件已投递 next={nxt}", file=sys.stderr)
     return 0
 
 
@@ -411,8 +493,9 @@ def cmd_assess(args: argparse.Namespace) -> int:
     tr, align, fetch_error = _assess(
         args.pr, args.repo, args.sha, args.rc, args.stage, tail, pr_body, args.base, files
     )
+    nxt = next_action(tr, align, autofix_count(args.pr) if args.pr else 0)
     print(json.dumps(
-        {"triage": tr, "alignment": align, "fetch_error": fetch_error},
+        {"triage": tr, "alignment": align, "next": nxt, "fetch_error": fetch_error},
         ensure_ascii=False, indent=2,
     ))
     # 供 shell 消费：aligned 才能自动继续
@@ -432,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--repo", default=os.environ.get("DAILYCHECK_PROD_REPO", "."))
         p.add_argument("--base", default="")
 
-    w = sub.add_parser("write", help="写回 PR 评论（含失败推企微）")
+    w = sub.add_parser("write", help="写回 PR 评论并投递 agent 事件")
     common(w)
     w.add_argument("--dry-run", action="store_true")
     w.set_defaults(func=cmd_write)

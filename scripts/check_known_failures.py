@@ -66,6 +66,20 @@ def main() -> int:
 
     failed = extract_failed_ids(sys.argv[1])
     known = load_known_ids()
+
+    # 防假绿第二层：摘要里有 failed，却一条 FAILED 行都没解析出来。
+    # 真因通常是喂了「剥过前缀」的失败集（`grep ^FAILED | sed 's/^FAILED //'`），
+    # 正则匹配不到 → failed 为空 → new 为空 → 无条件放行。2026-10-25 实测踩中：
+    # 22 个失败的全量跑被判定为「0 个新增失败」，差点让一条净增失败混进 main。
+    # 摘要与解析结果必须自洽，否则拒绝放行。
+    m_failed = re.search(r"(\d+) failed", text)
+    if m_failed and int(m_failed.group(1)) > 0 and not failed:
+        print(
+            f"FAIL: 摘要声明 {m_failed.group(1)} 个 failed，但未解析出任何 "
+            f"'FAILED <nodeid>' 行 —— 输入很可能被预处理过（门禁要求 pytest 原始输出）。"
+        )
+        return 1
+
     new = failed - known
     if not new:
         passed_info = f"，passed {m.group(1)}" if m else ""

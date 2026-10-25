@@ -62,6 +62,7 @@ elif method == "GET" and "/comments" in url:
     resp, code = os.environ.get("FAKE_CURL_COMMENTS", "[]"), "200"
 elif method == "POST":
     code = os.environ.get("FAKE_CURL_POST_CODE", "201")
+    resp = os.environ.get("FAKE_CURL_POST_BODY", "{{}}")
 elif method == "PATCH":
     code = os.environ.get("FAKE_CURL_PATCH_CODE", "200")
 if method == "GET":
@@ -85,8 +86,6 @@ def fake_curl(tmp_path, monkeypatch):
     monkeypatch.setenv("FEEDBACK_GITEA_API", "http://gitea.test/api/v1")
     monkeypatch.setenv("FEEDBACK_GITEA_REPO", "eric/dailycheck")
     monkeypatch.delenv("DAILYCHECK_GITEA_TOKEN_FILE", raising=False)
-    monkeypatch.delenv("WECOM_DEPLOY_WEBHOOK", raising=False)
-    monkeypatch.delenv("WECOM_FEEDBACK_WEBHOOK", raising=False)
     monkeypatch.delenv("DAILYCHECK_DEPLOY_REPORT", raising=False)
 
     def calls() -> list[dict]:
@@ -206,6 +205,56 @@ def test_bare_filename_does_not_match():
     assert tp._mentioned_files("error in items.py line 12", ["items.py"]) == []
 
 
+# ---------------------------------------------------------------- 动作授权
+
+_ALIGNED = {"verdict": tp.VERDICT_ALIGNED}
+_DRIFTED = {"verdict": tp.VERDICT_DRIFTED}
+_UNVERIFIABLE = {"verdict": tp.VERDICT_UNVERIFIABLE}
+_UNKNOWN = {"verdict": tp.VERDICT_UNKNOWN}
+
+
+@pytest.mark.parametrize(
+    "kind,alignment,count,expect",
+    [
+        (tp.KIND_SUCCESS, _ALIGNED, 0, tp.NEXT_NONE),
+        (tp.KIND_USAGE, _UNKNOWN, 0, tp.NEXT_AUDIT),
+        (tp.KIND_CODE, _ALIGNED, 0, tp.NEXT_AUTOFIX),
+        (tp.KIND_CODE, _ALIGNED, 2, tp.NEXT_AUTOFIX),
+        # 到顶不是「放弃」，是「这方向修不动了，重审目标」
+        (tp.KIND_CODE, _ALIGNED, tp.MAX_AUTOFIX, tp.NEXT_HALT),
+        # 环境问题即使在 aligned 下也不许改代码
+        (tp.KIND_ENV, _ALIGNED, 0, tp.NEXT_ENVFIX),
+        (tp.KIND_LOCK, _DRIFTED, 0, tp.NEXT_ENVFIX),
+        (tp.KIND_DRIFT, _DRIFTED, 0, tp.NEXT_ENVFIX),
+        (tp.KIND_CODE, _UNKNOWN, 0, tp.NEXT_ENVFIX),
+        # 没目标 → 先推导，不是叫人补
+        (tp.KIND_CODE, _UNVERIFIABLE, 0, tp.NEXT_DERIVE),
+    ],
+)
+def test_next_action_table(kind, alignment, count, expect):
+    assert tp.next_action({"kind": kind}, alignment, count) == expect
+
+
+def test_next_action_autofix_is_bounded():
+    """autofix 是本模块唯一的写授权，必须有上界。"""
+    tr = {"kind": tp.KIND_CODE}
+    assert tp.next_action(tr, _ALIGNED, tp.MAX_AUTOFIX - 1) == tp.NEXT_AUTOFIX
+    assert tp.next_action(tr, _ALIGNED, tp.MAX_AUTOFIX) == tp.NEXT_HALT
+
+
+def test_next_action_never_targets_a_human():
+    """链路上不存在「通知人」这个动作 —— 这是本次设计变更的核心约束。"""
+    values = {
+        tp.NEXT_NONE, tp.NEXT_AUTOFIX, tp.NEXT_ENVFIX,
+        tp.NEXT_DERIVE, tp.NEXT_AUDIT, tp.NEXT_HALT,
+    }
+    for kind in (tp.KIND_SUCCESS, tp.KIND_CODE, tp.KIND_ENV, tp.KIND_LOCK,
+                 tp.KIND_DRIFT, tp.KIND_USAGE, tp.KIND_UNKNOWN):
+        for align in (_ALIGNED, _DRIFTED, _UNVERIFIABLE, _UNKNOWN):
+            for count in (0, tp.MAX_AUTOFIX, 99):
+                assert tp.next_action({"kind": kind}, align, count) in values
+
+
 # ---------------------------------------------------------------- 脱敏
 
 def test_redact_masks_credentials():
@@ -250,23 +299,26 @@ def test_render_lists_pr_requirements():
 
 # ---------------------------------------------------------------- CLI write
 
-def _write(tmp_path, fake_curl, **env):
+def _write(tmp_path, fake_curl, sha: str | None = None, rc: int = 21, **env):
     log = tmp_path / "pipeline.log"
     log.write_text("line1\nERROR boom\n", encoding="utf-8")
+    os.environ["DAILYCHECK_DEPLOY_EVENT_LOG"] = str(tmp_path / "ev.jsonl")
     for k, v in env.items():
         os.environ[k] = str(v)
-    rc = deploy_report.main([
-        "write", "--pr", "29", "--sha", SHA, "--rc", "21",
-        "--stage", "verify", "--log", str(log), "--repo", str(tmp_path),
-    ])
-    for k in env:
-        os.environ.pop(k, None)
-    return rc, fake_curl()
+    try:
+        rc_code = deploy_report.main([
+            "write", "--pr", "29", "--sha", sha or SHA, "--rc", str(rc),
+            "--stage", "verify", "--log", str(log), "--repo", str(tmp_path),
+        ])
+        calls = fake_curl()
+    finally:
+        for k in (*env, "DAILYCHECK_DEPLOY_EVENT_LOG"):
+            os.environ.pop(k, None)
+    return rc_code, calls
 
 
 def test_write_posts_comment(tmp_path, fake_curl, monkeypatch):
     monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
-    monkeypatch.setenv("WECOM_DEPLOY_WEBHOOK", "")
     rc, calls = _write(tmp_path, fake_curl)
     assert rc == 0
     posts = [c for c in calls if c["method"] == "POST" and "/comments" in c["url"]]
@@ -306,28 +358,126 @@ def test_write_disabled_by_env(tmp_path, fake_curl, monkeypatch):
     assert calls == []
 
 
-def test_write_pushes_wecom_on_failure(tmp_path, fake_curl, monkeypatch):
+def test_write_never_calls_any_external_notifier(tmp_path, fake_curl, monkeypatch):
+    """失败时除 Gitea 外不许再打任何外部端点 —— 这条链路面向 agent，不面向人。
+
+    曾经这里推企微群。人不是这条链路的执行者，把「请去处理」推给人等于把
+    agent-first 的流程又接回人工值班。旧 env 即使被设上也必须无效。
+    """
     monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
     monkeypatch.setenv("WECOM_DEPLOY_WEBHOOK", "http://wecom.test/hook")
     rc, calls = _write(tmp_path, fake_curl)
     assert rc == 0
-    hooks = [c for c in calls if "wecom.test" in c["url"]]
-    assert len(hooks) == 1
-    assert "部署失败" in hooks[0]["payload"]
+    assert not [c for c in calls if "wecom.test" in c["url"]]
+    assert all("gitea.test" in c["url"] for c in calls), [c["url"] for c in calls]
 
 
-def test_write_success_does_not_push_wecom(tmp_path, fake_curl, monkeypatch):
-    """成功不推群 —— 每次合并都推，群就废了。"""
+# ---------------------------------------------------------------- 事件流
+
+def _events(tmp_path) -> list[dict]:
+    path = tmp_path / "ev.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def test_write_emits_machine_readable_event(tmp_path, fake_curl, monkeypatch):
+    """事件是 agent 唯一的入口，必须自包含：拿到它就知道该干什么、去哪看。"""
     monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
-    monkeypatch.setenv("WECOM_DEPLOY_WEBHOOK", "http://wecom.test/hook")
-    log = tmp_path / "pipeline.log"
-    log.write_text("ok\n", encoding="utf-8")
-    rc = deploy_report.main([
-        "write", "--pr", "29", "--sha", SHA, "--rc", "0",
-        "--stage", "", "--log", str(log), "--repo", str(tmp_path),
-    ])
-    assert rc == 0
-    assert not [c for c in fake_curl() if "wecom.test" in c["url"]]
+    monkeypatch.setenv("FAKE_CURL_POST_BODY", json.dumps({"id": 4242}))
+    _write(tmp_path, fake_curl)
+    rows = _events(tmp_path)
+    assert len(rows) == 1
+    ev = rows[0]
+    assert ev["v"] == 1 and ev["pr"] == 29 and ev["sha"] == SHA
+    assert (ev["kind"], ev["rc"]) == ("code", 21)
+    # tmp_path 不是 git 仓库 → 推不出改动文件 → 日志没命中 → unknown → envfix。
+    # 具体取值由 test_next_action_table 逐格覆盖，这里只验「判定被写进事件」。
+    assert ev["next"] == "envfix"
+    assert ev["report_comment"] == 4242
+    assert ev["log"], "事件必须带上日志路径，否则 agent 还得自己猜去哪找现场"
+
+
+def test_event_emitted_even_when_gitea_down(tmp_path, fake_curl, monkeypatch):
+    """Gitea 抖动不该让一次部署失败凭空消失。"""
+    monkeypatch.setenv("FAKE_CURL_POST_CODE", "500")
+    monkeypatch.setenv("FAKE_CURL_PR", "{}")
+    _write(tmp_path, fake_curl)
+    rows = _events(tmp_path)
+    assert len(rows) == 1 and rows[0]["report_comment"] == 0
+
+
+def test_event_log_survives_corrupt_line(tmp_path, fake_curl, monkeypatch):
+    """进程被 kill 会留下半行 JSON，不该让熔断计数整体失效。"""
+    path = tmp_path / "ev.jsonl"
+    good = json.dumps({"pr": 29, "sha": "a" * 40, "next": "autofix"})
+    path.write_text(good + "\n" + '{"pr": 29, "ne\n', encoding="utf-8")
+    assert deploy_report.autofix_count(29, path) == 1
+
+
+def test_autofix_count_dedupes_by_sha(tmp_path):
+    """同 sha 重跑不累加 —— 重跑没「修」任何东西，不该吃掉熔断额度。
+
+    真实场景：verify 挂了 → 人工/agent 修好 nginx 环境 → 同 sha 再跑一次。
+    这两条事件都是 autofix，但只修了零轮，算成两轮会让第三轮正常修复被
+    误判成 halt。
+    """
+    path = tmp_path / "ev.jsonl"
+    rows = [
+        {"pr": 29, "sha": "a" * 40, "next": "autofix"},
+        {"pr": 29, "sha": "a" * 40, "next": "autofix"},
+        {"pr": 29, "sha": "b" * 40, "next": "autofix"},
+        {"pr": 29, "sha": "c" * 40, "next": "envfix"},
+        {"pr": 30, "sha": "d" * 40, "next": "autofix"},
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    assert deploy_report.autofix_count(29, path) == 2
+
+
+def test_write_skips_event_when_disabled(tmp_path, fake_curl, monkeypatch):
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_REPORT", "0")
+    _write(tmp_path, fake_curl)
+    assert _events(tmp_path) == []
+
+
+def test_aligned_failure_grants_autofix_end_to_end(tmp_path, fake_curl, monkeypatch):
+    """端到端：真 git 仓库 + 日志指到改动文件 → 事件里必须是 autofix。
+
+    autofix 是本设计唯一的写授权，只在「失败确实由本 PR 引入」时给出。这条
+    用例存在的意义是防止映射表对、但 write 路径传错了入参。
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env={**os.environ, **env})
+    (repo / "README.md").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True,
+                   env={**os.environ, **env})
+    (repo / "blueprints").mkdir()
+    (repo / "blueprints" / "feedback.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "feat"], cwd=repo, check=True,
+                   env={**os.environ, **env})
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+                         text=True, check=True).stdout.strip()
+
+    monkeypatch.setenv("FAKE_CURL_PR", json.dumps({"body": _PR_BODY}))
+    log = repo / "pipeline.log"
+    log.write_text("FAILED blueprints/feedback.py::test_x\n", encoding="utf-8")
+    os.environ["DAILYCHECK_DEPLOY_EVENT_LOG"] = str(repo / "ev.jsonl")
+    try:
+        deploy_report.main([
+            "write", "--pr", "29", "--sha", sha, "--rc", "21", "--stage", "verify",
+            "--log", str(log), "--repo", str(repo),
+        ])
+    finally:
+        os.environ.pop("DAILYCHECK_DEPLOY_EVENT_LOG", None)
+
+    ev = _events(repo)[0]
+    assert ev["verdict"] == "aligned", ev
+    assert ev["next"] == "autofix", ev
 
 
 # ---------------------------------------------------------------- CLI assess
@@ -406,7 +556,6 @@ def test_pipeline_writes_back_and_keeps_exit_code(pipeline_sandbox, tmp_path):
         "FAKE_CURL_PR": json.dumps({"body": _PR_BODY}),
         "DAILYCHECK_GITEA_TOKEN": "tok",
         "FEEDBACK_GITEA_API": "http://gitea.test/api/v1",
-        "WECOM_DEPLOY_WEBHOOK": "",
     })
     env.pop("DAILYCHECK_DEPLOY_UNLOCKED", None)
     proc = subprocess.run(

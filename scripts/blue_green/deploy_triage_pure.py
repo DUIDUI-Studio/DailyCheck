@@ -29,6 +29,17 @@
 - ``unverifiable`` PR 里读不到可核对的目标。**禁止自动动手**，先补 PR body。
 - ``unknown``      机械层判不了，交语义层。
 
+## 为什么还要 ``next_action()``
+
+``verdict`` 是判定，不是指令。让每个消费端 agent 自己把 verdict + kind 翻译成
+「那我现在该干什么」，等于把同一套解释逻辑复制到每个 agent 里 —— 迟早各自
+解释出不同的动作，其中一个直接去改了不该改的代码。
+
+``next_action()`` 把它压成**六个穷举值**，消费端只做查表，不做推理。这也是
+``halt`` 存在的理由：自动修复本身要有熔断，否则两个 agent 会互相「修」对方的
+修复，直到把 PR 改成另一个东西。
+
+
 ## 硬保险
 
 ``assess_alignment()`` 会先看 PR body 有没有可解析的 R 条目。没有就直接
@@ -61,6 +72,20 @@ VERDICT_DRIFTED = "drifted"
 VERDICT_UNVERIFIABLE = "unverifiable"
 VERDICT_UNKNOWN = "unknown"
 
+# ── 下一步动作（给 agent 的授权枚举，消费端只查表不推理）──────────────────
+# 人不是执行者，所以这里没有「通知人」「等人审批」这两个值 —— 需要人拍板的
+# 事从来不在这条链路上，它由 PR 门禁与 merge 权限管。
+NEXT_NONE = "none"        # 成功，无事可做
+NEXT_AUTOFIX = "autofix"  # 失败在本 PR 影响面内，可在 PR 范围内改代码
+NEXT_ENVFIX = "envfix"    # 环境/流程问题，修环境，**禁止改 PR 代码**
+NEXT_DERIVE = "derive"    # PR 没声明目标，先推导并补写目标，再重判
+NEXT_AUDIT = "audit"      # 调用姿势错了（rc=64），修调用方，不要碰代码
+NEXT_HALT = "halt"        # 熔断：停止自动重试，回去重审目标本身
+
+# 同一 PR 连续自动修复的上限。超过就说明「这个改动方向本身有问题」，继续
+# 试只会把 PR 越改越远离原意 —— 那时候正确的动作是重审目标，不是再修一次。
+MAX_AUTOFIX = 3
+
 # 退出码 → 默认归因。stage 可覆盖（verify 有 ``verify-drift`` 子类型）。
 _BY_RC: dict[int, tuple[str, str]] = {
     64: (KIND_USAGE, SCOPE_OUT),
@@ -73,7 +98,7 @@ _BY_RC: dict[int, tuple[str, str]] = {
     24: (KIND_ENV, SCOPE_UNDETERMINED),
 }
 
-# 日志证据 → 判定。只在**确定**时命中：宁可 unknown 交人工，不要猜。
+# 日志证据 → 判定。只在**确定**时命中：宁可 unknown 交语义层，不要猜。
 # 每条是 (子串, kind, scope, 一句人话原因)。
 _LOG_EVIDENCE: tuple[tuple[str, str, str, str], ...] = (
     (
@@ -145,7 +170,7 @@ def triage(
         KIND_LOCK: "部署锁被占用或 acquire 失败 —— 另一部署在跑，等它收尾后重跑即可。",
         KIND_CODE: "阶段执行失败，最常见成因是本次改动的代码或迁移。",
         KIND_ENV: "编排/环境阶段失败，通常与本次改动的代码无直接关系。",
-    }.get(kind, f"退出码 {rc} 无预置语义，需人工看日志。")
+    }.get(kind, f"退出码 {rc} 无预置语义，交语义层读日志判定。")
     return _result(kind, scope, reason, rc, stage)
 
 
@@ -239,7 +264,9 @@ def assess_alignment(
             verdict=VERDICT_UNVERIFIABLE,
             reason="PR body 里没有可解析的「报告 1/4」需求条目 —— "
             "无从判断失败是否偏离目标。",
-            action="补 PR body 的需求对齐表后重新判定；在此之前不允许自动动手。",
+            action="agent 先从 PR body 的 Closes/Fixes 链接与本次 diff 推导目标，"
+            "以追加方式补写「报告 1/4」节（不改原文），再重跑 assess 重判；"
+            "推导不出来就落 halt，不要盲改。",
         )
         return base
 
@@ -268,6 +295,35 @@ def assess_alignment(
             "归因倾向本 PR（" + str(kind) + "），但日志未指向任何改动过的文件，"
             "机械层无法确认因果。"
         ),
-        action="交语义层：对照需求条目与失败日志判断，必要时直接转人工。",
+        action="对照需求条目与失败日志判断失败是否由本 PR 引入；判不了就 halt，"
+        "重审目标，不要试错式改动。",
     )
     return base
+
+
+def next_action(
+    triage_result: dict[str, Any],
+    alignment: dict[str, Any],
+    autofix_count: int = 0,
+) -> str:
+    """判定结果 → 消费端 agent 该做什么。六个穷举值，见模块 docstring。
+
+    ``autofix_count`` 是**同一 PR 已发生的 autofix 次数**（由事件流累计）。
+    到顶就 halt：不是「放弃」，是「这个方向修不动了，重审目标」。
+
+    判定顺序有讲究：先判死最不需要推理的（成功 / 调用姿势），再判目标缺失
+    （derive），最后才轮到授权改代码 —— 因为 ``autofix`` 是这里唯一的写权限，
+    必须让最严格的闸门挡在它前面。
+    """
+    kind = str(triage_result.get("kind") or KIND_UNKNOWN)
+    verdict = str(alignment.get("verdict") or VERDICT_UNKNOWN)
+
+    if kind == KIND_SUCCESS:
+        return NEXT_NONE
+    if kind == KIND_USAGE:
+        return NEXT_AUDIT
+    if verdict == VERDICT_UNVERIFIABLE:
+        return NEXT_DERIVE
+    if verdict == VERDICT_ALIGNED and kind == KIND_CODE:
+        return NEXT_AUTOFIX if int(autofix_count) < MAX_AUTOFIX else NEXT_HALT
+    return NEXT_ENVFIX

@@ -1456,7 +1456,7 @@ def test_switch_post_switch_probe_live_against_listening_server(tmp_path):
 
 
 def test_switch_layout_guard_does_not_touch_location(tmp_path):
-    """布局守卫+新布局：sed 后 location 行必须仍是 `proxy_pass http://dailycheck;`
+    """布局守卫+新布局：改写后 location 行必须仍是 `proxy_pass http://dailycheck;`
 
     不能动 location 是 Option 2 的核心契约 —— location 永远指合并 upstream。
     """
@@ -1464,24 +1464,25 @@ def test_switch_layout_guard_does_not_touch_location(tmp_path):
     conf.write_text(_NEW_LAYOUT_CONF, encoding="utf-8")
     backup = tmp_path / "bk"
     backup.mkdir()
-    # 静态断言：switch.sh sed 表达式只动 server 127.0.0.1:PORT 行，
+    # 静态断言：switch.sh 的改写表达式只动 server 127.0.0.1:PORT 行，
     # 不出现 proxy_pass 字样。
     content = SWITCH.read_text(encoding="utf-8")
-    # 直接断言 sed 块（_run sed -i 到 "${NGINX_CONF}" 之间）不含 proxy_pass
-    sed_match = re.search(
-        r"_run sed -i (.*?)\"\$\{NGINX_CONF\}\"",
-        content,
-        re.DOTALL,
-    )
-    assert sed_match is not None, "未找到 sed -i 块"
-    sed_text = sed_match.group(1)
+    # 断言范围是 _rewrite_conf() 整个函数体。2026-10-25 从 `_run sed -i` 改成
+    # 「sed → 临时文件 → mv」：BSD sed 会把 `-i -e` 里的 `-e` 当备份后缀吞掉，
+    # 那让 7 个蓝绿用例在 macOS 恒红、Linux CI 全绿，本地判据长期不可信。
+    fn_match = re.search(r"_rewrite_conf\(\) \{(.*?)\n\}", content, re.DOTALL)
+    assert fn_match is not None, "未找到 _rewrite_conf 函数"
+    sed_text = fn_match.group(1)
     # sed 表达式只能匹配 `server 127.0.0.1:PORT weight=N;` 或 `down;`，
     # 不能匹配 `proxy_pass`
     assert "proxy_pass" not in sed_text, (
-        f"switch.sh sed 块不应动 location proxy_pass（Issue #32 Option 2）:\n{sed_text}"
+        f"switch.sh 改写块不应动 location proxy_pass（Issue #32 Option 2）:\n{sed_text}"
     )
-    # 强约束：sed 只能动 server 行的 weight/down
+    # 强约束：只能动 server 行的 weight/down
     assert sed_text.count("server 127.0.0.1:") >= 4  # 主 + MCP 蓝绿各 1 行
+    # 不许回退到 `sed -i`（跨平台不可靠，见上）
+    assert "sed -i" not in sed_text
+    assert "${NGINX_CONF}" in sed_text and "mv " in sed_text
 
 
 def test_switch_layout_guard_source_static():
