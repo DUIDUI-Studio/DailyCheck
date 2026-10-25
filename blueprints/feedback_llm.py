@@ -55,8 +55,21 @@ from .feedback_pure import (
 
 logger = logging.getLogger(__name__)
 
-# 结构化分析比自由问答要长，但 1600 已经足够（实测输出 600~900 token）。
-MAX_OUTPUT_TOKENS = 1600
+# ⚠️ 这个预算不是「正文长度」，是「推理 + 正文」的总预算。
+#
+# 生产默认模型 MiniMax-M3.1-Flash 是**推理模型**，回复里先有 ``reasoning_content``
+# 再有 ``content``。2026-10-25 生产事故（ticket 9 / FB-20261024-0001）：1600 被
+# reasoning 吃光（1599 reasoning_tokens），推理没收敛就撞 ``finish_reason=length``，
+# 此时上游返回的 ``message`` 里**只有 reasoning_content、没有 content 键**，
+# 取值直接 KeyError → 被笼统报成「响应结构不可解析」，一审降级成模板兜底。
+#
+# 实测同一张单（prompt 2012 tokens）三档对照：
+#   1600 → length，reasoning 1599，无 content
+#   4096 → length，reasoning 4095，无 content
+#   8192 → stop，  reasoning 3325，content 1805 字符（合法 JSON）
+# 推理长度波动很大，所以取 8192 而不是刚刚够的 4096；真被截断时下面的错误
+# 文案会带上实际 reasoning 用量，便于判断要不要再抬。
+MAX_OUTPUT_TOKENS = 8192
 MODEL_TEMPLATE_LABEL = "template"
 
 
@@ -138,10 +151,38 @@ def _chat(messages: list[dict[str, str]]) -> str:
 
     try:
         data = json.loads((body or b"").decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        if not isinstance(choice, dict):
+            raise TypeError("choices[0] 不是对象")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise TypeError("message 不是对象")
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise LLMError("响应结构不可解析") from exc
-    return str(content or "")
+
+    # content 用 get 不用下标：推理模型撞 length 时这个键**根本不存在**，
+    # 拿它当结构异常会让「预算不够」伪装成「上游返回物怪异」，把排查引到错方向。
+    text = str(message.get("content") or "").strip()
+    if text:
+        return text
+
+    finish = str(choice.get("finish_reason") or "")
+    if finish == "length":
+        raise LLMError(
+            f"输出被 max_tokens={MAX_OUTPUT_TOKENS} 截断"
+            f"（reasoning 已用 {_reasoning_tokens(data)} tokens，正文未生成）"
+        )
+    raise LLMError(f"模型返回空内容（finish_reason={finish or '未提供'}）")
+
+
+def _reasoning_tokens(data: Any) -> int:
+    """从 usage 里抠 reasoning token 数，钻不出来就返 0（只用于告警文案）。"""
+    try:
+        usage = data.get("usage") if isinstance(data, dict) else None
+        details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        return int((details or {}).get("reasoning_tokens") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0
 
 
 # ---------------------------------------------------------------------------

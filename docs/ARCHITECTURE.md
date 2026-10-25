@@ -616,6 +616,25 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 失败语义同 §3.10 既有口径：`LLMError` 只记 HTTP 状态码或异常类型名，**key 绝不进日志**；单次失败不自动重试（线程里重试要么拖长占单时间，要么撞限流），由管理员点「重新分析」控制节奏。
 
+⚠️ **`MAX_OUTPUT_TOKENS` 是「推理 + 正文」的总预算，不是正文长度**（2026-10-25 生产事故修正）
+
+生产默认模型 `MiniMax-M3.1-Flash` 是**推理模型**：回复里先有 `reasoning_content` 再有 `content`。原来的 1600 被 `reasoning_tokens` 吃光，推理没收敛就撞 `finish_reason=length`，此时上游返回的 `message` 里**只有 `reasoning_content`、没有 `content` 键** —— `message["content"]` 抛 KeyError，被笼统包装成「响应结构不可解析」，一审静默降级成模板兜底，而 DB 里 `analysis_error` 是空的，只有 `gaps` 里那句含糊的说明。
+
+同一张单（prompt 2012 tokens）实测三档：
+
+| max_tokens | finish_reason | reasoning_tokens | content |
+|---|---|---|---|
+| 1600 | `length` | 1599 | **无该字段** |
+| 4096 | `length` | 4095 | **无该字段** |
+| 8192 | `stop` | 3325 / 2324 / 4100（三次） | 1805~1901 字符合法 JSON |
+
+所以两条一起改，缺一不可：
+
+- 预算抬到 **8192**（不是刚够的 4096，推理长度波动大）。
+- **解析层必须区分三件事**：结构真坏（无 `choices` / 空列表 / `message` 非对象）→「响应结构不可解析」；`finish_reason=length` 且无正文 →「输出被 max_tokens 截断（reasoning 已用 N tokens）」；有 `content` 但为空 →「模型返回空内容（finish_reason=X）」。把「预算不够」混报成「上游返回物怪异」，会把排查引向错误方向 —— 这次就绕了一圈才定位到。
+
+`tests/test_feedback_analysis.py` 有四条用例分别守着这三种分支 + `MAX_OUTPUT_TOKENS >= 8192`（防止有人觉得「正文才 1800 字符，1600 够了」又改回去）。
+
 **Issue 精确化**（`blueprints/feedback_introspect.py`，2026-10-17 追加）：
 
 派发出的 Issue 是交给自动化巡检（`automation-1784861165563`，每 4 小时，`gh issue list --state open` 全量拉取，不依赖标签）执行的任务单。巡检侧对「判断不清或有产品决策属性」的 issue 会跳过并转人工，所以正文的精确度直接决定这单是「自动跑」还是「回到人工」。而精确度**不来自用户措辞**——用户不懂代码、管理员只做判定，这两处粗糙是常态；精确度来自机器能从 `page_path` 反查到什么。
