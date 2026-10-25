@@ -2099,6 +2099,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - `products` 有生产记录（`production_runs`）时，`product_delete` 直接拒绝。物理删会连带 `production_runs` / `production_run_items` 一起 CASCADE，历史成本口径永久丢失。
 - 替代方案 `products.is_hidden`（v5 迁移）：隐藏后不进产品列表、不进 `/production/session` 的产品下拉，但 BOM 与生产历史全留，管理员可随时恢复（列表页 `?show_hidden=1`）。
 - 隐藏/恢复 = `POST /production/products/<id>/toggle-hidden`，仅 platform admin。
+- ⚠️ **隐藏不解除 `products.name` 的 UNIQUE**：`UNIQUE(name)` 是建表时的表级约束，SQLite 无法 `DROP CONSTRAINT`。所以「隐藏旧的 + 新建同名配方」走不通（新建仍撞名）。想保留原名只有一条路：直接编辑现有配方的 BOM。
 
 **原料行的删除是独立路由，不是表单里的 checkbox**：
 - 旧实现用 `bom_delete[]` 与 `bom_row_id[]` 平行数组按索引配对。**checkbox 未勾选就不提交**，数组长度必然短于行数 → 索引整体错位 → 勾第 3 行却删掉第 1 行（静默数据损坏，比 500 更危险）。
