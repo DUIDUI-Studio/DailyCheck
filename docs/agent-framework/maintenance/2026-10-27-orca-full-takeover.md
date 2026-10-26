@@ -39,9 +39,9 @@
 
 ### CI 实测
 
-- PR #60 / run 120：reports job `3m15s`，其中 generate 步骤 `7s`；日志确认复用 test job 摘要并跳过 pytest。
-- PR #57 / run 111：test job `27m56s`（pytest 步骤 `25m03s`，内部 `25m01s`，`14 failed / 2459 passed`，全部为 known baseline）；reports job `1m40s`，generate 步骤 `5s`。
-- merged-main push run 112：success。
+- PR #60 / run #107（id 120）：reports job `3m15s`，其中 generate 步骤 `7s`；日志确认复用 test job 摘要并跳过 pytest。
+- PR #57 / run #111（id 124）：test job `27m56s`（pytest 步骤 `25m03s`，内部 `25m01s`，`14 failed / 2459 passed`，全部为 known baseline）；reports job `1m40s`，generate 步骤 `5s`。
+- merged-main push run #112（id 125）：success。
 - 全量 verify：8/8 通过，30 分钟观察窗零 BLOCKED。
 
 ## 3. Orca 角色与模型编排
@@ -54,7 +54,7 @@
 - Planner / Escalation：Claude + `ccs-claude-qianwenai--qwen3.8-max[1M]`。
 - Release：Prod Agent，不调用 LLM；由确定性脚本执行 merge/deploy。
 
-基础设失败（401/403、429/配额、超时、连接失败、5xx、provider unavailable、effective model 不一致）才允许 fallback。Reviewer BLOCKER、CI 失败、测试失败和未知残留 writer 不得靠换模型绕过。
+基础设施失败（401/403、429/配额、超时、连接失败、5xx、provider unavailable、effective model 不一致）才允许 fallback。Reviewer BLOCKER、CI 失败、测试失败和未知残留 writer 不得靠换模型绕过。
 
 实际演练：
 
@@ -90,7 +90,7 @@
 - 时间：Asia/Shanghai 工作日 09:00
 - 模型：`ccs-claude-qianwenai--qwen3.8-flash[1M]` / low
 - 模式：现有 `重编排` workspace，每次 fresh session
-- 手动首跑：run 1 completed，只创建一个新 session；完成后会话正常回收，无重复 session
+- 手动首跑：automation run #1 completed，只创建一个新 session；完成后会话正常回收，无重复 session
 - 状态：enabled
 
 首跑识别出的当前工作队列：
@@ -103,7 +103,7 @@
 
 - 自动 CI artifact 传递与 MERGE_READY 门禁已上线，但 Issue/PR 的“业务优先级裁决”和 owner redline 仍由人决定。
 - `wdg-pr` route 仍存在以保持配置兼容；新 notifier/sender 不允许把 `pull_request` 路由到 provider，因此不会重新唤醒 Hermes。
-- Gitea 单 runner 仍是主要等待来源；下一阶段基于新 CI 数据评估 test-job 并行化、测试分片、缓存和依赖安装优化。
+- Gitea 单个 2 vCPU runner host（capacity=2）仍是主要等待来源；下一阶段基于新 CI 数据评估 test-job 并行化、测试分片、缓存和依赖安装优化。
 
 ## 8. 已知约束
 
