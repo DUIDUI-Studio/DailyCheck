@@ -60,7 +60,17 @@ def fake(tmp_path, monkeypatch):
     monkeypatch.setenv("DAILYCHECK_GITEA_TOKEN", "test-token")
     monkeypatch.setenv("FEEDBACK_GITEA_API", "http://gitea.test/api/v1")
     monkeypatch.setenv("FEEDBACK_GITEA_REPO", "eric/dailycheck")
-    monkeypatch.delenv("DAILYCHECK_GITEA_TOKEN_FILE", raising=False)
+    # token 文件指向一个**不存在**的路径，而不是 delenv。
+    # delenv 会让 deploy_report._token() 回落到默认路径 /etc/dailycheck/gitea-token
+    # —— 该文件在生产 VPS 上真实存在（CI 上不存在）。于是「缺 token」用例在生产上
+    # 读到真 token → rc 0 而非 32 → verify check 1 判新增失败（2026-10-26 PR #48 部署实测）。
+    # 用例结果不得取决于「在哪台机器上跑」。
+    monkeypatch.setenv("DAILYCHECK_GITEA_TOKEN_FILE", str(tmp_path / "no-such-token-file"))
+    # 同理清掉环境变量兜底：deploy_report._token() 的取值顺序是
+    # DAILYCHECK_GITEA_TOKEN → FEEDBACK_GITEA_TOKEN → token 文件。
+    # 生产上 /etc/dailycheck/wecom-notify.env 导出 FEEDBACK_GITEA_TOKEN
+    # （systemd EnvironmentFile），若不清掉，缺 token 用例在生产上仍会读到真 token。
+    monkeypatch.delenv("FEEDBACK_GITEA_TOKEN", raising=False)
 
     def respond(*items):
         queue.write_text(json.dumps(list(items)), encoding="utf-8")
