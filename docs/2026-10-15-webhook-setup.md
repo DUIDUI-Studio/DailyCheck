@@ -34,7 +34,12 @@
 >
 > **更新**：2026-10-26 增补 **Issue #54 event reducer** —— `dc-notify-prod-agent`
 > 先经 SQLite reducer 做 delivery/等价事件去重、短窗口合并、单 PR 租约和 429
-> cooldown，再唤醒 `wdg-pr` / `wdg-ci` / `dailycheck-deploy`；见 §3.8a。
+> cooldown，再按事件唤醒 provider；见 §3.8a。
+>
+> **更新**：2026-10-26 **Issue #56 deterministic merge-ready gate** ——
+> `pull_request` 只记账且永不唤醒 Hermes；CI 中间态/失败零 provider 请求；
+> 只有 Gitea 确认 open / same head / mergeable / required checks 全绿时，
+> 每个 `(repo, PR, head)` 才产生一次 `MERGE_READY → wdg-ci`。
 
 ## 1. 架构
 
@@ -292,16 +297,14 @@ chmod 755 /usr/local/bin/dc-notify-prod-agent
 #    重启 gateway 生效（root 用户级 systemd；重启会中断进行中的会话）：
 XDG_RUNTIME_DIR=/run/user/0 systemctl --user restart hermes-gateway.service
 ss -tlnp | grep 8644           # 期望 127.0.0.1:8644 LISTEN
-#    然后建订阅（CLI 一律走 venv 绝对路径，理由同步骤 1；两个订阅都要建）：
+#    然后确保 CI 订阅存在（CLI 一律走 venv 绝对路径，理由同步骤 1）。
+#    Issue #56 起不再需要 wdg-pr；旧订阅可保留但新代码不会读取：
 cd /root/hermes-agent
-/root/hermes-agent/.venv/bin/hermes webhook subscribe wdg-pr \
-  --prompt 'DailyCheck PR 通知: PR #{pr_number} {action} by {pr_author} ({pr_head_sha}) —— 走 dailycheck-prod-agent skill 判定 merge。最终回复=恰好一行 ≤50 字轻提醒（会原样推送飞书）。' \
-  --skills dailycheck-prod-agent
 /root/hermes-agent/.venv/bin/hermes webhook subscribe wdg-ci \
-  --prompt 'DailyCheck CI 完成通知: PR #{pr_number}，head {pr_head_sha}。走 dailycheck-prod-agent skill 判定 merge；若两必需 check 未全绿或无需动作 → 仅回 [SILENT]（不发消息）；有实质动作（merge/上报）→ 最终回复恰好一行 ≤50 字轻提醒。' \
+  --prompt 'DailyCheck MERGE_READY: PR #{pr_number}，head {pr_head_sha}，required checks 已由 reducer 确认为全绿。走 dailycheck-prod-agent skill 完成 merge 前置检查与合并；无需动作 → 仅回 [SILENT]；有实质动作 → 最终回复恰好一行 ≤50 字轻提醒。' \
   --skills dailycheck-prod-agent
-/root/hermes-agent/.venv/bin/hermes webhook list            # 确认 wdg-pr + wdg-ci 都在列
-#    （prompt 文案可按需调整；⚠️ [SILENT] 中间态静默依赖下一步 2c 的补丁）
+/root/hermes-agent/.venv/bin/hermes webhook list            # 确认 wdg-ci 在列
+#    （prompt 文案可按需调整；中间态不再进入 Hermes，[SILENT] 仅供 agent 自身无动作时使用）
 
 #    c) （2026-10-16 增，CI 快通道静默必需）[SILENT] 抑制补丁 ×2（均本地补丁）：
 #       ① webhook 跨平台投递抑制（上游无此能力 —— 上游仅 cron 投递支持 [SILENT]，
@@ -343,11 +346,11 @@ systemctl enable --now dc-inbox-rotate.timer
 # 4. 链路验证（秒级）
 systemctl status dc-inbox-watcher --no-pager
 journalctl -u dc-inbox-watcher -n 20 --no-pager   # 期望 [inbox_watcher] started: ...
-echo '{"delivery_id":"test-1","event":"pull_request","action":"opened","repo_full_name":"ericmr1981/DailyCheck","pr_number":1,"pr_title":"test","pr_head_sha":"deadbeef","received_at_ms":0}' \
+echo '{"delivery_id":"test-1","event":"pull_request","action":"opened","repo_full_name":"eric/dailycheck","pr_number":1,"pr_title":"test","pr_head_sha":"deadbeef","received_at_ms":0}' \
   >> /var/lib/dailycheck-prod-agent/inbox.jsonl
 sleep 3
 journalctl -u dc-inbox-watcher -n 5 --no-pager     # 期望出现 triggered: delivery=test-1
-# Prod Agent 侧（Hermes）应同时收到 wdg-pr 订阅的会话
+# reducer 应返回 silent/pr_state_updated；Hermes 与 LLM 会话数均为 0
 
 # 5. 手工跑一次 rotate（验证归档链路）
 systemctl start dc-inbox-rotate.service
@@ -396,9 +399,8 @@ drain 不会再为该 PR 生成第二个 active dispatch。若生产把
 **安装与 rollout**：
 
 ```bash
-# 0. 前置：确认两条新订阅存在，并确认 gateway 的 inactivity timeout 小于
+# 0. 前置：确认两个 provider route 存在，并确认 gateway 的 inactivity timeout 小于
 #    1,200,000 ms lease。缺订阅时不要覆盖生产 adapter。
-/root/hermes-agent/.venv/bin/hermes webhook list | grep -q '◆ wdg-pr'
 /root/hermes-agent/.venv/bin/hermes webhook list | grep -q '◆ wdg-ci'
 /root/hermes-agent/.venv/bin/hermes webhook list | grep -q '◆ dailycheck-deploy'
 
@@ -489,23 +491,24 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 - 脚本必须在 `HERMES_HOME/scripts/` 内（scheduler 强制校验，防任意路径执行）。
 - `DCPOLL_REPO` 环境变量仅用于测试输出格式；生产 cron 不设置（默认 `ericmr1981/DailyCheck`）。
 - 该 job 是 webhook 快通道的**冗余保底**，不是替代——两条通道独立，都指向同一 `dailycheck-prod-agent` skill 判定流程（merge 判定幂等）。
-- **轻提醒（2026-10-16 增）**：prod 的该 job 与 `wdg-pr` / `wdg-ci` 两订阅的 deliver 均为 `feishu:<chat_id>`（有实质动作时直推 ≤3 行轻提醒；静默 tick 仍被 [SILENT] 抑制，依赖 §3.8 步骤 2c 两补丁）；配 Hermes `config.yaml` `cron.wrap_response: false` 去掉 cron 包装头。⚠️ 本文档第 3 步命令里的 `--deliver local` 是最初创建参数，prod 现状已改为 feishu（以本条为准）。
+- **轻提醒（2026-10-16 增；2026-10-26 更新）**：兜底 cron 与 `wdg-ci` / `dailycheck-deploy` 的 deliver 均为 `feishu:<chat_id>`（有实质动作时直推 ≤3 行轻提醒；静默 tick 仍被 [SILENT] 抑制，依赖 §3.8 步骤 2c 两补丁）；配 Hermes `config.yaml` `cron.wrap_response: false` 去掉 cron 包装头。⚠️ 本文档第 3 步命令里的 `--deliver local` 是最初创建参数，prod 现状已改为 feishu（以本条为准）。
 
-### 3.10 CI 完成快通道（2026-10-16 增；2026-10-22 改为 Gitea `status` 事件）
+### 3.10 CI merge-ready 快通道（2026-10-16 增；2026-10-22 Gitea `status`；2026-10-26 Issue #56 改为确定性 gate）
 
-**目标**：CI 全绿 → **秒级**触发 Prod Agent 判定 merge（此前 merge 环节靠 §3.9 兜底轮询接棒，最坏 ≤30 分钟延迟）。
+**目标**：PR 生命周期不唤醒 LLM；CI running/failure/partial 静默记账；同一 PR/head 第一次达到确定可合并条件时才向 `wdg-ci` 产生一次 `MERGE_READY`。
 
-**链路**：Gitea `status`（state=success + 两个必需 check 全绿）→ receiver（§3.6 同一 webhook，Events 勾 `status`）→ inbox.jsonl → watcher（§3.8，unit `--actions` 含 `completed`）→ `dc-notify-prod-agent.sh`（按 `event` 路由 `wdg-ci` 订阅）→ Prod Agent（全绿即 merge；中间态回 `[SILENT]` 静默不打扰）。
+**链路**：Gitea `status` → receiver（§3.6 同一 webhook，Events 勾 `status`）→ inbox.jsonl → watcher（§3.8，unit `--actions` 含 `completed`）→ `dc-notify-prod-agent.sh` → reducer。reducer 查询 Gitea PR 与 commit statuses，要求 PR open、head 未变、mergeable、所有 required contexts success；只有全绿转换进入 `wdg-ci`，`deploy_result` 继续走 `dailycheck-deploy`。`pull_request` 只更新 reducer state，不进入 provider queue。
 
 **部署变更点**（相对 §3.3-3.9 的增量，代码已在本 repo）：
 
 | # | 位置 | 变更 |
 |---|------|------|
 | 1 | Gitea webhook Events | 勾 `status`（§3.6 步骤 5） |
-| 2 | `scripts/blue_green/webhook_receiver.py` | 支持 `status`：state=success 且按 sha 反查到 open PR、且两个必需 check 全绿才落盘（其余 200 ignored） |
+| 2 | `scripts/blue_green/webhook_receiver.py` | `status` / completed `check_suite` 按 sha 关联到 open PR 即落盘（包含 running/failure/partial）；无 PR 的 main CI 仍 ignored。确定性判断全部移到 reducer |
 | 3 | `deploy/systemd/dc-inbox-watcher.service` | `--actions opened,synchronize,reopened,completed` |
-| 4 | `deploy/scripts/dc-notify-prod-agent.sh` + `scripts/prod_agent/hermes_webhook_sender.py` | reducer 只允许 `pull_request → wdg-pr`、`check_suite → wdg-ci`、`deploy_result → dailycheck-deploy`；用 route secret 做 HMAC，HTTP 202 入队后立即 complete，不等待 agent turn |
-| 5 | Hermes 侧 | 订阅 `wdg-ci`（§3.8 步骤 2）+ gateway `webhook.py` [SILENT] 补丁（§3.8 步骤 2c） |
+| 4 | `scripts/prod_agent/merge_readiness.py` | stdlib-only Gitea helper；复用 `GITEA_TOKEN` / `GITEA_TOKEN_FILE` / `GITEA_URL`，请求有 timeout、不跟随 3xx、不记录 token。配置 `DAILYCHECK_REQUIRED_CONTEXTS`（逗号分隔，大小写敏感；默认 `test,agent-framework-reports`） |
+| 5 | `deploy/scripts/dc-notify-prod-agent.sh` + `scripts/prod_agent/hermes_webhook_sender.py` | provider 只允许 `MERGE_READY → wdg-ci` 与 `deploy_result → dailycheck-deploy`；`pull_request` / `wdg-pr` 在 reducer、adapter、sender 三层拒绝。用 route secret 做 HMAC，HTTP 202 入队后 complete |
+| 6 | Hermes 侧 | 需要 `wdg-ci` 订阅（§3.8 步骤 2）；既然中间态不再进入 Hermes，`[SILENT]` gateway 补丁不再是 merge gate 的正确性依赖 |
 
 **验证**（真 PR 的 CI 全绿后）：
 
@@ -513,18 +516,24 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 # 1. Gitea 侧：webhook 最近投递出现 status 类型 delivery，202
 # 2. receiver 侧：
 tail -1 /var/lib/dailycheck-prod-agent/inbox.jsonl | python3 -m json.tool
-#    期望：含 pr_number；event 字段仍是 "check_suite"（迁移期兼容写法，
-#          下游 watcher/路由不用改），但 webhook 投递类型是 status
+#    期望：含 pr_number/head/check_conclusion；event 字段仍为 "check_suite"
+#          （向下游兼容），source_event="status"
 # 3. watcher 侧：
 journalctl -u dc-inbox-watcher -n 10 --no-pager | grep triggered
-# 4. Prod Agent 侧：merge 时间戳 − CI 完成时间 < 1 分钟（对比旧链路 ≤30 分钟）
+# 4. reducer 侧：
+/root/DailyCheck/.venv/bin/python /root/DailyCheck/scripts/prod_agent/event_reducer.py \
+  --db /var/lib/dailycheck-prod-agent/event_reducer.sqlite3 status
+#    期望：pending/claimed 与 provider cooldown 可见；merge_ready 只列当前就绪 PR
+# 5. 单元证据（部署前/PR 验证）：
+python3 -m pytest tests/test_merge_readiness.py tests/test_event_reducer.py \
+  tests/test_provider_breaker.py tests/test_dashboard_reducer.py -q
 ```
 
 **注意**：
 
-- 一个 PR 的 CI 过程通常产生**多次 status 事件**（每个 workflow 的每个 check 各一次），每次 success 都会触发一次判定——前面 suite 完成时两必需 check 未齐 → Prod Agent 回 `[SILENT]`（**不产生飞书消息**）；最后一个凑齐全绿的 suite 才触发 merge + 一行轻提醒。多跑几次判定是幂等且静默的，属预期。
-- `conclusion=failure` 的 suite **不转发**（无 merge 动作可做；失败由 Dev 侧修复，兜底轮询照常看板）。
-- [SILENT] 抑制依赖两处本地补丁（§3.8 步骤 2c：gateway `webhook.py` + cron `scheduler.py`，均含「标记丢右括号」截断容错）；补丁缺失时会往飞书发字面 "[SILENT]" 消息——见 §5 风险表。
+- 一个 PR 的 CI 过程会产生多次 status/check 事件。reducer 每次都只更新 `pr_state` 且不调用 Hermes；`merge_ready_at_ms` 一旦写入，新的重复 delivery 直接 suppress。malformed Gitea response、token 缺失、网络超时均 fail-closed。
+- `check_suite` / `status` 的 failure/running/partial 已进入 reducer state，但不会产生 `MERGE_READY`；旧 head 的迟到事件为 `stale_head`。`pull_request / synchronize / reopened` 会记录新 head 并让旧 head 的 pending/claimed lease 失效。
+- 已存在的 `wdg-pr` route secret 不需要修改或删除；新代码不再读取它。是否清理该 Hermes 订阅属于独立运维动作，本变更不触碰现有 route secret。
 
 ### 3.11 审批跨会话修复（2026-10-16 深夜，本地补丁）
 
@@ -578,8 +587,8 @@ grep -E "cross-session" /root/.hermes/logs/agent.log   # 发生过跨会话解�
 | 15 | 端到端：PR → webhook → inbox → watcher → Prod Agent | 提一个测试 PR → GitHub Delivery 202 → watcher journal `triggered:` → Prod Agent 侧收到事件 |
 | 16 | 兜底轮询 job active | `hermes cron list` → 「DailyCheck PR 兜底轮询」（`*/30`，deliver local，skill dailycheck-prod-agent） |
 | 17 | 兜底轮询静默语义 | `hermes cron run <id>` 一次 → `cron/output/<id>/<ts>.md` 结尾 `Response = [SILENT]`（无 open PR 时） |
-| 18 | check_suite 快通道落盘 | 真 PR CI 全绿后 inbox 出现 `"event":"check_suite"` 行 / GitHub delivery 202（§3.10） |
-| 19 | CI 快通道秒级 merge | 全绿 suite 完成 → merge 时间差 < 1 分钟（§3.10 验证第 4 条） |
+| 18 | CI 状态落盘 | PR 中间态/失败/成功事件均出现 `"event":"check_suite"` inbox 行；main CI 仍不落盘（§3.10） |
+| 19 | MERGE_READY transition | 全绿**首次**产生一条 `trigger_name=MERGE_READY`；重复/旧 head 零新增 provider 投递（§3.10） |
 | 20 | [SILENT] 抑制生效 | 中间态判定不产生飞书消息；`grep 'Suppressed delivery' /path/agent.log` 或日志无声即成功 |
 | 21 | 审批跨会话放行（§3.11） | webhook 会话触发危险命令 → 飞书回复 `/approve` → `agent.log` 出现 `cross-session` 行 + 该命令解冻执行 |
 

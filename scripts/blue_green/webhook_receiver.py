@@ -11,14 +11,15 @@
 #   2. 仅处理 pull_request + status event（issue 由 DailyCheck 自己的 automation 处理）
 #   3. action 白名单分事件：pull_request ∈ {opened, synchronize, synchronized, reopened}
 #      —— 注意 Gitea 的 synchronize 拼作 "synchronized"（多一个 d），两个都收
-#      status = state 为 success 且「两个必需 check 全绿」才落盘
-#      —— status 通道 = 「CI 全绿 → 秒级唤醒 Prod Agent 判定 merge」快通道
+#      status = 有 open PR 关联就落盘；中间态由下游 reducer 静默记账，
+#      只有确定性 readiness gate 通过后才产生一次 MERGE_READY provider 调用
 #
 # Gitea 适配（2026-10-22，GitHub 账号停用后迁至 hub1 自托管 Gitea 28.1）：
 #   - Gitea 同时发 GitHub 兼容头：X-GitHub-Event / X-GitHub-Delivery /
 #     X-Hub-Signature-256（格式与 GitHub 完全一致 `sha256=<hex>`）→ 验签与幂等逻辑不用改
 #   - 事件名差异：Gitea 没有 check_suite，改用 status（每次 commit status 变化触发一次）；
-#     status 的 payload 没有 PR 关联字段，需按 sha 反查 open PR 并核对全部必需 check
+#     status 的 payload 没有 PR 关联字段，需按 sha 反查 open PR；决定性 check
+#     判定与 transition-only MERGE_READY 由 prod_agent/event_reducer.py 负责
 #   - PR 细分事件（pull_request_sync / pull_request_comment）仍以
 #     X-GitHub-Event: pull_request 发送，细分类别在 X-GitHub-Event-Type 里
 #   - Gitea 默认禁止向内网投递 webhook，需 app.ini 配
@@ -72,16 +73,9 @@ GITEA_TOKEN = os.environ.get("GITEA_TOKEN")  # 直接给值则优先，否则读
 GITEA_REPO = os.environ.get("GITEA_REPO", "eric/dailycheck")
 GITEA_TIMEOUT = int(os.environ.get("GITEA_TIMEOUT", "10"))
 
-# 必需通过的 check context（Gitea 形如 `CI / test (pull_request)`，按子串匹配）
-REQUIRED_CHECK_KEYS = {
-    "test": ("/ test (", "test (pull_request)"),
-    "agent-framework-reports": ("agent-framework-reports",),
-}
-
 # 仅处理的事件 + 分事件 action 白名单
 #   pull_request —— PR 生命周期触点（开 / 更新 / 重开）
-#   check_suite  —— CI 完成触点（仅 completed；且仅「有 PR 关联 + success」
-#                   才落盘，见 handler 内 4.5 业务过滤）→ 秒级唤醒快通道
+#   check_suite  —— CI 完成触点（仅 completed + 有 PR 关联才落盘）
 # 三事件并存：
 #   pull_request —— PR 生命周期（GitHub / Gitea 共用，Gitea 的 synchronize 拼作 synchronized）
 #   check_suite  —— GitHub 的 CI 完成事件（保留：迁移期兼容 + 既有测试覆盖）
@@ -248,13 +242,6 @@ def _gitea_get(path: str, token: str) -> object:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _is_required_check(context: str) -> bool:
-    """判断某个 status context 是否属于两个必需 check 之一。"""
-    return any(
-        any(k in context for k in keys) for keys in REQUIRED_CHECK_KEYS.values()
-    )
-
-
 def _resolve_pr_for_sha(sha: str, token: str) -> dict | None:
     """按 head sha 反查 open PR（Gitea 的 status 事件 payload 不带 PR 信息）。"""
     if not sha:
@@ -267,19 +254,6 @@ def _resolve_pr_for_sha(sha: str, token: str) -> dict | None:
         if head.get("sha") == sha:
             return pr
     return None
-
-
-def _all_required_checks_green(sha: str, token: str) -> bool:
-    """两个必需 check 是否都已 success（context 按子串匹配，兼容事件后缀）。"""
-    data = _gitea_get(f"/repos/{GITEA_REPO}/commits/{sha}/status", token)
-    statuses = (data or {}).get("statuses") or []
-    seen: dict[str, bool] = {name: False for name in REQUIRED_CHECK_KEYS}
-    for st in statuses:
-        ctx = str(st.get("context") or "")
-        for name, keys in REQUIRED_CHECK_KEYS.items():
-            if any(k in ctx for k in keys):
-                seen[name] = seen.get(name, False) or st.get("status") == "success"
-    return all(seen.values())
 
 
 def _build_status_record(delivery_id: str, data: dict, pr: dict) -> dict:
@@ -311,7 +285,7 @@ def _build_status_record(delivery_id: str, data: dict, pr: dict) -> dict:
         "pr_author": user.get("login", ""),
         "repo_full_name": repo_full_name,
         "repo_visibility": repo.get("visibility", repo.get("private", None)),
-        "check_conclusion": "success",
+        "check_conclusion": data.get("state", ""),
         "check_head_branch": head.get("ref", ""),
         "check_suite_id": data.get("id"),
         "status_context": data.get("context", ""),
@@ -349,35 +323,16 @@ def webhook():
             {"status": "ignored", "reason": "action", "event": event, "action": action}
         ), 200
 
-    # 4.5 status 业务过滤：只转发「必需 check 全绿且有关联 PR」的那一刻
-    #     - state != success → 不触发（失败由兜底轮询/人工处理）
-    #     - 非必需 check（其它 status 提供者）→ 忽略
-    #     - 无关联 open PR（如 main push 的 CI）→ Prod Agent 无事可做，不落盘
-    #     - 两个必需 check 未全部 success → 等下一个 status 事件再来
+    # 4.5 CI 业务过滤：只把关联到 open PR 的更新交给 reducer。
+    #     reducer 负责精确 required-context 匹配、Gitea readiness 查询和
+    #     transition-only MERGE_READY；中间态/失败落账但不唤醒 provider。
     if event == "check_suite":
         check_suite = data.get("check_suite") or {}
         if not (check_suite.get("pull_requests") or []):
             return jsonify({"status": "ignored", "reason": "no_pr"}), 200
-        if check_suite.get("conclusion") != "success":
-            return jsonify(
-                {
-                    "status": "ignored",
-                    "reason": "conclusion",
-                    "conclusion": check_suite.get("conclusion"),
-                }
-            ), 200
 
     status_pr: dict | None = None
     if event == "status":
-        if data.get("state") != "success":
-            return jsonify(
-                {"status": "ignored", "reason": "state", "state": data.get("state")}
-            ), 200
-        context = str(data.get("context") or "")
-        if not _is_required_check(context):
-            return jsonify(
-                {"status": "ignored", "reason": "context", "context": context}
-            ), 200
         sha = str(data.get("sha") or "")
         token = _gitea_token()
         if not token:
@@ -387,10 +342,6 @@ def webhook():
             status_pr = _resolve_pr_for_sha(sha, token)
             if not status_pr:
                 return jsonify({"status": "ignored", "reason": "no_pr"}), 200
-            if not _all_required_checks_green(sha, token):
-                return jsonify(
-                    {"status": "ignored", "reason": "checks_pending", "sha": sha[:8]}
-                ), 200
         except (urllib.error.URLError, urllib.error.HTTPError, ValueError, OSError) as exc:
             # 反查失败：让 Gitea 重试，避免快通道静默丢失
             abort(503, f"gitea lookup failed: {type(exc).__name__}")

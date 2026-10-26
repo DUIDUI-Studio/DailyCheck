@@ -29,6 +29,7 @@ DEFAULT_DB = Path("/var/lib/dailycheck-dashboard/dashboard.db")
 DEFAULT_HTML_DIR = Path("/var/lib/dailycheck-dashboard/snapshots")
 DEFAULT_HTML_LATEST = Path("/var/lib/dailycheck-dashboard/latest.html")
 DEFAULT_INBOX = Path("/var/lib/dailycheck-prod-agent/inbox.jsonl")
+DEFAULT_REDUCER_DB = Path("/var/lib/dailycheck-prod-agent/event_reducer.sqlite3")
 DEFAULT_REPO_DIR = Path("/root/DailyCheck")
 DEFAULT_REPO = "eric/dailycheck"   # 2026-10-22 起仓库迁至自托管 Gitea
 
@@ -119,6 +120,12 @@ def cmd_render(args: argparse.Namespace) -> int:
         _log(f"  inbox fetch FAILED: {exc}")
         inbox_stats = {"lines": 0, "deliveries": 0, "last_action_at": None, "last_pr_number": None}
 
+    reducer_state = fetchers.fetch_reducer_state(Path(args.reducer_db))
+    _log(
+        "  reducer state: "
+        + ("available" if reducer_state.get("available") else "unavailable")
+    )
+
     summary = fetchers.compute_summary(issues=issues, prs=prs, worktrees=worktrees)
     _log(f"  summary: {summary}")
 
@@ -196,6 +203,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         prs=prs,
         worktrees=worktrees,
         inbox_stats=inbox_stats,
+        reducer_state=reducer_state,
         diff=diff,
         deploy_events=deploy_events,
         verifications=verifications,
@@ -310,6 +318,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--html-dir", default=str(DEFAULT_HTML_DIR), help="HTML 快照目录")
     p_render.add_argument("--html-latest", default=str(DEFAULT_HTML_LATEST), help="最新 HTML 路径")
     p_render.add_argument("--inbox", default=str(DEFAULT_INBOX), help="inbox.jsonl 路径")
+    p_render.add_argument(
+        "--reducer-db",
+        default=str(DEFAULT_REDUCER_DB),
+        help="Prod Agent event reducer SQLite 路径（只读）",
+    )
     p_render.add_argument("--repo-dir", default=str(DEFAULT_REPO_DIR), help="git worktree 仓库根")
     p_render.add_argument(
         "--trigger-kind", default="manual",

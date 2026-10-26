@@ -20,18 +20,27 @@ def _reducer(tmp_path: Path) -> event_reducer.EventReducer:
             max_debounce_ms=10_000,
             lease_ttl_ms=1_200_000,
             provider_cooldown_ms=60_000,
-        )
+        ),
+        readiness_checker=lambda repo, pr, sha: {
+            "ready": True,
+            "reason": "ready",
+            "contexts": {
+                "test": "success",
+                "agent-framework-reports": "success",
+            },
+        },
     )
 
 
 def _payload(*, delivery_id: str = "breaker-pr") -> dict:
     return {
         "delivery_id": delivery_id,
-        "event": "pull_request",
-        "action": "opened",
+        "event": "check_suite",
+        "action": "completed",
         "repo_full_name": "eric/dailycheck",
         "pr_number": 54,
         "pr_head_sha": "a" * 40,
+        "check_conclusion": "success",
     }
 
 

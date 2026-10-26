@@ -2,8 +2,10 @@
 """Send one exact JSON body to a local Hermes webhook route.
 
 This is intentionally a small stdlib-only enqueue client: Hermes returns 202 as
-soon as it accepts the event, before the agent turn completes. The sender reads
-the route HMAC secret from ``webhook_subscriptions.json`` and never prints it.
+soon as it accepts the event, before the agent turn completes. Only deterministic
+``MERGE_READY`` (``wdg-ci``) and ``deploy_result`` work can be sent; PR lifecycle
+events are rejected. The sender reads the route HMAC secret from
+``webhook_subscriptions.json`` and never prints it.
 """
 
 from __future__ import annotations
@@ -23,8 +25,8 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any
 
-ROUTES = frozenset({"wdg-pr", "wdg-ci", "dailycheck-deploy"})
-EVENTS = frozenset({"pull_request", "check_suite", "deploy_result"})
+ROUTES = frozenset({"wdg-ci", "dailycheck-deploy"})
+EVENTS = frozenset({"check_suite", "deploy_result"})
 DEFAULT_SUBSCRIPTIONS = Path(
     os.environ.get("DAILYCHECK_HERMES_SUBSCRIPTIONS", "/root/.hermes/webhook_subscriptions.json")
 )
