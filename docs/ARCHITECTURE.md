@@ -990,6 +990,31 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 ---
 
+### 3.15 Orca 角色模型 fallback（2026-10-26 起）
+
+**问题**：DailyCheck 的 Orca 角色原先每个角色只绑定一个模型。模型 API 的认证、配额、端点或代理热切换出现基础设施故障时，Coordinator 只能停住整条波次；如果临时人工换模型，又没有项目内的顺序、停止条件和审计口径。
+
+**单一事实来源**：
+
+- 人读规则：[`agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md)
+- 机器配置：[`agent-framework/orca-model-routing.json`](agent-framework/orca-model-routing.json)
+- 校验/分类/命令生成：[`../scripts/agent_framework/model_routing.py`](../scripts/agent_framework/model_routing.py)
+
+**路由结构**：每个可调用 LLM 的角色声明一个主模型和有序 `fallbacks`；Release 不调用 LLM。CC Switch 聚合模式负责 provider 层热切换，项目路由只处理 Orca 角色的显式模型切换。
+
+**安全边界**：
+
+| 条件 | 动作 |
+|---|---|
+| 认证失败、429、配额、超时、连接失败、5xx、provider unavailable | 可切换下一模型 |
+| `launch.effective` 与声明的目标模型不一致 | 可切换下一模型 |
+| Reviewer BLOCKER、CI/测试失败、输出质量不达标 | **不切换**，按原失败处理 |
+| `outcome_unknown`、残留 writer/terminal、失败阶段未知 | **不自动切换**，先结算和取证 |
+
+切换必须复用同一 Task，并记录失败 Dispatch：Coordinator 先运行 `model_routing.py classify`，只有 `fallback_allowed=true` 才运行 `model_routing.py next` 生成带 `--retry-of` 的命令。直接调用 `orca orchestration worker-start` 会绕过该项目级机制；同一 worktree 仍遵守单写者铁律。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态
@@ -1921,6 +1946,7 @@ flowchart TB
         Redline["test_redline_gate.py<br/>红线机验：路径命中 / known_failures 净增 /<br/>自述需拍板但无授权<br/>19 用例（Issue #24）"]
         PrHygiene["test_pr_hygiene.py<br/>开工规范：分支前缀白名单 / issue 号与<br/>Closes·Part-Of 一致 / 无号须声明 No-Issue<br/>32 用例（Issue #26）"]
         CIHandoff["test_ci_artifact_handoff.py (9)<br/>+ test_ci_pytest_summary.py (6)<br/>artifact v4 零引用 / base64 job output /<br/>摘要保留 FAILED·ERROR·collection·末 5 行<br/>（Issue #59）"]
+        ModelRouting["test_orca_model_routing.py<br/>主模型/fallback 顺序 / 基础设施失败分类 /<br/>同 Task retry 命令 / Release 禁止 LLM<br/>16 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
         BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
     end
@@ -2150,6 +2176,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | `/production*` 页无侧栏 | 低 | pre-existing（2026-10-14 登记） | `templates/production/{products,runs,product_edit,session}.html` 把 `sidebar` block 覆盖为空 → 桌面端在这些页没有导航（只能靠返回/页内链接）。本次新增的「生产记录」入口沿用同布局。移动端不受影响（`mobile-nav` 未被覆盖） |
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
 | 企微推送无重发队列 / 无失败告警 | 低 | 已知限制（2026-10-16 登记，§3.9） | 对外通道失败只留 WARNING（`wecom_notify_dropped` + errcode），不阻塞下单、不回滚、不补发；机器人被移出群 / key 轮换后需人工更新 `/etc/dailycheck/app.env` 才恢复。通知 SLA 属商业化项，另立项 |
+| Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 
 ---
@@ -2164,6 +2191,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/DEV_ENV.md`](DEV_ENV.md) — wdg-systemd 容器部署细节
 - [`docs/mcp-configuration.md`](mcp-configuration.md) — MCP 接入
 - [`docs/agent-framework/workflow.md`](agent-framework/workflow.md) — Dev/Prod/Owner 三方协作工作流（角色、门禁、merge 政策、蓝绿部署、应急）
+- [`docs/agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md) — Orca 角色、模型、effort、fallback 与同 Task 重试规则
 
 ### 部署 / 运维
 

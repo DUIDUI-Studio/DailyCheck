@@ -4,6 +4,7 @@
 > 1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — **项目技术架构图（系统拓扑/数据/模块/请求生命周期/鉴权/MCP/业务领域/部署/PWA/测试/约定）**。改动任何子系统前必须先读。
 > 2. [`docs/DEV_ENV.md`](docs/DEV_ENV.md) — 记录了当前 dev 环境的部署方式(wdg-systemd 容器)、入口、调试命令和已知坑。错误的部署模型会导致走错方向(例如以为有独立 Dockerfile)。
 > 3. [`docs/agent-framework/workflow.md`](docs/agent-framework/workflow.md) — **Dev/Prod/Owner 三方协作工作流（权威口径）**：角色分工、push/merge 政策、PR 模板与门禁、蓝绿部署、应急。任何提交代码 / 提 PR / 部署动作前必须对齐。
+> 4. [`docs/agent-framework/orca-model-orchestration.md`](docs/agent-framework/orca-model-orchestration.md) — **Orca 角色与模型编排**：模型、effort、fallback 顺序、失败分类和同 Task 重试规则。
 
 ## 协作工作流速记（细节以 workflow.md 为准）
 
