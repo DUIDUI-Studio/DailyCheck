@@ -1,60 +1,172 @@
 #!/bin/bash
-# deploy/scripts/dc-notify-prod-agent.sh —— inbox 事件 → Prod Agent 唤醒适配器
+# deploy/scripts/dc-notify-prod-agent.sh —— inbox → deterministic reducer → Hermes
 #
-# 角色：dc-inbox-watcher 的 --trigger-cmd。stdin = inbox 事件 JSON（原样一行）。
-# 本脚本把事件投递给 Prod Agent 的入口；退出码非 0 会被 watcher 视为触发失败
-# （退避重试 + WARNING 留痕）。
+# Backward-compatible watcher interface:
+#   - default mode reads exactly one inbox JSON line from stdin.
+#   - exit 0  = consumed or intentionally suppressed.
+#   - exit 75 = durably deferred (watcher retries; drain timer is a second path).
+#   - other non-zero = state/provider failure; watcher retries with backoff.
 #
-# 默认实现指向 Hermes 的 webhook 订阅（VPS 上的 agent 框架；示例，非指定），
-# 按事件类型路由到三个订阅：
-#   check_suite   → dailycheck-ci      （CI 完成快通道：全绿即触发候选部署判定；
-#                                       prompt 内置 [SILENT] 静默语义，避免中间态打扰）
-#   deploy_result → dailycheck-deploy  （蓝绿部署结束：带 rc/stage/verdict/next，
-#                                       agent 按 next 查表动手，不看日志猜）
-#   其余           → dailycheck-pr      （PR 生命周期触点：opened / synchronize / reopened）
+# The reducer emits one JSON decision on stdout:
+#   {"decision":"suppress",...}  no provider wake
+#   {"decision":"defer",...}     queued; due_at_ms says when it becomes eligible
+#   {"decision":"trigger",...}   one active lease claimed for this PR
 #
-# ⚠️ deploy_result 的 action 复用 `completed`，不是笔误：dc-inbox-watcher 的
-#    --actions 白名单里已有它，为一个新 action 去改 systemd unit 不划算。
-#    真正的分流就在这里，按 event 走，不看 action。
-# 前置：
-#   1. Hermes webhook platform 已启用（config.yaml platforms.webhook.enabled=true）
-#   2. 三个订阅已建立（dailycheck-pr / dailycheck-ci / dailycheck-deploy），
-#      详见部署手册 §3.8
+# Routes are intentionally limited to:
+#   pull_request  -> wdg-pr
+#   check_suite   -> wdg-ci
+#   deploy_result -> dailycheck-deploy
 #
-# 若 Prod Agent 侧用别的机制（cron / 消息队列 / 自研入口），只改本脚本实现，
-# watcher 不需要任何改动。
+# `dc-notify-prod-agent --drain` runs the same send/complete path for queued work
+# and is used by dc-prod-agent-drain.timer.
 #
-# ⚠️ exec 行必须用 venv 绝对路径 /root/hermes-agent/.venv/bin/hermes ——
-#    /root/hermes-agent/hermes 的 shebang 是 #!/usr/bin/env python3，在 watcher 的
-#    PATH（/root/DailyCheck/.venv/bin 排第一）下解析到 DailyCheck venv（缺 PyYAML）
-#    → 触发恒失败 rc=1 ModuleNotFoundError: No module named 'yaml'（2026-10-16 实测）。
+# Installation:
+#   cp deploy/scripts/dc-notify-prod-agent.sh /usr/local/bin/dc-notify-prod-agent
+#   chmod 755 /usr/local/bin/dc-notify-prod-agent
 #
-# 安装：cp deploy/scripts/dc-notify-prod-agent.sh /usr/local/bin/dc-notify-prod-agent
-#      chmod 755 /usr/local/bin/dc-notify-prod-agent
-# 调试：
-#   echo '{"delivery_id":"t1","event":"pull_request","action":"opened","pr_number":1,"pr_head_sha":"deadbeef","repo_full_name":"ericmr1981/DailyCheck"}' \
-#     | /usr/local/bin/dc-notify-prod-agent; echo "rc=$?"
-#   echo '{"delivery_id":"t2","event":"check_suite","action":"completed","pr_number":1,"pr_head_sha":"deadbeef","repo_full_name":"ericmr1981/DailyCheck","check_conclusion":"success"}' \
-#     | /usr/local/bin/dc-notify-prod-agent; echo "rc=$?"
-#   echo '{"delivery_id":"t3","event":"deploy_result","action":"completed","pr_number":1,"pr_head_sha":"deadbeef","repo_full_name":"eric/dailycheck","deploy_rc":21,"deploy_next":"autofix"}' \
-#     | /usr/local/bin/dc-notify-prod-agent; echo "rc=$?"
+# Test/deployment overrides:
+#   DAILYCHECK_PYTHON, DAILYCHECK_EVENT_REDUCER,
+#   DAILYCHECK_EVENT_REDUCER_DB, DAILYCHECK_HERMES
 
-set -euo pipefail
+set -uo pipefail
 
-payload=$(cat)
-if [ -z "$payload" ]; then
-    echo "dc-notify-prod-agent: empty payload on stdin" >&2
-    exit 2
+PYTHON_BIN="${DAILYCHECK_PYTHON:-/root/DailyCheck/.venv/bin/python}"
+REDUCER="${DAILYCHECK_EVENT_REDUCER:-/root/DailyCheck/scripts/prod_agent/event_reducer.py}"
+REDUCER_DB="${DAILYCHECK_EVENT_REDUCER_DB:-/var/lib/dailycheck-prod-agent/event_reducer.sqlite3}"
+HERMES="${DAILYCHECK_HERMES:-/root/hermes-agent/.venv/bin/hermes}"
+
+common_args=(
+    --db "$REDUCER_DB"
+    --debounce-ms "${DAILYCHECK_REDUCER_DEBOUNCE_MS:-2000}"
+    --max-debounce-ms "${DAILYCHECK_REDUCER_MAX_DEBOUNCE_MS:-10000}"
+    --lease-ttl-ms "${DAILYCHECK_REDUCER_LEASE_TTL_MS:-30000}"
+    --provider-cooldown-ms "${DAILYCHECK_REDUCER_COOLDOWN_MS:-60000}"
+)
+
+if [ "${1:-}" = "--drain" ]; then
+    if [ "$#" -ne 1 ]; then
+        echo "dc-notify-prod-agent: --drain takes no additional arguments" >&2
+        exit 64
+    fi
+    decision=$("$PYTHON_BIN" "$REDUCER" "${common_args[@]}" drain)
+    reducer_rc=$?
+elif [ "$#" -eq 0 ]; then
+    payload=$(cat)
+    if [ -z "$payload" ]; then
+        echo "dc-notify-prod-agent: empty payload on stdin" >&2
+        exit 2
+    fi
+    decision=$(printf '%s' "$payload" | "$PYTHON_BIN" "$REDUCER" "${common_args[@]}" ingest)
+    reducer_rc=$?
+else
+    echo "dc-notify-prod-agent: unsupported arguments" >&2
+    exit 64
 fi
 
-# 按事件类型路由订阅（解析失败 → event 空 → 落 dailycheck-pr 默认通道）
-event=$(printf '%s' "$payload" | /root/DailyCheck/.venv/bin/python -c \
-    'import json, sys; print((json.load(sys.stdin) or {}).get("event", ""))' 2>/dev/null || true)
-case "$event" in
-    check_suite)   sub="dailycheck-ci" ;;
-    deploy_result) sub="dailycheck-deploy" ;;
-    *)             sub="dailycheck-pr" ;;
+if [ "$reducer_rc" -ne 0 ] && [ "$reducer_rc" -ne 75 ]; then
+    printf '%s\n' "$decision"
+    exit "$reducer_rc"
+fi
+
+printf '%s\n' "$decision"
+if [ "$reducer_rc" -eq 75 ]; then
+    exit 75
+fi
+
+decision_kind=$(
+    printf '%s' "$decision" | "$PYTHON_BIN" -c \
+        'import json,sys; print(json.load(sys.stdin).get("decision", ""))'
+) || {
+    echo "dc-notify-prod-agent: reducer returned invalid JSON" >&2
+    exit 1
+}
+
+case "$decision_kind" in
+    suppress|silent)
+        exit 0
+        ;;
+    defer)
+        exit 75
+        ;;
+    trigger)
+        ;;
+    *)
+        echo "dc-notify-prod-agent: unknown decision $decision_kind" >&2
+        exit 1
+        ;;
 esac
 
-# —— Prod Agent 入口（示例：Hermes webhook 订阅；替换点）——
-exec /root/hermes-agent/.venv/bin/hermes webhook test "$sub" --payload "$payload"
+payload_file=$(mktemp)
+meta_file=$(mktemp)
+cleanup() {
+    rm -f "$payload_file" "$meta_file"
+}
+trap cleanup EXIT
+
+if ! printf '%s' "$decision" | "$PYTHON_BIN" -c '
+import json, sys
+row = json.load(sys.stdin)
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump(row["payload"], fh, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+print(row["route"])
+print(row["trigger_id"])
+print(row["lease"])
+' "$payload_file" >"$meta_file"; then
+    echo "dc-notify-prod-agent: trigger decision is missing route/trigger/lease" >&2
+    exit 1
+fi
+
+route=$(sed -n '1p' "$meta_file")
+trigger_id=$(sed -n '2p' "$meta_file")
+lease=$(sed -n '3p' "$meta_file")
+payload=$(cat "$payload_file")
+
+case "$route" in
+    wdg-pr|wdg-ci|dailycheck-deploy) ;;
+    *)
+        echo "dc-notify-prod-agent: reducer returned unapproved route" >&2
+        exit 1
+        ;;
+esac
+
+# Capture provider diagnostics for quota detection, but do not echo them:
+# they may contain prompt content or credentials from a downstream adapter.
+provider_output=$("$HERMES" webhook test "$route" --payload "$payload" 2>&1)
+provider_rc=$?
+
+if [ "$provider_rc" -eq 0 ]; then
+    completion=$(
+        "$PYTHON_BIN" "$REDUCER" "${common_args[@]}" complete \
+            --trigger-id "$trigger_id" --lease "$lease"
+    )
+    completion_rc=$?
+    completion_ok=$(
+        printf '%s' "$completion" | "$PYTHON_BIN" -c \
+            'import json,sys; print(str(json.load(sys.stdin).get("completed", False)).lower())'
+    ) || completion_ok=false
+    if [ "$completion_rc" -ne 0 ] || [ "$completion_ok" != "true" ]; then
+        printf '%s\n' "$completion" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+provider_lower=$(printf '%s' "$provider_output" | tr '[:upper:]' '[:lower:]')
+quota_flag=()
+case "$provider_lower" in
+    *429*|*quota*|*rate_limit*|*rate\ limit*)
+        quota_flag=(--quota-exhausted)
+        ;;
+esac
+reason=${provider_output:0:400}
+failure=$(
+    "$PYTHON_BIN" "$REDUCER" "${common_args[@]}" fail \
+        --trigger-id "$trigger_id" --lease "$lease" \
+        --reason "$reason" "${quota_flag[@]}"
+)
+failure_rc=$?
+printf '%s\n' "$failure" >&2
+if [ "$failure_rc" -eq 75 ]; then
+    exit 75
+fi
+exit "${failure_rc:-1}"

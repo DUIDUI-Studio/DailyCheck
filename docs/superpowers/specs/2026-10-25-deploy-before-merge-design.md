@@ -111,7 +111,7 @@ stdlib-only 的 FF 合并助手，复用 `deploy_report.py` 的 Gitea 配置口�
 - `docs/agent-framework/session-bootstrap.md`：Prod Agent 常驻指令改为 deploy-first。
 - `docs/ARCHITECTURE.md` §3.4/§3.8：补 deploy-first 时序、C1-C3、新退出码。
 - `scripts/blue_green/README.md`：命令示例与失败路径。
-- `deploy/scripts/dc-notify-prod-agent.sh` 注释：`dailycheck-ci` 的含义从「触发 merge 判定」改为「触发候选部署判定」。
+- `deploy/scripts/dc-notify-prod-agent.sh` 注释：`wdg-ci` 的含义从「触发 merge 判定」改为「触发候选部署判定」。
 
 ### 4.5 Prod Agent skill（VPS 侧，仓库外）
 
