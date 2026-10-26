@@ -418,7 +418,7 @@ def test_chat_reports_truncation_not_structure_error(monkeypatch):
     with pytest.raises(feedback_llm.LLMError) as exc:
         feedback_llm._chat([{"role": "user", "content": "x"}])
     msg = str(exc.value)
-    assert "截断" in msg and "max_tokens" in msg
+    assert "截断" in msg and f"max_tokens={feedback_llm.MAX_OUTPUT_TOKENS}" in msg
     assert "1599" in msg, "必须报出实际 reasoning 用量，否则没法判断要不要再抬预算"
     assert "响应结构不可解析" not in msg
 
@@ -446,27 +446,56 @@ def test_chat_still_rejects_broken_structure(monkeypatch):
 def test_output_budget_covers_reasoning_tokens():
     """守着预算别再被改回「正文够用」的 1600。
 
-    实测同一张单 reasoning 要 3325 tokens 才收敛，4096 都不够。这条用例的存在
-    意义是：下次有人觉得「回复才 1800 字符，1600 够了」时会被挡住。
+    实测同一张单 reasoning 要 3325 tokens 才收敛，4096 都不够；长单（prompt 2074）
+    更要 6559~8190 —— 8192 恰好压在上沿，2026-10-26 生产冒烟三次里两次被截断。
+    所以下限守 16384（能覆盖实测最坏 8190 并留一倍余量）。这条用例的存在意义是：
+    下次有人觉得「回复才 1800 字符，1600/8192 够了」时会被挡住。
     """
-    assert feedback_llm.MAX_OUTPUT_TOKENS >= 8192
+    assert feedback_llm.MAX_OUTPUT_TOKENS >= 16384
+
+
+def test_chat_sends_current_output_budget(monkeypatch):
+    """请求体里的 ``max_tokens`` 必须取自常量，不能硬编码。
+
+    2026-10-26 ticket 11：8192 下 reasoning 8190 吃满、无 content → 降级模板；
+    16384 才通过。若只改常量、payload 还写死旧值，线上等于没改 —— 这条用例把
+    常量换成一个哨兵值，只有「真的读模块常量」才能通过。
+    """
+    seen = {}
+
+    def fake_urlopen(request, *_a, **_k):
+        seen["payload"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({
+            "choices": [{"finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_API_KEY", "k")
+    monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_BASE_URL", "https://llm.test")
+    monkeypatch.setattr(feedback_llm.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(feedback_llm, "MAX_OUTPUT_TOKENS", 23456)
+
+    feedback_llm._chat([{"role": "user", "content": "x"}])
+    assert seen["payload"]["max_tokens"] == 23456
 
 
 def test_timeout_covers_reasoning_latency(monkeypatch):
     """超时与输出预算是**一对**，只抬一边等于没修。
 
-    2026-10-25 生产 ticket 11：max_tokens 已抬到 8192，但默认 90s 超时先到，
+    2026-10-25 生产 ticket 9：max_tokens 已抬到 8192，但默认 90s 超时先到，
     单次真实耗时 108s → TimeoutError → 照样落 ``analysis_model=template``，
-    和「预算不够」在库里长得一模一样。实测值 108s，下限守 240s。
+    和「预算不够」在库里长得一模一样。
+    下限守 280：16384 预算吃满约 205s（按实测约 80 tok/s 反推），280 只留约
+    1.37 倍余量 —— 再往下调就等于把「预算翻倍」换来的余量又还回去了。
     """
     monkeypatch.delattr(feedback_llm.config, "FEEDBACK_LLM_TIMEOUT", raising=False)
-    assert feedback_llm._timeout() >= 240
+    assert feedback_llm._timeout() >= 280
 
 
 def test_timeout_falls_back_on_garbage_value(monkeypatch):
     """env 写错不该把分析打死，回到同一个下限。"""
     monkeypatch.setattr(feedback_llm.config, "FEEDBACK_LLM_TIMEOUT", "abc")
-    assert feedback_llm._timeout() >= 240
+    assert feedback_llm._timeout() >= 280
 
 
 def test_chat_reports_timeout_with_limit_and_elapsed(monkeypatch):

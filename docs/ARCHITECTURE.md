@@ -657,10 +657,28 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 所以两条一起改，缺一不可：
 
-- 预算抬到 **8192**（不是刚够的 4096，推理长度波动大）。
+- 预算抬到 **8192**（不是刚够的 4096，推理长度波动大）。**⚠️ 该基准已于 2026-10-26 被 16384 取代，见下节。**
 - **解析层必须区分三件事**：结构真坏（无 `choices` / 空列表 / `message` 非对象）→「响应结构不可解析」；`finish_reason=length` 且无正文 →「输出被 max_tokens 截断（reasoning 已用 N tokens）」；有 `content` 但为空 →「模型返回空内容（finish_reason=X）」。把「预算不够」混报成「上游返回物怪异」，会把排查引向错误方向 —— 这次就绕了一圈才定位到。
 
-`tests/test_feedback_analysis.py` 有四条用例分别守着这三种分支 + `MAX_OUTPUT_TOKENS >= 8192`（防止有人觉得「正文才 1800 字符，1600 够了」又改回去）。
+`tests/test_feedback_analysis.py` 有三条用例分别守着上述三种分支，另有两条守预算：`MAX_OUTPUT_TOKENS >= 16384`（防止有人觉得「正文才 1800 字符，1600/8192 够了」又改回去）与 `test_chat_sends_current_output_budget`（payload 里的 `max_tokens` 必须取自常量）。
+
+⚠️ **8192 只对「短 prompt + reasoning 短」的单够用，长单会压在上沿**（2026-10-26 二次标定，Issue #46）
+
+8192 是拿 ticket 9（prompt 2012 tokens）标定的。同一模型换成 ticket 11 / FB-20261025-0001（prompt 2074 tokens），reasoning 需求涨到 6559~8190：
+
+| max_tokens | 三次调用结果 | 落库 |
+|---|---|---|
+| 8192 | `length` / `stop` / `length` —— **2/3 截断**（两次 reasoning 8190 吃满、无 `content`；成功那次 reasoning 6559、content 2656 字符） | 2/3 落 `analysis_model=template` |
+| 16384 | `stop`，reasoning 7440、content 2181 字符、113s | 主路径成功 |
+
+⚠️ **换单后 reasoning 需求翻倍与 prompt 长度不成比例**（ticket 9 的 3325 → ticket 11 的 6559~8190，而 prompt 只从 2012 涨到 2074，+3%）—— 这是 n=1 的单次观测，**不能**据此用 prompt 长度推断安全预算。
+
+即 8192 落在这张单 reasoning 分布的上沿、余量近零；而且 8192 下观测到的 8190 是**被天花板截断的值**，真实上界不可知。**「预算不够」与「等得不够久」在库里同形**（都是 `analysis_model=template`），只有 `gaps` 文案能区分。所以预算定在 **16384**：
+
+- 覆盖已验证的最坏需求 8190，并留一倍余量吸收推理长度波动 —— 是「降低截断概率」，不是「保证不再截断」；
+- 预算对已收敛的单不产生额外消耗（模型 `stop` 即止），多花的只是本来会被截断的那批；
+- 余量核算：113s 完成 reasoning 7440 + content 2181 字符 ≈ 9000 completion tokens（中文按约 1 token/字粗估）⇒ 约 80 tok/s；吃满 16384 约 205s，对默认 300s 只剩 **1.5 倍**（解码降速约 46% 会先撞超时）。16384 本身不需要抬高超时，但这 1.5 倍不是「很足」，若后续再抬预算必须同步核 `FEEDBACK_LLM_TIMEOUT`；
+- 若仍撞 `length`，错误文案会报出 `16384` 与当时的 reasoning 用量，据此再定下一档。
 
 ⚠️ **超时与预算是同一个旋钮的两半**（2026-10-25 二次事故修正）
 
@@ -668,9 +686,9 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 所以：
 
-- 默认超时 **90s → 300s**（`config.FEEDBACK_LLM_TIMEOUT` 与 `feedback_llm._timeout()` 的兜底值必须同时改，两处都是 300）。300 对 108s 留了近 3 倍余量，覆盖 reasoning 长度波动。
+- 默认超时 **90s → 300s**（`config.FEEDBACK_LLM_TIMEOUT` 与 `feedback_llm._timeout()` 的兜底值必须同时改，两处都是 300）。**10-25 口径**：300 对 108s 留了近 3 倍余量；**16384 预算下这条余量已降到约 1.5 倍**（吃满约 205s），见上节。
 - 超时**单独报文案**：「调用超时（上限 300s，已等 108s）」，不再混进泛化的「调用失败（TimeoutError）」。上限和已等时长写进去，下次再撞一眼就知道该抬哪一头。
-- 用例守 `_timeout() >= 240`（`test_timeout_covers_reasoning_latency`），防止有人把默认值改回 90。
+- 用例守 `_timeout() >= 280`（`test_timeout_covers_reasoning_latency`），防止有人把默认值改回 90；16384 预算吃满约 205s，280 是 1.37 倍的下限。
 - **改一方必须看另一方**：抬 `MAX_OUTPUT_TOKENS` 就要确认超时跟得上；反之缩超时就要确认预算没超。
 
 蓝实例（`dailycheck.service`）的 `EnvironmentFile` 只在**启动时**读取 —— 往 `/etc/dailycheck/wecom-notify.env` 加 `FEEDBACK_LLM_*` 后不 restart 蓝实例，切回蓝就会静默退回「未配置 → 模板兜底」。切流量前先确认目标实例进程 env 里有 key（`tr '\0' '\n' < /proc/<pid>/environ | grep FEEDBACK`）。
@@ -739,7 +757,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_WEB_BASE` | 内网 API / Tailscale 展示基址 | **API 与给人点的链接刻意分开**（Gitea 的 `html_url` 是实例 ROOT_URL，办公端不可达） |
 | `FEEDBACK_LLM_API_KEY` | 空串 | 二审预分析用的模型 key；**空 = 不调模型**（一审降级为模板兜底分析）。回退 `LLM_API_KEY` |
 | `FEEDBACK_LLM_BASE_URL` / `FEEDBACK_LLM_MODEL` | `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` | OpenAI 兼容端点与模型名；回退 `LLM_BASE_URL` / `LLM_MODEL`（生产与企微库存助手共用一套凭证） |
-| `FEEDBACK_LLM_TIMEOUT` | `300` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长。**必须与 `MAX_OUTPUT_TOKENS` 成对调整**：8192 预算下单次实测 108s，90s 会让模型没说完就被掐断 |
+| `FEEDBACK_LLM_TIMEOUT` | `300` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长。**必须与 `MAX_OUTPUT_TOKENS` 成对调整**：16384 预算下单次实测 113s（8192 时 108s），90s 会让模型没说完就被掐断 |
 | `PUBLIC_BASE_URL` | `https://kjtang.cn` | 消息与 Issue 正文里的域名（复用 §3.9 同一项） |
 
 `WECOM_FEEDBACK_WEBHOOK` 与 `WECOM_STORE_ORDER_WEBHOOK` **刻意分开**：反馈消息与订单消息频率、受众不同，合用一个 webhook 就无法单独静音其中一路。
