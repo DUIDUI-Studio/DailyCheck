@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -506,19 +507,19 @@ def test_inbox_failure_does_not_fail_deploy(tmp_path, fake_curl, monkeypatch):
 
 
 def test_notify_adapter_routes_deploy_result():
-    """路由脚本必须给 deploy_result 单独一条订阅。
+    """生产入口只允许当前三个订阅，且部署结果不能落到 PR 通道。
 
-    落到默认的 dailycheck-pr 不会报错 —— 那个订阅的 prompt 是「判定 merge」，
+    落到默认 wdg-pr 不会报错 —— 那个订阅的 prompt 是「判定 merge」，
     会把一次部署失败当成 PR 更新处理，然后什么都不做。静默错投比投不出去更坏。
     """
     script = (Path(__file__).resolve().parents[1]
               / "deploy" / "scripts" / "dc-notify-prod-agent.sh")
     content = script.read_text(encoding="utf-8")
-    case_block = content.split("case \"$event\" in", 1)[1].split("esac", 1)[0]
-    assert "deploy_result)" in case_block
-    assert 'sub="dailycheck-deploy"' in case_block
-    # 默认分支必须仍然存在，否则解析失败的事件会直接掉地上
-    assert "*) " in case_block or "*)" in case_block
+    assert "deploy_result -> dailycheck-deploy" in content
+    assert "pull_request  -> wdg-pr" in content
+    assert "check_suite   -> wdg-ci" in content
+    assert 'wdg-pr|wdg-ci|dailycheck-deploy' in content
+    assert re.search(r"\bdailycheck-(?:pr|ci|ops)\b", content) is None
 
 
 def test_autofix_count_dedupes_by_sha(tmp_path):
