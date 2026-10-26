@@ -46,7 +46,9 @@ elif [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
 else
   PY="python3"
 fi
-STATE_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-/var/lib/dailycheck-deploy}"
+DEFAULT_STATE_DIR="/var/lib/dailycheck-deploy"
+DEFAULT_PROD_AGENT_INBOX="/var/lib/dailycheck-prod-agent/inbox.jsonl"
+STATE_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-${DEFAULT_STATE_DIR}}"
 
 LOG="${DAILYCHECK_PIPELINE_LOG:-/var/log/dailycheck/deploy-pipeline-$(date +%Y%m%d-%H%M%S).log}"
 if ! { mkdir -p "$(dirname "${LOG}")" 2>/dev/null && : >>"${LOG}" 2>/dev/null; }; then
@@ -180,12 +182,19 @@ _writeback_pr() {
     log "WARN: deploy_report.py 缺失，跳过 PR 回写（不影响部署结果）"
     return 0
   fi
-  # 事件文件跟着状态目录走：STATE_DIR 在测试/演练里会被指到临时目录，
-  # 事件也就跟着隔离，不会把演练结果混进生产收件箱。
+  # 事件文件与唤醒队列都跟着状态目录走：STATE_DIR 在测试/演练里会被指到
+  # 临时目录；此时若收件箱仍是生产默认值，就把它改投到 STATE_DIR 下。显式
+  # 指定的非默认收件箱保持原样，生产默认 STATE_DIR 的行为也不变（Issue #38）。
   local ev="${DAILYCHECK_DEPLOY_EVENT_LOG:-${STATE_DIR}/events.jsonl}"
+  local inbox="${DAILYCHECK_PROD_AGENT_INBOX:-${DEFAULT_PROD_AGENT_INBOX}}"
+  if [[ "${STATE_DIR}" != "${DEFAULT_STATE_DIR}" \
+        && "${inbox}" == "${DEFAULT_PROD_AGENT_INBOX}" ]]; then
+    inbox="${STATE_DIR}/inbox.jsonl"
+  fi
   local flag=""
   [[ "${DRY_RUN}" -eq 1 ]] && flag="--dry-run"
   if DAILYCHECK_DEPLOY_EVENT_LOG="${ev}" \
+     DAILYCHECK_PROD_AGENT_INBOX="${inbox}" \
      "${PY}" "${reporter}" write --pr "${PR}" --sha "${SHA}" --rc "${rc}" \
        --stage "${FAIL_STAGE:-}" --log "${LOG}" --repo "${REPO_ROOT}" ${flag} \
        >>"${LOG}" 2>&1; then

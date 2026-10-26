@@ -617,7 +617,7 @@ def test_assess_reports_drifted_exit_one(tmp_path, fake_curl):
 # ---------------------------------------------------------------- pipeline 集成
 
 @pytest.fixture()
-def pipeline_sandbox(tmp_path):
+def pipeline_sandbox(tmp_path, monkeypatch):
     """真 pipeline + 真 deploy_report/triage + 假四阶段脚本。"""
     sb = tmp_path / "bg"
     sb.mkdir()
@@ -638,7 +638,11 @@ def pipeline_sandbox(tmp_path):
         path.chmod(0o755)
     state = tmp_path / "state"
     state.mkdir()
-    return {"dir": sb, "state": state, "tmp": tmp_path}
+    inbox = tmp_path / "inbox.jsonl"
+    # 子进程继承 os.environ；在夹具层统一隔离，任何新增 pipeline 用例都不会
+    # 因漏写单个 env 而落到生产默认收件箱（Issue #38）。
+    monkeypatch.setenv("DAILYCHECK_PROD_AGENT_INBOX", str(inbox))
+    return {"dir": sb, "state": state, "tmp": tmp_path, "inbox": inbox}
 
 
 def test_pipeline_writes_back_and_keeps_exit_code(pipeline_sandbox, tmp_path):
@@ -671,8 +675,80 @@ def test_pipeline_writes_back_and_keeps_exit_code(pipeline_sandbox, tmp_path):
     )
     assert proc.returncode == 21, proc.stdout + proc.stderr
     assert curl_log.exists(), "cleanup 未触发 PR 回写"
+    inbox_rows = _inbox(tmp_path)
+    assert len(inbox_rows) == 1, inbox_rows
+    assert inbox_rows[0]["pr_number"] == 42
+    assert inbox_rows[0]["delivery_id"] == "deploy-42-abcdef123456-21"
     rows = [json.loads(ln) for ln in curl_log.read_text().splitlines() if ln]
     assert [r for r in rows if "gitea.test" in r["url"]]
+
+
+def _replace_reporter_with_inbox_capture(pipeline_sandbox, capture: Path) -> None:
+    """让 pipeline 只回显实际传给 deploy_report 的收件箱路径。"""
+    reporter = pipeline_sandbox["dir"] / "deploy_report.py"
+    reporter.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(capture)!r}).write_text("
+        'os.environ.get("DAILYCHECK_PROD_AGENT_INBOX", ""), encoding="utf-8")\n',
+        encoding="utf-8",
+    )
+    reporter.chmod(0o755)
+
+
+@pytest.mark.parametrize("ambient_inbox", [None, deploy_report.DEFAULT_PROD_AGENT_INBOX])
+def test_state_temp_redirects_production_default_inbox(
+    pipeline_sandbox, tmp_path, ambient_inbox
+):
+    """临时状态目录不得再把部署事件投进生产默认收件箱（Issue #38）。
+
+    参数分别覆盖「变量缺失 → reporter 自己取默认值」和「变量已是生产默认值」
+    两条泄漏路径；显式自定义路径由下一条用例保证不被误改。
+    """
+    capture = tmp_path / "captured-inbox.txt"
+    _replace_reporter_with_inbox_capture(pipeline_sandbox, capture)
+    env = os.environ.copy()
+    env.update({
+        "DAILYCHECK_DEPLOY_STATE_DIR": str(pipeline_sandbox["state"]),
+        "DAILYCHECK_PIPELINE_LOG": str(tmp_path / "pipeline.log"),
+        "DAILYCHECK_PIPELINE_TICK_SEC": "1",
+    })
+    if ambient_inbox is None:
+        env.pop("DAILYCHECK_PROD_AGENT_INBOX", None)
+    else:
+        env["DAILYCHECK_PROD_AGENT_INBOX"] = ambient_inbox
+
+    proc = subprocess.run(
+        ["bash", str(pipeline_sandbox["dir"] / "deploy_pipeline.sh"), "42", SHA],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+
+    assert proc.returncode == 21, proc.stdout + proc.stderr
+    got = capture.read_text(encoding="utf-8").strip()
+    assert got == str(pipeline_sandbox["state"] / "inbox.jsonl")
+    assert got != deploy_report.DEFAULT_PROD_AGENT_INBOX
+
+
+def test_state_temp_preserves_custom_inbox(pipeline_sandbox, tmp_path):
+    """隔离保护只重定向生产默认值，显式模板路径不得被改写。"""
+    capture = tmp_path / "captured-inbox.txt"
+    _replace_reporter_with_inbox_capture(pipeline_sandbox, capture)
+    custom = tmp_path / "custom-prod-agent-inbox.jsonl"
+    env = os.environ.copy()
+    env.update({
+        "DAILYCHECK_DEPLOY_STATE_DIR": str(pipeline_sandbox["state"]),
+        "DAILYCHECK_PIPELINE_LOG": str(tmp_path / "pipeline.log"),
+        "DAILYCHECK_PIPELINE_TICK_SEC": "1",
+        "DAILYCHECK_PROD_AGENT_INBOX": str(custom),
+    })
+
+    proc = subprocess.run(
+        ["bash", str(pipeline_sandbox["dir"] / "deploy_pipeline.sh"), "42", SHA],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+
+    assert proc.returncode == 21, proc.stdout + proc.stderr
+    assert capture.read_text(encoding="utf-8").strip() == str(custom)
 
 
 def test_pipeline_survives_missing_reporter(pipeline_sandbox, tmp_path):
