@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,10 @@ def _build_warehouse(
             )
     conn.commit()
     conn.close()
+
+
+def _order_no(created_at: datetime, sequence: int) -> str:
+    return f"SO-{created_at:%Y%m%d}-{sequence:04d}"
 
 
 @pytest.fixture
@@ -131,27 +136,32 @@ def env(tmp_path, monkeypatch):
             ("wh_003", "新天地店", "db/warehouses/wh_003.db", "storefront"),
         ],
     )
+    now = datetime.now(timezone.utc)
+    recent_created_at = now - timedelta(days=1)
+    outside_created_at = now - timedelta(days=40)
+    recent_order_no = _order_no(recent_created_at, 3)
+    outside_order_no = _order_no(outside_created_at, 1)
     # 一条在窗口内待发货，一条 40 天前已送达（用于验证天数过滤）
     master.executemany(
         "INSERT INTO store_orders VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 7,
-                "SO-20261018-0003",
+                recent_order_no,
                 "wh_003",
                 "wh_000",
                 "approved",
-                "2026-10-18 16:31:26",
-                "2026-10-21",
+                recent_created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (recent_created_at + timedelta(days=3)).date().isoformat(),
             ),
             (
                 1,
-                "SO-20260901-0001",
+                outside_order_no,
                 "wh_000",
                 "wh_000",
                 "delivered",
-                "2026-09-01 10:00:00",
-                "2026-09-03",
+                outside_created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                (outside_created_at + timedelta(days=2)).date().isoformat(),
             ),
         ],
     )
@@ -164,7 +174,11 @@ def env(tmp_path, monkeypatch):
 
     monkeypatch.setenv("DAILYCHECK_DB_DIR", str(db_dir))
     monkeypatch.setattr(tools, "DEFAULT_PUBLIC_BASE", "https://kjtang.cn")
-    return db_dir
+    return {
+        "db_dir": db_dir,
+        "recent_order_no": recent_order_no,
+        "outside_order_no": outside_order_no,
+    }
 
 
 class TestStoreOverview:
@@ -227,8 +241,46 @@ class TestOrders:
     def test_默认返回窗口内订单(self, env):
         result = tools.list_orders(days=7)
         assert result["ok"] is True
-        # 40 天前那条不该出现
-        assert [o["order_no"] for o in result["orders"]] == ["SO-20261018-0003"]
+        order_nos = [o["order_no"] for o in result["orders"]]
+        assert order_nos == [env["recent_order_no"]]
+        assert env["outside_order_no"] not in order_nos
+
+    def test_七天窗口边界内包含边界外排除(self, env):
+        now = datetime.now(timezone.utc)
+        inside = now - timedelta(days=6)
+        outside = now - timedelta(days=8)
+        inside_no = _order_no(inside, 4)
+        outside_no = _order_no(outside, 2)
+        with sqlite3.connect(env["db_dir"] / "master.db") as master:
+            master.executemany(
+                "INSERT INTO store_orders VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        8,
+                        inside_no,
+                        "wh_003",
+                        "wh_000",
+                        "approved",
+                        inside.strftime("%Y-%m-%d %H:%M:%S"),
+                        (inside + timedelta(days=3)).date().isoformat(),
+                    ),
+                    (
+                        9,
+                        outside_no,
+                        "wh_003",
+                        "wh_000",
+                        "approved",
+                        outside.strftime("%Y-%m-%d %H:%M:%S"),
+                        (outside + timedelta(days=3)).date().isoformat(),
+                    ),
+                ],
+            )
+
+        order_nos = [o["order_no"] for o in tools.list_orders(days=7)["orders"]]
+        # SQLite's date('now', '-7 day') cutoff is midnight-based. Offsets of
+        # six and eight days pin both sides without racing a UTC day boundary.
+        assert inside_no in order_nos
+        assert outside_no not in order_nos
 
     def test_状态筛选(self, env):
         result = tools.list_orders(status="approved", days=365)
