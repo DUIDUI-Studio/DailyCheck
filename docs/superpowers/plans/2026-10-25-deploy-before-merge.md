@@ -1106,10 +1106,10 @@ FF-only 合并。失败路径：切回蓝 + 工作树恢复 `origin/main`，PR �
 
 - [ ] **Step 4: 改 `dc-notify-prod-agent.sh` 注释**
 
-把 `check_suite → dailycheck-ci（CI 全绿即唤醒 merge 判定）` 改为：
+把 `check_suite → wdg-ci（CI 全绿即唤醒 merge 判定）` 改为：
 
 ```bash
-#   check_suite   → dailycheck-ci      （CI 全绿即唤醒候选部署判定；
+#   check_suite   → wdg-ci      （CI 全绿即唤醒候选部署判定；
 #                                       prompt 内置 [SILENT] 静默语义）
 ```
 
