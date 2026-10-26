@@ -205,7 +205,13 @@ class GiteaReadinessClient:
             raise ValueError("gitea_response_too_large")
         return json.loads(raw)
 
-    def check(self, pr_number: int, expected_head_sha: str) -> dict[str, Any]:
+    def check(
+        self,
+        pr_number: int,
+        expected_head_sha: str,
+        *,
+        repo: str | None = None,
+    ) -> dict[str, Any]:
         expected = expected_head_sha.lower()
         required = self.config.required_contexts
         if not self.config.token:
@@ -214,8 +220,11 @@ class GiteaReadinessClient:
                 expected_head=expected,
                 required_contexts=required,
             )
+        target_repo = self.config.repo if repo is None else repo
+        if not _REPO_RE.fullmatch(target_repo):
+            raise ValueError("invalid_gitea_repo")
         repo_path = "/".join(
-            urllib.parse.quote(part, safe="") for part in self.config.repo.split("/")
+            urllib.parse.quote(part, safe="") for part in target_repo.split("/")
         )
         try:
             pr = self._get_json(f"/repos/{repo_path}/pulls/{pr_number}")

@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -113,6 +114,134 @@ def _reducer(tmp_path: Path, *, readiness_checker=None, **overrides) -> event_re
         event_reducer.ReducerConfig(**config),
         readiness_checker=readiness_checker or (lambda repo, pr, sha: _readiness()),
     )
+
+
+def _fake_gitea_curl(tmp_path: Path, statuses: list[dict]) -> tuple[Path, Path]:
+    statuses_file = tmp_path / "gitea-statuses.json"
+    calls_file = tmp_path / "gitea-calls.txt"
+    statuses_file.write_text(
+        json.dumps({"state": "success", "statuses": statuses}),
+        encoding="utf-8",
+    )
+    fake_curl = tmp_path / "fake-gitea-curl"
+    fake_curl.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import pathlib
+import sys
+
+url = sys.argv[-1]
+with pathlib.Path(os.environ["FAKE_GITEA_CALLS"]).open("a", encoding="utf-8") as stream:
+    stream.write(url + "\\n")
+
+expected = "/api/v1/repos/eric/dailycheck/"
+if not url.startswith("http://gitea.invalid" + expected):
+    sys.stdout.write('{{"message":"unexpected repo"}}\\n404')
+    raise SystemExit(0)
+if "/pulls/54" in url:
+    payload = {{
+        "number": 54,
+        "state": "open",
+        "mergeable": True,
+        "head": {{"sha": os.environ["FAKE_GITEA_SHA"]}},
+    }}
+elif "/commits/" in url and url.endswith("/status"):
+    payload = json.loads(
+        pathlib.Path(os.environ["FAKE_GITEA_STATUSES"]).read_text(encoding="utf-8")
+    )
+else:
+    sys.stdout.write('{{"message":"not found"}}\\n404')
+    raise SystemExit(0)
+sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\\n200")
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    return fake_curl, calls_file
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected_returncode", "expected_decision", "expected_reason"),
+    [
+        (
+            [
+                {"context": "CI / test (pull_request)", "status": "success"},
+                {
+                    "context": "CI / agent-framework-reports (pull_request)",
+                    "status": "success",
+                },
+            ],
+            75,
+            "defer",
+            "debounce",
+        ),
+        (
+            [
+                {"context": "CI / test (pull_request)", "status": "success"},
+                {
+                    "context": "CI / agent-framework-reports (pull_request)",
+                    "status": "pending",
+                },
+            ],
+            0,
+            "silent",
+            "checks_running",
+        ),
+    ],
+)
+def test_production_readiness_wiring_uses_real_client_and_event_repo(
+    tmp_path, statuses, expected_returncode, expected_decision, expected_reason
+):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "prod_agent" / "event_reducer.py"
+    fake_curl, calls_file = _fake_gitea_curl(tmp_path, statuses)
+    env = os.environ.copy()
+    env.update(
+        {
+            "DAILYCHECK_EVENT_REDUCER_DB": str(tmp_path / "events.sqlite3"),
+            "DAILYCHECK_CURL": str(fake_curl),
+            "DAILYCHECK_REQUIRED_CONTEXTS": "test,agent-framework-reports",
+            "FAKE_GITEA_CALLS": str(calls_file),
+            "FAKE_GITEA_SHA": "a" * 40,
+            "FAKE_GITEA_STATUSES": str(tmp_path / "gitea-statuses.json"),
+            "GITEA_API": "http://gitea.invalid",
+            "GITEA_REPO": "wrong/default",
+            "GITEA_TOKEN": "test-token",
+        }
+    )
+    common = [sys.executable, str(script), "--now-ms", "1100", "ingest"]
+
+    opened = subprocess.run(
+        common,
+        input=json.dumps(_pr()).encode(),
+        capture_output=True,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    assert opened.returncode == 0, opened.stderr.decode("utf-8", "replace")
+    assert json.loads(opened.stdout)["reason"] == "pr_state_updated"
+
+    completed = subprocess.run(
+        common,
+        input=json.dumps(_check()).encode(),
+        capture_output=True,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == expected_returncode, completed.stderr.decode(
+        "utf-8", "replace"
+    )
+    decision = json.loads(completed.stdout)
+    assert decision["decision"] == expected_decision
+    assert decision["reason"] == expected_reason
+    calls = calls_file.read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        "http://gitea.invalid/api/v1/repos/eric/dailycheck/pulls/54",
+        f"http://gitea.invalid/api/v1/repos/eric/dailycheck/commits/{'a' * 40}/status",
+    ]
 
 
 def test_pull_request_lifecycle_only_updates_reducer_state_and_never_queues_wake(tmp_path):
@@ -412,6 +541,22 @@ def test_non_ready_ci_gate_is_silent_and_queues_nothing(
     assert reducer.inspect(pr=54)["queue"] == []
 
 
+def test_truthy_non_true_gate_does_not_record_checks_success(tmp_path):
+    reducer = _reducer(
+        tmp_path,
+        readiness_checker=lambda repo, pr, sha: {"ready": 1, "reason": "ready"},
+    )
+
+    decision = reducer.ingest(_check(), now_ms=1_000)
+    state = reducer.inspect(pr=54)["pr_state"]
+
+    assert decision["decision"] == "silent"
+    assert decision["reason"] == "ready"
+    assert state["checks_status"] == "unknown"
+    assert state["merge_ready_at_ms"] is None
+    assert reducer.inspect(pr=54)["queue"] == []
+
+
 @pytest.mark.parametrize("conclusion", ["queued", "requested", "in_progress", "failure"])
 def test_non_success_ci_conclusion_never_calls_readiness_or_hermes(tmp_path, conclusion):
     calls: list[tuple[str, int, str]] = []
@@ -526,6 +671,64 @@ def test_cli_negative_retry_after_uses_default_quota_cooldown(tmp_path):
     decision = json.loads(failed.stdout)
     assert decision["due_at_ms"] == 63_100
     assert decision["reason"] == "provider_cooldown"
+
+
+def test_cli_inspect_exits_cleanly_after_printing_state(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "prod_agent" / "event_reducer.py"
+    db = tmp_path / "events.sqlite3"
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+
+    inspected = subprocess.run(
+        [sys.executable, str(script), "--db", str(db), "inspect", "--pr", "54"],
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert inspected.returncode == 0, inspected.stderr.decode("utf-8", "replace")
+    assert inspected.stderr == b""
+    result = json.loads(inspected.stdout)
+    assert result["pr"] == 54
+    assert result["pr_state"]["head_sha"] == "a" * 40
+
+
+def test_migration_failure_survives_secondary_rollback_error(tmp_path, monkeypatch):
+    class Cursor:
+        def fetchall(self):
+            return []
+
+    class FailingConnection:
+        in_transaction = True
+        row_factory = None
+
+        def __init__(self):
+            self.closed = False
+            self.rollback_attempted = False
+
+        def execute(self, sql, parameters=()):
+            if sql == "ROLLBACK":
+                self.rollback_attempted = True
+                raise sqlite3.OperationalError("rollback failed")
+            if sql.startswith("ALTER TABLE"):
+                raise RuntimeError("migration failed")
+            return Cursor()
+
+        def executescript(self, script):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    connection = FailingConnection()
+    monkeypatch.setattr(event_reducer.sqlite3, "connect", lambda *args, **kwargs: connection)
+    reducer = _reducer(tmp_path)
+
+    with pytest.raises(RuntimeError, match="migration failed"):
+        reducer._connect()
+
+    assert connection.rollback_attempted is True
+    assert connection.closed is True
 
 
 def test_enqueue_completion_does_not_clear_an_active_external_cooldown(tmp_path):

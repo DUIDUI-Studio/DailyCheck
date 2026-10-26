@@ -283,21 +283,25 @@ class EventReducer:
                 curl_path=base.curl_path,
             )
             client = GiteaReadinessClient(readiness_config)
-            self._readiness_checker = client.check
+
+            def check_readiness(repo: str, pr_number: int, head_sha: str) -> dict[str, Any]:
+                return client.check(pr_number, head_sha, repo=repo)
+
+            self._readiness_checker = check_readiness
         else:
             self._readiness_checker = readiness_checker
 
     def _connect(self) -> sqlite3.Connection:
         self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.config.db_path), timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.executescript(SCHEMA)
-        conn.execute("BEGIN IMMEDIATE")
         try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.executescript(SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
             pr_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(pr_state)").fetchall()
             }
@@ -316,7 +320,12 @@ class EventReducer:
                     conn.execute(ddl)
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            conn.close()
             raise
         return conn
 
@@ -928,8 +937,9 @@ class EventReducer:
     @staticmethod
     def _checks_status_from_gate(gate: dict[str, Any], conclusion: str) -> str:
         reason = str(gate.get("reason", ""))
+        is_ready = gate.get("ready") is True
         if reason == "ready":
-            return "success"
+            return "success" if is_ready else "unknown"
         if reason == "checks_failed":
             return "failure"
         if reason == "checks_running":
@@ -940,6 +950,8 @@ class EventReducer:
             return "unknown"
         normalized = conclusion.lower()
         if normalized in {"success", "failure", "error"}:
+            if normalized == "success":
+                return "success" if is_ready else "unknown"
             return "failure" if normalized == "error" else normalized
         if normalized in {
             "pending",
@@ -2031,7 +2043,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _emit(decision)
-    if decision["decision"] == "defer":
+    if decision.get("decision") == "defer":
         return 75
     return 0
 
