@@ -20,12 +20,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from merge_readiness import (
+    DEFAULT_REQUIRED_CONTEXTS,
+    DEFAULT_REQUIRED_CONTEXTS_ENV,
+    GiteaReadinessClient,
+    ReadinessConfig,
+    parse_required_contexts,
+)
+
 ROUTES = {
-    "pull_request": "wdg-pr",
     "check_suite": "wdg-ci",
     "deploy_result": "dailycheck-deploy",
 }
-EVENT_PRIORITY = {"pull_request": 10, "check_suite": 20, "deploy_result": 30}
+SUPPORTED_EVENTS = frozenset({"pull_request", "check_suite", "deploy_result"})
+EVENT_PRIORITY = {"check_suite": 20, "deploy_result": 30}
 ALLOWED_ACTIONS = {
     "pull_request": frozenset({"opened", "synchronize", "synchronized", "reopened"}),
     "check_suite": frozenset({"completed"}),
@@ -72,6 +80,9 @@ CREATE TABLE IF NOT EXISTS pr_state (
     last_event TEXT NOT NULL,
     next_action TEXT NOT NULL DEFAULT '',
     updated_at_ms INTEGER NOT NULL,
+    merge_ready_at_ms INTEGER,
+    merge_ready_trigger_id TEXT,
+    gate_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo, pr_number)
 );
 
@@ -250,21 +261,72 @@ class ReducerConfig:
     max_debounce_ms: int = 10_000
     lease_ttl_ms: int = DEFAULT_LEASE_TTL_MS
     provider_cooldown_ms: int = 60_000
+    required_contexts: tuple[str, ...] = DEFAULT_REQUIRED_CONTEXTS
 
 
 class EventReducer:
-    def __init__(self, config: ReducerConfig):
+    def __init__(
+        self,
+        config: ReducerConfig,
+        *,
+        readiness_checker: Any | None = None,
+    ):
         self.config = config
+        if readiness_checker is None:
+            base = ReadinessConfig.from_environment()
+            readiness_config = ReadinessConfig(
+                api_url=base.api_url,
+                repo=base.repo,
+                token=base.token,
+                required_contexts=config.required_contexts,
+                timeout_s=base.timeout_s,
+                curl_path=base.curl_path,
+            )
+            client = GiteaReadinessClient(readiness_config)
+
+            def check_readiness(repo: str, pr_number: int, head_sha: str) -> dict[str, Any]:
+                return client.check(pr_number, head_sha, repo=repo)
+
+            self._readiness_checker = check_readiness
+        else:
+            self._readiness_checker = readiness_checker
 
     def _connect(self) -> sqlite3.Connection:
         self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.config.db_path), timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.executescript(SCHEMA)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.executescript(SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            pr_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(pr_state)").fetchall()
+            }
+            for name, ddl in (
+                ("merge_ready_at_ms", "ALTER TABLE pr_state ADD COLUMN merge_ready_at_ms INTEGER"),
+                (
+                    "merge_ready_trigger_id",
+                    "ALTER TABLE pr_state ADD COLUMN merge_ready_trigger_id TEXT",
+                ),
+                (
+                    "gate_reason",
+                    "ALTER TABLE pr_state ADD COLUMN gate_reason TEXT NOT NULL DEFAULT ''",
+                ),
+            ):
+                if name not in pr_columns:
+                    conn.execute(ddl)
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            conn.close()
+            raise
         return conn
 
     def normalize(self, payload: Any) -> dict[str, Any]:
@@ -272,7 +334,7 @@ class EventReducer:
             raise ValidationError("payload must be a JSON object")
         _validate_json_tree(payload)
         event_name = _text(payload.get("event"), field="event", limit=64)
-        if event_name not in ROUTES:
+        if event_name not in SUPPORTED_EVENTS:
             raise ValidationError("event is not supported")
         action = _text(payload.get("action"), field="action", limit=64)
         if action not in ALLOWED_ACTIONS[event_name]:
@@ -375,15 +437,20 @@ class EventReducer:
         return "trig_" + hashlib.sha256(("trigger|" + key).encode()).hexdigest()[:24]
 
     @staticmethod
+    def _merge_ready_key(repo: str, pr_number: int, head_sha: str) -> str:
+        canonical = [repo.lower(), pr_number, head_sha.lower(), "MERGE_READY"]
+        return hashlib.sha256(
+            json.dumps(canonical, separators=(",", ":"), ensure_ascii=True).encode()
+        ).hexdigest()
+
+    @staticmethod
     def _state_values(event: dict[str, Any]) -> tuple[str, str, str, str]:
         checks = ""
         review = ""
         deploy = ""
         if event["event"] == "check_suite":
-            checks = event["conclusion"]
-            next_action = (
-                "evaluate_deploy" if event["conclusion"].lower() == "success" else "inspect_ci"
-            )
+            checks = str(event.get("_checks_status") or event["conclusion"]).lower()
+            next_action = "merge" if checks == "success" else "wait_ci"
         elif event["event"] == "deploy_result":
             deploy = event["conclusion"]
             next_action = _text(
@@ -400,6 +467,8 @@ class EventReducer:
                 required=False,
             )
             next_action = "review_pr"
+            checks = "pending"
+            next_action = "wait_ci"
         return checks, review, deploy, next_action
 
     @staticmethod
@@ -658,20 +727,22 @@ class EventReducer:
         event: dict[str, Any],
         *,
         now_ms: int,
+        head_changed: bool,
     ) -> None:
         checks, review, deploy, next_action = self._state_values(event)
         last_event = f"{event['event']}:{event['action']}:{event['conclusion']}"
+        gate_reason = str(event.get("_gate_reason", ""))
         conn.execute(
             """
             INSERT INTO pr_state (
                 repo, pr_number, head_sha, checks_status, review_status,
-                deploy_status, last_event, next_action, updated_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                deploy_status, last_event, next_action, updated_at_ms,
+                merge_ready_at_ms, merge_ready_trigger_id, gate_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
             ON CONFLICT(repo, pr_number) DO UPDATE SET
                 head_sha = excluded.head_sha,
                 checks_status = CASE
-                    WHEN excluded.last_event LIKE 'pull_request:%'
-                         AND pr_state.head_sha <> excluded.head_sha
+                    WHEN ? = 1 AND excluded.last_event LIKE 'pull_request:%'
                     THEN 'pending'
                     WHEN excluded.checks_status = '' THEN pr_state.checks_status
                     ELSE excluded.checks_status END,
@@ -679,14 +750,22 @@ class EventReducer:
                     WHEN excluded.review_status = '' THEN pr_state.review_status
                     ELSE excluded.review_status END,
                 deploy_status = CASE
-                    WHEN excluded.last_event LIKE 'pull_request:%'
-                         AND pr_state.head_sha <> excluded.head_sha
+                    WHEN ? = 1 AND excluded.last_event LIKE 'pull_request:%'
                     THEN ''
                     WHEN excluded.deploy_status = '' THEN pr_state.deploy_status
                     ELSE excluded.deploy_status END,
                 last_event = excluded.last_event,
                 next_action = excluded.next_action,
-                updated_at_ms = excluded.updated_at_ms
+                updated_at_ms = excluded.updated_at_ms,
+                merge_ready_at_ms = CASE
+                    WHEN ? = 1 AND excluded.last_event LIKE 'pull_request:%'
+                    THEN NULL ELSE pr_state.merge_ready_at_ms END,
+                merge_ready_trigger_id = CASE
+                    WHEN ? = 1 AND excluded.last_event LIKE 'pull_request:%'
+                    THEN NULL ELSE pr_state.merge_ready_trigger_id END,
+                gate_reason = CASE
+                    WHEN excluded.gate_reason = '' THEN pr_state.gate_reason
+                    ELSE excluded.gate_reason END
             """,
             (
                 event["repo_full_name"].lower(),
@@ -698,6 +777,11 @@ class EventReducer:
                 last_event,
                 next_action,
                 now_ms,
+                gate_reason,
+                1 if head_changed else 0,
+                1 if head_changed else 0,
+                1 if head_changed else 0,
+                1 if head_changed else 0,
             ),
         )
 
@@ -757,6 +841,493 @@ class EventReducer:
 
     def ingest(self, payload: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         event = self.normalize(payload)
+        if event["event"] == "pull_request":
+            return self._ingest_pull_request(event, now_ms=now_ms)
+        if event["event"] == "check_suite":
+            return self._ingest_check_suite(event, now_ms=now_ms)
+        return self._ingest_deploy_result(event, now_ms=now_ms)
+
+    def _ingest_pull_request(
+        self, event: dict[str, Any], *, now_ms: int
+    ) -> dict[str, Any]:
+        """Record PR lifecycle without creating any provider work."""
+        key = event_key(event)
+        repo = event["repo_full_name"].lower()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            previous_delivery = conn.execute(
+                "SELECT event_key FROM deliveries WHERE delivery_id = ?",
+                (event["delivery_id"],),
+            ).fetchone()
+            if previous_delivery is not None:
+                conn.execute("COMMIT")
+                return {
+                    "decision": "silent",
+                    "reason": "delivery_already_recorded",
+                    "delivery_id": event["delivery_id"],
+                    "event_key": previous_delivery["event_key"],
+                    "payload": event,
+                }
+
+            state = conn.execute(
+                "SELECT * FROM pr_state WHERE repo = ? AND pr_number = ?",
+                (repo, event["pr_number"]),
+            ).fetchone()
+            head_changed = state is None or state["head_sha"] != event["pr_head_sha"]
+            reset_existing_head = state is not None and head_changed
+            if reset_existing_head:
+                old_trigger_ids = [
+                    row["trigger_id"]
+                    for row in conn.execute(
+                        """
+                        SELECT trigger_id FROM trigger_queue
+                        WHERE repo = ? AND pr_number = ?
+                          AND state IN ('pending', 'claimed')
+                        """,
+                        (repo, event["pr_number"]),
+                    ).fetchall()
+                ]
+                conn.execute(
+                    """
+                    UPDATE trigger_queue
+                    SET state = 'done', lease_token = NULL,
+                        lease_expires_ms = NULL, completed_at_ms = ?,
+                        last_error = 'superseded_head', updated_at_ms = ?
+                    WHERE repo = ? AND pr_number = ?
+                      AND state IN ('pending', 'claimed')
+                    """,
+                    (now_ms, now_ms, repo, event["pr_number"]),
+                )
+                for trigger_id in old_trigger_ids:
+                    conn.execute(
+                        "UPDATE deliveries SET disposition = 'superseded_head' WHERE trigger_id = ?",
+                        (trigger_id,),
+                    )
+
+            self._upsert_pr_state(
+                conn,
+                event,
+                now_ms=now_ms,
+                head_changed=head_changed,
+            )
+            self._record_delivery(
+                conn,
+                event,
+                key,
+                None,
+                "head_reset" if reset_existing_head else "state_updated",
+                now_ms,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+        return {
+            "decision": "silent",
+            "reason": "head_reset" if reset_existing_head else "pr_state_updated",
+            "delivery_id": event["delivery_id"],
+            "event_key": key,
+            "payload": event,
+        }
+
+    @staticmethod
+    def _checks_status_from_gate(gate: dict[str, Any], conclusion: str) -> str:
+        reason = str(gate.get("reason", ""))
+        is_ready = gate.get("ready") is True
+        if reason == "ready":
+            return "success" if is_ready else "unknown"
+        if reason == "checks_failed":
+            return "failure"
+        if reason == "checks_running":
+            return "pending"
+        if reason == "checks_missing":
+            return "partial"
+        if reason in {"invalid_response", "gitea_unavailable", "credentials_unavailable"}:
+            return "unknown"
+        normalized = conclusion.lower()
+        if normalized in {"success", "failure", "error"}:
+            if normalized == "success":
+                return "success" if is_ready else "unknown"
+            return "failure" if normalized == "error" else normalized
+        if normalized in {
+            "pending",
+            "queued",
+            "requested",
+            "in_progress",
+            "running",
+            "waiting",
+        }:
+            return "pending"
+        return "unknown"
+
+    def _record_check_state(
+        self,
+        event: dict[str, Any],
+        *,
+        key: str,
+        reason: str,
+        checks_status: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        repo = event["repo_full_name"].lower()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM deliveries WHERE delivery_id = ?",
+                (event["delivery_id"],),
+            ).fetchone():
+                conn.execute("COMMIT")
+                return {
+                    "decision": "silent",
+                    "reason": "delivery_already_recorded",
+                    "delivery_id": event["delivery_id"],
+                    "event_key": key,
+                }
+            state = conn.execute(
+                "SELECT * FROM pr_state WHERE repo = ? AND pr_number = ?",
+                (repo, event["pr_number"]),
+            ).fetchone()
+            if state is not None and state["head_sha"] != event["pr_head_sha"]:
+                self._record_delivery(conn, event, key, None, "stale_head", now_ms)
+                conn.execute("COMMIT")
+                return {
+                    "decision": "suppress",
+                    "reason": "stale_head",
+                    "delivery_id": event["delivery_id"],
+                    "event_key": key,
+                    "route": ROUTES["check_suite"],
+                    "current_head": state["head_sha"],
+                }
+            state_event = dict(event)
+            state_event["_checks_status"] = checks_status
+            state_event["_gate_reason"] = reason
+            self._upsert_pr_state(
+                conn,
+                state_event,
+                now_ms=now_ms,
+                head_changed=state is None or state["head_sha"] != event["pr_head_sha"],
+            )
+            self._record_delivery(conn, event, key, None, reason, now_ms)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return {
+            "decision": "silent",
+            "reason": reason,
+            "delivery_id": event["delivery_id"],
+            "event_key": key,
+            "route": ROUTES["check_suite"],
+        }
+
+    def _ingest_check_suite(
+        self, event: dict[str, Any], *, now_ms: int
+    ) -> dict[str, Any]:
+        conclusion = event["conclusion"].lower()
+        key = event_key(event)
+        if conclusion != "success":
+            busy = {
+                "pending",
+                "queued",
+                "requested",
+                "in_progress",
+                "running",
+                "waiting",
+            }
+            status = "pending" if conclusion in busy else (
+                "failure" if conclusion in {"failure", "error"} else "unknown"
+            )
+            return self._record_check_state(
+                event,
+                key=key,
+                reason=f"checks_{conclusion}",
+                checks_status=status,
+                now_ms=now_ms,
+            )
+
+        repo = event["repo_full_name"].lower()
+        conn = self._connect()
+        try:
+            state = conn.execute(
+                "SELECT * FROM pr_state WHERE repo = ? AND pr_number = ?",
+                (repo, event["pr_number"]),
+            ).fetchone()
+        finally:
+            conn.close()
+        if state is not None and state["head_sha"] != event["pr_head_sha"]:
+            return self._record_check_state(
+                event,
+                key=key,
+                reason="stale_head",
+                checks_status="unknown",
+                now_ms=now_ms,
+            )
+        if state is not None and state["merge_ready_at_ms"] is not None:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                delivery = conn.execute(
+                    "SELECT trigger_id FROM deliveries WHERE delivery_id = ?",
+                    (event["delivery_id"],),
+                ).fetchone()
+                queued = (
+                    conn.execute(
+                        "SELECT * FROM trigger_queue WHERE trigger_id = ?",
+                        (delivery["trigger_id"],),
+                    ).fetchone()
+                    if delivery is not None and delivery["trigger_id"]
+                    else None
+                )
+                blocked = self._provider_gate(conn, now_ms=now_ms)
+                if (
+                    delivery is not None
+                    and queued is not None
+                    and queued["state"] == "pending"
+                ):
+                    if blocked is not None:
+                        conn.execute("COMMIT")
+                        return self._pending_decision(
+                            queued,
+                            reason="provider_cooldown",
+                            delivery_id=event["delivery_id"],
+                            now_ms=now_ms,
+                            due_at_ms=max(
+                                int(queued["due_at_ms"]),
+                                int(blocked["cooldown_until_ms"]),
+                            ),
+                        )
+                    if queued["due_at_ms"] > now_ms:
+                        conn.execute("COMMIT")
+                        return self._pending_decision(
+                            queued,
+                            reason="debounce",
+                            delivery_id=event["delivery_id"],
+                            now_ms=now_ms,
+                        )
+                    triggered = self._claim_specific(
+                        conn,
+                        trigger_id=queued["trigger_id"],
+                        now_ms=now_ms,
+                        lease_ttl_ms=self.config.lease_ttl_ms,
+                    )
+                    if triggered is not None:
+                        conn.execute(
+                            "UPDATE deliveries SET disposition = 'triggered' WHERE delivery_id = ?",
+                            (event["delivery_id"],),
+                        )
+                        conn.execute("COMMIT")
+                        return triggered
+                self._record_delivery(
+                    conn,
+                    event,
+                    key,
+                    state["merge_ready_trigger_id"],
+                    "already_merge_ready",
+                    now_ms,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+            return {
+                "decision": "suppress",
+                "reason": "already_merge_ready",
+                "delivery_id": event["delivery_id"],
+                "event_key": key,
+                "trigger_id": state["merge_ready_trigger_id"],
+                "route": ROUTES["check_suite"],
+            }
+
+        try:
+            gate = self._readiness_checker(
+                event["repo_full_name"], event["pr_number"], event["pr_head_sha"]
+            )
+        except Exception:
+            gate = {"ready": False, "reason": "gitea_unavailable"}
+        if not isinstance(gate, dict):
+            gate = {"ready": False, "reason": "invalid_response"}
+        gate_reason = str(gate.get("reason") or "invalid_response")
+        if gate.get("ready") is not True:
+            return self._record_check_state(
+                event,
+                key=key,
+                reason=gate_reason,
+                checks_status=self._checks_status_from_gate(gate, conclusion),
+                now_ms=now_ms,
+            )
+
+        ready_event = dict(event)
+        ready_event["trigger_name"] = "MERGE_READY"
+        ready_event["merge_ready_contexts"] = gate.get("contexts", {})
+        ready_key = self._merge_ready_key(
+            event["repo_full_name"], event["pr_number"], event["pr_head_sha"]
+        )
+        trigger_id = self._trigger_id(ready_key)
+        payload_json = json.dumps(
+            ready_event,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        quota, retry_after_ms, provider_error = self._quota_details(
+            ready_event, default_cooldown_ms=self.config.provider_cooldown_ms
+        )
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cooldown_until_ms = (
+                self._open_provider_cooldown(
+                    conn,
+                    now_ms=now_ms,
+                    retry_after_ms=retry_after_ms,
+                    error=provider_error,
+                )
+                if quota
+                else 0
+            )
+            blocked = None if quota else self._provider_gate(conn, now_ms=now_ms)
+            provider_blocked = blocked is not None or quota
+            if blocked is not None:
+                cooldown_until_ms = int(blocked["cooldown_until_ms"])
+
+            if conn.execute(
+                "SELECT 1 FROM deliveries WHERE delivery_id = ?",
+                (event["delivery_id"],),
+            ).fetchone():
+                conn.execute("COMMIT")
+                return {
+                    "decision": "suppress",
+                    "reason": "delivery_already_recorded",
+                    "delivery_id": event["delivery_id"],
+                    "route": ROUTES["check_suite"],
+                }
+
+            state = conn.execute(
+                "SELECT * FROM pr_state WHERE repo = ? AND pr_number = ?",
+                (repo, event["pr_number"]),
+            ).fetchone()
+            if state is not None and state["head_sha"] != event["pr_head_sha"]:
+                self._record_delivery(conn, event, ready_key, None, "stale_head", now_ms)
+                conn.execute("COMMIT")
+                return {
+                    "decision": "suppress",
+                    "reason": "stale_head",
+                    "delivery_id": event["delivery_id"],
+                    "route": ROUTES["check_suite"],
+                    "current_head": state["head_sha"],
+                }
+            if state is not None and state["merge_ready_at_ms"] is not None:
+                self._record_delivery(
+                    conn, event, ready_key, state["merge_ready_trigger_id"],
+                    "already_merge_ready", now_ms,
+                )
+                conn.execute("COMMIT")
+                return {
+                    "decision": "suppress",
+                    "reason": "already_merge_ready",
+                    "delivery_id": event["delivery_id"],
+                    "trigger_id": state["merge_ready_trigger_id"],
+                    "route": ROUTES["check_suite"],
+                }
+
+            queued = conn.execute(
+                "SELECT * FROM trigger_queue WHERE trigger_id = ?",
+                (trigger_id,),
+            ).fetchone()
+            if queued is not None:
+                self._record_delivery(
+                    conn, event, ready_key, trigger_id, "already_merge_ready", now_ms
+                )
+                conn.execute("COMMIT")
+                return {
+                    "decision": "suppress",
+                    "reason": "already_merge_ready",
+                    "delivery_id": event["delivery_id"],
+                    "trigger_id": trigger_id,
+                    "route": ROUTES["check_suite"],
+                }
+
+            state_event = dict(ready_event)
+            state_event["_checks_status"] = "success"
+            state_event["_gate_reason"] = "ready"
+            self._upsert_pr_state(
+                conn,
+                state_event,
+                now_ms=now_ms,
+                head_changed=state is None or state["head_sha"] != event["pr_head_sha"],
+            )
+            conn.execute(
+                """
+                INSERT INTO trigger_queue (
+                    trigger_id, event_key, repo, pr_number, head_sha, event,
+                    action, conclusion, route, priority, payload_json, state,
+                    first_seen_ms, due_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, 'check_suite', 'completed', 'success',
+                          'wdg-ci', ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    trigger_id,
+                    ready_key,
+                    repo,
+                    event["pr_number"],
+                    event["pr_head_sha"],
+                    EVENT_PRIORITY["check_suite"],
+                    payload_json,
+                    now_ms,
+                    now_ms + self.config.debounce_ms,
+                    now_ms,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE pr_state
+                SET merge_ready_at_ms = ?, merge_ready_trigger_id = ?,
+                    checks_status = 'success', next_action = 'merge',
+                    gate_reason = 'ready', updated_at_ms = ?
+                WHERE repo = ? AND pr_number = ? AND head_sha = ?
+                """,
+                (now_ms, trigger_id, now_ms, repo, event["pr_number"], event["pr_head_sha"]),
+            )
+            self._record_delivery(
+                conn, event, ready_key, trigger_id, "deferred", now_ms
+            )
+            queued = conn.execute(
+                "SELECT * FROM trigger_queue WHERE trigger_id = ?",
+                (trigger_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+        return self._pending_decision(
+            queued,
+            reason="provider_cooldown" if provider_blocked else "debounce",
+            delivery_id=event["delivery_id"],
+            now_ms=now_ms,
+            due_at_ms=(
+                max(int(queued["due_at_ms"]), cooldown_until_ms)
+                if provider_blocked
+                else None
+            ),
+        )
+
+    def _ingest_deploy_result(
+        self, event: dict[str, Any], *, now_ms: int
+    ) -> dict[str, Any]:
         key = event_key(event)
         route = ROUTES[event["event"]]
         try:
@@ -927,27 +1498,12 @@ class EventReducer:
                     "route": route,
                 }
 
-            if event["event"] == "pull_request" and (
-                state is None or state["head_sha"] != event["pr_head_sha"]
-            ):
-                conn.execute(
-                    """
-                    UPDATE trigger_queue
-                    SET state = 'done', completed_at_ms = ?,
-                        last_error = 'superseded_head', updated_at_ms = ?
-                    WHERE repo = ? AND pr_number = ?
-                      AND state = 'pending' AND head_sha <> ?
-                    """,
-                    (
-                        now_ms,
-                        now_ms,
-                        event["repo_full_name"].lower(),
-                        event["pr_number"],
-                        event["pr_head_sha"],
-                    ),
-                )
-
-            self._upsert_pr_state(conn, event, now_ms=now_ms)
+            self._upsert_pr_state(
+                conn,
+                event,
+                now_ms=now_ms,
+                head_changed=state is None or state["head_sha"] != event["pr_head_sha"],
+            )
 
             pending = conn.execute(
                 """
@@ -1297,6 +1853,15 @@ class EventReducer:
             provider = conn.execute(
                 "SELECT * FROM provider_state WHERE provider = 'hermes'"
             ).fetchone()
+            merge_ready = conn.execute(
+                """
+                SELECT repo, pr_number, head_sha, merge_ready_at_ms AS ready_at_ms,
+                       merge_ready_trigger_id AS trigger_id
+                FROM pr_state
+                WHERE merge_ready_at_ms IS NOT NULL
+                ORDER BY merge_ready_at_ms DESC, pr_number
+                """
+            ).fetchall()
         finally:
             conn.close()
         provider_data = (
@@ -1317,6 +1882,7 @@ class EventReducer:
             "queue": counts,
             "next_due": dict(next_row) if next_row is not None else None,
             "provider": provider_data,
+            "merge_ready": [dict(row) for row in merge_ready],
         }
 
 
@@ -1340,6 +1906,7 @@ def _config_from_args(args: Any) -> ReducerConfig:
         max_debounce_ms=args.max_debounce_ms,
         lease_ttl_ms=args.lease_ttl_ms,
         provider_cooldown_ms=args.provider_cooldown_ms,
+        required_contexts=parse_required_contexts(args.required_contexts),
     )
 
 
@@ -1361,6 +1928,13 @@ def build_parser() -> Any:
     parser.add_argument("--max-debounce-ms", type=int, default=10_000)
     parser.add_argument("--lease-ttl-ms", type=int, default=DEFAULT_LEASE_TTL_MS)
     parser.add_argument("--provider-cooldown-ms", type=int, default=60_000)
+    parser.add_argument(
+        "--required-contexts",
+        default=os.environ.get(
+            "DAILYCHECK_REQUIRED_CONTEXTS", DEFAULT_REQUIRED_CONTEXTS_ENV
+        ),
+        help="comma-separated exact required CI context names",
+    )
     parser.add_argument("--now-ms", type=int, help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("ingest", help="read one event JSON object from stdin")
@@ -1439,6 +2013,19 @@ def main(argv: list[str] | None = None) -> int:
             decision = reducer.inspect(pr=args.pr)
         else:
             decision = reducer.status(now_ms=now_ms)
+    except ValueError:
+        print(
+            json.dumps(
+                {
+                    "decision": "retry",
+                    "reason": "invalid_configuration",
+                },
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     except (OSError, sqlite3.Error) as exc:
         print(
             json.dumps(
@@ -1456,7 +2043,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _emit(decision)
-    if decision["decision"] == "defer":
+    if decision.get("decision") == "defer":
         return 75
     return 0
 

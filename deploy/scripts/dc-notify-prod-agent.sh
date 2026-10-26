@@ -13,8 +13,8 @@
 #   {"decision":"trigger",...}   one active lease claimed for this PR
 #
 # Routes are intentionally limited to:
-#   pull_request  -> wdg-pr
-#   check_suite   -> wdg-ci
+#   pull_request  -> reducer state only; never provider work
+#   check_suite   -> wdg-ci only after deterministic MERGE_READY
 #   deploy_result -> dailycheck-deploy
 #
 # Hermes enqueue is asynchronous: HTTP 2xx means the gateway accepted the
@@ -49,6 +49,7 @@ common_args=(
     --max-debounce-ms "${DAILYCHECK_REDUCER_MAX_DEBOUNCE_MS:-10000}"
     --lease-ttl-ms "${DAILYCHECK_REDUCER_LEASE_TTL_MS:-1200000}"
     --provider-cooldown-ms "${DAILYCHECK_REDUCER_COOLDOWN_MS:-60000}"
+    --required-contexts "${DAILYCHECK_REQUIRED_CONTEXTS:-test,agent-framework-reports}"
 )
 
 if [ "${1:-}" = "--drain" ]; then
@@ -131,7 +132,7 @@ lease=$(sed -n '3p' "$meta_file")
 event=$(sed -n '4p' "$meta_file")
 
 case "$route" in
-    wdg-pr|wdg-ci|dailycheck-deploy) ;;
+    wdg-ci|dailycheck-deploy) ;;
     *)
         echo "dc-notify-prod-agent: reducer returned unapproved route" >&2
         exit 1
@@ -139,7 +140,7 @@ case "$route" in
 esac
 
 case "$event" in
-    pull_request|check_suite|deploy_result) ;;
+    check_suite|deploy_result) ;;
     *)
         echo "dc-notify-prod-agent: reducer returned unsupported event" >&2
         exit 1
