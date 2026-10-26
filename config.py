@@ -216,9 +216,11 @@ FEEDBACK_GITEA_WEB_BASE = (
 # - FEEDBACK_LLM_TIMEOUT：单次调用总超时（秒）。分析跑在后台线程里，
 #   超时只影响这张单的等待时长，不阻塞任何请求。
 #   ⚠️ 必须与 ``MAX_OUTPUT_TOKENS`` 成对看：推理模型的 reasoning 与正文共享
-#   预算，预算抬到 8192 后单次真实耗时实测 **108s**（2026-10-25 生产 ticket 11，
-#   提示词 2012 tokens）。默认值若停在 90，模型还没说完就撞超时，
-#   结果同样是「模板兜底」，且错误文案只写 TimeoutError，看不出差多少。
+#   预算。2026-10-25 预算 8192 时实测 108s（ticket 9，prompt 2012 tokens）；
+#   2026-10-26 抬到 16384 后实测 113s（ticket 11，prompt 2074 tokens）。按实测
+#   反推解码约 80 tok/s，吃满 16384 约 205s，对 300 只剩约 1.5 倍余量。
+#   默认值若停在 90，模型还没说完就撞超时，结果同样是「模板兜底」，
+#   且错误文案只写 TimeoutError，看不出差多少。
 # ─────────────────────────────────────────────────────────────────────
 _LLM_BASE_DEFAULT = "https://api.minimaxi.com"
 _LLM_MODEL_DEFAULT = "MiniMax-M3.1-Flash"
