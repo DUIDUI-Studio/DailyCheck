@@ -33,7 +33,25 @@ ALLOWED_ACTIONS = {
 }
 DEFAULT_DB = Path("/var/lib/dailycheck-prod-agent/event_reducer.sqlite3")
 MAX_INPUT_BYTES = 1_048_576
+MAX_PROVIDER_COOLDOWN_MS = 3_600_000
+DEFAULT_LEASE_TTL_MS = 1_200_000
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_REDACTIONS = (
+    (
+        re.compile(r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b((?:api[_-]?key|access[_-]?token|token|secret|password|passwd)"
+            r"\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
+    (re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{8,}\b"), "[REDACTED]"),
+    (re.compile(r"\bwhsec_[A-Za-z0-9_=-]{8,}\b"), "[REDACTED]"),
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -120,6 +138,73 @@ def _text(value: Any, *, field: str, limit: int = 512, required: bool = True) ->
     return value
 
 
+def redact_sensitive(value: Any, *, limit: int = 400) -> str:
+    """Return bounded diagnostic text with credential-shaped values removed."""
+    text = "" if value is None else str(value)
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text[:limit]
+
+
+def _validate_json_tree(value: Any, *, path: str = "$", depth: int = 0) -> None:
+    """Reject values Python accepts but RFC JSON cannot represent faithfully."""
+    if depth > 100:
+        raise ValidationError(f"{path} is nested too deeply")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValidationError(f"{path} contains an invalid Unicode surrogate") from exc
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValidationError(f"{path} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_tree(item, path=f"{path}[{index}]", depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValidationError(f"{path} contains a non-string object key")
+            try:
+                key.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValidationError(f"{path} contains an invalid object key") from exc
+            _validate_json_tree(item, path=f"{path}.*", depth=depth + 1)
+        return
+    raise ValidationError(f"{path} contains a non-JSON value")
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValidationError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValidationError(f"non-RFC JSON number {value}")
+
+
+def strict_json_loads(raw: bytes | str) -> Any:
+    """Parse JSON while rejecting NaN, Infinity, overflow and duplicate keys."""
+    payload = json.loads(
+        raw,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_strict_object,
+    )
+    _validate_json_tree(payload)
+    return payload
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -163,7 +248,7 @@ class ReducerConfig:
     db_path: Path
     debounce_ms: int = 2_000
     max_debounce_ms: int = 10_000
-    lease_ttl_ms: int = 30_000
+    lease_ttl_ms: int = DEFAULT_LEASE_TTL_MS
     provider_cooldown_ms: int = 60_000
 
 
@@ -185,6 +270,7 @@ class EventReducer:
     def normalize(self, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise ValidationError("payload must be a JSON object")
+        _validate_json_tree(payload)
         event_name = _text(payload.get("event"), field="event", limit=64)
         if event_name not in ROUTES:
             raise ValidationError("event is not supported")
@@ -262,6 +348,15 @@ class EventReducer:
             )
 
         normalized = dict(payload)
+        for field in (
+            "provider_error",
+            "error",
+            "deploy_reason",
+            "reason",
+            "last_error",
+        ):
+            if field in normalized:
+                normalized[field] = redact_sensitive(normalized[field], limit=512)
         normalized.update(
             {
                 "delivery_id": delivery_id,
@@ -308,21 +403,17 @@ class EventReducer:
         return checks, review, deploy, next_action
 
     @staticmethod
-    def _quota_details(
-        event: dict[str, Any], *, default_cooldown_ms: int
-    ) -> tuple[bool, int, str]:
+    def _quota_details(event: dict[str, Any], *, default_cooldown_ms: int) -> tuple[bool, int, str]:
         status_values = (
             event.get("provider_status"),
             event.get("http_status"),
             event.get("status_code"),
         )
         exhausted = any(
-            not isinstance(value, bool) and str(value).strip() == "429"
-            for value in status_values
+            not isinstance(value, bool) and str(value).strip() == "429" for value in status_values
         )
         exhausted = exhausted or any(
-            event.get(field) is True
-            for field in ("quota_exhausted", "provider_quota_exhausted")
+            event.get(field) is True for field in ("quota_exhausted", "provider_quota_exhausted")
         )
         text = " ".join(
             str(event.get(field, "")).lower()
@@ -397,9 +488,7 @@ class EventReducer:
         if active is not None:
             return None
         attempts = int(row["attempts"]) + 1
-        lease = hashlib.sha256(
-            f"{trigger_id}|{attempts}|{now_ms}|lease".encode()
-        ).hexdigest()[:40]
+        lease = hashlib.sha256(f"{trigger_id}|{attempts}|{now_ms}|lease".encode()).hexdigest()[:40]
         conn.execute(
             """
             UPDATE trigger_queue
@@ -490,9 +579,7 @@ class EventReducer:
             """,
             (now_ms,),
         )
-        row = conn.execute(
-            "SELECT * FROM provider_state WHERE provider = 'hermes'"
-        ).fetchone()
+        row = conn.execute("SELECT * FROM provider_state WHERE provider = 'hermes'").fetchone()
         if row["state"] == "open" and row["cooldown_until_ms"] > now_ms:
             return row
         if row["state"] == "open":
@@ -513,6 +600,7 @@ class EventReducer:
         retry_after_ms: int,
         error: str,
     ) -> int:
+        retry_after_ms = max(0, min(retry_after_ms, MAX_PROVIDER_COOLDOWN_MS))
         until_ms = now_ms + retry_after_ms
         conn.execute(
             """
@@ -529,9 +617,40 @@ class EventReducer:
                 last_error = excluded.last_error,
                 updated_at_ms = excluded.updated_at_ms
             """,
-            (until_ms, error[:400], now_ms),
+            (until_ms, redact_sensitive(error), now_ms),
         )
         return until_ms
+
+    def trip_provider(
+        self,
+        *,
+        now_ms: int,
+        cooldown_ms: int,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Open the provider breaker from an external quota monitor."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cooldown_until_ms = self._open_provider_cooldown(
+                conn,
+                now_ms=now_ms,
+                retry_after_ms=cooldown_ms,
+                error=reason,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        return {
+            "decision": "silent",
+            "reason": "provider_cooldown_set",
+            "provider": "hermes",
+            "state": "open",
+            "cooldown_until_ms": cooldown_until_ms,
+        }
 
     def _upsert_pr_state(
         self,
@@ -640,7 +759,16 @@ class EventReducer:
         event = self.normalize(payload)
         key = event_key(event)
         route = ROUTES[event["event"]]
-        payload_json = json.dumps(event, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        try:
+            payload_json = json.dumps(
+                event,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValidationError("payload is not RFC-compatible JSON") from exc
         quota, retry_after_ms, provider_error = self._quota_details(
             event, default_cooldown_ms=self.config.provider_cooldown_ms
         )
@@ -658,6 +786,10 @@ class EventReducer:
                 if quota
                 else 0
             )
+            blocked = None if quota else self._provider_gate(conn, now_ms=now_ms)
+            provider_blocked = blocked is not None or quota
+            if blocked is not None:
+                cooldown_until_ms = int(blocked["cooldown_until_ms"])
 
             delivery = conn.execute(
                 """
@@ -676,7 +808,7 @@ class EventReducer:
                     else None
                 )
                 if queued is not None and queued["state"] == "pending":
-                    if quota:
+                    if provider_blocked:
                         conn.execute("COMMIT")
                         return self._pending_decision(
                             queued,
@@ -772,14 +904,12 @@ class EventReducer:
                     conn.execute("COMMIT")
                     return self._pending_decision(
                         merged,
-                        reason=(
-                            "provider_cooldown" if quota else "coalesced"
-                        ),
+                        reason=("provider_cooldown" if provider_blocked else "coalesced"),
                         delivery_id=event["delivery_id"],
                         now_ms=now_ms,
                         due_at_ms=(
                             max(int(merged["due_at_ms"]), cooldown_until_ms)
-                            if quota
+                            if provider_blocked
                             else None
                         ),
                     )
@@ -842,18 +972,16 @@ class EventReducer:
                     route=route,
                     now_ms=now_ms,
                 )
-                self._record_delivery(
-                    conn, event, key, merged["trigger_id"], "coalesced", now_ms
-                )
+                self._record_delivery(conn, event, key, merged["trigger_id"], "coalesced", now_ms)
                 conn.execute("COMMIT")
                 return self._pending_decision(
                     merged,
-                    reason="provider_cooldown" if quota else "coalesced",
+                    reason="provider_cooldown" if provider_blocked else "coalesced",
                     delivery_id=event["delivery_id"],
                     now_ms=now_ms,
                     due_at_ms=(
                         max(int(merged["due_at_ms"]), cooldown_until_ms)
-                        if quota
+                        if provider_blocked
                         else None
                     ),
                 )
@@ -898,13 +1026,11 @@ class EventReducer:
 
         return self._pending_decision(
             queued,
-            reason="provider_cooldown" if quota else "debounce",
+            reason="provider_cooldown" if provider_blocked else "debounce",
             delivery_id=event["delivery_id"],
             now_ms=now_ms,
             due_at_ms=(
-                max(int(queued["due_at_ms"]), cooldown_until_ms)
-                if quota
-                else None
+                max(int(queued["due_at_ms"]), cooldown_until_ms) if provider_blocked else None
             ),
         )
 
@@ -1015,8 +1141,18 @@ class EventReducer:
                     last_error, updated_at_ms
                 ) VALUES ('hermes', 'closed', 0, 0, '', ?)
                 ON CONFLICT(provider) DO UPDATE SET
-                    state = 'closed', consecutive_failures = 0,
-                    cooldown_until_ms = 0, last_error = '',
+                    state = CASE
+                        WHEN provider_state.state = 'half_open' THEN 'closed'
+                        ELSE provider_state.state END,
+                    consecutive_failures = CASE
+                        WHEN provider_state.state = 'half_open' THEN 0
+                        ELSE provider_state.consecutive_failures END,
+                    cooldown_until_ms = CASE
+                        WHEN provider_state.state = 'half_open' THEN 0
+                        ELSE provider_state.cooldown_until_ms END,
+                    last_error = CASE
+                        WHEN provider_state.state = 'half_open' THEN ''
+                        ELSE provider_state.last_error END,
                     updated_at_ms = excluded.updated_at_ms
                 """,
                 (now_ms,),
@@ -1059,9 +1195,10 @@ class EventReducer:
                     "trigger_id": trigger_id,
                     "failed": False,
                 }
-            safe_reason = _text(reason, field="reason", limit=400, required=False)
+            safe_reason = redact_sensitive(_text(reason, field="reason", limit=400, required=False))
             if quota_exhausted:
                 delay = retry_after_ms or self.config.provider_cooldown_ms
+                delay = max(0, min(delay, MAX_PROVIDER_COOLDOWN_MS))
                 due_at_ms = self._open_provider_cooldown(
                     conn,
                     now_ms=now_ms,
@@ -1082,7 +1219,7 @@ class EventReducer:
                         last_error = excluded.last_error,
                         updated_at_ms = excluded.updated_at_ms
                     """,
-                    (safe_reason[:400], now_ms),
+                    (safe_reason, now_ms),
                 )
             conn.execute(
                 """
@@ -1092,7 +1229,7 @@ class EventReducer:
                     last_error = ?, updated_at_ms = ?
                 WHERE trigger_id = ?
                 """,
-                (due_at_ms, safe_reason[:400], now_ms, trigger_id),
+                (due_at_ms, safe_reason, now_ms, trigger_id),
             )
             conn.execute("COMMIT")
             return {
@@ -1218,7 +1355,7 @@ def build_parser() -> Any:
     )
     parser.add_argument("--debounce-ms", type=int, default=2_000)
     parser.add_argument("--max-debounce-ms", type=int, default=10_000)
-    parser.add_argument("--lease-ttl-ms", type=int, default=30_000)
+    parser.add_argument("--lease-ttl-ms", type=int, default=DEFAULT_LEASE_TTL_MS)
     parser.add_argument("--provider-cooldown-ms", type=int, default=60_000)
     parser.add_argument("--now-ms", type=int, help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1235,6 +1372,10 @@ def build_parser() -> Any:
     fail.add_argument("--reason", default="")
     fail.add_argument("--quota-exhausted", action="store_true")
     fail.add_argument("--retry-after-ms", type=int)
+
+    trip = sub.add_parser("provider-trip", help="open the provider cooldown breaker")
+    trip.add_argument("--cooldown-ms", type=int, required=True)
+    trip.add_argument("--reason", default="provider quota threshold")
 
     sub.add_parser("status", help="show queue and provider state")
     inspect = sub.add_parser("inspect", help="show one PR state and queue history")
@@ -1260,7 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
             try:
-                payload = json.loads(raw)
+                payload = strict_json_loads(raw)
                 decision = reducer.ingest(payload, now_ms=now_ms)
             except (ValidationError, ValueError, RecursionError, UnicodeError) as exc:
                 _emit(
@@ -1274,9 +1415,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "drain":
             decision = reducer.drain(now_ms=now_ms)
         elif args.command == "complete":
-            decision = reducer.complete(
-                args.trigger_id, args.lease, now_ms=now_ms
-            )
+            decision = reducer.complete(args.trigger_id, args.lease, now_ms=now_ms)
         elif args.command == "fail":
             decision = reducer.fail(
                 args.trigger_id,
@@ -1285,6 +1424,12 @@ def main(argv: list[str] | None = None) -> int:
                 reason=args.reason,
                 quota_exhausted=args.quota_exhausted,
                 retry_after_ms=args.retry_after_ms,
+            )
+        elif args.command == "provider-trip":
+            decision = reducer.trip_provider(
+                now_ms=now_ms,
+                cooldown_ms=args.cooldown_ms,
+                reason=args.reason,
             )
         elif args.command == "inspect":
             decision = reducer.inspect(pr=args.pr)

@@ -8,11 +8,14 @@ entry points used by the command-line adapter.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -20,6 +23,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "prod_agent"))
 
 import event_reducer  # noqa: E402
+import hermes_webhook_sender  # noqa: E402
 
 
 def _pr(
@@ -154,6 +158,36 @@ def test_equivalent_events_collapse_into_one_pending_trigger(tmp_path):
     assert queue[0]["collapsed_count"] == 2
 
 
+def test_new_delivery_equivalent_key_is_suppressed_while_trigger_is_claimed(tmp_path):
+    reducer = _reducer(tmp_path)
+
+    reducer.ingest(_pr(delivery_id="delivery-a"), now_ms=1_000)
+    claimed = reducer.drain(now_ms=3_000)
+    equivalent = reducer.ingest(_pr(delivery_id="delivery-b"), now_ms=3_100)
+
+    assert equivalent["decision"] == "suppress"
+    assert equivalent["reason"] == "equivalent_active"
+    assert equivalent["trigger_id"] == claimed["trigger_id"]
+    assert len(reducer.inspect(pr=54)["queue"]) == 1
+
+
+def test_new_delivery_equivalent_key_is_suppressed_after_trigger_is_done(tmp_path):
+    reducer = _reducer(tmp_path)
+
+    reducer.ingest(_pr(delivery_id="delivery-a"), now_ms=1_000)
+    claimed = reducer.drain(now_ms=3_000)
+    assert (
+        reducer.complete(claimed["trigger_id"], claimed["lease"], now_ms=3_100)["completed"] is True
+    )
+
+    equivalent = reducer.ingest(_pr(delivery_id="delivery-b"), now_ms=3_200)
+
+    assert equivalent["decision"] == "suppress"
+    assert equivalent["reason"] == "equivalent_completed"
+    assert equivalent["trigger_id"] == claimed["trigger_id"]
+    assert len(reducer.inspect(pr=54)["queue"]) == 1
+
+
 def test_rapid_pr_ci_deploy_burst_coalesces_to_one_deploy_trigger(tmp_path):
     reducer = _reducer(tmp_path)
 
@@ -182,9 +216,7 @@ def test_one_active_trigger_per_pr_serializes_later_work(tmp_path):
     assert blocked["decision"] == "silent"
     assert blocked["reason"] == "active_lease"
 
-    assert reducer.complete(
-        first["trigger_id"], first["lease"], now_ms=6_100
-    )["completed"] is True
+    assert reducer.complete(first["trigger_id"], first["lease"], now_ms=6_100)["completed"] is True
     second = reducer.drain(now_ms=6_200)
     assert second["decision"] == "trigger"
     assert second["payload"]["pr_head_sha"] == next_head
@@ -194,9 +226,7 @@ def test_retry_of_queued_work_while_other_head_active_stays_deferred(tmp_path):
     reducer = _reducer(tmp_path)
     reducer.ingest(_pr(), now_ms=1_000)
     reducer.drain(now_ms=3_000)
-    queued_payload = _pr(
-        delivery_id="delivery-sync", action="synchronize", sha="b" * 40
-    )
+    queued_payload = _pr(delivery_id="delivery-sync", action="synchronize", sha="b" * 40)
     reducer.ingest(queued_payload, now_ms=3_100)
 
     retried = reducer.ingest(queued_payload, now_ms=6_000)
@@ -306,13 +336,75 @@ def test_provider_failure_with_quota_opens_cooldown(tmp_path):
     assert reducer.drain(now_ms=93_100)["decision"] == "trigger"
 
 
+def test_enqueue_completion_does_not_clear_an_active_external_cooldown(tmp_path):
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+    claimed = reducer.drain(now_ms=3_000)
+    reducer.trip_provider(
+        now_ms=3_100,
+        cooldown_ms=900_000,
+        reason="provider_quota_threshold",
+    )
+
+    reducer.complete(claimed["trigger_id"], claimed["lease"], now_ms=3_200)
+
+    provider = reducer.status(now_ms=3_200)["provider"]
+    assert provider["state"] == "open"
+    assert provider["cooldown_until_ms"] == 903_100
+
+
+def test_half_open_probe_completion_returns_provider_to_closed(tmp_path):
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+    reducer.trip_provider(
+        now_ms=2_000,
+        cooldown_ms=1_000,
+        reason="provider_quota_threshold",
+    )
+
+    claimed = reducer.drain(now_ms=3_000)
+    reducer.complete(claimed["trigger_id"], claimed["lease"], now_ms=3_100)
+
+    assert reducer.status(now_ms=3_100)["provider"]["state"] == "closed"
+
+
 @pytest.mark.parametrize(
     "raw",
     [
         b"",
         b"not json",
         b"\xff",
+        (
+            b'{"delivery_id":"nan","event":"pull_request","action":"opened",'
+            b'"repo_full_name":"eric/dailycheck","pr_number":1,'
+            b'"pr_head_sha":"aaaaaaaa","extra":NaN}'
+        ),
+        (
+            b'{"delivery_id":"inf","event":"pull_request","action":"opened",'
+            b'"repo_full_name":"eric/dailycheck","pr_number":1,'
+            b'"pr_head_sha":"aaaaaaaa","extra":Infinity}'
+        ),
+        (
+            b'{"delivery_id":"neg-inf","event":"pull_request","action":"opened",'
+            b'"repo_full_name":"eric/dailycheck","pr_number":1,'
+            b'"pr_head_sha":"aaaaaaaa","extra":-Infinity}'
+        ),
+        (
+            b'{"delivery_id":"overflow","event":"pull_request","action":"opened",'
+            b'"repo_full_name":"eric/dailycheck","pr_number":1,'
+            b'"pr_head_sha":"aaaaaaaa","extra":1e9999}'
+        ),
+        (
+            b'{"delivery_id":"duplicate","delivery_id":"duplicate-2",'
+            b'"event":"pull_request","action":"opened","repo_full_name":"eric/dailycheck",'
+            b'"pr_number":1,"pr_head_sha":"aaaaaaaa"}'
+        ),
         b'{"event":"pull_request","action":"opened","delivery_id":"\\ud800"}',
+        (
+            b'{"event":"pull_request","action":"opened","delivery_id":"x",'
+            b'"pr_number":1,"repo_full_name":"eric/dailycheck",'
+            b'"pr_head_sha":"aaaaaaaa","extra":"\\ud800"}'
+        ),
         b'{"event":"pull_request","action":"opened","delivery_id":"x","pr_number":1,'
         b'"repo_full_name":"eric/dailycheck","pr_head_sha":"a" * 40}',
         ("[" * 2_000 + "0" + "]" * 2_000).encode(),
@@ -337,6 +429,40 @@ def test_cli_corrupt_input_is_silent_and_non_crashing(tmp_path, raw):
     assert decision["decision"] == "suppress"
     assert decision["reason"] == "invalid_payload"
     assert run.stderr == b""
+    assert not (tmp_path / "events.sqlite3").exists()
+
+
+def test_provider_failure_text_is_redacted_from_durable_state(tmp_path):
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+    claimed = reducer.drain(now_ms=3_000)
+    openai_secret = "sk-proj-super-secret-value"
+    github_secret = "ghp_supersecretvalue1234567890"
+    bearer_secret = "bearer-secret-value"
+
+    reducer.fail(
+        claimed["trigger_id"],
+        claimed["lease"],
+        now_ms=3_100,
+        reason=(
+            "HTTP 429 quota exhausted "
+            f"Authorization: Bearer {bearer_secret} "
+            f"api_key={openai_secret} token={github_secret}"
+        ),
+        quota_exhausted=True,
+        retry_after_ms=60_000,
+    )
+
+    inspect = reducer.inspect(pr=54)
+    status = reducer.status(now_ms=3_100)
+    durable = json.dumps({"inspect": inspect, "status": status})
+
+    assert inspect["queue"][0]["last_error"]
+    assert status["provider"]["last_error"]
+    assert "quota" in durable.lower()
+    assert openai_secret not in durable
+    assert github_secret not in durable
+    assert bearer_secret not in durable
 
 
 def _stress_event(index: int) -> dict:
@@ -347,11 +473,7 @@ def _stress_event(index: int) -> dict:
         delivery_id=f"stress-{index if index < 800 else index - 800}",
         pr=pr,
         sha=sha,
-        action=(
-            "opened"
-            if event == "pull_request"
-            else "completed"
-        ),
+        action=("opened" if event == "pull_request" else "completed"),
     )
     if event == "check_suite":
         row["event"] = "check_suite"
@@ -377,7 +499,9 @@ def test_1000_event_dedupe_coalesce_stress_has_one_active_wake_per_pr(tmp_path):
     assert all(item["decision"] in {"defer", "suppress"} for item in decisions)
     assert all(item.get("route") in event_reducer.ROUTES.values() for item in decisions)
     pending = [
-        item for pr in range(1, 41) for item in reducer.inspect(pr=pr)["queue"]
+        item
+        for pr in range(1, 41)
+        for item in reducer.inspect(pr=pr)["queue"]
         if item["state"] == "pending"
     ]
     assert len(pending) == 40
@@ -404,20 +528,13 @@ def test_1000_event_dedupe_coalesce_stress_has_one_active_wake_per_pr(tmp_path):
             item for item in reducer.inspect(pr=pr)["queue"] if item["state"] == "claimed"
         )
         # Completing by a stale lease must not settle a claimed row.
-        stale = reducer.complete(
-            claimed["trigger_id"], "not-the-lease", now_ms=22_200
-        )
+        stale = reducer.complete(claimed["trigger_id"], "not-the-lease", now_ms=22_200)
         assert stale["reason"] == "stale_lease"
     assert reducer.drain(now_ms=22_300)["reason"] == "active_lease"
 
 
 def test_notify_adapter_uses_only_approved_routes_and_distinct_exit_semantics():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "deploy"
-        / "scripts"
-        / "dc-notify-prod-agent.sh"
-    )
+    script = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "dc-notify-prod-agent.sh"
     content = script.read_text(encoding="utf-8")
 
     assert "wdg-pr" in content
@@ -428,52 +545,90 @@ def test_notify_adapter_uses_only_approved_routes_and_distinct_exit_semantics():
     assert "suppress" in content
     assert "defer" in content
     assert "trigger" in content
+    assert '--reason="$reason"' in content
+    assert "webhook test" not in content
 
 
-def _shell_env(
-    tmp_path: Path, *, hermes_rc: int = 0, hermes_output: str = ""
-) -> tuple[dict, Path]:
-    fake_hermes = tmp_path / "hermes"
-    fake_hermes.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, sys\n"
-        "with open(os.environ['HERMES_CALLS'], 'a', encoding='utf-8') as fh:\n"
-        "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        "print(os.environ.get('HERMES_OUTPUT', ''))\n"
-        "sys.exit(int(os.environ.get('HERMES_RC', '0')))\n",
+class _WebhookCapture(BaseHTTPRequestHandler):
+    requests: list[dict] = []
+    response_status = 202
+    retry_after: str | None = None
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        self.__class__.requests.append(
+            {
+                "path": self.path,
+                "headers": {key.lower(): value for key, value in self.headers.items()},
+                "body": body,
+            }
+        )
+        self.send_response(self.__class__.response_status)
+        if self.__class__.retry_after is not None:
+            self.send_header("Retry-After", self.__class__.retry_after)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        return
+
+
+@pytest.fixture
+def webhook_server():
+    _WebhookCapture.requests = []
+    _WebhookCapture.response_status = 202
+    _WebhookCapture.retry_after = None
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _WebhookCapture)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield _WebhookCapture, f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _shell_env(tmp_path: Path, *, base_url: str, secret: str = "route-secret") -> tuple[dict, Path]:
+    subscriptions = tmp_path / "webhook_subscriptions.json"
+    subscriptions.write_text(
+        json.dumps(
+            {
+                route: {"secret": secret, "events": []}
+                for route in ("wdg-pr", "wdg-ci", "dailycheck-deploy")
+            }
+        ),
         encoding="utf-8",
     )
-    fake_hermes.chmod(0o755)
-    calls = tmp_path / "hermes-calls.jsonl"
+    subscriptions.chmod(0o600)
     env = os.environ.copy()
     env.update(
         {
             "DAILYCHECK_PYTHON": sys.executable,
             "DAILYCHECK_EVENT_REDUCER": str(
-                Path(__file__).resolve().parents[1]
-                / "scripts"
-                / "prod_agent"
-                / "event_reducer.py"
+                Path(__file__).resolve().parents[1] / "scripts" / "prod_agent" / "event_reducer.py"
             ),
             "DAILYCHECK_EVENT_REDUCER_DB": str(tmp_path / "events.sqlite3"),
             "DAILYCHECK_REDUCER_DEBOUNCE_MS": "0",
-            "DAILYCHECK_HERMES": str(fake_hermes),
-            "HERMES_CALLS": str(calls),
-            "HERMES_RC": str(hermes_rc),
-            "HERMES_OUTPUT": hermes_output,
+            "DAILYCHECK_REDUCER_LEASE_TTL_MS": "1200000",
+            "DAILYCHECK_HERMES_SENDER": str(
+                Path(__file__).resolve().parents[1]
+                / "scripts"
+                / "prod_agent"
+                / "hermes_webhook_sender.py"
+            ),
+            "DAILYCHECK_HERMES_WEBHOOK_URL": base_url,
+            "DAILYCHECK_HERMES_SUBSCRIPTIONS": str(subscriptions),
         }
     )
-    return env, calls
+    return env, subscriptions
 
 
-def test_notify_adapter_defer_then_trigger_then_suppress(tmp_path):
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "deploy"
-        / "scripts"
-        / "dc-notify-prod-agent.sh"
-    )
-    env, calls = _shell_env(tmp_path)
+def test_notify_adapter_defer_then_http_enqueue_then_suppress(tmp_path, webhook_server):
+    capture, base_url = webhook_server
+    script = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "dc-notify-prod-agent.sh"
+    env, _ = _shell_env(tmp_path, base_url=base_url)
     line = json.dumps(_pr()) + "\n"
 
     deferred = subprocess.run(
@@ -486,7 +641,7 @@ def test_notify_adapter_defer_then_trigger_then_suppress(tmp_path):
     )
     assert deferred.returncode == 75
     assert json.loads(deferred.stdout)["decision"] == "defer"
-    assert not calls.exists()
+    assert capture.requests == []
 
     triggered = subprocess.run(
         ["bash", str(script)],
@@ -497,10 +652,24 @@ def test_notify_adapter_defer_then_trigger_then_suppress(tmp_path):
         check=False,
     )
     assert triggered.returncode == 0, triggered.stderr.decode("utf-8", "replace")
-    assert json.loads(triggered.stdout)["decision"] == "trigger"
-    call = json.loads(calls.read_text(encoding="utf-8").splitlines()[0])
-    assert call[:3] == ["webhook", "test", "wdg-pr"]
-    assert json.loads(call[call.index("--payload") + 1])["pr_number"] == 54
+    decision = json.loads(triggered.stdout)
+    assert decision["decision"] == "trigger"
+    assert len(capture.requests) == 1
+    request = capture.requests[0]
+    assert request["path"] == "/webhooks/wdg-pr"
+    assert request["headers"]["x-github-event"] == "pull_request"
+    assert request["headers"]["x-github-delivery"] == f"dailycheck-{decision['trigger_id']}"
+    expected_body = json.dumps(
+        decision["payload"],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    assert request["body"] == expected_body
+    expected_sig = "sha256=" + hmac.new(b"route-secret", expected_body, hashlib.sha256).hexdigest()
+    assert request["headers"]["x-hub-signature-256"] == expected_sig
+    assert "route-secret" not in triggered.stdout.decode()
+    assert "route-secret" not in triggered.stderr.decode()
 
     suppressed = subprocess.run(
         ["bash", str(script)],
@@ -512,17 +681,69 @@ def test_notify_adapter_defer_then_trigger_then_suppress(tmp_path):
     )
     assert suppressed.returncode == 0
     assert json.loads(suppressed.stdout)["decision"] == "suppress"
-    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(capture.requests) == 1
 
 
-def test_notify_adapter_drain_path_sends_due_work(tmp_path):
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "deploy"
-        / "scripts"
-        / "dc-notify-prod-agent.sh"
+@pytest.mark.parametrize("status", [200, 202, 204])
+def test_http_sender_accepts_all_2xx_enqueue_statuses(tmp_path, webhook_server, status):
+    capture, base_url = webhook_server
+    capture.response_status = status
+    subscriptions = tmp_path / "webhook_subscriptions.json"
+    subscriptions.write_text(
+        json.dumps({"wdg-pr": {"secret": "route-secret"}}),
+        encoding="utf-8",
     )
-    env, calls = _shell_env(tmp_path)
+    body = b'{"one":1}'
+
+    rc, result = hermes_webhook_sender.send(
+        subscriptions_path=subscriptions,
+        base_url=base_url,
+        route="wdg-pr",
+        event="pull_request",
+        delivery_id="dailycheck-stable-id",
+        body=body,
+    )
+
+    assert rc == 0
+    assert result == {"accepted": True, "http_status": status}
+    assert capture.requests[0]["body"] == body
+
+
+@pytest.mark.parametrize(
+    ("route", "event"),
+    [
+        ("wdg-pr", "pull_request"),
+        ("wdg-ci", "check_suite"),
+        ("dailycheck-deploy", "deploy_result"),
+    ],
+)
+def test_http_sender_uses_real_event_header_for_each_route(tmp_path, webhook_server, route, event):
+    capture, base_url = webhook_server
+    subscriptions = tmp_path / "webhook_subscriptions.json"
+    subscriptions.write_text(
+        json.dumps({route: {"secret": "route-secret"}}),
+        encoding="utf-8",
+    )
+
+    rc, result = hermes_webhook_sender.send(
+        subscriptions_path=subscriptions,
+        base_url=base_url,
+        route=route,
+        event=event,
+        delivery_id="dailycheck-stable-id",
+        body=b"{}",
+    )
+
+    assert rc == 0
+    assert result["accepted"] is True
+    assert capture.requests[0]["path"] == f"/webhooks/{route}"
+    assert capture.requests[0]["headers"]["x-github-event"] == event
+
+
+def test_notify_adapter_drain_path_sends_due_work(tmp_path, webhook_server):
+    capture, base_url = webhook_server
+    script = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "dc-notify-prod-agent.sh"
+    env, _ = _shell_env(tmp_path, base_url=base_url)
     seeded = subprocess.run(
         ["bash", str(script)],
         input=(json.dumps(_pr()) + "\n").encode(),
@@ -543,23 +764,18 @@ def test_notify_adapter_drain_path_sends_due_work(tmp_path):
 
     assert drained.returncode == 0, drained.stderr.decode("utf-8", "replace")
     assert json.loads(drained.stdout)["decision"] == "trigger"
-    assert calls.exists()
+    assert len(capture.requests) == 1
+    assert capture.requests[0]["path"] == "/webhooks/wdg-pr"
 
 
-def test_notify_adapter_429_from_provider_opens_cooldown(tmp_path):
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "deploy"
-        / "scripts"
-        / "dc-notify-prod-agent.sh"
-    )
-    env, calls = _shell_env(
-        tmp_path,
-        hermes_rc=1,
-        hermes_output="provider HTTP 429 quota exhausted",
-    )
+def test_notify_adapter_429_from_route_opens_cooldown(tmp_path, webhook_server):
+    capture, base_url = webhook_server
+    capture.response_status = 429
+    capture.retry_after = "120"
+    script = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "dc-notify-prod-agent.sh"
+    env, _ = _shell_env(tmp_path, base_url=base_url)
     line = json.dumps(_pr()) + "\n"
-    subprocess.run(
+    seeded = subprocess.run(
         ["bash", str(script)],
         input=line.encode(),
         capture_output=True,
@@ -567,6 +783,7 @@ def test_notify_adapter_429_from_provider_opens_cooldown(tmp_path):
         timeout=20,
         check=False,
     )
+    assert seeded.returncode == 75
 
     failed = subprocess.run(
         ["bash", str(script)],
@@ -577,7 +794,9 @@ def test_notify_adapter_429_from_provider_opens_cooldown(tmp_path):
         check=False,
     )
     assert failed.returncode == 75
-    assert calls.exists()
+    assert len(capture.requests) == 1
+    assert "route-secret" not in failed.stdout.decode()
+    assert "route-secret" not in failed.stderr.decode()
 
     status = subprocess.run(
         [
@@ -593,5 +812,91 @@ def test_notify_adapter_429_from_provider_opens_cooldown(tmp_path):
         check=False,
     )
     assert status.returncode == 0
-    assert json.loads(status.stdout)["provider"]["state"] == "open"
+    provider = json.loads(status.stdout)["provider"]
+    assert provider["state"] == "open"
+    assert provider["last_error"] == "http_status=429; retry_after_ms=120000"
 
+
+def test_notify_adapter_handles_nonquota_http_status_without_secret_output(
+    tmp_path, webhook_server
+):
+    capture, base_url = webhook_server
+    capture.response_status = 500
+    script = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "dc-notify-prod-agent.sh"
+    env, _ = _shell_env(tmp_path, base_url=base_url)
+    seeded = subprocess.run(
+        ["bash", str(script)],
+        input=(json.dumps(_pr()) + "\n").encode(),
+        capture_output=True,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    assert seeded.returncode == 75
+
+    failed = subprocess.run(
+        ["bash", str(script)],
+        input=(json.dumps(_pr()) + "\n").encode(),
+        capture_output=True,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+
+    assert failed.returncode == 75
+    assert "route-secret" not in failed.stdout.decode()
+    assert "route-secret" not in failed.stderr.decode()
+    status = subprocess.run(
+        [
+            env["DAILYCHECK_PYTHON"],
+            env["DAILYCHECK_EVENT_REDUCER"],
+            "--db",
+            env["DAILYCHECK_EVENT_REDUCER_DB"],
+            "status",
+        ],
+        capture_output=True,
+        env=env,
+        timeout=20,
+        check=False,
+    )
+    provider = json.loads(status.stdout)["provider"]
+    assert provider["state"] == "closed"
+    assert provider["last_error"] == "http_status=500"
+
+
+def test_concurrent_drainers_claim_only_one_active_trigger_per_pr(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "prod_agent" / "event_reducer.py"
+    db = tmp_path / "events.sqlite3"
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+    command = [
+        sys.executable,
+        str(script),
+        "--db",
+        str(db),
+        "--now-ms",
+        "3000",
+        "drain",
+    ]
+
+    processes = [
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(16)
+    ]
+    completed = [process.communicate(timeout=20) for process in processes]
+    decisions = []
+    for index, process in enumerate(processes):
+        stdout, stderr = completed[index]
+        assert process.returncode == 0, stderr.decode("utf-8", "replace")
+        decisions.append(json.loads(stdout))
+
+    triggered = [item for item in decisions if item["decision"] == "trigger"]
+    assert len(triggered) == 1
+    assert all(item["decision"] == "silent" for item in decisions if item["decision"] != "trigger")
+    queue = reducer.inspect(pr=54)["queue"]
+    assert len(queue) == 1
+    assert queue[0]["state"] == "claimed"

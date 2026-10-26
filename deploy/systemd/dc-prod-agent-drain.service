@@ -3,7 +3,7 @@
 # One-shot drainer for the durable Prod Agent reducer queue (Issue #54).
 # Timer frequency is intentionally modest: the inbox watcher still retries
 # deferred deliveries immediately with backoff; this unit is the recovery path
-# when the watcher is down or a previous provider call was interrupted.
+# when the watcher is down or an enqueue/complete transition was interrupted.
 
 [Unit]
 Description=DailyCheck Prod Agent reducer queue drain (Issue #54)
@@ -21,8 +21,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/local/bin/dc-notify-prod-agent --drain
 TimeoutStartSec=120
 
-# The trigger command is the only writer to the SQLite state; the reducer
-# serializes claims transactionally even if watcher and timer race.
+# The reducer remains the only trigger-queue writer. It serializes claims
+# transactionally even if watcher, timer and provider-breaker writes race.
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/dailycheck-prod-agent /root/.hermes
@@ -35,4 +35,3 @@ LockPersonality=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-

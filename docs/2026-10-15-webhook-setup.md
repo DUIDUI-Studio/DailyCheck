@@ -375,24 +375,47 @@ systemctl list-timers dc-inbox-rotate.timer --no-pager   # 期望下次 00:30
 |---|---|---:|---|
 | `suppress` | delivery 重复、等价事件已完成、坏输入或 stale head | 0 | 记 handled，不再重试 |
 | `defer` | 已持久入队；可能因 debounce、同 PR active lease 或 429 cooldown 等待 | 75 | 非 0，按原退避重试 |
-| `trigger` | 已原子 claim 一个 lease，随后调用 Hermes | 0（Hermes + complete 成功） | 记 handled |
+| `trigger` | 已原子 claim 一个 lease，随后投递 Hermes | 0（HTTP 2xx 入队 + complete 成功） | 记 handled |
 
 `trigger` 的 stdout JSON 含 `route / trigger_id / lease / lease_expires_ms /
-payload`。Hermes 成功后 adapter 调 `complete`；失败则调 `fail`，或由下一次
-`drain` 在 lease 过期后回收。**defer 不是成功消费**：事件一直在 DB 中，且
-watcher 仍会重试；drain timer 只是 watcher 停机/重启时的第二 recovery 路径。
+payload`。adapter 用 stdlib sender 向 `127.0.0.1:8644/webhooks/<route>` 提交
+原样 JSON body，事件头取真实 `pull_request` / `check_suite` / `deploy_result`，
+并使用 `trigger_id` 派生稳定的语义 `X-GitHub-Delivery`。HMAC secret 只从
+`/root/.hermes/webhook_subscriptions.json` 对应 route 读取，不回显。
+Hermes 返回 HTTP 2xx 只表示**已入队**（正常为 202），不代表 agent turn 已结束；
+adapter 随即将 reducer 行标 `complete`。HTTP 429 的 immediate `Retry-After` 会写入
+provider cooldown 和 `last_error`，其它 HTTP/传输失败也持久化为非 quota 重试。
+**defer 不是成功消费**：事件一直在 DB 中，且 watcher 仍会重试；drain timer 只是
+watcher 停机/重启时的第二 recovery 路径。
+
+per-PR lease 默认 **1,200,000 ms（20 分钟）**，必须长于 Hermes
+`agent.gateway_timeout`。这样 gateway 已收 202 但 agent 仍在运行时，lease 到期的
+drain 不会再为该 PR 生成第二个 active dispatch。若生产把
+`agent.gateway_timeout` 调高，必须同步调大 `DAILYCHECK_REDUCER_LEASE_TTL_MS`。
 
 **安装与 rollout**：
 
 ```bash
+# 0. 前置：确认两条新订阅存在，并确认 gateway 的 inactivity timeout 小于
+#    1,200,000 ms lease。缺订阅时不要覆盖生产 adapter。
+/root/hermes-agent/.venv/bin/hermes webhook list | grep -q '◆ wdg-pr'
+/root/hermes-agent/.venv/bin/hermes webhook list | grep -q '◆ wdg-ci'
+/root/hermes-agent/.venv/bin/hermes webhook list | grep -q '◆ dailycheck-deploy'
+
 # 1. 先确认 reducer 可运行且 DB 健康（不会调用 provider）
 /root/DailyCheck/.venv/bin/python \
   /root/DailyCheck/scripts/prod_agent/event_reducer.py status
 
-# 2. 部署 adapter + drain units，但先不启动 timer
+# 2. 部署 adapter、HTTP sender、breaker 与 units，但先不启动 timer
 cp deploy/scripts/dc-notify-prod-agent.sh /usr/local/bin/dc-notify-prod-agent
+cp scripts/prod_agent/event_reducer.py \
+   scripts/prod_agent/hermes_webhook_sender.py \
+   scripts/prod_agent/provider_breaker.py \
+   /root/DailyCheck/scripts/prod_agent/
 cp deploy/systemd/dc-prod-agent-drain.service \
    deploy/systemd/dc-prod-agent-drain.timer \
+   deploy/systemd/dc-prod-agent-provider-breaker.service \
+   deploy/systemd/dc-prod-agent-provider-breaker.timer \
    /etc/systemd/system/
 chmod 755 /usr/local/bin/dc-notify-prod-agent
 systemctl daemon-reload
@@ -404,7 +427,8 @@ printf '%s\n' '{"delivery_id":"reducer-smoke-1","event":"pull_request","action":
 # 首次期望 rc=75 / decision=defer（debounce）
 # 同一行按 watcher 退避重试时期望 trigger；完成后重复投递期望 suppress
 
-# 4. 重启 watcher，随后启用 drain timer
+# 4. 启用 breaker，再重启 watcher，随后启用 drain timer
+systemctl enable --now dc-prod-agent-provider-breaker.timer
 systemctl restart dc-inbox-watcher.service
 systemctl enable --now dc-prod-agent-drain.timer
 
@@ -412,19 +436,26 @@ systemctl enable --now dc-prod-agent-drain.timer
 /root/DailyCheck/.venv/bin/python scripts/prod_agent/event_reducer.py status
 /root/DailyCheck/.venv/bin/python scripts/prod_agent/event_reducer.py inspect --pr 54
 journalctl -u dc-prod-agent-drain -n 50 --no-pager
+journalctl -u dc-prod-agent-provider-breaker -n 50 --no-pager
 ```
 
 **cooldown / recovery 检查**：`status` 的 `provider.state=open` 且
-`cooldown_until_ms` 在未来表示 429 熔断；到期后的第一条 trigger 会把状态转
-half-open，成功即 closed。`inspect --pr N` 中 `claimed + lease_expires_ms` 是
-当前 active；若 `last_error=lease_expired`，说明中断已被下一次 drain 回收并重新
-排队。不要手工改 DB 行来“修”卡住状态，先等 TTL 或运行 `--drain`。
+`cooldown_until_ms` 在未来表示 429 熔断。外部 breaker 每 30 秒只读 Hermes
+`errors.log` 的新增完整行；5 分钟内 3 条 provider 429/quota 错误打开 15 分钟
+cooldown，若日志有 `Retry-After` / `X-RateLimit-Reset` 则延长但封顶 1 小时。
+它的 cursor 与 pending trip 原子落盘，重启不重放旧日志。到期后 drain 会把状态转
+half-open；每次 drain 事务最多 claim 一个 due work，但并发 drain 可各自 claim
+不同 PR 的一条，**不是全局单探针**。成功即 closed。`inspect --pr N` 中
+`claimed + lease_expires_ms` 是当前 active；若 `last_error=lease_expired`，说明
+中断已被下一次 drain 回收并重新排队。不要手工改 DB 行来“修”卡住状态，先等 TTL
+或运行 `--drain`。
 
-**rollback**：停 `dc-prod-agent-drain.timer`，恢复上一版
-`/usr/local/bin/dc-notify-prod-agent`，重启 `dc-inbox-watcher`。SQLite 文件保留为
-审计/后续回放资料；watcher 的 `inbox_watcher_state.json` 与 delivery-ID 安全逻辑
-不动，因此回滚不会扩大重复触发窗口。不要把 reducer DB 变回事件源，也不要复制
-`inbox.jsonl`——两者都会重新引入双源竞态。
+**rollback**：停 `dc-prod-agent-drain.timer` 与
+`dc-prod-agent-provider-breaker.timer`，恢复上一版
+`/usr/local/bin/dc-notify-prod-agent`，重启 `dc-inbox-watcher`。SQLite 文件与
+breaker cursor 保留为审计/后续恢复资料；watcher 的 `inbox_watcher_state.json`
+与 delivery-ID 安全逻辑不动，因此回滚不会扩大重复触发窗口。不要把 reducer DB
+变回事件源，也不要复制 `inbox.jsonl`——两者都会重新引入双源竞态。
 
 ### 3.9 部署兜底轮询（10 分钟，Issue #47 / #51）
 
@@ -473,7 +504,7 @@ ls -t /root/.hermes/cron/output/<job-id>/               # 期望产出 <ts>.md�
 | 1 | Gitea webhook Events | 勾 `status`（§3.6 步骤 5） |
 | 2 | `scripts/blue_green/webhook_receiver.py` | 支持 `status`：state=success 且按 sha 反查到 open PR、且两个必需 check 全绿才落盘（其余 200 ignored） |
 | 3 | `deploy/systemd/dc-inbox-watcher.service` | `--actions opened,synchronize,reopened,completed` |
-| 4 | `deploy/scripts/dc-notify-prod-agent.sh` | reducer 只允许 `pull_request → wdg-pr`、`check_suite → wdg-ci`、`deploy_result → dailycheck-deploy`；Hermes 走 venv 绝对路径 |
+| 4 | `deploy/scripts/dc-notify-prod-agent.sh` + `scripts/prod_agent/hermes_webhook_sender.py` | reducer 只允许 `pull_request → wdg-pr`、`check_suite → wdg-ci`、`deploy_result → dailycheck-deploy`；用 route secret 做 HMAC，HTTP 202 入队后立即 complete，不等待 agent turn |
 | 5 | Hermes 侧 | 订阅 `wdg-ci`（§3.8 步骤 2）+ gateway `webhook.py` [SILENT] 补丁（§3.8 步骤 2c） |
 
 **验证**（真 PR 的 CI 全绿后）：
