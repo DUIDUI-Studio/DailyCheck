@@ -32,6 +32,11 @@ DEFAULT_BASE_URL = os.environ.get("DAILYCHECK_HERMES_WEBHOOK_URL", "http://127.0
 MAX_BODY_BYTES = 1_048_576
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _retry_after_ms(value: str | None, *, now_s: float | None = None) -> int:
     if not value:
         return 0
@@ -121,7 +126,8 @@ def send(
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=timeout_s) as response:
             status = int(response.status)
             response.read(4096)
     except urllib.error.HTTPError as exc:

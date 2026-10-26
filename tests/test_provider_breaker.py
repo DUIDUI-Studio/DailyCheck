@@ -184,6 +184,44 @@ def test_non_provider_rate_limit_lines_do_not_trip_breaker(tmp_path):
     assert reducer.status(now_ms=10_000)["provider"]["state"] == "closed"
 
 
+def test_generic_quota_lines_without_provider_context_do_not_trip_breaker(tmp_path):
+    log = tmp_path / "errors.log"
+    log.touch()
+    state = tmp_path / "breaker.json"
+    reducer = _reducer(tmp_path)
+    provider_breaker.scan_once(
+        log_path=log,
+        state_path=state,
+        reducer=reducer,
+        now_ms=0,
+    )
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write("feishu quota exhausted\n")
+        fh.write("background job quota exceeded\n")
+        fh.write("insufficient_quota\n")
+
+    result = provider_breaker.scan_once(
+        log_path=log,
+        state_path=state,
+        reducer=reducer,
+        now_ms=10_000,
+    )
+
+    assert result["new_quota_events"] == 0
+    assert result["tripped"] is False
+    assert reducer.status(now_ms=10_000)["provider"]["state"] == "closed"
+
+
+def test_provider_context_and_explicit_429_lines_remain_quota_events():
+    for line in (
+        "provider: quota exhausted",
+        "quota exhausted by model provider",
+        "provider HTTP 429 Too Many Requests",
+        'provider_status="429"',
+    ):
+        assert provider_breaker._is_quota_line(line), line
+
+
 def test_cooldown_blocks_ingest_claim_until_recovery(tmp_path):
     log = tmp_path / "errors.log"
     log.touch()

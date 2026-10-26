@@ -1197,7 +1197,11 @@ class EventReducer:
                 }
             safe_reason = redact_sensitive(_text(reason, field="reason", limit=400, required=False))
             if quota_exhausted:
-                delay = retry_after_ms or self.config.provider_cooldown_ms
+                delay = (
+                    retry_after_ms
+                    if retry_after_ms is not None and retry_after_ms >= 0
+                    else self.config.provider_cooldown_ms
+                )
                 delay = max(0, min(delay, MAX_PROVIDER_COOLDOWN_MS))
                 due_at_ms = self._open_provider_cooldown(
                     conn,

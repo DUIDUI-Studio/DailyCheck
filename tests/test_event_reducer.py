@@ -250,6 +250,14 @@ def test_expired_lease_is_recovered_atomically(tmp_path):
     assert reducer.inspect(pr=54)["queue"][0]["last_error"] == "lease_expired"
 
 
+def test_default_lease_ttl_is_literal_twenty_minutes():
+    script = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "dc-notify-prod-agent.sh"
+
+    assert event_reducer.DEFAULT_LEASE_TTL_MS == 1_200_000
+    assert event_reducer.build_parser().parse_args(["status"]).lease_ttl_ms == 1_200_000
+    assert "${DAILYCHECK_REDUCER_LEASE_TTL_MS:-1200000}" in script.read_text(encoding="utf-8")
+
+
 def test_quota_exhaustion_opens_cooldown_and_blocks_drain(tmp_path):
     reducer = _reducer(tmp_path)
     payload = _check(delivery_id="delivery-quota")
@@ -334,6 +342,62 @@ def test_provider_failure_with_quota_opens_cooldown(tmp_path):
     assert reducer.status(now_ms=3_100)["provider"]["state"] == "open"
     assert reducer.drain(now_ms=3_200)["reason"] == "provider_cooldown"
     assert reducer.drain(now_ms=93_100)["decision"] == "trigger"
+
+
+def test_negative_retry_after_uses_default_quota_cooldown(tmp_path):
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+    claimed = reducer.drain(now_ms=3_000)
+
+    failed = reducer.fail(
+        claimed["trigger_id"],
+        claimed["lease"],
+        now_ms=3_100,
+        reason="HTTP 429",
+        quota_exhausted=True,
+        retry_after_ms=-1,
+    )
+
+    assert failed["decision"] == "defer"
+    assert failed["due_at_ms"] == 63_100
+    assert reducer.drain(now_ms=3_200)["reason"] == "provider_cooldown"
+
+
+def test_cli_negative_retry_after_uses_default_quota_cooldown(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts" / "prod_agent" / "event_reducer.py"
+    db = tmp_path / "events.sqlite3"
+    reducer = _reducer(tmp_path)
+    reducer.ingest(_pr(), now_ms=1_000)
+    claimed = reducer.drain(now_ms=3_000)
+
+    failed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--db",
+            str(db),
+            "--now-ms",
+            "3100",
+            "fail",
+            "--trigger-id",
+            claimed["trigger_id"],
+            "--lease",
+            claimed["lease"],
+            "--reason",
+            "HTTP 429",
+            "--quota-exhausted",
+            "--retry-after-ms",
+            "-1",
+        ],
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert failed.returncode == 75, failed.stderr.decode("utf-8", "replace")
+    decision = json.loads(failed.stdout)
+    assert decision["due_at_ms"] == 63_100
+    assert decision["reason"] == "provider_cooldown"
 
 
 def test_enqueue_completion_does_not_clear_an_active_external_cooldown(tmp_path):
@@ -553,6 +617,7 @@ class _WebhookCapture(BaseHTTPRequestHandler):
     requests: list[dict] = []
     response_status = 202
     retry_after: str | None = None
+    redirect_status: int | None = None
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
         length = int(self.headers.get("Content-Length", "0"))
@@ -564,6 +629,12 @@ class _WebhookCapture(BaseHTTPRequestHandler):
                 "body": body,
             }
         )
+        if self.__class__.redirect_status is not None:
+            self.send_response(self.__class__.redirect_status)
+            self.send_header("Location", "/redirect-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(self.__class__.response_status)
         if self.__class__.retry_after is not None:
             self.send_header("Retry-After", self.__class__.retry_after)
@@ -579,6 +650,7 @@ def webhook_server():
     _WebhookCapture.requests = []
     _WebhookCapture.response_status = 202
     _WebhookCapture.retry_after = None
+    _WebhookCapture.redirect_status = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), _WebhookCapture)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -707,6 +779,33 @@ def test_http_sender_accepts_all_2xx_enqueue_statuses(tmp_path, webhook_server, 
     assert rc == 0
     assert result == {"accepted": True, "http_status": status}
     assert capture.requests[0]["body"] == body
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_http_sender_rejects_redirects_without_forwarding_signed_body(
+    tmp_path, webhook_server, status
+):
+    capture, base_url = webhook_server
+    capture.redirect_status = status
+    subscriptions = tmp_path / "webhook_subscriptions.json"
+    subscriptions.write_text(
+        json.dumps({"wdg-pr": {"secret": "route-secret"}}),
+        encoding="utf-8",
+    )
+
+    rc, result = hermes_webhook_sender.send(
+        subscriptions_path=subscriptions,
+        base_url=base_url,
+        route="wdg-pr",
+        event="pull_request",
+        delivery_id="dailycheck-stable-id",
+        body=b'{"one":1}',
+    )
+
+    assert rc == 4
+    assert result == {"accepted": False, "http_status": status, "reason": "http_error"}
+    assert len(capture.requests) == 1
+    assert capture.requests[0]["path"] == "/webhooks/wdg-pr"
 
 
 @pytest.mark.parametrize(

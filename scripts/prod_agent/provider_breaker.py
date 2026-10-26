@@ -37,16 +37,22 @@ MAX_SCAN_BYTES = 16 * 1024 * 1024
 _PROVIDER_CONTEXT = (
     r"(?:provider|model|api|llm|openai|anthropic|gemini|codex|nous|deepseek|minimax)"
 )
+_PROVIDER_CONTEXT_TOKEN = rf"(?<![A-Za-z0-9]){_PROVIDER_CONTEXT}(?![A-Za-z0-9])"
+_QUOTA_MARKER = (
+    r"(?:quota[ _-]?(?:exhausted|exceeded|limit|reached)|insufficient_quota)"
+)
 _QUOTA_PATTERNS = (
+    re.compile(rf"(?i){_PROVIDER_CONTEXT_TOKEN}.{{0,120}}\b{_QUOTA_MARKER}\b"),
+    re.compile(rf"(?i)\b{_QUOTA_MARKER}\b.{{0,120}}{_PROVIDER_CONTEXT_TOKEN}"),
     re.compile(
-        r"(?i)\b(?:quota[ _-]?(?:exhausted|exceeded|limit|reached)|"
-        r"insufficient_quota)\b"
-    ),
-    re.compile(
-        rf"(?i)\b{_PROVIDER_CONTEXT}\b.{{0,120}}"
+        rf"(?i){_PROVIDER_CONTEXT_TOKEN}.{{0,120}}"
         r"\b(?:rate[ _-]?limit|usage[ _-]?limit)\b"
     ),
-    re.compile(rf"(?i)\b(?:rate[ _-]?limit|usage[ _-]?limit)\b.{{0,120}}\b{_PROVIDER_CONTEXT}\b"),
+    re.compile(
+        rf"(?i)\b(?:rate[ _-]?limit|usage[ _-]?limit)\b.{{0,120}}"
+        rf"{_PROVIDER_CONTEXT_TOKEN}"
+    ),
+    re.compile(rf"(?i){_PROVIDER_CONTEXT_TOKEN}.{{0,120}}\b429\b"),
     re.compile(
         r"(?i)\b(?:http(?:\s+status)?|status(?:_code)?|error(?:\s+code)?|code)"
         r"\s*[:=]?\s*429\b|\(429\)|\b429\s+(?:too many requests|client error)"
