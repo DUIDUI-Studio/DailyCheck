@@ -507,18 +507,20 @@ def test_inbox_failure_does_not_fail_deploy(tmp_path, fake_curl, monkeypatch):
 
 
 def test_notify_adapter_routes_deploy_result():
-    """生产入口只允许当前三个订阅，且部署结果不能落到 PR 通道。
+    """生产入口只允许 MERGE_READY/deploy 两条 provider 路由。
 
-    落到默认 wdg-pr 不会报错 —— 那个订阅的 prompt 是「判定 merge」，
-    会把一次部署失败当成 PR 更新处理，然后什么都不做。静默错投比投不出去更坏。
+    pull_request 只更新 reducer state，不能落进任何 provider 通道：
+    PR 生命周期事件不是可执行工作，误投 wdg-pr 会消耗无意义的 LLM session。
+    部署结果仍必须进入 dailycheck-deploy，静默错投比投不出去更坏。
     """
     script = (Path(__file__).resolve().parents[1]
               / "deploy" / "scripts" / "dc-notify-prod-agent.sh")
     content = script.read_text(encoding="utf-8")
     assert "deploy_result -> dailycheck-deploy" in content
-    assert "pull_request  -> wdg-pr" in content
-    assert "check_suite   -> wdg-ci" in content
-    assert 'wdg-pr|wdg-ci|dailycheck-deploy' in content
+    assert "pull_request  -> reducer state only; never provider work" in content
+    assert "check_suite   -> wdg-ci only after deterministic MERGE_READY" in content
+    assert "wdg-ci|dailycheck-deploy" in content
+    assert "wdg-pr" not in content
     assert re.search(r"\bdailycheck-(?:pr|ci|ops)\b", content) is None
 
 

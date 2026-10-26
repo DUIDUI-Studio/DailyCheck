@@ -66,10 +66,10 @@ def _reducer_db(path: Path) -> Path:
             """
             INSERT INTO pr_state VALUES (
                 'eric/dailycheck', 56, ?, 'success', 'open', '', 'check_suite:completed:success',
-                'merge', 10_000, 10_000, 'trigger-from-56', 'ready'
+                'merge', ?, ?, 'trigger-from-56', 'ready'
             )
             """,
-            ("a" * 40,),
+            ("a" * 40, 10_000, 10_000),
         )
     return path
 
