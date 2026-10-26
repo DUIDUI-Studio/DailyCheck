@@ -67,6 +67,9 @@ jobs:
       # 把 pytest 原始输出交给 reports job 复用，避免全量重跑（2 vCPU 上省约 20 分钟）
       - name: Upload pytest output for reports job
         if: always()
+        # Gitea 的 artifact v4 兼容性不稳定（GHESNotSupportedError，2026-10-25 实测）。
+        # 上传失败不得把门禁判红：reports job 下载失败会自动重跑 pytest。
+        continue-on-error: true
         uses: http://172.28.129.216:3000/actions/upload-artifact@v4
         with:
           name: pytest-output
@@ -160,6 +163,8 @@ jobs:
 
       - name: Upload reports as artifact
         if: always()
+        # 同 test job：Gitea artifact v4 上传失败只丢产物，不得打红门禁。
+        continue-on-error: true
         uses: http://172.28.129.216:3000/actions/upload-artifact@v4
         with:
           name: agent-framework-reports

@@ -161,15 +161,33 @@ def _git(repo: str, *args: str) -> str:
         return ""
 
 
+def _is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor", ancestor, descendant],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        return out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def changed_files(repo: str, sha: str, base: str = "") -> list[str]:
     """本 PR 改动过的文件。
 
-    取**第一个父提交**到 sha 的 diff：部署的目标通常是 merge commit，那样得到
-    的正好是整个 PR 的改动。fast-forward 部署时只能拿到最后一个 commit，改动
-    偏少 —— 保守方向是安全的：命中越少，``assess_alignment`` 越倾向 unknown
-    而非误判 aligned，不会让自动化改错地方。
+    deploy-first 下部署目标是 PR head（尚未合入 main），``sha^1..sha`` 只能看到
+    最后一个 commit —— 用 ``merge-base(origin/main, sha)..sha`` 才覆盖整个 PR。
+    已合入 main 的 merge commit 仍走 ``sha^1..sha``（第一个父提交即合并前 main）。
+    两个 base 都取不到时退回旧行为，保守方向是安全的：命中越少，
+    ``assess_alignment`` 越倾向 unknown 而非误判 aligned。
     """
-    rng = f"{base}..{sha}" if base else f"{sha}^1..{sha}"
+    if base:
+        rng = f"{base}..{sha}"
+    elif _is_ancestor(repo, sha, "origin/main"):
+        rng = f"{sha}^1..{sha}"
+    else:
+        merge_base = _git(repo, "merge-base", "origin/main", sha).strip()
+        rng = f"{merge_base}..{sha}" if merge_base else f"{sha}^1..{sha}"
     out = _git(repo, "diff", "--name-only", rng)
     files = [ln.strip() for ln in out.splitlines() if ln.strip()]
     if not files and base:
