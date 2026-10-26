@@ -18,6 +18,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
     steps:
       - name: Checkout code
         uses: http://172.28.129.216:3000/eric/actions-checkout@v4
@@ -57,24 +59,18 @@ jobs:
       - name: Pytest (full suite, mcp_server excluded — container-gated, see header)
         run: |
           set +e
-          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
-            --ignore=tests/mcp_server > /tmp/pytest-output.txt
+          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE \
+            --ignore=tests/mcp_server > /tmp/pytest-output.txt 2>&1
           tail -3 /tmp/pytest-output.txt
 
       - name: Zero-new-failure gate
         run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt
 
-      # 把 pytest 原始输出交给 reports job 复用，避免全量重跑（2 vCPU 上省约 20 分钟）
-      - name: Upload pytest output for reports job
-        if: always()
-        # Gitea 的 artifact v4 兼容性不稳定（GHESNotSupportedError，2026-10-25 实测）。
-        # 上传失败不得把门禁判红：reports job 下载失败会自动重跑 pytest。
-        continue-on-error: true
-        uses: http://172.28.129.216:3000/actions/upload-artifact@v4
-        with:
-          name: pytest-output
-          path: /tmp/pytest-output.txt
-          retention-days: 7
+      # Gitea 不支持 artifact v4。只传递下游报告和零新增门禁所需的小型摘要：
+      # 全部 FAILED/ERROR、collection/interrupted 标记，以及最后 5 行汇总。
+      - name: Create compact pytest summary output
+        id: pytest_summary
+        run: python3 scripts/ci/pytest_summary.py /tmp/pytest-output.txt
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
@@ -93,13 +89,17 @@ jobs:
           # generate_reports.sh 那条是 `|| true`，失败被静默吞掉。
           fetch-depth: 0
 
-      # 下载失败不阻塞：generate_reports.sh 检测不到文件会自动重跑 pytest
-      - name: Download pytest output from test job
-        uses: http://172.28.129.216:3000/actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: pytest-output
-          path: /tmp/ci-pytest
+      # test job 成功才进入本 job，因此输出缺失/损坏必须显式失败，
+      # 不能假装有复用文件而进入 pytest 重跑 fallback。
+      - name: Decode pytest summary from test job
+        env:
+          PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}
+        run: |
+          set -euo pipefail
+          test -n "${PYTEST_SUMMARY_B64}"
+          mkdir -p /tmp/ci-pytest
+          printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > /tmp/ci-pytest/pytest-output.txt
+          test -s /tmp/ci-pytest/pytest-output.txt
 
       - name: Python（镜像自带 3.12 + pip）
         run: python3 --version && python3 -m pip --version
@@ -115,6 +115,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUM: ${{ github.event.pull_request.number }}
+          PYTEST_REUSE_FILE: /tmp/ci-pytest/pytest-output.txt
         run: |
           # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
           export PATH=/opt/venv/bin:$PATH
@@ -160,13 +161,3 @@ jobs:
           echo "$PR_BODY" > /tmp/pr/body.md
           /opt/venv/bin/python scripts/agent_framework/check_pr_hygiene.py \
             --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file /tmp/pr/body.md
-
-      - name: Upload reports as artifact
-        if: always()
-        # 同 test job：Gitea artifact v4 上传失败只丢产物，不得打红门禁。
-        continue-on-error: true
-        uses: http://172.28.129.216:3000/actions/upload-artifact@v4
-        with:
-          name: agent-framework-reports
-          path: reports/
-          retention-days: 14
