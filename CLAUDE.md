@@ -134,7 +134,7 @@ docs/
   superpowers/             # 开发计划文档
 ```
 
-## MCP 服务器（13 个工具）
+## MCP 服务器（29 个工具）
 
 通过 Model Context Protocol 提供 AI Agent 数据访问能力。支持两种传输模式：
 - **stdio**: 本地 Claude Code 使用（`flask mcp`）
@@ -142,6 +142,7 @@ docs/
 
 | 工具 | 功能 |
 |------|------|
+| `warehouse_list` | 列出 token 可见的仓库（code + name） |
 | `items_list` | 列出仓库所有库存品 |
 | `items_detail` | 单个库存品详情 |
 | `movements_list` | 近期库存变动流水 |
@@ -155,6 +156,26 @@ docs/
 | `item_forecast` | 单品需求预测 |
 | `procurement_store` | 店铺采购建议 |
 | `procurement_hub` | 全仓库采购建议 |
+| `canonical_list` | 列品项主数据 |
+| `canonical_detail` | 单条主数据详情（+ 别名 + 跨仓绑定） |
+| `canonical_categories` | 主数据品类清单 |
+| `canonical_fanout_targets` | 扇出目标仓候选 |
+| `canonical_conflicts` | 未裁决的主数据冲突 |
+| `canonical_fanout_event` | 扇出事件流水 |
+| `canonical_create` | 新建主数据 |
+| `canonical_update` | 更新主数据可编辑字段 |
+| `canonical_claim` | 仓内 items 行认领到主数据 |
+| `canonical_unclaim` | 解绑 items 行与主数据 |
+| `canonical_fanout` | 主数据字段扇出到多个仓 |
+| `canonical_resolve_conflict` | 裁决主数据冲突 |
+| `canonical_set_binding_active` | 按仓启停 items 绑定行 |
+| `store_order_list` | 列门店订单（只读；可按仓库/状态/分页过滤） |
+| `store_order_detail` | 单张门店订单详情（只读；头 + 明细 + 发货 + 收货 + 状态历史） |
+
+门店订单只读域（Issue #73）：`store_order_list` / `store_order_detail` 走路径级 ACL
+（`GET /api/v1/store-orders`、`GET /api/v1/store-orders/<id>`），token 的
+`allowed_read_paths` 需覆盖 `/api/v1/store-orders`；仓库范围按「门店仓或总仓任一命中
+`allowed_warehouses` 即可见」。
 
 认证方式：Bearer Token（环境变量 `DAILYCHECK_MCP_TOKEN`）或 `agent_tokens` 表票据验证，支持路径级别的 ACL 和仓库范围权限。
 
