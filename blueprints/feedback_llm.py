@@ -68,12 +68,25 @@ logger = logging.getLogger(__name__)
 #   1600 → length，reasoning 1599，无 content
 #   4096 → length，reasoning 4095，无 content
 #   8192 → stop，  reasoning 3325，content 1805 字符（合法 JSON）
-# 推理长度波动很大，所以取 8192 而不是刚刚够的 4096；真被截断时下面的错误
-# 文案会带上实际 reasoning 用量，便于判断要不要再抬。
 #
-# ⚠️ 改这个数必须同时看 ``_timeout()``：预算越大生成越久，8192 下单次实测 108s。
-# 只抬预算不抬超时的后果与「预算不够」完全同形——都落 analysis_model=template。
-MAX_OUTPUT_TOKENS = 8192
+# ⚠️ 8192 对这一档的单仍不够（2026-10-26 ticket 11 生产冒烟，prompt 2074 tokens）：
+#   8192  → 三次里两次 length，reasoning 8190 吃满、无 content → 降级模板
+#   16384 → stop，reasoning 7440、content 2181 字符、113s
+# 8192 恰好压在这张单 reasoning 分布的上沿（同 prompt 内 6559~8190 摆动），余量近零；
+# 且 8192 下的 8190 是**被天花板截断的观测**，真实上界不可知。取 16384：覆盖已验证
+# 的最坏需求 8190 并留一倍余量，降低截断概率。若仍撞 length，错误文案会带出新的
+# 16384 与当时的 reasoning 用量，据此再谈。预算对已收敛的单不产生额外消耗
+# （模型 stop 即止），多花的只是那些本来会被截断的单。
+#
+# ⚠️ 换单后 reasoning 需求翻倍（ticket 9 的 3325 → ticket 11 的 6559~8190，n=1）
+# 与 prompt 只涨 3%（2012 → 2074）**不成比例**，不能拿 prompt 长度做安全推断。
+#
+# ⚠️ 改这个数必须同时看 ``_timeout()``：预算越大生成越久。按本次实测反推解码约
+# 80 tok/s（reasoning 7440 + content 2181 字符 ≈ 9000 completion tokens，中文按
+# 约 1 token/字粗估 / 113s），吃满 16384 约 205s，对默认 300s 剩约 1.5 倍余量
+# —— 解码降速约 46% 才会先撞超时。只抬预算不抬超时的后果与「预算不够」完全
+# 同形——都落 analysis_model=template。
+MAX_OUTPUT_TOKENS = 16384
 MODEL_TEMPLATE_LABEL = "template"
 
 
@@ -93,9 +106,12 @@ def _model_name() -> str:
 def _timeout() -> float:
     """单次调用总超时（秒）。
 
-    默认 300 而不是 90：8192 输出预算下推理模型真实耗时实测 108s（见
-    ``MAX_OUTPUT_TOKENS`` 上方注释）。90 会让「预算够了」的单子死在超时上，
+    默认 300 而不是 90：16384 输出预算下推理模型真实耗时实测 113s（8192 时 108s，
+    见 ``MAX_OUTPUT_TOKENS`` 上方注释）。90 会让「预算够了」的单子死在超时上，
     且两种降级在库里长得一样（``analysis_model=template``），排查极易走错方向。
+
+    注意 ``urllib`` 的 timeout 是 **socket 级**（连接 / 单次 recv）而不是端到端墙钟，
+    非流式下两者接近但不相等；``MAX_OUTPUT_TOKENS`` 上方按总耗时做的余量核算属保守近似。
     """
     try:
         return max(5.0, float(getattr(config, "FEEDBACK_LLM_TIMEOUT", 300) or 300))

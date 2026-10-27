@@ -192,16 +192,16 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 5. **登录后被踢回登录页** = `ROOT_URL` 与访问协议不一致导致 Cookie 带 `Secure` 被丢弃，
    报 owner 改 `app.ini`，不要自己动。
 
-## 四、Merge 政策（2026-10-15 Eric 二次拍板：Prod merge，替代同日早先的候选 A）
+## 四、Merge 政策（2026-10-25 Eric 拍板：候选部署通过后 FF merge；原 2026-10-15 Prod merge）
 
-**Prod Agent 在 CI 全绿后判定并执行 merge**（Gitea：`POST /api/v1/repos/{owner}/{repo}/pulls/{num}/merge`，body `{"do":"merge"}`），merge 与部署由同一角色贯通。
+**Prod Agent 在 CI 全绿后判定并执行「候选部署」**（2026-10-25 起，deploy-first）：CI 两必需 check 全绿 → 独立审查 → 调 `deploy_pipeline.sh <PR> <sha> --candidate --merge-pr`。验证、切流、观察通过后由脚本执行 fast-forward-only merge；merge 前任何一步失败，PR 保持 open，不产生未验证的 main 提交。merge 与部署仍由同一角色贯通。
 
 Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 
 1. 确认 CI 两必需 check 全绿（test + agent-framework-reports）
 2. 读 PR 的「报告 1/4」（根因/取舍/不在范围）与「生产侧事项」，**用自己的生产视角评估**：变更类别、影响面、部署风险是否有未声明项
-3. 有异议 → 不 merge，PR 评论打回 + 开 Issue 转 Dev；无异议 → merge 并按 §五 部署
-4. **merge 后删除源分支**（本地 + 远程，2026-10-25 Eric 拍板）：工作已并入 main，留着分支只会污染列表、误导后续判断。Gitea PR 界面勾选「合并后删除分支」或手动删除；漏删的存量用 `scripts/cleanup-merged-branches.sh` 批量清理（只删已合入 main 的分支，安全）。注意：merge 用的 API `POST /pulls/{num}/merge` 不删分支，删除是独立的 `DELETE /repos/{o}/{r}/branches/{branch}`
+3. 有异议 → 不部署、PR 评论打回 + 开 Issue 转 Dev；无异议 → 进入 §五 候选部署
+4. **merge 后删除源分支**（本地 + 远程，2026-10-25 Eric 拍板）：§五 的 FF merge 把工作并入 main 后，源分支留着只会污染列表、误导后续判断 → 随即删除源分支。Gitea PR 界面勾选「合并后删除分支」或手动删除；漏删的存量用 `scripts/cleanup-merged-branches.sh` 批量清理（只删已合入 main 的分支，merge-base 判定，安全）。注意：merge 用的 API `POST /pulls/{num}/merge` 不删分支，删除是独立的 `DELETE /repos/{o}/{r}/branches/{branch}`
 
 红线清单——以下 PR 仍须上报 owner 拍板，Prod Agent 不得自行 merge：
 
@@ -243,17 +243,17 @@ body 格式，完全不看改动文件路径。
 
 ## 五、部署机制（Prod Agent，蓝绿）
 
-入口即 §四：Prod Agent merge 后直接进入部署流程（merge 与部署同角色贯通，无交接间隙）。
+入口即 §四：Prod Agent 审查通过后直接进入**候选部署**（验证通过才 merge，merge 与部署同角色贯通，无交接间隙）。
 
 前置一次性（已就位）：绿 systemd unit 声明 `Environment=DAILYCHECK_DB_DIR=/var/lib/dailycheck-green/db`（Issue #28）。
 
 **部署单飞（2026-10-16 起，机制细节见 `docs/ARCHITECTURE.md` §3.8）**：部署是 40-60 分钟长流程，而 webhook 事件天生并发——同一时刻全系统至多一个部署会话在动蓝绿设施；「欠账」由状态事实（`deployed.sha` vs `origin/main`）判定，不靠会话排队。
 
 ```
-deploy_state.py acquire --pr <N> --sha <merge sha>
+deploy_state.py acquire --pr <N> --sha <PR head sha>
              ├─ rc 10（他人在部署）→ 不排队、直接结束，欠账留待下一次 catchup（兜底轮询 ≤30min 保底）
              └─ rc 0 → 持锁进入部署（长步骤间 deploy_state.py heartbeat --token <t> --phase <阶段>）
-git pull → up.sh <pr> <sha>
+fetch refs/pull/<N>/head → 校验 sha 包含 origin/main → checkout --detach <sha> → up.sh <pr> <sha>
              ├─ 守卫：绿 unit 必须声明 DAILYCHECK_DB_DIR 且 = 拷贝目标，否则拒启
              ├─ cp -aL 真库 ${APP_DIR}/db → /var/lib/dailycheck-green/db（独立副本）
              └─ 起绿 :8091/:5101 + 健康检查（绿 unit 声明 DRY_RUN=true = 验证期写隔离）
@@ -267,6 +267,9 @@ git pull → up.sh <pr> <sha>
              ⚠️ 未转正时 switch.sh 的 DRY_RUN 守卫会拒跑（exit 3）——这是预期拦截，不是故障
          → switch.sh 灰度 5% → 50% → 100%（每档观察；100%/0% 边界自动做落点核验）
          → 观察窗 ≥30min → 收官（绿=生产，蓝 standby）
+         → FF-only merge PR（deploy_merge.py；锁内冻结 main）
+             merge 后 fetch origin main + checkout -B main origin/main，保证本地树 == 远端 main
+             失败：switch.sh blue 100 → 工作树恢复 origin/main → exit 26（PR 保持 open）
          → deploy_state.py release --token <t> --result success（推进 deployed 锚点）
              失败：release --result failed —— 同 sha 不自动重试（防坏 main 死循环），留 last_attempt 供追查
 ```

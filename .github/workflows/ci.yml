@@ -1,4 +1,4 @@
-# DailyCheck CI：测试门禁 + 部署（deploy 依赖 test 通过）
+# DailyCheck CI：测试门禁 + 四报告门禁。部署不在此工作流——蓝绿部署由 Prod Agent
 #
 # 零新增失败门禁：tests/known_failures.txt 是已知 pre-existing 失败基线（只许收缩）。
 # tests/mcp_server 在 runner 上不经容器、无法等价复现，故 CI 跳过（known_failures.txt
@@ -18,6 +18,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
     steps:
       - name: Checkout code
         uses: http://172.28.129.216:3000/eric/actions-checkout@v4
@@ -57,21 +59,18 @@ jobs:
       - name: Pytest (full suite, mcp_server excluded — container-gated, see header)
         run: |
           set +e
-          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no \
-            --ignore=tests/mcp_server > /tmp/pytest-output.txt
+          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE \
+            --ignore=tests/mcp_server > /tmp/pytest-output.txt 2>&1
           tail -3 /tmp/pytest-output.txt
 
       - name: Zero-new-failure gate
         run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt
 
-      # 把 pytest 原始输出交给 reports job 复用，避免全量重跑（2 vCPU 上省约 20 分钟）
-      - name: Upload pytest output for reports job
-        if: always()
-        uses: http://172.28.129.216:3000/actions/upload-artifact@v4
-        with:
-          name: pytest-output
-          path: /tmp/pytest-output.txt
-          retention-days: 7
+      # Gitea 不支持 artifact v4。只传递下游报告和零新增门禁所需的小型摘要：
+      # 全部 FAILED/ERROR、collection/interrupted 标记，以及最后 5 行汇总。
+      - name: Create compact pytest summary output
+        id: pytest_summary
+        run: python3 scripts/ci/pytest_summary.py /tmp/pytest-output.txt
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
@@ -90,13 +89,17 @@ jobs:
           # generate_reports.sh 那条是 `|| true`，失败被静默吞掉。
           fetch-depth: 0
 
-      # 下载失败不阻塞：generate_reports.sh 检测不到文件会自动重跑 pytest
-      - name: Download pytest output from test job
-        uses: http://172.28.129.216:3000/actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: pytest-output
-          path: /tmp/ci-pytest
+      # test job 成功才进入本 job，因此输出缺失/损坏必须显式失败，
+      # 不能假装有复用文件而进入 pytest 重跑 fallback。
+      - name: Decode pytest summary from test job
+        env:
+          PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}
+        run: |
+          set -euo pipefail
+          test -n "${PYTEST_SUMMARY_B64}"
+          mkdir -p /tmp/ci-pytest
+          printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > /tmp/ci-pytest/pytest-output.txt
+          test -s /tmp/ci-pytest/pytest-output.txt
 
       - name: Python（镜像自带 3.12 + pip）
         run: python3 --version && python3 -m pip --version
@@ -112,6 +115,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUM: ${{ github.event.pull_request.number }}
+          PYTEST_REUSE_FILE: /tmp/ci-pytest/pytest-output.txt
         run: |
           # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
           export PATH=/opt/venv/bin:$PATH
@@ -157,69 +161,3 @@ jobs:
           echo "$PR_BODY" > /tmp/pr/body.md
           /opt/venv/bin/python scripts/agent_framework/check_pr_hygiene.py \
             --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file /tmp/pr/body.md
-
-      - name: Upload reports as artifact
-        if: always()
-        uses: http://172.28.129.216:3000/actions/upload-artifact@v4
-        with:
-          name: agent-framework-reports
-          path: reports/
-          retention-days: 14
-
-  deploy:
-    needs: test
-    # 生产部署暂禁自动触发（2026-10-11 Eric 拍板）：仅允许 workflow_dispatch 手动执行。
-    # 生产部署正式启用前须：至少一次手动 workflow_dispatch 演练跑通。
-    # （2026-10-24 修订：原列「备份 cron + 异地副本」已移除——备份 cron 早就在跑，
-    #   部署流程不触碰数据库且 deploy_vps.sh 自身即做库快照，异地副本属独立容灾议题）
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Deploy to VPS (backup → switch → migrate → health-check → auto-rollback)
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_PORT: ${{ secrets.VPS_PORT }}
-          VPS_USERNAME: ${{ secrets.VPS_USERNAME }}
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          # 私钥写在工作区之外（2026-10-24 首次演练暴露，Issue #9）：
-          # 原先把 key 落在仓库根目录，tar 打包时把它一起带走 → 解包到
-          # /root/releases/<ts>/vps_key → rsync 进生产 /root/DailyCheck/vps_key。
-          # 现在放到 mktemp 的临时文件，并用 trap 保证退出即删。
-          SSH_KEY=$(mktemp "${TMPDIR:-/tmp}/ci-deploy-key.XXXXXX")
-          printf '%s\n' "$VPS_SSH_KEY" > "$SSH_KEY"
-          chmod 600 "$SSH_KEY"
-          trap 'rm -f "$SSH_KEY"' EXIT
-          SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $VPS_PORT -i $SSH_KEY $VPS_USERNAME@$VPS_HOST"
-
-          # Build tar locally — 严格排除数据/运行时文件（*.db 覆盖所有库文件，
-          # 但保留 db/ Python 包），部署永不触碰生产数据。
-          # vps_key 仍是排除项：防的是分支上残留的旧版本脚本 / 本地遗留文件。
-          tar --exclude='.git' \
-              --exclude='__pycache__' \
-              --exclude='*.log' \
-              --exclude='*.db' \
-              --exclude='backups' \
-              --exclude='.venv' \
-              --exclude='.workbuddy' \
-              --exclude='.claude' \
-              --exclude='node_modules' \
-              --exclude='issue-reports' \
-              --exclude='graphify-out' \
-              --exclude='vps_key' \
-              --exclude='*.pem' \
-              -czf /tmp/dailycheck.tar.gz .
-
-          # 解压到带时间戳的 release 目录，由 deploy_vps.sh 完成切换/迁移/回滚
-          REL=$($SSH 'echo /root/releases/$(date +%Y%m%d-%H%M%S)')
-          $SSH "mkdir -p $REL"
-          # tar 必须从 stdin 读（-）：上一版写成读远端 /tmp/dailycheck.tar.gz，
-          # 而那行 `cat > /tmp/...` 在 CI 里 stdin 是空的，只创建了 0 字节文件，
-          # 导致远端 tar 报 "unexpected end of file"。2026-10-24 首次真实演练暴露。
-          cat /tmp/dailycheck.tar.gz | $SSH "tar -xzf - -C $REL"
-          $SSH "bash -s $REL" < scripts/deploy_vps.sh

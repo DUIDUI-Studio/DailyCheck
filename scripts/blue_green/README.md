@@ -40,7 +40,17 @@
 
 ## 端到端编排（`deploy_pipeline.sh`，2026-10-17 起）
 
-merge 之后**只需要这一条命令**：
+**deploy-first（2026-10-25 起，Prod Agent 使用）**：
+
+```bash
+bash scripts/blue_green/deploy_pipeline.sh <pr-num> <pr-head-sha> --candidate --merge-pr
+```
+
+`--candidate` 校验 PR head 包含当前 main 并 `checkout --detach`；`--merge-pr` 在观察窗后调
+`deploy_merge.py` 做 **FF-only** 合并。失败路径：`switch.sh blue 100` + 工作树恢复
+`origin/main`，PR 保持 open。退出码 25 = 候选前置不满足，26 = FF 合并失败。
+
+旧调用（merge 后部署；脚本回退用，不带开关时行为不变）：
 
 ```bash
 bash scripts/blue_green/deploy_pipeline.sh <pr-num> <merge-sha>

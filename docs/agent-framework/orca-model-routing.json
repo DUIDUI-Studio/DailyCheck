@@ -1,0 +1,212 @@
+{
+  "schema_version": 2,
+  "project": "DailyCheck",
+  "updated_at": "2026-10-26",
+  "authority": "docs/agent-framework/workflow.md",
+  "model_id_policy": {
+    "qwen_requires_stacked_id": true,
+    "forbidden_bare_ids": [
+      "qwen3.8-flash",
+      "qwen3.8-max",
+      "qwen3.7-plus",
+      "qwen3.5-plus"
+    ],
+    "verification": "Compare launch.requested with launch.effective for every attempt. A declared fallback may change the model; an undeclared replacement is an infrastructure failure."
+  },
+  "fallback_policy": {
+    "max_fallbacks_per_task": 2,
+    "fallback_on": [
+      "infrastructure_failure",
+      "effective_model_mismatch"
+    ],
+    "do_not_fallback_on": [
+      "review_blocker",
+      "ci_failure",
+      "quality_failure",
+      "unknown_failure"
+    ],
+    "record_attempts": true
+  },
+  "roles": {
+    "coordinator": {
+      "agent": "codex",
+      "model": "deepseek-flash",
+      "effort": "medium",
+      "writes_code": false,
+      "fallbacks": [
+        {
+          "agent": "codex",
+          "model": "ccs-tencent/deepseek-v4.1-flash-1017",
+          "effort": "medium"
+        },
+        {
+          "agent": "codex",
+          "model": "ccs-minimax/MiniMax-M3.1-Flash",
+          "effort": "medium"
+        }
+      ],
+      "purpose": "Create the Run and tasks, dispatch workers, wait for settlements, route findings, and release terminals."
+    },
+    "triage": {
+      "agent": "claude",
+      "model": "ccs-claude-qianwenai--qwen3.8-flash[1M]",
+      "effort": "low",
+      "writes_code": false,
+      "fallbacks": [
+        {
+          "agent": "claude",
+          "model": "ccs-claude-tencent--mimo-v2.6-flash[1M]",
+          "effort": "low"
+        },
+        {
+          "agent": "claude",
+          "model": "ccs-claude-qwen--MiniMax-M3.1-Flash[1M]",
+          "effort": "low"
+        }
+      ],
+      "purpose": "Classify issues, detect duplicates, identify affected areas, and flag owner-decision or high-risk work."
+    },
+    "planner": {
+      "agent": "claude",
+      "model": "ccs-claude-qianwenai--qwen3.8-max[1M]",
+      "effort": "medium",
+      "writes_code": false,
+      "fallbacks": [
+        {
+          "agent": "claude",
+          "model": "ccs-claude-tencent--kimi-k3.1-pro[1M]",
+          "effort": "high"
+        },
+        {
+          "agent": "claude",
+          "model": "ccs-claude-qwen--MiniMax-M3",
+          "effort": "high"
+        }
+      ],
+      "purpose": "For complex work: reproduce, propose root cause, define file ownership, tests, and a bounded implementation plan."
+    },
+    "developer": {
+      "agent": "codex",
+      "model": "deepseek-flash",
+      "effort": "medium",
+      "writes_code": true,
+      "fallbacks": [
+        {
+          "agent": "codex",
+          "model": "ccs-tencent/deepseek-v4.1-flash-1017",
+          "effort": "medium"
+        },
+        {
+          "agent": "codex",
+          "model": "ccs-minimax/MiniMax-M3.1-Flash",
+          "effort": "medium"
+        }
+      ],
+      "purpose": "Implement scoped bugs and features, add regression tests, run required checks, commit, and open the PR."
+    },
+    "developer_complex": {
+      "agent": "codex",
+      "model": "deepseek-flash",
+      "effort": "high",
+      "writes_code": true,
+      "fallbacks": [
+        {
+          "agent": "codex",
+          "model": "ccs-tencent/deepseek-v4.1-flash-1017",
+          "effort": "high"
+        },
+        {
+          "agent": "codex",
+          "model": "ccs-tencent/hy3",
+          "effort": "high"
+        }
+      ],
+      "purpose": "Implement cross-module, SQL, permission, migration, or contract-sensitive changes after the planner handoff."
+    },
+    "reviewer": {
+      "agent": "claude",
+      "model": "ccs-claude-qwen--MiniMax-M3",
+      "effort": "high",
+      "writes_code": false,
+      "fallbacks": [
+        {
+          "agent": "claude",
+          "model": "ccs-claude-qianwenai--qwen3.8-max[1M]",
+          "effort": "high"
+        },
+        {
+          "agent": "claude",
+          "model": "ccs-claude-tencent--kimi-k3.1-pro[1M]",
+          "effort": "high"
+        }
+      ],
+      "purpose": "Independent read-only review of the diff, issue acceptance, regression validity, and deployment risk."
+    },
+    "escalation": {
+      "agent": "claude",
+      "model": "ccs-claude-qianwenai--qwen3.8-max[1M]",
+      "effort": "max",
+      "writes_code": false,
+      "fallbacks": [
+        {
+          "agent": "claude",
+          "model": "ccs-claude-tencent--kimi-k3.1-pro[1M]",
+          "effort": "max"
+        },
+        {
+          "agent": "claude",
+          "model": "ccs-claude-tencent--glm-5.3[1M]",
+          "effort": "max"
+        }
+      ],
+      "purpose": "Resolve architecture, data-loss, security, repeated-review-blocker, or owner-red-line questions. Output analysis only."
+    },
+    "release": {
+      "agent": "prod-agent",
+      "model": null,
+      "effort": null,
+      "writes_code": false,
+      "fallbacks": [],
+      "purpose": "Merge and deploy only after required CI checks are green, using the existing blue-green workflow."
+    }
+  },
+  "flow": [
+    "triage",
+    "complexity_gate",
+    "planner_if_complex",
+    "developer_or_developer_complex",
+    "reviewer",
+    "fix_on_blocker_using_original_developer",
+    "new_reviewer_session",
+    "ci",
+    "release"
+  ],
+  "escalation_rules": {
+    "use_planner": [
+      "the issue crosses more than two runtime modules",
+      "the root cause is not reproduced after two focused attempts",
+      "the change touches SQL joins, migrations, permissions, or data deletion",
+      "the change affects Flask, templates, MCP, and persistence contracts together"
+    ],
+    "use_escalation": [
+      "review returns two blockers of the same class",
+      "a production data-loss or security risk is possible",
+      "an owner red line or product semantic decision is required",
+      "high effort has failed twice without new evidence"
+    ],
+    "hard_gates": [
+      "one worktree has only one code writer at a time",
+      "reviewers never edit the reviewed worktree",
+      "nested agents may perform read-only exploration unless explicitly authorized",
+      "CI, merge, and deployment remain deterministic and outside model discretion"
+    ]
+  },
+  "limits": {
+    "max_concurrent_developers": 2,
+    "max_reviewers": 1,
+    "max_prs_in_ci": 1,
+    "default_retry_limit": 2,
+    "use_targeted_tests_during_development": true,
+    "run_full_suite_once_before_pr": true
+  }
+}

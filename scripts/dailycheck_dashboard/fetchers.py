@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import urllib.error
 import urllib.parse
@@ -340,6 +341,81 @@ def fetch_inbox_stats(inbox_path: Path) -> dict:
         "deliveries": len(deliveries),
         "last_action_at": last_action_at,
         "last_pr_number": last_pr_number,
+    }
+
+
+# ============================================================
+# Prod Agent reducer（只读 SQLite；不 import runtime 模块）
+# ============================================================
+def fetch_reducer_state(db_path: Path) -> dict:
+    """Read queue/provider/merge-ready truth from the reducer SQLite database.
+
+    The dashboard deliberately uses SQL rather than importing the runtime
+    reducer. A missing or malformed database is reported as unavailable, never
+    converted into zeroes or an empty-but-healthy queue.
+    """
+    if not db_path.exists():
+        return {"available": False, "reason": "state_unavailable", "merge_ready": []}
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            counts = {
+                state: int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM trigger_queue WHERE state = ?",
+                        (state,),
+                    ).fetchone()[0]
+                )
+                for state in ("pending", "claimed", "done")
+            }
+            provider_row = conn.execute(
+                "SELECT * FROM provider_state WHERE provider = 'hermes'"
+            ).fetchone()
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(pr_state)").fetchall()
+            }
+            trigger_expr = (
+                "merge_ready_trigger_id AS trigger_id"
+                if "merge_ready_trigger_id" in columns
+                else "NULL AS trigger_id"
+            )
+            gate_expr = "gate_reason" if "gate_reason" in columns else "'' AS gate_reason"
+            merge_rows = conn.execute(
+                f"""
+                SELECT repo, pr_number, head_sha,
+                       merge_ready_at_ms AS ready_at_ms,
+                       {trigger_expr},
+                       checks_status,
+                       {gate_expr}
+                FROM pr_state
+                WHERE merge_ready_at_ms IS NOT NULL
+                ORDER BY merge_ready_at_ms DESC, pr_number
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return {"available": False, "reason": "state_unavailable", "merge_ready": []}
+
+    provider = (
+        dict(provider_row)
+        if provider_row is not None
+        else {
+            "provider": "hermes",
+            "state": "unknown",
+            "consecutive_failures": None,
+            "cooldown_until_ms": None,
+            "last_error": "",
+            "updated_at_ms": None,
+        }
+    )
+    return {
+        "available": True,
+        "queue": counts,
+        "provider": provider,
+        "merge_ready": [dict(row) for row in merge_rows],
     }
 
 

@@ -31,8 +31,8 @@ SHA = "abcdef1234567890abcdef1234567890abcdef12"
 @pytest.fixture()
 def sandbox(tmp_path: Path):
     """最小可执行沙盒：真 deploy_state.py + 真 pipeline + 假四阶段脚本。"""
-    sb = tmp_path / "bg"
-    sb.mkdir()
+    sb = tmp_path / "scripts" / "blue_green"
+    sb.mkdir(parents=True)
     for name in ("deploy_state.py", "deploy_pipeline.sh"):
         shutil.copy2(BG_DIR / name, sb / name)
         (sb / name).chmod(0o755)
@@ -60,6 +60,7 @@ def _env(sb: dict, **extra) -> dict:
     env["DAILYCHECK_DEPLOY_STATE_DIR"] = str(sb["state"])
     env["DAILYCHECK_PIPELINE_LOG"] = str(sb["tmp"] / "pipeline.log")
     env["DAILYCHECK_PIPELINE_TICK_SEC"] = "1"
+    env["CALLS"] = str(sb["calls"])
     env.pop("DAILYCHECK_DEPLOY_UNLOCKED", None)
     env.pop("DAILYCHECK_DEPLOY_HEARTBEAT_TTL", None)
     env.update({k: str(v) for k, v in extra.items()})
@@ -643,3 +644,200 @@ def test_dashboard_hook_failure_records_audit(sandbox):
     assert proc.returncode == 0, "钩子失败不得影响部署结果"
     assert "kind=dashboard-hook-failed" in _audit(sandbox), _audit(sandbox)
 
+
+
+# ---------------------------------------------------------------- 候选模式
+
+@pytest.fixture()
+def candidate_sandbox(sandbox):
+    """在 sandbox 的 tmp 目录里建真 git 仓库 + bare origin + 假合并助手。"""
+    repo = sandbox["tmp"]
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True, capture_output=True, text=True,
+        )
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "T")
+    (repo / "app.py").write_text("v1\n", encoding="utf-8")
+    git("add", "app.py")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD").stdout.strip()
+
+    git("checkout", "-qb", "feat")
+    (repo / "app.py").write_text("v2\n", encoding="utf-8")
+    git("commit", "-qam", "candidate")
+    sha = git("rev-parse", "HEAD").stdout.strip()
+
+    origin = repo / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    git("remote", "add", "origin", str(origin))
+    git("push", "-q", "origin", "main")
+    git("push", "-q", "origin", "HEAD:refs/pull/42/head")
+    git("checkout", "-q", "main")
+
+    helper = repo / "fake_merge.py"
+    helper.write_text(
+        f"""#!{sys.executable}
+import os, subprocess, sys
+args = sys.argv[1:]
+with open(os.environ["CALLS"], "a", encoding="utf-8") as fh:
+    fh.write("merge_helper " + " ".join(args) + "\\n")
+if args and args[0] == "check" and os.environ.get("FAKE_CHECK_RC"):
+    sys.exit(int(os.environ["FAKE_CHECK_RC"]))
+if args and args[0] == "merge":
+    if os.environ.get("FAKE_MERGE_RC"):
+        sys.exit(int(os.environ["FAKE_MERGE_RC"]))
+    sha = args[args.index("--sha") + 1]
+    subprocess.run(
+        ["git", "-C", os.environ["FAKE_ORIGIN"], "update-ref", "refs/heads/main", sha],
+        check=True,
+    )
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+
+    up = sandbox["dir"] / "up.sh"
+    up.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo \"up.sh $(git -C '{repo}' rev-parse --short=12 HEAD)\" >> \"{sandbox['calls']}\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    up.chmod(0o755)
+
+    return {
+        **sandbox, "repo": repo, "origin": origin,
+        "sha": sha, "base": base, "helper": helper,
+    }
+
+
+def _cand_env(sb, **extra) -> dict:
+    return {
+        "DAILYCHECK_DEPLOY_MERGE_BIN": str(sb["helper"]),
+        "FAKE_ORIGIN": str(sb["origin"]),
+        **extra,
+    }
+
+
+def _head(sb) -> str:
+    return subprocess.run(
+        ["git", "-C", str(sb["repo"]), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _branch(sb) -> str:
+    return subprocess.run(
+        ["git", "-C", str(sb["repo"]), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_candidate_checks_out_pr_head_before_up(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(sb, "42", sb["sha"], "--candidate", "--observe-min", "0", **_cand_env(sb))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = _calls(sb)
+    assert calls[0].startswith("merge_helper check")
+    assert calls[1].startswith(f"up.sh {sb['sha'][:12]}")
+    assert _head(sb) == sb["sha"], "候选模式成功后工作树应停在候选 sha"
+
+
+def test_candidate_rejects_stale_branch_before_up(candidate_sandbox):
+    sb = candidate_sandbox
+    subprocess.run(["git", "-C", str(sb["repo"]), "checkout", "-q", "main"], check=True)
+    (sb["repo"] / "other.py").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(sb["repo"]), "add", "other.py"], check=True)
+    subprocess.run(["git", "-C", str(sb["repo"]), "commit", "-qm", "advance"], check=True)
+    subprocess.run(["git", "-C", str(sb["repo"]), "push", "-q", "origin", "main"], check=True)
+    sb["calls"].unlink(missing_ok=True)
+
+    proc = _pipe(sb, "42", sb["sha"], "--candidate", "--observe-min", "0", **_cand_env(sb))
+
+    assert proc.returncode == 25
+    assert _calls(sb) == [], "前置失败不得调 up/verify"
+    assert _branch(sb) == "main"
+
+
+def test_candidate_rejects_sha_mismatch(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(
+        sb, "42", "0" * 40, "--candidate", "--observe-min", "0", **_cand_env(sb)
+    )
+
+    assert proc.returncode == 25
+    assert _calls(sb) == []
+
+
+def test_candidate_rejects_gitea_precondition(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(
+        sb, "42", sb["sha"], "--candidate", "--observe-min", "0",
+        **_cand_env(sb, FAKE_CHECK_RC="31"),
+    )
+
+    assert proc.returncode == 25
+    assert not any(c.startswith("up.sh") for c in _calls(sb))
+
+
+def test_candidate_dry_run_does_not_checkout(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(sb, "42", sb["sha"], "--candidate", "--dry-run", **_cand_env(sb))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _branch(sb) == "main"
+
+
+def test_candidate_up_failure_restores_main(candidate_sandbox):
+    sb = candidate_sandbox
+    _write_fake(sb["dir"] / "up.sh", "up.sh", sb["calls"], 7)
+    proc = _pipe(sb, "42", sb["sha"], "--candidate", "--observe-min", "0", **_cand_env(sb))
+
+    assert proc.returncode == 20
+    assert _branch(sb) == "main"
+    assert _head(sb) == sb["base"]
+
+
+def test_merge_runs_after_switch_and_before_release(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(
+        sb, "42", sb["sha"], "--candidate", "--merge-pr", "--observe-min", "0",
+        **_cand_env(sb),
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = _calls(sb)
+    names = [c.split()[0] for c in calls]
+    assert names == [
+        "merge_helper", "up.sh", "verify.sh", "promote.sh", "switch.sh", "merge_helper"
+    ], calls
+    assert calls[0].startswith("merge_helper check")
+    assert calls[-1].startswith("merge_helper merge")
+    assert _state(sb)["deployed"]["sha"] == sb["sha"]
+    assert _branch(sb) == "main"
+    assert _head(sb) == sb["sha"]
+
+
+def test_merge_failure_rolls_back_blue(candidate_sandbox):
+    sb = candidate_sandbox
+    proc = _pipe(
+        sb, "42", sb["sha"], "--candidate", "--merge-pr", "--observe-min", "0",
+        **_cand_env(sb, FAKE_MERGE_RC="30"),
+    )
+
+    assert proc.returncode == 26
+    assert _calls(sb)[-1] == "switch.sh blue 100"
+    assert _state(sb)["deployed"] is None
+    assert _branch(sb) == "main"
+
+
+def test_merge_pr_without_candidate_is_usage_error(sandbox):
+    proc = _pipe(sandbox, "42", SHA, "--merge-pr")
+    assert proc.returncode == 64
