@@ -905,13 +905,19 @@ def _clone_catalog_from(src_path: Path, dst_path: Path) -> dict[str, int]:
               r["unit_cost"], r["unit"], r["gram_per_unit"], now) for r in items],
         )
 
+        # 源库可能是未迁移的老库（直接 connect，不走 migrate），缺列时补 0
+        src_product_cols = {
+            r[1] for r in src.execute("PRAGMA table_info(products)").fetchall()
+        }
+        hidden_col = "is_hidden" if "is_hidden" in src_product_cols else "0 AS is_hidden"
         products = src.execute(
-            "SELECT name, unit, note, created_at FROM products"
+            f"SELECT name, unit, note, {hidden_col}, created_at FROM products"
         ).fetchall()
         dst.executemany(
-            """INSERT INTO products (name, unit, note, created_at)
-               VALUES (?, ?, ?, ?)""",
-            [(r["name"], r["unit"], r["note"], now) for r in products],
+            """INSERT INTO products (name, unit, note, is_hidden, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [(r["name"], r["unit"], r["note"], r["is_hidden"], now)
+             for r in products],
         )
 
         # BOM preserves product_id / item_id from src. This relies on both
