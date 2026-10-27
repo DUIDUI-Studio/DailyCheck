@@ -504,21 +504,28 @@ def list_available_dc_items(
       - category_name (Chinese; from DC categories.name → fallback to
         canonical_categories.name → fallback to category_code → fallback to '—')
       - unit_price (selling_price → unit_cost → 0)
+      - store_quantity / store_bound (from the storefront warehouse row matched
+        by canonical_id; missing rows are zero, never DC stock)
     """
     master_conn.row_factory = sqlite3.Row
-    # P0-10：先取该门店已停用的 canonical_id 集合（本仓字段，与 DC 无关）。
+    # P0-10 + Issue #67：先取该门店已停用的 canonical_id 与本地库存。
+    # 后者必须与 DC 行分开，不能用 DC `items.quantity` 回退。
     deactivated: set[int] = set()
+    store_quantities: dict[int, float] = {}
     if store_warehouse_code:
         store_conn = open_warehouse_db(store_warehouse_code)
         try:
-            deactivated = {
-                int(r["canonical_id"])
-                for r in store_conn.execute(
-                    """SELECT canonical_id FROM items
-                       WHERE canonical_id IS NOT NULL
-                         AND COALESCE(is_active, 1) = 0"""
-                ).fetchall()
-            }
+            store_rows = store_conn.execute(
+                """SELECT canonical_id, quantity, is_active FROM items
+                   WHERE canonical_id IS NOT NULL
+                   ORDER BY id"""
+            ).fetchall()
+            for row in store_rows:
+                canonical_id = int(row["canonical_id"])
+                if canonical_id not in store_quantities:
+                    store_quantities[canonical_id] = float(row["quantity"] or 0)
+                if row["is_active"] is not None and int(row["is_active"]) == 0:
+                    deactivated.add(canonical_id)
         finally:
             store_conn.close()
 
@@ -576,6 +583,8 @@ def list_available_dc_items(
             unit_cost = float(item.get("unit_cost") or 0)
             item["unit_price"] = selling_price if selling_price > 0 else unit_cost
             item["order_multiple"] = normalize_order_multiple(item.get("order_multiple"))
+            item["store_quantity"] = store_quantities.get(canonical_id, 0.0)
+            item["store_bound"] = canonical_id in store_quantities
             out.append(item)
         return out
     finally:

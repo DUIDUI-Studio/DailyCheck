@@ -99,7 +99,7 @@ def store_env(tmp_path, monkeypatch):
     cat_id = store.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
     store.execute(
         "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("ST-A", "测试包材A", cat_id, 0.0, "件", 101, ts),
+        ("ST-A", "测试包材A", cat_id, 7.0, "件", 101, ts),
     )
     # item 102 intentionally unbound
     store.commit()
@@ -139,16 +139,37 @@ def test_catalog_with_dc(store_env):
     assert "加入购物车" in body
 
 
-def test_catalog_displays_dc_stock(store_env):
-    """Issue #63: ordering cards and modal must show current DC stock."""
+def test_catalog_displays_store_stock_not_dc_stock(store_env):
+    """Issue #67: ordering cards and modal show the current store's stock."""
     resp = store_env["client"].get("/store-ordering/catalog?dc=dc_test")
     assert resp.status_code == 200
     body = resp.data.decode()
 
-    assert "DC 库存" in body
-    assert "配送中心库存" in body
-    assert "100 件" in body
-    assert 'data-stock="100"' in body
+    assert "门店库存" in body
+    assert "DC 库存" not in body
+    assert "配送中心库存" not in body
+
+    card_101 = re.search(
+        r'data-canonical-id="101"(?:(?!data-canonical-id=).)*?data-stock="([^"]+)"',
+        body,
+        re.DOTALL,
+    )
+    card_102 = re.search(
+        r'data-canonical-id="102"(?:(?!data-canonical-id=).)*?data-stock="([^"]+)"',
+        body,
+        re.DOTALL,
+    )
+    assert card_101 and card_101.group(1) == "7"
+    assert card_102 and card_102.group(1) == "0"
+    assert re.search(
+        r'<span class="metric-label">门店库存</span>\s*'
+        r'<span class="metric-value small">7 件</span>',
+        body,
+    )
+    assert re.search(
+        r"cmStock\.textContent = '门店库存 ' \+ \(stock \|\| '0'\) \+ ' ' \+ unit",
+        body,
+    )
 
 
 def test_catalog_draft_scope_is_user_and_dc(store_env):
