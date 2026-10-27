@@ -42,7 +42,7 @@
 
 ## 1. 项目一句话
 
-**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 13 个工具。**
+**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 29 个工具。**
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
@@ -71,7 +71,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["13 个 MCP 工具<br/>(items_list / outbound_create / ... / procurement_hub)"]
+        Tools["29 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -817,7 +817,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
 
-**为什么不走 MCP**：MCP 那 22 个工具里有 9 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
+**为什么不走 MCP**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
 
 **链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
 
@@ -1597,7 +1597,7 @@ flowchart TB
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（22 个工具里 9 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
 
 ### 9.1 进程拓扑
 
@@ -1606,7 +1606,7 @@ flowchart LR
     subgraph MCP["mcp_server/ 进程 (uvicorn :5100)"]
         Main["main.py<br/>lifespan + AuthMiddleware + 健康检查"]
         Protocol["protocol/<br/>server.py + tools/"]
-        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical"]
+        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical / store_order"]
         Data["data/<br/>master.py / warehouse.py / unit_of_work.py"]
         Infra["infra/<br/>errors.py / access_log.py"]
     end
@@ -1618,7 +1618,7 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 24 个 MCP 工具
+### 9.2 29 个 MCP 工具
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
@@ -1648,6 +1648,19 @@ flowchart LR
 | `canonical_fanout` | canonical | write | 显式传 warehouse_codes |
 | `canonical_resolve_conflict` | canonical | write | 全局（跨仓） |
 | `canonical_set_binding_active` | canonical | write | per-token |
+| `store_order_list` | store_order | read | per-token |
+| `store_order_detail` | store_order | read | per-token |
+
+**门店订单只读域（Issue #73）**：`store_order_list` / `store_order_detail` 只读 `master.db` 的门店订单五张表（`store_orders` / `store_order_items` / `store_order_deliveries` / `store_order_receipts` / `store_order_status_history`），无迁移、无写语义、无删除语义。策略来源复用 `blueprints/store_ordering_pure.list_orders` / `.get_order_detail`（与 `service/canonical.py` 复用 `canonical_pure` 同一先例），`mcp_server/service/store_order.py` 只负责 ACL 翻译与返回形状整理。
+
+| 项 | 契约 |
+|---|------|
+| 路径 ACL | `GET /api/v1/store-orders`（列表）、`GET /api/v1/store-orders/<id>`（详情） |
+| 仓库可见性 | `store_warehouse_code` **或** `dc_warehouse_code` 任一命中 `allowed_warehouses` 即可见；`allowed_warehouses=None` 全可见。范围外的单对列表不可见、对详情等同「不存在」（不泄露存在性） |
+| 列表过滤 | `warehouse_code`（命中门店侧或总仓侧皆可）/ `status` / `limit`（1–500）/ `offset` |
+| 详情形状 | `order`（头）+ `items` + `deliveries` + `receipts` + `status_history` 五段；`items` 含 `canonical_name` / `quantity` / `fulfilled_quantity` / `dc_item_id`（null 表示尚未回填配送中心 items.id）与 `dc_item_bound` 布尔标记 |
+
+> **可见性 OR 与纯函数的 AND 语义**：`sop.list_orders` 的 `store_warehouse_code` / `dc_warehouse_code` 是 AND 关系，而 ACL 可见性是 OR。服务层把 OR 展开成若干次 AND 查询的并集（`_scope_pairs`），并按「各子集各取前 `limit + offset` 行 → 合并去重 → 全局排序 → 切片」保证分页正确。
 
 ### 9.3 双传输模式
 
@@ -2034,7 +2047,7 @@ flowchart TB
         MCPPure["test_*_pure.py"]
         MCPRoute["test_*_route.py"]
         MCPData["test_data/test_warehouse.py"]
-        MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>(26 用例 mock)"]
+        MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>+ test_store_order.py<br/>(18 用例 mock，Issue #73)"]
     end
 
     Pytest --> Conftest
@@ -2086,6 +2099,8 @@ flowchart TB
 **Pre-existing 16 failed 分布**（2026-10-13 起）：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
+
+**门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
 
 ---
 
@@ -2282,6 +2297,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 配方成本 qty 语义不一致 | **高** | **已修复（2026-10-16，`feat/recipe-rd-upgrade`）** | ic_recipe 引用行 qty 统一为**克**（`_save_recipe` output_qty 累计 / pure 成本层 / 前端 JS / BOM CSV 四处对齐，旧「份」语义废弃）。两库 recipes 表均 0 行，无存量迁移。详见 `docs/2026-10-16-recipe-rd-upgrade.md` §D1 |
 | 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:80,100` / `blueprints/procurement.py:185` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:91` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 的 4 个调用点 / 3 个代码站点（`replay_item_layers`、`compute_stocktake_quality`、`compute_fulfillment`）；行号按 2026-10-15 `52516a8` 校准，改动这些模块时按符号名而非行号定位。后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | 事故已止血；**根治已交付待 merge**（Issue #41 → PR #42） | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。**处置**：生产侧已 `switch.sh blue 100` 止血（运行态 blue 100 / green down）；**根治**= §3.4 铁律新增的 `switch.sh` DRY_RUN 守卫（承接流量且 `DRY_RUN=true` → 拒跑 exit 3），已随 Issue #41 修复交付（PR #42）。⚠️ **下一次切流量前必须先按 `scripts/blue_green/README.md`「绿转正」关闭绿的写隔离**，否则会被守卫拒跑（预期行为） |
+| MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的 `store_warehouse_code` 或 `dc_warehouse_code` 任一命中才可见。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |

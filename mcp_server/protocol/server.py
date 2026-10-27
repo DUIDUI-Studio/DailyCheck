@@ -48,6 +48,10 @@ from mcp_server.protocol.tools.procurement import (
     procurement_hub_impl,
     procurement_store_impl,
 )
+from mcp_server.protocol.tools.store_order import (
+    store_order_detail_impl,
+    store_order_list_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,8 @@ _tool_map = {
     "canonical_fanout": canonical_fanout_impl,
     "canonical_resolve_conflict": canonical_resolve_conflict_impl,
     "canonical_set_binding_active": canonical_set_binding_active_impl,
+    "store_order_list": store_order_list_impl,
+    "store_order_detail": store_order_detail_impl,
 }
 
 
