@@ -134,7 +134,7 @@ docs/
   superpowers/             # 开发计划文档
 ```
 
-## MCP 服务器（13 个工具）
+## MCP 服务器（27 个工具）
 
 通过 Model Context Protocol 提供 AI Agent 数据访问能力。支持两种传输模式：
 - **stdio**: 本地 Claude Code 使用（`flask mcp`）
@@ -142,6 +142,7 @@ docs/
 
 | 工具 | 功能 |
 |------|------|
+| `warehouse_list` | 列出 token 可访问的仓库 |
 | `items_list` | 列出仓库所有库存品 |
 | `items_detail` | 单个库存品详情 |
 | `movements_list` | 近期库存变动流水 |
@@ -155,6 +156,7 @@ docs/
 | `item_forecast` | 单品需求预测 |
 | `procurement_store` | 店铺采购建议 |
 | `procurement_hub` | 全仓库采购建议 |
+| `canonical_*` | 13 个主数据治理工具（列表/详情/分类/扇出/冲突/认领/更新等，见 `docs/ARCHITECTURE.md` §9.2） |
 
 认证方式：Bearer Token（环境变量 `DAILYCHECK_MCP_TOKEN`）或 `agent_tokens` 表票据验证，支持路径级别的 ACL 和仓库范围权限。
 

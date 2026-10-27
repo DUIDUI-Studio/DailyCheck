@@ -2,18 +2,16 @@
 from __future__ import annotations
 
 from mcp_server.data.master import resolve_warehouse
-from mcp_server.data.warehouse import (
-    create_restock as _create_restock,
-    item_exists,
-    list_restock_movements as _list_restock_movements,
-)
 from mcp_server.data.unit_of_work import warehouse_connection
-from mcp_server.service.auth import AuthContext, check_warehouse
+from mcp_server.data.warehouse import create_restock as _create_restock
+from mcp_server.data.warehouse import item_exists
+from mcp_server.data.warehouse import list_restock_movements as _list_restock_movements
 from mcp_server.infra.errors import (
     ForbiddenError,
     NotFoundError,
     ValidationError,
 )
+from mcp_server.service.auth import AuthContext, check_warehouse
 
 
 def create_restock(
@@ -45,6 +43,12 @@ def create_restock(
 
 
 def list_restock(warehouse_code: str, ctx: AuthContext) -> list[dict]:
+    """List inbound restock requests (入库单) for a warehouse.
+
+    Rows come from `restock_requests` (read path switched in Issue #72).
+    Shape per row: {id, item_id, item_name, quantity, status, reason,
+    created_at}, newest first.
+    """
     if not warehouse_code:
         raise ValidationError("warehouse_code_required")
     if not check_warehouse(ctx, warehouse_code):

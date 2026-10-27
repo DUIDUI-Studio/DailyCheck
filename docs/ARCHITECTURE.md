@@ -42,7 +42,7 @@
 
 ## 1. 项目一句话
 
-**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 13 个工具。**
+**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 27 个工具。**
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
@@ -71,7 +71,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["13 个 MCP 工具<br/>(items_list / outbound_create / ... / procurement_hub)"]
+        Tools["27 个 MCP 工具<br/>(items_list / outbound_create / ... / canonical_set_binding_active)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -817,7 +817,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
 
-**为什么不走 MCP**：MCP 那 22 个工具里有 9 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
+**为什么不走 MCP**：MCP 那 27 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
 
 **链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
 
@@ -1597,7 +1597,7 @@ flowchart TB
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（22 个工具里 9 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（27 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
 
 ### 9.1 进程拓扑
 
@@ -1618,10 +1618,11 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 24 个 MCP 工具
+### 9.2 27 个 MCP 工具
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
+| `warehouse_list` | inventory | read | per-token |
 | `items_list` | inventory | read | per-token |
 | `items_detail` | inventory | read | per-token |
 | `movements_list` | inventory | read | per-token |
@@ -1648,6 +1649,11 @@ flowchart LR
 | `canonical_fanout` | canonical | write | 显式传 warehouse_codes |
 | `canonical_resolve_conflict` | canonical | write | 全局（跨仓） |
 | `canonical_set_binding_active` | canonical | write | per-token |
+
+> **`restock_list` 的数据源（Issue #72，2026-10-27）**：读 `restock_requests` LEFT JOIN `items`，
+> 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC`）。
+> 此前读 `stock_movements` 且过滤 `action='restock'`，而入库流程写入的是 `action='补货入库'`，
+> 因此该工具恒返回空数组。写路径（`restock_create`）未改动。
 
 ### 9.3 双传输模式
 
@@ -1988,6 +1994,16 @@ flowchart LR
 
 ## 12. 测试架构
 
+Issue #72 的入库读链路回归：`tests/mcp_server/test_data/test_warehouse.py` 用
+`restock_requests` 播种 N>1 条（`status` 覆盖 `'入库'` 与 `'提交'`），锁
+`list_restock_movements` 返回 N 条、七字段齐全（`id` / `item_id` / `item_name` /
+`quantity` / `status` / `reason` / `created_at`）、`created_at DESC`；另有一条
+「`restock_requests` 为空但 `stock_movements` 存在 `action='restock'` 流水行时返回空」
+锁定数据源已切换。`tests/mcp_server/test_service/test_inbound.py` 与
+`tests/mcp_server/test_protocol/test_inbound_tools.py`（新目录；共享
+`tests/mcp_server/conftest.py` 的 `warehouse_db` 夹具）锁「MCP `restock_create`
+写入后 `restock_list` 立即读回」。
+
 Issue #64 在 `tests/test_store_ordering_dc_route.py` 增加两条路由级回归：审批后 DC
 库存不变且 `/outbound` 解释「审批不锁库存」；发货后 `/outbound` 必须出现订单号、
 「订单发货」来源及订单详情回链。
@@ -2029,6 +2045,7 @@ flowchart TB
         MCPRoute["test_*_route.py"]
         MCPData["test_data/test_warehouse.py"]
         MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>(26 用例 mock)"]
+        MCPProtocol["test_protocol/test_inbound_tools.py<br/>MCP 工具层：写入后立即读回"]
     end
 
     Pytest --> Conftest
@@ -2248,7 +2265,7 @@ with app.test_client() as c, c.session_transaction() as s:
 
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
-| 16 failed 测试（本地全量口径，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
+| 15 failed 测试（本地全量口径，2026-10-27 起） | 中 | pre-existing（Issue #72 收缩 1 条：MCP 入库读链路用例修复） | 商业化前必须归零 |
 | 订货目录把 DC 库存误作门店库存 | 中 | **已修复（Issue #67，2026-10-27）** | `list_available_dc_items()` 按 `canonical_id` 汇总本店全部绑定行 `SUM(items.quantity)`；重复绑定不再只取首行，未绑定行固定为 0，卡片/弹窗/`data-stock` 均不回退 DC 库存 |
 | 时区不一致 | **高** | pre-existing（`render_ops` 一处已修，2026-10-18） | 多租户改造前必修。已修的一处：`render_ops._render_kpis` 的「今日」判据曾用 `time.strftime`（进程本地时区）→ 在 UTC 环境（CI / dev 容器）与 `_cst_day()`（显式 +8h）错位，UTC 16:00–24:00 窗口内「今日部署 / 今日合并 PR」恒显 0；改为 `datetime.now(CST)` 与三处 +8 同源（§13.3）。**其余站点仍是 pre-existing**：全仓 `datetime.now()` / SQL `datetime('now')` 混用未收敛 |
 | **测试隐式依赖本机端口 / 环境** | 中 | pre-existing（2026-10-18 CI 实 hit） | `deploy_pipeline.sh` 的观察窗会真探 `http://127.0.0.1:8080/`。**本机 dev 容器在听该端口（返 302）→ 观察窗放行 → 用例通过；CI runner 无监听 → curl 得 000 → 触发「观察窗异常」→ 回滚 → exit 24**，表现为「本地全绿、CI 判红」。凡跑编排/部署脚本的测试必须注入 fake 外部命令（既有 `_observe_tools()` 提供 fake curl / journalctl；`blue_green_testenv.py` 提供 fake systemctl），不得依赖本机恰好有服务在跑。**新增这类用例前先看同文件既有测试怎么脱真环境**——本次就是漏抄了既有模式 |
