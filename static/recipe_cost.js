@@ -84,12 +84,7 @@
     var rows = document.querySelectorAll('#bom-body .bom-row');
     var totalP = 0, totalS = 0, totalSOrig = 0, totalGrams = 0;
     rows.forEach(function(row) {
-      var delCb = row.querySelector('input[name="bom_delete"]');
-      if (delCb && delCb.checked) {
-        row.querySelector('.bom-cost-purchase').textContent = '0.00';
-        row.querySelector('.bom-cost-selling').textContent = '0.00';
-        return;
-      }
+      // 原料行删除已改为独立路由（自带 bom_id），页面上不再有 delete checkbox。
       var st = row.getAttribute('data-source-type') || 'item';
       var cost;
       if (st === 'ic_recipe') {
@@ -319,7 +314,7 @@
           '<td><span class="bom-sp">0.000</span></td>',
           '<td class="sp-adj-col"><input type="number" class="bom-sp-adj" name="bom_sp_adj" min="0" step="0.01" value="0" data-original-sp="0" /></td>',
           '<td><span class="bom-cost-selling">0.00</span></td>',
-          '<td><label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label></td>',
+          '<td><button type="button" class="btn-sm btn-delete" data-remove-row>删除</button></td>',
         ].join('');
       } else {
         tr.innerHTML = [
@@ -336,7 +331,7 @@
           '<td><span class="bom-cost-purchase">0.00</span></td>',
           '<td><span class="bom-cost-selling">0.00</span></td>',
           '<td><input type="number" class="bom-temp-price" min="0" step="0.01" value="0" disabled /></td>',
-          '<td><label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label></td>',
+          '<td><button type="button" class="btn-sm btn-delete" data-remove-row>删除</button></td>',
         ].join('');
       }
 
@@ -365,6 +360,19 @@
       bindTempPriceInput(row);
       bindSpAdjInput(row);
     });
+
+    // 未保存的新增行：删除只是把 DOM 行摘掉（还没落库，无需请求）。
+    // 已保存的历史行走独立删除表单（自带 bom_id），不经过这里。
+    var tbody = document.getElementById('bom-body');
+    if (tbody) {
+      tbody.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-remove-row]');
+        if (!btn) return;
+        var tr = btn.closest('tr');
+        if (tr) tr.remove();
+        recomputeAll();
+      });
+    }
 
     bindSourceTypeSwitches();
     bindAddRow();

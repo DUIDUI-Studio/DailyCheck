@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 22 个（已装配 21 / 未装配 1）
-- 路由 **182** 条（按鉴权强度：平台超管 57 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **184** 条（按鉴权强度：平台超管 59 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 5`
 - MCP 工具域 7 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -22,7 +22,7 @@
 
 | 蓝图 | 文件 | 路由数 | 装配 |
 |---|---|---|---|
-| `recipe_cost` | `recipe_cost.py` | 23 | 在役 |
+| `recipe_cost` | `recipe_cost.py` | 25 | 在役 |
 | `store_ordering` | `store_ordering.py` | 23 | 在役 |
 | `canonical` | `canonical.py` | 20 | 在役 |
 | `production` | `production.py` | 12 | 在役 |
@@ -236,6 +236,7 @@
 |---|---|---|---|---|
 | `recipe_cost.api_cost` | GET | `/recipe-cost/api/cost/<kind>/<int:rid>` | 权限点 | report.cost.view |
 | `recipe_cost.ic_recipe_bom_export_csv` | GET | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/export.csv` | 权限点 | report.cost.view |
+| `recipe_cost.ic_recipe_bom_row_delete` | POST | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/bom/<int:bom_id>/delete` | 平台超管 |  |
 | `recipe_cost.ic_recipe_delete` | POST | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/delete` | 平台超管 |  |
 | `recipe_cost.ic_recipe_edit` | GET,POST | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/edit` | 平台超管 |  |
 | `recipe_cost.ic_recipe_new` | GET,POST | `/recipe-cost/ic-recipes/new` | 平台超管 |  |
@@ -249,6 +250,7 @@
 | `recipe_cost.overview` | GET | `/recipe-cost/overview` | 权限点 | report.cost.view |
 | `recipe_cost.overview_export_csv` | GET | `/recipe-cost/overview/export.csv` | 权限点 | report.cost.view |
 | `recipe_cost.recipe_bom_export_csv` | GET | `/recipe-cost/recipes/<int:recipe_id>/export.csv` | 权限点 | report.cost.view |
+| `recipe_cost.recipe_bom_row_delete` | POST | `/recipe-cost/recipes/<int:recipe_id>/bom/<int:bom_id>/delete` | 平台超管 |  |
 | `recipe_cost.recipe_delete` | POST | `/recipe-cost/recipes/<int:recipe_id>/delete` | 平台超管 |  |
 | `recipe_cost.recipe_edit` | GET,POST | `/recipe-cost/recipes/<int:recipe_id>/edit` | 平台超管 |  |
 | `recipe_cost.recipe_new` | GET,POST | `/recipe-cost/recipes/new` | 平台超管 |  |

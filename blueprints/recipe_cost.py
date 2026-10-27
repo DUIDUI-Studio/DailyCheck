@@ -347,11 +347,51 @@ def ic_recipe_delete(ic_recipe_id: int):
     return redirect(url_for("recipe_cost.ic_recipes_list"))
 
 
+@bp.route(
+    "/recipe-cost/ic-recipes/<int:ic_recipe_id>/bom/<int:bom_id>/delete",
+    methods=["POST"],
+)
+@require_platform_admin
+def ic_recipe_bom_row_delete(ic_recipe_id: int, bom_id: int):
+    """删除冰激凌配方中的一行原料（行内按钮，点击即落库）。
+
+    与「保存配方」分开：表单只负责新增/改用量，删除有独立入口。
+    好处是每行的删除意图自带 bom_id，不存在按索引配对错位的可能
+    （旧实现用 `bom_delete[]` checkbox，未勾选就不提交 → 索引整体错位，
+    勾第 3 行会删掉第 1 行，静默改坏配方用量）。
+    """
+    db = get_warehouse_db()
+    row = db.execute(
+        """SELECT ri.id, ri.item_id, i.name AS item_name
+           FROM ic_recipe_items ri LEFT JOIN items i ON i.id = ri.item_id
+           WHERE ri.id = ? AND ri.ic_recipe_id = ?""",
+        (bom_id, ic_recipe_id),
+    ).fetchone()
+    if row is None:
+        # 借 A 配方的 URL 删 B 配方的行 —— 不允许。
+        flash("该配方行不存在或不属于此冰激凌配方", "error")
+        return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=ic_recipe_id))
+
+    db.execute("DELETE FROM ic_recipe_items WHERE id = ?", (bom_id,))
+    db.commit()
+    audit("recipe_cost.ic_recipe_bom.delete", "ic_recipe", ic_recipe_id, {
+        "bom_id": bom_id, "item_id": int(row["item_id"]),
+        "item_name": row["item_name"],
+    })
+    flash(f"已删除原料「{row['item_name']}」")
+    return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=ic_recipe_id))
+
+
 def _save_ic_recipe(ic_recipe_id: int | None):
     """Create or update an ic_recipe + its BOM rows.
 
     Form fields: name / note / output_unit / output_qty / sale_price /
-                 bom_row_id[] / bom_item_id[] / bom_qty[] / bom_delete[]
+                 bom_row_id[] / bom_item_id[] / bom_qty[]
+
+    删除原料行不在本表单里 —— 那是独立路由（ic_recipe_bom_row_delete），
+    删除意图自带 bom_id。原实现用 `bom_delete[]` 与 `bom_row_id[]` 平行数组
+    按索引配对，而 checkbox 未勾选就不提交 → 数组长度必然短于行数 →
+    索引整体错位（勾第 3 行却删掉第 1 行，静默改坏配方用量）。
 
     `output_qty` is auto-computed as Σ(bom.qty_per_unit) of surviving rows
     (grams in RD world). The user-supplied value is overwritten.
@@ -362,17 +402,20 @@ def _save_ic_recipe(ic_recipe_id: int | None):
     sale_price = float(request.form.get("sale_price", "0") or 0)
 
     if not name:
-        flash("配方名称为必填")
+        flash("配方名称为必填", "error")
         if ic_recipe_id:
             return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=ic_recipe_id))
         return redirect(url_for("recipe_cost.ic_recipe_new"))
     if sale_price < 0:
-        flash("售价不能为负")
+        flash("售价不能为负", "error")
 
     db = get_warehouse_db()
+    created = False
     if ic_recipe_id is None:
         try:
             # Insert with placeholder output_qty=0; we'll update after BOM.
+            # 不在这里 commit —— 配方行与 BOM 行必须同生共死（Issue #47）：
+            # 早先配方先 commit、BOM 后失败 → 留下半保存的空配方。
             db.execute(
                 """INSERT INTO ic_recipes
                    (name, note, output_unit, output_qty, sale_price,
@@ -381,10 +424,10 @@ def _save_ic_recipe(ic_recipe_id: int | None):
                 (name, note, output_unit, sale_price, now(), now()),
             )
             new_id = int(db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-            db.commit()
-            audit("recipe_cost.ic_recipe.create", "ic_recipe", new_id, {"name": name})
+            created = True
         except sqlite3.IntegrityError:
-            flash("配方名称已存在")
+            db.rollback()
+            flash("配方名称已存在", "error")
             return redirect(url_for("recipe_cost.ic_recipe_new"))
     else:
         # output_qty updated after BOM processing
@@ -394,21 +437,16 @@ def _save_ic_recipe(ic_recipe_id: int | None):
     bom_ids = request.form.getlist("bom_row_id")
     item_ids = request.form.getlist("bom_item_id")
     qtys = request.form.getlist("bom_qty")
-    deletes = request.form.getlist("bom_delete")
     sp_adjs = request.form.getlist("bom_sp_adj")
     has_sp_adj = "bom_sp_adj" in request.form  # 仅当字段存在时才更新
-    added = removed = updated = 0
+    added = updated = 0
     total_grams = 0.0
     target_id = ic_recipe_id if ic_recipe_id is not None else new_id
     item_price_updates = {}  # {int(item_id): float(sp_adj)} → 写回 items 表
+    failed_row = None
 
     for i in range(len(bom_ids)):
         row_id = bom_ids[i].strip()
-        if i < len(deletes) and deletes[i] == "1":
-            if row_id:
-                db.execute("DELETE FROM ic_recipe_items WHERE id = ?", (int(row_id),))
-                removed += 1
-            continue
         item_id = item_ids[i].strip() if i < len(item_ids) else ""
         qty = parse_qty(qtys[i]) if i < len(qtys) else 0.0
         if not item_id or qty <= 0:
@@ -419,23 +457,38 @@ def _save_ic_recipe(ic_recipe_id: int | None):
             sp_adj = parse_qty(sp_adj_raw) if sp_adj_raw else None
             if sp_adj is not None and sp_adj > 0:
                 item_price_updates[int(item_id)] = sp_adj
-        if row_id:
-            db.execute(
-                "UPDATE ic_recipe_items SET item_id=?, qty_per_unit=? WHERE id=?",
-                (int(item_id), qty, int(row_id)),
-            )
-            updated += 1
-        else:
-            try:
+        # ic_recipe_items 有 UNIQUE(ic_recipe_id, item_id)：两行指向同一原料
+        # 会撞唯一约束。撞了就整批回滚（半保存的配方比不保存更难排查），
+        # 并指明第几行重复 —— 不再让 IntegrityError 冒成 500。
+        try:
+            if row_id:
+                db.execute(
+                    "UPDATE ic_recipe_items SET item_id=?, qty_per_unit=? WHERE id=?",
+                    (int(item_id), qty, int(row_id)),
+                )
+                updated += 1
+            else:
                 db.execute(
                     "INSERT INTO ic_recipe_items (ic_recipe_id, item_id, qty_per_unit)"
                     " VALUES (?, ?, ?)",
                     (target_id, int(item_id), qty),
                 )
                 added += 1
-            except sqlite3.IntegrityError:
-                flash(f"第 {i+1} 行原料重复")
+        except sqlite3.IntegrityError:
+            failed_row = i + 1
+            break
         total_grams += qty
+
+    if failed_row is not None:
+        # 整批回滚：配方行与 BOM 行一起撤销，不留半保存。
+        db.rollback()
+        flash(
+            f"保存失败：第 {failed_row} 行的原料与配方中其它行重复，本次修改已全部撤销",
+            "error",
+        )
+        if created:
+            return redirect(url_for("recipe_cost.ic_recipe_new"))
+        return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=target_id))
 
     # 将调整后的原料销售单价持久化到品项表（items.selling_price）
     if item_price_updates:
@@ -458,15 +511,25 @@ def _save_ic_recipe(ic_recipe_id: int | None):
     output_qty_final = round(float(_sum["g"]), 2)
 
     # Now update output_qty + sale_price + name/note for the recipe
-    db.execute(
-        """UPDATE ic_recipes SET name=?, note=?, output_unit=?,
-           output_qty=?, sale_price=?, updated_at=? WHERE id=?""",
-        (name, note, output_unit, output_qty_final, sale_price, now(), target_id),
-    )
+    try:
+        db.execute(
+            """UPDATE ic_recipes SET name=?, note=?, output_unit=?,
+               output_qty=?, sale_price=?, updated_at=? WHERE id=?""",
+            (name, note, output_unit, output_qty_final, sale_price, now(), target_id),
+        )
+    except sqlite3.IntegrityError:
+        # ic_recipes.name UNIQUE：改成已存在的名字 → 整批回滚，不再 500。
+        db.rollback()
+        flash("保存失败：配方名称已存在，本次修改已全部撤销", "error")
+        if created:
+            return redirect(url_for("recipe_cost.ic_recipe_new"))
+        return redirect(url_for("recipe_cost.ic_recipe_edit", ic_recipe_id=target_id))
 
     db.commit()
+    if created:
+        audit("recipe_cost.ic_recipe.create", "ic_recipe", target_id, {"name": name})
     audit("recipe_cost.ic_recipe.update", "ic_recipe", target_id, {
-        "added": added, "removed": removed, "updated": updated,
+        "added": added, "updated": updated,
         "output_qty": output_qty_final,
     })
     _upsert_recipe_draft("ic_recipe", target_id, user_id=g.user["id"] if g.user else None)
@@ -620,23 +683,74 @@ def recipe_delete(recipe_id: int):
     return redirect(url_for("recipe_cost.recipes_list"))
 
 
+@bp.route(
+    "/recipe-cost/recipes/<int:recipe_id>/bom/<int:bom_id>/delete",
+    methods=["POST"],
+)
+@require_platform_admin
+def recipe_bom_row_delete(recipe_id: int, bom_id: int):
+    """删除出品配方中的一行原料（行内按钮，点击即落库）。
+
+    与「保存配方」分开：表单只负责新增/改用量，删除有独立入口。
+    好处是每行的删除意图自带 bom_id，不存在按索引配对错位的可能
+    （旧实现用 `bom_delete[]` checkbox，未勾选就不提交 → 索引整体错位，
+    勾第 3 行会删掉第 1 行，静默改坏配方用量）。
+    """
+    db = get_warehouse_db()
+    row = db.execute(
+        """SELECT ri.id, ri.source_type, ri.item_id, ri.ic_recipe_id,
+                  i.name AS item_name, ic.name AS ic_recipe_name
+           FROM recipe_items ri
+           LEFT JOIN items i ON i.id = ri.item_id
+           LEFT JOIN ic_recipes ic ON ic.id = ri.ic_recipe_id
+           WHERE ri.id = ? AND ri.recipe_id = ?""",
+        (bom_id, recipe_id),
+    ).fetchone()
+    if row is None:
+        # 借 A 配方的 URL 删 B 配方的行 —— 不允许。
+        flash("该配方行不存在或不属于此出品配方", "error")
+        return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
+
+    db.execute("DELETE FROM recipe_items WHERE id = ?", (bom_id,))
+    db.commit()
+    audit("recipe_cost.recipe_bom.delete", "recipe", recipe_id, {
+        "bom_id": bom_id,
+        "source_type": row["source_type"],
+        "item_id": row["item_id"],
+        "ic_recipe_id": row["ic_recipe_id"],
+        "name": row["item_name"] or row["ic_recipe_name"],
+    })
+    flash(f"已删除原料「{row['item_name'] or row['ic_recipe_name']}」")
+    return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
+
+
 def _save_recipe(recipe_id):
+    """Create or update a serving recipe + its BOM rows.
+
+    删除原料行不在本表单里 —— 那是独立路由（recipe_bom_row_delete），
+    删除意图自带 bom_id。旧实现用 `bom_delete[]` 与 `bom_row_id[]` 平行数组
+    按索引配对，而 checkbox 未勾选就不提交 → 数组长度必然短于行数 →
+    索引整体错位（勾第 3 行却删掉第 1 行，静默改坏配方用量）。
+    """
     name = request.form.get("name", "").strip()
     note = request.form.get("note", "").strip()
     output_unit = "g"  # RD world: output always grams
     sale_price = float(request.form.get("sale_price", "0") or 0)
 
     if not name:
-        flash("配方名称为必填")
+        flash("配方名称为必填", "error")
         if recipe_id:
             return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
         return redirect(url_for("recipe_cost.recipe_new"))
     if sale_price < 0:
-        flash("售价不能为负")
+        flash("售价不能为负", "error")
 
     db = get_warehouse_db()
+    created = False
     if recipe_id is None:
         try:
+            # 不在这里 commit —— 配方行与 BOM 行必须同生共死（Issue #47）：
+            # 早先配方先 commit、BOM 后失败 → 留下半保存的空配方。
             db.execute(
                 """INSERT INTO recipes
                    (name, note, output_unit, output_qty, sale_price,
@@ -645,10 +759,10 @@ def _save_recipe(recipe_id):
                 (name, note, output_unit, sale_price, now(), now(), now()),
             )
             new_id = int(db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
-            db.commit()
-            audit("recipe_cost.recipe.create", "recipe", new_id, {"name": name})
+            created = True
         except sqlite3.IntegrityError:
-            flash("配方名称已存在")
+            db.rollback()
+            flash("配方名称已存在", "error")
             return redirect(url_for("recipe_cost.recipe_new"))
     else:
         old = db.execute(
@@ -656,13 +770,19 @@ def _save_recipe(recipe_id):
         ).fetchone()
         old_sp = float(old["sale_price"] or 0) if old else 0
         sp_updated_at = now() if sale_price != old_sp else None
-        db.execute(
-            """UPDATE recipes SET name=?, note=?, output_unit=?,
-               sale_price=?, sale_price_updated_at=?,
-               updated_at=? WHERE id=?""",
-            (name, note, output_unit, sale_price, sp_updated_at,
-             now(), recipe_id),
-        )
+        try:
+            db.execute(
+                """UPDATE recipes SET name=?, note=?, output_unit=?,
+                   sale_price=?, sale_price_updated_at=?,
+                   updated_at=? WHERE id=?""",
+                (name, note, output_unit, sale_price, sp_updated_at,
+                 now(), recipe_id),
+            )
+        except sqlite3.IntegrityError:
+            # recipes.name UNIQUE：改成已存在的名字 → 整批回滚，不再 500。
+            db.rollback()
+            flash("保存失败：配方名称已存在，本次修改已全部撤销", "error")
+            return redirect(url_for("recipe_cost.recipe_edit", recipe_id=recipe_id))
 
     # BOM rows (多态)
     bom_ids = request.form.getlist("bom_row_id")
@@ -670,18 +790,14 @@ def _save_recipe(recipe_id):
     item_ids = request.form.getlist("bom_item_id")
     ic_ids = request.form.getlist("bom_ic_recipe_id")
     qtys = request.form.getlist("bom_qty")
-    deletes = request.form.getlist("bom_delete")
-    added = removed = updated = 0
+    added = updated = 0
     total_grams = 0.0
     target_id = recipe_id if recipe_id is not None else new_id
+    failed_row = None
+    seen_targets = {}  # ("item"|"ic_recipe", target_id) → 行号
 
     for i in range(len(bom_ids)):
         row_id = bom_ids[i].strip()
-        if i < len(deletes) and deletes[i] == "1":
-            if row_id:
-                db.execute("DELETE FROM recipe_items WHERE id = ?", (int(row_id),))
-                removed += 1
-            continue
         st = source_types[i].strip() if i < len(source_types) else "item"
         qty = parse_qty(qtys[i]) if i < len(qtys) else 0.0
         if qty <= 0:
@@ -691,47 +807,72 @@ def _save_recipe(recipe_id):
         if st == "item":
             if not item_id:
                 continue
-            if row_id:
-                db.execute(
-                    """UPDATE recipe_items SET source_type='item',
-                       item_id=?, ic_recipe_id=NULL, qty_per_unit=? WHERE id=?""",
-                    (int(item_id), qty, int(row_id)),
-                )
-                updated += 1
-            else:
-                db.execute(
-                    """INSERT INTO recipe_items
-                       (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
-                       VALUES (?, 'item', ?, NULL, ?)""",
-                    (target_id, int(item_id), qty),
-                )
-                added += 1
-            # For items: each qty is in grams (input form is grams per serving).
-            total_grams += qty
+            target = ("item", int(item_id))
         elif st == "ic_recipe":
             if not ic_id:
                 continue
+            target = ("ic_recipe", int(ic_id))
+        else:
+            continue
+        # recipe_items 没有 UNIQUE 约束（多态：item_id / ic_recipe_id 二选一），
+        # 所以重复原料要在这里判 —— 否则同一原料被静默记两行、用量与成本
+        # 口径一起失真。撞了就整批回滚，并指明第几行重复。
+        if target in seen_targets:
+            failed_row = i + 1
+            break
+        seen_targets[target] = i + 1
+        try:
             if row_id:
-                db.execute(
-                    """UPDATE recipe_items SET source_type='ic_recipe',
-                       item_id=NULL, ic_recipe_id=?, qty_per_unit=? WHERE id=?""",
-                    (int(ic_id), qty, int(row_id)),
-                )
+                if st == "item":
+                    db.execute(
+                        """UPDATE recipe_items SET source_type='item',
+                           item_id=?, ic_recipe_id=NULL, qty_per_unit=? WHERE id=?""",
+                        (int(item_id), qty, int(row_id)),
+                    )
+                else:
+                    db.execute(
+                        """UPDATE recipe_items SET source_type='ic_recipe',
+                           item_id=NULL, ic_recipe_id=?, qty_per_unit=? WHERE id=?""",
+                        (int(ic_id), qty, int(row_id)),
+                    )
                 updated += 1
             else:
-                db.execute(
-                    """INSERT INTO recipe_items
-                       (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
-                       VALUES (?, 'ic_recipe', NULL, ?, ?)""",
-                    (target_id, int(ic_id), qty),
-                )
+                if st == "item":
+                    db.execute(
+                        """INSERT INTO recipe_items
+                           (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
+                           VALUES (?, 'item', ?, NULL, ?)""",
+                        (target_id, int(item_id), qty),
+                    )
+                else:
+                    db.execute(
+                        """INSERT INTO recipe_items
+                           (recipe_id, source_type, item_id, ic_recipe_id, qty_per_unit)
+                           VALUES (?, 'ic_recipe', NULL, ?, ?)""",
+                        (target_id, int(ic_id), qty),
+                    )
                 added += 1
-            # D1（2026-10-16）：ic_recipe 行的 qty 语义 = 克（与 item 行一致，
-            # 与 recipe_cost_pure.recipe_cost 的成本折算口径对齐）。
-            # 旧实现按「份」× ic.output_qty 累计，和成本层（按克）互相矛盾；
-            # 出品配方的心智模型是「小杯 120g = 基料 100g + 酱 20g」，
-            # 用户按克配料，因此统一为克。
-            total_grams += qty
+        except sqlite3.IntegrityError:
+            failed_row = i + 1
+            break
+        # For items: each qty is in grams (input form is grams per serving).
+        # D1（2026-10-16）：ic_recipe 行的 qty 语义 = 克（与 item 行一致，
+        # 与 recipe_cost_pure.recipe_cost 的成本折算口径对齐）。
+        # 旧实现按「份」× ic.output_qty 累计，和成本层（按克）互相矛盾；
+        # 出品配方的心智模型是「小杯 120g = 基料 100g + 酱 20g」，
+        # 用户按克配料，因此统一为克。
+        total_grams += qty
+
+    if failed_row is not None:
+        # 整批回滚：配方行与 BOM 行一起撤销，不留半保存。
+        db.rollback()
+        flash(
+            f"保存失败：第 {failed_row} 行的原料与配方中其它行重复，本次修改已全部撤销",
+            "error",
+        )
+        if created:
+            return redirect(url_for("recipe_cost.recipe_new"))
+        return redirect(url_for("recipe_cost.recipe_edit", recipe_id=target_id))
 
     # Update output_qty (auto = total grams)
     db.execute(
@@ -740,8 +881,10 @@ def _save_recipe(recipe_id):
     )
 
     db.commit()
+    if created:
+        audit("recipe_cost.recipe.create", "recipe", target_id, {"name": name})
     audit("recipe_cost.recipe.update", "recipe", target_id, {
-        "added": added, "removed": removed, "updated": updated,
+        "added": added, "updated": updated,
         "output_qty": round(total_grams, 2),
     })
     _upsert_recipe_draft("recipe", target_id, user_id=g.user["id"] if g.user else None)
