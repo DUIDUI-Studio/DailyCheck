@@ -4,8 +4,6 @@
 #      （CI 忽略 tests/mcp_server；本地可跑该目录，实测 2 failed / 78 passed），
 #      引用 passed 数时必须写明口径，否则跨环境对比会误判。
 # 2026-10-13：nav_integration×2 随导航模块化修复并移除（失败集 18→16）。
-# 2026-10-27：Issue #72 修复 MCP 入库读链路用例（test_create_restock_increases_quantity），
-#              清单收缩为 15 条（失败集 16→15）。
 # 规则：清单只许收缩不许扩张；修复一个就删一行；新增失败不允许加进来。
 tests/mcp_server/test_service/test_inbound.py::TestCreateRestock::test_create_restock_success
 tests/test_aux_unit.py::test_create_item_with_game_syncs_gram_per_unit
