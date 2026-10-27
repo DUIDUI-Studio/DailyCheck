@@ -1277,7 +1277,7 @@ flowchart TB
         Core["core.py<br/>仪表盘 + 品类管理"]
         Items["items.py<br/>库存品 CRUD + 库存视图"]
         Canonical["canonical.py<br/>主数据 CRUD + 扇出"]
-        StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货"]
+        StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货<br/>catalog 展示 DC 现有库存"]
         RecipeCost["recipe_cost.py<br/>配方 (产品 BOM + ic_recipe + recipe) + 成本"]
         Forecast["forecast.py<br/>预测 + 定时调度"]
         Procurement["procurement.py<br/>采购建议"]
@@ -1701,6 +1701,13 @@ flowchart TB
 
 ### 10.3 Store Ordering 状态机
 
+**订货目录库存可见（Issue #63，2026-10-27）**：`list_available_dc_items()` 一直返回
+DC 本仓 `items.quantity`，但 catalog 卡片与弹窗此前刻意隐藏，门店只能在库存总览另查。
+门店反馈「订货时能看到库存」后，卡片显示 `DC 库存`，选品弹窗同时显示库存与单价。
+这与既有提交语义一致：目录库存仅作决策参考，**提交订单仍不锁库存、不拦截 DC 库存不足**；
+真正校验和扣减发生在 DC 发货。回归由
+`tests/test_store_ordering_store_route.py::test_catalog_displays_dc_stock` 锁定。
+
 ```mermaid
 stateDiagram-v2
     [*] --> pending: cart.submit
@@ -1928,6 +1935,10 @@ flowchart LR
   按链接级可见性过滤的既有先例（同「门店订货」组内 `品项管理` 的写法），
   侧栏与 `/land` 两载体条件逐字一致，双向不变量由 `tests/test_reports_health.py::TestNavCarriers` 钉住。
 
+**订货目录库存展示（Issue #63，2026-10-27）**：门店 catalog 的每张卡片复用既有
+`.inv-card-body` 指标区显示 `DC 库存`，弹窗顶部同时显示库存与单价；不新增异步请求，
+也不改变移动端提交链路。
+
 **响应式布局契约（2026-10-20 排版审计后确立，改样式前必读）**：
 
 - **断点**：480 / 560 / 600 / 640 / 720 / 760 / 960 / 1100 px。721–1099 是中屏档
@@ -1951,6 +1962,10 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #63 的订货目录库存展示由
+`tests/test_store_ordering_store_route.py::test_catalog_displays_dc_stock` 覆盖：
+HTTP 页面必须同时出现卡片 `DC 库存` 与弹窗的配送中心库存文案。
 
 ```mermaid
 flowchart TB
