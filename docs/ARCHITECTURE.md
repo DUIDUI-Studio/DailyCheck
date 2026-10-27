@@ -1278,7 +1278,7 @@ flowchart TB
         Items["items.py<br/>库存品 CRUD + 库存视图"]
         Canonical["canonical.py<br/>主数据 CRUD + 扇出"]
         StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货<br/>catalog 展示本店现有库存"]
-        RecipeCost["recipe_cost.py<br/>配方 (产品 BOM + ic_recipe + recipe) + 成本"]
+        RecipeCost["recipe_cost.py<br/>配方 (产品 BOM + ic_recipe + recipe) + 成本<br/>配方原料行删除走独立路由(自带 bom_id)"]
         Forecast["forecast.py<br/>预测 + 定时调度"]
         Procurement["procurement.py<br/>采购建议"]
         Notifications["notifications.py<br/>应用内通知"]
@@ -1999,6 +1999,12 @@ Issue #67 的订货目录库存展示由
 `test_catalog_sums_duplicate_store_bindings` 再覆盖同一 canonical 的两条门店绑定行
 7+3=10（首行 7、DC=100），锁定聚合值而非首行或 DC 值。
 
+Issue #47 的研发配方页回归在 `tests/test_recipe_bom_delete.py`（20 例：冰激凌配方页
+10 + 出品配方页 9 + 跨页权限 1）。覆盖「原料行删除只删目标行 / 跨配方行被拒 /
+删除往返 / AJAX 拒绝返 ok:false / AJAX 成功返 ok:true / 重复原料整批回滚并指明第几行 /
+正常保存不误伤 / 保存表单不再提交 bom_delete[] / 新建撞重复不留半保存配方」。
+详见 §13.13。
+
 ```mermaid
 flowchart TB
     subgraph Pytest["pytest (59 个测试文件, 977 用例；2026-10-15 实测)"]
@@ -2244,6 +2250,27 @@ with app.test_client() as c, c.session_transaction() as s:
 
 回归：`tests/test_production_recipe_archive.py`（9 例，含"只删目标行"与"跨产品行拒绝"）。
 
+### 13.13 研发配方编辑页的原料行删除与保存回滚（2026-10-27 起，Issue #47）
+
+**背景**：PR #42 修了门店生产配方页（§13.12），但明确排除研发中心的两个配方编辑页 —— 冰激凌配方（`ic_recipe_edit.html`）与出品配方（`recipe_edit.html`）。Issue #47 承接被排除的范围。同型缺陷两条：
+
+1. **原料行删除索引错位（静默数据损坏，比 500 更危险）**：`request.form.getlist("bom_delete")` 与 `bom_row_id[]` 平行数组按索引配对。**checkbox 未勾选就不提交** → `deletes` 长度必然短于 `bom_row_id` → 索引整体错位：勾第 3 行实际删掉第 1 行，BOM 与用量静默对不上且不报错。
+2. **未捕获 IntegrityError → 500 + 半保存**：`except sqlite3.IntegrityError` 只 flash 不 rollback；新建配方时配方行已 commit、BOM 行却回滚 → 留下半保存的空配方。
+
+**删除意图自带主键（两个页面各一条路由）**：
+- `POST /recipe-cost/ic-recipes/<ic_recipe_id>/bom/<bom_id>/delete` → `recipe_cost.ic_recipe_bom_row_delete`
+- `POST /recipe-cost/recipes/<recipe_id>/bom/<bom_id>/delete` → `recipe_cost.recipe_bom_row_delete`
+- 路由内校验 `bom_id` 属于该配方（`WHERE id = ? AND <外键> = ?`）→ 不能借 A 配方的 URL 删 B 配方的行；不匹配时 `flash(..., "error")` → AJAX 侧是 409 `business_rule`（§13.7）。
+- 「保存配方」表单**不再提交 `bom_delete[]`**，只负责新增与改用量。历史行的删除按钮用 HTML5 `form` 属性关联到表格外的 `<form>`（外层已是 `bom-form`，不能再嵌套 form，HTML 会截断 DOM）；未保存的新增行删除只摘 DOM（`static/recipe_cost.js` 的 `[data-remove-row]` 委托）。
+
+**保存撞唯一约束 → 整批 rollback**：
+- `ic_recipe_items` 有 `UNIQUE(ic_recipe_id, item_id)`：两行指向同一原料会撞唯一约束 → 整批 `rollback()` + `flash("保存失败：第 N 行的原料与配方中其它行重复，本次修改已全部撤销", "error")` → AJAX 侧 409 `business_rule`（与 §13.12 同语义）。
+- `recipe_items` 是多态表（`item_id` / `ic_recipe_id` 二选一），**没有 UNIQUE 约束** → 重复原料在视图层判定（`(source_type, target_id)` 在本次提交内不得重复），否则同一原料被静默记两行、用量与成本口径一起失真。
+- 配方行与 BOM 行必须**同生共死**：新建配方时配方 `INSERT` 不再提前 commit（`audit()` 内部自带 commit，故 create 审计移到最终 commit 之后写），失败时 `rollback()` 一并撤销配方行。
+- 改名撞 `recipes.name` / `ic_recipes.name` 的 UNIQUE 同样整批回滚 + `flash(..., "error")`，不再 500。
+
+回归：`tests/test_recipe_bom_delete.py`（20 例，冰激凌配方页 10 + 出品配方页 9 + 跨页权限 1）。变异验证：整包还原成 `origin/main` 的 bug 版 → 20 例中 17 例变红；定向还原「旧 IntegrityError 处理」→ 3 例红；把 `bom_delete[]` checkbox 放回保存表单 → 1 例红。
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
@@ -2264,6 +2291,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
 | 企微推送无重发队列 / 无失败告警 | 低 | 已知限制（2026-10-16 登记，§3.9） | 对外通道失败只留 WARNING（`wecom_notify_dropped` + errcode），不阻塞下单、不回滚、不补发；机器人被移出群 / key 轮换后需人工更新 `/etc/dailycheck/app.env` 才恢复。通知 SLA 属商业化项，另立项 |
 | Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
+| 出品配方的多态行 `bom_item_id[]` / `bom_ic_recipe_id[]` 与 `bom_row_id[]` **不按位对齐** | **高** | pre-existing（Issue #47 复核时发现，**本次未修**，已另立 issue） | 模板每行只渲染「当前类型」的那一个 select（`bom_item_id` 或 `bom_ic_recipe_id`），浏览器提交时两个数组各自按类型计数、与 `bom_row_id[]` 长度不等；后端按 `item_ids[i]` / `ic_ids[i]` 取值 → **混合来源**的出品配方保存时，部分行的原料/用量被静默跳过，甚至写错行（行序为 [ic_recipe, item, item] 时，第 2 行可能被写成第 3 行的原料）。与 §13.13 同属「平行数组按位配对」家族，但根因在**模板渲染 ≠ 表单契约**，与 Issue #47 的两条缺陷不同源 → 按 workflow.md D2 另立 issue，不在本 PR 修。**修法**：每行同时渲染另一类型的 hidden 占位（`value=""`），或后端改为按行解析。存量风险：混合来源的出品配方保存后行数/用量可能与预期不符，**改配方前先核对行数** |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 
 ---

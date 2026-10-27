@@ -270,10 +270,12 @@ ROUTE_MATRIX: dict[str, str] = {
     "recipe_cost.ic_recipe_new": PLATFORM,
     "recipe_cost.ic_recipe_edit": PLATFORM,
     "recipe_cost.ic_recipe_delete": PLATFORM,
+    "recipe_cost.ic_recipe_bom_row_delete": PLATFORM,
     "recipe_cost.recipes_list": LOGIN,
     "recipe_cost.recipe_new": PLATFORM,
     "recipe_cost.recipe_edit": PLATFORM,
     "recipe_cost.recipe_delete": PLATFORM,
+    "recipe_cost.recipe_bom_row_delete": PLATFORM,
     "recipe_cost.update_selling_price": PLATFORM,
     # R1 终裁（2026-10-13，验证报告 R1）：配方成本读接口收紧至 report.cost.view
     # （staff/viewer 403；manager/finance/admin 放行）。
