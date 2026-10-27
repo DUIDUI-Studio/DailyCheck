@@ -1,0 +1,37 @@
+# deploy/systemd/dc-prod-agent-drain.service
+#
+# One-shot drainer for the durable Prod Agent reducer queue (Issue #54).
+# Timer frequency is intentionally modest: the inbox watcher still retries
+# deferred deliveries immediately with backoff; this unit is the recovery path
+# when the watcher is down or an enqueue/complete transition was interrupted.
+
+[Unit]
+Description=DailyCheck Prod Agent reducer queue drain (Issue #54)
+After=dc-inbox-watcher.service
+ConditionPathExists=/usr/local/bin/dc-notify-prod-agent
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/DailyCheck
+Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/usr/local/bin/dc-notify-prod-agent --drain
+TimeoutStartSec=120
+
+# The reducer remains the only trigger-queue writer. It serializes claims
+# transactionally even if watcher, timer and provider-breaker writes race.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dailycheck-prod-agent /root/.hermes
+PrivateTmp=true
+ProtectHome=read-only
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

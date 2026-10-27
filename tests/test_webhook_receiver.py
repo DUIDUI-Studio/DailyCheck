@@ -12,7 +12,8 @@
 
 验证（v2，2026-10-16 check_suite 快通道）：
 - check_suite completed + conclusion=success + 有 PR 关联 → 202 落盘（check_* 字段）
-- 无 PR 关联 / conclusion≠success / 非 completed action → 200 ignored 不落盘
+- 无 PR 关联 / 非 completed action → 200 ignored 不落盘
+- conclusion 中间态/失败落盘给 reducer 记账，由 reducer 静默 fail-closed
 - action 白名单按事件分叉（check_suite 不接受 opened 等）
 
 不测（实跑在 VPS 由 Prod Agent 验）：
@@ -469,8 +470,8 @@ def test_check_suite_success_queued(tmp_path, monkeypatch):
     assert rec["pr_url"] == "https://github.com/ericmr1981/DailyCheck/pull/52"
 
 
-def test_check_suite_failure_conclusion_ignored(tmp_path, monkeypatch):
-    """conclusion ∈ {failure, cancelled, timed_out, neutral, skipped} → ignored。"""
+def test_check_suite_failure_conclusion_is_passed_to_reducer_without_provider(tmp_path, monkeypatch):
+    """失败/中间态也落盘，由 reducer 更新状态且零 provider 调用。"""
     monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
     monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
     client = webhook_receiver.app.test_client()
@@ -486,9 +487,19 @@ def test_check_suite_failure_conclusion_ignored(tmp_path, monkeypatch):
                 "X-Hub-Signature-256": sig,
             },
         )
-        assert resp.status_code == 200
-        assert b"ignored" in resp.data
-    assert not (tmp_path / "inbox.jsonl").exists()
+        assert resp.status_code == 202
+        assert b"queued" in resp.data
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "inbox.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["check_conclusion"] for record in records] == [
+        "failure",
+        "cancelled",
+        "timed_out",
+        "neutral",
+        "skipped",
+    ]
 
 
 def test_check_suite_without_pr_ignored(tmp_path, monkeypatch):
@@ -676,8 +687,8 @@ def test_status_all_checks_green_queued(tmp_path, monkeypatch):
     assert rec["status_context"] == "CI / test (pull_request)"
 
 
-def test_status_other_check_pending_ignored(tmp_path, monkeypatch):
-    """两个必需 check 未全绿（另一个还 pending）→ 200 ignored checks_pending，不落盘。"""
+def test_status_other_check_pending_is_passed_to_reducer(tmp_path, monkeypatch):
+    """部分成功也落盘；下游 reducer 查询全量状态后静默等待。"""
     monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
     monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
     sha = "cd" * 20
@@ -690,7 +701,7 @@ def test_status_other_check_pending_ignored(tmp_path, monkeypatch):
         ],
     )
     client = webhook_receiver.app.test_client()
-    payload = _make_status_payload(sha=sha)
+    payload = _make_status_payload(state="pending", sha=sha)
     resp = client.post(
         "/webhook",
         data=payload,
@@ -700,16 +711,17 @@ def test_status_other_check_pending_ignored(tmp_path, monkeypatch):
             "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
         },
     )
-    assert resp.status_code == 200
-    assert b"checks_pending" in resp.data
-    assert not (tmp_path / "inbox.jsonl").exists()
+    assert resp.status_code == 202
+    assert b"queued" in resp.data
+    rec = _read_first_line(tmp_path / "inbox.jsonl")
+    assert rec["check_conclusion"] == "pending"
 
 
-def test_status_failure_state_ignored(tmp_path, monkeypatch):
-    """state != success → ignored（不触发 merge 判定）。"""
+def test_status_failure_state_is_passed_to_reducer(tmp_path, monkeypatch):
+    """state != success 落盘给 reducer 记账，不在这里唤醒任何 provider。"""
     monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
     monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
-    _stub_gitea(monkeypatch, prs=[], statuses=[])
+    _stub_gitea(monkeypatch, prs=[_pr_obj(number=80)], statuses=[])
     client = webhook_receiver.app.test_client()
     for state in ("failure", "pending", "error"):
         payload = _make_status_payload(state=state)
@@ -722,9 +734,17 @@ def test_status_failure_state_ignored(tmp_path, monkeypatch):
                 "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
             },
         )
-        assert resp.status_code == 200
-        assert b"ignored" in resp.data
-    assert not (tmp_path / "inbox.jsonl").exists()
+        assert resp.status_code == 202
+        assert b"queued" in resp.data
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "inbox.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["check_conclusion"] for record in records] == [
+        "failure",
+        "pending",
+        "error",
+    ]
 
 
 def test_status_no_pr_ignored(tmp_path, monkeypatch):
@@ -748,11 +768,11 @@ def test_status_no_pr_ignored(tmp_path, monkeypatch):
     assert not (tmp_path / "inbox.jsonl").exists()
 
 
-def test_status_non_required_context_ignored(tmp_path, monkeypatch):
-    """非必需 check 的 status（别的 status 提供者）→ ignored context。"""
+def test_status_non_required_context_is_passed_and_left_to_exact_reducer_gate(tmp_path, monkeypatch):
+    """receiver 不再用子串猜 required context；reducer 用精确配置判定。"""
     monkeypatch.setattr(webhook_receiver, "WEBHOOK_SECRET", _TEST_SECRET)
     monkeypatch.setattr(webhook_receiver, "INBOX_PATH", tmp_path / "inbox.jsonl")
-    _stub_gitea(monkeypatch, prs=[], statuses=[])
+    _stub_gitea(monkeypatch, prs=[_pr_obj(number=81)], statuses=[])
     client = webhook_receiver.app.test_client()
     payload = _make_status_payload(context="someone-else/lint")
     resp = client.post(
@@ -764,9 +784,10 @@ def test_status_non_required_context_ignored(tmp_path, monkeypatch):
             "X-Hub-Signature-256": _make_signature(_TEST_SECRET, payload),
         },
     )
-    assert resp.status_code == 200
-    assert b"context" in resp.data
-    assert not (tmp_path / "inbox.jsonl").exists()
+    assert resp.status_code == 202
+    assert b"queued" in resp.data
+    rec = _read_first_line(tmp_path / "inbox.jsonl")
+    assert rec["status_context"] == "someone-else/lint"
 
 
 def test_pull_request_synchronized_accepted(tmp_path, monkeypatch):

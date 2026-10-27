@@ -140,6 +140,24 @@ def triage(
     if rc == 0:
         return _result(KIND_SUCCESS, SCOPE_OUT, "部署全链完成", rc, stage)
 
+    if rc == 25:
+        return _result(
+            KIND_ENV,
+            SCOPE_OUT,
+            "候选模式前置不满足（分支落后 main / sha 不符 / PR 非 open），"
+            "未触碰蓝绿。",
+            rc,
+            stage,
+        )
+    if rc == 26:
+        return _result(
+            KIND_ENV,
+            SCOPE_OUT,
+            "验证期间 main 被改动，FF 合并失败；已切回蓝，main 未包含候选代码。",
+            rc,
+            stage,
+        )
+
     if stage == "verify-drift":
         return _result(
             KIND_DRIFT,

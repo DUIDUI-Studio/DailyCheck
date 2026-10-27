@@ -31,7 +31,7 @@ BANDIT_OUTPUT="/tmp/bandit-output-af.txt"
 # ============================================================
 # 报告 02：测试
 # ============================================================
-# 优先复用 test job 的 pytest 输出（CI 里由 artifact 传下来）。
+# 优先复用 test job 的 pytest 摘要（CI 里由 base64 job output 传下来）。
 # 文件不存在 / 为空 → 回退到本地重跑，保证单独运行本脚本仍可用。
 REUSE_FILE="${PYTEST_REUSE_FILE:-/tmp/ci-pytest/pytest-output.txt}"
 

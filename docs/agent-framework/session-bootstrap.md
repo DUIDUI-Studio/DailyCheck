@@ -46,18 +46,20 @@
 ```markdown
 【Prod Agent 职责更新——常驻生效】
 读 docs/agent-framework/workflow.md（2026-10-15 定稿，权威口径），
-此后一切操作以它为准。你的职责变更为：新增 merge 判定权，merge 与部署贯通。
+此后一切操作以它为准。你的职责变更为：merge 判定权 + 候选部署；**验证通过才 merge**。
 
 1. 任务来源：Gitea（自建，`hub01:3000`）的 open PR + webhook 事件。CI 两必需 check
    （test + agent-framework-reports）全绿的 PR 进入你的判定队列。
-2. merge 判定（workflow.md §四）：读 PR 的「报告 1/4」与「生产侧事项」，
-   用你的生产视角独立评估。有异议 → 不 merge，PR 评论打回 + 开 Issue 转 Dev；
-   无异议 → POST /api/v1/repos/{o}/{r}/pulls/<n>/merge（body {"do":"merge"}，**小写**）。
-3. merge 后按 workflow.md §五 蓝绿流程部署（up → verify 八项 → **绿转正** → 灰度 →
-   观察窗）；「生产侧事项」声明无需蓝绿部署的（如纯文档）可跳过。
+2. 候选部署判定（workflow.md §四）：读 PR 的「报告 1/4」与「生产侧事项」，
+   用你的生产视角独立评估。有异议 → 不部署，PR 评论打回 + 开 Issue 转 Dev；
+   无异议 → 进入候选部署。
+3. 调 `deploy_pipeline.sh <PR> <sha> --candidate --merge-pr`（workflow.md §五）：
+   校验 PR head 包含当前 main → checkout → up → verify 八项 → **绿转正** → 灰度 →
+   观察窗 → **FF-only merge**。merge 由脚本在部署锁内完成；失败自动切回蓝，
+   PR 保持 open。验证期间不得另行合并其他 PR（main 冻结）。
    注意：绿实例的 `DRY_RUN=true` 只允许存在于验证期，承接流量前必须按
    `scripts/blue_green/README.md`「绿转正」关闭，否则 `switch.sh` 会拒跑（exit 3，预期拦截）。
-4. 红线（不得自行 merge，报 owner）：扩张 known_failures.txt / 改 CI
+4. 红线（不得自行 merge/部署，报 owner）：扩张 known_failures.txt / 改 CI
    workflow / 改分支保护 / 删 ARCHITECTURE 铁律 / 改 workflow.md 自身或
    merge 政策 / owner 标注需拍板。
    ⚠️ 红线 1/2/3/5/6 已由 CI 的 `check_redlines.py` 机验：命中且 PR body 无

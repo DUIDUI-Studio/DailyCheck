@@ -3,7 +3,7 @@
 
 背景（Issue #47 / docs/2026-10-15-webhook-setup.md §3.8）：
   快通道 = Gitea webhook → dc-webhook-receiver → inbox.jsonl → dc-inbox-watcher
-           → dc-notify-prod-agent → Hermes dailycheck-pr 订阅（≤5s 唤起判定）。
+           → dc-notify-prod-agent → Hermes wdg-pr 订阅（≤5s 唤起判定）。
   本脚本是「快通道整体故障时」的兜底：每 30 分钟直接查 Gitea open PR。
 
 迁移说明（2026-10-22，GitHub 账号停用后迁至 hub1 自托管 Gitea）：
