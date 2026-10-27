@@ -128,12 +128,14 @@ flowchart LR
 ```mermaid
 flowchart LR
     Gitea["Gitea Actions<br/>(hub1 · .github/workflows/ci.yml)"]
+    ProdAgent["Prod Agent (VPS)<br/>scripts/blue_green/deploy_pipeline.sh"]
     VPS["VPS 112.124.18.246:33756 root<br/>/root/DailyCheck"]
     Gunicorn["gunicorn -w 2 --threads 4<br/>-b 127.0.0.1:8090 app:app<br/>(**非 wdg-systemd**)"]
     SQLite["SQLite 文件 (非 bind mount)"]
     Secrets["/etc/dailycheck/app.env<br/>0600 — 强 secret + DAILYCHECK_ENV=production"]
 
-    Gitea -->|SSH: tar → releases/ → scripts/deploy_vps.sh<br/>（备份→切换→migrate→健康检查→失败自动回滚）<br/>**前置 CI test 通过**| VPS
+    Gitea -->|CI 门禁 + status webhook<br/>（不再触发部署）| ProdAgent
+    ProdAgent -->|蓝绿部署（§3.4）| VPS
     VPS --> Gunicorn
     Gunicorn --> SQLite
     Secrets -.->|EnvironmentFile| Gunicorn
@@ -148,7 +150,7 @@ flowchart LR
 | **进程管理器** | systemd in container | gunicorn -D（无 systemd） |
 | **Flask reload** | `--debug` 自动 reload | 无 |
 | **MCP 进程** | systemd unit | **未部署**（MCP 只在 dev 跑） |
-| **部署方式** | mount + edit | `ci.yml` test 通过后走 `scripts/deploy_vps.sh`：sqlite 热备全库 + 代码备份 → rsync 切换（`*.db`/log/venv 永不触碰）→ `flask migrate up` → systemd 重启 → `/health` 探活 → 失败自动回滚代码并重启。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑）。**凭据类文件（`vps_key`/`*.pem`）双向排除**：CI 侧面把私钥写到 `mktemp` 临时文件（不在打包目录内），打包与 rsync 两侧各自再排除一次，切换前显式 `rm -f $APP_DIR/vps_key` 清历史残留——rsync `--delete` 不处理排除项（Issue #9，2026-10-24） |
+| **部署方式** | mount + edit | **Prod Agent 蓝绿部署**（§3.4：`deploy_pipeline.sh` → up/verify/promote/switch/观察窗；2026-10-25 起 deploy-first：验证通过后 FF-only merge）。`scripts/deploy_vps.sh` 保留为**应急手动路径**（sqlite 热备 + rsync + migrate + 重启 + 探活 + 失败回滚），CI 不再调用（`f293746` 移除 deploy job）。**db/ Python 包必须进代码备份**（2026-10-10 dev 演练踩坑）。**凭据类文件（`vps_key`/`*.pem`）双向排除**：打包与 rsync 两侧各自再排除一次，切换前显式 `rm -f $APP_DIR/vps_key` 清历史残留——rsync `--delete` 不处理排除项（Issue #9，2026-10-24） |
 | **备份/DR** | 无 | `scripts/backup_all.sh`（cron 每日，integrity_check + tar + 可选异地）+ `scripts/verify_restore.sh`（每周还原演练）+ `docs/runbook-dr.md`（RPO=24h/RTO=1h） |
 | **入口端口** | :8080 / :5100 | :8090（仅 Flask） |
 
@@ -183,7 +185,7 @@ Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver`
 
 **组件**（`scripts/blue_green/webhook_receiver.py`，Flask 127.0.0.1:8443）：
 - **HMAC-SHA256 验签**（`X-Hub-Signature-256` + `WEBHOOK_SECRET` env）—— 拒伪 + 拒重放，constant-time 防时序攻击
-- **事件过滤**：`pull_request`（action 仅 `{opened, synchronize, synchronized, reopened}`——Gitea 的 synchronize 拼作 **synchronized**，两个都收）+ CI 完成事件（GitHub 是 `check_suite` completed+success；Gitea 没有该事件，改用 `status`：state=success 且按 sha 反查到 open PR、两个必需 check 全绿才落盘 —— 秒级唤醒快通道）
+- **事件过滤**：`pull_request`（action 仅 `{opened, synchronize, synchronized, reopened}`——Gitea 的 synchronize 拼作 **synchronized**，两个都收）只落 reducer 状态；CI 更新（GitHub `check_suite` completed；Gitea 没有该事件，改用 `status` 并按 sha 反查 open PR）也全部落盘，running/failure/partial 由 reducer 静默记账。只有确定性 readiness gate 通过后才产生一次 `MERGE_READY`
 - **幂等**：按 `X-GitHub-Delivery` / `X-Gitea-Delivery` 去重（两端都会重试，receiver 必须幂等否则 inbox 写脏）
 - **反压**：`inbox_size ≥ MAX_INBOX_LINES`（默认 1000）返回 503，投递方暂停重试（指数退避 1s/2s/.../1h）
 - **inbox 落盘**：每行 JSON，append-only，含 `delivery_id / event / action / pr_number / pr_title / pr_head_sha / pr_base_ref / pr_author / repo_full_name / received_at_ms`；`check_suite` 记录追加 `check_conclusion / check_head_branch / check_suite_id`（payload 没有的字段如 pr_title / pr_author 填空串，字段形状与 pull_request 记录对齐）
@@ -199,22 +201,35 @@ Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver`
 
 **生产侧操作手册**：`docs/2026-10-15-webhook-setup.md`（50-70 分钟手动部署；DNS / **443 放行核验** / 申请 hook 独立证书 / systemd / nginx reload / Gitea 配 webhook + 端到端验证）。
 
-**测试**：`tests/test_webhook_receiver.py`（19 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点 / check_suite 六态（success 落盘 + check_* 字段 / 非 success 拒绝 / 无 PR 拒绝 / 非 completed 拒绝 / action 白名单分叉 / 幂等）；全部经变异验证真 FAIL —— 删 HMAC 验签 / 删反压 / 删幂等 / 删 conclusion 过滤 / 删 no_pr 过滤 / 白名单误加 opened 各自对应测试 FAIL）。
+**测试**：`tests/test_webhook_receiver.py`（25 用例：HMAC 三态 / event 过滤 / action 白名单 / 幂等 / 反压 / inbox 字段完整性 / `/health` 端点 / check_suite success 与 failure 落盘 / 无 PR 拒绝 / 非 completed 拒绝 / action 白名单分叉 / Gitea status success/pending/failure 落盘且 check_conclusion 保真）。receiver 只做 PR 关联与传输幂等；required contexts 的精确判断由 reducer 单测覆盖。
 
-**Prod Agent 集成（2026-10-16 实装，Issue #47）**：`scripts/prod_agent/inbox_watcher.py` 常驻订阅 `inbox.jsonl`，新条目 **≤5s** 内触发 `--trigger-cmd`（事件 JSON 原样走 stdin；样例 `deploy/scripts/dc-notify-prod-agent.sh` 把事件投给 Prod Agent 入口，默认指向 Hermes webhook 订阅）。要点：
+**Prod Agent 集成（2026-10-16 实装，Issue #47；Issue #56 收紧 provider 边界）**：`scripts/prod_agent/inbox_watcher.py` 常驻订阅 `inbox.jsonl`，新条目 **≤5s** 内触发 `--trigger-cmd`（事件 JSON 原样走 stdin；`deploy/scripts/dc-notify-prod-agent.sh` 只在 reducer 产出 `MERGE_READY` / `deploy_result` 时调用 Hermes）。要点：
 
-- **三个订阅，按 `event` 分流**（`dc-notify-prod-agent`）：`check_suite` → `dailycheck-ci`（CI 全绿即唤醒 merge 判定）、`deploy_result` → `dailycheck-deploy`（部署收尾唤醒，见 §3.4）、其余 → `dailycheck-pr`（PR 生命周期）。**路由错投不会报错**：落到 `dailycheck-pr` 时那个订阅的 prompt 是「判定 merge」，会把一次部署失败当成 PR 更新处理然后什么都不做 —— 静默错投比投不出去更坏，故有用例钉着这条 `case` 分支。
+- **两个 provider 路由**（`dc-notify-prod-agent`）：确定性的 `MERGE_READY` → `wdg-ci`，`deploy_result` → `dailycheck-deploy`（部署收尾，见 §3.4）。`pull_request` 与 `wdg-pr` 在 reducer、shell adapter 和 sender 三层都不可形成 provider 调用；已有 `wdg-pr` secret 不读取、不改写，可留待运维清理。
 - **`deploy_result` 的 `action` 复用 `completed`**：watcher 的 `--actions` 白名单已含它，不为新值改 systemd unit。分流只看 `event`。
 
 - **tail 语义**（纯 stdlib、跨平台）：轮询 `stat(inode, size, mtime)` 检测变更（默认 0.5s 间隔），只处理以 `\n` 结尾的完整行（半行留待下轮）——不用 inotify（Linux-only）、不引三方库
 - **去重语义**：全文件扫描 + `handled_ids` 状态集合（原子写 `inbox_watcher_state.json`）—— 重启 / rotate 换 inode / 停机期间新增等任何时序下，每条 `delivery_id` 至多触发一次、未触发过的必然补触发
-- **机械过滤**（纵深防御）：仅 `repo_full_name == ericmr1981/DailyCheck` 且 action 属白名单（unit 显式传 `--actions opened,synchronize,reopened,completed`，`completed` 供 check_suite 事件使用）的条目触发；draft 等业务语义交 Prod Agent 判定，本脚本不预判
+- **机械过滤**（纵深防御）：仅 `repo_full_name == eric/dailycheck` 且 action 属白名单（unit 显式传 `--actions opened,synchronize,reopened,completed`，`completed` 供 check_suite 事件使用）的条目触发；draft 等业务语义交 reducer/Prod Agent 判定，本脚本不预判
 - **失败重试**：触发非 0 退出 / 超时 → 指数退避（1s→60s 封顶）+ WARNING 留痕，绝不静默丢弃。退避到期**不再依赖 inbox 文件签名变化**（Issue #51 修复）：主循环条件为 `sig != last_sig or retry_due(state)`，inbox 无新行时退避条目也会自行重试；`retry_due` / `_next_at` 与 `load()` 归一化共用 `state.sane_ahead` 上界（= `retry_max + 300s` 时钟余量）。下方兜底轮询继续保底
 - **兜底轮询（2026-10-16 实装，§3.9）**：Prod 侧 Hermes cron 每 30 分钟跑 `dailycheck_pr_poll.py`（repo 同源 `deploy/scripts/`）直接查 Gitea `GET /api/v1/repos/eric/dailycheck/pulls?state=open`——webhook 快通道整体故障时的保底发现通道；无 open PR 零 stdout（agent 回 `[SILENT]` 无投递），有 PR 走同一 `dailycheck-prod-agent` skill 判定
-- **CI 完成快通道（2026-10-16 增）**：`check_suite`（CI 全绿）事件走同一 inbox → watcher 链路，`dc-notify-prod-agent.sh` 按事件类型路由订阅（check_suite → `dailycheck-ci`，其余 → `dailycheck-pr`）——CI 一绿即触发 Prod Agent 判定 merge（此前 merge 环节需等兜底轮询接棒，最坏 ≤30 分钟）。中间态（suite 绿但两必需 check 未齐）由 Prod Agent 回 `[SILENT]` 抑制投递。⚠️ webhook 通道的 `[SILENT]` 抑制 = gateway `gateway/platforms/webhook.py` 的**本地补丁**（上游出厂仅 cron 投递支持），Hermes 重装/升级后需重打，见手册 §3.8 步骤 3.5
+- **CI merge-ready 快通道（Issue #56）**：PR-associated `check_suite` / Gitea `status` 走同一 inbox → watcher 链路。`event_reducer.py` 调用 stdlib Gitea helper 精确核对 PR open、head 未变、mergeable 与全部 required contexts success；只有该 `(repo, PR, head)` 首次从非就绪转为全绿时，才向 `wdg-ci` 入队一条 `MERGE_READY`。running/failure/partial、malformed API response、重复状态事件均静默且不调用 Hermes；`pull_request` 生命周期只更新 reducer state，不产生 provider work。
 - **归档（防反压挂死）**：`scripts/prod_agent/inbox_rotate.py` + 每日 timer 把 >7 天旧行迁到 `inbox.archive.jsonl`（rename+重建+收敛回填，与 receiver 并发不丢行）—— inbox 是反压闸门（≥1000 行 receiver 返 503），只增不减会挂死新通知
 - **部署**：`deploy/systemd/dc-inbox-watcher.service`（Restart=always / 5s）+ `dc-inbox-rotate.{service,timer}`（每日 00:30）。⚠️ 两个要点（2026-10-16 实测）：unit 的 `ProtectHome` 必须 ≤ `read-only`（`=true` 屏蔽整个 `/root` → `203/EXEC` 无限重启）；触发命令走 Hermes 时必须用 venv 绝对路径 `/root/hermes-agent/.venv/bin/hermes`（`#!/usr/bin/env python3` wrapper 在 watcher 的 PATH 下会解析到 DailyCheck venv，缺 yaml）。手册见 `docs/2026-10-15-webhook-setup.md` §3.8/§3.9
 - **测试**：`tests/test_inbox_watcher.py`（**85 用例**：完整行/半行/U+2028 不误切 / 过滤 / 去重（重启不重复、停机补触发）/ 失败退避 / rotate 七态 / 真实子进程 ≤5s 端到端 / 确定性「旧 fd 窗口」收敛回填 / **json 层损坏不崩（4301 位整数 / 非 UTF-8 字节 / 超深嵌套）** / **代理字符键与代理字符 inbox 值均不崩** / **inbox 行解析三形态不崩** / **孤立代理字符 delivery_id 按坏行处理** / **退化退避到期后无新行自动重试（端到端）** / **8 类条目级 + 3 类容器级损坏归一化与 WARNING 留痕** / **`next=1e308` 不再永久锁死** / **天文位数 attempts 不挂死** / **prune 排除已 handled 的失败残留（否则 retry_due 恒 True → 主循环空转）**；关键断言经变异验证真 FAIL —— 删去重 / 删半行等待 / 失败走成功分支 / 删尾部回填 / 边界反转 / 回退日志转义 / 回退 gating / 回退归一化 / 回退 ldexp 各自对应测试 FAIL）
+
+**事件 reducer / 持久队列（Issue #54，2026-10-26）**：`inbox_watcher` 仍是唯一的 inbox 读者；`deploy/scripts/dc-notify-prod-agent.sh` 把同一条 stdin JSON 交给 `scripts/prod_agent/event_reducer.py`（纯 stdlib + SQLite），不再在 shell 里按事件名直接 `exec`。这层解决四件相互独立的事：输入归一化、delivery/等价事件去重、短窗口合并、以及 provider 调用的单 PR 串行化。
+
+- **状态是唯一事实源**：默认 DB `/var/lib/dailycheck-prod-agent/event_reducer.sqlite3`，WAL + `synchronous=FULL`。`deliveries(delivery_id PK, event_key)` 做幂等；`trigger_queue` 保存 pending/claimed/done、`trigger_id`、`route`、规范化 payload、`due_at_ms`、租约、尝试次数和 collapse 数；`pr_state(repo, pr PK)` 保存 `head_sha / checks_status / review_status / deploy_status / last_event / next_action / updated_at_ms / merge_ready_at_ms / merge_ready_trigger_id / gate_reason`；`provider_state` 保存 Hermes 的 closed/open/half-open、连续失败与 cooldown deadline。
+- **provider 边界与等价键**：支持 inbox 已有的扁平 Gitea 记录，也接受带 `repository` / `pull_request` / `check_suite` 的嵌套形状。校验合法非空 `delivery_id`、正 PR 编号、7–64 位十六进制 head SHA、事件/action 白名单；provider route 只有 `wdg-ci` 与 `dailycheck-deploy`。`pull_request` 在 reducer 中只更新 `pr_state`（首次 opened/reopened 为 `pr_state_updated`，新 head 为 `head_reset`），不进入 trigger queue；新 head 同时把旧 head 的 pending/claimed 行标成 done + `superseded_head`，清空旧 `merge_ready_at_ms`/trigger id，并让旧 lease 的后续 complete/fail 失效。输入在持久化前按 RFC JSON 校验：坏 JSON、NaN/Infinity、数值溢出、重复键、非 UTF-8、代理字符、超深嵌套、超长输入均为 `suppress/invalid_payload`，退出 0，且不会创建毒行。
+- **确定性 merge readiness（Issue #56）**：`scripts/prod_agent/merge_readiness.py` 是 stdlib-only helper，复用 `GITEA_TOKEN` / `GITEA_TOKEN_FILE` / `GITEA_URL`（及既有 token 文件回退）且所有请求有 timeout、禁止 3xx 跟随。它查询事件 `repo_full_name` 对应的 `GET /pulls/{N}` 与 `/commits/{head}/status`（helper CLI 未带事件上下文时使用 `GITEA_REPO`），要求 PR `state=open`、返回 head 与事件 head 完全相同、`mergeable=true`，并逐个精确匹配 `DAILYCHECK_REQUIRED_CONTEXTS`（默认 `test,agent-framework-reports`）的状态；匹配按完整 context 或 `/` 后的 job 叶名精确比较，不做子串猜测。只要同一 required context 存在非成功状态就继续等待/失败，避免旧 success 掩盖新 pending。malformed JSON/字段、token 缺失、超时/网络错误一律 fail-closed。仅第一次全绿转换写成 `MERGE_READY`（payload 带 `trigger_name` 和 `merge_ready_contexts`）并进入 pending；同 `(repo, PR, head)` 的后续事件直接 suppress，零新增 provider 请求。
+- **defer / collapse 语义**：只有 `MERGE_READY` 与 `deploy_result` 进入 pending，`due_at = first_seen + debounce`；deploy 可合并同 PR 同 head 的待处理项并保持最高优先级，窗口最多延长到 `max_debounce`。同 delivery 重试 `MERGE_READY` 若已到期会 claim 既有 trigger（watcher 秒级路径），新 delivery 的重复 CI 则 suppress 为 `already_merge_ready`；旧 head 的 CI/deploy 迟到事件 suppress 为 `stale_head`。
+- **单 PR 租约与 recovery**：`BEGIN IMMEDIATE` 内先回收 `lease_expires_ms <= now` 的 claimed 行为 pending（保留 `last_error=lease_expired`），再只选择一个 due pending。SQLite partial unique index 保证同一 `(repo, pr)` 最多一行 claimed；attempt 递增后生成确定性 lease token，默认 TTL 20 分钟，必须长于 Hermes `agent.gateway_timeout`。Hermes HTTP 2xx 是异步 **enqueue accepted**（正常 202），adapter 立即 `complete`，不等待 agent turn；失败或中断则 `fail` 或到期回收，均不会把事件静默吞掉。完成一个 PR 后才允许该 PR 的下一条 pending trigger；不同 PR 可各自持有一条 active。
+- **429 / circuit breaker**：入站事件、HTTP route 响应或失败报告中的 429/quota 会打开 `provider_state=open`；immediate `Retry-After` 决定 deadline（默认 60s，封顶 1h），写入 `last_error` 前会脱敏 bearer/token/key/password 等凭证形态文本。非法负值按默认 60s cooldown 处理，不允许把 quota 失败退化成立即重试。外部 stdlib breaker 由 timer 每 30s 只读 Hermes `errors.log` 的新增完整字节；无 provider 上下文的泛化 quota 文本不计入，provider 上下文 quota 与显式 429 仍计入，5 分钟内 3 条错误打开 15 分钟 cooldown。日志带 provider reset / `Retry-After` 时最多延长到 1h；cursor 和 pending trip 原子落盘，重启不重放旧事件。deadline 前 drain/ingest 都返回 `defer/provider_cooldown`。到期转 half-open 后，每次 drain 事务可 claim 一个 due work；并发 drain 可各自 claim 不同 PR 的一条，并非全局单探针；成功后回 closed。
+- **CLI 与 watcher 兼容**：`event_reducer.py ingest` 从 stdin 读一行并输出单行 JSON；`drain` 取一条 due work；`status` / `inspect --pr N` 分别做总体与单 PR 观测；`complete` / `fail` 只接受匹配 lease。shell 对 `suppress` 返回 0、对 `defer` 返回 75、对 `trigger` 用 stdlib sender 把原样 body、真实 event 头和稳定的语义 `X-GitHub-Delivery` 发到本地 Hermes route；sender 不跟随任何 3xx，避免把签名 body/header 转发到别处。HMAC secret 只从 `webhook_subscriptions.json` 的对应 route 读取且不回显，HTTP 2xx 入队后 complete 并返回 0。任何未消费失败返回非 0，watcher 原有 delivery-ID 安全和 timeout/backoff 行为不变。
+- **第二条 recovery 路径**：`dc-prod-agent-drain.{service,timer}` 每 30s 调 `dc-notify-prod-agent --drain`，只在 timer 启动后启用；它与 watcher 可并发但 SQLite claim 使其不会为同一 PR 产生第二个 active wake。timer 服务失败保持非 0，journal 可见，不会伪装成功。
+- **rollout**：前置是 `wdg-ci` 与 `dailycheck-deploy` route 可读（已有 `wdg-pr` secret 不需要移除或改写），且 `agent.gateway_timeout` 小于 20 分钟 lease；Gitea token 必须对 PR/status API 可读。部署 reducer/helper/adapter/sender/breaker 后跑 `event_reducer.py status`，用 synthetic opened→running→success→duplicate 验证零/零/一次/零 provider 调用，再观察 24h 的 pending/claimed 与 gate_reason。**rollback**：停用 drain 与 breaker timer，恢复上一版 adapter/sender/reducer，保留 SQLite 与 breaker cursor 供审计；不把 DB 当第二事件源，也不回写 inbox。
+- **测试**：`tests/test_merge_readiness.py` 覆盖 exact context 解析/匹配、open/head/mergeable、missing/running/failure、malformed response 与凭证 fail-closed；`tests/test_event_reducer.py` 覆盖生产 CLI 用真实 readiness client + fake curl 的 ready/not-ready 事件仓库流、PR 零 queue、旧 head lease 失效、非就绪静默、全绿一次 `MERGE_READY`、重复事件 suppress、watcher retry、deploy 保留、429 cooldown、RFC JSON/NaN、redaction、shell HTTP 与并发 drain。`tests/test_dashboard_reducer.py` 验证 dashboard 只读 reducer 投影及 unavailable 不伪零；`tests/test_provider_breaker.py` 继续覆盖 cooldown 与 secret 不落盘。
 
 - **输入层损坏不崩（Issue #66 审核 H-1 / M-3 / L-6，2026-10-17 加固）**：① `WatcherState.load()` 的异常网从 `(OSError, json.JSONDecodeError)` 放宽为 `(OSError, ValueError, RecursionError)` —— 覆盖非 UTF-8 状态文件的 `UnicodeDecodeError`、`json.loads` 对 **>4300 位整数字面量**抛的 ValueError（`sys.get_int_max_str_digits()` 默认 4300，比 `float()` 的 309 位阈值更早触发）、超深嵌套 JSON 的 `RecursionError`；修复前三者直穿 `main()` → `Restart=always` 崩溃循环。② `_parse_record()` 的异常网同样放宽为 `(ValueError, RecursionError)` —— 单条含 >4300 位整数 / 超深嵌套的 inbox 行此前会让 `process_once` 抛出并**反复崩在同一行**（该行永远进不了 `bad_hashes`，故永不跳过）。③ `_delivery_id()` 拒绝**无法 UTF-8 编码**的 id（inbox 行里 `"\ud800"` 这类孤立代理字符能被 `json.loads` 解出，但 `print` / 状态写盘都会抛 `UnicodeEncodeError`）→ 按坏行处理（指纹去重 + `!r` 转义打印）。三处均与孪生副本 `deploy/scripts/dailycheck_dashboard_on_pr.py` 同口径；同 PR 另修两条同型缺陷：① 两侧 `action` 为 list / dict 等**不可哈希**值时 `x in frozenset` 抛 TypeError → 崩溃循环（M-1-r4，先判 `isinstance(action, str)`）；② `triggered:` 日志的 `pr_number` / `pr_head_sha` 未转义 → 代理字符值崩溃循环（H-1-r3，统一过 `_short()`）。`tests/test_inbox_watcher.py` 在同 PR 内由 38 用例扩至 84
 
@@ -226,7 +241,7 @@ Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver`
 - **核心包** `scripts/dailycheck_dashboard/`（dev 端，可 commit）：
   - `__main__.py`：CLI 三子命令 — `render`（拉数据 + 渲染 + 落 db）/ `history`（列最近 N 快照）/ `diff`（最近两次 KPI 对比）
   - `db.py`：SQLite 封装（`snapshots` 主表 + `issues_snapshot` / `prs_snapshot` / `worktrees_snapshot` 三个子表 + `schema_version` 幂等迁移；autocommit 模式 + WAL + `synchronous=NORMAL`）
-  - `fetchers.py`：**Gitea REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`limit=50` 最多 6 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 `/pulls` 的 state 只有 open/closed，「已合并」靠 `merged`/`merged_at` 判）。**不用 gh CLI**（Gitea 没有 gh）。地址按运行位置取（生产 `172.28.129.216:3000`、本机 `hub01:3000`），可用 `GITEA_API_BASE` 覆盖。仓库 private，**没有匿名兜底**：token 依次取 `GITEA_TOKEN` → `/root/.gitea-token` → `~/.config/gitea-token`，全无则抛 `FetchError`（宁可显性失败，也不返回空列表被读成「今日 0 个合并」）。⚠️ Gitea 时间戳带 `+08:00`，`_norm_ts` 必须真正换算成 UTC（截断补 `Z` 会让交付周期差 8 小时）
+  - `fetchers.py`：**Gitea REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`limit=50` 最多 6 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 `/pulls` 的 state 只有 open/closed，「已合并」靠 `merged`/`merged_at` 判）。**不用 gh CLI**（Gitea 没有 gh）。地址按运行位置取（生产 `172.28.129.216:3000`、本机 `hub01:3000`），可用 `GITEA_API_BASE` 覆盖。仓库 private，**没有匿名兜底**：token 依次取 `GITEA_TOKEN` → `/root/.gitea-token` → `~/.config/gitea-token`，全无则抛 `FetchError`（宁可显性失败，也不返回空列表被读成「今日 0 个合并」）。⚠️ Gitea 时间戳带 `+08:00`，`_norm_ts` 必须真正换算成 UTC（截断补 `Z` 会让交付周期差 8 小时）。**Issue #56 起**另有 `fetch_reducer_state()` 用 `mode=ro` 直接读 reducer SQLite，投影 pending/claimed/done、provider state/cooldown 与 `pr_state.merge_ready_*`；不 import runtime reducer，DB 缺失/损坏时返回 `available=false`，页面明确显示不可用而不是伪报 0
   - `render.py`：HTML 渲染（`string.Template` 内嵌 CSS，零三方依赖，KPI 卡片差异行用 `↑N` / `↓N` / `→` 三态箭头）
   - **零三方依赖**：纯 stdlib（`sqlite3` / `subprocess` / `json` / `urllib` / `pathlib` / `string.Template`）
 - **触发 listener** `deploy/scripts/dailycheck_dashboard_on_pr.py`（VPS 端，systemd 拉起）：订阅 `inbox.jsonl`，收到 PR 事件（`{opened,synchronize,reopened}`）→ 调 `python -m scripts.dailycheck_dashboard render --trigger-kind pr_xxx --trigger-event-id <delivery_id>`。**与 `dc-inbox-watcher` 完全独立、互不干扰**（各自一份 handled_ids state-file；同一 inbox.jsonl 多读者，写者只有 receiver）。⚠️ 该脚本是 `scripts/prod_agent/inbox_watcher.py` 的**同源孪生副本**（退避语义、状态归一化规则共享，默认参数与触发方式有意不同）——**任一侧改动必须同步另一侧**，历史上出现过「一侧修、另一侧漏」的单侧漂移（Issue #51 → #66）。⚠️ **孪生口径已收口（2026-10-17，Issue #66 收口 #51）**：规则 7（损坏状态归一化 + 留痕 + `sane_ahead` 上界）现已**两侧同时落地**——本侧首发，孪生侧 `inbox_watcher.py` 随同一 PR 补齐（`_sane_next` / `_normalize_failure` / `_str_set` / `_next_at` / `_attempts` / `retry_due` / `state.sane_ahead`，主循环 gating 同为 `sig != last_sig or retry_due(state)`）。收口背景（按**实测**记录）：Issue #51 的修复分支（`6b70183`）只有 `retry_due` + `_next_at`，**不含** `_normalize_failure` / `_sane_next` / `_str_set` / `sane_ahead`——8 种条目级损坏形态与 3 种容器级形态**全部零 WARNING**，即「合并 #51 并不等于孪生侧收口」；故 owner 于 2026-10-17 拍板由 #66 统一收口，**#51 已关闭（not planned，留收口说明）**，本 PR 为该缺陷族唯一落点。⚠️ **修复前的风险口径（不得低估）**：在役 `dc-inbox-watcher` 对**非数值 / 溢出** `next` 是**抛异常崩溃**（`next="x"` → `ValueError`、`next=10**309` → `OverflowError`；`state.save()` 不执行 → 条目永久留在状态文件 → `Restart=always` 永久崩溃循环），「静默锁死」只描述**有限但越界**（如 `1e308`）这一种形态——两者现已同时关闭
@@ -472,6 +487,17 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 - **机器可读契约**：评论首行固定 `<!-- deploy-report:v1 -->`，正文带 commit 短 sha 与 `下一步` 行。消费端按标记 + sha 检索，不解析自然语言。
 - **best-effort**：Gitea 不可达 / token 缺失 / `deploy_report.py` 文件缺失都只 WARN。这是收尾路径 —— 让回写失败把一次成功部署变成红，本末倒置。**评论写失败也照样投事件**：事件是 agent 唯一入口，Gitea 抖动不该让一次部署失败凭空消失。评论与唤醒队列各自独立失败：inbox 写不进去时，agent 仍能在下一轮兜底轮询里从事件文件 / PR 评论补上。`DAILYCHECK_DEPLOY_REPORT=0` 整体关闭（含事件与唤醒）。
 - **配置**：`DAILYCHECK_GITEA_TOKEN_FILE`（默认 `/etc/dailycheck/gitea-token`，0600）、`FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_REPO`（复用 §3.10 口径）、`DAILYCHECK_DEPLOY_EVENT_LOG`（默认 `/var/lib/dailycheck-deploy/events.jsonl`）、`DAILYCHECK_PROD_AGENT_INBOX`（默认 `/var/lib/dailycheck-prod-agent/inbox.jsonl`）、`DAILYCHECK_CURL`（测试注入 fake）。
+- **沙箱收件箱随状态目录隔离（Issue #38）**：`deploy_pipeline.sh` 默认状态目录仍为 `/var/lib/dailycheck-deploy`，生产唤醒队列仍指向 `/var/lib/dailycheck-prod-agent/inbox.jsonl`；但当 `DAILYCHECK_DEPLOY_STATE_DIR` 被指向任意非默认目录（pytest / 演练）且收件箱为空或仍是生产默认值时，pipeline 将收件箱改投 `${STATE_DIR}/inbox.jsonl`。显式自定义收件箱保持原值，避免改变模板调用语义。pytest 的 `pipeline_sandbox` 同时在夹具层强制隔离该变量，双层防止测试事件唤醒生产 agent。
+
+**deploy-first 合并助手（2026-10-25 起）**：`scripts/blue_green/deploy_merge.py`（stdlib）负责 FF-only 合并前的 PR 校验与合并后复核；Gitea 配置复用 `deploy_report.py` 口径（`FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_REPO` / `DAILYCHECK_GITEA_TOKEN_FILE` / `DAILYCHECK_CURL`）。退出码 0/30/31/32/64，stdout 单行 JSON（`pr` / `sha` / `merged` / `merged_sha` / `reason`）。30 = 非快进（main 在验证期间被改动），31 = PR 前置不匹配，32 = API/token 失败。
+
+`deploy_pipeline.sh` 新增 `--candidate`：部署前 fetch `refs/pull/<pr>/head`，校验 `FETCH_HEAD == sha`、PR open/非 draft/base=main、且 sha 包含当前 `origin/main`，然后 `checkout --detach <sha>`。任一不满足 exit 25，不触碰蓝绿；失败清理把工作树恢复为 `origin/main`。
+
+新增 `--merge-pr`：观察窗通过后、`release success` 之前调 `deploy_merge.py merge`；FF 失败（main 在验证期间被改动）先 `switch.sh blue 100` 回滚，再 exit 26。成功路径 `fetch origin main` + `checkout -B main origin/main`，保证本地树与远端 main 一致。
+
+归因：rc 25（候选前置不满足）与 rc 26（FF 合并失败）均映射 `KIND_ENV` / `SCOPE_OUT` / `NEXT_ENVFIX`，`stage=candidate` / `merge` 写入事件流；两者都不授权改 PR 代码。
+
+`deploy_report.changed_files()` 候选感知：sha 已合入 `origin/main` 时用 `sha^1..sha`；否则用 `merge-base(origin/main, sha)..sha`，保证 deploy-first 下 autofix 能看到整个 PR 的改动。
 
 **PR 兜底轮询**（`scripts/prod_agent/pr_poll.py`，2026-10-25 迁移）：
 
@@ -482,8 +508,10 @@ webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人�
 - **静默语义不变**（skill `no-agent-cron-script-pattern`）：全部无事 → 零 stdout（cron 收空 → 不投递）；有 PR / 有部署欠账 → 输出块。**失败一律出声**：token 读不到、HTTP 非 200、返回非数组、单个 PR 的 status 查不到，都必须落成可见告警 —— 尤其「返回对象而不是数组」不能当成「没有 PR」静默放过。
 - **状态码不能跟着响应体一起丢**：响应体不是 JSON（nginx 502 页、Gitea 明文报错）时仍要报出真实 HTTP code —— 告警里 `HTTP 502` 和 `HTTP 0` 的排查方向完全不同。
 
-**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（40 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（10min / 0min → `observe-window-shortened`、30min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
-+ `tests/test_deploy_report.py`（62 用例：归因十态（含 `verify-drift` 优先于 rc、DRY_RUN BLOCKED 判 out-of-scope）/ 需求解析（加粗 `**R-001**` 与下划线标识符 `DRY_RUN` 不得被误洗）/ 对齐四态（含「无需求条目即挡住自动化」）/ **动作授权表逐格覆盖 + autofix 上界 + 「不存在面向人的动作」的穷举守卫** / 脱敏两形态 / 渲染含标记与 `下一步` 行且不漏明文凭据 / CLI write 的 POST 新建·同 sha PATCH 幂等·Gitea 500 仍 rc 0·`DAILYCHECK_DEPLOY_REPORT=0` 关闭·**失败时除 Gitea 外不得打任何外部端点**（守着「不再推企微」）/ **事件流四例**（自包含字段、Gitea 挂了仍投递、半行 JSON 不废熔断计数、开关关闭不投）/ **唤醒队列七例**（字段自包含且平铺、**必须过 watcher 的 repo 与 action 两道静默过滤**、成功也投、inbox 写失败不影响 rc 与事件流、路由脚本必须有 `deploy_result` 分支且保留默认分支）/ **aligned 端到端给 autofix**（真 git 仓库 + 日志命中改动文件，防映射表对而 write 传错参）/ assess 退出码 / **pipeline 集成三例**（verify 失败后 rc 仍为 21 且真发出评论、`deploy_report.py` 缺失只 WARN、开关生效））。
+**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（49 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（10min / 0min → `observe-window-shortened`、30min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
+ `tests/test_deploy_report.py`（69 用例：归因十态（含 `verify-drift` 优先于 rc、DRY_RUN BLOCKED 判 out-of-scope）/ 需求解析（加粗 `**R-001**` 与下划线标识符 `DRY_RUN` 不得被误洗）/ 对齐四态（含「无需求条目即挡住自动化」）/ **动作授权表逐格覆盖 + autofix 上界 + 「不存在面向人的动作」的穷举守卫** / 脱敏两形态 / 渲染含标记与 `下一步` 行且不漏明文凭据 / CLI write 的 POST 新建·同 sha PATCH 幂等·Gitea 500 仍 rc 0·`DAILYCHECK_DEPLOY_REPORT=0` 关闭·**失败时除 Gitea 外不得打任何外部端点**（守着「不再推企微」）/ **事件流四例**（自包含字段、Gitea 挂了仍投递、半行 JSON 不废熔断计数、开关关闭不投）/ **唤醒队列七例**（字段自包含且平铺、**必须过 watcher 的 repo 与 action 两道静默过滤**、成功也投、inbox 写失败不影响 rc 与事件流、路由脚本必须有 `deploy_result` 分支且保留默认分支）/ **aligned 端到端给 autofix**（真 git 仓库 + 日志命中改动文件，防映射表对而 write 传错参）/ assess 退出码 / **pipeline 集成六例**（verify 失败后 rc 仍为 21 且真发出评论与隔离 inbox、`deploy_report.py` 缺失只 WARN、开关生效、**Issue #38：临时状态目录在收件箱缺失或为生产默认值时改投 tmp，自定义路径保持原值**））。
+ `tests/test_deploy_merge.py`（14 用例：FF-only 合并助手 —— open/closed/draft/sha 不符/base 非 main 前置、FF 成功 payload 必须是 `{"do":"fast-forward-only"}`、405 → rc 30、500/非 JSON/未标记 merged → rc 32、token 缺失 → rc 32、dry-run 不 POST、输出不含 token；fake curl 响应队列，不触网）。
+ **2026-10-25 deploy-first 新增**：`test_deploy_pipeline.py` 9 例（候选前置 rc 25 不触蓝绿 / checkout 先于 up / dry-run 不 checkout / 失败恢复 `origin/main` / merge 在 switch 后 release 前 / merge 失败切蓝 rc 26 / `--merge-pr` 缺 `--candidate` 用法错）；`test_deploy_report.py` 4 例（rc 25/26 归因、`changed_files` 候选感知）。
 + `tests/test_pr_poll.py`（12 用例：无 open PR 与单飞未初始化均静默 / PR 清单含 head·mergeable·draft / 未过 context 逐条列出且不混入已过项 / 多 PR 全列 / token 缺失·HTTP 非 200·返回非数组·单 PR status 查不到全部**出声** / `main()` 兜住未捕获异常（异常必须变可见告警，不能变成空输出）/ 薄包装的 `TARGET` 指向真实存在的文件）。
 
 ---
@@ -630,10 +658,42 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 所以两条一起改，缺一不可：
 
-- 预算抬到 **8192**（不是刚够的 4096，推理长度波动大）。
+- 预算抬到 **8192**（不是刚够的 4096，推理长度波动大）。**⚠️ 该基准已于 2026-10-26 被 16384 取代，见下节。**
 - **解析层必须区分三件事**：结构真坏（无 `choices` / 空列表 / `message` 非对象）→「响应结构不可解析」；`finish_reason=length` 且无正文 →「输出被 max_tokens 截断（reasoning 已用 N tokens）」；有 `content` 但为空 →「模型返回空内容（finish_reason=X）」。把「预算不够」混报成「上游返回物怪异」，会把排查引向错误方向 —— 这次就绕了一圈才定位到。
 
-`tests/test_feedback_analysis.py` 有四条用例分别守着这三种分支 + `MAX_OUTPUT_TOKENS >= 8192`（防止有人觉得「正文才 1800 字符，1600 够了」又改回去）。
+`tests/test_feedback_analysis.py` 有三条用例分别守着上述三种分支，另有两条守预算：`MAX_OUTPUT_TOKENS >= 16384`（防止有人觉得「正文才 1800 字符，1600/8192 够了」又改回去）与 `test_chat_sends_current_output_budget`（payload 里的 `max_tokens` 必须取自常量）。
+
+⚠️ **8192 只对「短 prompt + reasoning 短」的单够用，长单会压在上沿**（2026-10-26 二次标定，Issue #46）
+
+8192 是拿 ticket 9（prompt 2012 tokens）标定的。同一模型换成 ticket 11 / FB-20261025-0001（prompt 2074 tokens），reasoning 需求涨到 6559~8190：
+
+| max_tokens | 三次调用结果 | 落库 |
+|---|---|---|
+| 8192 | `length` / `stop` / `length` —— **2/3 截断**（两次 reasoning 8190 吃满、无 `content`；成功那次 reasoning 6559、content 2656 字符） | 2/3 落 `analysis_model=template` |
+| 16384 | `stop`，reasoning 7440、content 2181 字符、113s | 主路径成功 |
+
+⚠️ **换单后 reasoning 需求翻倍与 prompt 长度不成比例**（ticket 9 的 3325 → ticket 11 的 6559~8190，而 prompt 只从 2012 涨到 2074，+3%）—— 这是 n=1 的单次观测，**不能**据此用 prompt 长度推断安全预算。
+
+即 8192 落在这张单 reasoning 分布的上沿、余量近零；而且 8192 下观测到的 8190 是**被天花板截断的值**，真实上界不可知。**「预算不够」与「等得不够久」在库里同形**（都是 `analysis_model=template`），只有 `gaps` 文案能区分。所以预算定在 **16384**：
+
+- 覆盖已验证的最坏需求 8190，并留一倍余量吸收推理长度波动 —— 是「降低截断概率」，不是「保证不再截断」；
+- 预算对已收敛的单不产生额外消耗（模型 `stop` 即止），多花的只是本来会被截断的那批；
+- 余量核算：113s 完成 reasoning 7440 + content 2181 字符 ≈ 9000 completion tokens（中文按约 1 token/字粗估）⇒ 约 80 tok/s；吃满 16384 约 205s，对默认 300s 只剩 **1.5 倍**（解码降速约 46% 会先撞超时）。16384 本身不需要抬高超时，但这 1.5 倍不是「很足」，若后续再抬预算必须同步核 `FEEDBACK_LLM_TIMEOUT`；
+- 若仍撞 `length`，错误文案会报出 `16384` 与当时的 reasoning 用量，据此再定下一档。
+
+⚠️ **超时与预算是同一个旋钮的两半**（2026-10-25 二次事故修正）
+
+预算抬到 8192 后，同一张单在生产环境的单次真实耗时 **108s**，而 `FEEDBACK_LLM_TIMEOUT` 默认 90s —— 模型还没说完就撞 `TimeoutError`，照样降级，DB 里同样只留 `analysis_model=template` + `gaps` 一句「调用失败（TimeoutError）」。**「预算不够」和「等得不够久」在现场完全同形**，这是本次排查最费时的地方（先疑凭证、再疑网络、最后才回到耗时）。
+
+所以：
+
+- 默认超时 **90s → 300s**（`config.FEEDBACK_LLM_TIMEOUT` 与 `feedback_llm._timeout()` 的兜底值必须同时改，两处都是 300）。**10-25 口径**：300 对 108s 留了近 3 倍余量；**16384 预算下这条余量已降到约 1.5 倍**（吃满约 205s），见上节。
+- 超时**单独报文案**：「调用超时（上限 300s，已等 108s）」，不再混进泛化的「调用失败（TimeoutError）」。上限和已等时长写进去，下次再撞一眼就知道该抬哪一头。
+- 用例守 `_timeout() >= 280`（`test_timeout_covers_reasoning_latency`），防止有人把默认值改回 90；16384 预算吃满约 205s，280 是 1.37 倍的下限。
+- **改一方必须看另一方**：抬 `MAX_OUTPUT_TOKENS` 就要确认超时跟得上；反之缩超时就要确认预算没超。
+
+蓝实例（`dailycheck.service`）的 `EnvironmentFile` 只在**启动时**读取 —— 往 `/etc/dailycheck/wecom-notify.env` 加 `FEEDBACK_LLM_*` 后不 restart 蓝实例，切回蓝就会静默退回「未配置 → 模板兜底」。切流量前先确认目标实例进程 env 里有 key（`tr '\0' '\n' < /proc/<pid>/environ | grep FEEDBACK`）。
+
 
 **Issue 精确化**（`blueprints/feedback_introspect.py`，2026-10-17 追加）：
 
@@ -698,7 +758,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `FEEDBACK_GITEA_API` / `FEEDBACK_GITEA_WEB_BASE` | 内网 API / Tailscale 展示基址 | **API 与给人点的链接刻意分开**（Gitea 的 `html_url` 是实例 ROOT_URL，办公端不可达） |
 | `FEEDBACK_LLM_API_KEY` | 空串 | 二审预分析用的模型 key；**空 = 不调模型**（一审降级为模板兜底分析）。回退 `LLM_API_KEY` |
 | `FEEDBACK_LLM_BASE_URL` / `FEEDBACK_LLM_MODEL` | `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` | OpenAI 兼容端点与模型名；回退 `LLM_BASE_URL` / `LLM_MODEL`（生产与企微库存助手共用一套凭证） |
-| `FEEDBACK_LLM_TIMEOUT` | `90` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长 |
+| `FEEDBACK_LLM_TIMEOUT` | `300` | 单次调用总超时（秒）。分析在后台线程里，超时只影响这张单的等待时长。**必须与 `MAX_OUTPUT_TOKENS` 成对调整**：16384 预算下单次实测 113s（8192 时 108s），90s 会让模型没说完就被掐断 |
 | `PUBLIC_BASE_URL` | `https://kjtang.cn` | 消息与 Issue 正文里的域名（复用 §3.9 同一项） |
 
 `WECOM_FEEDBACK_WEBHOOK` 与 `WECOM_STORE_ORDER_WEBHOOK` **刻意分开**：反馈消息与订单消息频率、受众不同，合用一个 webhook 就无法单独静音其中一路。
@@ -946,6 +1006,31 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 `_env_int()` 对非法值回退默认而不是抛——config 是 import 期求值，一个手滑的 `DIGEST_MAIL_PORT=` 不该让整个 app 起不来。
 
 **测试**（`tests/test_procurement_digest_pure.py` 23 + `tests/test_procurement_digest.py` 25 + `tests/test_procurement_digest_route.py` 8 = 56 用例）：纯渲染（四个决策数字都在 / 截断后总额仍按全量 / 失败店显示「—」/ 空清单三态可在主题区分 / 品项名 HTML 转义 / 缺 `orderable` fail-closed）、取数（真实临时 sqlite：盘点盈亏剔除 / 回退扣减 / **窗口两端 [today-6, today] 钉死** / 坏店记名 / 负消耗截 0）、装配（DC 缺失与未绑主数据的告警）、投递（未配置不发 / 只发一次 / 失败可重试至上限 / 接管 attempts+1 / flock 争用返回 in_progress / 锁文件打不开返回 lock_failed / 状态写不下拒发 / force 仍过锁 / 结果里不含密码）、路由（非超管 403 / 503、502 分流 / GET 405）。
+
+---
+
+### 3.15 Orca 角色模型 fallback（2026-10-26 起）
+
+**问题**：DailyCheck 的 Orca 角色原先每个角色只绑定一个模型。模型 API 的认证、配额、端点或代理热切换出现基础设施故障时，Coordinator 只能停住整条波次；如果临时人工换模型，又没有项目内的顺序、停止条件和审计口径。
+
+**单一事实来源**：
+
+- 人读规则：[`agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md)
+- 机器配置：[`agent-framework/orca-model-routing.json`](agent-framework/orca-model-routing.json)
+- 校验/分类/命令生成：[`../scripts/agent_framework/model_routing.py`](../scripts/agent_framework/model_routing.py)
+
+**路由结构**：每个可调用 LLM 的角色声明一个主模型和有序 `fallbacks`；Release 不调用 LLM。CC Switch 聚合模式负责 provider 层热切换，项目路由只处理 Orca 角色的显式模型切换。
+
+**安全边界**：
+
+| 条件 | 动作 |
+|---|---|
+| 认证失败、429、配额、超时、连接失败、5xx、provider unavailable | 可切换下一模型 |
+| `launch.effective` 与声明的目标模型不一致 | 可切换下一模型 |
+| Reviewer BLOCKER、CI/测试失败、输出质量不达标 | **不切换**，按原失败处理 |
+| `outcome_unknown`、残留 writer/terminal、失败阶段未知 | **不自动切换**，先结算和取证 |
+
+切换必须复用同一 Task，并记录失败 Dispatch：Coordinator 先运行 `model_routing.py classify`，只有 `fallback_allowed=true` 才运行 `model_routing.py next` 生成带 `--retry-of` 的命令。直接调用 `orca orchestration worker-start` 会绕过该项目级机制；同一 worktree 仍遵守单写者铁律。
 
 ---
 
@@ -1886,6 +1971,8 @@ flowchart TB
         KeyHygiene["test_deploy_key_hygiene.py<br/>部署凭据卫生：私钥不进打包目录 /<br/>不进生产应用目录 / 不进索引<br/>6 用例（Issue #9）"]
         Redline["test_redline_gate.py<br/>红线机验：路径命中 / known_failures 净增 /<br/>自述需拍板但无授权<br/>19 用例（Issue #24）"]
         PrHygiene["test_pr_hygiene.py<br/>开工规范：分支前缀白名单 / issue 号与<br/>Closes·Part-Of 一致 / 无号须声明 No-Issue<br/>32 用例（Issue #26）"]
+        CIHandoff["test_ci_artifact_handoff.py (9)<br/>+ test_ci_pytest_summary.py (6)<br/>artifact v4 零引用 / base64 job output /<br/>摘要保留 FAILED·ERROR·collection·末 5 行<br/>（Issue #59）"]
+        ModelRouting["test_orca_model_routing.py<br/>主模型/fallback 顺序 / 基础设施失败分类 /<br/>同 Task retry 命令 / Release 禁止 LLM<br/>16 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
         BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
     end
@@ -1918,6 +2005,8 @@ flowchart TB
 
 **基线更新（2026-10-13，`feat/nav-modules`，rebase 至 `f00e490` 后）**：16 failed / 801 passed — `test_nav_integration.py` 旧断言（staff 应见采购）随导航模块化修正并扩充为 12 用例（796→801），失败集 18→16；`tests/known_failures.txt` 同步删 2 行（清单收缩为 16，与实际失败集逐条一致）。零新增。⚠️ 复用旧 basetemp（`/tmp/pytest-dc`）会因沙箱清理不完全随机出现 1~3 条 `sqlite3.OperationalError` ERROR；换全新 basetemp 即消失，与代码无关。
 
+**时间种子稳定性（2026-10-26，Issue #52）**：订单窗口种子按测试当前的 UTC 时间生成，禁止写死日历日期。`tests/bot/test_tools_ext.py` 保留「1 天前在默认 7 天窗口内、40 天前在窗口外」的原语义，并用 6 天前/8 天前两条订单钉住午夜日期 cutoff 两侧，避免 UTC 跨日导致 CI 时间炸弹。
+
 **整改基线（2026-10-14，`fix/pr-18-nav-modules-defects`）**：14 failed / 768 passed（CI 口径 `--ignore=tests/mcp_server`）。导航用例 12→57（`nav_client_factory` 角色矩阵 + 三载体链接集相等 + 全链接可达性 + 移动端可达性守卫），门禁 exit 0。
 
 **权限精细化基线（2026-10-15，`feat/permission-granularity`，并流 main `9bb9d99` 后）**：14 failed / 928 passed（CI 口径；本地全量 16 failed / 1006 passed）。新增 `test_route_permission_matrix.py` 49 用例（A 覆盖 / B deny-allow / C 不变式）、`test_master_db_migrate.py` RBAC 迁移 +7 用例、`tests/conftest.py` 角色夹具（`manager_client` / `viewer_client` / `finance_client`）；并流后 `url_map` 实测 151 endpoint，Test A 双向断言无遗漏 / 无残留。失败集与 `known_failures.txt` 逐行一致，零新增，门禁 exit 0。
@@ -1933,9 +2022,8 @@ flowchart TB
 - ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
 - `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
 - **防假绿（2026-10-11 起）**：门禁对 pytest 收集错误 / 空输出 / 0 passed 一律拒绝放行（收集错误不产生 FAILED 行，坏依赖曾致门禁空过假绿）。测试三方依赖（如 openpyxl）必须进 requirements.txt。
-- `deploy` job `needs: test`：CI 不过不部署（PR 触发不部署）。
-- **生产部署触发（2026-10-11 起）**：仅 `workflow_dispatch` 手动执行，push main **不**自动部署。启用自动部署的前置条件：至少一次手动 `workflow_dispatch` 演练跑通。
-  - 2026-10-24 修订：原列「备份 cron + 异地副本」已移除。备份 cron 早已在运行（每日 03:00，保留 7 天）；部署流程不触碰数据库，`deploy_vps.sh` 自身在切换前即做库快照与代码备份；异地副本属独立容灾议题，与能否启用自动部署无因果关系。
+- **部署 job 已移除（2026-10-25，`f293746`）**：CI 只做门禁与通知；生产部署归 Prod Agent 蓝绿（§3.4/§3.8）。`scripts/deploy_vps.sh` 保留为应急手动路径，CI 不再调用。
+- **pytest 摘要 job-output 交接（2026-10-26，Issue #59）**：Gitea 不支持 artifact v4，旧 `upload-artifact/download-artifact@v4` 会报 `GHESNotSupportedError`，reports job 下载失败后重跑全量 pytest（Issue 实测每次多耗 18–32 分钟）。CI 现已完全移除两对 artifact 动作：test job 在零新增门禁通过后用 `scripts/ci/pytest_summary.py` 只抽取全部 `FAILED`/`ERROR`、collection/interrupted 标记及最后 5 行，base64 后写入 `pytest_summary_b64` job output；上限 48 KiB，超限失败而非截断。reports job 解码到 `/tmp/ci-pytest/pytest-output.txt` 并设置 `PYTEST_REUSE_FILE`，缺失或损坏时显式失败；直接/手动运行 `generate_reports.sh` 仍保留“文件不存在则跑 pytest”的 fallback。
 - **`agent-framework-reports` 门禁（2026-10-15 起）**：`check_reports.py` 要求 PR body 含 h2「报告 1/4」「Checklist」「生产侧事项」三段且无未消解 ❌；CI 读事件时刻 body 快照，事后补 body 须推空 commit。
 
 **测试的环境无关性（2026-10-15 起，Issue #44）**：用例结果不得取决于「在哪台机器上跑」。最脆的一维是**宿主 systemd**：`switch.sh` 的 DRY_RUN 守卫（PR #42）以 `systemctl show -p MainPID / -p Environment --value <unit>` 取证，于是 dev/CI（**无可用 systemd** —— dev 机没有 `systemctl` 命令；CI 镜像有该命令，但 systemd 未作 PID 1 致取证为空；两者都判「无法判定」→ 仅告警放行）与生产 VPS（`dailycheck-green.service` 固定 `Environment=DRY_RUN=true`，绿未「转正」→ 按设计 `exit 3` 拒跑）结论相反 —— 同一批 `test_blue_green_implementation.py` 用例在 prod 全红、在 dev/CI 全绿（Issue #44 现场 = 跑 `verify.sh` 时 check 1 报 5 个 fail）。**约定**：凡调用 `scripts/blue_green/*.sh` 的用例，必须把宿主 systemd 态**显式钉死**，不许默认「本机没有 systemctl」。`test_blue_green_implementation.py` 用模块级 autouse fixture `_fake_systemctl` 前置 fake `systemctl`（`Environment` 恒 `DRY_RUN=false` =「绿转正后的合法生产态」→ 守卫判 `not_dry_run` 放行），使用例回到「验证切流量动作本身」的原始意图；守卫自身行为由 `test_blue_green_dryrun_guard.py` 专项覆盖（该文件自建按 unit 注入 `Environment` 的 fake）。两处 fake 均只接管 `show`，其余子命令 `exit 0`，故 `journalctl` 等真命令缺失仍能让 `verify.sh` 的失败路径用例保持原语义。
@@ -2114,6 +2202,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | `/production*` 页无侧栏 | 低 | pre-existing（2026-10-14 登记） | `templates/production/{products,runs,product_edit,session}.html` 把 `sidebar` block 覆盖为空 → 桌面端在这些页没有导航（只能靠返回/页内链接）。本次新增的「生产记录」入口沿用同布局。移动端不受影响（`mobile-nav` 未被覆盖） |
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
 | 企微推送无重发队列 / 无失败告警 | 低 | 已知限制（2026-10-16 登记，§3.9） | 对外通道失败只留 WARNING（`wecom_notify_dropped` + errcode），不阻塞下单、不回滚、不补发；机器人被移出群 / key 轮换后需人工更新 `/etc/dailycheck/app.env` 才恢复。通知 SLA 属商业化项，另立项 |
+| Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 
 ---
@@ -2128,10 +2217,12 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/DEV_ENV.md`](DEV_ENV.md) — wdg-systemd 容器部署细节
 - [`docs/mcp-configuration.md`](mcp-configuration.md) — MCP 接入
 - [`docs/agent-framework/workflow.md`](agent-framework/workflow.md) — Dev/Prod/Owner 三方协作工作流（角色、门禁、merge 政策、蓝绿部署、应急）
+- [`docs/agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md) — Orca 角色、模型、effort、fallback 与同 Task 重试规则
 
 ### 部署 / 运维
 
 - [`scripts/blue_green/README.md`](../scripts/blue_green/README.md) — 蓝绿部署操作手册（6 脚本用法 / 验证矩阵 / **「绿转正」标准步骤**，2026-10-15 事故后增补）
+- [`docs/superpowers/specs/2026-10-25-deploy-before-merge-design.md`](superpowers/specs/2026-10-25-deploy-before-merge-design.md) — deploy-first 设计稿（2026-10-25：候选部署 → verify/切流/观察 → FF-only merge）
 
 ### 业务领域
 

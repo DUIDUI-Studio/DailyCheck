@@ -1,0 +1,13 @@
+# deploy/systemd/dc-prod-agent-provider-breaker.timer
+
+[Unit]
+Description=DailyCheck Prod Agent provider-quota breaker timer (Issue #54)
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=dc-prod-agent-provider-breaker.service
+
+[Install]
+WantedBy=timers.target

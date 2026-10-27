@@ -29,6 +29,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -67,9 +68,25 @@ logger = logging.getLogger(__name__)
 #   1600 → length，reasoning 1599，无 content
 #   4096 → length，reasoning 4095，无 content
 #   8192 → stop，  reasoning 3325，content 1805 字符（合法 JSON）
-# 推理长度波动很大，所以取 8192 而不是刚刚够的 4096；真被截断时下面的错误
-# 文案会带上实际 reasoning 用量，便于判断要不要再抬。
-MAX_OUTPUT_TOKENS = 8192
+#
+# ⚠️ 8192 对这一档的单仍不够（2026-10-26 ticket 11 生产冒烟，prompt 2074 tokens）：
+#   8192  → 三次里两次 length，reasoning 8190 吃满、无 content → 降级模板
+#   16384 → stop，reasoning 7440、content 2181 字符、113s
+# 8192 恰好压在这张单 reasoning 分布的上沿（同 prompt 内 6559~8190 摆动），余量近零；
+# 且 8192 下的 8190 是**被天花板截断的观测**，真实上界不可知。取 16384：覆盖已验证
+# 的最坏需求 8190 并留一倍余量，降低截断概率。若仍撞 length，错误文案会带出新的
+# 16384 与当时的 reasoning 用量，据此再谈。预算对已收敛的单不产生额外消耗
+# （模型 stop 即止），多花的只是那些本来会被截断的单。
+#
+# ⚠️ 换单后 reasoning 需求翻倍（ticket 9 的 3325 → ticket 11 的 6559~8190，n=1）
+# 与 prompt 只涨 3%（2012 → 2074）**不成比例**，不能拿 prompt 长度做安全推断。
+#
+# ⚠️ 改这个数必须同时看 ``_timeout()``：预算越大生成越久。按本次实测反推解码约
+# 80 tok/s（reasoning 7440 + content 2181 字符 ≈ 9000 completion tokens，中文按
+# 约 1 token/字粗估 / 113s），吃满 16384 约 205s，对默认 300s 剩约 1.5 倍余量
+# —— 解码降速约 46% 才会先撞超时。只抬预算不抬超时的后果与「预算不够」完全
+# 同形——都落 analysis_model=template。
+MAX_OUTPUT_TOKENS = 16384
 MODEL_TEMPLATE_LABEL = "template"
 
 
@@ -87,10 +104,19 @@ def _model_name() -> str:
 
 
 def _timeout() -> float:
+    """单次调用总超时（秒）。
+
+    默认 300 而不是 90：16384 输出预算下推理模型真实耗时实测 113s（8192 时 108s，
+    见 ``MAX_OUTPUT_TOKENS`` 上方注释）。90 会让「预算够了」的单子死在超时上，
+    且两种降级在库里长得一样（``analysis_model=template``），排查极易走错方向。
+
+    注意 ``urllib`` 的 timeout 是 **socket 级**（连接 / 单次 recv）而不是端到端墙钟，
+    非流式下两者接近但不相等；``MAX_OUTPUT_TOKENS`` 上方按总耗时做的余量核算属保守近似。
+    """
     try:
-        return max(5.0, float(getattr(config, "FEEDBACK_LLM_TIMEOUT", 90) or 90))
+        return max(5.0, float(getattr(config, "FEEDBACK_LLM_TIMEOUT", 300) or 300))
     except (TypeError, ValueError):
-        return 90.0
+        return 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +162,7 @@ def _chat(messages: list[dict[str, str]]) -> str:
         },
         method="POST",
     )
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(request, timeout=_timeout()) as resp:
             body = resp.read()
@@ -147,6 +174,13 @@ def _chat(messages: list[dict[str, str]]) -> str:
         # 只留状态码：响应体可能回显部分请求头，日志里不能出现凭据片段。
         raise LLMError(f"HTTP {exc.code}") from exc
     except Exception as exc:  # noqa: BLE001 - 网络/超时/SSL 一律归为不可用
+        # 超时单独给文案：默认超时被撞破时，光看 "TimeoutError" 分不清是网络
+        # 不稳还是「模型还没说完，是我们等得不够久」——把上限和已等时长写进去，
+        # 下次再撞一眼就知道该抬哪一头。
+        if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+            raise LLMError(
+                f"调用超时（上限 {_timeout():.0f}s，已等 {time.monotonic() - started:.0f}s）"
+            ) from exc
         raise LLMError(f"调用失败（{type(exc).__name__}）") from exc
 
     try:

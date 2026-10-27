@@ -1,0 +1,16 @@
+# deploy/systemd/dc-prod-agent-drain.timer
+#
+# Recover due queue work every 30 seconds. `Persistent` is immaterial for a
+# monotonic timer; `OnBootSec` provides the post-reboot catch-up.
+
+[Unit]
+Description=DailyCheck Prod Agent reducer drain timer (Issue #54)
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=dc-prod-agent-drain.service
+
+[Install]
+WantedBy=timers.target
