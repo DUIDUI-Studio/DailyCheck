@@ -8,13 +8,12 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from datetime import datetime
-from typing import Union
 from pathlib import Path
 
 
 def clone_warehouse_catalog(
-    src_path: Union[str, Path],
-    dst_path: Union[str, Path],
+    src_path: str | Path,
+    dst_path: str | Path,
 ) -> dict:
     """Copy categories, items (qty=0), products, and product_bom
     from src_path into dst_path. Returns row counts copied.
@@ -60,13 +59,22 @@ def clone_warehouse_catalog(
             )
             item_map[r["id"]] = cur.lastrowid
 
-        # 3. products
+        # 3. products —— is_hidden 一并复制：归档状态属于配方的业务属性，
+        # 克隆出来的仓库不该把隐藏的配方又变回可见。
+        # 源库可能是未迁移的老库（本函数直接 connect，不走 migrate），
+        # 缺列时按 0（可见）处理。
+        src_product_cols = {
+            r[1] for r in src.execute("PRAGMA table_info(products)").fetchall()
+        }
+        has_hidden = "is_hidden" in src_product_cols
         src_prods = src.execute("SELECT * FROM products").fetchall()
         prod_map: dict = {}
         for r in src_prods:
             cur = dst.execute(
-                "INSERT INTO products (name, unit, note, created_at) VALUES (?, ?, ?, ?)",
-                (r["name"], r["unit"], r["note"], ts),
+                "INSERT INTO products (name, unit, note, is_hidden, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (r["name"], r["unit"], r["note"],
+                 r["is_hidden"] if has_hidden else 0, ts),
             )
             prod_map[r["id"]] = cur.lastrowid
 

@@ -8,24 +8,41 @@
   <a class="btn" href="{{ url_for('core.land') }}">← 返回落地页</a>
   <a class="btn" href="{{ url_for('production.runs_list') }}">历史记录 →</a>
   {% if is_platform_admin %}
-  <a class="btn" href="{{ url_for('production.product_new') }}">+ 新建产品</a>
+    {% if show_hidden %}
+    <a class="btn" href="{{ url_for('production.products_list') }}">← 隐藏已展开</a>
+    {% elif hidden_count %}
+    <a class="btn" href="{{ url_for('production.products_list', show_hidden=1) }}">显示已隐藏（{{ hidden_count }}）</a>
+    {% endif %}
+    <a class="btn" href="{{ url_for('production.product_new') }}">+ 新建产品</a>
   {% endif %}
 </div>
+
+{% if show_hidden %}
+<p class="muted">已展开隐藏的配方。隐藏只影响列表与生产录入的选择集，配方内容和生产历史都保留。</p>
+{% endif %}
 
 {% if products %}
   <div class="card-list card-list-3">
     {% for p in products %}
     <div class="card" data-href="{{ url_for('production.session') }}?product_id={{ p['id'] }}" data-row>
       <div class="card-main">
-        <h3>{{ p['name'] }}</h3>
+        <h3>
+          {{ p['name'] }}
+          {% if p['is_hidden'] %}<span class="badge-warn">已隐藏</span>{% endif %}
+        </h3>
         <p class="muted">单位：{{ p['unit'] }}{% if p['note'] %} · {{ p['note'] }}{% endif %}</p>
         <p>配方项数：<strong>{{ p['bom_count'] }}</strong></p>
       </div>
       {% if is_platform_admin %}
       <div class="card-actions">
         <a class="btn-sm" href="{{ url_for('production.product_edit', product_id=p['id']) }}">编辑配方</a>
-        <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" data-ajax data-ajax-confirm="确认删除该产品？">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <form method="post" action="{{ url_for('production.product_toggle_hidden', product_id=p['id']) }}" data-ajax data-ajax-mode="reload-stay">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="hidden" value="{{ '0' if p['is_hidden'] else '1' }}">
+          <button class="btn-sm" type="submit">{{ '恢复' if p['is_hidden'] else '隐藏' }}</button>
+        </form>
+        <form method="post" action="{{ url_for('production.product_delete', product_id=p['id']) }}" data-ajax data-ajax-confirm="确认删除该产品？有生产记录的产品不能删除，只能隐藏。">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="btn-sm btn-delete" type="submit">删除</button>
         </form>
       </div>

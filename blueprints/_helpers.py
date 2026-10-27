@@ -289,6 +289,10 @@ def register_ajax_handlers(app) -> None:
         # so popping is the right thing. Non-AJAX callers never reach here.
         flashes = session.pop("_flashes", []) if "_flashes" in session else []
         message = "\n".join(str(m) for _, m in flashes) if flashes else ""
+        # category="error" 的 flash 表示「业务规则拒绝了这次操作」——视图
+        # 仍然是 redirect(PRG)，但结果不是成功。不区分就会重演「有生产记录
+        # 的产品删不掉，前端却把卡片移除了」的假成功（本次生产配方事故）。
+        has_error = any(cat == "error" for cat, _ in flashes)
 
         kind = _redirect_kind(location, request.endpoint)
         if kind == "auth":
@@ -303,6 +307,13 @@ def register_ajax_handlers(app) -> None:
                 "ok": False,
                 "reason": "warehouse_required",
                 "message": message or "请先选择仓库。",
+            }
+            status = 409
+        elif has_error:
+            payload = {
+                "ok": False,
+                "reason": "business_rule",
+                "message": message or "操作未生效，请检查后重试。",
             }
             status = 409
         else:

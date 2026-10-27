@@ -54,13 +54,27 @@ def _set_no_sidebar_and_guard():
 @require_login
 def products_list():
     db = get_warehouse_db()
+    # 隐藏（归档）的产品默认不出现在列表里 —— 它们仍有生产历史，只是退出了
+    # 日常选择集。管理员用 ?show_hidden=1 查看并恢复。
+    show_hidden = request.args.get("show_hidden", "0") == "1"
+    where = "" if show_hidden else "WHERE p.is_hidden = 0"
     products_data = db.execute(
-        """SELECT p.*, COUNT(b.id) AS bom_count
+        f"""SELECT p.*, COUNT(b.id) AS bom_count
            FROM products p
            LEFT JOIN product_bom b ON b.product_id = p.id
+           {where}
            GROUP BY p.id ORDER BY p.id DESC"""
     ).fetchall()
-    return render("production/products.html", products=products_data, no_sidebar=True)
+    hidden_count = db.execute(
+        "SELECT COUNT(*) AS c FROM products WHERE is_hidden = 1"
+    ).fetchone()["c"]
+    return render(
+        "production/products.html",
+        products=products_data,
+        show_hidden=show_hidden,
+        hidden_count=hidden_count,
+        no_sidebar=True,
+    )
 
 
 def _load_items_for_bom():
@@ -96,7 +110,7 @@ def product_new():
             flash("产品已创建，请补充配方")
             return redirect(url_for("production.product_edit", product_id=new_id))
         except sqlite3.IntegrityError:
-            flash("产品名称已存在")
+            flash("产品名称已存在", "error")
             return redirect(url_for("production.product_new"))
     return render("production/product_edit.html", product=None, bom_rows=[], items=_load_items_for_bom(), no_sidebar=True)
 
@@ -115,50 +129,61 @@ def product_edit(product_id: int):
         unit = request.form.get("unit", "件").strip() or "件"
         note = request.form.get("note", "").strip()
         if not name:
-            flash("产品名称为必填")
+            flash("产品名称为必填", "error")
             return redirect(url_for("production.product_edit", product_id=product_id))
-        db.execute(
-            "UPDATE products SET name=?, unit=?, note=? WHERE id=?",
-            (name, unit, note, product_id),
-        )
-        # BOM rows: parallel arrays. bom_row_id[] identifies existing rows
-        # (empty string = new); bom_delete[]='1' removes that row. We do
-        # NOT need a separate product_bom check on delete — schema has
-        # ON DELETE CASCADE from products (see db/__init__.py).
+        try:
+            db.execute(
+                "UPDATE products SET name=?, unit=?, note=? WHERE id=?",
+                (name, unit, note, product_id),
+            )
+        except sqlite3.IntegrityError:
+            db.rollback()
+            flash("产品名称已存在", "error")
+            return redirect(url_for("production.product_edit", product_id=product_id))
+
+        # BOM rows: parallel arrays, bom_row_id 为空串表示新增行。
+        # 删除某一行不走本表单 —— 每行有独立的「删除」按钮，点击即调
+        # production.bom_row_delete 落库。这样后端不再需要 bom_delete[]
+        # 数组：checkbox 不勾选就不提交，长度必然短于 bom_row_id，按索引
+        # 配对会整体错位（曾导致「删 A 行结果删掉 B 行」）。
         bom_ids = request.form.getlist("bom_row_id")
         item_ids = request.form.getlist("bom_item_id")
         qtys = request.form.getlist("bom_qty")
-        deletes = request.form.getlist("bom_delete")
-        added, removed, updated = 0, 0, 0
+        added, updated = 0, 0
+        failed_row = None
         for i in range(len(bom_ids)):
             row_id = bom_ids[i].strip()
-            if i < len(deletes) and deletes[i] == "1":
-                if row_id:
-                    db.execute("DELETE FROM product_bom WHERE id = ?", (int(row_id),))
-                    removed += 1
-                continue
             item_id = item_ids[i].strip() if i < len(item_ids) else ""
             qty = parse_qty(qtys[i]) if i < len(qtys) else 0.0
             if not item_id or qty <= 0:
                 continue
-            if row_id:
-                db.execute(
-                    "UPDATE product_bom SET item_id=?, qty_per_unit=? WHERE id=?",
-                    (int(item_id), qty, int(row_id)),
-                )
-                updated += 1
-            else:
-                try:
+            try:
+                if row_id:
+                    db.execute(
+                        "UPDATE product_bom SET item_id=?, qty_per_unit=? WHERE id=?",
+                        (int(item_id), qty, int(row_id)),
+                    )
+                    updated += 1
+                else:
                     db.execute(
                         "INSERT INTO product_bom (product_id, item_id, qty_per_unit) VALUES (?, ?, ?)",
                         (product_id, int(item_id), qty),
                     )
                     added += 1
-                except sqlite3.IntegrityError:
-                    flash(f"第 {i+1} 行原料重复或无效")
+            except sqlite3.IntegrityError:
+                failed_row = i + 1
+                break
+        if failed_row is not None:
+            # 整批回滚：半保存的配方比不保存更难排查（行数变了但用量没变）。
+            db.rollback()
+            flash(
+                f"保存失败：第 {failed_row} 行的原料与配方中其它行重复，本次修改已全部撤销",
+                "error",
+            )
+            return redirect(url_for("production.product_edit", product_id=product_id))
         db.commit()
         audit("production.product.update", "product", product_id, {
-            "added": added, "removed": removed, "updated": updated,
+            "added": added, "updated": updated,
         })
         flash("产品已保存")
         return redirect(url_for("production.product_edit", product_id=product_id))
@@ -182,7 +207,12 @@ def product_delete(product_id: int):
         (product_id,),
     ).fetchone()["c"]
     if used > 0:
-        flash("该产品存在生产记录，无法删除")
+        # 物理删除会连同 production_runs / production_run_items 的历史成本
+        # 口径一起丢掉，所以有生产记录就拒绝。替代方案是隐藏（归档）。
+        flash(
+            f"该产品有 {used} 条生产记录，不能删除；如需从列表移除请用「隐藏」",
+            "error",
+        )
         return redirect(url_for("production.products_list"))
     db.execute("DELETE FROM products WHERE id = ?", (product_id,))
     db.commit()
@@ -191,12 +221,76 @@ def product_delete(product_id: int):
     return redirect(url_for("production.products_list"))
 
 
+@bp.route("/production/products/<int:product_id>/toggle-hidden", methods=["POST"])
+@require_platform_admin
+def product_toggle_hidden(product_id: int):
+    """隐藏 / 恢复配方（管理员）。
+
+    有生产记录的产品删不掉，但门店经常需要让它退出日常选择集。
+    隐藏只改 products.is_hidden，BOM 与生产历史全部保留，随时可恢复。
+    """
+    db = get_warehouse_db()
+    product = db.execute(
+        "SELECT id, name, is_hidden FROM products WHERE id = ?", (product_id,)
+    ).fetchone()
+    if product is None:
+        flash("产品不存在", "error")
+        return redirect(url_for("production.products_list"))
+
+    hidden = request.form.get("hidden", "1") == "1"
+    db.execute(
+        "UPDATE products SET is_hidden = ? WHERE id = ?",
+        (1 if hidden else 0, product_id),
+    )
+    db.commit()
+    audit("production.product.toggle_hidden", "product", product_id, {"hidden": hidden})
+    flash(
+        f"已隐藏「{product['name']}」，生产录入里不再出现"
+        if hidden
+        else f"已恢复「{product['name']}」"
+    )
+    return redirect(url_for("production.products_list", show_hidden="1" if hidden else None))
+
+
+@bp.route(
+    "/production/products/<int:product_id>/bom/<int:bom_id>/delete",
+    methods=["POST"],
+)
+@require_platform_admin
+def bom_row_delete(product_id: int, bom_id: int):
+    """删除配方中的一行原料（行内按钮，点击即落库）。
+
+    与「保存配方」分开：表单只负责新增/改用量，删除有独立入口。
+    好处是每行的删除意图自带 bom_id，不存在按索引配对错位的可能。
+    """
+    db = get_warehouse_db()
+    row = db.execute(
+        """SELECT b.id, b.item_id, i.name AS item_name
+           FROM product_bom b LEFT JOIN items i ON i.id = b.item_id
+           WHERE b.id = ? AND b.product_id = ?""",
+        (bom_id, product_id),
+    ).fetchone()
+    if row is None:
+        flash("该配方行不存在或不属于此产品", "error")
+        return redirect(url_for("production.product_edit", product_id=product_id))
+
+    db.execute("DELETE FROM product_bom WHERE id = ?", (bom_id,))
+    db.commit()
+    audit("production.bom.delete", "product", product_id, {
+        "bom_id": bom_id, "item_id": int(row["item_id"]),
+        "item_name": row["item_name"],
+    })
+    flash(f"已删除原料「{row['item_name']}」")
+    return redirect(url_for("production.product_edit", product_id=product_id))
+
+
 @bp.route("/production/session", methods=["GET"])
 @require_login
 def session():
     db = get_warehouse_db()
+    # 隐藏的产品不进下拉：它们退出了日常选择集，但仍可从历史记录里查看。
     products_data = db.execute(
-        "SELECT id, name, unit FROM products ORDER BY name"
+        "SELECT id, name, unit FROM products WHERE is_hidden = 0 ORDER BY name"
     ).fetchall()
     product_id = request.args.get("product_id", type=int)
     bom = []

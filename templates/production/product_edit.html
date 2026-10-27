@@ -18,7 +18,7 @@
 {% if product %}
 <hr/>
 <h3>配方 (BOM)</h3>
-<p class="muted">每生产 1 单位产品，消耗多少该原料。</p>
+<p class="muted">每生产 1 单位产品，消耗多少该原料。删除原料点行尾的「删除」，改用量后点「保存配方」。</p>
 
 <form method="post" id="bom-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -47,7 +47,10 @@
         <td><input type="number" step="0.01" min="0" name="bom_qty" value="{{ b['qty_per_unit'] }}" /></td>
         <td><span class="bom-unit-label"></span></td>
         <td>
-          <label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label>
+          {# button 用 form 属性关联到表格外的 form —— 外层已是 bom-form，
+             不能再嵌套一层 form（HTML 会截断 DOM）。 #}
+          <button type="submit" form="del-bom-{{ b['id'] }}"
+                  class="btn-sm btn-delete">删除</button>
         </td>
       </tr>
       {% endfor %}
@@ -57,6 +60,16 @@
   <button type="button" id="bom-add" class="btn-sm">+ 新增一行</button>
   <button type="submit" class="btn-primary">保存配方</button>
 </form>
+
+{# 每行一个独立删除表单：自带 bom_id，不存在按索引配对错位的可能。 #}
+{% for b in bom_rows %}
+<form id="del-bom-{{ b['id'] }}" method="post"
+      action="{{ url_for('production.bom_row_delete', product_id=product['id'], bom_id=b['id']) }}"
+      data-ajax data-ajax-mode="reload-stay"
+      data-ajax-confirm="确认删除原料「{{ b['item_name'] }}」？该操作立即生效。">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+</form>
+{% endfor %}
 
 <script>
 function refreshBomUnitLabel(sel) {
@@ -79,12 +92,19 @@ document.getElementById('bom-add').addEventListener('click', function() {
     </td>
     <td><input type="number" step="0.01" min="0" name="bom_qty" value="0" /></td>
     <td><span class="bom-unit-label"></span></td>
-    <td><label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label></td>
+    <td><button type="button" class="btn-sm btn-delete" data-remove-row>删除</button></td>
   `;
   tbody.appendChild(tr);
   var sel = tr.querySelector('.bom-item-sel');
   sel.addEventListener('change', function() { refreshBomUnitLabel(sel); });
   refreshBomUnitLabel(sel);
+});
+
+// 未保存的新增行：删除只是把 DOM 行摘掉（还没落库，无需请求）。
+document.getElementById('bom-body').addEventListener('click', function(e) {
+  var btn = e.target.closest('[data-remove-row]');
+  if (!btn) return;
+  btn.closest('tr').remove();
 });
 
 // 初始化已有行
