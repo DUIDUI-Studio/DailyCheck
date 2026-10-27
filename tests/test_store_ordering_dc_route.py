@@ -285,6 +285,66 @@ def test_dc_outbound_page_links_store_order_shipment(dc_env):
     assert f"/store-ordering/orders/{dc_env['order_id']}" in body
 
 
+def test_storefront_outbound_page_keeps_existing_columns(dc_env):
+    store = sqlite3.connect(str(dc_env["store_path"]))
+    item_id = store.execute("SELECT id FROM items WHERE canonical_id=101").fetchone()[0]
+    store.execute(
+        """INSERT INTO outbound_requests
+           (item_id, requested_quantity, reason, status, rolled_back, created_at, source_type)
+           VALUES (?, 1, '生产补录', '出库', 0, '2026-10-27 10:00:00', 'production')""",
+        (item_id,),
+    )
+    store.execute(
+        """INSERT INTO outbound_requests
+           (item_id, requested_quantity, reason, status, rolled_back, created_at, source_type)
+           VALUES (?, 2, '盘点补录', '出库', 0, '2026-10-27 10:01:00', 'stocktake_loss')""",
+        (item_id,),
+    )
+    store.commit()
+    store.close()
+
+    client = dc_env["client"]
+    _login_as(client, 1, 2)
+    resp = client.get("/outbound")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "生产补录" in body
+    assert "盘点补录" in body
+    assert "<th>来源</th>" not in body
+    assert "人工出库" not in body
+    assert "生产领料" not in body
+    assert "盘点盘亏" not in body
+
+
+def test_dc_outbound_page_derives_manual_source_labels(dc_env):
+    dc = sqlite3.connect(str(dc_env["dc_path"]))
+    item_id = dc.execute("SELECT id FROM items WHERE canonical_id=101").fetchone()[0]
+    dc.execute(
+        """INSERT INTO outbound_requests
+           (item_id, requested_quantity, reason, status, rolled_back, created_at, source_type)
+           VALUES (?, 1, '生产补录', '出库', 0, '2026-10-27 10:00:00', 'production')""",
+        (item_id,),
+    )
+    dc.execute(
+        """INSERT INTO outbound_requests
+           (item_id, requested_quantity, reason, status, rolled_back, created_at, source_type)
+           VALUES (?, 2, '盘点补录', '出库', 0, '2026-10-27 10:01:00', 'stocktake_loss')""",
+        (item_id,),
+    )
+    dc.commit()
+    dc.close()
+
+    client = dc_env["client"]
+    _login_as(client, 3, 1)
+    resp = client.get("/outbound")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "<th>来源</th>" in body
+    assert "生产领料" in body
+    assert "盘点盘亏" in body
+    assert "人工出库" not in body
+
+
 def test_ship_insufficient_stock_rejected(dc_env):
     """2026-10-10 决策反转：DC 发货不得超过现有库存（原 A7 欠货出库已废止）。
 

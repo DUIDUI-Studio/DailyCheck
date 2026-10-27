@@ -15,6 +15,12 @@ from .auth import audit
 
 bp = Blueprint("outbound", __name__)
 
+_SOURCE_LABELS = {
+    "manual": "人工出库",
+    "production": "生产领料",
+    "stocktake_loss": "盘点盘亏",
+}
+
 
 @bp.before_request
 def _require_storefront():
@@ -117,7 +123,7 @@ def outbound_list():
         record = dict(row)
         record.update({
             "is_order_shipment": False,
-            "source_label": "人工出库",
+            "source_label": _SOURCE_LABELS.get(record.get("source_type"), "其他来源"),
             "order_no": None,
             "order_url": None,
         })

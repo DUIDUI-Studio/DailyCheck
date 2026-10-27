@@ -12,10 +12,15 @@
 {% endif %}
 
 <table>
-  <tr><th>时间</th><th>来源</th><th>品项</th><th>出库数量</th><th>原因</th><th>状态</th><th>操作</th></tr>
+  <tr>
+    <th>时间</th>
+    {% if show_order_stock_note %}<th>来源</th>{% endif %}
+    <th>品项</th><th>出库数量</th><th>原因</th><th>状态</th><th>操作</th>
+  </tr>
   {% for r in requests %}
   <tr data-row>
     <td>{{ r.created_at }}</td>
+    {% if show_order_stock_note %}
     <td>
       {% if r.order_url %}
       <a href="{{ r.order_url }}">{{ r.source_label }} {{ r.order_no }}</a>
@@ -25,6 +30,7 @@
       {{ r.source_label }}
       {% endif %}
     </td>
+    {% endif %}
     <td>{{ r.item_name }}</td>
     <td>{{ r.requested_quantity | fmt_qty }} {{ r.unit }}</td>
     <td>{{ r.reason }}</td>
