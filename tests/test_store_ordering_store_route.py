@@ -139,6 +139,18 @@ def test_catalog_with_dc(store_env):
     assert "加入购物车" in body
 
 
+def test_catalog_displays_dc_stock(store_env):
+    """Issue #63: ordering cards and modal must show current DC stock."""
+    resp = store_env["client"].get("/store-ordering/catalog?dc=dc_test")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+
+    assert "DC 库存" in body
+    assert "配送中心库存" in body
+    assert "100 件" in body
+    assert 'data-stock="100"' in body
+
+
 def test_catalog_draft_scope_is_user_and_dc(store_env):
     """Catalog persists un-submitted selections under a per-user/DC scope.
 

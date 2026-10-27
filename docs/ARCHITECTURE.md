@@ -1277,7 +1277,7 @@ flowchart TB
         Core["core.py<br/>仪表盘 + 品类管理"]
         Items["items.py<br/>库存品 CRUD + 库存视图"]
         Canonical["canonical.py<br/>主数据 CRUD + 扇出"]
-        StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货"]
+        StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货<br/>catalog 展示 DC 现有库存"]
         RecipeCost["recipe_cost.py<br/>配方 (产品 BOM + ic_recipe + recipe) + 成本"]
         Forecast["forecast.py<br/>预测 + 定时调度"]
         Procurement["procurement.py<br/>采购建议"]
@@ -1714,6 +1714,13 @@ flowchart TB
 只能随订单流程处理，不能从 `/outbound` 单独回退。门店人工出库的数据源和操作不变。
 回归由 `tests/test_store_ordering_dc_route.py` 中两个 Issue #64 用例锁定。
 
+**订货目录库存可见（Issue #63，2026-10-27）**：`list_available_dc_items()` 一直返回
+DC 本仓 `items.quantity`，但 catalog 卡片与弹窗此前刻意隐藏，门店只能在库存总览另查。
+门店反馈「订货时能看到库存」后，卡片显示 `DC 库存`，选品弹窗同时显示库存与单价。
+这与既有提交语义一致：目录库存仅作决策参考，**提交订单仍不锁库存、不拦截 DC 库存不足**；
+真正校验和扣减发生在 DC 发货。回归由
+`tests/test_store_ordering_store_route.py::test_catalog_displays_dc_stock` 锁定。
+
 ```mermaid
 stateDiagram-v2
     [*] --> pending: cart.submit
@@ -1945,6 +1952,10 @@ flowchart LR
 列和订单回链，沿用现有裸 `<table>` + 自动 `.table-scroll` 契约；移动端不新增固定层
 或特殊交互。页面隐藏「新建出库」，因为 DC 的人工出库入口不存在，发货由订单详情驱动。
 
+**订货目录库存展示（Issue #63，2026-10-27）**：门店 catalog 的每张卡片复用既有
+`.inv-card-body` 指标区显示 `DC 库存`，弹窗顶部同时显示库存与单价；不新增异步请求，
+也不改变移动端提交链路。
+
 **响应式布局契约（2026-10-20 排版审计后确立，改样式前必读）**：
 
 - **断点**：480 / 560 / 600 / 640 / 720 / 760 / 960 / 1100 px。721–1099 是中屏档
@@ -1972,6 +1983,10 @@ flowchart LR
 Issue #64 在 `tests/test_store_ordering_dc_route.py` 增加两条路由级回归：审批后 DC
 库存不变且 `/outbound` 解释「审批不锁库存」；发货后 `/outbound` 必须出现订单号、
 「订单发货」来源及订单详情回链。
+
+Issue #63 的订货目录库存展示由
+`tests/test_store_ordering_store_route.py::test_catalog_displays_dc_stock` 覆盖：
+HTTP 页面必须同时出现卡片 `DC 库存` 与弹窗的配送中心库存文案。
 
 ```mermaid
 flowchart TB
