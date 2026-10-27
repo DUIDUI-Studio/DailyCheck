@@ -2012,8 +2012,6 @@ Issue #67 的订货目录库存展示由
 `test_catalog_sums_duplicate_store_bindings` 再覆盖同一 canonical 的两条门店绑定行
 7+3=10（首行 7、DC=100），锁定聚合值而非首行或 DC 值。
 
-**门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
-
 ```mermaid
 flowchart TB
     subgraph Pytest["pytest (59 个测试文件, 977 用例；2026-10-15 实测)"]
@@ -2095,6 +2093,8 @@ flowchart TB
 **Pre-existing 16 failed 分布**（2026-10-13 起）：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
+
+**门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
 
 ---
 
