@@ -504,8 +504,8 @@ def list_available_dc_items(
       - category_name (Chinese; from DC categories.name → fallback to
         canonical_categories.name → fallback to category_code → fallback to '—')
       - unit_price (selling_price → unit_cost → 0)
-      - store_quantity / store_bound (from the storefront warehouse row matched
-        by canonical_id; missing rows are zero, never DC stock)
+      - store_quantity / store_bound (summed from storefront warehouse rows
+        matched by canonical_id; missing rows are zero, never DC stock)
     """
     master_conn.row_factory = sqlite3.Row
     # P0-10 + Issue #67：先取该门店已停用的 canonical_id 与本地库存。
@@ -516,15 +516,18 @@ def list_available_dc_items(
         store_conn = open_warehouse_db(store_warehouse_code)
         try:
             store_rows = store_conn.execute(
-                """SELECT canonical_id, quantity, is_active FROM items
+                """SELECT canonical_id,
+                          SUM(quantity) AS quantity,
+                          MAX(CASE WHEN COALESCE(is_active, 1) = 0 THEN 1 ELSE 0 END)
+                              AS deactivated
+                   FROM items
                    WHERE canonical_id IS NOT NULL
-                   ORDER BY id"""
+                   GROUP BY canonical_id"""
             ).fetchall()
             for row in store_rows:
                 canonical_id = int(row["canonical_id"])
-                if canonical_id not in store_quantities:
-                    store_quantities[canonical_id] = float(row["quantity"] or 0)
-                if row["is_active"] is not None and int(row["is_active"]) == 0:
+                store_quantities[canonical_id] = float(row["quantity"] or 0)
+                if int(row["deactivated"]):
                     deactivated.add(canonical_id)
         finally:
             store_conn.close()

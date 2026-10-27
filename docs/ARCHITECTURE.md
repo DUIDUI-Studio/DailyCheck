@@ -1372,7 +1372,8 @@ flowchart LR
 - **pure 层不依赖 Flask 上下文**（不 import flask），便于测试和跨场景复用。
 - `store_ordering_pure` 是跨最多业务的纯模块（订货同时触发采购缓存重建 + 通知事件）。
 - `store_ordering_pure.list_available_dc_items()` 同时读取 DC 与当前门店仓：DC 行决定
-  目录范围/价格/起订倍数，门店行只按 `canonical_id` 提供 `store_quantity` 展示值。
+  目录范围/价格/起订倍数，门店行按 `canonical_id` 以 `SUM(quantity)` 提供
+  `store_quantity` 展示值。
 - `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
   `master.db.store_orders` 给订单发货流水补订单链接。
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
@@ -1718,12 +1719,15 @@ flowchart TB
 
 **订货目录显示本店库存（Issue #67，2026-10-27）**：`list_available_dc_items()` 仍以
 DC 品项决定目录可订范围、价格与起订倍数，但在返回行上按 `canonical_id` 附带当前门店
-`items.quantity`（`store_quantity`）及绑定状态（`store_bound`）。门店本地无绑定行时
-`store_quantity=0`，**绝不能回退到 DC 的 `items.quantity`**；后者继续只服务发货校验。
+全部绑定行的 `SUM(items.quantity)`（`store_quantity`）及绑定状态（`store_bound`）。
+门店本地无绑定行时 `store_quantity=0`，**绝不能回退到 DC 的 `items.quantity`**；
+后者继续只服务发货校验。门店启停过滤保持原语义：同一 canonical 的任一行已停用，
+该品项仍从目录排除。
 卡片和选品弹窗统一显示 `门店库存`，并把同一个 `store_quantity` 写入前端 `data-stock`。
 这与既有提交语义一致：本店库存仅作参考，**提交订单仍不锁库存、不拦截 DC 库存不足**；
 真正校验和扣减发生在 DC 发货。回归由
-`tests/test_store_ordering_store_route.py::test_catalog_displays_store_stock_not_dc_stock` 锁定。
+`test_catalog_displays_store_stock_not_dc_stock` 与
+`test_catalog_sums_duplicate_store_bindings` 锁定。
 
 ```mermaid
 stateDiagram-v2
@@ -1992,6 +1996,8 @@ Issue #67 的订货目录库存展示由
 `tests/test_store_ordering_store_route.py::test_catalog_displays_store_stock_not_dc_stock`
 覆盖：同一 canonical 品项的 DC=100、门店=7 时必须渲染门店 7；门店无绑定行时即使 DC=5
 也必须渲染 0，并同时锁定卡片、`data-stock` 与选品弹窗的本店库存文案。
+`test_catalog_sums_duplicate_store_bindings` 再覆盖同一 canonical 的两条门店绑定行
+7+3=10（首行 7、DC=100），锁定聚合值而非首行或 DC 值。
 
 ```mermaid
 flowchart TB
@@ -2243,7 +2249,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
 | 16 failed 测试（本地全量口径，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
-| 订货目录把 DC 库存误作门店库存 | 中 | **已修复（Issue #67，2026-10-27）** | `list_available_dc_items()` 按 `canonical_id` 附带本店 `store_quantity`；未绑定行固定为 0，卡片/弹窗/`data-stock` 均不再回退 DC 库存 |
+| 订货目录把 DC 库存误作门店库存 | 中 | **已修复（Issue #67，2026-10-27）** | `list_available_dc_items()` 按 `canonical_id` 汇总本店全部绑定行 `SUM(items.quantity)`；重复绑定不再只取首行，未绑定行固定为 0，卡片/弹窗/`data-stock` 均不回退 DC 库存 |
 | 时区不一致 | **高** | pre-existing（`render_ops` 一处已修，2026-10-18） | 多租户改造前必修。已修的一处：`render_ops._render_kpis` 的「今日」判据曾用 `time.strftime`（进程本地时区）→ 在 UTC 环境（CI / dev 容器）与 `_cst_day()`（显式 +8h）错位，UTC 16:00–24:00 窗口内「今日部署 / 今日合并 PR」恒显 0；改为 `datetime.now(CST)` 与三处 +8 同源（§13.3）。**其余站点仍是 pre-existing**：全仓 `datetime.now()` / SQL `datetime('now')` 混用未收敛 |
 | **测试隐式依赖本机端口 / 环境** | 中 | pre-existing（2026-10-18 CI 实 hit） | `deploy_pipeline.sh` 的观察窗会真探 `http://127.0.0.1:8080/`。**本机 dev 容器在听该端口（返 302）→ 观察窗放行 → 用例通过；CI runner 无监听 → curl 得 000 → 触发「观察窗异常」→ 回滚 → exit 24**，表现为「本地全绿、CI 判红」。凡跑编排/部署脚本的测试必须注入 fake 外部命令（既有 `_observe_tools()` 提供 fake curl / journalctl；`blue_green_testenv.py` 提供 fake systemctl），不得依赖本机恰好有服务在跑。**新增这类用例前先看同文件既有测试怎么脱真环境**——本次就是漏抄了既有模式 |
 | 配方成本 qty 语义不一致 | **高** | **已修复（2026-10-16，`feat/recipe-rd-upgrade`）** | ic_recipe 引用行 qty 统一为**克**（`_save_recipe` output_qty 累计 / pure 成本层 / 前端 JS / BOM CSV 四处对齐，旧「份」语义废弃）。两库 recipes 表均 0 行，无存量迁移。详见 `docs/2026-10-16-recipe-rd-upgrade.md` §D1 |
