@@ -1,22 +1,44 @@
 {% extends 'base.html' %}
 {% block content %}
 <h2>出库记录</h2>
+{% if show_order_stock_note %}
+<p class="calc-hint">订单审批不锁定库存；配送中心发货时才会校验并扣减库存。</p>
+{% endif %}
+{% if can_create %}
 <form method="post" action="{{ url_for('outbound.outbound_start') }}" class="form-inline">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <button type="submit">新建出库</button>
 </form>
+{% endif %}
 
 <table>
-  <tr><th>时间</th><th>品项</th><th>出库数量</th><th>原因</th><th>状态</th><th>操作</th></tr>
+  <tr>
+    <th>时间</th>
+    {% if show_order_stock_note %}<th>来源</th>{% endif %}
+    <th>品项</th><th>出库数量</th><th>原因</th><th>状态</th><th>操作</th>
+  </tr>
   {% for r in requests %}
   <tr data-row>
     <td>{{ r.created_at }}</td>
+    {% if show_order_stock_note %}
+    <td>
+      {% if r.order_url %}
+      <a href="{{ r.order_url }}">{{ r.source_label }} {{ r.order_no }}</a>
+      {% elif r.order_no %}
+      {{ r.source_label }} {{ r.order_no }}
+      {% else %}
+      {{ r.source_label }}
+      {% endif %}
+    </td>
+    {% endif %}
     <td>{{ r.item_name }}</td>
     <td>{{ r.requested_quantity | fmt_qty }} {{ r.unit }}</td>
     <td>{{ r.reason }}</td>
-    <td>{% if r.rolled_back == 1 %}已回退{% else %}{{ r.status }}{% endif %}</td>
+    <td>{% if r.rolled_back == 1 %}已回退{% else %}{{ r.status or '已出库' }}{% endif %}</td>
     <td>
-      {% if r.rolled_back == 0 %}
+      {% if r.is_order_shipment %}
+        <span class="muted">随订单发货，不可单独回退</span>
+      {% elif r.rolled_back == 0 %}
         {# 生产领料记录只能从生产批次回退,不出现在这里允许删除(防止双扣)
            流程:删除出库→stock_movements.action='出库回退'(+qty),且
                 DELETE outbound_requests(rolled_back=0,但流水已回滚)。

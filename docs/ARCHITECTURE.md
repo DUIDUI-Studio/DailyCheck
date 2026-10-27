@@ -1284,7 +1284,7 @@ flowchart TB
         Notifications["notifications.py<br/>应用内通知"]
         Stocktake["stocktake.py<br/>盘点批次"]
         Restock["restock.py<br/>入库申请"]
-        Outbound["outbound.py<br/>出库申请"]
+        Outbound["outbound.py<br/>人工出库 +<br/>DC 订单发货流水汇总"]
         Production["production.py<br/>生产录入 + CSV"]
         Adjustment["adjustment.py<br/>库存调整 (⚠️ 未注册到 app.py)"]
         Consumption["consumption.py<br/>消耗分析"]
@@ -1356,12 +1356,15 @@ flowchart LR
     Procurement --> ProcurementPure
     Notifications[notifications.py]:::bp --> Shared
     Notifications --> NotificationsPure
+    Outbound[outbound.py]:::bp --> Shared
+    Outbound --> StoreOrderingPure
+    Outbound -->|master.db 只读| StoreOrders
     Users[users.py]:::bp --> Shared
     AgentTokens[agent_tokens.py]:::bp --> Shared
     Reports[reports.py]:::bp --> Shared
     Reports --> ReportsHealthPure[reports_health_pure.py]:::pure
     Reports -->|master.db 只读| StoreOrders["store_orders（门店履约）"]
-    Others["stocktake/restock/outbound/production/<br/>adjustment/consumption/<br/>core/import_items"]:::bp --> Shared
+    Others["stocktake/restock/production/<br/>adjustment/consumption/<br/>core/import_items"]:::bp --> Shared
 ```
 
 **依赖原则**：
@@ -1370,6 +1373,8 @@ flowchart LR
 - `store_ordering_pure` 是跨最多业务的纯模块（订货同时触发采购缓存重建 + 通知事件）。
 - `store_ordering_pure.list_available_dc_items()` 同时读取 DC 与当前门店仓：DC 行决定
   目录范围/价格/起订倍数，门店行只按 `canonical_id` 提供 `store_quantity` 展示值。
+- `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
+  `master.db.store_orders` 给订单发货流水补订单链接。
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
 
 ---
@@ -1703,6 +1708,14 @@ flowchart TB
 
 ### 10.3 Store Ordering 状态机
 
+**订单审批与出库可见性（Issue #64，2026-10-27）**：审批只更新订单状态并授权后续
+发货，**不预留、不锁定库存**；DC 确认发货时才校验现有库存、扣减 `items.quantity`
+并写入 `stock_movements`。`/outbound` 原先只读 `outbound_requests`，因此订单发货
+实际发生了却不可见。现由 `outbound.outbound_list` 在配送中心上下文合并
+`门店订货出库` / `总仓调货出库` 流水，按订单号回链订单详情，并明确标注这些记录
+只能随订单流程处理，不能从 `/outbound` 单独回退。门店人工出库的数据源和操作不变。
+回归由 `tests/test_store_ordering_dc_route.py` 中两个 Issue #64 用例锁定。
+
 **订货目录显示本店库存（Issue #67，2026-10-27）**：`list_available_dc_items()` 仍以
 DC 品项决定目录可订范围、价格与起订倍数，但在返回行上按 `canonical_id` 附带当前门店
 `items.quantity`（`store_quantity`）及绑定状态（`store_bound`）。门店本地无绑定行时
@@ -1939,6 +1952,10 @@ flowchart LR
   按链接级可见性过滤的既有先例（同「门店订货」组内 `品项管理` 的写法），
   侧栏与 `/land` 两载体条件逐字一致，双向不变量由 `tests/test_reports_health.py::TestNavCarriers` 钉住。
 
+**DC 出库记录（Issue #64，2026-10-27）**：`/outbound` 在配送中心上下文增加「来源」
+列和订单回链，沿用现有裸 `<table>` + 自动 `.table-scroll` 契约；移动端不新增固定层
+或特殊交互。页面隐藏「新建出库」，因为 DC 的人工出库入口不存在，发货由订单详情驱动。
+
 **订货目录库存展示（Issue #67，2026-10-27）**：门店 catalog 的每张卡片复用既有
 `.inv-card-body` 指标区显示 `门店库存`，弹窗顶部也以同一 `data-stock` 显示本店库存与单价；
 数据在既有目录查询内一次解析，不新增异步请求，也不改变移动端提交链路。
@@ -1966,6 +1983,10 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #64 在 `tests/test_store_ordering_dc_route.py` 增加两条路由级回归：审批后 DC
+库存不变且 `/outbound` 解释「审批不锁库存」；发货后 `/outbound` 必须出现订单号、
+「订单发货」来源及订单详情回链。
 
 Issue #67 的订货目录库存展示由
 `tests/test_store_ordering_store_route.py::test_catalog_displays_store_stock_not_dc_stock`
