@@ -234,6 +234,57 @@ def test_shipment_list_and_ship(dc_env):
     assert status == "shipped"
 
 
+def test_dc_outbound_page_explains_approval_does_not_lock_stock(dc_env):
+    client = dc_env["client"]
+    _login_as(client, 2, 1)
+    client.post(
+        f"/store-ordering/orders/{dc_env['order_id']}/review",
+        data={"decision": "approved", "note": "ok"},
+    )
+
+    _login_as(client, 3, 1)
+    resp = client.get("/outbound")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "审批不锁定库存" in body
+    assert "发货时" in body
+    assert "扣减" in body
+
+    dc = sqlite3.connect(str(dc_env["dc_path"]))
+    quantity = dc.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101"
+    ).fetchone()[0]
+    dc.close()
+    assert quantity == 100.0
+
+
+def test_dc_outbound_page_links_store_order_shipment(dc_env):
+    client = dc_env["client"]
+    _login_as(client, 2, 1)
+    client.post(
+        f"/store-ordering/orders/{dc_env['order_id']}/review",
+        data={"decision": "approved", "note": "ok"},
+    )
+    _login_as(client, 3, 1)
+    client.post(
+        f"/store-ordering/orders/{dc_env['order_id']}/ship",
+        data={},
+    )
+
+    master = sqlite3.connect(str(dc_env["master_path"]))
+    order_no = master.execute(
+        "SELECT order_no FROM store_orders WHERE id=?", (dc_env["order_id"],)
+    ).fetchone()[0]
+    master.close()
+
+    resp = client.get("/outbound")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert order_no in body
+    assert "订单发货" in body
+    assert f"/store-ordering/orders/{dc_env['order_id']}" in body
+
+
 def test_ship_insufficient_stock_rejected(dc_env):
     """2026-10-10 决策反转：DC 发货不得超过现有库存（原 A7 欠货出库已废止）。
 

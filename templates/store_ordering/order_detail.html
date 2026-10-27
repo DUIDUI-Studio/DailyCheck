@@ -42,6 +42,10 @@
   {% endif %}
 </div>
 
+{% if is_dc_view and not is_transfer %}
+<p class="calc-hint">审批只确认订单，不锁定库存；配送中心确认发货时才会校验并扣减库存。</p>
+{% endif %}
+
 {# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
 <div class="info-card">
   <div class="info-card-grid">
