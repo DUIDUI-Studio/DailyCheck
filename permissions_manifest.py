@@ -141,6 +141,9 @@ ROUTE_MATRIX: dict[str, str] = {
     "agent_tokens.list_tokens": PLATFORM,
     "agent_tokens.create_token": PLATFORM,
     "agent_tokens.revoke_token": PLATFORM,
+    # ---- bot admin（企微 Bot 管理配置台；Issue #79 PR1）----
+    "bot_admin.index": PLATFORM,
+    "bot_admin.save_config": PLATFORM,
     # ---- auth / pwa ----
     "auth.login": PUBLIC,
     "auth.logout": PUBLIC,

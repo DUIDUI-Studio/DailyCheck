@@ -127,11 +127,12 @@
   {% if is_admin or is_rd or (g.role and g.role['role'] == 'admin') %}
   <section class="land-card">
     <h3>管理员</h3>
-    <p>{% if is_admin %}账号 / Token / 运维看板 / 待拍板 / 品项数据{% elif is_rd %}品项主数据{% else %}品项批量导入{% endif %}</p>
+    <p>{% if is_admin %}账号 / Token / Bot / 运维看板 / 待拍板 / 品项数据{% elif is_rd %}品项主数据{% else %}品项批量导入{% endif %}</p>
     <ul class="land-links">
       {% if is_admin %}
       <li><a href="{{ url_for('users.list_users') }}">账号管理</a></li>
       <li><a href="{{ url_for('agent_tokens.list_tokens') }}">Agent Token</a></li>
+      <li><a href="{{ url_for('bot_admin.index') }}">企微 Bot</a></li>
       <li><a href="{{ url_for('ops.ops_dashboard') }}">运维看板</a></li>
       <li><a href="{{ url_for('owner_approvals.list_approvals') }}">待拍板</a></li>
       <li><a href="{{ url_for('items.items_list') }}">品类与品项</a></li>
