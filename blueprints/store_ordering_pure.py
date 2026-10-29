@@ -1012,10 +1012,22 @@ def compute_store_order_report(
 
     时间范围过滤：store_orders.created_at ∈ [start_date 00:00, end_date 23:59]
     类别过滤：canonical_items.category_code
+
+    多仓粒度（spec §10 / D11）：
+      - 明细数量按**行来源仓** ``COALESCE(source_warehouse_code, dc_warehouse_code)``
+        分组——历史 NULL 来源行与开关关闭时的数据恒等于按头仓分组；
+      - 订单数 = **去重订单集**：全局算一次（summary），仓维度只数与该仓相关的
+        单、每单一次（同一订单多行不翻倍；跨仓单在每个参与仓各计一次）；
+      - 运费 = 头级事实**禁止跨仓求和**：全局只累加去重订单的头级值；仓维度
+        展示相关订单的全单值（各行不可相加，UI 需注明）。实现上分「过滤后
+        明细集合」与「去重订单集合」两个查询，绝不 JOIN 明细后 SUM 头级字段。
+
     返回：含 ``summary`` + 4 个分维数组的 dict（按 4 个 group key 求和）。
     """
     master_conn.row_factory = sqlite3.Row
 
+    # 行来源仓表达式：参与仓维度（历史 NULL 行回落头仓）
+    source = "COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)"
     where_parts = ["so.flow_type = ?"]
     params: list[Any] = [FLOW_STORE_ORDER]
     if start_date:
@@ -1028,7 +1040,8 @@ def compute_store_order_report(
         where_parts.append("so.store_warehouse_code = ?")
         params.append(store_warehouse_code)
     if dc_warehouse_code:
-        where_parts.append("so.dc_warehouse_code = ?")
+        # 按参与仓过滤：只取该仓的明细行，与 by_dc 的仓维度口径一致
+        where_parts.append(f"{source} = ?")
         params.append(dc_warehouse_code)
     if category_code:
         where_parts.append("ci.category_code = ?")
@@ -1038,19 +1051,18 @@ def compute_store_order_report(
     sql = f"""
         SELECT
             so.store_warehouse_code AS store_code,
-            so.dc_warehouse_code    AS dc_code,
+            {source}                AS dc_code,
             ci.category_code        AS cat_code,
             ci.name                 AS canonical_name,
             soi.canonical_id        AS canonical_id,
             SUM(soi.quantity)              AS ordered_qty,
             SUM(soi.shipped_quantity)      AS shipped_qty,
-            SUM(soi.fulfilled_quantity)    AS received_qty,
-            COUNT(DISTINCT so.id)          AS order_count
+            SUM(soi.fulfilled_quantity)    AS received_qty
         FROM store_order_items soi
         JOIN store_orders so ON so.id = soi.order_id
         JOIN canonical_items ci ON ci.id = soi.canonical_id
         WHERE {where}
-        GROUP BY so.store_warehouse_code, so.dc_warehouse_code,
+        GROUP BY so.store_warehouse_code, {source},
                  ci.category_code, ci.name, soi.canonical_id
     """
     rows = master_conn.execute(sql, params).fetchall()
@@ -1130,43 +1142,40 @@ def compute_store_order_report(
             "shortfall_qty": shortfall,
         })
 
-    # 后算 order_count（去重）：每个 store 在过滤范围内出现的订单数
-    # oc_where_parts 复用 where_parts，但移除引用 ci. 的部分
-    oc_where_parts: list[str] = []
-    oc_params: list[Any] = []
-    p_iter = iter(params)
-    for w in where_parts:
-        if w == "1=1":
-            continue
-        if "ci." in w:
-            # skip ci-related predicate and its param
-            next(p_iter, None)
-            continue
-        oc_where_parts.append(w)
-        oc_params.append(next(p_iter))
-    if not oc_where_parts:
-        oc_where = "1=1"
-    else:
-        oc_where = " AND ".join(oc_where_parts)
-    oc_sql = f"""
-        SELECT so.store_warehouse_code AS store_code,
-               so.dc_warehouse_code    AS dc_code,
-               COUNT(DISTINCT so.id)   AS order_count,
-               SUM(so.shipping_fee)    AS shipping_fee
-        FROM store_orders so
-        WHERE {oc_where}
-        GROUP BY so.store_warehouse_code, so.dc_warehouse_code
+    # 去重订单集合：只从明细表派生 (order, store, 来源仓) 三元组，
+    # 头级字段（shipping_fee）按订单去重后再累加——绝不 JOIN 明细后 SUM 头级值。
+    order_sql = f"""
+        SELECT so.id                     AS order_id,
+               so.store_warehouse_code   AS store_code,
+               {source}                  AS dc_code,
+               so.shipping_fee           AS shipping_fee
+        FROM store_order_items soi
+        JOIN store_orders so ON so.id = soi.order_id
+        JOIN canonical_items ci ON ci.id = soi.canonical_id
+        WHERE {where}
+        GROUP BY so.id, so.store_warehouse_code, {source}
     """
-    for r in master_conn.execute(oc_sql, oc_params).fetchall():
-        sf = float(r["shipping_fee"] or 0)
-        if r["store_code"] in by_store:
-            by_store[r["store_code"]]["order_count"] = int(r["order_count"])
-            by_store[r["store_code"]]["shipping_fee"] += sf
-        if r["dc_code"] in by_dc:
-            by_dc[r["dc_code"]]["order_count"] = int(r["order_count"])
-            by_dc[r["dc_code"]]["shipping_fee"] += sf
-        summary["order_count"] += int(r["order_count"])
-        summary["shipping_fee"] += sf
+    order_fee: dict[int, float] = {}
+    orders_by_store: dict[str, set[int]] = {}
+    orders_by_dc: dict[str, set[int]] = {}
+    for r in master_conn.execute(order_sql, params).fetchall():
+        order_id = int(r["order_id"])
+        order_fee.setdefault(order_id, float(r["shipping_fee"] or 0))
+        orders_by_store.setdefault(r["store_code"], set()).add(order_id)
+        orders_by_dc.setdefault(r["dc_code"], set()).add(order_id)
+
+    # 全局订单数与运费：每单只计一次（跨仓单不因参与仓数翻倍）
+    summary["order_count"] = len(order_fee)
+    summary["shipping_fee"] = sum(order_fee.values())
+    for code, bucket in by_store.items():
+        order_ids = orders_by_store.get(code, set())
+        bucket["order_count"] = len(order_ids)
+        bucket["shipping_fee"] = sum(order_fee[oid] for oid in order_ids)
+    for code, bucket in by_dc.items():
+        order_ids = orders_by_dc.get(code, set())
+        bucket["order_count"] = len(order_ids)
+        # D11：仓维度展示相关订单的全单运费，不是拆分份额；各行不可相加
+        bucket["shipping_fee"] = sum(order_fee[oid] for oid in order_ids)
 
     # 排序 + 算费率
     for d in by_store.values():

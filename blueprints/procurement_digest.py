@@ -133,6 +133,7 @@ def collect_digest(today: date | None = None, limit: int | None = DEFAULT_LIMIT)
     from .replenishment_data import (
         build_board,
         load_params,
+        load_routing_map,
         store_stock_and_consumption,
     )
 
@@ -173,6 +174,7 @@ def collect_digest(today: date | None = None, limit: int | None = DEFAULT_LIMIT)
         limit=limit,
         warnings=warnings,
         dc_configured=bool(dc_names),
+        routing=load_routing_map(),
     )
 
     if not stores:

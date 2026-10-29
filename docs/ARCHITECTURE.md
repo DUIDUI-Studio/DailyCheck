@@ -1991,6 +1991,34 @@ stateDiagram-v2
 
 详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
 
+### 10.3.2 报表与补货的参与仓口径（2026-10-29，多仓履约 Task 9）
+
+**订货报表**（`store_ordering_pure.compute_store_order_report` → `/store-ordering/admin/report`）：
+明细数量按**行来源仓** `COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)` 分组
+（`by_dc` 即履约来源仓维度；历史 NULL 来源行回落头仓，与开关关闭时的数据恒等）。
+实现分两个查询：①「过滤后明细集合」（SUM 数量）；②「去重订单集合」
+（`GROUP BY so.id, store, 来源仓` 得到 (订单, 门店, 仓) 三元组）。订单数 = 去重订单集：
+summary 全局一次，仓维度各计一次（同单多行不翻倍、跨仓单在每个参与仓各计一次）。
+**运费 D11**：`shipping_fee` 是头级事实，全局按去重订单累加一次；仓维度列显示相关订单的
+**全单值**（模板注明「各行不可相加」），**禁止 JOIN 明细后 SUM 头级字段**，也禁止把仓维度
+相加当作全局。仓 / 品类 / 日期过滤在明细集合与订单集合上共用同一 WHERE 片段。
+
+**健康报表**（`reports_health_pure.compute_fulfillment`）：积压 / 在途 / 平均履约周期从
+`dc_warehouse_code = ?` 改为**参与仓**判定——`store_warehouse_code = ? OR EXISTS(参与仓行) OR
+(头仓 AND 无明细行)`。EXISTS 保证一单多行不把计数放大；`NOT EXISTS` 只为历史/最小 schema
+的无明细单保留头仓兜底。本模块是顶层纯模块，谓词**独立落地一份**（镜像
+`order_participation_sql`，见文件头注释），改口径时两处同步。
+
+**补货 / 采购按路由归仓**（spec §10）：`replenishment_data.load_routing_map()` 读取
+`item_routing`（**开关 `MULTI_WAREHOUSE_FULFILLMENT` 关闭时返回空**，行为回落到现状）。
+`build_board()`：DC 的下游拉动需求只给**路由来源仓**；同 canonical 的非来源仓镜像用自己的
+出库史算水位（不承接门店需求、也不静默归零）；未配置路由的 canonical 保持现状（所有 DC
+都按下游拉动）。可订开关 `dc_orderable` 从**来源仓**解析（修复多 DC last-wins 覆盖 bug），
+过期路由（来源仓没有该 canonical 绑定）不生效。`procurement_digest_pure.pick_purchase_rows`
+新增 `routing` 注入参数（纯层不碰 DB），按路由去重 DC 行——双 DC 镜像同 canonical、路由=B
+时采购单只出现 B 一次；`build_digest` / `collect_digest` 透传。测试：
+`tests/test_report_multi_dc.py`、`tests/test_replenishment_routing.py`。
+
 ### 10.4 Canonical 扇出流程
 
 ```mermaid
@@ -2066,6 +2094,12 @@ ALTER，不要另写映射）。
    提前期 3+7，待订项几乎全部直接落进 `critical`，`due` 恒为 0；若把 `due` 叫作
    「本周需订」，页面就读成「19 个断货风险，本周却不用采购」。`due=0` 时还须给出
    空态解释，别只留一个光秃秃的 0。
+
+**多仓路由（2026-10-29，Task 9）**：门店需求只拉动 `item_routing` 指向的**来源仓**
+（`replenishment_data.load_routing_map()`；开关关闭返回空 → 现状恒等）。双 DC 镜像同
+canonical 时，非来源仓用自己的出库史算水位、不承接门店需求；未配置路由的 canonical
+维持「所有 DC 都按下游拉动」的现状。可订开关以来源仓 `is_orderable` 为准（修复按 DC
+遍历 last-wins 的覆盖 bug）。采购邮件按路由去重 DC 行（`pick_purchase_rows(routing=...)`）。
 
 设计说明：`docs/2026-10-20-replenishment-board.md`（11 章，含回测与口径取舍）。
 
