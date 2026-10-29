@@ -119,16 +119,19 @@ ALTER TABLE stock_movements ADD COLUMN op_no TEXT;   -- 外部操作号，订单
 3. 仓库 db：`BEGIN IMMEDIATE` → **条件原子扣减**
    `UPDATE items SET quantity=quantity-? WHERE id=? AND quantity>=?`（替代 v1/现状的读-算-写绝对值，
    防并发覆盖）→ 写 `stock_movements(op_no)` → 校验本仓行累计不超发（重读行，锁内）→ COMMIT。
-4. master db：`BEGIN IMMEDIATE` → **先 INSERT 批次头+批次行明细（op_no UNIQUE）**：
-   - `changes()=0` 且已存在同 `op_no` → 视为成功，直接返回（幂等重试路径）；
-   - 冲突于**不同** op_no 命中同行 → 拒绝（同请求重试）。
+4. master db：`BEGIN IMMEDIATE` → **先 INSERT 批次头+批次行明细**。
+   **勘误（2026-10-29，Task 5 实施裁决）**：`store_order_delivery_items.op_no` 为单列 UNIQUE
+   （Task 1 已合入并有测试锁死），与「多行共享一个请求级 op_no」矛盾。实施采用**行级派生键**
+   `line_op_no = f'{op_no}:{order_item_id}'`（uuid4 hex 无冒号，首 ':' 分割无歧义），同时写入
+   `store_order_delivery_items.op_no` 与仓内 `stock_movements.op_no`；请求级 op_no 以
+   `split(':',1)[0]` 还原。幂等路径：行明细 INSERT 撞 IntegrityError → 按 line_op_no 精确查回
+   既有 delivery_id → 校验同订单且前缀=本请求 op_no → 幂等返回既有批次（不重复扣减）。
    → `UPDATE store_order_items SET shipped_quantity=shipped_quantity+?, ship_op_no=? WHERE id=? AND ship_op_no IS DISTINCT FROM 本 op_no`（累计式，带守卫）
    → §9 锁内重聚合定状态 → COMMIT。
-5. 崩溃恢复：仓库 db 有 `op_no` 流水但 master 无对应批次 → 孤儿，**库存不动**，对账作业以
-   红字冲销流水（生成反向 movement + 待人工确认告警）；主库失败前批次未落 → 库存已扣、
-   客户端重试被批次 `op_no` UNIQUE 挡住重复扣减？不——重试会生成新 op_no。因此**客户端重试
-   必须复用原 op_no**（发货表单携带幂等键，Web 表单由服务端在页面生成、提交回传）。
-   孤儿对账是兜底，不是主路径。
+5. 崩溃恢复：仓库 db 有 `line_op_no` 流水但 master 无对应明细行 → 孤儿，**库存不动**，对账作业
+   按 line_op_no 精确等值匹配，以红字冲销流水（生成反向 movement + 待人工确认告警）；
+   客户端重试**必须复用原请求级 op_no**（发货表单携带幂等键，Web 表单由服务端在页面生成、
+   提交回传）——派生键确定性保证重试命中同一 UNIQUE 键。孤儿对账是兜底，不是主路径。
 6. D9 澄清：不预留、不锁定库存不变；上述短事务锁不是预留。
 
 **收货（镜像协议）**：门店 db 条件原子加库 + `op_no` 流水；master 先写 receipt 记录（op_no UNIQUE）
@@ -144,11 +147,12 @@ ALTER TABLE stock_movements ADD COLUMN op_no TEXT;   -- 外部操作号，订单
 CREATE TABLE store_order_delivery_items (
     delivery_id INTEGER NOT NULL, order_item_id INTEGER NOT NULL,
     warehouse_code TEXT NOT NULL, item_id INTEGER NOT NULL,      -- 仓内实扣行
-    quantity REAL NOT NULL, op_no TEXT NOT NULL UNIQUE,
+    quantity REAL NOT NULL, op_no TEXT NOT NULL UNIQUE,   -- 存行级派生键 line_op_no（见上文勘误）
     created_at TEXT NOT NULL, …
 );
 ```
 批次 `delivered_at` 维持整单派生语义（现状 `store_ordering_pure.py:2233`），不宣称批次级签收。
+收货协议（Task 6）沿用同一派生键约定：receipt 幂等键 = `f'{op_no}:{order_item_id}'`。
 
 ## 8. 并发状态聚合（消 P1-01）
 
