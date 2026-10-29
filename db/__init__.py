@@ -597,6 +597,10 @@ CREATE TABLE IF NOT EXISTS store_order_receipts (
     received_by INTEGER NOT NULL,
     note TEXT,
     created_at TEXT NOT NULL,
+    -- 收货幂等键 = f'{op_no}:{order_item_id}'（多仓履约 Task 6，§7 勘误约定）
+    op_no TEXT UNIQUE,
+    -- 0 = master 已落 receipt、门店库加库未回写；1 = 已入库完成
+    applied INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
     FOREIGN KEY (order_item_id) REFERENCES store_order_items(id) ON DELETE CASCADE,
     FOREIGN KEY (received_by) REFERENCES users(id)

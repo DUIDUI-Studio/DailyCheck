@@ -165,7 +165,9 @@ def test_registered_seed_is_one_time_auditable_and_repeat_safe(routing_db, tmp_p
     master.commit()
     assert any(v == 4 for v, *_ in MIGRATIONS), "seed migration missing"
     path = tmp_path / "master.db"
-    assert migrate_up(path, MIGRATIONS, tmp_path / "backups") == [4]
+    applied = migrate_up(path, MIGRATIONS, tmp_path / "backups")
+    # 「从基线 3 起，所有已注册的更新迁移按序全部应用」；不钉注册表尖端快照。
+    assert 4 in applied and applied == [v for v, *_ in MIGRATIONS if v > 3]
     assert routing_api().get_routing(master, 1) == "A"
     assert "enabled" in caplog.text and "missing" in caplog.text
     # 播种后新增绑定不触发新路由，启动/runner 重跑也不补种。

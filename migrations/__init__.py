@@ -19,6 +19,8 @@ from migrations.multi_warehouse_fulfillment import (
     registered_down,
     registered_up,
 )
+from migrations.receipt_op_protocol import registered_down as receipt_op_down
+from migrations.receipt_op_protocol import registered_up as receipt_op_up
 from migrations.seed_item_routing import registered_down as seed_routing_down
 from migrations.seed_item_routing import registered_up as seed_routing_up
 
@@ -88,4 +90,6 @@ MIGRATIONS: list[Migration] = [
      registered_up, registered_down),
     (4, "item_routing: 同租户 DC 路由一次性播种与审计清单",
      seed_routing_up, seed_routing_down),
+    (5, "receipt protocol: store_order_receipts.op_no UNIQUE + applied 标记",
+     receipt_op_up, receipt_op_down),
 ]

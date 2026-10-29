@@ -712,6 +712,8 @@ def order_detail(order_id: int) -> str:
         is_dc_view=is_dc_view,
         # 发货幂等键：页面下发、随表单回传；同一页面重复提交只扣一次。
         ship_op_no=sop.generate_op_no(),
+        # 收货幂等键（多仓履约 Task 6）：与发货同模式，门店侧重复提交只入库一次。
+        receive_op_no=sop.generate_op_no(),
         store_inflows=store_inflows,
         transfer=transfer_ctx,
         can_review=(
@@ -1033,21 +1035,23 @@ def cancel_order_route(order_id: int) -> str:
     status = order["status"]
     actor_id = int(g.user["id"])
     is_requestor = int(order["requested_by"]) == actor_id
-    wh_type = _current_warehouse_type()
-    role = g.role["role"] if g.role else None
 
     if status == sop.ORDER_STATUS_PENDING:
         if not (is_requestor or _is_admin()):
             flash("只有下单人或管理员可以取消待审批订单")
             return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     elif status == sop.ORDER_STATUS_APPROVED:
-        # DC 已审批：必须当前 DC 的 manager/admin 或平台管理员
-        if not _is_admin():
-            if wh_type != sop.WAREHOUSE_TYPE_DC or role not in ("manager", "admin"):
+        # D12（多仓履约）：取消已审批订单 = 审批级动作，须对**全部参与仓**
+        # 持有 order.approve；平台管理员绕过。缺失仓在提示里列清楚。
+        allowed, missing = sop.can_act_on_order(
+            actor_id, order_id, perm="order.approve"
+        )
+        if not allowed:
+            if missing:
+                flash("取消已审批订单需对全部参与仓具备审批权限，缺少：" + "、".join(missing))
+            else:
                 flash("审批后只能由配送中心经理以上或管理员取消")
-                return redirect(url_for("store_ordering.order_detail", order_id=order_id))
-            if order["dc_warehouse_code"] != _current_warehouse_code():
-                abort(403)
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     else:
         flash(f"订单当前状态 {status} 不可取消")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
@@ -1221,6 +1225,8 @@ def receive_order_route(order_id: int) -> str:
       order_item_id: the store_order_items.id being received
       quantity:      base-unit quantity being received this batch
       note:          optional free-text note
+      op_no:         idempotency key issued by the detail page (Task 6); the
+                     line-level key is ``op_no:order_item_id``
 
     Permission: storefront manager/admin (or platform admin). DC users are
     redirected to review list by `_storefront_or_admin`.
@@ -1242,26 +1248,35 @@ def receive_order_route(order_id: int) -> str:
     order_item_id = request.form.get("order_item_id", type=int)
     quantity = parse_qty(request.form.get("quantity", "0"))
     note = (request.form.get("note") or "").strip() or None
+    # 收货幂等键（多仓履约 Task 6）：详情页下发、提交回传；重试同一 op_no
+    # 不会重复入库。旧客户端不带该字段时服务端生成新的一次性键。
+    op_no = (request.form.get("op_no") or "").strip() or sop.generate_op_no()
 
     if order_item_id is None or quantity <= 0:
         flash("请填写有效的收货数量")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     try:
-        result = sop.receive_order_item(
+        result = sop.receive_partial(
             master,
+            sop.open_warehouse_db,
             order_id=order_id,
-            order_item_id=order_item_id,
-            qty=quantity,
-            actor_id=g.user["id"],
+            op_no=op_no,
+            item_qty={order_item_id: quantity},
+            received_by=g.user["id"],
             note=note,
         )
     except ValueError as e:
         flash(str(e))
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    if result["is_fully_received"]:
-        # Notify only when the whole order is fulfilled (matches v2 §9.3).
+    if result["idempotent"]:
+        # 同一 op_no 的重复提交：不重复入库，也不重复发通知。
+        flash("该批收货已处理，重复提交未重复入库")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    if result["transitioned_to_delivered"]:
+        # 收齐：仅条件迁移 changes()==1 的那次调用发通知（spec §8）。
         refreshed = sop.get_order_detail(master, order_id)
         if refreshed is not None:
             sop.notify_order_event(

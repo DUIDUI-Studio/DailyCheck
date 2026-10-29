@@ -1175,6 +1175,11 @@ erDiagram
   同时保存并重建子表，保留购物车及明细、索引、触发器和自增序列，避免父表 DROP 级联丢数据。
 - 仓内 `stock_movements.op_no TEXT` 用于外部发货/收货操作回链（可空，不限制每个操作的流水行数）。
   仓库版本升至 v6，已有 v5 仓的请求迁移会幂等补列。
+- master v5 迁移（`migrations/receipt_op_protocol.py`）：`store_order_receipts` 增
+  `op_no TEXT`（UNIQUE，行级派生键 `f'{op_no}:{order_item_id}'`）与
+  `applied INTEGER NOT NULL DEFAULT 1`；存量行回填 `applied=1`（旧路径写入即已入库）。
+  迁移幂等可重跑，表不存在时直接跳过；新库 DDL 内联列约束、不在 `init_master_db`
+  的 executescript 里单建索引，避免老库缺列时整段 DDL 失败。测试 `tests/test_receipt_migration.py`。
 
 存量迁移注册为 master v3（`migrations/multi_warehouse_fulfillment.py`）；公共契约
 `migrate_multi_warehouse_fulfillment(master_conn, warehouse_conns) -> dict`，
@@ -1519,6 +1524,37 @@ sequenceDiagram
 `op_no IS NOT NULL AND delta<0` 且无对应 `store_order_delivery_items` 的流水，
 回加库存并写 `op_no='REV:<line_op_no>'` 红字冲销；重跑按 REV 键判重，幂等。
 库存差额的恢复只在人工调用对账作业时发生，不作为正常请求路径。
+
+### 7.4 跨库收货提交协议（2026-10-29，多仓履约 Task 6）
+
+收货沿用 §7.3 的「op_no 幂等 + 短事务」模式，由 `receive_partial()` 串起三段：
+
+1. **master** `BEGIN IMMEDIATE` → 行级键 `op_no:order_item_id` 查/插
+   `store_order_receipts(op_no, applied=0)` → 条件累计
+   `UPDATE store_order_items SET fulfilled_quantity=fulfilled_quantity+? … WHERE id=?
+   AND fulfilled_quantity+? <= 上限`（超收 `rowcount==0` 整批回滚）。上限按行取
+   `fulfilled + order_item_receivable_qty()`，即**受已发数封顶**（旧 v2 数据
+   status=shipped 且 shipped=0 时回落订货量）。审批中（approved）也可按行收货。
+2. **仓库库** `BEGIN IMMEDIATE` → 按派生键跳过已存在流水；缺 items 行时按 canonical
+   自动建行 → 原子加库存 + 写 `stock_movements(op_no)` → COMMIT。
+3. **master** `BEGIN IMMEDIATE` → `applied=1` + 回写 `store_item_id` → 锁内重读全部行，
+   全行收齐时 `UPDATE store_orders SET status='delivered' … WHERE id=? AND
+   status='shipped'`；`changes()==1` 才写 SHIPPED→DELIVERED 历史并置收货时间。
+
+**幂等与故障恢复**：同 op_no 同数量重试返回 `idempotent=True`（不重复入库/通知），
+同键换数量或换订单直接拒绝。仓库段失败 → master 侧 `applied=0` 保留；重试经派生键
+补做仓库段后置 1。`reconcile_orphan_receipts()` 扫描 `applied=0` 且仓库缺流水的
+receipt 补库并回填，已存在流水则只标记 applied。收货表单隐藏字段 `op_no` 由详情页
+下发（每次渲染换新键），旧客户端缺省时服务端生成。
+
+**取消竞争**：`cancel_order()` 在同一 `BEGIN IMMEDIATE` 内条件写
+`UPDATE store_orders SET status='cancelled' WHERE id=? AND status IN ('pending','approved')`，
+`changes()==0` → 「订单状态已变更」；已有收货/发货记录仍整单拒绝。发货先提交则取消
+必然失败、订单保持 approved，不会出现「已取消但货在途」。取消已审批订单的权限改走
+`can_act_on_order(..., perm="order.approve")`（D12：需对**全部参与仓**具备
+`order.approve`，平台管理员绕过），缺失仓在提示中列出。测试
+`tests/test_receipt_op_protocol.py`（纯函数）与 `tests/test_store_ordering_store_route.py`
+（路由 op_no 下发/回传/重放）。
 
 ---
 

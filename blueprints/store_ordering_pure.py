@@ -1636,6 +1636,20 @@ def generate_op_no() -> str:
     return uuid.uuid4().hex
 
 
+def _begin_immediate(conn: sqlite3.Connection) -> bool:
+    """Start a write-locked transaction unless the caller already owns one.
+
+    Returns True when this call started the transaction (and therefore owns
+    the matching commit/rollback). Callers that already sit inside a
+    transaction (e.g. legacy tests seeding rows on the same connection) keep
+    their transaction; the protocol still runs inside it.
+    """
+    if conn.in_transaction:
+        return False
+    conn.execute("BEGIN IMMEDIATE")
+    return True
+
+
 def _line_op_no(op_no: str, order_item_id: int) -> str:
     """Derive the per-line idempotency key from the request-level ``op_no``.
 
@@ -2453,6 +2467,440 @@ def mark_order_delivered(
     return get_order_detail(master_conn, order_id)
 
 
+def _find_existing_receipts(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+    line_keys: dict[int, str],
+) -> dict[str, sqlite3.Row]:
+    """Return receipts already written for this request's derived keys.
+
+    Raises when a key belongs to another order; silently reusing it would
+    corrupt unrelated receiving history.
+    """
+    if not line_keys:
+        return {}
+    placeholders = ",".join("?" for _ in line_keys)
+    rows = master_conn.execute(
+        f"SELECT * FROM store_order_receipts WHERE op_no IN ({placeholders})",
+        tuple(line_keys.values()),
+    ).fetchall()
+    found: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        if int(row["order_id"]) != int(order_id):
+            raise ValueError("op_no 已属于其他订单，拒绝复用")
+        found[str(row["op_no"])] = row
+    return found
+
+
+def _ensure_store_item(
+    store_conn: sqlite3.Connection,
+    master_conn: sqlite3.Connection,
+    canonical_id: int,
+    ts: str,
+) -> sqlite3.Row:
+    """Return the storefront ``items`` row, auto-creating it when unbound (§3.1)."""
+    store_item = store_conn.execute(
+        "SELECT * FROM items WHERE canonical_id=?",
+        (canonical_id,),
+    ).fetchone()
+    if store_item is not None:
+        return store_item
+    canon = master_conn.execute(
+        "SELECT name, category_code, unit FROM canonical_items WHERE id=?",
+        (canonical_id,),
+    ).fetchone()
+    if canon is None:
+        raise ValueError(f"canonical_id={canonical_id} not found")
+    # Auto-create: pick category by canonical_category_code → categories.name.
+    cat_id: int | None = None
+    if canon["category_code"]:
+        row = store_conn.execute(
+            "SELECT id FROM categories WHERE canonical_code=?",
+            (canon["category_code"],),
+        ).fetchone()
+        if row is not None:
+            cat_id = int(row["id"])
+        else:
+            cc = master_conn.execute(
+                "SELECT name FROM canonical_categories WHERE code=?",
+                (canon["category_code"],),
+            ).fetchone()
+            cn = cc["name"] if cc else None
+            if cn:
+                row = store_conn.execute(
+                    "SELECT id FROM categories WHERE name=?",
+                    (cn,),
+                ).fetchone()
+                if row is not None:
+                    cat_id = int(row["id"])
+    if cat_id is None:
+        row = store_conn.execute(
+            "SELECT id FROM categories ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"门店仓尚未初始化品类，无法为 canonical_id={canonical_id} 自动创建 items"
+            )
+        cat_id = int(row["id"])
+    cur = store_conn.execute(
+        """INSERT INTO items
+           (sku, name, category_id, quantity, safety_stock,
+            unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
+            canonical_id, updated_at)
+           VALUES (?, ?, ?, 0, 0, ?, 0, 0, NULL, 0, ?, ?)""",
+        (
+            f"AUTO-RECEIVE-{canonical_id}",
+            str(canon["name"]),
+            cat_id,
+            str(canon["unit"] or "件"),
+            canonical_id,
+            ts,
+        ),
+    )
+    return store_conn.execute(
+        "SELECT * FROM items WHERE id=?", (int(cur.lastrowid),)
+    ).fetchone()
+
+
+def _apply_store_receipts(
+    master_conn: sqlite3.Connection,
+    store_conn_factory,
+    store_code: str,
+    order: dict[str, Any],
+    pending: list[dict[str, Any]],
+    ts: str,
+) -> dict[int, int]:
+    """Mirror the receipt into the storefront db under ``BEGIN IMMEDIATE``.
+
+    Each line's derived ``op_no`` is written to ``stock_movements`` so a replay
+    after a crash skips the add (the movement already exists). Returns the
+    storefront ``items.id`` per order_item so master can backfill
+    ``store_item_id``.
+    """
+    store_conn = store_conn_factory(store_code)
+    item_ids: dict[int, int] = {}
+    try:
+        store_conn.row_factory = sqlite3.Row
+        store_conn.execute("BEGIN IMMEDIATE")
+        recv_action = receipt_action_for(order)
+        for entry in pending:
+            order_item_id = int(entry["order_item_id"])
+            canonical_id = int(entry["canonical_id"])
+            qty = parse_qty(entry["quantity"])
+            line_op_no = str(entry["op_no"])
+            existing = store_conn.execute(
+                "SELECT item_id FROM stock_movements WHERE op_no=? LIMIT 1",
+                (line_op_no,),
+            ).fetchone()
+            if existing is not None:
+                item_ids[order_item_id] = int(existing["item_id"])
+                continue
+            store_item = _ensure_store_item(
+                store_conn, master_conn, canonical_id, ts
+            )
+            item_id = int(store_item["id"])
+            store_conn.execute(
+                "UPDATE items SET quantity = quantity + ?, updated_at=? WHERE id=?",
+                (qty, ts, item_id),
+            )
+            store_conn.execute(
+                """INSERT INTO stock_movements
+                   (item_id, action, delta, note, created_at, op_no)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    item_id,
+                    recv_action,
+                    qty,
+                    f"{recv_action} #{order['order_no']}",
+                    ts,
+                    line_op_no,
+                ),
+            )
+            item_ids[order_item_id] = item_id
+        store_conn.commit()
+    except Exception:
+        try:
+            store_conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        store_conn.close()
+    return item_ids
+
+
+def _finalise_receipt_state(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+    actor_id: int,
+    note: str | None,
+    ts: str,
+) -> bool:
+    """Re-read every line under the master lock; transition to delivered once.
+
+    Returns True only for the call whose conditional
+    ``UPDATE … WHERE status='shipped'`` actually moved the order, so the route
+    emits exactly one ``store_order_delivered`` notification.
+    """
+    rows = master_conn.execute(
+        """SELECT id, quantity, fulfilled_quantity
+             FROM store_order_items WHERE order_id=?""",
+        (order_id,),
+    ).fetchall()
+    all_done = bool(rows) and all(
+        parse_qty(row["fulfilled_quantity"]) >= parse_qty(row["quantity"]) - 1e-9
+        for row in rows
+    )
+    if not all_done:
+        return False
+    moved = master_conn.execute(
+        """UPDATE store_orders
+              SET status=?, delivered_at=?, updated_at=?
+            WHERE id=? AND status=?""",
+        (
+            ORDER_STATUS_DELIVERED,
+            ts,
+            ts,
+            order_id,
+            ORDER_STATUS_SHIPPED,
+        ),
+    )
+    if moved.rowcount != 1:
+        return False
+    master_conn.execute(
+        "UPDATE store_order_deliveries SET delivered_at=? WHERE order_id=?",
+        (ts, order_id),
+    )
+    _insert_status_history(
+        master_conn,
+        order_id,
+        ORDER_STATUS_SHIPPED,
+        ORDER_STATUS_DELIVERED,
+        actor_id,
+        note or "门店收货自动完成",
+    )
+    return True
+
+
+def receive_partial(
+    master_conn: sqlite3.Connection,
+    store_conn_factory,
+    *,
+    order_id: int,
+    op_no: str,
+    item_qty: dict[int, float],
+    received_by: int,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Receive one or more lines under a request-level idempotency key.
+
+    Mirror protocol (spec v2 §7):
+      1. Master ``BEGIN IMMEDIATE``: insert the receipt rows (``op_no`` =
+         ``f'{op_no}:{order_item_id}'``, ``applied=0``) and conditionally
+         accumulate ``fulfilled_quantity + ? <=`` this line's receivable
+         ceiling (shipped, or ordered for identifiable v2 legacy rows). The
+         whole batch rolls back if any line exceeds its ceiling.
+      2. Storefront db ``BEGIN IMMEDIATE``: conditional-increment each
+         ``items.quantity`` and write one ``stock_movements(op_no)``; a line
+         whose movement already carries the key is skipped (retry-safe).
+      3. Master ``BEGIN IMMEDIATE``: flip ``applied=1`` and, when every line is
+         fulfilled, conditionally migrate ``shipped → delivered`` exactly once.
+
+    A crash between 2 and 3 leaves ``applied=0``; replaying with the same
+    ``op_no`` (or ``reconcile_orphan_receipts``) completes the mirror without
+    double-adding stock or double-accumulating ``fulfilled_quantity``.
+    """
+    if not op_no:
+        raise ValueError("op_no is required")
+    master_conn.row_factory = sqlite3.Row
+    order = get_order_detail(master_conn, order_id)
+    if order is None:
+        raise ValueError(f"order_id={order_id} not found")
+    items_by_id = {int(it["id"]): it for it in order["order_items"]}
+    selected: list[tuple[int, dict[str, Any], float]] = []
+    for raw_id, raw_qty in item_qty.items():
+        try:
+            order_item_id = int(raw_id)
+        except (TypeError, ValueError):
+            raise ValueError(f"order_item_id={raw_id!r} 无效") from None
+        item = items_by_id.get(order_item_id)
+        if item is None:
+            raise ValueError(
+                f"order_item_id={order_item_id} 不属于 order_id={order_id}"
+            )
+        qty = parse_qty(raw_qty)
+        if qty <= 0:
+            raise ValueError("收货数量必须大于 0")
+        selected.append((order_item_id, item, qty))
+    if not selected:
+        raise ValueError("请至少填写一项收货数量")
+
+    line_keys = {oid: _line_op_no(op_no, oid) for oid, _, _ in selected}
+    store_code = order["store_warehouse_code"]
+    ts = now()
+    pending_store: list[dict[str, Any]] = []
+    needs_work = False
+
+    owns_tx = _begin_immediate(master_conn)
+    try:
+        row = master_conn.execute(
+            "SELECT status FROM store_orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"order_id={order_id} not found")
+        status = str(row["status"])
+        existing = _find_existing_receipts(master_conn, order_id, line_keys)
+        if status not in RECEIVABLE_ORDER_STATUSES:            # A retry of the receipt that already completed the order must stay
+            # idempotent even though ``delivered`` is no longer receivable.
+            for order_item_id, _item, qty in selected:
+                receipt = existing.get(line_keys[order_item_id])
+                if receipt is None or int(receipt["applied"]) == 0:
+                    raise ValueError(
+                        f"order must be approved or shipped to receive, got {status!r}"
+                    )
+                if int(receipt["order_item_id"]) != order_item_id:
+                    raise ValueError(
+                        f"op_no={line_keys[order_item_id]} 已用于其他明细，拒绝复用"
+                    )
+                if abs(parse_qty(receipt["quantity"]) - qty) > 1e-9:
+                    raise ValueError(
+                        f"op_no 已用于不同数量的收货（order_item_id={order_item_id}）"
+                    )
+        else:
+            for order_item_id, item, qty in selected:
+                key = line_keys[order_item_id]
+                receipt = existing.get(key)
+                if receipt is not None:
+                    if int(receipt["order_item_id"]) != order_item_id:
+                        raise ValueError(
+                            f"op_no={key} 已用于其他明细，拒绝复用"
+                        )
+                    if abs(parse_qty(receipt["quantity"]) - qty) > 1e-9:
+                        raise ValueError(
+                            f"op_no 已用于不同数量的收货（order_item_id={order_item_id}）"
+                        )
+                    if int(receipt["applied"]) == 0:
+                        needs_work = True
+                        pending_store.append(
+                            {
+                                "order_item_id": order_item_id,
+                                "op_no": key,
+                                "quantity": parse_qty(receipt["quantity"]),
+                                "canonical_id": int(item["canonical_id"]),
+                            }
+                        )
+                    continue
+                needs_work = True
+                line = master_conn.execute(
+                    """SELECT id, quantity, shipped_quantity, fulfilled_quantity
+                         FROM store_order_items WHERE id=?""",
+                    (order_item_id,),
+                ).fetchone()
+                if line is None:
+                    raise ValueError(f"order_item_id={order_item_id} not found")
+                remaining = order_item_receivable_qty(status, dict(line))
+                if qty > remaining + 1e-9:
+                    raise ValueError(f"收货数量 {qty:g} 超过待收 {remaining:g}")
+                ceiling = parse_qty(line["fulfilled_quantity"]) + remaining
+                updated = master_conn.execute(
+                    """UPDATE store_order_items
+                          SET fulfilled_quantity = fulfilled_quantity + ?,
+                              status = CASE
+                                  WHEN fulfilled_quantity + ? >= quantity - 0.000000001
+                                      THEN 'fulfilled'
+                                  WHEN fulfilled_quantity + ? > 0 THEN 'partial'
+                                  ELSE status END
+                        WHERE id = ?
+                          AND fulfilled_quantity + ? <= ? + 0.000000001""",
+                    (qty, qty, qty, order_item_id, qty, ceiling),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"收货数量 {qty:g} 超过待收 {remaining:g}")
+                master_conn.execute(
+                    """INSERT INTO store_order_receipts
+                       (order_id, order_item_id, quantity, received_by, note,
+                        created_at, op_no, applied)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                    (order_id, order_item_id, qty, received_by, note, ts, key),
+                )
+                pending_store.append(
+                    {
+                        "order_item_id": order_item_id,
+                        "op_no": key,
+                        "quantity": qty,
+                        "canonical_id": int(item["canonical_id"]),
+                    }
+                )
+        master_conn.commit()
+    except Exception:
+        if owns_tx and master_conn.in_transaction:
+            master_conn.rollback()
+        raise
+
+    transitioned = False
+    if pending_store:
+        item_ids = _apply_store_receipts(
+            master_conn, store_conn_factory, store_code, order, pending_store, ts
+        )
+        owns_tx = _begin_immediate(master_conn)
+        try:
+            for entry in pending_store:
+                master_conn.execute(
+                    """UPDATE store_order_receipts SET applied=1
+                        WHERE op_no=? AND applied=0""",
+                    (entry["op_no"],),
+                )
+                store_item_id = item_ids.get(int(entry["order_item_id"]))
+                if store_item_id is not None:
+                    master_conn.execute(
+                        """UPDATE store_order_items SET store_item_id=?
+                            WHERE id=?""",
+                        (store_item_id, entry["order_item_id"]),
+                    )
+            transitioned = _finalise_receipt_state(
+                master_conn, order_id, received_by, note, ts
+            )
+            master_conn.commit()
+        except Exception:
+            if owns_tx and master_conn.in_transaction:
+                master_conn.rollback()
+            raise
+
+    refreshed = get_order_detail(master_conn, order_id) or {}
+    refreshed_items = {
+        int(it["id"]): it for it in refreshed.get("order_items", [])
+    }
+    receipt_by_key = {
+        str(r["op_no"]): r
+        for r in refreshed.get("receipts", [])
+        if r.get("op_no")
+    }
+    receipts_out: list[dict[str, Any]] = []
+    for order_item_id, _item, qty in selected:
+        receipt = receipt_by_key.get(line_keys[order_item_id])
+        receipts_out.append(
+            {
+                "order_item_id": order_item_id,
+                "receipt_id": int(receipt["id"]) if receipt else None,
+                "quantity": parse_qty(receipt["quantity"]) if receipt else qty,
+                "applied": int(receipt["applied"]) if receipt else 0,
+                "fulfilled_quantity": parse_qty(
+                    refreshed_items[order_item_id]["fulfilled_quantity"]
+                ) if order_item_id in refreshed_items else 0.0,
+            }
+        )
+    new_order_status = refreshed.get("status", status)
+    return {
+        "order_id": order_id,
+        "op_no": op_no,
+        "receipts": receipts_out,
+        "new_order_status": new_order_status,
+        "is_fully_received": new_order_status == ORDER_STATUS_DELIVERED,
+        "transitioned_to_delivered": transitioned,
+        "idempotent": not needs_work,
+    }
+
+
 def receive_order_item(
     master_conn: sqlite3.Connection,
     *,
@@ -2462,238 +2910,143 @@ def receive_order_item(
     actor_id: int,
     note: str | None = None,
 ) -> dict[str, Any]:
-    """Receive (partial or full) a single order_item at the storefront warehouse.
+    """Legacy single-line entry point; delegates to :func:`receive_partial`.
 
-    - Validates order.status in ('approved', 'shipped'). A v3 order stays
-      ``approved`` while the DC ships it in batches and only flips to
-      ``shipped`` once every line is complete, so receiving must be permitted
-      there too (2026-10-10 fix: a status-only gate left partial shipments
-      unreceivable at the store).
-    - Validates the order_item belongs to the order.
-    - Validates qty > 0 and qty <= min(shipped_quantity, quantity) − fulfilled_quantity.
-      上限取「实发量与订货量的较小值」——配送中心可能只发了一部分，门店
-      最多只能收实发量（缺陷修复 2026-10-10：原按订货量计算，导致
-      「DC 发 2、门店可收 100」）。未发货的行上限为 0，不可收。
-    - Writes a row to ``store_order_receipts``.
-    - Adds ``qty`` to the storefront warehouse ``items.quantity`` (auto-creating
-      a local row if needed; see §3.1 + §9.1). Writes a ``stock_movements``
-      entry with action='门店订货入库'.
-    - Increments ``store_order_items.fulfilled_quantity`` and bumps its
-      status to 'partial' / 'fulfilled' accordingly.
-    - When every order_item is fulfilled, flips ``store_orders.status`` to
-      'delivered' (sets delivered_at, history). Does NOT emit notifications;
-      the route layer is responsible for calling ``notify_order_event``.
-      Note: this can only ever fire from ``shipped``. An ``approved`` order
-      can never satisfy ``fulfilled == quantity`` on every line, because each
-      line's ceiling is its shipped quantity, which stays below ``quantity``
-      while the DC has not finished shipping. Receiving against ``approved``
-      therefore never short-circuits the order out of the shipping flow.
-
-    Returns a dict with ``order_id``, ``order_item_id``, ``receipt_id``,
-    ``fulfilled_quantity``, ``new_order_status``, ``is_fully_received``.
-    Raises ValueError for any of the validation failures listed above.
+    A fresh ``op_no`` is generated per call, so callers that need retry
+    idempotency must use :func:`receive_partial` with their own key (the web
+    form carries the page-level key).
     """
-    master_conn.row_factory = sqlite3.Row
-    if qty is None:
-        raise ValueError("qty is required")
-    qty = parse_qty(qty)
-    if qty <= 0:
-        raise ValueError("收货数量必须大于 0")
-
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    if order["status"] not in RECEIVABLE_ORDER_STATUSES:
-        raise ValueError(
-            f"order must be approved or shipped to receive, got {order['status']!r}"
-        )
-
-    target_item = next(
-        (it for it in order["order_items"] if int(it["id"]) == int(order_item_id)),
+    result = receive_partial(
+        master_conn,
+        open_warehouse_db,
+        order_id=order_id,
+        op_no=generate_op_no(),
+        item_qty={order_item_id: qty},
+        received_by=actor_id,
+        note=note,
+    )
+    line = next(
+        (
+            r for r in result["receipts"]
+            if int(r["order_item_id"]) == int(order_item_id)
+        ),
         None,
     )
-    if target_item is None:
-        raise ValueError(
-            f"order_item_id={order_item_id} 不属于 order_id={order_id}"
-        )
-
-    # 收货上限 = min(实发量, 订货量) − 已收量，由 order_item_receivable_qty
-    # 统一计算（含 v2 legacy 回落）。
-    # 门禁已放宽到 approved：DC 分批发货期间订单停在 approved，此时只放行
-    # 「本行已发且未收」的数量；未发货的行上限为 0，天然拒绝。
-    remaining = order_item_receivable_qty(order["status"], target_item)
-    if qty > remaining + 1e-9:
-        raise ValueError(
-            f"收货数量 {qty} 超过待收 {remaining}"
-        )
-
-    # 1. write receipt row.
-    ts = now()
-    cur = master_conn.execute(
-        """INSERT INTO store_order_receipts
-           (order_id, order_item_id, quantity, received_by, note, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (order_id, order_item_id, qty, actor_id, note, ts),
-    )
-    receipt_id = int(cur.lastrowid)
-
-    # 2. open storefront warehouse and update stock + write movement.
-    store_code = order["store_warehouse_code"]
-    recv_action = receipt_action_for(order)
-    canonical_id = int(target_item["canonical_id"])
-    canon = master_conn.execute(
-        "SELECT name, category_code, unit FROM canonical_items WHERE id=?",
-        (canonical_id,),
-    ).fetchone()
-    if canon is None:
-        raise ValueError(f"canonical_id={canonical_id} not found")
-    canonical_category_code = canon["category_code"]
-
-    store_conn = open_warehouse_db(store_code)
-    try:
-        store_conn.row_factory = sqlite3.Row
-        store_item = store_conn.execute(
-            "SELECT * FROM items WHERE canonical_id=?",
-            (canonical_id,),
-        ).fetchone()
-        if store_item is None:
-            # Auto-create: pick category by canonical_code → categories.name.
-            cat_id: int | None = None
-            if canonical_category_code:
-                row = store_conn.execute(
-                    "SELECT id FROM categories WHERE canonical_code=?",
-                    (canonical_category_code,),
-                ).fetchone()
-                if row is not None:
-                    cat_id = int(row["id"])
-                else:
-                    # Fallback: pick by Chinese name from canonical_categories.
-                    cc = master_conn.execute(
-                        "SELECT name FROM canonical_categories WHERE code=?",
-                        (canonical_category_code,),
-                    ).fetchone()
-                    cn = cc["name"] if cc else None
-                    if cn:
-                        row = store_conn.execute(
-                            "SELECT id FROM categories WHERE name=?",
-                            (cn,),
-                        ).fetchone()
-                        if row is not None:
-                            cat_id = int(row["id"])
-            if cat_id is None:
-                # Last-resort: first category row (init seeds all 9).
-                row = store_conn.execute(
-                    "SELECT id FROM categories ORDER BY id LIMIT 1"
-                ).fetchone()
-                if row is None:
-                    raise ValueError(
-                        f"门店仓 {store_code} 尚未初始化品类，"
-                        f"无法为 canonical_id={canonical_id} 自动创建 items"
-                    )
-                cat_id = int(row["id"])
-            sku = f"AUTO-RECEIVE-{canonical_id}"
-            # P0-8：单位取主数据值（此前硬编码 '件'，与主数据不一致）
-            recv_unit = str(canon["unit"] or "件")
-            cur = store_conn.execute(
-                """INSERT INTO items
-                   (sku, name, category_id, quantity, safety_stock,
-                    unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
-                    canonical_id, updated_at)
-                   VALUES (?, ?, ?, 0, 0, ?, 0, 0, NULL, 0, ?, ?)""",
-                (sku, str(canon["name"]), cat_id, recv_unit, canonical_id, ts),
-            )
-            new_id = int(cur.lastrowid)
-            store_conn.commit()
-            # Re-open a fresh read so the row is visible to subsequent reads
-            # (in case the same connection's read transaction snapshots the
-            # state before the insert).
-            store_conn.close()
-            store_conn = open_warehouse_db(store_code)
-            store_conn.row_factory = sqlite3.Row
-            store_item = store_conn.execute(
-                "SELECT * FROM items WHERE id=?", (new_id,)
-            ).fetchone()
-        assert store_item is not None
-        new_qty = parse_qty(float(store_item["quantity"]) + qty)
-        store_conn.execute(
-            "UPDATE items SET quantity=?, updated_at=? WHERE id=?",
-            (new_qty, ts, store_item["id"]),
-        )
-        store_conn.execute(
-            """INSERT INTO stock_movements
-               (item_id, action, delta, note, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                store_item["id"], recv_action, qty,
-                f"{recv_action} #{order['order_no']}", ts,
-            ),
-        )
-        store_conn.commit()
-        # Backfill store_item_id on the order item so subsequent receipts can
-        # locate it directly.
-        master_conn.execute(
-            "UPDATE store_order_items SET store_item_id=? WHERE id=?",
-            (store_item["id"], order_item_id),
-        )
-    except Exception:
-        store_conn.rollback()
-        store_conn.close()
-        raise
-    else:
-        store_conn.close()
-
-    # 3. update order item fulfilled_quantity + status.
-    new_fulfilled = parse_qty(float(target_item["fulfilled_quantity"]) + qty)
-    if abs(new_fulfilled - float(target_item["quantity"])) < 1e-9:
-        new_item_status = ORDER_ITEM_STATUS_FULFILLED
-    elif new_fulfilled > 0:
-        new_item_status = ORDER_ITEM_STATUS_PARTIAL
-    else:
-        new_item_status = ORDER_ITEM_STATUS_PENDING
-    master_conn.execute(
-        """UPDATE store_order_items
-           SET fulfilled_quantity=?, status=?
-           WHERE id=?""",
-        (new_fulfilled, new_item_status, order_item_id),
-    )
-
-    # 4. decide whether to flip the order to delivered.
-    new_order_status = order["status"]
-    is_fully_received = False
-    # Reload items because we just updated one.
-    refreshed = get_order_detail(master_conn, order_id)
-    if refreshed is not None:
-        all_done = all(
-            abs(parse_qty(it["fulfilled_quantity"]) - parse_qty(it["quantity"])) < 1e-9
-            for it in refreshed["order_items"]
-        )
-        if all_done and refreshed["status"] == ORDER_STATUS_SHIPPED:
-            master_conn.execute(
-                """UPDATE store_orders
-                   SET status=?, delivered_at=?, updated_at=?
-                   WHERE id=?""",
-                (ORDER_STATUS_DELIVERED, ts, ts, order_id),
-            )
-            master_conn.execute(
-                "UPDATE store_order_deliveries SET delivered_at=? WHERE order_id=?",
-                (ts, order_id),
-            )
-            _insert_status_history(
-                master_conn, order_id, ORDER_STATUS_SHIPPED,
-                ORDER_STATUS_DELIVERED, actor_id, note or "门店收货自动完成",
-            )
-            new_order_status = ORDER_STATUS_DELIVERED
-            is_fully_received = True
-    master_conn.commit()
-
     return {
         "order_id": order_id,
         "order_item_id": order_item_id,
-        "receipt_id": receipt_id,
-        "fulfilled_quantity": new_fulfilled,
-        "new_order_status": new_order_status,
-        "is_fully_received": is_fully_received,
+        "receipt_id": line["receipt_id"] if line else None,
+        "fulfilled_quantity": line["fulfilled_quantity"] if line else 0.0,
+        "new_order_status": result["new_order_status"],
+        "is_fully_received": result["is_fully_received"],
     }
+
+
+def reconcile_orphan_receipts(
+    master_conn: sqlite3.Connection,
+    store_conn_factory,
+) -> list[dict[str, Any]]:
+    """Complete receipts whose master row landed but whose store add did not.
+
+    ``applied=0`` means the storefront mirror was never acknowledged (crash
+    between the master commit and the store write, or before the write-back).
+    This job adds the quantity once, keyed ``f'{op_no}'`` on the store
+    movement, then flips ``applied=1``. Re-running is a no-op because the
+    movement key and the ``applied`` flag are checked first.
+    """
+    master_conn.row_factory = sqlite3.Row
+    rows = master_conn.execute(
+        """SELECT r.id, r.op_no, r.quantity, r.order_item_id,
+                  so.order_no, so.flow_type, so.store_warehouse_code,
+                  soi.canonical_id
+             FROM store_order_receipts r
+             JOIN store_orders so ON so.id = r.order_id
+             JOIN store_order_items soi ON soi.id = r.order_item_id
+            WHERE r.applied=0 AND r.op_no IS NOT NULL
+            ORDER BY r.id"""
+    ).fetchall()
+    repaired: list[dict[str, Any]] = []
+    for row in rows:
+        code = str(row["store_warehouse_code"])
+        line_op_no = str(row["op_no"])
+        qty = parse_qty(row["quantity"])
+        ts = now()
+        store_conn = store_conn_factory(code)
+        try:
+            store_conn.row_factory = sqlite3.Row
+            store_conn.execute("BEGIN IMMEDIATE")
+            existing = store_conn.execute(
+                "SELECT item_id FROM stock_movements WHERE op_no=? LIMIT 1",
+                (line_op_no,),
+            ).fetchone()
+            if existing is not None:
+                item_id = int(existing["item_id"])
+            else:
+                store_item = _ensure_store_item(
+                    store_conn, master_conn, int(row["canonical_id"]), ts
+                )
+                item_id = int(store_item["id"])
+                store_conn.execute(
+                    "UPDATE items SET quantity = quantity + ?, updated_at=? WHERE id=?",
+                    (qty, ts, item_id),
+                )
+                action = (
+                    TRANSFER_RECEIPT_ACTION
+                    if str(row["flow_type"]) == FLOW_DC_TRANSFER
+                    else RECEIPT_ACTION
+                )
+                store_conn.execute(
+                    """INSERT INTO stock_movements
+                       (item_id, action, delta, note, created_at, op_no)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        item_id,
+                        action,
+                        qty,
+                        f"{action} #{row['order_no']} 对账补录",
+                        ts,
+                        line_op_no,
+                    ),
+                )
+            store_conn.commit()
+        except Exception:
+            try:
+                store_conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            store_conn.close()
+        repaired.append(
+            {
+                "receipt_id": int(row["id"]),
+                "order_item_id": int(row["order_item_id"]),
+                "warehouse_code": code,
+                "quantity": qty,
+                "op_no": line_op_no,
+                "store_item_id": item_id,
+            }
+        )
+    if repaired:
+        owns_tx = _begin_immediate(master_conn)
+        try:
+            for entry in repaired:
+                master_conn.execute(
+                    """UPDATE store_order_receipts SET applied=1
+                        WHERE id=? AND applied=0""",
+                    (entry["receipt_id"],),
+                )
+                master_conn.execute(
+                    "UPDATE store_order_items SET store_item_id=? WHERE id=?",
+                    (entry["store_item_id"], entry["order_item_id"]),
+                )
+            master_conn.commit()
+        except Exception:
+            if owns_tx and master_conn.in_transaction:
+                master_conn.rollback()
+            raise
+    return repaired
+
 
 
 def list_order_receipts(
@@ -2738,41 +3091,66 @@ def cancel_order(
     cancelled_by: int,
     reason: str,
 ) -> dict[str, Any]:
-    """Cancel a pending or approved order (P1 placeholder)."""
+    """Cancel a pending or approved order inside one locked transaction.
+
+    The status transition is conditional
+    (``WHERE id=? AND status IN ('pending','approved')``): a concurrent
+    shipment that commits first makes ``changes()==0``, so the check-then-act
+    gap is closed and the order keeps its post-shipment state (spec §8/D12).
+    """
     master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    _assert_transition(order["status"], ORDER_STATUS_CANCELLED)
-    # 已有收货记录则拒绝取消：货已实际入库，作废订单会造成账实不符。
-    # （2026-10-10：approved 状态开放「部分发货即可收货」后新增的防护路径；
-    #  此前 approved 不可收货，故不存在该状态。）
-    received = master_conn.execute(
-        "SELECT COUNT(*) AS n FROM store_order_receipts WHERE order_id=?",
-        (order_id,),
-    ).fetchone()
-    if received is not None and int(received["n"]) > 0:
-        raise ValueError("订单已有收货记录，无法取消")
-    # 同理：只要发过货（含部分发货），总仓库存已扣、货在途，作废单据会让
-    # 在途货物失去账面对应。调货单同样适用（2026-10-19）。
-    shipped = master_conn.execute(
-        "SELECT COALESCE(SUM(shipped_quantity), 0) AS q "
-        "FROM store_order_items WHERE order_id=?",
-        (order_id,),
-    ).fetchone()
-    if shipped is not None and parse_qty(shipped["q"]) > 0:
-        raise ValueError("订单已有发货记录，无法取消")
-    ts = now()
-    master_conn.execute(
-        """UPDATE store_orders
-           SET status=?, cancelled_by=?, cancelled_at=?, cancel_reason=?, updated_at=?
-           WHERE id=?""",
-        (ORDER_STATUS_CANCELLED, cancelled_by, ts, reason, ts, order_id),
-    )
-    _insert_status_history(
-        master_conn, order_id, order["status"], ORDER_STATUS_CANCELLED, cancelled_by, reason,
-    )
-    master_conn.commit()
+    owns_tx = _begin_immediate(master_conn)
+    try:
+        order = get_order_detail(master_conn, order_id)
+        if order is None:
+            raise ValueError(f"order_id={order_id} not found")
+        _assert_transition(order["status"], ORDER_STATUS_CANCELLED)
+        # 已有收货记录则拒绝取消：货已实际入库，作废订单会造成账实不符。
+        # （2026-10-10：approved 状态开放「部分发货即可收货」后新增的防护路径；
+        #  此前 approved 不可收货，故不存在该状态。）
+        received = master_conn.execute(
+            "SELECT COUNT(*) AS n FROM store_order_receipts WHERE order_id=?",
+            (order_id,),
+        ).fetchone()
+        if received is not None and int(received["n"]) > 0:
+            raise ValueError("订单已有收货记录，无法取消")
+        # 同理：只要发过货（含部分发货），总仓库存已扣、货在途，作废单据会让
+        # 在途货物失去账面对应。调货单同样适用（2026-10-19）。
+        shipped = master_conn.execute(
+            "SELECT COALESCE(SUM(shipped_quantity), 0) AS q "
+            "FROM store_order_items WHERE order_id=?",
+            (order_id,),
+        ).fetchone()
+        if shipped is not None and parse_qty(shipped["q"]) > 0:
+            raise ValueError("订单已有发货记录，无法取消")
+        ts = now()
+        moved = master_conn.execute(
+            """UPDATE store_orders
+                  SET status=?, cancelled_by=?, cancelled_at=?,
+                      cancel_reason=?, updated_at=?
+                WHERE id=? AND status IN (?, ?)""",
+            (
+                ORDER_STATUS_CANCELLED,
+                cancelled_by,
+                ts,
+                reason,
+                ts,
+                order_id,
+                ORDER_STATUS_PENDING,
+                ORDER_STATUS_APPROVED,
+            ),
+        )
+        if moved.rowcount != 1:
+            raise ValueError("订单状态已变更，无法取消")
+        _insert_status_history(
+            master_conn, order_id, order["status"], ORDER_STATUS_CANCELLED,
+            cancelled_by, reason,
+        )
+        master_conn.commit()
+    except Exception:
+        if owns_tx and master_conn.in_transaction:
+            master_conn.rollback()
+        raise
     return get_order_detail(master_conn, order_id)
 
 
