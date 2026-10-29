@@ -14,6 +14,7 @@ import logging
 import sqlite3
 import tempfile
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -1314,6 +1315,12 @@ def init_master_db() -> None:
 
                 # Phase 3: 权限点目录 + 5 内置角色 + 角色-权限包（幂等播种）。
                 # 必须在 flock 块内——gunicorn 多 worker 并发启动时防重复播种竞态。
+                # 显式路由 FK 依赖默认租户；新安装与存量库启动均幂等物化。
+                conn.execute(
+                    "INSERT OR IGNORE INTO tenants (id, name, status, created_at) "
+                    "VALUES (1, '默认租户', 'active', ?)",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+                )
                 _seed_permissions_and_roles(conn)
 
                 # 启动断言（防空包全站 403 的沉默失败）：告警而非 raise，

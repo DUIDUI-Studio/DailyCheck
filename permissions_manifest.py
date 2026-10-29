@@ -176,6 +176,9 @@ ROUTE_MATRIX: dict[str, str] = {
     # ---- ops（运维交付看板：托管 dc-dashboard-refresh.timer 的渲染产物）----
     # 内容含部署阶段耗时 / 会话 token 用量，属内部运维信息 → 仅平台超管。
     "ops.ops_dashboard": PLATFORM,
+    "item_routing.admin": PLATFORM,
+    "item_routing.set_route": PLATFORM,
+    "item_routing.delete_route": PLATFORM,
     # ---- owner_approvals（待拍板队列：Prod Agent 登记红线 PR，owner 一键批）----
     # 页面与按钮同档：能看队列的人就是能拍板的人，不拆两级。
     # 三个 /api/ops/approvals* 端点不走本矩阵 —— 它们用 Bearer 共享令牌，

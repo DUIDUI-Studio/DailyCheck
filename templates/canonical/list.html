@@ -6,6 +6,7 @@
   <h2>品项主数据</h2>
   <div class="page-header-actions">
     {% if is_admin %}
+    <a class="btn-sm" href="{{ url_for('item_routing.admin') }}">履约路由</a>
     <a class="btn-sm primary" href="{{ url_for('canonical.canonical_edit') }}">➕ 新建</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_bulk_import') }}">📥 批量导入</a>
     <a class="btn-sm" href="{{ url_for('canonical.canonical_fanout') }}">📤 扇出</a>

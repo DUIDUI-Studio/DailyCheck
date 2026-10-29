@@ -102,6 +102,7 @@ def create_app() -> Flask:
     from blueprints.forecast import _start_scheduler
     from blueprints.forecast import bp as forecast_bp
     from blueprints.import_items import bp as import_items_bp
+    from blueprints.item_routing import bp as item_routing_bp
     from blueprints.items import bp as items_bp
     from blueprints.notifications import bp as notifications_bp
     from blueprints.ops import bp as ops_bp
@@ -119,6 +120,7 @@ def create_app() -> Flask:
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
     app.register_blueprint(items_bp)
+    app.register_blueprint(item_routing_bp)
     app.register_blueprint(stocktake_bp)
     app.register_blueprint(restock_bp)
     app.register_blueprint(outbound_bp)

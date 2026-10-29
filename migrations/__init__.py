@@ -19,6 +19,8 @@ from migrations.multi_warehouse_fulfillment import (
     registered_down,
     registered_up,
 )
+from migrations.seed_item_routing import registered_down as seed_routing_down
+from migrations.seed_item_routing import registered_up as seed_routing_up
 
 __all__ = ["MIGRATIONS", "Migration", "migrate_multi_warehouse_fulfillment"]
 
@@ -84,4 +86,6 @@ MIGRATIONS: list[Migration] = [
      _m002_up, _m002_down),
     (3, "multi-warehouse fulfillment: 行来源/批次仓/购物车可空/op_no/item_routing",
      registered_up, registered_down),
+    (4, "item_routing: 同租户 DC 路由一次性播种与审计清单",
+     seed_routing_up, seed_routing_down),
 ]

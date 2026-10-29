@@ -1191,6 +1191,10 @@ erDiagram
 完成主库及仓库备份、执行版本迁移并审查异常报告；异常行需人工处置，不静默修数。
 多仓创建仍属于后续阶段，版本迁移本身不启用跨仓业务。
 
+**默认租户前置**：`init_master_db()` 与 master v4 路由播种迁移均先幂等插入
+`tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`
+外键可用；已有租户配置不覆盖，路由 pure 层不代建租户。
+
 ### 4.3 warehouse.db 核心表（ER 简图）
 
 ```mermaid
@@ -1754,6 +1758,21 @@ flowchart TB
 | Q7 库存零丢失 | `strict` | 扇出前自动备份；写库前 `shutil.copy2`；禁止真库写测试 |
 
 > **Q7 `guard_real_db` 软链穿透防护（2026-10-15）**：prod 部署把 `db/warehouses/*.db` 做成指向 `/var/lib/dailycheck/warehouses/` 的软链，`resolve()` 会穿透使路径比较失配、guard 放行（verify.sh check1 在 prod 首演实测抓到）。guard 现对**未 resolve 的 absolute parent** 再比一次，任一命中即拒——改部署布局（换数据目录/软链形态）时必须保持此语义。
+
+**显式履约路由（2026-10-29）**：`blueprints/item_routing_pure.py` 负责租户 1 的
+`item_routing` 播种及 CRUD。独立 master v4 迁移只扫描同租户、类型为
+`distribution_center` 的仓内绑定，要求主数据 `status='active'`、本地
+`is_active=1 AND is_alias=0 AND is_store_exclusive=0`；唯一 DC 自动启用，多个 DC
+列为 ambiguous，无 DC 列为 missing，仅存在专属 DC 行列为 skipped_exclusive。
+门店专属标记是本店属性，不否决其他仓合法绑定。已有配置始终保留，迁移日志输出
+四段审计清单；日常启动、扇出和 claim 不补种或改路由。
+`routing_pending(master_conn, wh_db_map=None)` 只读打开登记的 DC 库动态诊断；缺库/坏库
+显式失败，不把不完整扫描误当唯一候选。新增唯一绑定仍等待管理员显式配置。
+新蓝图 `item_routing.py` 在 `app.py` 注册，入口 `/admin/item-routing`（主数据列表可达），
+沿用 `@require_platform_admin`、仅租户 1、全局 CSRF，权限清单三个端点标为 PLATFORM；
+支持列表、待配置高亮、设置与删除，设置记录 `updated_by/updated_at`，变更沿用仓内 audit_log。
+路由配置不改已提交订单；纯函数不 commit，由调用方管理事务。
+验证见 `tests/test_item_routing_pure.py` / `tests/test_item_routing_route.py`。
 
 ### 10.3 Store Ordering 状态机
 
