@@ -69,9 +69,27 @@ def _m002_down(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS tenants")
 
 
+def _m003_up(conn: sqlite3.Connection) -> None:
+    """企微 Bot 管理配置表（Issue #79 PR1）。"""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS bot_agent_config (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT,
+            updated_by TEXT
+        )"""
+    )
+
+
+def _m003_down(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS bot_agent_config")
+
+
 MIGRATIONS: list[Migration] = [
     (1, "baseline: login_throttle + agent_tokens.rate_limit（P0-4 收编）",
      _m001_up, _m001_down),
     (2, "multi-tenant PoC: tenants 表 + 三表 tenant_id（P0-1）",
      _m002_up, _m002_down),
+    (3, "bot-agent config: bot_agent_config 键值表（Issue #79 PR1）",
+     _m003_up, _m003_down),
 ]
