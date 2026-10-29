@@ -180,8 +180,18 @@ def create_outbound(
 
 
 def count_outbound(conn: sqlite3.Connection) -> int:
-    """出库申请总数（与 list_outbound 同一数据源）。"""
-    row = conn.execute("SELECT COUNT(*) AS total FROM outbound_requests").fetchone()
+    """出库申请总数（与 list_outbound 完全同口径）。
+
+    `outbound_requests.item_id` 有 FK 声明，但 SQLite 连接默认
+    `PRAGMA foreign_keys = 0`，且库存品物理删除不会清理历史出库申请 ——
+    孤儿行真实存在（Prod 在 wh_003 实测 17 行）。因此计数与列表都用
+    LEFT JOIN items：孤儿行计入 total 且仍可翻到（item_name 为 null），
+    `total` 恒等于实际可翻页行数，客户端按 truncated 翻页不会多出空页。
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS total FROM outbound_requests o "
+        "LEFT JOIN items i ON i.id = o.item_id"
+    ).fetchone()
     return int(row["total"])
 
 
@@ -193,7 +203,7 @@ def list_outbound(
                   o.requested_quantity AS quantity, o.reason,
                   o.status, o.rolled_back, o.created_at
            FROM outbound_requests o
-           JOIN items i ON i.id = o.item_id
+           LEFT JOIN items i ON i.id = o.item_id
            ORDER BY o.created_at DESC, o.id DESC
            LIMIT ? OFFSET ?""",
         (limit, offset),

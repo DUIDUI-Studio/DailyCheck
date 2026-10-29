@@ -1700,6 +1700,21 @@ flowchart LR
 的 `id` tie-break 是分页正确性的一部分（同秒多行时仅按 `created_at` 排序，
 逐页 OFFSET 可能重复/遗漏）。回归 `tests/test_mcp_list_pagination.py`（见 §12）。
 
+**口径一致性与入参校验（Prod 复审 B1-B3，2026-10-29）**：
+- `count_outbound` / `list_outbound` 统一 `LEFT JOIN items`。`outbound_requests.item_id` 虽有 FK
+  声明，但 SQLite 连接默认 `PRAGMA foreign_keys = 0`，库存品物理删除不会清理历史出库申请，
+  孤儿行真实存在（生产 `wh_003` 实测 17 行）；统一 LEFT JOIN 后 `total` 恒等于实际可翻页行数，
+  孤儿行 `item_name` 为 null 而非被静默丢弃，客户端按 `truncated` 翻页不会多出空页。
+- `mcp_server/service/pagination.py` 严格解析 `limit` / `offset`：非整数（None / 非数字字符串 /
+  小数 / 布尔）抛 MCP 结构化 `ValidationError`，由 `protocol/server.py::call_tool` 捕获，
+  不再让裸 `ValueError` / `TypeError` 穿透成非结构化错误。
+- 外部 agent 的机器可读契约 `docs/integrations/dailycheck-mcp/tools.json` 同步 `limit` / `offset`
+  与 `{items,total,limit,offset,truncated}` 信封描述。
+- 回归 `tests/test_mcp_list_pagination.py` 补孤儿行 fixture、`truncated` 终止判定、
+  类型守卫与实际 `call_tool` 的结构化错误序列化用例；生产同形种子（1630 条关联行 +
+  17 条孤儿行）返回 1647 条、17 页、末页 47 条且 `truncated=False`。变异仅将
+  `count_outbound` 改回 INNER JOIN，5 个出库分页用例转红。
+
 > **`restock_list` 的数据源（Issue #72，2026-10-27）**：读 `restock_requests` LEFT JOIN `items`，
 > 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC, id DESC`）。
 > 此前读 `stock_movements` 且过滤 `action='restock'`，而入库流程写入的是 `action='补货入库'`，
@@ -2156,10 +2171,12 @@ flowchart TB
 
 **门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
 
-**MCP 列表分页（Issue #74）**：`tests/test_mcp_list_pagination.py`（14 用例，真实临时
-`master.db` + warehouse DB，种 120 条 outbound / 120 条 restock 流水）——逐页拼接与
+**MCP 列表分页（Issue #74）**：`tests/test_mcp_list_pagination.py`（39 用例，真实临时
+`master.db` + warehouse DB，默认种 120 条关联 outbound + 5 条孤儿 outbound / 120 条 restock，
+另含 1630 + 17 条生产同形出库种子）——逐页拼接与
 全量一致且无重复无遗漏、`total` 恒等于总行数、`truncated` 首末页翻转、limit/offset
-clamp、两个工具的 `inputSchema`/description 契约，以及工具层端到端透传。断言用同一
+clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分页契约一致性，
+以及工具层端到端透传。断言用同一
 `created_at` 的 120 行钉住 `id DESC` tie-break；三处变异（`truncated` 恒 False /
 去掉 limit clamp / 数据层忽略 offset）均实测打红对应用例。该文件同样落在 `tests/`
 根目录，CI 会跑。

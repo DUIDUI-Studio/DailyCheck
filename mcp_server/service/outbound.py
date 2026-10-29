@@ -14,6 +14,7 @@ from mcp_server.infra.errors import (
     ValidationError,
 )
 from mcp_server.service.auth import AuthContext, check_warehouse
+from mcp_server.service.pagination import parse_limit, parse_offset
 
 
 def _mark_invalid(item_id: int) -> None:
@@ -84,8 +85,8 @@ def list_outbound(
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    limit = max(1, min(int(limit), 500))
-    offset = max(0, int(offset))
+    limit = parse_limit(limit)
+    offset = parse_offset(offset)
     with warehouse_connection(wh["db_path"]) as conn:
         items = _list_outbound(conn, limit=limit, offset=offset)
         total = _count_outbound(conn)
