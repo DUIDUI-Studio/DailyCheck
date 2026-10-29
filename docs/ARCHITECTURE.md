@@ -1158,6 +1158,39 @@ erDiagram
 
 > **权限精细化新增表（2026-10-13 起）**：`permissions` / `roles` / `role_permissions` / `permission_routes` / `approval_policies`（5 张，均 `CREATE TABLE IF NOT EXISTS`，对存量 master.db 为 no-op 追加；由 `init_master_db()` 幂等播种）。角色包与权限点目录的**单一事实来源**是 `permissions_manifest.py`（守卫 / 管理 UI / 测试四方共用）。详 §8.7。
 
+**多仓履约 schema（2026-10-29，实施计划 Task 1）**：
+
+- `store_order_items.source_warehouse_code TEXT` 固化每行来源仓，
+  `ship_op_no TEXT` 留存最近一次发货操作号；`store_order_deliveries.warehouse_code TEXT`
+  固化每批发货仓。头级 `dc_warehouse_code` 仍保留供兼容展示。
+- `store_order_delivery_items(delivery_id, order_item_id, warehouse_code, item_id,
+  quantity, op_no, created_at)` 记录实际扣库批次行；`op_no TEXT NOT NULL UNIQUE`，
+  批次头/订单明细外键级联删除，`item_id` 是对应来源仓内的行 ID。
+- `item_routing(tenant_id, canonical_id, fulfillment_warehouse_code, updated_at,
+  updated_by)` 以 `(tenant_id, canonical_id)` 为主键，关联租户、主数据、来源仓和维护人；
+  本次只建表，路由播种与配置入口属于后续 Task。
+- `store_order_carts.dc_warehouse_code` 改为可空，历史非空值原样保留；
+  `UNIQUE(user_id, store_warehouse_code)` 继续保证每用户每门店一车。
+  迁移在 FK ON 和 runner 外层事务内通过 create/copy/drop/rename 重建，
+  同时保存并重建子表，保留购物车及明细、索引、触发器和自增序列，避免父表 DROP 级联丢数据。
+- 仓内 `stock_movements.op_no TEXT` 用于外部发货/收货操作回链（可空，不限制每个操作的流水行数）。
+  仓库版本升至 v6，已有 v5 仓的请求迁移会幂等补列。
+
+存量迁移注册为 master v3（`migrations/multi_warehouse_fulfillment.py`）；公共契约
+`migrate_multi_warehouse_fulfillment(master_conn, warehouse_conns) -> dict`，
+`warehouse_conns` 为仓 code 到已打开连接的映射，事务由调用方提交或回滚。
+返回 `{backfilled_items, backfilled_deliveries, carts_rebuilt, anomalies}`，前三项为本次写入行数/
+是否重建，重跑分别为 `0 / 0 / False`。来源与批次仓回填只写 NULL，已固化的跨仓来源不会覆盖；
+违反 `0 ≤ fulfilled_quantity ≤ shipped_quantity ≤ quantity` 的行进入 `anomalies`
+（含订单/明细 ID 和原始数量），该行连来源字段也不写，交人工处置。
+注册表适配器按 `warehouses.db_path` 打开仓文件（相对路径按 `config.BASE_DIR` 解析），
+缺文件拒绝迁移并输出完整迁移报告；迁移不可 down，回退走备份。
+新库 DDL 与存量迁移共用两张新增表的 DDL；测试见 `tests/test_migration_multi_warehouse.py`。
+
+生产侧事项：本次属于 master 与全部仓库的 schema 兼容变更，Prod Agent 按标准迁移流程
+完成主库及仓库备份、执行版本迁移并审查异常报告；异常行需人工处置，不静默修数。
+多仓创建仍属于后续阶段，版本迁移本身不启用跨仓业务。
+
 ### 4.3 warehouse.db 核心表（ER 简图）
 
 ```mermaid
@@ -1244,11 +1277,11 @@ flowchart LR
     Start["get_warehouse_db()<br/>每个请求调"] --> ReadVersion{"PRAGMA<br/>user_version<br/>>= WAREHOUSE_SCHEMA_VERSION?"}
     ReadVersion -->|Yes| Skip["跳过（单次 PRAGMA 读）"]
     ReadVersion -->|No| Migrate["migrate_warehouse_db_columns()<br/>PRAGMA table_info 守卫<br/>+ idempotent ALTER<br/>+ 创建索引"]
-    Migrate --> Stamp["PRAGMA user_version = 2"]
+    Migrate --> Stamp["PRAGMA user_version = 6"]
     Stamp --> Skip
 ```
 
-- **`WAREHOUSE_SCHEMA_VERSION = 3`**，改了 ALTER 块必须 bump。
+- **`WAREHOUSE_SCHEMA_VERSION = 6`**，改了 ALTER 块必须 bump。
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。

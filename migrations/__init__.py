@@ -14,6 +14,14 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 
+from migrations.multi_warehouse_fulfillment import (
+    migrate_multi_warehouse_fulfillment,
+    registered_down,
+    registered_up,
+)
+
+__all__ = ["MIGRATIONS", "Migration", "migrate_multi_warehouse_fulfillment"]
+
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None],
                   Callable[[sqlite3.Connection], None]]
 
@@ -74,4 +82,6 @@ MIGRATIONS: list[Migration] = [
      _m001_up, _m001_down),
     (2, "multi-tenant PoC: tenants 表 + 三表 tenant_id（P0-1）",
      _m002_up, _m002_down),
+    (3, "multi-warehouse fulfillment: 行来源/批次仓/购物车可空/op_no/item_routing",
+     registered_up, registered_down),
 ]
