@@ -2480,3 +2480,44 @@ def _exclude_self(user_ids: list[int], actor_user_id: int | None) -> list[int]:
     if actor_user_id is None:
         return user_ids
     return sorted({uid for uid in user_ids if uid != actor_user_id})
+
+
+def order_participation_sql(alias: str = "so") -> str:
+    """SQL predicate for one warehouse code; callers supply a trusted SQL alias."""
+    return (
+        "EXISTS (SELECT 1 FROM store_order_items soi "
+        f"WHERE soi.order_id={alias}.id "
+        f"AND COALESCE(soi.source_warehouse_code, {alias}.dc_warehouse_code) = ?)"
+    )
+
+
+def order_participants(master_conn, order_id: int) -> list[str]:
+    """Return sorted line-source warehouses, falling back only for NULL sources."""
+    rows = master_conn.execute(
+        """SELECT DISTINCT COALESCE(soi.source_warehouse_code, so.dc_warehouse_code) AS code
+             FROM store_order_items soi
+             JOIN store_orders so ON so.id = soi.order_id
+            WHERE so.id = ?
+            ORDER BY code""",
+        (order_id,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def can_act_on_order(
+    user_id: int, order_id: int, *, perm: str = "order.approve",
+) -> tuple[bool, list[str]]:
+    """Request-bound RBAC adapter; SQL participation helpers remain Flask-free."""
+    from db import get_master_db
+    from permissions import has_permission
+
+    master = get_master_db()
+    user = master.execute("SELECT is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+    if user is not None and user[0]:
+        return True, []
+    participants = order_participants(master, order_id)
+    missing = [
+        code for code in participants
+        if not has_permission(user_id, perm, warehouse_code=code)
+    ]
+    return bool(participants) and not missing, missing

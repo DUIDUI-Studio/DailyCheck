@@ -1624,6 +1624,20 @@ flowchart TB
 
 **解析（`permissions.py::current_permissions()`）**：每请求一次 JOIN 查 master.db（`warehouse_users → roles → role_permissions`），结果缓存到 `g.perm_set`——**禁进程级缓存**（gunicorn 多 worker 会各自漂移）；**fail-closed**：任何异常 → 空集 → 403 + 日志；`is_admin=1` 返回全目录哨兵（超管直通）。未知角色 code（JOIN 空集）→ 403。
 
+**订单参与仓与目标仓鉴权（2026-10-29）**：`has_permission(user_id, perm, warehouse_code=...)`
+按目标仓解析内置/当前租户角色；省略目标仓时使用当前仓。既有 `has_permission(*codes)`
+调用语义及 `g.perm_set` 不变；显式目标解析使用独立的请求缓存 `g.target_perm_sets`，
+键为 `(user_id, warehouse_code, tenant_id)`，无绑定、跨租户、未知角色或查询异常均失败关闭。
+平台管理员恒放行，显式用户检查不借用当前会话用户的管理员身份。
+`store_ordering_pure.order_participation_sql(alias="so")` 返回参数化 `EXISTS` 谓词，
+以 `COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)` 识别参与仓，避免多行 JOIN
+使计数翻倍；头仓仅兜底历史 NULL 来源行。`order_participants(master_conn, order_id)`
+返回去重排序的参与仓；请求内适配器 `can_act_on_order(user_id, order_id, perm="order.approve")`
+逐仓校验并返回 `(是否全部授权, 缺权仓列表)`，空订单失败关闭，平台管理员返回 `(True, [])`。
+SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复用；本阶段未切换现有路由守卫。
+回归：`tests/test_order_participation_pure.py`、`tests/test_permissions_target_warehouse.py`
+及既有 `tests/test_route_permission_matrix.py`（断言零修改）。
+
 **存储**（master.db，`init_master_db()` 幂等播种）：`permissions` / `roles` / `role_permissions` / `permission_routes`（Web 与 MCP 共用词汇表，Phase B 填充）/ `approval_policies`（Phase 3 扩展点，空表）。启动断言 `_verify_builtin_packages()`（空包 / 阶梯破坏 / 权限数契约 / 越界点 / 孤儿点）**告警不 raise**（防单点数据问题拒绝启动）。改包后须 `flask reseed-builtin-roles` 显式重播种（`INSERT OR IGNORE` 不更新已存在行）。
 
 **成本脱敏 / 成本读访问**（服务端，`blueprints/cost_redaction_pure.py`）：报表导出 `export_consumption` / `export_summary` 对无 `report.cost.view` 者把成本列留空（列结构不变）；**配方成本读接口**（`recipe_cost` 5 个 CSV 导出 + `api_cost` + `overview` 总览页）挂 `report.cost.view`（staff/viewer 403）；`/summary`、`/inventory` 页**不脱敏**（Eric 终裁④，口径例外）。另 `users.html` 页脚已注明「仓管理(该仓全权，品项删除除外)」（对齐终裁②：`item.delete` 为平台级）。
