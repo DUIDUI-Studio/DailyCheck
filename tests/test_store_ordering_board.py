@@ -179,3 +179,44 @@ def test_storefront_user_forbidden_on_both_urls(nav_client_factory):
     client, _ = nav_client_factory("storefront", "manager")
     for path in BOARD_PATHS:
         assert client.get(path).status_code == 403, f"{path} 不应向门店用户开放"
+
+
+# ---------------------------------------------------------------------------
+# 多仓履约 Task 8：参与仓口径 + ?warehouse= 筛选（D7）
+# ---------------------------------------------------------------------------
+
+def test_dc_user_cannot_widen_scope_via_warehouse_param(board):
+    """`?warehouse=`（参与仓）对 DC 用户同样不生效，与 ?dc=/?store= 同一守卫。"""
+    body = board["client"].get(
+        f"/store-ordering/review?warehouse={board['other_dc']}"
+    ).data.decode()
+    assert "SO-OTHER-PENDING" not in body, "DC 用户通过 ?warehouse= 看到了别家仓的订单"
+    assert "SO-MINE-PENDING" in body
+
+
+def test_legacy_line_less_orders_still_visible_to_head_dc(board):
+    """参与仓口径不得把历史无明细行的单据从原头仓的看板上抹掉。"""
+    conn = sqlite3.connect(board["master_path"])
+    line_count = conn.execute("SELECT COUNT(*) FROM store_order_items").fetchone()[0]
+    conn.close()
+    assert line_count == 0, "本用例依赖 fixture 里没有明细行的历史订单"
+    body = board["client"].get("/store-ordering/review").data.decode()
+    assert "SO-MINE-PENDING" in body
+    assert "SO-MINE-APPROVED" in body
+
+
+def test_admin_warehouse_filter_falls_back_to_head(admin_board):
+    """admin `?warehouse=` 在无明细行时回落到头仓，与订单板口径一致。"""
+    filtered = admin_board["client"].get(
+        f"/store-ordering/admin/orders?warehouse={admin_board['other_dc']}"
+    ).data.decode()
+    assert "SO-OTHER-PENDING" in filtered
+    assert "SO-MINE-PENDING" not in filtered
+
+
+def test_participant_filter_rendered_for_admin_only(board, admin_board):
+    """参与仓下拉只给平台管理员：DC 用户不渲染该筛选（也无从生效）。"""
+    admin_body = admin_board["client"].get("/store-ordering/admin/orders").data.decode()
+    assert 'name="warehouse"' in admin_body
+    dc_body = board["client"].get("/store-ordering/review").data.decode()
+    assert 'name="warehouse"' not in dc_body

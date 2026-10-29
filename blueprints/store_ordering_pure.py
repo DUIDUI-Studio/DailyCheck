@@ -1657,11 +1657,74 @@ def get_dc_items_for_order_detail(
         dc_conn.close()
 
 
+def _participants_by_order(
+    master_conn: sqlite3.Connection,
+    order_ids: list[int],
+) -> dict[int, list[str]]:
+    """Map order_id -> sorted participating warehouse codes (one batch query).
+
+    Uses ``DISTINCT`` over the line sources so an order with several lines in
+    the same warehouse is still counted once (spec §10 EXISTS semantics).
+    """
+    if not order_ids:
+        return {}
+    master_conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in order_ids)
+    rows = master_conn.execute(
+        f"""SELECT DISTINCT so.id AS order_id,
+                   COALESCE(soi.source_warehouse_code, so.dc_warehouse_code) AS code
+              FROM store_orders so
+              LEFT JOIN store_order_items soi ON soi.order_id = so.id
+             WHERE so.id IN ({placeholders})""",
+        order_ids,
+    ).fetchall()
+    codes: dict[int, set[str]] = {}
+    for row in rows:
+        if row["code"]:
+            codes.setdefault(int(row["order_id"]), set()).add(str(row["code"]))
+    return {order_id: sorted(warehouses) for order_id, warehouses in codes.items()}
+
+
+def _warehouse_name_map(master_conn: sqlite3.Connection) -> dict[str, str]:
+    master_conn.row_factory = sqlite3.Row
+    return {
+        str(row["code"]): str(row["name"] or row["code"])
+        for row in master_conn.execute("SELECT code, name FROM warehouses").fetchall()
+    }
+
+
+def _attach_participant_warehouses(
+    master_conn: sqlite3.Connection,
+    orders: list[dict[str, Any]],
+) -> None:
+    """Annotate list rows with participant codes/names and a cross-warehouse flag.
+
+    Orders without any line row (legacy fixtures / pre-migration dirty data)
+    fall back to the header warehouse — that is the only signal left.
+    """
+    if not orders:
+        return
+    codes_by_order = _participants_by_order(
+        master_conn, [int(order["id"]) for order in orders]
+    )
+    names = _warehouse_name_map(master_conn)
+    for order in orders:
+        codes = codes_by_order.get(int(order["id"]))
+        if not codes:
+            head = order.get("dc_warehouse_code")
+            codes = [str(head)] if head else []
+        order["participant_warehouses"] = [
+            {"code": code, "name": names.get(code, code)} for code in codes
+        ]
+        order["is_multi_warehouse"] = len(codes) > 1
+
+
 def list_orders(
     master_conn: sqlite3.Connection,
     *,
     store_warehouse_code: str | None = None,
     dc_warehouse_code: str | None = None,
+    participant_warehouse_code: str | None = None,
     status: str | None = None,
     flow_type: str | None = None,
     start_date: str | None = None,
@@ -1669,7 +1732,13 @@ def list_orders(
     limit: int = 200,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Query orders with optional filters."""
+    """Query orders with optional filters.
+
+    ``participant_warehouse_code`` filters by the unified "参与仓" predicate
+    (spec §10): any line whose source warehouse (header fallback for legacy
+    NULL rows) equals the code. Orders with no line rows at all also match
+    their header warehouse — pre-multi-warehouse data had no per-line source.
+    """
     master_conn.row_factory = sqlite3.Row
     where_parts: list[str] = []
     params: list[Any] = []
@@ -1679,6 +1748,13 @@ def list_orders(
     if dc_warehouse_code:
         where_parts.append("dc_warehouse_code = ?")
         params.append(dc_warehouse_code)
+    if participant_warehouse_code:
+        where_parts.append(
+            f"({order_participation_sql('so')} OR "
+            "(so.dc_warehouse_code = ? AND NOT EXISTS ("
+            "SELECT 1 FROM store_order_items legacy WHERE legacy.order_id = so.id)))"
+        )
+        params.extend([participant_warehouse_code, participant_warehouse_code])
     if status:
         where_parts.append("status = ?")
         params.append(status)
@@ -1711,7 +1787,9 @@ def list_orders(
             LIMIT ? OFFSET ?""",
         params,
     ).fetchall()
-    return [dict(r) for r in rows]
+    orders = [dict(r) for r in rows]
+    _attach_participant_warehouses(master_conn, orders)
+    return orders
 
 
 def count_orders_by_status(
@@ -1719,24 +1797,33 @@ def count_orders_by_status(
     *,
     store_warehouse_code: str | None = None,
     dc_warehouse_code: str | None = None,
+    participant_warehouse_code: str | None = None,
 ) -> dict[str, int]:
     """Return {status: count} over exactly the same scope as list_orders.
 
     过滤下推到 SQL 的 GROUP BY，不把订单全表捞回来在应用层数——Issue #19 的
-    合并订单页要在页签上显示各状态计数。
+    合并订单页要在页签上显示各状态计数。参与仓口径走 EXISTS，多行同仓不翻倍。
     """
     master_conn.row_factory = sqlite3.Row
     where_parts: list[str] = []
     params: list[Any] = []
+    alias = "store_orders"
     if store_warehouse_code:
-        where_parts.append("store_warehouse_code = ?")
+        where_parts.append(f"{alias}.store_warehouse_code = ?")
         params.append(store_warehouse_code)
     if dc_warehouse_code:
-        where_parts.append("dc_warehouse_code = ?")
+        where_parts.append(f"{alias}.dc_warehouse_code = ?")
         params.append(dc_warehouse_code)
+    if participant_warehouse_code:
+        where_parts.append(
+            f"({order_participation_sql(alias)} OR "
+            f"({alias}.dc_warehouse_code = ? AND NOT EXISTS ("
+            f"SELECT 1 FROM store_order_items legacy WHERE legacy.order_id = {alias}.id)))"
+        )
+        params.extend([participant_warehouse_code, participant_warehouse_code])
     where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     rows = master_conn.execute(
-        f"SELECT status, COUNT(*) AS n FROM store_orders {where} GROUP BY status",
+        f"SELECT status, COUNT(*) AS n FROM {alias} {where} GROUP BY status",
         params,
     ).fetchall()
     return {str(r["status"]): int(r["n"]) for r in rows}
@@ -1824,6 +1911,14 @@ def get_order_detail(
             (order_id,),
         ).fetchall()
     ]
+    # 多仓履约（Task 8）：审批视角需要「整单全部行 + 每行来源仓标签」，
+    # 发货视角由模板按来源仓只读/可操作。历史 NULL 行回落头仓。
+    _attach_participant_warehouses(master_conn, [order])
+    names = _warehouse_name_map(master_conn)
+    for item in order["order_items"]:
+        source = item.get("source_warehouse_code") or order["dc_warehouse_code"]
+        item["effective_source_warehouse_code"] = source
+        item["source_warehouse_name"] = names.get(str(source), source) if source else None
     return order
 
 
@@ -1838,31 +1933,37 @@ def review_order(
     actor_id: int,
     note: str | None = None,
 ) -> dict[str, Any]:
-    """Approve or reject an order."""
+    """Approve or reject an order.
+
+    Multi-warehouse §8: the transition is conditional on the status read
+    inside the locked transaction, so a concurrent cancel/ship that commits
+    first makes ``changes()==0`` and this call fails instead of overwriting
+    the newer state. One approval moves the whole order (D2/D5).
+    """
     master_conn.row_factory = sqlite3.Row
     if decision not in (ORDER_STATUS_APPROVED, ORDER_STATUS_REJECTED):
         raise ValueError(f"decision must be approved/rejected, got {decision!r}")
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    _assert_transition(order["status"], decision)
-    ts = now()
-    if decision == ORDER_STATUS_APPROVED:
-        master_conn.execute(
+    owns_tx = _begin_immediate(master_conn)
+    try:
+        order = get_order_detail(master_conn, order_id)
+        if order is None:
+            raise ValueError(f"order_id={order_id} not found")
+        _assert_transition(order["status"], decision)
+        ts = now()
+        moved = master_conn.execute(
             """UPDATE store_orders
                SET status=?, approved_by=?, approved_at=?, approved_note=?, updated_at=?
-               WHERE id=?""",
-            (ORDER_STATUS_APPROVED, actor_id, ts, note, ts, order_id),
+               WHERE id=? AND status=?""",
+            (decision, actor_id, ts, note, ts, order_id, order["status"]),
         )
-    else:
-        master_conn.execute(
-            """UPDATE store_orders
-               SET status=?, approved_by=?, approved_at=?, approved_note=?, updated_at=?
-               WHERE id=?""",
-            (ORDER_STATUS_REJECTED, actor_id, ts, note, ts, order_id),
-        )
-    _insert_status_history(master_conn, order_id, order["status"], decision, actor_id, note)
-    master_conn.commit()
+        if moved.rowcount != 1:
+            raise ValueError("订单状态已变更，请刷新后重试")
+        _insert_status_history(master_conn, order_id, order["status"], decision, actor_id, note)
+        master_conn.commit()
+    except Exception:
+        if owns_tx and master_conn.in_transaction:
+            master_conn.rollback()
+        raise
     return get_order_detail(master_conn, order_id)
 
 
@@ -3579,3 +3680,106 @@ def can_act_on_order(
         if not has_permission(user_id, perm, warehouse_code=code)
     ]
     return bool(participants) and not missing, missing
+
+
+# ---------------------------------------------------------------------------
+# Approval coverage / diagnostics (Task 8, spec §11)
+# ---------------------------------------------------------------------------
+
+NO_APPROVER_ALERT_EVENT: str = "store_order_no_approver_alert"
+
+
+def _users_with_permission(
+    master_conn: sqlite3.Connection,
+    perm: str,
+    warehouse_code: str,
+    *,
+    tenant_id: int = 1,
+) -> set[int]:
+    """Non-admin active users holding `perm` on one warehouse (pure SQL).
+
+    Mirrors ``permissions._has_target_permission`` rules (builtin or same-tenant
+    role, tenant match, fail closed) without importing Flask.
+    """
+    master_conn.row_factory = sqlite3.Row
+    rows = master_conn.execute(
+        """SELECT DISTINCT wu.user_id
+             FROM warehouse_users wu
+             JOIN warehouses w ON w.id = wu.warehouse_id AND w.tenant_id = ?
+             JOIN users u ON u.id = wu.user_id AND u.is_active = 1 AND u.is_admin = 0
+             JOIN roles r ON r.code = wu.role AND (r.is_builtin = 1 OR r.tenant_id = ?)
+             JOIN role_permissions rp ON rp.role_id = r.id
+            WHERE w.code = ? AND rp.permission_code = ?""",
+        (tenant_id, tenant_id, warehouse_code, perm),
+    ).fetchall()
+    return {int(row["user_id"]) for row in rows}
+
+
+def has_full_approver(
+    master_conn: sqlite3.Connection,
+    participants: list[str],
+    *,
+    perm: str = "order.approve",
+    tenant_id: int = 1,
+) -> bool:
+    """True iff some non-admin active user holds `perm` on every participant.
+
+    Platform admins are deliberately excluded: they are the escalation target
+    of the alert, not evidence that the warehouse side can approve.
+    """
+    if not participants:
+        return False
+    holders: set[int] | None = None
+    for code in participants:
+        current = _users_with_permission(master_conn, perm, code, tenant_id=tenant_id)
+        holders = current if holders is None else holders & current
+        if not holders:
+            return False
+    return bool(holders)
+
+
+def alert_no_full_approver(
+    master_conn: sqlite3.Connection,
+    order: dict[str, Any],
+    *,
+    tenant_id: int = 1,
+) -> int:
+    """Inbox alert for platform admins when nobody can approve a cross order.
+
+    Dedupe key is (event_type, target_url, admin) so re-rendering the board or
+    re-processing the same order never duplicates the alert (spec §11).
+    Returns the number of rows written.
+    """
+    if order.get("status") != ORDER_STATUS_PENDING:
+        return 0
+    participants = [
+        str(p["code"]) for p in (order.get("participant_warehouses") or [])
+    ]
+    if len(participants) < 2 or has_full_approver(
+        master_conn, participants, tenant_id=tenant_id
+    ):
+        return 0
+    master_conn.row_factory = sqlite3.Row
+    admins = [
+        int(row["id"]) for row in master_conn.execute(
+            "SELECT id FROM users WHERE is_admin=1 AND is_active=1 AND tenant_id=?",
+            (tenant_id,),
+        ).fetchall()
+    ]
+    target_url = f"/store-ordering/orders/{order['id']}"
+    already = {
+        int(row["user_id"]) for row in master_conn.execute(
+            "SELECT user_id FROM notifications WHERE event_type=? AND target_url=?",
+            (NO_APPROVER_ALERT_EVENT, target_url),
+        ).fetchall()
+    }
+    recipients = [uid for uid in admins if uid not in already]
+    if not recipients:
+        return 0
+    summary = (
+        f"订货单 {order['order_no']} 跨仓（{'、'.join(participants)}）"
+        "无全权审批人，请平台管理员介入"
+    )
+    return emit_event(
+        master_conn, NO_APPROVER_ALERT_EVENT, summary, target_url, recipients,
+    )

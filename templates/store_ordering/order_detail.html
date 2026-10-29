@@ -46,6 +46,23 @@
 <p class="calc-hint">审批只确认订单，不锁定库存；配送中心确认发货时才会校验并扣减库存。</p>
 {% endif %}
 
+{# 多仓履约（Task 8）：跨仓单在详情页给出「本仓 / 全单」双口径进度，
+   避免本仓发完后误以为整单已完成。 #}
+{% if ship_progress.is_multi %}
+<p class="calc-hint">
+  跨仓订单：本仓 {{ ship_progress.own_pending }}/{{ ship_progress.own_total }} 待发
+  · 全单 {{ ship_progress.all_pending }}/{{ ship_progress.all_total }} 待发
+</p>
+{% endif %}
+
+{# 审批权不足（D5）：把缺权仓明确列出来，用户才知道该找谁。 #}
+{% if review_missing_warehouses %}
+<p class="calc-hint warn">
+  缺少审批权限的参与仓：
+  {% for code in review_missing_warehouses %}{{ fmt_warehouse(none, code) }}{% if not loop.last %}、{% endif %}{% endfor %}
+</p>
+{% endif %}
+
 {# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
 <div class="info-card">
   <div class="info-card-grid">
@@ -55,6 +72,12 @@
     <div><strong>创建时间：</strong>{{ order.created_at }}</div>
     <div><strong>期望到货：</strong>{{ order.expected_delivery_date or '—' }}</div>
     <div><strong>备注：</strong>{{ order.note or '—' }}</div>
+    {% if ship_progress.is_multi %}
+    <div>
+      <strong>参与仓：</strong>
+      {% for p in order.participant_warehouses %}{{ p.name }}{% if not loop.last %}、{% endif %}{% endfor %}
+    </div>
+    {% endif %}
     <div><strong>{{ '发起审批' if is_transfer else '审批人' }}：</strong>{{ order.approved_by_username or '—' }}</div>
     <div><strong>审批时间：</strong>{{ order.approved_at or '—' }}</div>
     <div><strong>发货人：</strong>{{ order.shipped_by_username or '—' }}</div>
@@ -123,7 +146,7 @@
      ⚠️ 整张明细表必须包在 <form id="shipment-form"> 内 —— 每行的「本批发货」
      数量 input 是 form 的后代，浏览器提交时才会带上它们。此前 input 与 form
      互为兄弟节点（B16 根因）→ 提交时静默丢弃 → 服务端退化为「整单全发」。 #}
-  {% set show_ship_form = can_ship and order.status == 'approved' %}
+  {% set show_ship_form = can_ship and order.status == 'approved' and (not ship_progress.is_multi or ship_progress.own_pending > 0) %}
   {% if show_ship_form %}
   <h3>{{ '总仓发货' if is_transfer else 'DC 发货' }}</h3>
   <p class="muted">支持多次部分发货；本批可只填部分品项，未填视为本批不发。已发货数量将保留至下次发货。<strong>发货量不得超过{{ '总仓' if is_transfer else '配送中心' }}现有库存。</strong></p>
@@ -139,6 +162,7 @@
     <thead>
       <tr>
         <th>品项</th>
+        {% if ship_progress.is_multi %}<th>来源仓</th>{% endif %}
         <th>单位</th>
         {% if not is_transfer %}<th>单价</th>{% endif %}
         <th>数量</th>
@@ -154,8 +178,14 @@
         {% set stock = item.dc_available or 0 %}
         {# 可发量 = min(剩余订单量, DC 库存)：发货禁止超库存（2026-10-10）。 #}
         {% set shippable = ([pending, stock] | min) if stock > 0 else 0 %}
+        {# 多仓履约（Task 5 裁决 A）：只有来源仓 = 当前会话仓的行才可发货；
+           他仓行只读展示由谁发货。单仓单不受影响（row_own 恒真）。 #}
+        {% set row_own = (not ship_progress.is_multi) or (item.effective_source_warehouse_code == current_warehouse_code) %}
         <tr>
           <td>{{ item.canonical_name }}</td>
+          {% if ship_progress.is_multi %}
+          <td>{{ fmt_warehouse(item.source_warehouse_name, item.effective_source_warehouse_code) }}</td>
+          {% endif %}
           <td>{{ item.unit }}</td>
           {% if not is_transfer %}<td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>{% endif %}
           <td>{{ item.quantity | fmt_qty }}</td>
@@ -168,7 +198,9 @@
           </td>
           {% if can_ship and order.status == 'approved' %}
           <td>
-            {% if shippable > 0 %}
+            {% if not row_own %}
+            <span class="muted">由 {{ fmt_warehouse(item.source_warehouse_name, item.effective_source_warehouse_code) }} 发货</span>
+            {% elif shippable > 0 %}
             {# 上限 = min(剩余订单量, DC 库存)：禁止超库存发货（2026-10-10）。
                name 直接写死为 shipped_items[N] —— 本 form 的原生字段，无需 JS
                改写；值为空/0 时服务端按 v3 §4.1 静默跳过该行。 #}

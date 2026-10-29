@@ -117,24 +117,42 @@ def _storefront_or_admin(view: Callable) -> Callable:
     return wrapped
 
 
-def _order_viewable(order: dict[str, Any]) -> bool:
-    """Order can be viewed if it belongs to current store, current DC, or user is admin."""
+def _order_viewable(master: sqlite3.Connection, order: dict[str, Any]) -> bool:
+    """Order can be viewed by the current store, any participating DC, or admin.
+
+    多仓履约（Task 8 / spec §10）：可见性收敛到「参与仓」——订单明细行的
+    来源仓（历史 NULL 行回落头仓）任一命中即可见。没有任何明细行的存量脏数据
+    回落到头仓，与订单板口径一致。
+    """
     if _is_admin():
         return True
     wh = g.get("warehouse")
     if wh is None:
         return False
     code = wh["code"]
-    return order["store_warehouse_code"] == code or order["dc_warehouse_code"] == code
+    if order["store_warehouse_code"] == code:
+        return True
+    participants = sop.order_participants(master, int(order["id"]))
+    if participants:
+        return code in participants
+    return order["dc_warehouse_code"] == code
 
 
 def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: int) -> None:
+    """403 unless the session warehouse is a participant of the order (admin bypass)."""
     if _is_admin():
         return
-    order_dc = sop.get_order_dc_code(master, order_id)
-    if order_dc is None:
+    current = _current_warehouse_code()
+    head_dc = sop.get_order_dc_code(master, order_id)
+    if head_dc is None:
         abort(404)
-    if order_dc != _current_warehouse_code():
+    participants = sop.order_participants(master, order_id)
+    if participants:
+        if current not in participants:
+            abort(403)
+        return
+    # 历史无明细行的单据只有头仓可用（与订单板兜底一致）。
+    if head_dc != current:
         abort(403)
 
 
@@ -759,7 +777,7 @@ def order_detail(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     role = g.role["role"] if g.role else None
     wh_type = _current_warehouse_type()
@@ -784,6 +802,35 @@ def order_detail(order_id: int) -> str:
         order["shipping_fee"] = 0.0
 
     is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC
+    current_wh_code = _current_warehouse_code()
+
+    # 多仓履约（Task 8 / D4）：审批按钮按「全部参与仓 order.approve」展示；
+    # 缺权时把缺失仓清单显示在页面上，而不是只给一个无信息的 403。
+    review_allowed = False
+    review_missing: list[str] = []
+    if is_dc_view:
+        review_allowed, review_missing = sop.can_act_on_order(
+            int(g.user["id"]), order_id, perm="order.approve",
+        )
+
+    # 跨仓进度徽标：本仓 x/y 待发 · 全单 m/n（按行数，不按数量）。
+    own_lines = [
+        item for item in order["order_items"]
+        if item.get("effective_source_warehouse_code") == current_wh_code
+    ]
+    ship_progress = {
+        "is_multi": bool(order.get("is_multi_warehouse")),
+        "own_pending": sum(
+            1 for item in own_lines
+            if parse_qty(item["quantity"]) - parse_qty(item.get("shipped_quantity") or 0) > 0
+        ),
+        "own_total": len(own_lines),
+        "all_pending": sum(
+            1 for item in order["order_items"]
+            if parse_qty(item["quantity"]) - parse_qty(item.get("shipped_quantity") or 0) > 0
+        ),
+        "all_total": len(order["order_items"]),
+    }
 
     # Store-side inflow log: stock_movements with action='门店订货入库' for the
     # order's store warehouse, joined to canonical_items for the name.
@@ -855,14 +902,14 @@ def order_detail(order_id: int) -> str:
         receive_op_no=sop.generate_op_no(),
         store_inflows=store_inflows,
         transfer=transfer_ctx,
-        can_review=(
-            wh_type == sop.WAREHOUSE_TYPE_DC
-            and role in ("manager", "admin")
-        ),
+        can_review=(is_dc_view and review_allowed),
+        review_missing_warehouses=review_missing,
         can_ship=(
             wh_type == sop.WAREHOUSE_TYPE_DC
             and role in ("staff", "manager", "admin")
         ),
+        current_warehouse_code=current_wh_code,
+        ship_progress=ship_progress,
         can_deliver=(
             wh_type == "storefront"
             and role in ("manager", "admin")
@@ -884,7 +931,7 @@ def payment_proof_download(order_id: int, proof_id: int):
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     proof = ppp.get_proof(master, order_id, proof_id)
     if proof is None:
@@ -928,28 +975,41 @@ _ORDER_STATUS_TABS: tuple[tuple[str, str], ...] = (
 
 
 def _render_order_board() -> str:
-    """合并后的订单页：审批 + 订单管理同一份实现、同一张模板（Issue #19）。"""
+    """合并后的订单页：审批 + 订单管理同一份实现、同一张模板（Issue #19）。
+
+    多仓履约（Task 8 / D7）补充：
+      - 非管理员的数据范围从「头仓 = 本仓」改为**参与仓口径**（任意行来源仓
+        等于本仓），并忽略 `?warehouse=`（防越权枚举）；
+      - 平台管理员新增 `?warehouse=` 参与仓筛选，`?dc=`（头仓）保留；
+      - 跨仓单若无任何非管理员用户能对全部参与仓审批，给平台管理员恰一条
+        站内告警，并在行上显示「无全权审批人」徽标。
+    """
     master = get_master_db()
     is_admin = _is_admin()
     status = request.args.get("status", "").strip()
     start_date = request.args.get("start_date", "").strip()
     end_date = request.args.get("end_date", "").strip()
+    current_wh = _current_warehouse_code()
 
     if is_admin:
         store = request.args.get("store", "").strip()
         dc = request.args.get("dc", "").strip()
+        warehouse = request.args.get("warehouse", "").strip()
     else:
         store = ""
-        dc = _current_warehouse_code() or ""
+        dc = ""
+        warehouse = ""
 
-    # 非管理员且拿不到当前仓库 code 时必须给空集，绝不能退化成「不加 dc 过滤」——
-    # 那会把全平台订单吐给一个范围不明的登录用户。
-    scope_ok = bool(is_admin or dc)
+    # 非管理员锁本仓（参与仓口径）；拿不到当前仓库 code 时必须给空集，绝
+    # 不能退化成「不加过滤」——那会把全平台订单吐给范围不明的登录用户。
+    participant = warehouse or (None if is_admin else current_wh)
+    scope_ok = bool(is_admin or participant)
     orders = (
         sop.list_orders(
             master,
             store_warehouse_code=store or None,
             dc_warehouse_code=dc or None,
+            participant_warehouse_code=participant,
             status=status or None,
             start_date=start_date or None,
             end_date=end_date or None,
@@ -964,10 +1024,22 @@ def _render_order_board() -> str:
             master,
             store_warehouse_code=store or None,
             dc_warehouse_code=dc or None,
+            participant_warehouse_code=participant,
         )
         if scope_ok
         else {}
     )
+
+    # 无全权审批人诊断：只在跨仓待审批单上评估；幂等写入（每单每管理员一条）。
+    for order in orders:
+        codes = [p["code"] for p in order.get("participant_warehouses") or []]
+        order["no_full_approver"] = (
+            order.get("status") == sop.ORDER_STATUS_PENDING
+            and len(codes) > 1
+            and not sop.has_full_approver(master, codes)
+        )
+        if order["no_full_approver"]:
+            sop.alert_no_full_approver(master, order)
 
     # 页签必须留在当前 URL 上：从 /review 进来的用户点页签不该被弹到 /admin/orders。
     endpoint = (
@@ -986,6 +1058,7 @@ def _render_order_board() -> str:
                 status=code or None,
                 store=store or None,
                 dc=dc or None,
+                warehouse=warehouse or None,
                 start_date=start_date or None,
                 end_date=end_date or None,
             ),
@@ -1000,8 +1073,10 @@ def _render_order_board() -> str:
         status=status,
         store=store,
         dc=dc,
+        warehouse=warehouse,
         start_date=start_date,
         end_date=end_date,
+        current_warehouse_code=current_wh,
         stores=_list_stores(master) if is_admin else [],
         dcs=_list_dcs(master) if is_admin else [],
         is_admin_view=is_admin,
@@ -1027,7 +1102,11 @@ def review_list() -> str:
 @require_warehouse_type("distribution_center")
 @require_permission("order.approve")
 def review_order_route(order_id: int) -> str:
-    """Approve or reject an order."""
+    """Approve or reject an order.
+
+    D5/D12（多仓履约）：操作者须对订单**全部参与仓**持有 `order.approve`；
+    平台管理员绕过。任一参与仓缺权 → 403，并在错误页列出缺失仓清单。
+    """
     decision = request.form.get("decision", "").strip()
     note = (request.form.get("note") or "").strip()
     if decision not in (sop.ORDER_STATUS_APPROVED, sop.ORDER_STATUS_REJECTED):
@@ -1039,6 +1118,13 @@ def review_order_route(order_id: int) -> str:
 
     master = get_master_db()
     _assert_order_belongs_to_current_dc(master, order_id)
+    allowed, missing = sop.can_act_on_order(
+        int(g.user["id"]), order_id, perm="order.approve",
+    )
+    if not allowed:
+        if missing:
+            abort(403, description="缺少审批权限的参与仓：" + "、".join(missing))
+        abort(403, description="当前用户无权审批该订单")
     try:
         order = sop.review_order(master, order_id, decision, g.user["id"], note or None)
     except ValueError as e:
@@ -1163,7 +1249,7 @@ def cancel_order_route(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
 
     reason = (request.form.get("reason") or "").strip()
@@ -1335,7 +1421,7 @@ def deliver_order_route(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     if _current_warehouse_type() != "storefront":
         flash("只有门店可确认收货")
@@ -1374,7 +1460,7 @@ def receive_order_route(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     if _current_warehouse_type() != "storefront":
         flash("只有门店可以收货")
