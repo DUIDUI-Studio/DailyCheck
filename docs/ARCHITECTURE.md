@@ -1915,6 +1915,15 @@ stateDiagram-v2
 
 **通知**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out（收件人按事件方向选 DC 审批人 / 门店用户，排除操作者自己）。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
 
+**建单/目录/购物车去 DC 化（2026-10-29，多仓履约 Task 7）**：由 `config.MULTI_WAREHOUSE_FULFILLMENT`（默认 `False`）控制，**关闭时行为与存量完全一致**，新逻辑只在开启后生效。
+
+- **目录**：不再出现 DC 选择器，也不再读 session `store_ordering_dc`（开启路径直接 `session.pop`）。品项范围 = 既有四道门禁（canonical 有效 / 来源行 `is_orderable` / 门店启停 / 起订倍数）**∩ `item_routing` 配置**，再排除 `is_store_exclusive` 的门店行——`list_available_routed_items()` 按路由到各 DC 分别复用 `list_available_dc_items()` 再取交集，未配置路由与门店专属品项**不出现在目录**。
+- **购物车**：`store_order_carts.dc_warehouse_code` 写 `NULL`，一用户一门店仍只有一行（`UNIQUE(user_id, store_warehouse_code)`）；行上展示的来源仓由当前路由派生，属显示态。
+- **提交**：逐行一次性解析并**固化**——`item_routing` → `resolve_fulfillment_item()` → 价格/倍数快照，写入行的 `source_warehouse_code` / `dc_item_id`；此后路由变更只影响新订单（`tests/test_submit_routing.py` 的路由变更用例）。任一行未配置路由 → **整单退回**并列品项（D6）；门店专属品项同样整单拒绝。头 `dc_warehouse_code` 按 D8 取「行数最多的来源仓，并列取仓库码字典序最小」。
+- **价格/倍数变化确认**：提交页把本页展示的单价与起订倍数随 `snapshot_price_<canonical_id>` / `snapshot_multiple_<canonical_id>` 回传；与提交时刻解析值不一致时**不建单**，渲染差异并要求勾选 `confirm_price_change=1` 重新提交。
+- **草稿键 v2**：`dc.catalogDraft.v2:<user_id>:<store_warehouse_code>`（原 v1 为 `:<dc>`，见「未提交选择的草稿」）。catalog 写入与 cart 消费/清理同步切换；检测到旧 v1 键**立即丢弃并提示**，恢复草稿前按当前目录有效项剪枝，无效项列给用户。
+- 回归：`tests/test_catalog_multi_dc.py`（6 例）、`tests/test_submit_routing.py`（9 例）、`tests/test_store_ordering_store_route.py` 的开关默认关闭用例；共享夹具 `tests/multi_warehouse_env.py`（两 DC + 路由 + 门店专属 / 未路由品项）。
+
 **未提交选择的草稿（2026-10-17，Issue #100）**：catalog 页的品类 chip 与搜索框都是**整页 GET 跳转**，而弹窗确认的数量原先只活在当页 DOM 的 hidden input 里，一换筛选就重建清零。现在按 `dc.catalogDraft.v1:<user_id>:<warehouse_code>` 落 localStorage（7 天过期），**只存 canonical_id → 数量 / 单位名 / 单位档位**，不存整页快照：被筛选隐藏的项留在草稿里等下次露面，当前可见项由服务端重新渲染后再回填。选 localStorage 而非服务端 session，是因为弹窗「确认」是纯前端动作，走 session 得为每次点击加一次往返请求。三个收口点必须联动，缺一个就变静默漏单：
 
 1. **弹窗确认** → 写/删对应条目 + 回填卡片；
@@ -1922,6 +1931,8 @@ stateDiagram-v2
 3. **购物车页渲染时清空该 dc 的草稿** —— 批次加购已把草稿整体消费，不清的话从 bfcache 回退到 catalog 会拿旧 DOM 重复加购（`add_cart_item` 是**累加**语义）。
 
 「清空选择」按钮同时清草稿；`pageshow(persisted)` 时按草稿重新同步一次卡片，修复 bfcache 的陈旧 DOM。附带修复：卡片 `unit[]` 存的是中文单位名（后端契约），弹窗单位 pill 的回填改读 `data-saved-unit` 的 `base`/`aux` 档位——原先直接读 `unit[]`，导致重复编辑同一张卡片时两个 pill 都不高亮、点「确认」静默无响应。
+
+> 多仓开关开启后上述键与清理点整体切到 v2（`<user>:<store>`），见上一节「建单/目录/购物车去 DC 化」。
 
 **起订倍数（2026-10-18）**：DC 可对每个品项设一个正整数倍数（`items.order_multiple`，1 = 不限），门店下单数量必须是它的整数倍（例：设 5 → 只能订 5/10/15…）。配置入口在 **DC 品项管理页**（`/store-ordering/dc-items`，`store_ordering.set_dc_item_multiple`），与「可订开关」同级同页，属**本仓字段**，主数据扇出不覆盖。
 

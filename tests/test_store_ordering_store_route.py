@@ -579,3 +579,84 @@ def test_receive_route_same_op_no_does_not_double_add(store_env):
     ).fetchone()["c"]
     master.close()
     assert count == 1
+
+
+# —— 多仓履约 Task 7：开关开时去 DC / 废弃 session 键 —— #
+
+
+def _enable_multi_warehouse(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(config_module, "MULTI_WAREHOUSE_FULFILLMENT", True, raising=False)
+
+
+def _seed_routing(master_path, canonical_id, dc_code="dc_test"):
+    master = sqlite3.connect(str(master_path))
+    master.execute(
+        "INSERT OR REPLACE INTO item_routing "
+        "(tenant_id, canonical_id, fulfillment_warehouse_code, updated_at, updated_by) "
+        "VALUES (1, ?, ?, ?, NULL)",
+        (canonical_id, dc_code, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    master.commit()
+    master.close()
+
+
+def test_multi_warehouse_catalog_ignores_legacy_session_dc(store_env, monkeypatch):
+    _enable_multi_warehouse(monkeypatch)
+    _seed_routing(store_env["master_path"], 101)
+    client = store_env["client"]
+    with client.session_transaction() as s:
+        s["store_ordering_dc"] = "dc_test"
+
+    body = client.get("/store-ordering/catalog").data.decode()
+    assert "选择配送中心" not in body
+    assert "测试包材A" in body
+    with client.session_transaction() as s:
+        assert "store_ordering_dc" not in s
+
+
+def test_multi_warehouse_cart_writes_null_dc(store_env, monkeypatch):
+    _enable_multi_warehouse(monkeypatch)
+    _seed_routing(store_env["master_path"], 101)
+    client = store_env["client"]
+    client.post(
+        "/store-ordering/cart/add",
+        data={"canonical_id": 101, "quantity": "3", "unit": "件"},
+    )
+    body = client.get("/store-ordering/cart").data.decode()
+    assert "配送中心：" not in body
+    assert "测试包材A" in body
+
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute("SELECT dc_warehouse_code FROM store_order_carts").fetchone()
+    master.close()
+    assert row["dc_warehouse_code"] is None
+
+
+def test_multi_warehouse_submit_needs_no_session_dc(store_env, monkeypatch):
+    _enable_multi_warehouse(monkeypatch)
+    _seed_routing(store_env["master_path"], 101)
+    client = store_env["client"]
+    client.post(
+        "/store-ordering/cart/add",
+        data={"canonical_id": 101, "quantity": "2", "unit": "件"},
+    )
+    tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
+    resp = client.post(
+        "/store-ordering/cart/submit",
+        data={"expected_delivery_date": tomorrow, "note": ""},
+        follow_redirects=True,
+    )
+    assert "提交成功" in resp.data.decode()
+
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    order = master.execute("SELECT * FROM store_orders ORDER BY id DESC LIMIT 1").fetchone()
+    line = master.execute(
+        "SELECT * FROM store_order_items WHERE order_id=?", (order["id"],)
+    ).fetchone()
+    master.close()
+    assert order["dc_warehouse_code"] == "dc_test"
+    assert line["source_warehouse_code"] == "dc_test"

@@ -19,6 +19,8 @@ from typing import Any
 
 import config
 from blueprints._helpers import now, parse_qty
+from blueprints.fulfillment_pure import parse_price_and_multiple, resolve_fulfillment_item
+from blueprints.item_routing_pure import get_routing
 from blueprints.notifications_pure import emit_event
 from blueprints.procurement_pure import (
     compute_safety_stock,
@@ -30,6 +32,12 @@ from blueprints.procurement_pure import (
 # ---------------------------------------------------------------------------
 
 WAREHOUSE_TYPE_DC: str = "distribution_center"
+
+
+def multi_warehouse_enabled() -> bool:
+    """Rollout switch (design D14). Read per call so tests can monkeypatch it."""
+    return bool(getattr(config, "MULTI_WAREHOUSE_FULFILLMENT", False))
+
 
 # 单据流向（store_orders.flow_type）：
 #   store_order —— 门店发起订货（默认，走 pending 审批）
@@ -240,10 +248,18 @@ def get_or_create_cart(
     master_conn: sqlite3.Connection,
     user_id: int,
     store_warehouse_code: str,
-    dc_warehouse_code: str,
+    dc_warehouse_code: str | None,
 ) -> dict[str, Any]:
-    """Get or create cart. If dc changed, clear existing cart items first."""
+    """Get or create cart. If dc changed, clear existing cart items first.
+
+    Multi-warehouse mode keeps one cart per (user, store) and stores a NULL
+    ``dc_warehouse_code``; routing is resolved per line at display/submit time,
+    so switching the header DC can no longer invalidate the cart.
+    """
     master_conn.row_factory = sqlite3.Row
+    multi = multi_warehouse_enabled()
+    if multi:
+        dc_warehouse_code = None
     cart = master_conn.execute(
         "SELECT * FROM store_order_carts WHERE user_id=? AND store_warehouse_code=?",
         (user_id, store_warehouse_code),
@@ -267,6 +283,16 @@ def get_or_create_cart(
         }
 
     cart_dict = dict(cart)
+    if multi:
+        if cart_dict["dc_warehouse_code"] is not None:
+            master_conn.execute(
+                "UPDATE store_order_carts SET dc_warehouse_code=NULL, updated_at=? WHERE id=?",
+                (now(), cart_dict["id"]),
+            )
+            master_conn.commit()
+            cart_dict["dc_warehouse_code"] = None
+        return cart_dict
+
     if cart_dict["dc_warehouse_code"] != dc_warehouse_code:
         # DC changed: clear items and update target dc.
         clear_cart(master_conn, cart_dict["id"])
@@ -298,6 +324,9 @@ def list_cart_items(
         return []
     dc_code = cart["dc_warehouse_code"]
     store_code = cart["store_warehouse_code"]
+    # Multi-warehouse carts have no header DC: each line's display price and
+    # multiple come from its routed source warehouse (submit re-resolves).
+    routed_display = multi_warehouse_enabled() or dc_code is None
 
     rows = master_conn.execute(
         """SELECT sci.id AS cart_item_id, sci.canonical_id, sci.quantity,
@@ -314,7 +343,14 @@ def list_cart_items(
     for r in rows:
         item = dict(r)
         canonical_id = item["canonical_id"]
-        dc_item = get_dc_item_by_canonical(master_conn, dc_code, canonical_id)
+        source_code = (
+            get_routing(master_conn, canonical_id) if routed_display else dc_code
+        )
+        item["source_warehouse_code"] = source_code
+        dc_item = (
+            get_dc_item_by_canonical(master_conn, source_code, canonical_id)
+            if source_code else None
+        )
         item["dc_available"] = dc_item["quantity"] if dc_item else 0.0
         item["dc_item_id"] = dc_item["id"] if dc_item else None
         binding = get_store_binding_by_canonical(master_conn, store_code, canonical_id)
@@ -396,14 +432,19 @@ def get_cart_item_multiple(
     cart_id: int,
     canonical_id: int,
 ) -> float:
-    """购物车所属 DC 上该品项的起订倍数。"""
+    """购物车所属 DC 上该品项的起订倍数（多仓模式按路由来源仓）。"""
     master_conn.row_factory = sqlite3.Row
     row = master_conn.execute(
         "SELECT dc_warehouse_code FROM store_order_carts WHERE id=?", (cart_id,)
     ).fetchone()
     if row is None:
         return ORDER_MULTIPLE_UNLIMITED
-    return get_dc_item_order_multiple(master_conn, row["dc_warehouse_code"], canonical_id)
+    dc_code = row["dc_warehouse_code"]
+    if multi_warehouse_enabled() or dc_code is None:
+        dc_code = get_routing(master_conn, canonical_id)
+        if dc_code is None:
+            return ORDER_MULTIPLE_UNLIMITED
+    return get_dc_item_order_multiple(master_conn, dc_code, canonical_id)
 
 
 def update_cart_item_quantity(
@@ -593,6 +634,75 @@ def list_available_dc_items(
         return out
     finally:
         dc_conn.close()
+
+
+def _store_exclusive_canonical_ids(store_warehouse_code: str) -> set[int]:
+    """canonical ids the store marked ``is_store_exclusive=1`` (design D10)."""
+    store_conn = open_warehouse_db(store_warehouse_code)
+    try:
+        rows = store_conn.execute(
+            "SELECT DISTINCT canonical_id FROM items "
+            "WHERE canonical_id IS NOT NULL AND is_store_exclusive=1"
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+    finally:
+        store_conn.close()
+
+
+def list_available_routed_items(
+    master_conn: sqlite3.Connection,
+    store_warehouse_code: str,
+    category_code: str | None = None,
+    keyword: str | None = None,
+) -> list[dict[str, Any]]:
+    """One storefront catalogue merged across every routed source warehouse.
+
+    Reuses :func:`list_available_dc_items` per DC (canonical active, source
+    ``is_orderable=1``, store deactivation, price/multiple all stay untouched)
+    then intersects with the explicit routing table and removes items the
+    store marked exclusive. Unrouted canonicals never appear, so a store
+    cannot add something that submit would have to reject (design §5).
+    """
+    master_conn.row_factory = sqlite3.Row
+    exclusive = _store_exclusive_canonical_ids(store_warehouse_code)
+    routing_rows = master_conn.execute(
+        "SELECT canonical_id, fulfillment_warehouse_code FROM item_routing WHERE tenant_id=1"
+    ).fetchall()
+    by_dc: dict[str, set[int]] = {}
+    for canonical_id, dc_code in routing_rows:
+        canonical_id = int(canonical_id)
+        if canonical_id in exclusive:
+            continue
+        by_dc.setdefault(str(dc_code), set()).add(canonical_id)
+
+    out: list[dict[str, Any]] = []
+    for dc_code in sorted(by_dc):
+        allowed = by_dc[dc_code]
+        for item in list_available_dc_items(
+            master_conn, dc_code, category_code, keyword,
+            store_warehouse_code=store_warehouse_code,
+        ):
+            canonical_id = item["canonical_id"]
+            if canonical_id is None or int(canonical_id) not in allowed:
+                continue
+            item["source_warehouse_code"] = dc_code
+            out.append(item)
+    out.sort(key=lambda item: (str(item.get("canonical_name") or ""), int(item["canonical_id"])))
+    return out
+
+
+def list_unorderable_routed_canonicals(
+    master_conn: sqlite3.Connection,
+    canonical_ids: list[int],
+) -> list[dict[str, Any]]:
+    """Submit-time re-check of ``is_orderable`` on each line's routed source."""
+    out: list[dict[str, Any]] = []
+    for canonical_id in canonical_ids:
+        dc_code = get_routing(master_conn, canonical_id)
+        if dc_code is None:
+            continue  # missing routing has its own整单退回 message
+        out.extend(list_unorderable_cart_canonicals(master_conn, dc_code, [canonical_id]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1212,17 +1322,116 @@ def validate_cart_for_submit(
     }
 
 
+def _primary_source_warehouse(codes: list[str]) -> str:
+    """D8 header rule: most lines wins; ties break on the smallest warehouse code."""
+    counts: dict[str, int] = {}
+    for code in codes:
+        counts[code] = counts.get(code, 0) + 1
+    return min(counts, key=lambda code: (-counts[code], code))
+
+
+def _resolve_routed_cart_lines(
+    master_conn: sqlite3.Connection,
+    cart_items: list[dict[str, Any]],
+    store_warehouse_code: str,
+) -> list[dict[str, Any]]:
+    """Resolve routing → unique fulfillment row → price/multiple, once, at submit.
+
+    Missing routing rejects the whole order (D6) with the item list; store
+    exclusive items never enter a DC order (D10). Resolution failures keep the
+    fulfillment error text so the storepage can point at the exact item.
+    """
+    exclusive = _store_exclusive_canonical_ids(store_warehouse_code)
+    missing: list[str] = []
+    blocked: list[str] = []
+    lines: list[dict[str, Any]] = []
+    for ci in cart_items:
+        canonical_id = int(ci["canonical_id"])
+        name = ci["name"]
+        if canonical_id in exclusive:
+            blocked.append(name)
+            continue
+        dc_code = get_routing(master_conn, canonical_id)
+        if dc_code is None:
+            missing.append(name)
+            continue
+        wh_conn = open_warehouse_db(dc_code)
+        try:
+            resolved = resolve_fulfillment_item(
+                master_conn, wh_conn, canonical_id=canonical_id, warehouse_code=dc_code,
+            )
+            row = wh_conn.execute("SELECT * FROM items WHERE id=?", (resolved["item_id"],)).fetchone()
+            unit_price, _ = parse_price_and_multiple(row)
+        except ValueError as exc:
+            raise ValueError(f"{name} 无法解析履约行：{exc}") from exc
+        finally:
+            wh_conn.close()
+        lines.append({
+            "canonical_id": canonical_id,
+            "name": name,
+            "quantity": parse_qty(ci["quantity"]),
+            "unit": ci.get("cart_unit") or resolved["unit"],
+            "store_item_id": ci.get("store_item_id"),
+            "dc_item_id": resolved["item_id"],
+            "source_warehouse_code": dc_code,
+            "unit_price": unit_price,
+            "order_multiple": resolved["order_multiple"],
+        })
+    if missing:
+        raise ValueError("以下品项未配置履约仓，整单退回：" + "、".join(missing))
+    if blocked:
+        raise ValueError("以下品项为门店专属，不能提交订货单：" + "、".join(blocked))
+    return lines
+
+
+def _snapshot_changes(
+    lines: list[dict[str, Any]],
+    price_snapshot: dict[int, float] | None,
+    multiple_snapshot: dict[int, float] | None,
+) -> list[dict[str, Any]]:
+    """Compare resolved values against what the cart page showed the store."""
+    changes: list[dict[str, Any]] = []
+    for line in lines:
+        canonical_id = line["canonical_id"]
+        if price_snapshot is not None and canonical_id in price_snapshot:
+            old = parse_qty(price_snapshot[canonical_id])
+            new = parse_qty(line["unit_price"])
+            if abs(old - new) > 1e-9:
+                changes.append({
+                    "canonical_id": canonical_id, "name": line["name"],
+                    "field": "price", "old": old, "new": new,
+                })
+        if multiple_snapshot is not None and canonical_id in multiple_snapshot:
+            old_m = normalize_order_multiple(multiple_snapshot[canonical_id])
+            new_m = normalize_order_multiple(line["order_multiple"])
+            if abs(old_m - new_m) > 1e-9:
+                changes.append({
+                    "canonical_id": canonical_id, "name": line["name"],
+                    "field": "multiple", "old": old_m, "new": new_m,
+                })
+    return changes
+
+
 def submit_order(
     master_conn: sqlite3.Connection,
     cart_id: int,
     requested_by: int,
     expected_delivery_date: str | None,
     note: str | None,
+    *,
+    price_snapshot: dict[int, float] | None = None,
+    multiple_snapshot: dict[int, float] | None = None,
+    confirm_price_change: bool = False,
 ) -> dict[str, Any]:
     """Convert cart to order, return order dict.
 
     v3.1: 写入 shipping_fee（基于当前 active 运费规则 + 订单金额合计）。
     运费在 submit 时锁定，ship / receive 时不再重算。
+
+    多仓开关开：逐行解析路由与履约行，把 ``source_warehouse_code`` /
+    ``dc_item_id`` 固化到订单行；路由缺失整单退回（D6）。购物车阶段展示的
+    价格/倍数与本刻重解析不一致时，返回 ``{"price_changed": [...]}``，门店
+    带 ``confirm_price_change=1`` 重提交才建单（设计 §5）。
     """
     master_conn.row_factory = sqlite3.Row
     cart = master_conn.execute(
@@ -1236,12 +1445,38 @@ def submit_order(
         raise ValueError(f"cart validation failed: {validation}")
 
     cart_items = list_cart_items(master_conn, cart_id)
-    order_no = generate_order_no(master_conn)
     ts = now()
+    multi = multi_warehouse_enabled()
+    if multi:
+        lines = _resolve_routed_cart_lines(
+            master_conn, cart_items, cart_dict["store_warehouse_code"],
+        )
+        changes = _snapshot_changes(lines, price_snapshot, multiple_snapshot)
+        if changes and not confirm_price_change:
+            return {"order": None, "price_changed": changes}
+        subtotal = sum(
+            parse_qty(line["unit_price"] * line["quantity"]) for line in lines
+        )
+        header_dc = _primary_source_warehouse(
+            [line["source_warehouse_code"] for line in lines]
+        )
+    else:
+        lines = [{
+            "canonical_id": ci["canonical_id"],
+            "name": ci["name"],
+            "quantity": parse_qty(ci["quantity"]),
+            "unit": ci["cart_unit"],
+            "store_item_id": ci.get("store_item_id"),
+            "dc_item_id": None,
+            "source_warehouse_code": cart_dict["dc_warehouse_code"],
+            "unit_price": ci.get("unit_price"),
+            "order_multiple": ci.get("order_multiple"),
+        } for ci in cart_items]
+        subtotal = sum(parse_qty(ci.get("line_subtotal") or 0) for ci in cart_items)
+        header_dc = cart_dict["dc_warehouse_code"]
+
+    order_no = generate_order_no(master_conn)
     # v3.1: 算订单金额合计 + 运费
-    subtotal = sum(
-        parse_qty(ci.get("line_subtotal") or 0) for ci in cart_items
-    )
     rule = get_active_shipping_rule(master_conn)
     shipping_fee = compute_shipping_fee(subtotal, rule)
 
@@ -1252,21 +1487,21 @@ def submit_order(
             shipping_fee)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            order_no, cart_dict["store_warehouse_code"], cart_dict["dc_warehouse_code"],
+            order_no, cart_dict["store_warehouse_code"], header_dc,
             ORDER_STATUS_PENDING, requested_by, expected_delivery_date,
             note, ts, ts, shipping_fee,
         ),
     )
     order_id = int(cur.lastrowid)
-    for ci in cart_items:
+    for line in lines:
         master_conn.execute(
             """INSERT INTO store_order_items
-               (order_id, canonical_id, store_item_id, quantity, unit,
-                fulfilled_quantity, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (order_id, canonical_id, dc_item_id, store_item_id, source_warehouse_code,
+                quantity, unit, fulfilled_quantity, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                order_id, ci["canonical_id"], ci.get("store_item_id"),
-                parse_qty(ci["quantity"]), ci["cart_unit"], 0.0,
+                order_id, line["canonical_id"], line["dc_item_id"], line["store_item_id"],
+                line["source_warehouse_code"], line["quantity"], line["unit"], 0.0,
                 ORDER_ITEM_STATUS_PENDING, ts,
             ),
         )

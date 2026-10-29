@@ -145,7 +145,11 @@ def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: in
 @bp.route("/catalog")
 @require_login
 def catalog() -> str:
-    """Show DC selector or item catalog for the selected DC."""
+    """Show DC selector or item catalog for the selected DC.
+
+    多仓开关开时不出现选择器：目录按 item_routing 合并各来源仓
+    （``_catalog_multi_warehouse``）。
+    """
     # DC users and admins in a DC warehouse go straight to the review queue.
     if _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC:
         return redirect(url_for("store_ordering.review_list"))
@@ -154,6 +158,9 @@ def catalog() -> str:
         return redirect(url_for("core.dashboard"))
 
     master = get_master_db()
+    if sop.multi_warehouse_enabled():
+        return _catalog_multi_warehouse(master)
+
     dc_code = request.args.get("dc") or session.get("store_ordering_dc")
     dcs = _list_dcs(master)
 
@@ -164,6 +171,9 @@ def catalog() -> str:
             items=None,
             selected_dc=None,
             cart_summary=None,
+            multi_warehouse=False,
+            draft_store_code=None,
+            valid_draft_items={},
         )
 
     # Validate DC exists.
@@ -226,6 +236,77 @@ def catalog() -> str:
         current_cat=category_code or "",
         keyword=keyword or "",
         cart_summary=cart_summary,
+        multi_warehouse=False,
+        draft_store_code=None,
+        valid_draft_items={},
+    )
+
+
+def _catalog_multi_warehouse(master: sqlite3.Connection) -> str:
+    """One catalogue for the storefront: no DC selector, routing decides source.
+
+    The session key ``store_ordering_dc`` is deprecated — multi-warehouse mode
+    never reads or writes it, and any leftover value is dropped so a stale
+    single-DC choice cannot leak into the new flow.
+    """
+    session.pop("store_ordering_dc", None)
+    store_code = _current_warehouse_code()
+    if not store_code:
+        flash("当前未绑定门店仓库")
+        return redirect(url_for("core.dashboard"))
+
+    category_code = request.args.get("cat", "").strip() or None
+    keyword = request.args.get("q", "").strip() or None
+
+    cart = sop.get_or_create_cart(master, g.user["id"], store_code, None)
+    cart_items = sop.list_cart_items(master, cart["id"])
+    cart_summary = {
+        "count": len(cart_items),
+        "total_qty": sum(i["quantity"] for i in cart_items),
+    }
+
+    items = sop.list_available_routed_items(master, store_code, category_code, keyword)
+    # Unfiltered set drives draft restore: an item hidden by the current chip
+    # or search stays in the draft, while a genuinely invalid one is dropped.
+    valid_items = sop.list_available_routed_items(master, store_code)
+    valid_draft_items = {
+        str(it["canonical_id"]): it.get("canonical_name") for it in valid_items
+    }
+
+    suggestions: dict[int, int] = {}
+    if not _is_admin():
+        try:
+            from db import get_warehouse_db
+            suggestions = sop.compute_suggested_order_qty(
+                get_warehouse_db(), master, store_code,
+            )
+        except Exception:
+            suggestions = {}
+
+    code_name_pairs: list[tuple[str, str]] = []
+    seen_codes: set[str] = set()
+    for it in items:
+        code = it.get("category_code") or ""
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        code_name_pairs.append((code, str(it.get("category_name") or code)))
+    category_names = sorted(code_name_pairs, key=lambda pair: pair[1])
+
+    return render_template(
+        "store_ordering/catalog.html",
+        dcs=[],
+        selected_dc=None,
+        items=items,
+        suggestions=suggestions,
+        categories=[code for code, _ in category_names],
+        category_names=category_names,
+        current_cat=category_code or "",
+        keyword=keyword or "",
+        cart_summary=cart_summary,
+        multi_warehouse=True,
+        draft_store_code=store_code,
+        valid_draft_items=valid_draft_items,
     )
 
 
@@ -239,32 +320,39 @@ def add_to_cart() -> str:
     affordances). The catalog page renders an inline modal-driven batch form
     pointing at /cart/add-batch.
     """
-    dc_code = request.form.get("dc") or session.get("store_ordering_dc")
-    if not dc_code:
+    multi = sop.multi_warehouse_enabled()
+    dc_code = request.form.get("dc") or (None if multi else session.get("store_ordering_dc"))
+    if not multi and not dc_code:
         flash("请先选择配送中心")
         return redirect(url_for("store_ordering.catalog"))
-    session["store_ordering_dc"] = dc_code
+    if not multi:
+        session["store_ordering_dc"] = dc_code
+
+    def _catalog_redirect() -> Any:
+        if multi:
+            return redirect(url_for("store_ordering.catalog"))
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
 
     canonical_id = request.form.get("canonical_id", type=int)
     quantity = parse_qty(request.form.get("quantity", "0"))
     unit = (request.form.get("unit") or "件").strip() or "件"
     if canonical_id is None or quantity <= 0:
         flash("请选择品项并填写有效数量")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
 
     master = get_master_db()
     store_code = _current_warehouse_code()
     if not store_code:
         flash("当前未绑定门店仓库")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
     try:
         sop.add_cart_item(master, cart["id"], canonical_id, quantity, unit)
     except ValueError as e:
         flash(str(e))
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
     flash("已加入购物车")
-    return redirect(url_for("store_ordering.catalog", dc=dc_code))
+    return _catalog_redirect()
 
 
 @bp.route("/cart/add-batch", methods=["POST"])
@@ -280,23 +368,30 @@ def cart_add_batch() -> str:
 
     Items with empty qty are skipped. After processing, redirect to /cart.
     """
-    dc_code = request.form.get("dc") or session.get("store_ordering_dc")
-    if not dc_code:
+    multi = sop.multi_warehouse_enabled()
+    dc_code = request.form.get("dc") or (None if multi else session.get("store_ordering_dc"))
+    if not multi and not dc_code:
         flash("请先选择配送中心")
         return redirect(url_for("store_ordering.catalog"))
-    session["store_ordering_dc"] = dc_code
+    if not multi:
+        session["store_ordering_dc"] = dc_code
+
+    def _catalog_redirect() -> Any:
+        if multi:
+            return redirect(url_for("store_ordering.catalog"))
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
 
     selected_list = request.form.getlist("selected[]")
     qty_list = request.form.getlist("qty[]")
     unit_list = request.form.getlist("unit[]")
     if len(selected_list) != len(qty_list) or len(selected_list) != len(unit_list):
         flash("表单字段不一致，请重试")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
 
     store_code = _current_warehouse_code()
     if not store_code:
         flash("当前未绑定门店仓库")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
 
     master = get_master_db()
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
@@ -342,9 +437,10 @@ def cart_add_batch() -> str:
 @_storefront_or_admin
 def cart_view() -> str:
     """Show cart."""
-    dc_code = session.get("store_ordering_dc")
+    multi = sop.multi_warehouse_enabled()
+    dc_code = None if multi else session.get("store_ordering_dc")
     store_code = _current_warehouse_code()
-    if not dc_code or not store_code:
+    if (not multi and not dc_code) or not store_code:
         flash("购物车为空")
         return redirect(url_for("store_ordering.catalog"))
     master = get_master_db()
@@ -357,6 +453,8 @@ def cart_view() -> str:
         items=items,
         dc_code=dc_code,
         cart_total=cart_total,
+        multi_warehouse=multi,
+        draft_store_code=store_code,
     )
 
 
@@ -401,9 +499,10 @@ def remove_cart_item_route(cart_item_id: int) -> str:
 @_storefront_or_admin
 def clear_cart_route() -> str:
     """Clear cart."""
-    dc_code = session.get("store_ordering_dc")
+    multi = sop.multi_warehouse_enabled()
+    dc_code = None if multi else session.get("store_ordering_dc")
     store_code = _current_warehouse_code()
-    if dc_code and store_code:
+    if (multi or dc_code) and store_code:
         master = get_master_db()
         cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
         sop.clear_cart(master, cart["id"])
@@ -482,14 +581,30 @@ def _save_payment_proofs(master: sqlite3.Connection, order_id: int, files: list[
         flash(f"有 {skipped} 个付款凭证未能保存，请在订单详情页核对后重新提交")
 
 
+def _snapshot_dicts(form) -> tuple[dict[int, float], dict[int, float]]:
+    """Read the cart-page price/multiple snapshot carried by the submit form."""
+    prices: dict[int, float] = {}
+    multiples: dict[int, float] = {}
+    for key in form:
+        try:
+            if key.startswith("snapshot_price_"):
+                prices[int(key[len("snapshot_price_"):])] = float(form[key] or 0)
+            elif key.startswith("snapshot_multiple_"):
+                multiples[int(key[len("snapshot_multiple_"):])] = float(form[key] or 0)
+        except (TypeError, ValueError):
+            continue
+    return prices, multiples
+
+
 @bp.route("/cart/submit", methods=["GET", "POST"])
 @require_permission("order.create")
 @_storefront_or_admin
 def submit_order_route() -> str:
     """Submit cart as order."""
-    dc_code = session.get("store_ordering_dc")
+    multi = sop.multi_warehouse_enabled()
+    dc_code = None if multi else session.get("store_ordering_dc")
     store_code = _current_warehouse_code()
-    if not dc_code or not store_code:
+    if (not multi and not dc_code) or not store_code:
         flash("请先选择配送中心并添加商品")
         return redirect(url_for("store_ordering.catalog"))
 
@@ -501,14 +616,18 @@ def submit_order_route() -> str:
         flash("购物车为空")
         return redirect(url_for("store_ordering.cart_view"))
 
-    # v3.1: 校验购物车里品项在 DC 端仍可订（防止「先加购后被下架」漏提交）
+    # v3.1: 校验购物车里品项在来源仓仍可订（防止「先加购后被下架」漏提交）
     cart_canonicals = [int(it["canonical_id"]) for it in items if it.get("canonical_id")]
-    unorderable = sop.list_unorderable_cart_canonicals(master, dc_code, cart_canonicals)
+    if multi:
+        unorderable = sop.list_unorderable_routed_canonicals(master, cart_canonicals)
+    else:
+        unorderable = sop.list_unorderable_cart_canonicals(master, dc_code, cart_canonicals)
 
     expected_date = _tomorrow()
     note = ""
     errors: dict[str, Any] = {
-        "shortages": [], "unbound": [], "unorderable": unorderable, "multiples": [],
+        "shortages": [], "unbound": [], "unorderable": unorderable,
+        "multiples": [], "price_changed": [],
     }
 
     if request.method == "POST":
@@ -516,6 +635,8 @@ def submit_order_route() -> str:
         note = (request.form.get("note") or "").strip()
         uploads = _collect_payment_proofs()
         proof_error = _validate_payment_proofs(uploads)
+        price_snapshot, multiple_snapshot = _snapshot_dicts(request.form)
+        confirm_price_change = request.form.get("confirm_price_change") == "1"
         if expected_date < _today():
             flash("期望到货日期不能早于今天")
         elif unorderable:
@@ -527,31 +648,47 @@ def submit_order_route() -> str:
         else:
             validation = sop.validate_cart_for_submit(master, cart)
             if not validation["ok"]:
-                errors = validation
+                errors.update(validation)
                 if validation.get("multiples"):
                     flash("提交失败：部分品项数量不符合起订倍数，请先调整数量")
                 else:
                     flash("提交失败，请检查门店绑定")
             else:
-                order = sop.submit_order(
-                    master, cart["id"], g.user["id"],
-                    _date_input(expected_date), note or None,
-                )
-                # 凭证在订单落库后写：需要 order_id 才能建目录。
-                # 单个文件失败只记日志，不回滚订单 —— 单已经下了，
-                # 凭证缺失可让门店在补传入口补（本期先提示重传）。
-                _save_payment_proofs(master, order["id"], uploads)
-                sop.notify_order_event(master, sop.EVENT_ORDER_SUBMITTED, order, g.user["id"])
-                # 站内通知之后补一条对外通道（企微群）；后台线程发送，
-                # 失败不影响本次提交 —— 见 _notify_wecom_new_order。
-                _notify_wecom_new_order(order)
-                session.pop("store_ordering_dc", None)
-                flash(f"订单 {order['order_no']} 提交成功")
-                return redirect(url_for("store_ordering.order_detail", order_id=order["id"]))
+                order: dict[str, Any] | None = None
+                try:
+                    result = sop.submit_order(
+                        master, cart["id"], g.user["id"],
+                        _date_input(expected_date), note or None,
+                        price_snapshot=price_snapshot or None,
+                        multiple_snapshot=multiple_snapshot or None,
+                        confirm_price_change=confirm_price_change,
+                    )
+                except ValueError as exc:
+                    # 缺路由 / 专属品 / 履约行无法解析：整单退回并列明品项。
+                    flash(str(exc))
+                    result = None
+                if result is not None:
+                    if result.get("price_changed"):
+                        errors["price_changed"] = result["price_changed"]
+                        flash("以下品项的价格/起订倍数已变化，请确认后重新提交")
+                    else:
+                        order = result
+                if order is not None:
+                    # 凭证在订单落库后写：需要 order_id 才能建目录。
+                    # 单个文件失败只记日志，不回滚订单 —— 单已经下了，
+                    # 凭证缺失可让门店在补传入口补（本期先提示重传）。
+                    _save_payment_proofs(master, order["id"], uploads)
+                    sop.notify_order_event(master, sop.EVENT_ORDER_SUBMITTED, order, g.user["id"])
+                    # 站内通知之后补一条对外通道（企微群）；后台线程发送，
+                    # 失败不影响本次提交 —— 见 _notify_wecom_new_order。
+                    _notify_wecom_new_order(order)
+                    session.pop("store_ordering_dc", None)
+                    flash(f"订单 {order['order_no']} 提交成功")
+                    return redirect(url_for("store_ordering.order_detail", order_id=order["id"]))
 
     validation = sop.validate_cart_for_submit(master, cart)
     if not validation["ok"]:
-        errors = validation
+        errors.update(validation)
 
     return render_template(
         "store_ordering/submit.html",
@@ -565,6 +702,8 @@ def submit_order_route() -> str:
         note=note,
         errors=errors,
         today=_date_input(_today()),
+        multi_warehouse=multi,
+        price_changes=errors.get("price_changed") or [],
     )
 
 
