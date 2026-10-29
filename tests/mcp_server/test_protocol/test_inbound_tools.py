@@ -32,10 +32,16 @@ def test_restock_create_then_restock_list_reads_back(warehouse_db, monkeypatch):
             "reason": "demo",
         }
     )
-    rows = inbound_tools.restock_list_impl({"warehouse_code": "WH001"})
+    envelope = inbound_tools.restock_list_impl({"warehouse_code": "WH001"})
+    rows = envelope["items"]
 
     assert created["item_id"] == 1
     assert created["quantity"] == 5
+    # Issue #74 起 restock_list 返回 {items,total,limit,offset,truncated} 信封。
+    assert envelope["total"] == 1
+    assert envelope["limit"] == 100
+    assert envelope["offset"] == 0
+    assert envelope["truncated"] is False
     assert len(rows) == 1
     assert set(rows[0]) == {
         "id", "item_id", "item_name", "quantity", "status", "reason", "created_at"
