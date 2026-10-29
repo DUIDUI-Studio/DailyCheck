@@ -873,8 +873,20 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `LLM_BASE_URL` / `LLM_MODEL` | 否 | 缺省 `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` |
 | `BOT_VERIFY_NUMBERS` | 否 | `0` 关闭数字对账 |
 | `BOT_PUBLIC_BASE_URL` | 否 | 消息里链接的域名，缺省 `https://kjtang.cn`。**不能用 127.0.0.1**，群里点不开 |
+| `BOT_TOOL_CALL_LOG` | 否 | 工具调用计数 JSONL 路径；缺省 `<DAILYCHECK_DB_DIR>/../bot_tool_calls.log`（bot 写入端与 Web 读取端共用该推导） |
 
 **部署**：独立 systemd unit `dailycheck-bot.service`，**不在蓝绿流程里**——它不接 HTTP 流量、不与两实例共享进程，重启不影响订货。⚠️ 长连接是**单连接**：同一 BotID 只能有一个进程在线，本地调试前必须先停生产进程，否则互相挤掉。
+
+**管理配置台与热加载（Issue #79 PR1，2026-10-29 起）**：
+
+- 入口 `/admin/bot-agent`（GET）与 `/admin/bot-agent/save`（POST），均 `@require_platform_admin`；保留 Flask-WTF 默认 CSRF；审计复用 `blueprints/audit_pure.append_admin_audit`。
+- 配置落 `master.db.bot_agent_config(key TEXT PRIMARY KEY, value TEXT, updated_at, updated_by)`，键为 `tool.<name>` / `llm.reasoning_effort` / `write.allowed_userids`；迁移 v3 注册，`init_master_db()` 同步幂等建表（新库与存量库都覆盖）。
+- 展示集合 `D = get_tools()` 实时 29 项 + bot 五自有 = **34 主行**；四个旧名（`list_warehouses` / `list_warehouse_items` / `get_item_detail` / `get_item_consumption`）作为兼容子条目，`get_price` 单列诊断（D1=A / D6=A）。行集合**不复制静态清单**：新增注册项会自动出现并标「待确认」。
+- 执行集合 `E = TOOL_NAMES(9) ∩ 当前消息配置快照`；MCP 名称或未知名称即使配置成 on 也不会进入 E。PR1 不接入 MCP 执行能力、不开放任何写操作执行路径。
+- `bot/agent.py:answer_stream()` **每条消息只调用一次** `load_effective_config()`；同一快照用于 `tools` 数组、`_run_tool` 过滤与 `reasoning_effort`。主答与数字校正辅助调用都在请求体**顶层**携带 `reasoning_effort`。
+- 回退：缺表 / 锁库 / 读取异常 / 非法配置值 → 现有 9 项全开 + `medium`；回退绝不启用新写能力。
+- 计数：`bot/usage.py` 在真实工具调用后向 DB 同级的 `bot_tool_calls.log` 追加 JSON 行（`BOT_TOOL_CALL_LOG` 可覆盖）；页面只聚合最近 7 天，不另造遥测平台。
+- 性能采样：`docs/2026-10-29-bot-reasoning-effort-benchmark.md`（同 prompt/模型 5 组配对；baseline 默认 max 在 4000 token 内 5/5 无 content，medium 5/5 产出 content；生产 bot 环境用真实问法复测仍归 Prod）。
 
 **已知坑（都踩过）**：
 
@@ -1146,6 +1158,12 @@ erDiagram
         string allowed_warehouse_codes_json
         string revoked_at
     }
+    BOT_AGENT_CONFIG {
+        string key PK "tool.<name> / llm.reasoning_effort / write.allowed_userids"
+        string value
+        string updated_at
+        string updated_by
+    }
     STORE_ORDERS {
         int id PK
         string order_no UK
@@ -1157,6 +1175,8 @@ erDiagram
 ```
 
 > **权限精细化新增表（2026-10-13 起）**：`permissions` / `roles` / `role_permissions` / `permission_routes` / `approval_policies`（5 张，均 `CREATE TABLE IF NOT EXISTS`，对存量 master.db 为 no-op 追加；由 `init_master_db()` 幂等播种）。角色包与权限点目录的**单一事实来源**是 `permissions_manifest.py`（守卫 / 管理 UI / 测试四方共用）。详 §8.7。
+>
+> **Bot 配置表（Issue #79 PR1，2026-10-29 起）**：`bot_agent_config` 由迁移 v3 注册，同时写进 `MASTER_SCHEMA`，因此新库初始化、存量库迁移、重复初始化三条路径都得到同一张表；配置值只由 `/admin/bot-agent` 写，bot 侧只读。
 
 ### 4.3 warehouse.db 核心表（ER 简图）
 
@@ -1252,7 +1272,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前注册表到 **v3**（`bot_agent_config`，Issue #79）。
 
 ---
 
@@ -1292,6 +1312,7 @@ flowchart TB
         Users["users.py<br/>用户管理"]
         ImportItems["import_items.py<br/>CSV 导入库存品"]
         AgentTokens["agent_tokens.py<br/>平台管理员令牌管理"]
+        BotAdmin["bot_admin.py<br/>企微 Bot 配置台<br/>（Issue #79 PR1）"]
     end
 
     subgraph PureLogic["纯逻辑层 (无 Flask 依赖，易测)"]
@@ -1361,6 +1382,7 @@ flowchart LR
     Outbound -->|master.db 只读| StoreOrders
     Users[users.py]:::bp --> Shared
     AgentTokens[agent_tokens.py]:::bp --> Shared
+    BotAdmin[bot_admin.py]:::bp --> Shared
     Reports[reports.py]:::bp --> Shared
     Reports --> ReportsHealthPure[reports_health_pure.py]:::pure
     Reports -->|master.db 只读| StoreOrders["store_orders（门店履约）"]
@@ -2126,6 +2148,8 @@ flowchart TB
 
 **门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
 
+**Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。CI 的 `--ignore=tests/mcp_server` 不影响这些文件。
+
 ---
 
 ## 13. 关键约定与坑
@@ -2309,6 +2333,19 @@ with app.test_client() as c, c.session_transaction() as s:
 - 改名撞 `recipes.name` / `ic_recipes.name` 的 UNIQUE 同样整批回滚 + `flash(..., "error")`，不再 500。
 
 回归：`tests/test_recipe_bom_delete.py`（20 例，冰激凌配方页 10 + 出品配方页 9 + 跨页权限 1）。变异验证：整包还原成 `origin/main` 的 bug 版 → 20 例中 17 例变红；定向还原「旧 IntegrityError 处理」→ 3 例红；把 `bom_delete[]` checkbox 放回保存表单 → 1 例红。
+
+### 13.14 Bot 配置热加载与执行集合（2026-10-29 起，Issue #79 PR1）
+
+**背景**：`get_tools()` 从原计划的 14 项漂移到 29 项，而 bot schema 只有 9 项；任何「把 UI 行写死成 19」或「拿展示清单当执行授权」都会在下次注册新工具时静默失真（#78 契约核对的核心结论）。PR1 因此把**展示集合 D** 与**执行集合 E** 分开：
+
+- `D = get_tools()` 实时注册名 + bot 五自有；页面不存工具清单，新增注册项自动出现（无元数据时标「待确认」）。
+- `E = TOOL_NAMES(9) ∩ 消息开始时的配置快照`。MCP 名称/未知名称/旧名映射都不能凭配置扩大 E；PR1 不新增 MCP adapter，也不开放写操作。
+- `bot_agent_config` 的 `tool.<name>` 只对 9 项生效；旧名子条目有独立开关但**不旁路**其父 MCP 的未接入状态（父行本来就不在执行集合）。
+- 配置读取**每条消息一次**（`answer_stream`），不是每轮工具调用一次；这样同一条回复的多轮工具调用看到同一套开关，避免半途切换。
+- 失败回退固定为「9 项 + medium」而不是「全量 + 默认」：宁可少能力，也不把未验收的 MCP/写工具带进故障路径。
+- 调用计数是 JSONL 追加（`bot_tool_calls.log`），不是新遥测平台；bot 的 SQLite 连接保持 `mode=ro`，计数不写业务库。
+
+**回归**：见 §12 的五个测试文件；关键断言做过变异验证（把 `_tool_schemas_for` 改回全量、把 `_run_tool` 的 allowed 检查删掉、把顶层 `reasoning_effort` 塞进 messages、把非法值回退改成保留半套开关，分别会打红对应用例）。
 
 ## 14. pre-existing 风险清单
 

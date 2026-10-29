@@ -222,6 +222,15 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
     rate_limit INTEGER
 );
 
+-- 企微 Bot 管理配置台（Issue #79 PR1）：键值对，UI 只写配置值。
+-- 键：tool.<name> / llm.reasoning_effort / write.allowed_userids。
+CREATE TABLE IF NOT EXISTS bot_agent_config (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT,
+    updated_by TEXT
+);
+
 -- 登录爆破锁定（P0-4）：按 (ip, username) 记失败计数与锁定到期时间。
 -- 时间一律 UTC naive（rate_limit_pure 约定），与进程时区无关。
 CREATE TABLE IF NOT EXISTS login_throttle (
