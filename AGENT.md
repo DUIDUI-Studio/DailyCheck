@@ -81,9 +81,9 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 | `admin` | 3 | 仓库管理员 |
 | `is_admin` | — | 平台管理员（全局绕过仓库角色检查） |
 
-## MCP 服务器（27 个工具）
+## MCP 服务器（29 个工具）
 通过 Model Context Protocol 提供 AI Agent 数据访问，支持 stdio（`flask mcp`）与 HTTP/SSE（`python3 -m mcp_server`，:5100）两种模式；Bearer Token（环境变量 `DAILYCHECK_MCP_TOKEN`）或 `agent_tokens` 表票据认证，支持路径级 ACL 与仓库范围权限。
-工具：`warehouse_list` / `items_list` / `items_detail` / `movements_list` / `restock_create` / `restock_list` / `outbound_create` / `outbound_list` / `outbound_rollback` / `warehouse_consumption` / `item_consumption` / `item_forecast` / `procurement_store` / `procurement_hub` + `canonical_*`（13 个主数据治理工具）
+工具：`warehouse_list` / `items_list` / `items_detail` / `movements_list` / `restock_create` / `restock_list` / `item_forecast` / `procurement_store` / `procurement_hub` / `outbound_create` / `outbound_list` / `outbound_rollback` / `warehouse_consumption` / `item_consumption` / `canonical_list` / `canonical_detail` / `canonical_categories` / `canonical_fanout_targets` / `canonical_conflicts` / `canonical_fanout_event` / `canonical_create` / `canonical_update` / `canonical_claim` / `canonical_unclaim` / `canonical_fanout` / `canonical_resolve_conflict` / `canonical_set_binding_active` / `store_order_list` / `store_order_detail`
 
 ## 常见维护任务
 - 修改固定品类：调整 `config.py` 中 `FIXED_CATEGORIES`

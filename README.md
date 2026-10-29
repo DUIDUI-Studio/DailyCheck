@@ -52,7 +52,7 @@ DAILYCHECK_SECRET_KEY=dev-key-change-me flask --app app run --host 0.0.0.0 --por
 - 库存查阅（支持搜索 + 低库存提示）
 - 补货申请（含状态流转）
 - 生产录入（产品配方驱动，按产出量自动扣减原料）
-- MCP 服务器（27 个工具，AI Agent 数据访问）
+- MCP 服务器（29 个工具，AI Agent 数据访问）
 
 ## 生产部署
 

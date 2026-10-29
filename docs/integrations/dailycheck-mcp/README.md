@@ -75,7 +75,7 @@ export DAILYCHECK_MCP_TOKEN="<raw-token-from-create>"
 
 **The token is a shared secret.** It must be passed via TLS in production and never logged. Rotate via [integration-checklist.md](./integration-checklist.md#rotating-the-token).
 
-## 4. Tool registry (14 tools)
+## 4. Tool registry (16 tools)
 
 Fetch the full live registry: `tools/list`. Snapshot included in [tools.json](./tools.json).
 
@@ -92,6 +92,8 @@ Reading / analysis:
 | `procurement_hub` | Hub-level procurement rollup |
 | `warehouse_consumption` | **Per-item consumption summary** (rank, qty, daily avg, **turnover rate**) + warehouse-level 30d financial turnover |
 | `item_consumption` | Single-item consumption detail (7d / 14d / 30d / monthly) — opt-in `include_turnover` adds stocktake-anchored COGS turnover |
+| `store_order_list` | Store orders (store ordering / DC transfer) visible to this token — filter by `warehouse_code` / `status`, paginated with `limit` / `offset` |
+| `store_order_detail` | One store order: header + line items (`canonical_name`, `quantity`, `fulfilled_quantity`, `dc_item_id`) + deliveries + receipts + status history |
 
 Write:
 

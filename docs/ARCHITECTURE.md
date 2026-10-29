@@ -42,7 +42,7 @@
 
 ## 1. 项目一句话
 
-**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 27 个工具。**
+**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 29 个工具。**
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
@@ -71,7 +71,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["27 个 MCP 工具<br/>(items_list / outbound_create / ... / canonical_set_binding_active)"]
+        Tools["29 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -817,7 +817,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
 
-**为什么不走 MCP**：MCP 那 27 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
+**为什么不走 MCP**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
 
 **链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
 
@@ -1278,7 +1278,7 @@ flowchart TB
         Items["items.py<br/>库存品 CRUD + 库存视图"]
         Canonical["canonical.py<br/>主数据 CRUD + 扇出"]
         StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货<br/>catalog 展示本店现有库存"]
-        RecipeCost["recipe_cost.py<br/>配方 (产品 BOM + ic_recipe + recipe) + 成本"]
+        RecipeCost["recipe_cost.py<br/>配方 (产品 BOM + ic_recipe + recipe) + 成本<br/>配方原料行删除走独立路由(自带 bom_id)"]
         Forecast["forecast.py<br/>预测 + 定时调度"]
         Procurement["procurement.py<br/>采购建议"]
         Notifications["notifications.py<br/>应用内通知"]
@@ -1597,7 +1597,7 @@ flowchart TB
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（27 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
 
 ### 9.1 进程拓扑
 
@@ -1606,7 +1606,7 @@ flowchart LR
     subgraph MCP["mcp_server/ 进程 (uvicorn :5100)"]
         Main["main.py<br/>lifespan + AuthMiddleware + 健康检查"]
         Protocol["protocol/<br/>server.py + tools/"]
-        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical"]
+        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical / store_order"]
         Data["data/<br/>master.py / warehouse.py / unit_of_work.py"]
         Infra["infra/<br/>errors.py / access_log.py"]
     end
@@ -1618,7 +1618,7 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 27 个 MCP 工具
+### 9.2 29 个 MCP 工具
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
@@ -1649,6 +1649,19 @@ flowchart LR
 | `canonical_fanout` | canonical | write | 显式传 warehouse_codes |
 | `canonical_resolve_conflict` | canonical | write | 全局（跨仓） |
 | `canonical_set_binding_active` | canonical | write | per-token |
+| `store_order_list` | store_order | read | per-token |
+| `store_order_detail` | store_order | read | per-token |
+
+**门店订单只读域（Issue #73）**：`store_order_list` / `store_order_detail` 只读 `master.db` 的门店订单五张表（`store_orders` / `store_order_items` / `store_order_deliveries` / `store_order_receipts` / `store_order_status_history`），无迁移、无写语义、无删除语义。策略来源复用 `blueprints/store_ordering_pure.list_orders` / `.get_order_detail`（与 `service/canonical.py` 复用 `canonical_pure` 同一先例），`mcp_server/service/store_order.py` 只负责 ACL 翻译与返回形状整理。
+
+| 项 | 契约 |
+|---|------|
+| 路径 ACL | `GET /api/v1/store-orders`（列表）、`GET /api/v1/store-orders/<id>`（详情） |
+| 仓库可见性 | `store_warehouse_code` **或** `dc_warehouse_code` 任一命中 `allowed_warehouses` 即可见；`allowed_warehouses=None` 全可见。范围外的单对列表不可见、对详情等同「不存在」（不泄露存在性） |
+| 列表过滤 | `warehouse_code`（命中门店侧或总仓侧皆可）/ `status` / `limit`（1–500）/ `offset` |
+| 详情形状 | `order`（头）+ `items` + `deliveries` + `receipts` + `status_history` 五段；`items` 含 `canonical_name` / `quantity` / `fulfilled_quantity` / `dc_item_id`（null 表示尚未回填配送中心 items.id）与 `dc_item_bound` 布尔标记 |
+
+> **可见性 OR 与纯函数的 AND 语义**：`sop.list_orders` 的 `store_warehouse_code` / `dc_warehouse_code` 是 AND 关系，而 ACL 可见性是 OR。服务层把 OR 展开成若干次 AND 查询的并集（`_scope_pairs`），并按「各子集各取前 `limit + offset` 行 → 合并去重 → 全局排序 → 切片」保证分页正确。
 
 > **`restock_list` 的数据源（Issue #72，2026-10-27）**：读 `restock_requests` LEFT JOIN `items`，
 > 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC`）。
@@ -2015,6 +2028,12 @@ Issue #67 的订货目录库存展示由
 `test_catalog_sums_duplicate_store_bindings` 再覆盖同一 canonical 的两条门店绑定行
 7+3=10（首行 7、DC=100），锁定聚合值而非首行或 DC 值。
 
+Issue #47 的研发配方页回归在 `tests/test_recipe_bom_delete.py`（20 例：冰激凌配方页
+10 + 出品配方页 9 + 跨页权限 1）。覆盖「原料行删除只删目标行 / 跨配方行被拒 /
+删除往返 / AJAX 拒绝返 ok:false / AJAX 成功返 ok:true / 重复原料整批回滚并指明第几行 /
+正常保存不误伤 / 保存表单不再提交 bom_delete[] / 新建撞重复不留半保存配方」。
+详见 §13.13。
+
 ```mermaid
 flowchart TB
     subgraph Pytest["pytest (59 个测试文件, 977 用例；2026-10-15 实测)"]
@@ -2044,7 +2063,7 @@ flowchart TB
         MCPPure["test_*_pure.py"]
         MCPRoute["test_*_route.py"]
         MCPData["test_data/test_warehouse.py"]
-        MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>(26 用例 mock)"]
+        MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>+ test_store_order.py<br/>(18 用例 mock，Issue #73)"]
         MCPProtocol["test_protocol/test_inbound_tools.py<br/>MCP 工具层：写入后立即读回"]
     end
 
@@ -2097,6 +2116,8 @@ flowchart TB
 **Pre-existing 16 failed 分布**（2026-10-13 起）：
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
+
+**门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
 
 ---
 
@@ -2261,6 +2282,27 @@ with app.test_client() as c, c.session_transaction() as s:
 
 回归：`tests/test_production_recipe_archive.py`（9 例，含"只删目标行"与"跨产品行拒绝"）。
 
+### 13.13 研发配方编辑页的原料行删除与保存回滚（2026-10-27 起，Issue #47）
+
+**背景**：PR #42 修了门店生产配方页（§13.12），但明确排除研发中心的两个配方编辑页 —— 冰激凌配方（`ic_recipe_edit.html`）与出品配方（`recipe_edit.html`）。Issue #47 承接被排除的范围。同型缺陷两条：
+
+1. **原料行删除索引错位（静默数据损坏，比 500 更危险）**：`request.form.getlist("bom_delete")` 与 `bom_row_id[]` 平行数组按索引配对。**checkbox 未勾选就不提交** → `deletes` 长度必然短于 `bom_row_id` → 索引整体错位：勾第 3 行实际删掉第 1 行，BOM 与用量静默对不上且不报错。
+2. **未捕获 IntegrityError → 500 + 半保存**：`except sqlite3.IntegrityError` 只 flash 不 rollback；新建配方时配方行已 commit、BOM 行却回滚 → 留下半保存的空配方。
+
+**删除意图自带主键（两个页面各一条路由）**：
+- `POST /recipe-cost/ic-recipes/<ic_recipe_id>/bom/<bom_id>/delete` → `recipe_cost.ic_recipe_bom_row_delete`
+- `POST /recipe-cost/recipes/<recipe_id>/bom/<bom_id>/delete` → `recipe_cost.recipe_bom_row_delete`
+- 路由内校验 `bom_id` 属于该配方（`WHERE id = ? AND <外键> = ?`）→ 不能借 A 配方的 URL 删 B 配方的行；不匹配时 `flash(..., "error")` → AJAX 侧是 409 `business_rule`（§13.7）。
+- 「保存配方」表单**不再提交 `bom_delete[]`**，只负责新增与改用量。历史行的删除按钮用 HTML5 `form` 属性关联到表格外的 `<form>`（外层已是 `bom-form`，不能再嵌套 form，HTML 会截断 DOM）；未保存的新增行删除只摘 DOM（`static/recipe_cost.js` 的 `[data-remove-row]` 委托）。
+
+**保存撞唯一约束 → 整批 rollback**：
+- `ic_recipe_items` 有 `UNIQUE(ic_recipe_id, item_id)`：两行指向同一原料会撞唯一约束 → 整批 `rollback()` + `flash("保存失败：第 N 行的原料与配方中其它行重复，本次修改已全部撤销", "error")` → AJAX 侧 409 `business_rule`（与 §13.12 同语义）。
+- `recipe_items` 是多态表（`item_id` / `ic_recipe_id` 二选一），**没有 UNIQUE 约束** → 重复原料在视图层判定（`(source_type, target_id)` 在本次提交内不得重复），否则同一原料被静默记两行、用量与成本口径一起失真。
+- 配方行与 BOM 行必须**同生共死**：新建配方时配方 `INSERT` 不再提前 commit（`audit()` 内部自带 commit，故 create 审计移到最终 commit 之后写），失败时 `rollback()` 一并撤销配方行。
+- 改名撞 `recipes.name` / `ic_recipes.name` 的 UNIQUE 同样整批回滚 + `flash(..., "error")`，不再 500。
+
+回归：`tests/test_recipe_bom_delete.py`（20 例，冰激凌配方页 10 + 出品配方页 9 + 跨页权限 1）。变异验证：整包还原成 `origin/main` 的 bug 版 → 20 例中 17 例变红；定向还原「旧 IntegrityError 处理」→ 3 例红；把 `bom_delete[]` checkbox 放回保存表单 → 1 例红。
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
@@ -2272,6 +2314,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 配方成本 qty 语义不一致 | **高** | **已修复（2026-10-16，`feat/recipe-rd-upgrade`）** | ic_recipe 引用行 qty 统一为**克**（`_save_recipe` output_qty 累计 / pure 成本层 / 前端 JS / BOM CSV 四处对齐，旧「份」语义废弃）。两库 recipes 表均 0 行，无存量迁移。详见 `docs/2026-10-16-recipe-rd-upgrade.md` §D1 |
 | 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:80,100` / `blueprints/procurement.py:185` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:91` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 的 4 个调用点 / 3 个代码站点（`replay_item_layers`、`compute_stocktake_quality`、`compute_fulfillment`）；行号按 2026-10-15 `52516a8` 校准，改动这些模块时按符号名而非行号定位。后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | 事故已止血；**根治已交付待 merge**（Issue #41 → PR #42） | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。**处置**：生产侧已 `switch.sh blue 100` 止血（运行态 blue 100 / green down）；**根治**= §3.4 铁律新增的 `switch.sh` DRY_RUN 守卫（承接流量且 `DRY_RUN=true` → 拒跑 exit 3），已随 Issue #41 修复交付（PR #42）。⚠️ **下一次切流量前必须先按 `scripts/blue_green/README.md`「绿转正」关闭绿的写隔离**，否则会被守卫拒跑（预期行为） |
+| MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的 `store_warehouse_code` 或 `dc_warehouse_code` 任一命中才可见。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |
@@ -2281,6 +2324,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
 | 企微推送无重发队列 / 无失败告警 | 低 | 已知限制（2026-10-16 登记，§3.9） | 对外通道失败只留 WARNING（`wecom_notify_dropped` + errcode），不阻塞下单、不回滚、不补发；机器人被移出群 / key 轮换后需人工更新 `/etc/dailycheck/app.env` 才恢复。通知 SLA 属商业化项，另立项 |
 | Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
+| 出品配方的多态行 `bom_item_id[]` / `bom_ic_recipe_id[]` 与 `bom_row_id[]` **不按位对齐** | **高** | pre-existing（Issue #47 复核时发现，**本次未修**，已另立 issue） | 模板每行只渲染「当前类型」的那一个 select（`bom_item_id` 或 `bom_ic_recipe_id`），浏览器提交时两个数组各自按类型计数、与 `bom_row_id[]` 长度不等；后端按 `item_ids[i]` / `ic_ids[i]` 取值 → **混合来源**的出品配方保存时，部分行的原料/用量被静默跳过，甚至写错行（行序为 [ic_recipe, item, item] 时，第 2 行可能被写成第 3 行的原料）。与 §13.13 同属「平行数组按位配对」家族，但根因在**模板渲染 ≠ 表单契约**，与 Issue #47 的两条缺陷不同源 → 按 workflow.md D2 另立 issue，不在本 PR 修。**修法**：每行同时渲染另一类型的 hidden 占位（`value=""`），或后端改为按行解析。存量风险：混合来源的出品配方保存后行数/用量可能与预期不符，**改配方前先核对行数** |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 
 ---

@@ -26,7 +26,7 @@
 
 <hr/>
 <h3>原料配方·销售单价试算</h3>
-<p class="muted">可修改每行原料的<b>销售单价</b>来评估对整体毛利和利润的影响（仅影响销售价值和相关毛利项，不影响采购成本及采购毛利）。</p>
+<p class="muted">可修改每行原料的<b>销售单价</b>来评估对整体毛利和利润的影响（仅影响销售价值和相关毛利项，不影响采购成本及采购毛利）。删除原料点行尾的「删除」（立即生效），改用量后点「保存配方」。</p>
 
 <form method="post" id="bom-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -86,7 +86,11 @@
         </td>
         <td><span class="bom-cost-selling">0.00</span></td>
         <td>
-          <label class="del-flag"><input type="checkbox" name="bom_delete" value="1" /> 删除</label>
+          {# 按钮用 HTML5 form 属性关联到表格外的 form —— 外层已是 bom-form，
+             不能再嵌套一层 form（HTML 会截断 DOM）。删除意图自带 bom_id，
+             不依赖任何数组顺序（旧的 bom_delete[] checkbox 会索引错位）。 #}
+          <button type="submit" form="del-bom-{{ b['id'] }}"
+                  class="btn-sm btn-delete">删除</button>
         </td>
       </tr>
       {% endfor %}
@@ -138,6 +142,16 @@
   {% endif %}
 </form>
 
+{# 每行一个独立删除表单：自带 bom_id，不存在按索引配对错位的可能。 #}
+{% for b in bom_rows %}
+<form id="del-bom-{{ b['id'] }}" method="post"
+      action="{{ url_for('recipe_cost.ic_recipe_bom_row_delete', ic_recipe_id=recipe['id'], bom_id=b['id']) }}"
+      data-ajax data-ajax-mode="reload-stay"
+      data-ajax-confirm="确认删除原料「{{ b['item_name'] }}」？该操作立即生效。">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+</form>
+{% endfor %}
+
 <script>
   window.__items = [
     {% for it in items %}
@@ -149,5 +163,5 @@
     {% endfor %}
   ];
 </script>
-<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=10"></script>
+<script src="{{ url_for('static', filename='recipe_cost.js') }}?v=11"></script>
 {% endblock %}

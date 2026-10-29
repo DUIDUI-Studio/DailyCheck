@@ -600,5 +600,78 @@ def get_tools() -> list[Tool]:
                 "required": ["warehouse_code", "canonical_id", "active"],
             },
         ),
+        #  门店订单（store order）只读工具 — 见 mcp_server/protocol/tools/store_order.py
+        Tool(
+            name="store_order_list",
+            title="List Store Orders",
+            description=(
+                "List store orders (store ordering / DC transfer documents) visible to "
+                "this token. Read-only. Optional filters: warehouse_code (matches "
+                "either the store side or the DC side of an order), status, limit, "
+                "offset. Returns: {orders: [{id, order_no, store_warehouse_code, "
+                "dc_warehouse_code, flow_type, status, requested_by, expected_delivery_date, "
+                "created_at, updated_at, ...}], total, limit, offset, truncated}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "warehouse_code": {
+                        "type": "string",
+                        "description": (
+                            "Optional warehouse code filter; matches an order whose "
+                            "store side or DC side is this warehouse (e.g. wh_000)."
+                        ),
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "pending",
+                            "approved",
+                            "rejected",
+                            "shipped",
+                            "delivered",
+                            "cancelled",
+                        ],
+                        "description": "Optional order status filter.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "default": 200,
+                        "description": "Page size (1-500, default 200).",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Page offset (default 0).",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="store_order_detail",
+            title="Get Store Order Detail",
+            description=(
+                "Get one store order with its header, line items, deliveries, receipts "
+                "and status history. Read-only. Returns: {order: {id, order_no, "
+                "store_warehouse_code, dc_warehouse_code, flow_type, status, ...}, "
+                "items: [{id, canonical_id, canonical_name, dc_item_id, dc_item_bound, "
+                "quantity, fulfilled_quantity, shipped_quantity, unit, status}], "
+                "deliveries: [...], receipts: [...], status_history: [...]}."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "Store order id (store_orders.id).",
+                    },
+                },
+                "required": ["order_id"],
+            },
+        ),
     ]
     return tools
