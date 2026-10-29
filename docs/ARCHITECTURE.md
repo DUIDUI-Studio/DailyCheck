@@ -1662,6 +1662,21 @@ flowchart LR
 
 > **可见性 OR 与纯函数的 AND 语义**：`sop.list_orders` 的 `store_warehouse_code` / `dc_warehouse_code` 是 AND 关系，而 ACL 可见性是 OR。服务层把 OR 展开成若干次 AND 查询的并集（`_scope_pairs`），并按「各子集各取前 `limit + offset` 行 → 合并去重 → 全局排序 → 切片」保证分页正确。
 
+**列表分页（Issue #74）**：`outbound_list` / `restock_list` 返回分页信封
+`{items, total, limit, offset, truncated}`，口径与 `service/canonical.py` 一致：
+
+| 项 | 契约 |
+|---|---|
+| `limit` | 默认 100，clamp 到 `[1, 500]`（0 / 负数 → 1；>500 → 500） |
+| `offset` | 默认 0，clamp 到 `>=0`（负值 → 0） |
+| `total` | 与列表同一数据源的 `COUNT(*)`，**不随 limit/offset 变化** |
+| `truncated` | `total > offset + len(items)`（首页 True、末页 False） |
+
+数据层 `list_outbound` / `list_restock_movements` 各带 `LIMIT ? OFFSET ?` 与配套
+`count_outbound` / `count_restock_movements`；`ORDER BY created_at DESC, id DESC`
+的 `id` tie-break 是分页正确性的一部分（同秒多行时仅按 `created_at` 排序，
+逐页 OFFSET 可能重复/遗漏）。回归 `tests/test_mcp_list_pagination.py`（见 §12）。
+
 ### 9.3 双传输模式
 
 | 模式 | 入口 | 鉴权 | 用途 |
@@ -2101,6 +2116,14 @@ flowchart TB
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
 
 **门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
+
+**MCP 列表分页（Issue #74）**：`tests/test_mcp_list_pagination.py`（14 用例，真实临时
+`master.db` + warehouse DB，种 120 条 outbound / 120 条 restock 流水）——逐页拼接与
+全量一致且无重复无遗漏、`total` 恒等于总行数、`truncated` 首末页翻转、limit/offset
+clamp、两个工具的 `inputSchema`/description 契约，以及工具层端到端透传。断言用同一
+`created_at` 的 120 行钉住 `id DESC` tie-break；三处变异（`truncated` 恒 False /
+去掉 limit clamp / 数据层忽略 offset）均实测打红对应用例。该文件同样落在 `tests/`
+根目录，CI 会跑。
 
 ---
 

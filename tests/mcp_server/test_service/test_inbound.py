@@ -1,9 +1,11 @@
 """入库服务测试。"""
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
-from mcp_server.service.inbound import create_restock, list_restock
+
+from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
 from mcp_server.service.auth import AuthContext
-from mcp_server.infra.errors import ForbiddenError, ValidationError, NotFoundError
+from mcp_server.service.inbound import create_restock, list_restock
 
 
 class TestCreateRestock:
@@ -103,10 +105,15 @@ class TestListRestock:
             {"id": 1, "item_id": 1, "item_name": "Item 1",
              "qty": 10, "reason": "restock", "created_at": "2024-01-01"}
         ]
+        mock_context.execute.return_value.fetchone.return_value = {"total": 1}
         mock_conn.return_value = mock_context
 
         ctx = AuthContext(1, [], [], None)
         result = list_restock("WH001", ctx)
 
-        assert len(result) == 1
-        assert result[0]["qty"] == 10
+        assert result["total"] == 1
+        assert result["limit"] == 100
+        assert result["offset"] == 0
+        assert result["truncated"] is False
+        assert len(result["items"]) == 1
+        assert result["items"][0]["qty"] == 10

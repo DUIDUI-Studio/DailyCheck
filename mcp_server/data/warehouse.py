@@ -109,15 +109,26 @@ def create_restock(
     return {"id": req_id, "movement_id": cur2.lastrowid}
 
 
-def list_restock_movements(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+def count_restock_movements(conn: sqlite3.Connection) -> int:
+    """入库流水总数（与 list_restock_movements 同一过滤口径）。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS total FROM stock_movements WHERE action = 'restock'"
+    ).fetchone()
+    return int(row["total"])
+
+
+def list_restock_movements(
+    conn: sqlite3.Connection, limit: int = 100, offset: int = 0
+) -> list[dict]:
     rows = conn.execute(
         """SELECT s.id, s.item_id, i.name AS item_name,
                   s.delta AS qty, s.action AS reason, s.created_at
            FROM stock_movements s
            JOIN items i ON i.id = s.item_id
            WHERE s.action = 'restock'
-           ORDER BY s.created_at DESC LIMIT ?""",
-        (limit,),
+           ORDER BY s.created_at DESC, s.id DESC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -158,15 +169,24 @@ def create_outbound(
     return req_id
 
 
-def list_outbound(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+def count_outbound(conn: sqlite3.Connection) -> int:
+    """出库申请总数（与 list_outbound 同一数据源）。"""
+    row = conn.execute("SELECT COUNT(*) AS total FROM outbound_requests").fetchone()
+    return int(row["total"])
+
+
+def list_outbound(
+    conn: sqlite3.Connection, limit: int = 100, offset: int = 0
+) -> list[dict]:
     rows = conn.execute(
         """SELECT o.id, o.item_id, i.name AS item_name,
                   o.requested_quantity AS quantity, o.reason,
                   o.status, o.rolled_back, o.created_at
            FROM outbound_requests o
            JOIN items i ON i.id = o.item_id
-           ORDER BY o.created_at DESC LIMIT ?""",
-        (limit,),
+           ORDER BY o.created_at DESC, o.id DESC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
     ).fetchall()
     return [dict(r) for r in rows]
 
