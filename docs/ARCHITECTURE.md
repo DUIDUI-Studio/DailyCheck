@@ -158,6 +158,18 @@ flowchart LR
 
 Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起绿：DB `cp -a` + systemd **restart** + 30×2s 健康检查，**重启前先判绿是否在承流**，在役则先切蓝；**并把 unit 复位成静息态**——`DRY_RUN=true` + 副本库）→ `verify.sh`（八项生产验证，报告落 `backups/prod-verifications/`）→ `promote.sh`（**绿转正**：关 `DRY_RUN` + DB 指回真库 + daemon-reload/restart + 健康复核，幂等 + 备份 + 失败回滚）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。**完整时序**：up（复位静息态 → 重启为 `DRY_RUN=true` + 副本库）→ verify → promote → switch（5/50/100）。
 
+**多仓履约发布节奏（T1→T2→T3，2026-10-29，spec §6/D14）**：
+- **T1 兼容发布**：新代码（含 MCP / bot / 订单板 / 报表）全量上线，`config.MULTI_WAREHOUSE_FULFILLMENT`
+  **保持关闭** → 目录/提交/发货与存量逐字节恒等（单仓路径）；master v3/v4/v5 与仓库 v6 迁移在
+  T1 发布时执行，播种 pending 清单交人工配置。
+- **T2 开跨仓**：确认**蓝绿双实例均 ≥ T1**（都能识别行级来源）、且灰度期没有旧写者承流后，
+  才开启 `MULTI_WAREHOUSE_FULFILLMENT`。**首张跨仓单产生后，回滚目标版本必须仍是 T1+**，
+  严禁回滚到不识别 `source_warehouse_code` 的版本（否则按头仓扣所有行）。
+- **T3 收敛**：`dc_warehouse_code` 降级为纯展示，报表/MCP/健康报表的参与仓谓词已切换完成。
+- 灰度期蓝绿同池（`switch.sh` 5%/50%）时**绝不开启跨仓创建**——旧实例按头仓扣行的风险由此关闭；
+  本设计不改部署流水线（红线不动）。
+
+
 **铁律**：
 - **nginx 备份绝不写 `sites-enabled/`** —— 主配置 `include sites-enabled/*` 会把 `.bak` 当配置加载 → duplicate upstream 永久 fail（Issue #24 Bug A）。统一落 `BACKUP_DIR`（默认 `/var/lib/dailycheck-blue-green-backups/`）。
 - **`verify.sh` 禁用 `set -e`** —— check 失败由 `OVERALL_PASS` 跟踪，`trap _write_report EXIT` 兜底保证任何失败路径都写报告（Issue #24 Bug B）。
@@ -1168,7 +1180,7 @@ erDiagram
   批次头/订单明细外键级联删除，`item_id` 是对应来源仓内的行 ID。
 - `item_routing(tenant_id, canonical_id, fulfillment_warehouse_code, updated_at,
   updated_by)` 以 `(tenant_id, canonical_id)` 为主键，关联租户、主数据、来源仓和维护人；
-  本次只建表，路由播种与配置入口属于后续 Task。
+  播种迁移（master v4）与 `/admin/item-routing` 配置入口见 §10.2。
 - `store_order_carts.dc_warehouse_code` 改为可空，历史非空值原样保留；
   `UNIQUE(user_id, store_warehouse_code)` 继续保证每用户每门店一车。
   迁移在 FK ON 和 runner 外层事务内通过 create/copy/drop/rename 重建，
@@ -1194,7 +1206,8 @@ erDiagram
 
 生产侧事项：本次属于 master 与全部仓库的 schema 兼容变更，Prod Agent 按标准迁移流程
 完成主库及仓库备份、执行版本迁移并审查异常报告；异常行需人工处置，不静默修数。
-多仓创建仍属于后续阶段，版本迁移本身不启用跨仓业务。
+版本迁移本身不启用跨仓业务；跨仓创建由 `MULTI_WAREHOUSE_FULFILLMENT` 开关控制
+（默认关，即 T1 兼容发布），发布节奏见 §3.4「多仓履约发布节奏」。
 
 **默认租户前置**：`init_master_db()` 与 master v4 路由播种迁移均先幂等插入
 `tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`

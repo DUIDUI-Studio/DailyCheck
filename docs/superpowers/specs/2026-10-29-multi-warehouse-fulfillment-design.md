@@ -2,7 +2,8 @@
 
 - 日期：2026-10-29（v2 修订同日晚于 codex 评审）
 - 分支：dailycheck-dev/llm-deepseek-account-model-5（worktree 双仓库功能逻辑）
-- 状态：**v2 已消解评审全部 P0/P1/P2 + Eric 三项产品拍板，待 Eric 过目后进实施计划**
+- 状态：**已实施**（2026-10-29 Task 1-11 全部合入；验收矩阵见
+  `tests/test_multi_warehouse_acceptance.py`，发布节奏见 `docs/ARCHITECTURE.md` §3.4）
 - 评审：`docs/superpowers/reviews/2026-10-29-multi-warehouse-fulfillment-codex-review.md`
   （1 P0 / 10 P1 / 3 P2，结论「需修订后实施」）
 - v1→v2 变更：D5/D6 扩充、新增 D10–D14；P0-01、P1-01/02/03/04/05/06/07/08/09/10、
