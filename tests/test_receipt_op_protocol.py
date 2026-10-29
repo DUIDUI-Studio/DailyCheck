@@ -257,6 +257,32 @@ def test_same_op_no_retry_stocks_once(receipt_env):
         ).fetchone()[0] == 1
 
 
+def test_retry_after_store_commit_survives_lost_writeback(receipt_env):
+    """crash window 2→3：门店已加库、master 回写丢失（applied=0）。
+
+    同 op_no 重试必须只补 ``applied``，不得按派生键二次加库。
+    """
+    env = receipt_env
+    order_id, ids = env["make_order"]([(101, 5.0, 5.0)])
+    _receive(env, order_id, "op-crash", {ids[0]: 2.0})
+    env["master"].execute(
+        "UPDATE store_order_receipts SET applied=0 WHERE op_no=?",
+        (f"op-crash:{ids[0]}",),
+    )
+    env["master"].commit()
+    assert env["store_stock"](101) == 2.0
+
+    retry = _receive(env, order_id, "op-crash", {ids[0]: 2.0})
+
+    assert retry["receipts"][0]["applied"] == 1
+    assert env["store_stock"](101) == 2.0
+    with sop.open_warehouse_db("store_test") as store:
+        assert store.execute(
+            "SELECT COUNT(*) FROM stock_movements WHERE op_no=?",
+            (f"op-crash:{ids[0]}",),
+        ).fetchone()[0] == 1
+
+
 def test_same_op_no_retry_with_different_quantity_rejected(receipt_env):
     env = receipt_env
     order_id, ids = env["make_order"]([(101, 5.0, 5.0)])
