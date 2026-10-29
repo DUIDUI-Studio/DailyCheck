@@ -975,8 +975,12 @@ def test_notify_order_cancelled_targets_both_sides(ordering_env):
     assert notified == {1, 3, 5}
 
 
-def test_notify_order_received_targets_dc_reviewers(ordering_env):
-    """partial receive 通知发给 DC 审批人 + 平台管理员（去自己）。"""
+def test_notify_order_received_targets_store_and_source_warehouse(ordering_env):
+    """partial receive 通知发给门店侧 + 来源仓审批人 + 平台管理员（去自己）。
+
+    spec §11 矩阵（多仓履约 Task 10）：部分收货 → 门店 + 该批来源仓相关者。
+    本用例没有收货行，来源仓回落全部参与仓（= dc_test）。
+    """
     conn = ordering_env["master_conn"]
     cart = sop.get_or_create_cart(
         conn, user_id=2, store_warehouse_code="store_test", dc_warehouse_code="dc_test",
@@ -984,15 +988,15 @@ def test_notify_order_received_targets_dc_reviewers(ordering_env):
     sop.add_cart_item(conn, cart["id"], 101, 5.0, "件")
     order = sop.submit_order(conn, cart["id"], requested_by=2, expected_delivery_date=None, note="")
 
-    # actor=2 (门店 requester)，DC manager 5 + platform admin 1 应被通知
+    # actor=2（门店 requester，排自己）→ 门店经理 3 + DC 审批人 5 + 平台管理员 1
     count = sop.notify_order_event(conn, sop.EVENT_ORDER_RECEIVED, order, actor_user_id=2)
-    assert count == 2
+    assert count == 3
     rows = conn.execute(
         "SELECT user_id FROM notifications WHERE event_type=?",
         (sop.EVENT_ORDER_RECEIVED,),
     ).fetchall()
     notified = {r["user_id"] for r in rows}
-    assert notified == {1, 5}
+    assert notified == {1, 3, 5}
 
 
 # ---------------------------------------------------------------------------

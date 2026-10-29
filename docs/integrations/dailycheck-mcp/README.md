@@ -92,8 +92,15 @@ Reading / analysis:
 | `procurement_hub` | Hub-level procurement rollup |
 | `warehouse_consumption` | **Per-item consumption summary** (rank, qty, daily avg, **turnover rate**) + warehouse-level 30d financial turnover |
 | `item_consumption` | Single-item consumption detail (7d / 14d / 30d / monthly) — opt-in `include_turnover` adds stocktake-anchored COGS turnover |
-| `store_order_list` | Store orders (store ordering / DC transfer) visible to this token — filter by `warehouse_code` / `status`, paginated with `limit` / `offset` |
-| `store_order_detail` | One store order: header + line items (`canonical_name`, `quantity`, `fulfilled_quantity`, `dc_item_id`) + deliveries + receipts + status history |
+| `store_order_list` | Store orders (store ordering / DC transfer) visible to this token by **participating warehouse** — filter by `warehouse_code` (store side or any participating warehouse) / `status`, paginated with `limit` / `offset` |
+| `store_order_detail` | One store order: header + line items (`canonical_name`, `quantity`, `fulfilled_quantity`, `dc_item_id`, `source_warehouse_code`) + deliveries (`warehouse_code`) + receipts + status history |
+
+**Store-order ACL expansion (explicit).** An order is visible when the token is
+allowed on its store warehouse or on **any participating warehouse** (a line's
+source warehouse, header DC as legacy fallback). A token allowed on any
+participating warehouse can read the **full order** — including line items
+fulfilled by other warehouses, their amounts and the receipt history. This is
+intentional: one cross-warehouse order is one document for both sides.
 
 Write:
 

@@ -3542,99 +3542,171 @@ def notify_order_event(
     order: dict[str, Any],
     actor_user_id: int | None = None,
 ) -> int:
-    """Fan out an order event to the right users. Returns number of rows written."""
+    """Fan out an order event to the right users. Returns number of rows written.
+
+    收件人按**有效权限**解析（spec §11），不是角色名硬编码：
+
+      * 参与仓侧 —— 在任一参与仓持有 ``order.approve`` 的在职非平台管理员；
+        平台管理员另行加入（他们本来就能跨仓审批）。
+      * 门店侧 —— 下单人 + 在门店仓持有 ``order.receive`` 的在职用户。
+
+    逐事件方向严格按 spec §11 矩阵；调货事件方向维持现状。
+    """
     master_conn.row_factory = sqlite3.Row
     # 调货单与订货单共用事件通道，但对外文案必须区分，否则分仓会收到
     # 「订货单已发出」这种与自己没有订货关系、无法据此操作的通知。
     is_transfer = order.get("flow_type") == FLOW_DC_TRANSFER
     doc_label = "总仓调货单" if is_transfer else "订货单"
+    participants = _participants_from_order(order)
     if event_type == EVENT_TRANSFER_CREATED:
         # 总仓发起调货 → 通知分仓经理/管理员准备接收。
         user_ids = _recipients_for_store_users(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"总仓调货单 {order['order_no']} 已发起，请准备接收"
     elif event_type == EVENT_ORDER_SUBMITTED:
-        user_ids = _recipients_for_dc_reviewers(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
+        # 各参与仓 order.approve 持有人（知会 + 可审一体）。
+        user_ids = _recipients_for_approvers(master_conn, participants)
         summary = f"门店订货单 {order['order_no']} 已提交"
     elif event_type == EVENT_ORDER_APPROVED:
         user_ids = _recipients_for_store_users(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"{doc_label} {order['order_no']} 已审批通过"
     elif event_type == EVENT_ORDER_REJECTED:
         user_ids = _recipients_for_store_users(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"{doc_label} {order['order_no']} 已被拒绝"
     elif event_type == EVENT_ORDER_SHIPPED:
         user_ids = _recipients_for_store_users(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"{doc_label} {order['order_no']} 已出库配送"
     elif event_type == EVENT_ORDER_DELIVERED:
         user_ids = _recipients_for_store_users(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
         summary = f"{doc_label} {order['order_no']} 已送达"
     elif event_type == EVENT_ORDER_RECEIVED:
-        # 部分收货通知发给 DC 审批人 + 平台管理员，让 DC 知道门店收到多少
-        user_ids = _recipients_for_dc_reviewers(master_conn, order)
-        user_ids = _exclude_self(user_ids, actor_user_id)
+        if is_transfer:
+            # 调货方向维持现状：只通知发货仓侧。
+            user_ids = _recipients_for_approvers(master_conn, participants)
+        else:
+            # 部分收货 → 门店 + **该批**来源仓相关者（不是全部参与仓）。
+            sources = _receipt_batch_warehouses(order, participants)
+            user_ids = _merge(
+                _recipients_for_store_users(master_conn, order),
+                _recipients_for_approvers(master_conn, sources),
+            )
         summary = f"{doc_label} {order['order_no']} 部分收货"
     elif event_type == EVENT_ORDER_CANCELLED:
-        # 取消通知发给对侧：门店取消 → DC 审批人；DC 取消 → 门店用户。
-        # 简化做法：双侧都发给 requester + dc reviewers（去重 + 排自己）。
-        user_ids = _recipients_for_store_users(master_conn, order)
-        user_ids += [
-            uid for uid in _recipients_for_dc_reviewers(master_conn, order)
-            if uid not in user_ids
-        ]
-        user_ids = _exclude_self(user_ids, actor_user_id)
+        # 取消 → 参与仓审批人 + 门店（去重 + 排自己）。
+        user_ids = _merge(
+            _recipients_for_store_users(master_conn, order),
+            _recipients_for_approvers(master_conn, participants),
+        )
         summary = f"订货单 {order['order_no']} 已取消"
     else:
         raise ValueError(f"unknown event_type {event_type!r}")
 
+    user_ids = _exclude_self(user_ids, actor_user_id)
     target_url = f"/store-ordering/orders/{order['id']}"
     if not user_ids:
         return 0
     return emit_event(master_conn, event_type, summary, target_url, user_ids)
 
 
-def _recipients_for_dc_reviewers(
-    master_conn: sqlite3.Connection,
+def _participants_from_order(order: dict[str, Any]) -> list[str]:
+    """Line sources with header fallback (same rule as the visibility predicate)."""
+    codes: set[str] = set()
+    for item in order.get("order_items") or []:
+        code = item.get("source_warehouse_code") or order.get("dc_warehouse_code")
+        if code:
+            codes.add(str(code))
+    if codes:
+        return sorted(codes)
+    head = order.get("dc_warehouse_code")
+    return [str(head)] if head else []
+
+
+def _receipt_batch_warehouses(
     order: dict[str, Any],
+    fallback: list[str],
+) -> list[str]:
+    """Source warehouses of the most recent receipt batch.
+
+    ``get_order_detail`` returns receipts newest-first; rows written by one
+    receive call share ``created_at``. When no receipt rows are available
+    (e.g. event invoked before persistence), fall back to all participants.
+    """
+    receipts = order.get("receipts") or []
+    if not receipts:
+        return fallback
+    latest = max(str(r.get("created_at") or "") for r in receipts)
+    item_ids = {
+        int(r["order_item_id"])
+        for r in receipts
+        if str(r.get("created_at") or "") == latest
+    }
+    source_by_item = {
+        int(item["id"]): (
+            item.get("source_warehouse_code") or order.get("dc_warehouse_code")
+        )
+        for item in order.get("order_items") or []
+        if item.get("id") is not None
+    }
+    codes = {
+        str(source_by_item[item_id])
+        for item_id in item_ids
+        if source_by_item.get(item_id)
+    }
+    return sorted(codes) or fallback
+
+
+def _merge(*groups: list[int]) -> list[int]:
+    merged: set[int] = set()
+    for group in groups:
+        merged.update(int(uid) for uid in group)
+    return sorted(merged)
+
+
+def _recipients_for_approvers(
+    master_conn: sqlite3.Connection,
+    warehouse_codes: list[str],
+    *,
+    perm: str = "order.approve",
+    tenant_id: int = 1,
 ) -> list[int]:
-    """DC managers/admins for the target DC plus platform admins."""
-    master_conn.row_factory = sqlite3.Row
-    dc_code = order["dc_warehouse_code"]
-    rows = master_conn.execute(
-        """SELECT wu.user_id
-           FROM warehouse_users wu
-           JOIN warehouses w ON w.id = wu.warehouse_id
-           WHERE w.code=? AND wu.role IN ('manager', 'admin')""",
-        (dc_code,),
-    ).fetchall()
-    user_ids = {int(r["user_id"]) for r in rows}
-    admins = master_conn.execute(
-        "SELECT id FROM users WHERE is_admin=1"
-    ).fetchall()
-    user_ids.update(int(r["id"]) for r in admins)
+    """Users holding ``perm`` on any of the warehouses + active platform admins."""
+    user_ids: set[int] = set()
+    for code in warehouse_codes:
+        user_ids |= _users_with_permission(
+            master_conn, perm, code, tenant_id=tenant_id
+        )
+    user_ids |= _active_platform_admin_ids(master_conn, tenant_id=tenant_id)
     return sorted(user_ids)
+
+
+def _active_platform_admin_ids(
+    master_conn: sqlite3.Connection,
+    *,
+    tenant_id: int = 1,
+) -> set[int]:
+    master_conn.row_factory = sqlite3.Row
+    return {
+        int(row["id"]) for row in master_conn.execute(
+            "SELECT id FROM users WHERE is_admin=1 AND is_active=1 AND tenant_id=?",
+            (tenant_id,),
+        ).fetchall()
+    }
 
 
 def _recipients_for_store_users(
     master_conn: sqlite3.Connection,
     order: dict[str, Any],
+    *,
+    perm: str = "order.receive",
+    tenant_id: int = 1,
 ) -> list[int]:
-    """Requester + store managers/admins."""
-    master_conn.row_factory = sqlite3.Row
+    """Requester + users holding ``perm`` on the storefront warehouse."""
     store_code = order["store_warehouse_code"]
-    user_ids: set[int] = {int(order["requested_by"])}
-    rows = master_conn.execute(
-        """SELECT wu.user_id
-           FROM warehouse_users wu
-           JOIN warehouses w ON w.id = wu.warehouse_id
-           WHERE w.code=? AND wu.role IN ('manager', 'admin')""",
-        (store_code,),
-    ).fetchall()
-    user_ids.update(int(r["user_id"]) for r in rows)
+    user_ids: set[int] = set()
+    if order.get("requested_by"):
+        user_ids.add(int(order["requested_by"]))
+    user_ids |= _users_with_permission(
+        master_conn, perm, store_code, tenant_id=tenant_id
+    )
     return sorted(user_ids)
 
 

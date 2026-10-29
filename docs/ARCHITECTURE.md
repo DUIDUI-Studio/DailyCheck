@@ -1778,11 +1778,12 @@ flowchart LR
 | 项 | 契约 |
 |---|------|
 | 路径 ACL | `GET /api/v1/store-orders`（列表）、`GET /api/v1/store-orders/<id>`（详情） |
-| 仓库可见性 | `store_warehouse_code` **或** `dc_warehouse_code` 任一命中 `allowed_warehouses` 即可见；`allowed_warehouses=None` 全可见。范围外的单对列表不可见、对详情等同「不存在」（不泄露存在性） |
-| 列表过滤 | `warehouse_code`（命中门店侧或总仓侧皆可）/ `status` / `limit`（1–500）/ `offset` |
-| 详情形状 | `order`（头）+ `items` + `deliveries` + `receipts` + `status_history` 五段；`items` 含 `canonical_name` / `quantity` / `fulfilled_quantity` / `dc_item_id`（null 表示尚未回填配送中心 items.id）与 `dc_item_bound` 布尔标记 |
+| 仓库可见性 | **「订单参与仓」谓词**（spec §10）：门店仓 **或** 任一明细行来源仓（历史 NULL 行回落头仓；无明细行的存量单回落头仓）命中 `allowed_warehouses` 即可见；`allowed_warehouses=None` 全可见。范围外的单对列表不可见、对详情等同「不存在」（不泄露存在性） |
+| **ACL 扩权（显式）** | token 命中**任一参与仓** → 可读**全单**：包括由其他参与仓履约的行、金额与收货历史。已写入工具 `description` 与 `docs/integrations/dailycheck-mcp/` |
+| 列表过滤 | `warehouse_code`（门店仓或任一参与仓命中皆可）/ `status` / `limit`（1–500）/ `offset` |
+| 详情形状 | `order`（头）+ `items` + `deliveries` + `receipts` + `status_history` 五段；`items` 含 `canonical_name` / `quantity` / `fulfilled_quantity` / `dc_item_id`（null 表示尚未回填配送中心 items.id）/ `dc_item_bound` 布尔标记 / **`source_warehouse_code`（行来源仓）**；`deliveries` 每批含 **`warehouse_code`（实际发货仓）** |
 
-> **可见性 OR 与纯函数的 AND 语义**：`sop.list_orders` 的 `store_warehouse_code` / `dc_warehouse_code` 是 AND 关系，而 ACL 可见性是 OR。服务层把 OR 展开成若干次 AND 查询的并集（`_scope_pairs`），并按「各子集各取前 `limit + offset` 行 → 合并去重 → 全局排序 → 切片」保证分页正确。
+> **统一可见性谓词（多仓履约 Task 10，spec §10）**：列表、计数与详情共用 `mcp_server/service/store_order.py::_visibility_sql()` 一段纯 SQL `EXISTS` 谓词（`EXISTS (… store_order_items soi WHERE soi.order_id = so.id AND COALESCE(soi.source_warehouse_code, so.dc_warehouse_code) IN (…))`，外加门店仓命中与无明细行存量单的头仓兜底）。`EXISTS` 保证多行同仓不把订单计数翻倍。`sop.list_orders` 仍是单仓 AND 过滤器，服务层按「门店侧 + 参与仓」两个入口各查一次再按订单 id 合并去重（`_scope_filters`），分页仍满足「各子集取前 `limit+offset` 行 → 合并去重 → 全局排序 → 切片」。列表 `total` 由同谓词的 COUNT 给出，因此 `list` / `total` / `truncated` / 详情成员关系一致。
 
 ### 9.3 双传输模式
 
@@ -1913,7 +1914,7 @@ stateDiagram-v2
 跨仓必须显式传 `operator_dc_code`）。所有失败点均以 `op_no` 可恢复：同键重试幂等，
 仓库已提交而主库未落由 `reconcile_orphan_shipments` 红字冲销。
 
-**通知**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out（收件人按事件方向选 DC 审批人 / 门店用户，排除操作者自己）。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
+**通知（多仓履约 Task 10，spec §11）**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out，**收件人按有效权限解析，不硬编码角色名**：参与仓侧 = 在任一参与仓持有 `order.approve` 的在职用户 + 在职平台管理员；门店侧 = 下单人 + 在门店仓持有 `order.receive` 的在职用户。逐事件方向：提交 → 各参与仓审批人；批准/拒绝 → 门店侧；部分收货 → 门店 + **该批**来源仓（按最近一批 receipt 的 `order_item_id` 回溯来源仓，无收货行时回落全部参与仓）；全发齐 `shipped` → 门店（由 §8 条件迁移保证恰一条）；取消 → 参与仓审批人 + 门店；调货事件方向维持现状（发起/批准/发货 → 收货门店，收货 → 发货仓侧）。所有方向均排除操作者自己。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
 
 **建单/目录/购物车去 DC 化（2026-10-29，多仓履约 Task 7）**：由 `config.MULTI_WAREHOUSE_FULFILLMENT`（默认 `False`）控制，**关闭时行为与存量完全一致**，新逻辑只在开启后生效。
 
@@ -2493,7 +2494,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 配方成本 qty 语义不一致 | **高** | **已修复（2026-10-16，`feat/recipe-rd-upgrade`）** | ic_recipe 引用行 qty 统一为**克**（`_save_recipe` output_qty 累计 / pure 成本层 / 前端 JS / BOM CSV 四处对齐，旧「份」语义废弃）。两库 recipes 表均 0 行，无存量迁移。详见 `docs/2026-10-16-recipe-rd-upgrade.md` §D1 |
 | 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:80,100` / `blueprints/procurement.py:185` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:91` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 的 4 个调用点 / 3 个代码站点（`replay_item_layers`、`compute_stocktake_quality`、`compute_fulfillment`）；行号按 2026-10-15 `52516a8` 校准，改动这些模块时按符号名而非行号定位。后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | 事故已止血；**根治已交付待 merge**（Issue #41 → PR #42） | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。**处置**：生产侧已 `switch.sh blue 100` 止血（运行态 blue 100 / green down）；**根治**= §3.4 铁律新增的 `switch.sh` DRY_RUN 守卫（承接流量且 `DRY_RUN=true` → 拒跑 exit 3），已随 Issue #41 修复交付（PR #42）。⚠️ **下一次切流量前必须先按 `scripts/blue_green/README.md`「绿转正」关闭绿的写隔离**，否则会被守卫拒跑（预期行为） |
-| MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的 `store_warehouse_code` 或 `dc_warehouse_code` 任一命中才可见。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
+| MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27；参与仓口径更新 2026-10-29） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的门店仓或**任一参与仓**（明细行来源仓，历史 NULL 回落头仓）命中才可见；命中任一参与仓即可读**全单**（含他仓行/金额/收货历史）。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |
