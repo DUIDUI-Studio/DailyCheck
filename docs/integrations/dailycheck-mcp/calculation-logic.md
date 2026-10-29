@@ -1,7 +1,7 @@
 # MCP 工具数据计算逻辑对照表
 
 > 生成日期：2026-07-21
-> 覆盖工具：13 个 MCP 工具（items_list / items_detail / movements_list / restock_create / restock_list / outbound_create / outbound_list / outbound_rollback / warehouse_consumption / item_consumption / item_forecast / procurement_store / procurement_hub）
+> 覆盖工具：14 个基础 MCP 工具（warehouse_list / items_list / items_detail / movements_list / restock_create / restock_list / outbound_create / outbound_list / outbound_rollback / warehouse_consumption / item_consumption / item_forecast / procurement_store / procurement_hub）；canonical_* 13 个主数据治理工具见 `docs/ARCHITECTURE.md` §9.2，合计 27 个工具。
 
 ---
 
@@ -67,9 +67,9 @@
 ### restock_list
 | 项目 | 说明 |
 |------|------|
-| 原始表 | `stock_movements` + `items` JOIN |
-| 计算逻辑 | 过滤 `action='restock'` 或 `'补货入库'`，按 `created_at DESC` |
-| 输出字段 | `id, item_id, item_name, qty, reason, created_at` |
+| 原始表 | `restock_requests` + `items` LEFT JOIN（Issue #72 改读入库单表） |
+| 计算逻辑 | 不过滤状态（`'提交'` 与 `'入库'` 都返回），按 `created_at DESC` |
+| 输出字段 | `id, item_id, item_name, quantity, status, reason, created_at` |
 
 ---
 
@@ -192,7 +192,7 @@
 | `items_detail` | `items` | 无，直接返回 |
 | `movements_list` | `outbound_requests` + `stock_movements` | 合并后按时间排序 |
 | `restock_create` | `items` + `restock_requests` + `stock_movements` | `quantity += qty` |
-| `restock_list` | `stock_movements` | 过滤 `action='restock'` |
+| `restock_list` | `restock_requests` + `items` LEFT JOIN | 不过滤状态，按 `created_at DESC` |
 | `outbound_create` | `items` + `outbound_requests` + `stock_movements` | `quantity -= qty`，失效采购缓存 |
 | `outbound_list` | `outbound_requests` | 无计算，直接返回 |
 | `outbound_rollback` | `items` + `outbound_requests` + `stock_movements` | `quantity += qty`，标记 `rolled_back=1` |

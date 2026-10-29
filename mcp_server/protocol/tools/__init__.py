@@ -99,7 +99,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="restock_list",
             title="List Restocks",
-            description="List restock records for a warehouse. Returns: array of {id, item_id, item_name, qty, reason, created_at}.",
+            description="List inbound restock requests for a warehouse. Returns: array of {id, item_id, item_name, quantity, status, reason, created_at}.",
             inputSchema={
                 "type": "object",
                 "properties": {

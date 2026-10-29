@@ -28,8 +28,8 @@ def create_stock_movements_table(conn: sqlite3.Connection) -> None:
     """Create stock_movements table with required schema."""
     conn.execute(
         "CREATE TABLE stock_movements ("
-        "id INTEGER PRIMARY KEY, item_id INTEGER, delta INTEGER, "
-        "action TEXT, created_at TEXT)"
+        "id INTEGER PRIMARY KEY, item_id INTEGER, delta REAL, "
+        "action TEXT, note TEXT, created_at TEXT)"
     )
 
 
@@ -122,6 +122,7 @@ def test_create_restock_increases_quantity():
     """Test create_restock adds restock record and updates quantity."""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    create_categories_table(conn)  # required by get_item's category subquery
     create_items_table(conn)
     create_stock_movements_table(conn)
     create_restock_requests_table(conn)
@@ -138,12 +139,14 @@ def test_create_restock_increases_quantity():
 
     # Check item quantity updated
     item = warehouse.get_item(conn, 1)
-    assert item["quantity"] == 15
+    assert item["current_stock"] == 15
 
-    # Check stock_movements record
+    # Check the inbound request shows up in the list (data source: restock_requests)
     movements = warehouse.list_restock_movements(conn)
     assert len(movements) == 1
-    assert movements[0]["qty"] == 5
+    assert movements[0]["quantity"] == 5
+    assert movements[0]["status"] == "入库"
+    assert movements[0]["item_name"] == "Test"
 
 
 def test_list_restock_movements_empty():
@@ -152,7 +155,97 @@ def test_list_restock_movements_empty():
     conn.row_factory = sqlite3.Row
     create_items_table(conn)
     create_stock_movements_table(conn)
+    create_restock_requests_table(conn)
     assert warehouse.list_restock_movements(conn) == []
+
+
+def test_list_restock_movements_reads_restock_requests():
+    """入库列表读 restock_requests：N 条请求 → N 条结果，七字段齐全 + created_at DESC."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    create_items_table(conn)
+    create_restock_requests_table(conn)
+    conn.execute(
+        "INSERT INTO items (id, sku, name, quantity) VALUES (1, 'SKU1', 'Item A', 10)"
+    )
+    conn.execute(
+        "INSERT INTO items (id, sku, name, quantity) VALUES (2, 'SKU2', 'Item B', 20)"
+    )
+    conn.execute(
+        "INSERT INTO restock_requests "
+        "(item_id, requested_quantity, reason, status, created_at) "
+        "VALUES (1, 5, 'first', '入库', '2026-01-01 10:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO restock_requests "
+        "(item_id, requested_quantity, reason, status, created_at) "
+        "VALUES (2, 7, 'second', '提交', '2026-01-02 10:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO restock_requests "
+        "(item_id, requested_quantity, reason, status, created_at) "
+        "VALUES (1, 3, 'third', '提交', '2026-01-03 10:00:00')"
+    )
+
+    rows = warehouse.list_restock_movements(conn)
+
+    assert len(rows) == 3
+    for row in rows:
+        assert set(row) == {
+            "id", "item_id", "item_name", "quantity", "status", "reason", "created_at"
+        }
+    # created_at DESC —— 最新入库在前
+    assert [r["created_at"] for r in rows] == [
+        "2026-01-03 10:00:00",
+        "2026-01-02 10:00:00",
+        "2026-01-01 10:00:00",
+    ]
+    assert [r["status"] for r in rows] == ["提交", "提交", "入库"]
+    assert [r["id"] for r in rows] == [3, 2, 1]
+    assert rows[0]["item_id"] == 1
+    assert rows[0]["item_name"] == "Item A"
+    assert rows[0]["quantity"] == 3
+    assert rows[0]["reason"] == "third"
+    assert rows[1]["item_name"] == "Item B"
+    assert rows[1]["quantity"] == 7
+    assert rows[2]["quantity"] == 5
+    assert rows[2]["reason"] == "first"
+
+
+def test_list_restock_movements_ignores_stock_movements_rows():
+    """数据源已切换：restock_requests 为空、只有 action='restock' 流水行时返回空."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    create_items_table(conn)
+    create_stock_movements_table(conn)
+    create_restock_requests_table(conn)
+    conn.execute("INSERT INTO items (id, sku, name) VALUES (1, 'SKU1', 'Item A')")
+    conn.execute(
+        "INSERT INTO stock_movements (item_id, delta, action, created_at) "
+        "VALUES (1, 9, 'restock', '2026-01-01 10:00:00')"
+    )
+
+    assert warehouse.list_restock_movements(conn) == []
+
+
+def test_list_restock_movements_keeps_request_without_item_row():
+    """LEFT JOIN items：库存品缺失时入库单仍返回（item_name 为 None）."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    create_items_table(conn)
+    create_restock_requests_table(conn)
+    conn.execute(
+        "INSERT INTO restock_requests "
+        "(item_id, requested_quantity, reason, status, created_at) "
+        "VALUES (99, 4, 'orphan', '提交', '2026-01-01 10:00:00')"
+    )
+
+    rows = warehouse.list_restock_movements(conn)
+
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == 99
+    assert rows[0]["item_name"] is None
+    assert rows[0]["quantity"] == 4
 
 
 def test_list_movements_empty():
@@ -258,8 +351,8 @@ def create_stocktakes_table(conn: sqlite3.Connection) -> None:
 def create_restock_requests_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE restock_requests ("
-        "id INTEGER PRIMARY KEY, item_id INTEGER, requested_quantity INTEGER, "
-        "reason TEXT, status TEXT, created_at TEXT)"
+        "id INTEGER PRIMARY KEY, item_id INTEGER, requested_quantity REAL, "
+        "reason TEXT, status TEXT DEFAULT '提交', created_at TEXT)"
     )
 
 

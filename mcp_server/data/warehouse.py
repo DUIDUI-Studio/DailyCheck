@@ -110,13 +110,22 @@ def create_restock(
 
 
 def list_restock_movements(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+    """List inbound restock requests (入库单), newest first.
+
+    Data source: `restock_requests` LEFT JOINed with `items`. Each row:
+    {id, item_id, item_name, quantity, status, reason, created_at}.
+
+    History: this used to read `stock_movements` rows filtered on
+    `action='restock'`, but the inbound flow writes `action='补货入库'` there
+    — so the MCP list came back empty for every warehouse (Issue #72).
+    """
     rows = conn.execute(
-        """SELECT s.id, s.item_id, i.name AS item_name,
-                  s.delta AS qty, s.action AS reason, s.created_at
-           FROM stock_movements s
-           JOIN items i ON i.id = s.item_id
-           WHERE s.action = 'restock'
-           ORDER BY s.created_at DESC LIMIT ?""",
+        """SELECT r.id, r.item_id, i.name AS item_name,
+                  r.requested_quantity AS quantity, r.status, r.reason,
+                  r.created_at
+           FROM restock_requests r
+           LEFT JOIN items i ON i.id = r.item_id
+           ORDER BY r.created_at DESC LIMIT ?""",
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
