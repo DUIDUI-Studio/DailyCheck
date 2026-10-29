@@ -122,7 +122,7 @@ Three tools expose a list-style view of stock activity. They overlap but answer 
 |---|---|---|
 | "Show me recent activity in this warehouse" (any kind) | `movements_list` | **Union view** — merges outbound + stock_movements, with `type` field |
 | "List outbound requests, including rolled-back ones" | `outbound_list` | Has `status` / `rolled_back` fields that `movements_list` strips |
-| "List restock (inbound) records" | `restock_list` | Filtered to `action='restock'` |
+| "List restock (inbound) records" | `restock_list` | Reads `restock_requests` (inbound orders), newest first — carries `quantity` / `status` |
 | "Show me what items exist + their stock" | `items_list` | Snapshot, no activity |
 | "Show me what this item's recent activity is" | `items_detail` | Per-item lookup, no activity |
 | "Show me what categories consume the most" | `warehouse_consumption` | Has `consume_pct` + `daily_avg` + `turnover_rate` + warehouse-level turnover |

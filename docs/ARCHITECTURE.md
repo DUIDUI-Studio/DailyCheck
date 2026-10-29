@@ -160,7 +160,7 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
 
 **多仓履约发布节奏（T1→T2→T3，2026-10-29，spec §6/D14）**：
 - **T1 兼容发布**：新代码（含 MCP / bot / 订单板 / 报表）全量上线，`config.MULTI_WAREHOUSE_FULFILLMENT`
-  **保持关闭** → 目录/提交/发货与存量逐字节恒等（单仓路径）；master v3/v4/v5 与仓库 v6 迁移在
+  **保持关闭** → 目录/提交/发货与存量逐字节恒等（单仓路径）；master v4/v5/v6 与每仓 schema v6 迁移在
   T1 发布时执行，播种 pending 清单交人工配置。
 - **T2 开跨仓**：确认**蓝绿双实例均 ≥ T1**（都能识别行级来源）、且灰度期没有旧写者承流后，
   才开启 `MULTI_WAREHOUSE_FULFILLMENT`。**首张跨仓单产生后，回滚目标版本必须仍是 T1+**，
@@ -885,8 +885,20 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `LLM_BASE_URL` / `LLM_MODEL` | 否 | 缺省 `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` |
 | `BOT_VERIFY_NUMBERS` | 否 | `0` 关闭数字对账 |
 | `BOT_PUBLIC_BASE_URL` | 否 | 消息里链接的域名，缺省 `https://kjtang.cn`。**不能用 127.0.0.1**，群里点不开 |
+| `BOT_TOOL_CALL_LOG` | 否 | 工具调用计数 JSONL 路径；缺省 `<DAILYCHECK_DB_DIR>/../bot_tool_calls.log`（bot 写入端与 Web 读取端共用该推导） |
 
 **部署**：独立 systemd unit `dailycheck-bot.service`，**不在蓝绿流程里**——它不接 HTTP 流量、不与两实例共享进程，重启不影响订货。⚠️ 长连接是**单连接**：同一 BotID 只能有一个进程在线，本地调试前必须先停生产进程，否则互相挤掉。
+
+**管理配置台与热加载（Issue #79 PR1，2026-10-29 起）**：
+
+- 入口 `/admin/bot-agent`（GET）与 `/admin/bot-agent/save`（POST），均 `@require_platform_admin`；保留 Flask-WTF 默认 CSRF；审计复用 `blueprints/audit_pure.append_admin_audit`。
+- 配置落 `master.db.bot_agent_config(key TEXT PRIMARY KEY, value TEXT, updated_at, updated_by)`，键为 `tool.<name>` / `llm.reasoning_effort` / `write.allowed_userids`；迁移 v3 注册，`init_master_db()` 同步幂等建表（新库与存量库都覆盖）。
+- 展示集合 `D = get_tools()` 实时 29 项 + bot 五自有 = **34 主行**；四个旧名（`list_warehouses` / `list_warehouse_items` / `get_item_detail` / `get_item_consumption`）作为兼容子条目，`get_price` 单列诊断（D1=A / D6=A）。行集合**不复制静态清单**：新增注册项会自动出现并标「待确认」。
+- 执行集合 `E = TOOL_NAMES(9) ∩ 当前消息配置快照`；MCP 名称或未知名称即使配置成 on 也不会进入 E。PR1 不接入 MCP 执行能力、不开放任何写操作执行路径。
+- `bot/agent.py:answer_stream()` **每条消息只调用一次** `load_effective_config()`；同一快照用于 `tools` 数组、`_run_tool` 过滤与 `reasoning_effort`。主答与数字校正辅助调用都在请求体**顶层**携带 `reasoning_effort`。
+- 回退：缺表 / 锁库 / 读取异常 / 非法配置值 → 现有 9 项全开 + `medium`；回退绝不启用新写能力。
+- 计数：`bot/usage.py` 在真实工具调用后向 DB 同级的 `bot_tool_calls.log` 追加 JSON 行（`BOT_TOOL_CALL_LOG` 可覆盖）；页面只聚合最近 7 天，不另造遥测平台。
+- 性能采样：`docs/2026-10-29-bot-reasoning-effort-benchmark.md`（同 prompt/模型 5 组配对；baseline 默认 max 在 4000 token 内 5/5 无 content，medium 5/5 产出 content；生产 bot 环境用真实问法复测仍归 Prod）。
 
 **已知坑（都踩过）**：
 
@@ -1158,6 +1170,12 @@ erDiagram
         string allowed_warehouse_codes_json
         string revoked_at
     }
+    BOT_AGENT_CONFIG {
+        string key PK "tool.<name> / llm.reasoning_effort / write.allowed_userids"
+        string value
+        string updated_at
+        string updated_by
+    }
     STORE_ORDERS {
         int id PK
         string order_no UK
@@ -1169,6 +1187,8 @@ erDiagram
 ```
 
 > **权限精细化新增表（2026-10-13 起）**：`permissions` / `roles` / `role_permissions` / `permission_routes` / `approval_policies`（5 张，均 `CREATE TABLE IF NOT EXISTS`，对存量 master.db 为 no-op 追加；由 `init_master_db()` 幂等播种）。角色包与权限点目录的**单一事实来源**是 `permissions_manifest.py`（守卫 / 管理 UI / 测试四方共用）。详 §8.7。
+>
+> **Bot 配置表（Issue #79 PR1，2026-10-29 起）**：`bot_agent_config` 由迁移 v3 注册，同时写进 `MASTER_SCHEMA`，因此新库初始化、存量库迁移、重复初始化三条路径都得到同一张表；配置值只由 `/admin/bot-agent` 写，bot 侧只读。
 
 **多仓履约 schema（2026-10-29，实施计划 Task 1）**：
 
@@ -1180,20 +1200,20 @@ erDiagram
   批次头/订单明细外键级联删除，`item_id` 是对应来源仓内的行 ID。
 - `item_routing(tenant_id, canonical_id, fulfillment_warehouse_code, updated_at,
   updated_by)` 以 `(tenant_id, canonical_id)` 为主键，关联租户、主数据、来源仓和维护人；
-  播种迁移（master v4）与 `/admin/item-routing` 配置入口见 §10.2。
+  播种迁移（master v5）与 `/admin/item-routing` 配置入口见 §10.2。
 - `store_order_carts.dc_warehouse_code` 改为可空，历史非空值原样保留；
   `UNIQUE(user_id, store_warehouse_code)` 继续保证每用户每门店一车。
   迁移在 FK ON 和 runner 外层事务内通过 create/copy/drop/rename 重建，
   同时保存并重建子表，保留购物车及明细、索引、触发器和自增序列，避免父表 DROP 级联丢数据。
 - 仓内 `stock_movements.op_no TEXT` 用于外部发货/收货操作回链（可空，不限制每个操作的流水行数）。
   仓库版本升至 v6，已有 v5 仓的请求迁移会幂等补列。
-- master v5 迁移（`migrations/receipt_op_protocol.py`）：`store_order_receipts` 增
+- master v6 迁移（`migrations/receipt_op_protocol.py`）：`store_order_receipts` 增
   `op_no TEXT`（UNIQUE，行级派生键 `f'{op_no}:{order_item_id}'`）与
   `applied INTEGER NOT NULL DEFAULT 1`；存量行回填 `applied=1`（旧路径写入即已入库）。
   迁移幂等可重跑，表不存在时直接跳过；新库 DDL 内联列约束、不在 `init_master_db`
   的 executescript 里单建索引，避免老库缺列时整段 DDL 失败。测试 `tests/test_receipt_migration.py`。
 
-存量迁移注册为 master v3（`migrations/multi_warehouse_fulfillment.py`）；公共契约
+存量迁移注册为 master v4（`migrations/multi_warehouse_fulfillment.py`）；公共契约
 `migrate_multi_warehouse_fulfillment(master_conn, warehouse_conns) -> dict`，
 `warehouse_conns` 为仓 code 到已打开连接的映射，事务由调用方提交或回滚。
 返回 `{backfilled_items, backfilled_deliveries, carts_rebuilt, anomalies}`，前三项为本次写入行数/
@@ -1209,7 +1229,7 @@ erDiagram
 版本迁移本身不启用跨仓业务；跨仓创建由 `MULTI_WAREHOUSE_FULFILLMENT` 开关控制
 （默认关，即 T1 兼容发布），发布节奏见 §3.4「多仓履约发布节奏」。
 
-**默认租户前置**：`init_master_db()` 与 master v4 路由播种迁移均先幂等插入
+**默认租户前置**：`init_master_db()` 与 master v5 路由播种迁移均先幂等插入
 `tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`
 外键可用；已有租户配置不覆盖，路由 pure 层不代建租户。
 
@@ -1307,7 +1327,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前注册表到 **v3**（`bot_agent_config`，Issue #79）。
 
 ---
 
@@ -1347,6 +1367,7 @@ flowchart TB
         Users["users.py<br/>用户管理"]
         ImportItems["import_items.py<br/>CSV 导入库存品"]
         AgentTokens["agent_tokens.py<br/>平台管理员令牌管理"]
+        BotAdmin["bot_admin.py<br/>企微 Bot 配置台<br/>（Issue #79 PR1）"]
     end
 
     subgraph PureLogic["纯逻辑层 (无 Flask 依赖，易测)"]
@@ -1418,6 +1439,7 @@ flowchart LR
     Outbound -->|master.db 只读| StoreOrders
     Users[users.py]:::bp --> Shared
     AgentTokens[agent_tokens.py]:::bp --> Shared
+    BotAdmin[bot_admin.py]:::bp --> Shared
     Reports[reports.py]:::bp --> Shared
     Reports --> ReportsHealthPure[reports_health_pure.py]:::pure
     Reports -->|master.db 只读| StoreOrders["store_orders（门店履约）"]
@@ -1757,6 +1779,7 @@ flowchart LR
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
+| `warehouse_list` | inventory | read | per-token |
 | `items_list` | inventory | read | per-token |
 | `items_detail` | inventory | read | per-token |
 | `movements_list` | inventory | read | per-token |
@@ -1797,6 +1820,11 @@ flowchart LR
 | 详情形状 | `order`（头）+ `items` + `deliveries` + `receipts` + `status_history` 五段；`items` 含 `canonical_name` / `quantity` / `fulfilled_quantity` / `dc_item_id`（null 表示尚未回填配送中心 items.id）/ `dc_item_bound` 布尔标记 / **`source_warehouse_code`（行来源仓）**；`deliveries` 每批含 **`warehouse_code`（实际发货仓）** |
 
 > **统一可见性谓词（多仓履约 Task 10，spec §10）**：列表、计数与详情共用 `mcp_server/service/store_order.py::_visibility_sql()` 一段纯 SQL `EXISTS` 谓词（`EXISTS (… store_order_items soi WHERE soi.order_id = so.id AND COALESCE(soi.source_warehouse_code, so.dc_warehouse_code) IN (…))`，外加门店仓命中与无明细行存量单的头仓兜底）。`EXISTS` 保证多行同仓不把订单计数翻倍。`sop.list_orders` 仍是单仓 AND 过滤器，服务层按「门店侧 + 参与仓」两个入口各查一次再按订单 id 合并去重（`_scope_filters`），分页仍满足「各子集取前 `limit+offset` 行 → 合并去重 → 全局排序 → 切片」。列表 `total` 由同谓词的 COUNT 给出，因此 `list` / `total` / `truncated` / 详情成员关系一致。
+
+> **`restock_list` 的数据源（Issue #72，2026-10-27）**：读 `restock_requests` LEFT JOIN `items`，
+> 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC`）。
+> 此前读 `stock_movements` 且过滤 `action='restock'`，而入库流程写入的是 `action='补货入库'`，
+> 因此该工具恒返回空数组。写路径（`restock_create`）未改动。
 
 ### 9.3 双传输模式
 
@@ -1857,7 +1885,7 @@ flowchart TB
 > **Q7 `guard_real_db` 软链穿透防护（2026-10-15）**：prod 部署把 `db/warehouses/*.db` 做成指向 `/var/lib/dailycheck/warehouses/` 的软链，`resolve()` 会穿透使路径比较失配、guard 放行（verify.sh check1 在 prod 首演实测抓到）。guard 现对**未 resolve 的 absolute parent** 再比一次，任一命中即拒——改部署布局（换数据目录/软链形态）时必须保持此语义。
 
 **显式履约路由（2026-10-29）**：`blueprints/item_routing_pure.py` 负责租户 1 的
-`item_routing` 播种及 CRUD。独立 master v4 迁移只扫描同租户、类型为
+`item_routing` 播种及 CRUD。独立 master v5 迁移只扫描同租户、类型为
 `distribution_center` 的仓内绑定，要求主数据 `status='active'`、本地
 `is_active=1 AND is_alias=0 AND is_store_exclusive=0`；唯一 DC 自动启用，多个 DC
 列为 ambiguous，无 DC 列为 missing，仅存在专属 DC 行列为 skipped_exclusive。
@@ -2005,7 +2033,13 @@ stateDiagram-v2
 
 详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
 
-### 10.3.2 报表与补货的参与仓口径（2026-10-29，多仓履约 Task 9）
+### 10.3.2 订单板日期筛选（2026-10-24，Issue #23）
+
+**WHERE 列名必须限定（2026-10-24，Issue #23）**：`store_ordering_pure.list_orders()` 的查询 `FROM store_orders so` 同时 `LEFT JOIN users` 与 `LEFT JOIN warehouses`——这三张表**都有 `created_at` 列**。此前 WHERE 子句用未限定列名拼日期条件（`created_at >= ?`），带 `?start_date=` / `?end_date=` 的订单板整页 500（`sqlite3.OperationalError: ambiguous column name: created_at`）；`ORDER BY so.created_at` 是限定过的，所以只有日期过滤炸，不带日期不炸。**铁律：凡查询 JOIN 了多张可能同名列的表，WHERE / GROUP BY / ORDER BY 的列名一律带表别名前缀**（本处统一 `so.`）。本次把 `list_orders()` 与 `count_orders_by_status()` 的全部条件都限定（不只 `created_at`——`status` / `store_warehouse_code` 等今天恰好不重名，但将来给 `users` / `warehouses` 加同名列时同样会炸）。**受影响 URL 有三条**（共用同一 `list_orders()`，但范围裁剪各不相同，必须逐条验）：`/store-ordering/admin/orders`（平台）、`/store-ordering/review`（DC）、`/store-ordering/orders`（门店「我的订单」）。回归 `tests/test_store_ordering_date_filter.py`（17 用例：纯层最小复现 / 区间过滤 / **边界含当日 00:00:00 与 23:59:59**（种子订单刻意落在区间两个端点上，`>=` 改 `>`、`23:59:59` 改 `23:59:58` 均会让本文件打红）/ 与其他过滤叠加 / 计数口径一致 / 三条 URL 带日期参数 200 + 内容过滤）。页签计数**不吃日期条件**（`count_orders_by_status()` 签名没有 start/end，`_render_order_board()` 也没传）：带日期筛选时列表是区间内订单、页签仍是全时段计数。这是**既有行为，本次未改**（改它属产品口径变更），本 PR 只保证它不因加前缀而漂移。
+
+**已知盲区（2026-10-24，未修，待 owner 拍板）**：蓝绿 `verify.sh` 的「八项」没有任何一项带 `start_date` / `?end_date` 参数——既有 bug 至今没被 verify 拦住（绿 verify 全绿 ≠ 用户路径全通）。加第 9 项要同步改 `docs/agent-framework/workflow.md`（红线 6 路径）且蓝绿子系统是最高危面，故本次未动；本 PR 的回归测试会被 verify 第 1 项（集成测试 pytest）跑到，算部分补网。
+
+### 10.3.3 报表与补货的参与仓口径（2026-10-29，多仓履约 Task 9）
 
 **订货报表**（`store_ordering_pure.compute_store_order_report` → `/store-ordering/admin/report`）：
 明细数量按**行来源仓** `COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)` 分组
@@ -2211,6 +2245,16 @@ flowchart LR
 
 ## 12. 测试架构
 
+Issue #72 的入库读链路回归：`tests/mcp_server/test_data/test_warehouse.py` 用
+`restock_requests` 播种 N>1 条（`status` 覆盖 `'入库'` 与 `'提交'`），锁
+`list_restock_movements` 返回 N 条、七字段齐全（`id` / `item_id` / `item_name` /
+`quantity` / `status` / `reason` / `created_at`）、`created_at DESC`；另有一条
+「`restock_requests` 为空但 `stock_movements` 存在 `action='restock'` 流水行时返回空」
+锁定数据源已切换。`tests/mcp_server/test_service/test_inbound.py` 与
+`tests/mcp_server/test_protocol/test_inbound_tools.py`（新目录；共享
+`tests/mcp_server/conftest.py` 的 `warehouse_db` 夹具）锁「MCP `restock_create`
+写入后 `restock_list` 立即读回」。
+
 Issue #64 在 `tests/test_store_ordering_dc_route.py` 增加两条路由级回归：审批后 DC
 库存不变且 `/outbound` 解释「审批不锁库存」；发货后 `/outbound` 必须出现订单号、
 「订单发货」来源及订单详情回链。
@@ -2258,6 +2302,7 @@ flowchart TB
         MCPRoute["test_*_route.py"]
         MCPData["test_data/test_warehouse.py"]
         MCPService["test_service/test_inbound.py<br/>+ test_canonical.py<br/>+ test_store_order.py<br/>(18 用例 mock，Issue #73)"]
+        MCPProtocol["test_protocol/test_inbound_tools.py<br/>MCP 工具层：写入后立即读回"]
     end
 
     Pytest --> Conftest
@@ -2311,6 +2356,8 @@ flowchart TB
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
 
 **门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
+
+**Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。CI 的 `--ignore=tests/mcp_server` 不影响这些文件。
 
 ---
 
@@ -2496,11 +2543,24 @@ with app.test_client() as c, c.session_transaction() as s:
 
 回归：`tests/test_recipe_bom_delete.py`（20 例，冰激凌配方页 10 + 出品配方页 9 + 跨页权限 1）。变异验证：整包还原成 `origin/main` 的 bug 版 → 20 例中 17 例变红；定向还原「旧 IntegrityError 处理」→ 3 例红；把 `bom_delete[]` checkbox 放回保存表单 → 1 例红。
 
+### 13.14 Bot 配置热加载与执行集合（2026-10-29 起，Issue #79 PR1）
+
+**背景**：`get_tools()` 从原计划的 14 项漂移到 29 项，而 bot schema 只有 9 项；任何「把 UI 行写死成 19」或「拿展示清单当执行授权」都会在下次注册新工具时静默失真（#78 契约核对的核心结论）。PR1 因此把**展示集合 D** 与**执行集合 E** 分开：
+
+- `D = get_tools()` 实时注册名 + bot 五自有；页面不存工具清单，新增注册项自动出现（无元数据时标「待确认」）。
+- `E = TOOL_NAMES(9) ∩ 消息开始时的配置快照`。MCP 名称/未知名称/旧名映射都不能凭配置扩大 E；PR1 不新增 MCP adapter，也不开放写操作。
+- `bot_agent_config` 的 `tool.<name>` 只对 9 项生效；旧名子条目有独立开关但**不旁路**其父 MCP 的未接入状态（父行本来就不在执行集合）。
+- 配置读取**每条消息一次**（`answer_stream`），不是每轮工具调用一次；这样同一条回复的多轮工具调用看到同一套开关，避免半途切换。
+- 失败回退固定为「9 项 + medium」而不是「全量 + 默认」：宁可少能力，也不把未验收的 MCP/写工具带进故障路径。
+- 调用计数是 JSONL 追加（`bot_tool_calls.log`），不是新遥测平台；bot 的 SQLite 连接保持 `mode=ro`，计数不写业务库。
+
+**回归**：见 §12 的五个测试文件；关键断言做过变异验证（把 `_tool_schemas_for` 改回全量、把 `_run_tool` 的 allowed 检查删掉、把顶层 `reasoning_effort` 塞进 messages、把非法值回退改成保留半套开关，分别会打红对应用例）。
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
-| 16 failed 测试（本地全量口径，2026-10-13 起） | 中 | pre-existing | 商业化前必须归零 |
+| 15 failed 测试（本地全量口径，2026-10-27 起） | 中 | pre-existing（Issue #72 收缩 1 条：MCP 入库读链路用例修复） | 商业化前必须归零 |
 | 订货目录把 DC 库存误作门店库存 | 中 | **已修复（Issue #67，2026-10-27）** | `list_available_dc_items()` 按 `canonical_id` 汇总本店全部绑定行 `SUM(items.quantity)`；重复绑定不再只取首行，未绑定行固定为 0，卡片/弹窗/`data-stock` 均不回退 DC 库存 |
 | 时区不一致 | **高** | pre-existing（`render_ops` 一处已修，2026-10-18） | 多租户改造前必修。已修的一处：`render_ops._render_kpis` 的「今日」判据曾用 `time.strftime`（进程本地时区）→ 在 UTC 环境（CI / dev 容器）与 `_cst_day()`（显式 +8h）错位，UTC 16:00–24:00 窗口内「今日部署 / 今日合并 PR」恒显 0；改为 `datetime.now(CST)` 与三处 +8 同源（§13.3）。**其余站点仍是 pre-existing**：全仓 `datetime.now()` / SQL `datetime('now')` 混用未收敛 |
 | **测试隐式依赖本机端口 / 环境** | 中 | pre-existing（2026-10-18 CI 实 hit） | `deploy_pipeline.sh` 的观察窗会真探 `http://127.0.0.1:8080/`。**本机 dev 容器在听该端口（返 302）→ 观察窗放行 → 用例通过；CI runner 无监听 → curl 得 000 → 触发「观察窗异常」→ 回滚 → exit 24**，表现为「本地全绿、CI 判红」。凡跑编排/部署脚本的测试必须注入 fake 外部命令（既有 `_observe_tools()` 提供 fake curl / journalctl；`blue_green_testenv.py` 提供 fake systemctl），不得依赖本机恰好有服务在跑。**新增这类用例前先看同文件既有测试怎么脱真环境**——本次就是漏抄了既有模式 |

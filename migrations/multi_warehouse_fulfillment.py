@@ -1,4 +1,4 @@
-"""多仓履约 schema 与历史来源回填（master v3 / warehouse v6）。"""
+"""多仓履约 schema 与历史来源回填（master v4 / warehouse v6；v3 被 bot_agent_config 占用后顺延）。"""
 
 from __future__ import annotations
 

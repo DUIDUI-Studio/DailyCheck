@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}企微 Bot 管理{% endblock %}
+{% block content %}
+<h2>企微 Bot 管理</h2>
+<p class="muted">
+  配置写入 <code>master.db.bot_agent_config</code>，bot 每条消息开始时读取一次。
+  模型名 <code>{{ model_name }}</code> 只读；思考强度会在下一次消息请求中生效。
+</p>
+
+{% if effective.degraded %}
+<div data-degraded="1" style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:10px 14px;margin:12px 0;color:#991b1b;font-size:13px">
+  <strong>配置回退中：</strong>读取失败或存在非法值，运行时已回退到现有 9 个只读工具 + medium。
+  <span class="muted">（{{ effective.degraded_reason }}）</span>
+</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('bot_admin.save_config') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <section class="card" style="margin-bottom:16px;padding:14px 16px">
+    <h3 style="margin-top:0">模型与思考强度</h3>
+    <p style="margin:0 0 8px">
+      模型：<code>{{ model_name }}</code>
+      <small class="muted">只读，来自部署侧 <code>LLM_MODEL</code></small>
+    </p>
+    <div role="radiogroup" aria-label="思考强度" style="display:flex;flex-wrap:wrap;gap:14px;margin:8px 0">
+      {% for effort in efforts %}
+      <label style="display:flex;align-items:center;gap:6px;font-weight:normal;cursor:pointer">
+        <input type="radio" name="reasoning_effort" value="{{ effort }}"
+               {% if effective.reasoning_effort == effort %}checked{% endif %}>
+        {{ effort_labels[effort] }} <code style="font-size:12px">{{ effort }}</code>
+      </label>
+      {% endfor %}
+    </div>
+    <p class="muted" style="margin:0;font-size:12px">
+      五档单选；非法值（例如 none）不能保存，运行时回退 medium。
+    </p>
+  </section>
+
+  <section class="card" style="margin-bottom:16px;padding:14px 16px;border-color:#fca5a5">
+    <h3 style="margin-top:0;color:#991b1b">写操作白名单（仅登记）</h3>
+    <p class="muted" style="margin:0 0 8px;font-size:13px">
+      本 PR 不开放任何写操作执行路径。此名单只为 PR2 的写护栏预留，
+      当前不会让任何写工具进入执行集合；默认空 = 不允许任何人。
+    </p>
+    <label style="display:block">
+      允许的企微 userid（逗号分隔）
+      <input name="write_allowed_userids" value="{{ write_allowed_userids }}"
+             placeholder="例如 U1001, U1002" autocomplete="off" style="width:100%;max-width:520px">
+    </label>
+  </section>
+
+  <table class="role-matrix" style="width:100%" data-bot-tools>
+    <thead>
+      <tr>
+        <th style="text-align:left">工具 / 用途</th>
+        <th>属性</th>
+        <th>开关</th>
+        <th title="最近 7 天">7 天调用</th>
+        <th style="text-align:left">状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr data-tool-row="{{ row.name }}"
+          data-write="{{ '1' if row.write else '0' }}"
+          data-call-count="{{ row.call_count }}"
+          data-status-code="{{ row.status_code }}"
+          {% if row.write %}style="background:#fef2f2;border-left:4px solid #dc2626"{% endif %}>
+        <td style="text-align:left">
+          <strong>{{ row.name }}</strong>
+          <div class="muted" style="font-size:13px">{{ row.purpose }}</div>
+          {% if row.write %}
+          <div style="color:#b91c1c;font-size:12px;margin-top:2px">
+            风险：写操作；PR1 只展示，不进入执行集合。
+          </div>
+          {% endif %}
+        </td>
+        <td>
+          {% if row.write is none %}
+          <span class="muted">待确认</span>
+          {% elif row.write %}
+          <span class="badge badge-error">写</span>
+          {% else %}
+          <span class="badge badge-ok">只读</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if row.executable %}
+          <label style="display:inline-flex;align-items:center;gap:4px;font-weight:normal;cursor:pointer">
+            <input type="checkbox" name="tool.{{ row.name }}" value="1"
+                   {% if row.enabled %}checked{% endif %}>
+            启用
+          </label>
+          {% else %}
+          <label style="display:inline-flex;align-items:center;gap:4px;font-weight:normal;color:#9ca3af"
+                 title="PR1 未接入，开关不生效">
+            <input type="checkbox" disabled> 未接入
+          </label>
+          {% endif %}
+        </td>
+        <td>{{ row.call_count }}</td>
+        <td style="text-align:left">
+          <span {% if row.status_code == 'pending' %}style="color:#b45309"{% elif row.status_code == 'not_connected' %}class="muted"{% endif %}>
+            {{ row.status }}
+          </span>
+        </td>
+      </tr>
+      {% for child in row.children %}
+      <tr data-legacy-row="{{ child.name }}"
+          data-write="0"
+          data-call-count="{{ child.call_count }}"
+          data-status-code="{{ child.status_code }}"
+          style="background:#f8fafc">
+        <td style="text-align:left;padding-left:28px">
+          ↳ <strong>{{ child.name }}</strong>
+          <small class="muted">（旧名兼容 → {{ child.maps_to }}）</small>
+          <div class="muted" style="font-size:13px">{{ child.purpose }}</div>
+        </td>
+        <td><span class="badge badge-ok">只读</span></td>
+        <td>
+          <label style="display:inline-flex;align-items:center;gap:4px;font-weight:normal;cursor:pointer">
+            <input type="checkbox" name="tool.{{ child.name }}" value="1"
+                   {% if child.enabled %}checked{% endif %}>
+            启用
+          </label>
+        </td>
+        <td>{{ child.call_count }}</td>
+        <td style="text-align:left"><span class="muted">{{ child.status }}</span></td>
+      </tr>
+      {% endfor %}
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+    <button type="submit" class="btn primary">保存配置</button>
+    <small class="muted">保存后下一条消息生效；审计记录操作者与变更。</small>
+  </div>
+</form>
+
+<details class="card" style="margin-top:18px;padding:12px 16px">
+  <summary><strong>诊断：get_price</strong></summary>
+  <p class="muted" style="margin:8px 0 0;font-size:13px">{{ get_price_diagnostic }}</p>
+</details>
+
+<p class="muted" style="font-size:12px;margin-top:14px">
+  调用计数来源：与 master.db 同级的 <code>bot_tool_calls.log</code>
+  （每次真实工具调用追加一行 JSON，仅聚合最近 7 天；不另造遥测平台）。
+  配置文件：<code>{{ config_path }}</code>
+</p>
+{% endblock %}

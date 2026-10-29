@@ -283,11 +283,13 @@ def test_migration_missing_dc_rolls_back_tenant_seed_and_version(routing_db, tmp
     master.execute("DELETE FROM tenants WHERE id=1")
     master.execute("UPDATE warehouses SET db_path=? WHERE code='B'",
                    (str(tmp_path / "missing.db"),))
-    master.execute("PRAGMA user_version=3")
+    # 多仓三条迁移合入 main 后顺延为 v4/v5/v6；这里只跑到播种那一步（v5），
+    # 所以把起点设成 v4（schema 迁移已完成），失败回滚后版本停在 v4。
+    master.execute("PRAGMA user_version=4")
     master.commit()
     with pytest.raises(sqlite3.OperationalError):
         migrate_up(tmp_path / "master.db", MIGRATIONS, tmp_path / "backups")
-    assert master.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert master.execute("PRAGMA user_version").fetchone()[0] == 4
     assert master.execute("SELECT id FROM tenants WHERE id=1").fetchone() is None
     assert master.execute("SELECT COUNT(*) FROM item_routing").fetchone()[0] == 0
 

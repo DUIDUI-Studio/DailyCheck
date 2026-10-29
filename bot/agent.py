@@ -23,21 +23,32 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 
 from bot import tools
+from bot.agent_config import (
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    BotAgentConfig,
+    load_effective_config,
+    normalize_reasoning_effort,
+    resolve_model_name,
+)
 from bot.prompt import SYSTEM_PROMPT
 from bot.tool_schema import TOOL_NAMES, TOOL_SCHEMAS
+from bot.usage import record_tool_call
 from bot.verify_pure import build_correction_prompt, collect_numbers, find_untraceable
 
 logger = logging.getLogger("bot.agent")
 
+# serve.py 用 agent.DEFAULT_MODEL 打启动日志；保留该公开名字。
+__all__ = ["DEFAULT_MODEL", "LLMError", "answer", "answer_stream", "split_for_stream"]
+
 DEFAULT_BASE_URL = "https://api.minimaxi.com"
-DEFAULT_MODEL = "MiniMax-M3.1-Flash"
 
 # 3 轮足够覆盖「先搜候选 → 再查详情」的绝大多数问法。
 # 原来给 5 轮，实测有个含糊问题连跑 4 轮工具、60 秒才超时，员工体验极差。
@@ -93,8 +104,42 @@ def _load_api_key(env: dict[str, str] | None = None) -> str:
 
 def _config() -> tuple[str, str, str]:
     base_url = (os.environ.get("LLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-    model = os.environ.get("LLM_MODEL") or DEFAULT_MODEL
+    model = resolve_model_name()
     return base_url, model, _load_api_key()
+
+
+def _tool_schemas_for(enabled_tools: Collection[str]) -> list[dict[str, Any]]:
+    """只暴露本条消息有效配置允许的工具（顺序与注册表一致）。"""
+    allowed = frozenset(enabled_tools) & TOOL_NAMES
+    return [schema for schema in TOOL_SCHEMAS if schema["function"]["name"] in allowed]
+
+
+def _request_payload(
+    messages: list[dict[str, Any]], model: str, config: BotAgentConfig
+) -> dict[str, Any]:
+    """构造主答请求体。
+
+    ``reasoning_effort`` 必须位于**顶层**（MiniMax/OpenAI 兼容协议），
+    不能塞进 messages/tools；测试用捕获器钉住这个位置。
+    """
+    return {
+        "model": model,
+        "messages": messages,
+        "tools": _tool_schemas_for(config.enabled_tools),
+        "tool_choice": "auto",
+        "reasoning_effort": config.reasoning_effort,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "stream": True,
+    }
+
+
+def _default_config() -> BotAgentConfig:
+    """仅给直接调用 ``_stream_once`` 的调试路径兜底；消息链必须传入快照。"""
+    return BotAgentConfig(
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        enabled_tools=frozenset(TOOL_NAMES),
+        write_allowed_userids=(),
+    )
 
 
 _PROMPT_CACHE: str | None = None
@@ -173,13 +218,22 @@ def _to_tool_text(payload: dict[str, Any]) -> str:
     )
 
 
-def _run_tool(name: str, raw_args: str) -> tuple[str, dict[str, Any] | None]:
+def _run_tool(
+    name: str,
+    raw_args: str,
+    allowed_tools: Collection[str] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
     """执行单个工具。
+
+    ``allowed_tools`` 是**同一条消息**的有效执行集合（消息开始时读取一次）。
+    被关闭的工具、旧历史/伪造调用一律返回 ``unknown_tool``，且不进入 dispatch。
+    默认值仅用于调试/旧单测；消息链必须显式传快照。
 
     返回 ``(给模型看的文本, 完整结果对象)`` 两样东西：文本可能被裁剪过，而
     对象始终完整——数字对账必须看完整数据，不能看裁过的版本。
     """
-    if name not in TOOL_NAMES:
+    allowed = (TOOL_NAMES if allowed_tools is None else frozenset(allowed_tools)) & TOOL_NAMES
+    if name not in allowed:
         return json.dumps({"ok": False, "error": "unknown_tool", "name": name}), None
     try:
         args = json.loads(raw_args) if raw_args.strip() else {}
@@ -191,6 +245,7 @@ def _run_tool(name: str, raw_args: str) -> tuple[str, dict[str, Any] | None]:
     try:
         result = _DISPATCH[name](**args)
     except TypeError as exc:
+        record_tool_call(name, ok=False)
         return (
             json.dumps(
                 {"ok": False, "error": "bad_arguments", "message": str(exc)},
@@ -199,6 +254,7 @@ def _run_tool(name: str, raw_args: str) -> tuple[str, dict[str, Any] | None]:
             None,
         )
     except Exception as exc:  # noqa: BLE001 - 单个工具失败不该中断整轮对话
+        record_tool_call(name, ok=False)
         logger.warning("工具 %s 执行失败: %s", name, exc)
         return (
             json.dumps(
@@ -207,29 +263,28 @@ def _run_tool(name: str, raw_args: str) -> tuple[str, dict[str, Any] | None]:
             ),
             None,
         )
+    record_tool_call(name, ok=True)
     return _to_tool_text(result), result
 
 
 async def _stream_once(
-    messages: list[dict[str, Any]], on_delta: DeltaCallback | None
+    messages: list[dict[str, Any]],
+    on_delta: DeltaCallback | None,
+    config: BotAgentConfig | None = None,
 ) -> dict[str, Any]:
     """一次流式调用，返回拼装好的 assistant 消息。
 
     边收边回调 ``on_delta(累积文本)`` —— 企微的 stream 是覆盖语义，每次推
     当前累积全文即可，不用自己算增量。
+
+    ``config`` 是消息级快照；``tools`` 与 ``reasoning_effort`` 都来自它。
+    未传时仅给调试路径兜底（9 项 + medium）。
     """
     base_url, model, api_key = _config()
     if not api_key:
         raise LLMError("没有可用的 LLM API key")
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "tools": TOOL_SCHEMAS,
-        "tool_choice": "auto",
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "stream": True,
-    }
+    payload = _request_payload(messages, model, config or _default_config())
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     content = ""
@@ -303,11 +358,18 @@ async def _stream_once(
     return message
 
 
-async def _simple_completion(system: str, user: str) -> str:
+async def _simple_completion(
+    system: str,
+    user: str,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+) -> str:
     """一次不带工具、不流式的补全。只给数字校正用。
 
     这里刻意不开流式：校正结果要在推送前完整拿到、重新校验一遍，边流边推
     会把没验过的内容直接暴露给员工。
+
+    辅助 LLM 调用也必须显式携带同一条消息的 ``reasoning_effort``（顶层），
+    否则主答与校正会跑在不同思考强度上。
     """
     base_url, model, api_key = _config()
     if not api_key:
@@ -319,6 +381,7 @@ async def _simple_completion(system: str, user: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        "reasoning_effort": normalize_reasoning_effort(reasoning_effort),
         "max_tokens": CORRECTION_MAX_TOKENS,
         "temperature": 0.2,
         "stream": False,
@@ -357,6 +420,7 @@ async def _verified_answer(
     content: str,
     tool_payloads: list[dict[str, Any]],
     on_delta: DeltaCallback | None,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> str:
     """对账回复里的数字，发现无出处的大数就重写一次。
 
@@ -383,7 +447,9 @@ async def _verified_answer(
     prompt = build_correction_prompt(question, content, suspicious, digest)
 
     try:
-        corrected = await _simple_completion(CORRECTION_SYSTEM, prompt)
+        corrected = await _simple_completion(
+            CORRECTION_SYSTEM, prompt, reasoning_effort=reasoning_effort
+        )
     except LLMError as exc:
         logger.error("数字校正失败，保留原答：%s", exc)
         return content
@@ -421,11 +487,14 @@ async def answer_stream(
         messages.extend(history[-HISTORY_TURNS:])
     messages.append({"role": "user", "content": question})
 
+    # 每条消息只读一次有效配置；实际请求与执行过滤共用这份快照。
+    config = load_effective_config()
+
     tool_payloads: list[dict[str, Any]] = []
     last_content = ""
 
     for round_index in range(MAX_TOOL_ROUNDS):
-        message = await _stream_once(messages, on_delta)
+        message = await _stream_once(messages, on_delta, config)
         last_content = message.get("content") or ""
 
         tool_calls = message.get("tool_calls") or []
@@ -446,6 +515,7 @@ async def answer_stream(
                     _run_tool,
                     (call.get("function") or {}).get("name", ""),
                     (call.get("function") or {}).get("arguments", ""),
+                    config.enabled_tools,
                 )
                 for call in tool_calls
             ]
@@ -463,7 +533,9 @@ async def answer_stream(
             "这个问题要查的东西有点多，能再具体一点吗？比如告诉我品项名或者仓库名。"
         )
 
-    return await _verified_answer(question, content, tool_payloads, on_delta)
+    return await _verified_answer(
+        question, content, tool_payloads, on_delta, config.reasoning_effort
+    )
 
 
 async def answer(question: str, history: list[dict[str, str]] | None = None) -> str:
