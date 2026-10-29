@@ -99,7 +99,7 @@ def store_env(tmp_path, monkeypatch):
     cat_id = store.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
     store.execute(
         "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("ST-A", "测试包材A", cat_id, 0.0, "件", 101, ts),
+        ("ST-A", "测试包材A", cat_id, 7.0, "件", 101, ts),
     )
     # item 102 intentionally unbound
     store.commit()
@@ -137,6 +137,84 @@ def test_catalog_with_dc(store_env):
     body = resp.data.decode()
     assert "测试包材A" in body
     assert "加入购物车" in body
+
+
+def test_catalog_displays_store_stock_not_dc_stock(store_env):
+    """Issue #67: ordering cards and modal show the current store's stock."""
+    resp = store_env["client"].get("/store-ordering/catalog?dc=dc_test")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+
+    assert "门店库存" in body
+    assert "DC 库存" not in body
+    assert "配送中心库存" not in body
+
+    card_101 = re.search(
+        r'data-canonical-id="101"(?:(?!data-canonical-id=).)*?data-stock="([^"]+)"',
+        body,
+        re.DOTALL,
+    )
+    card_102 = re.search(
+        r'data-canonical-id="102"(?:(?!data-canonical-id=).)*?data-stock="([^"]+)"',
+        body,
+        re.DOTALL,
+    )
+    assert card_101 and card_101.group(1) == "7"
+    assert card_102 and card_102.group(1) == "0"
+    assert re.search(
+        r'<span class="metric-label">门店库存</span>\s*'
+        r'<span class="metric-value small">7 件</span>',
+        body,
+    )
+    assert re.search(
+        r"cmStock\.textContent = '门店库存 ' \+ \(stock \|\| '0'\) \+ ' ' \+ unit",
+        body,
+    )
+
+
+def test_catalog_sums_duplicate_store_bindings(store_env):
+    """Issue #67 reviewer regression: all store rows for a canonical id count."""
+    store = sqlite3.connect(str(store_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    cat_id = store.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()["id"]
+    store.execute(
+        "INSERT INTO items (sku, name, category_id, quantity, unit, canonical_id, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("ST-A-2", "测试包材A-分装", cat_id, 3.0, "件", 101, "2026-10-27 15:00:00"),
+    )
+    store_rows = store.execute(
+        "SELECT quantity FROM items WHERE canonical_id=101 ORDER BY id"
+    ).fetchall()
+    store.commit()
+    store.close()
+
+    dc = sqlite3.connect(str(store_env["dc_path"]))
+    dc_qty = dc.execute("SELECT quantity FROM items WHERE canonical_id=101").fetchone()[0]
+    dc.close()
+
+    first_store_qty = float(store_rows[0]["quantity"])
+    summed_store_qty = sum(float(row["quantity"]) for row in store_rows)
+    assert len(store_rows) >= 2
+    assert summed_store_qty not in {first_store_qty, float(dc_qty)}
+
+    resp = store_env["client"].get("/store-ordering/catalog?dc=dc_test")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    card_101 = re.search(
+        r'data-canonical-id="101"(?:(?!data-canonical-id=).)*?data-stock="([^"]+)"',
+        body,
+        re.DOTALL,
+    )
+    assert card_101 and card_101.group(1) == "10"
+    assert re.search(
+        r'<span class="metric-label">门店库存</span>\s*'
+        r'<span class="metric-value small">10 件</span>',
+        body,
+    )
+    assert re.search(
+        r"cmStock\.textContent = '门店库存 ' \+ \(stock \|\| '0'\) \+ ' ' \+ unit",
+        body,
+    )
 
 
 def test_catalog_draft_scope_is_user_and_dc(store_env):

@@ -13,23 +13,23 @@
 ## 0. 一览
 
 - 蓝图 22 个（已装配 21 / 未装配 1）
-- 路由 **180** 条（按鉴权强度：平台超管 55 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
-- 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 4`
-- MCP 工具域 7 个
+- 路由 **184** 条（按鉴权强度：平台超管 59 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 数据表 **63** 张，`WAREHOUSE_SCHEMA_VERSION = 5`
+- MCP 工具域 8 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
 
 ## 1. 蓝图装配
 
 | 蓝图 | 文件 | 路由数 | 装配 |
 |---|---|---|---|
-| `recipe_cost` | `recipe_cost.py` | 23 | 在役 |
+| `recipe_cost` | `recipe_cost.py` | 25 | 在役 |
 | `store_ordering` | `store_ordering.py` | 23 | 在役 |
 | `canonical` | `canonical.py` | 20 | 在役 |
+| `production` | `production.py` | 12 | 在役 |
 | `stocktake` | `stocktake.py` | 12 | 在役 |
 | `users` | `users.py` | 12 | 在役 |
 | `feedback` | `feedback.py` | 11 | 在役 |
 | `items` | `items.py` | 11 | 在役 |
-| `production` | `production.py` | 10 | 在役 |
 | `forecast` | `forecast.py` | 7 | 在役 |
 | `reports` | `reports.py` | 7 | 在役 |
 | `auth / pwa` | `auth.py` | 6 | 在役 |
@@ -210,10 +210,12 @@
 
 | endpoint | 方法 | 规则 | 鉴权 | 明细 |
 |---|---|---|---|---|
+| `production.bom_row_delete` | POST | `/production/products/<int:product_id>/bom/<int:bom_id>/delete` | 平台超管 |  |
 | `production.delete_run` | POST | `/production/runs/<int:run_id>/delete` | 角色 | staff |
 | `production.product_delete` | POST | `/production/products/<int:product_id>/delete` | 平台超管 |  |
 | `production.product_edit` | GET,POST | `/production/products/<int:product_id>/edit` | 平台超管 |  |
 | `production.product_new` | GET,POST | `/production/products/new` | 平台超管 |  |
+| `production.product_toggle_hidden` | POST | `/production/products/<int:product_id>/toggle-hidden` | 平台超管 |  |
 | `production.products_list` | GET | `/production` | 登录 |  |
 | `production.rollback` | POST | `/production/runs/<int:run_id>/rollback` | 角色 | staff |
 | `production.runs_csv` | GET | `/production/runs.csv` | 登录 |  |
@@ -234,6 +236,7 @@
 |---|---|---|---|---|
 | `recipe_cost.api_cost` | GET | `/recipe-cost/api/cost/<kind>/<int:rid>` | 权限点 | report.cost.view |
 | `recipe_cost.ic_recipe_bom_export_csv` | GET | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/export.csv` | 权限点 | report.cost.view |
+| `recipe_cost.ic_recipe_bom_row_delete` | POST | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/bom/<int:bom_id>/delete` | 平台超管 |  |
 | `recipe_cost.ic_recipe_delete` | POST | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/delete` | 平台超管 |  |
 | `recipe_cost.ic_recipe_edit` | GET,POST | `/recipe-cost/ic-recipes/<int:ic_recipe_id>/edit` | 平台超管 |  |
 | `recipe_cost.ic_recipe_new` | GET,POST | `/recipe-cost/ic-recipes/new` | 平台超管 |  |
@@ -247,6 +250,7 @@
 | `recipe_cost.overview` | GET | `/recipe-cost/overview` | 权限点 | report.cost.view |
 | `recipe_cost.overview_export_csv` | GET | `/recipe-cost/overview/export.csv` | 权限点 | report.cost.view |
 | `recipe_cost.recipe_bom_export_csv` | GET | `/recipe-cost/recipes/<int:recipe_id>/export.csv` | 权限点 | report.cost.view |
+| `recipe_cost.recipe_bom_row_delete` | POST | `/recipe-cost/recipes/<int:recipe_id>/bom/<int:bom_id>/delete` | 平台超管 |  |
 | `recipe_cost.recipe_delete` | POST | `/recipe-cost/recipes/<int:recipe_id>/delete` | 平台超管 |  |
 | `recipe_cost.recipe_edit` | GET,POST | `/recipe-cost/recipes/<int:recipe_id>/edit` | 平台超管 |  |
 | `recipe_cost.recipe_new` | GET,POST | `/recipe-cost/recipes/new` | 平台超管 |  |
@@ -349,7 +353,7 @@
 
 ## 3. 数据层
 
-- `WAREHOUSE_SCHEMA_VERSION = 4`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
+- `WAREHOUSE_SCHEMA_VERSION = 5`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
 - 表 63 张：
 
 - `adjustment_requests` · `agent_tokens` · `approval_policies` · `audit_log`
@@ -380,6 +384,7 @@
 | `inventory` | 4 |
 | `outbound` | 3 |
 | `procurement` | 2 |
+| `store_order` | 2 |
 
 ## 5. 未装配 / 未登记（死代码与漏网）
 

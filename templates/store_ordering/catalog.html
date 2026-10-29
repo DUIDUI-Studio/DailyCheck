@@ -69,7 +69,7 @@
            data-unit="{{ item.canonical_unit or item.unit }}"
            data-aux-unit="{{ item.aux_unit or '' }}"
            data-aux-rate="{{ item.aux_rate or 0 }}"
-           data-stock="{{ item.quantity | fmt_qty }}"
+           data-stock="{{ item.store_quantity | fmt_qty }}"
            data-unit-price="{{ item.unit_price or 0 }}"
            data-multiple="{{ item.order_multiple | fmt_qty }}"
            data-suggested="{{ sug if sug else 0 }}"
@@ -97,6 +97,10 @@
           <div class="inv-metric">
             <span class="metric-label">单价</span>
             <span class="metric-value small">¥ {{ (item.unit_price or 0) | fmt_money }}</span>
+          </div>
+          <div class="inv-metric">
+            <span class="metric-label">门店库存</span>
+            <span class="metric-value small">{{ item.store_quantity | fmt_qty }} {{ item.canonical_unit or item.unit }}</span>
           </div>
           <div class="inv-metric">
             <span class="metric-label">已填</span>
@@ -318,8 +322,8 @@
     _currentStock = parseFloat(stock);
 
     cmName.textContent = name;
-    {# v3 A5: 弹窗内移除库存数字，仅显示单价。 #}
-    cmStock.textContent = '单价 ¥ ' + unitPrice.toFixed(2);
+    cmStock.textContent = '门店库存 ' + (stock || '0') + ' ' + unit
+      + ' · 单价 ¥ ' + unitPrice.toFixed(2);
 
     {# P1-5: 弹窗「建议订 N」hint：点击填入 qty。 #}
     var sugEl = document.getElementById('cm-suggestion');

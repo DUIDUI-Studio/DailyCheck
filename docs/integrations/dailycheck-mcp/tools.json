@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "DailyCheck MCP server tool registry",
+  "description": "DailyCheck MCP server tool registry — 基础工具（14 个）的输入契约；canonical_* 主数据治理工具（13 个）见 docs/ARCHITECTURE.md §9.2。合计 27 个工具。",
   "server": null,
   "tools": [
     {
@@ -97,7 +97,7 @@
     },
     {
       "name": "restock_list",
-      "description": "List restock records for a warehouse. Returns: array of {id, item_id, item_name, qty, reason, created_at}.",
+      "description": "List inbound restock requests for a warehouse. Returns: array of {id, item_id, item_name, quantity, status, reason, created_at}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -305,6 +305,61 @@
         "required": [
           "item_id",
           "warehouse_code"
+        ]
+      }
+    },
+    {
+      "name": "store_order_list",
+      "description": "List store orders (store ordering / DC transfer documents) visible to this token. Read-only. Optional filters: warehouse_code (matches either the store side or the DC side of an order), status, limit, offset. Returns: {orders: [{id, order_no, store_warehouse_code, dc_warehouse_code, flow_type, status, requested_by, expected_delivery_date, created_at, updated_at, ...}], total, limit, offset, truncated}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "warehouse_code": {
+            "type": "string",
+            "description": "Optional warehouse code filter; matches an order whose store side or DC side is this warehouse (e.g. wh_000)."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "shipped",
+              "delivered",
+              "cancelled"
+            ],
+            "description": "Optional order status filter."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 200,
+            "description": "Page size (1-500, default 200)."
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Page offset (default 0)."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "store_order_detail",
+      "description": "Get one store order with its header, line items, deliveries, receipts and status history. Read-only. Returns: {order: {id, order_no, store_warehouse_code, dc_warehouse_code, flow_type, status, ...}, items: [{id, canonical_id, canonical_name, dc_item_id, dc_item_bound, quantity, fulfilled_quantity, shipped_quantity, unit, status}], deliveries: [...], receipts: [...], status_history: [...]}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "integer",
+            "description": "Store order id (store_orders.id)."
+          }
+        },
+        "required": [
+          "order_id"
         ]
       }
     }

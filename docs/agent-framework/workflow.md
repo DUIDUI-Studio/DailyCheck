@@ -1,8 +1,8 @@
 # DailyCheck Agent 协作工作流
 
-> 版本：2026-10-15 定稿（Eric 口述对齐 + 实况核对；同日二次修订——push 政策放开、merge 政策改为 Prod 判定）。
+> 版本：2026-10-15 定稿（Eric 口述对齐 + 实况核对；同日二次修订——push 政策放开、merge 政策改为 Prod 判定）。2026-10-25 修订——新增 §四「merge 后删除源分支」与 §三批量清理豁免（Eric 拍板）。2026-10-27 修订——全局化「CI 绿不是终态」，要求手动与定时 Coordinator 跟踪到部署成功。
 > 新/旧 agent session 接入本机制的提示词见 [`session-bootstrap.md`](session-bootstrap.md)。
-> 本文档是 Dev / Prod / Owner 三方协作的权威口径；与本文冲突的口头约定以本文为准。
+> 本文档是 Dev / Coordinator / Prod / Owner 四方协作的权威口径；与本文冲突的口头约定以本文为准。
 > 机制细节的演进史见 `docs/agent-framework/v0.1.md`。
 
 ## 一、角色分工
@@ -10,6 +10,7 @@
 | 角色 | 载体 | 职责 | 绝不碰 |
 |------|------|------|--------|
 | **Dev Agent** | 本地开发机 | 开发、测试、提 PR（含「生产侧事项」段落，见 §三） | merge（由 Prod Agent 执行，§四）、生产环境（VPS 只读排查需 owner 授权） |
+| **Coordinator / Triage** | 本地 Orca（手动或定时） | Issue 认领、分派 writer/reviewer、跟踪冲突/CI/部署终态、回流失败 | 业务代码（分派后由 writer 写）、merge、部署、生产环境、Issue 关闭 |
 | **Prod Agent** | VPS (wdg_vps) | **merge 判定**、部署执行、生产验证、灰度切流、回滚、清理 | 仓库治理决策（主动改 main 内容、开非常规 PR；对 PR 内容有异议 → 打回/开 Issue，不自行改代码） |
 | **Owner (Eric)** | — | 需求拍板、方案拍板、红线内政策的最终决定 | — |
 
@@ -22,7 +23,13 @@
                                                                               │ 全绿
    ┌──────────────────────────────────────────────────────────────────────────┘
    ▼
-⑤ Prod Agent merge 判定 + 执行（§四）──► ⑥ 部署（蓝绿，§五）──► ⑦ 收官/回滚
+⑤ 自动交接 Prod Agent：独立审查 + 候选部署（§四）
+   │
+   ├─ 失败 ──► Coordinator 按 code/review/env 回流后重跑
+   ▼
+⑥ 部署 + 观察窗（蓝绿，§五）──► ⑦ merge / Issue 关闭 / 生产验证
+   │
+   └─ 部署结果成功 = 交付终态；CI 绿与 merge 均不是终态
 ```
 
 ### ② 开发 + 本地门禁（Dev Agent）
@@ -86,9 +93,10 @@
 | # | 规则 |
 |---|------|
 | F1 | PR body 三段齐全 + `Closes #N` **[机验]** |
-| F2 | 止于 PR，不 merge |
-| F3 | 在 issue 留一句结论（不是关单，是留痕） |
+| F2 | Dev 止于 PR，不 merge；Coordinator 接手跟踪到交付终态 |
+| F3 | 在 issue 留阶段结论（不是关单，也不是交付终态） |
 | F4 | worktree 用完删掉。2026-10-24 已积累 50+ 个 worktree、大半 `prunable` —— 每个 `git worktree list` 都变成噪音 |
+| F5 | CI 绿后必须继续跟踪 Prod Agent；部署未成功时不得向 owner 报告“完成”，应报告 `awaiting_deploy` / `deploy_failed` |
 
 #### 为什么不把这些全做成机验
 
@@ -128,10 +136,36 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
 
+### ④′ 自动交付跟随契约（2026-10-27 Eric 拍板，全局适用）
+
+CI 两必需 check 全绿后，Prod Agent 会自动接手独立审查和候选部署。**CI 绿不是
+交付终态，merge 也不是。** Dev / Coordinator / 所有定时任务必须按同一状态机跟进：
+
+| 状态 | 判据 | 当前 owner / 动作 |
+|---|---|---|
+| `ci_failed` | 任一必需 check 红 | Dev/Coordinator：原 Issue writer 修复并重新 Review/CI |
+| `merge_conflict` | PR `mergeable=false` | Coordinator：原 Issue writer 同步最新 `origin/main`，修冲突，推进同一 PR |
+| `review_blocker` | Reviewer 报 BLOCKER | Coordinator：writer 修复，新 Reviewer session 复审 |
+| `awaiting_prod` | CI 全绿，PR 仍 open，等待 Prod Agent 审查/合并 | Coordinator：继续跟踪，不得结束为“完成” |
+| `awaiting_deploy` | PR 已 merge，尚无成功部署报告 | Coordinator：继续查询部署报告和 Issue 状态 |
+| `deploy_failed` | Prod Agent 回写失败 | 按归因回流：代码问题回 writer；环境/流程问题回 Prod Agent；不得盲改 PR |
+| `delivered` | PR merged + Issue closed + 两项 CI success + 部署成功报告 | Coordinator：记录终态、清理 worktree 并向 owner 汇报 |
+
+规则：
+
+- 手动 Coordinator 在 CI 绿后继续跟踪，不把会话停在 `awaiting_prod`。
+- 定时任务不要求单次运行占满 40–60 分钟部署窗口，但必须把队列状态持久化为
+  `awaiting_prod` / `awaiting_deploy` / `deploy_failed` / `delivered`，由后续运行持续对账；
+  禁止在 CI 绿或 merge 时直接把队列项标成 `done`。
+- 日报/巡检必须区分“等部署”“部署失败”“已交付”；缺少部署报告时报告等待，
+  不得推断成功。
+- 只有 Prod Agent 可以 merge、部署、关闭 Issue；Coordinator 只跟踪与回流。
+
 ## 三、Push 政策（2026-10-15 Eric 放开）
 
 - **普通 `git push`（新分支/已有分支推进）不再需要 owner 事先确认。**
 - 仍需 owner 单独确认的操作：`--force` / `--force-with-lease`、删除远程分支、改分支保护规则。
+- 豁免（2026-10-25 Eric 拍板）：`scripts/cleanup-merged-branches.sh` 的**批量清理**（只删已合入 main 的分支，merge-base 判定）视为已获授权，脚本内 `--no-verify` 即本次拍板的凭证姿势。单条手动删分支仍需逐次确认。
 - pre-push hook（`core.hooksPath` → `~/.workbuddy/git-hooks`）2026-10-19 起是**黑名单**：只拦「删除远程分支」和「非快进覆盖」，新分支/快进照常放行。
   仍建议 `git push --no-verify`（避开 hook 里的网络调用），但不再强制。
 
@@ -193,13 +227,20 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 
 ## 四、Merge 政策（2026-10-25 Eric 拍板：候选部署通过后 FF merge；原 2026-10-15 Prod merge）
 
-**Prod Agent 在 CI 全绿后判定并执行「候选部署」**（2026-10-25 起，deploy-first）：CI 两必需 check 全绿 → 独立审查 → 调 `deploy_pipeline.sh <PR> <sha> --candidate --merge-pr`。验证、切流、观察通过后由脚本执行 fast-forward-only merge；merge 前任何一步失败，PR 保持 open，不产生未验证的 main 提交。merge 与部署仍由同一角色贯通。
+**Prod Agent 在 CI 全绿后自动判定并执行「候选部署」**（2026-10-25 起，deploy-first；
+2026-10-27 起自动交接要求 Coordinator 持续跟随）：CI 两必需 check 全绿 → 自动交接
+Prod Agent → 独立审查 → 调 `deploy_pipeline.sh <PR> <sha> --candidate --merge-pr`。
+验证、切流、观察通过后由脚本执行 fast-forward-only merge；merge 前任何一步失败，
+PR 保持 open，不产生未验证的 main 提交。merge 与部署仍由同一角色贯通。
+**自动交接不代表终态**：Coordinator 必须按 §④′ 跟踪到 `delivered`，或把失败准确
+回流给代码 writer / 环境 owner。
 
 Prod Agent 的 merge 判定 = 独立审查，不是橡皮图章：
 
 1. 确认 CI 两必需 check 全绿（test + agent-framework-reports）
 2. 读 PR 的「报告 1/4」（根因/取舍/不在范围）与「生产侧事项」，**用自己的生产视角评估**：变更类别、影响面、部署风险是否有未声明项
 3. 有异议 → 不部署、PR 评论打回 + 开 Issue 转 Dev；无异议 → 进入 §五 候选部署
+4. **merge 后删除源分支**（本地 + 远程，2026-10-25 Eric 拍板）：§五 的 FF merge 把工作并入 main 后，源分支留着只会污染列表、误导后续判断 → 随即删除源分支。Gitea PR 界面勾选「合并后删除分支」或手动删除；漏删的存量用 `scripts/cleanup-merged-branches.sh` 批量清理（只删已合入 main 的分支，merge-base 判定，安全）。注意：merge 用的 API `POST /pulls/{num}/merge` 不删分支，删除是独立的 `DELETE /repos/{o}/{r}/branches/{branch}`
 
 红线清单——以下 PR 仍须上报 owner 拍板，Prod Agent 不得自行 merge：
 

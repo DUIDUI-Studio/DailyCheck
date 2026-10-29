@@ -75,7 +75,7 @@ export DAILYCHECK_MCP_TOKEN="<raw-token-from-create>"
 
 **The token is a shared secret.** It must be passed via TLS in production and never logged. Rotate via [integration-checklist.md](./integration-checklist.md#rotating-the-token).
 
-## 4. Tool registry (14 tools)
+## 4. Tool registry (16 tools)
 
 Fetch the full live registry: `tools/list`. Snapshot included in [tools.json](./tools.json).
 
@@ -92,6 +92,8 @@ Reading / analysis:
 | `procurement_hub` | Hub-level procurement rollup |
 | `warehouse_consumption` | **Per-item consumption summary** (rank, qty, daily avg, **turnover rate**) + warehouse-level 30d financial turnover |
 | `item_consumption` | Single-item consumption detail (7d / 14d / 30d / monthly) — opt-in `include_turnover` adds stocktake-anchored COGS turnover |
+| `store_order_list` | Store orders (store ordering / DC transfer) visible to this token — filter by `warehouse_code` / `status`, paginated with `limit` / `offset` |
+| `store_order_detail` | One store order: header + line items (`canonical_name`, `quantity`, `fulfilled_quantity`, `dc_item_id`) + deliveries + receipts + status history |
 
 Write:
 
@@ -113,7 +115,7 @@ Three tools expose a list-style view of stock activity. They overlap but answer 
 |---|---|---|
 | "Show me recent activity in this warehouse" (any kind) | `movements_list` | **Union view** — merges outbound + stock_movements, with `type` field |
 | "List outbound requests, including rolled-back ones" | `outbound_list` | Has `status` / `rolled_back` fields that `movements_list` strips |
-| "List restock (inbound) records" | `restock_list` | Filtered to `action='restock'` |
+| "List restock (inbound) records" | `restock_list` | Reads `restock_requests` (inbound orders), newest first — carries `quantity` / `status` |
 | "Show me what items exist + their stock" | `items_list` | Snapshot, no activity |
 | "Show me what this item's recent activity is" | `items_detail` | Per-item lookup, no activity |
 | "Show me what categories consume the most" | `warehouse_consumption` | Has `consume_pct` + `daily_avg` + `turnover_rate` + warehouse-level turnover |
