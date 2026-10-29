@@ -132,6 +132,8 @@
         id="shipment-form"
         data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        {# 发货幂等键（多仓履约 Task 5）：服务端下发、提交回传；重复提交不重复扣减。 #}
+        <input type="hidden" name="op_no" value="{{ ship_op_no }}">
   {% endif %}
   <table class="data-table">
     <thead>

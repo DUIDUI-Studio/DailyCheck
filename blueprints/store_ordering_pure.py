@@ -12,6 +12,7 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §6.
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -1630,12 +1631,591 @@ def review_order(
     return get_order_detail(master_conn, order_id)
 
 
+def generate_op_no() -> str:
+    """Return a fresh shipment operation key (uuid4 hex, never contains ``:``)."""
+    return uuid.uuid4().hex
+
+
+def _line_op_no(op_no: str, order_item_id: int) -> str:
+    """Derive the per-line idempotency key from the request-level ``op_no``.
+
+    ``store_order_delivery_items.op_no`` is single-column UNIQUE (Task 1
+    schema), so a multi-line batch cannot store the same request key on every
+    row. The derived key is deterministic, which lets a retry (or orphan
+    reconciliation) find exactly the same row. Requests are uuid4 hex, so the
+    first ``:`` unambiguously separates the request key from the line id.
+    """
+    return f"{op_no}:{order_item_id}"
+
+
+def _line_source_warehouse(order: dict[str, Any], item: dict[str, Any]) -> str:
+    """Frozen line source; the header is only a legacy NULL fallback (spec §10)."""
+    return item.get("source_warehouse_code") or order["dc_warehouse_code"]
+
+
+def _select_ship_lines(
+    order: dict[str, Any],
+    line_qty: dict[int, float],
+    operator_dc_code: str,
+    op_no: str,
+) -> list[tuple[int, dict[str, Any], float]]:
+    """Validate every requested line before any stock is touched.
+
+    Zero/blank quantities are no-ops (UI blank rows). Unknown line IDs and
+    lines whose frozen source is not the operation warehouse are hard errors,
+    so a forged foreign row can never deduct stock.
+    """
+    items_by_id: dict[int, dict[str, Any]] = {
+        int(it["id"]): it for it in order["order_items"]
+    }
+    selected: list[tuple[int, dict[str, Any], float]] = []
+    for raw_id, raw_qty in line_qty.items():
+        try:
+            order_item_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        item = items_by_id.get(order_item_id)
+        if item is None:
+            raise ValueError(
+                f"order_item_id={order_item_id} 不属于 order_id={order['id']}"
+            )
+        try:
+            qty = parse_qty(raw_qty)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        source = _line_source_warehouse(order, item)
+        if source != operator_dc_code:
+            raise ValueError(
+                f"order_item_id={order_item_id} 不属于操作仓 {operator_dc_code}"
+                f"（行来源 {source}）"
+            )
+        already = parse_qty(item.get("shipped_quantity") or 0)
+        target = parse_qty(item["quantity"])
+        # A retry of this very operation already carried the quantity into
+        # shipped_quantity; the idempotency lookup returns the existing batch
+        # instead of applying it again.
+        if item.get("ship_op_no") != op_no and already + qty > target + 1e-9:
+            raise ValueError(
+                f"累计发货 {already + qty:g} 超过订单数 {target:g}"
+                f"（order_item_id={order_item_id}）"
+            )
+        selected.append((order_item_id, item, qty))
+    if not selected:
+        raise ValueError("本批发货数量全部为空，请至少填写一项")
+    return selected
+
+
+def _find_existing_batch(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+    line_keys: dict[int, str],
+) -> int | None:
+    """Return the delivery id already written for this request's keys.
+
+    Raises when the keys resolve to a different order or a different batch;
+    silently reusing them would corrupt an unrelated order.
+    """
+    placeholders = ",".join("?" for _ in line_keys)
+    rows = master_conn.execute(
+        f"""SELECT di.op_no, di.delivery_id, d.order_id
+              FROM store_order_delivery_items di
+              JOIN store_order_deliveries d ON d.id = di.delivery_id
+             WHERE di.op_no IN ({placeholders})""",
+        tuple(line_keys.values()),
+    ).fetchall()
+    if not rows:
+        return None
+    if any(int(row["order_id"]) != int(order_id) for row in rows):
+        raise ValueError("op_no 已属于其他订单，拒绝复用")
+    delivery_ids = {int(row["delivery_id"]) for row in rows}
+    if len(delivery_ids) != 1 or set(line_keys.values()) != {
+        row["op_no"] for row in rows
+    }:
+        raise ValueError("op_no 已用于不同批次，拒绝复用")
+    return next(iter(delivery_ids))
+
+
+def _ship_result(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+    *,
+    delivery_id: int,
+    op_no: str,
+    warehouse_code: str,
+    selected_ids: list[int],
+    transitioned_to_shipped: bool = False,
+    idempotent: bool = False,
+) -> dict[str, Any]:
+    """Refresh the order and attach the protocol metadata callers rely on."""
+    order = get_order_detail(master_conn, order_id) or {}
+    items = {int(it["id"]): it for it in order.get("order_items", [])}
+    is_fully_shipped = bool(items) and all(
+        parse_qty(it["shipped_quantity"]) >= parse_qty(it["quantity"]) - 1e-9
+        for it in items.values()
+    )
+    order.update(
+        {
+            "shipped_items": [
+                {
+                    "order_item_id": oid,
+                    "shipped_quantity": parse_qty(
+                        items[oid]["shipped_quantity"]
+                    ),
+                }
+                for oid in selected_ids
+                if oid in items
+            ],
+            "delivery_id": delivery_id,
+            "op_no": op_no,
+            "warehouse_code": warehouse_code,
+            "is_fully_shipped": is_fully_shipped,
+            "transitioned_to_shipped": transitioned_to_shipped,
+            "idempotent": idempotent,
+            "new_order_status": order.get("status"),
+        }
+    )
+    return order
+
+
+def _apply_warehouse_shipment(
+    master_conn: sqlite3.Connection,
+    wh_conn_factory,
+    operator_dc_code: str,
+    order: dict[str, Any],
+    selected: list[tuple[int, dict[str, Any], float]],
+    line_keys: dict[int, str],
+    ship_action: str,
+    ts: str,
+) -> dict[int, int]:
+    """Conditionally decrement local stock and write one ``op_no`` movement.
+
+    The whole batch runs under ``BEGIN IMMEDIATE`` so two orders racing the
+    last unit are serialized: the loser's ``UPDATE … WHERE quantity >= ?``
+    changes zero rows and the batch is rejected without any partial write.
+    A line whose movement already carries this request's key is skipped, so a
+    retry after a master failure cannot deduct twice.
+    """
+    from blueprints.fulfillment_pure import resolve_fulfillment_item
+
+    wh_conn = wh_conn_factory(operator_dc_code)
+    item_ids: dict[int, int] = {}
+    try:
+        wh_conn.row_factory = sqlite3.Row
+        wh_conn.execute("BEGIN IMMEDIATE")
+        for order_item_id, item, qty in selected:
+            resolved = resolve_fulfillment_item(
+                master_conn,
+                wh_conn,
+                canonical_id=int(item["canonical_id"]),
+                warehouse_code=operator_dc_code,
+            )
+            item_id = int(resolved["item_id"])
+            item_ids[order_item_id] = item_id
+            applied = wh_conn.execute(
+                "SELECT 1 FROM stock_movements WHERE op_no=? LIMIT 1",
+                (line_keys[order_item_id],),
+            ).fetchone()
+            if applied is not None:
+                continue
+            updated = wh_conn.execute(
+                """UPDATE items SET quantity = quantity - ?
+                    WHERE id = ? AND quantity >= ?""",
+                (qty, item_id, qty),
+            )
+            if updated.rowcount != 1:
+                row = wh_conn.execute(
+                    "SELECT quantity FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                available = parse_qty(row["quantity"]) if row else 0.0
+                raise ValueError(
+                    f"库存不足：{item.get('canonical_name')} 本批发货 {qty:g}，"
+                    f"配送中心现有库存 {available:g}"
+                )
+            wh_conn.execute(
+                """INSERT INTO stock_movements
+                   (item_id, action, delta, note, created_at, op_no)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    item_id,
+                    ship_action,
+                    -qty,
+                    f"{ship_action} #{order['order_no']} partial {qty:g}",
+                    ts,
+                    line_keys[order_item_id],
+                ),
+            )
+        wh_conn.commit()
+    except Exception:
+        try:
+            wh_conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        wh_conn.close()
+    return item_ids
+
+
+def _insert_master_batch(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+    operator_dc_code: str,
+    selected: list[tuple[int, dict[str, Any], float]],
+    line_keys: dict[int, str],
+    item_ids: dict[int, int],
+    op_no: str,
+    shipped_by: int,
+    tracking_note: str | None,
+    ts: str,
+) -> int:
+    """Insert the batch header + line rows and accumulate line quantities."""
+    delivery_no = _generate_delivery_no(master_conn)
+    cur = master_conn.execute(
+        """INSERT INTO store_order_deliveries
+           (order_id, delivery_no, warehouse_code, shipped_by, shipped_at,
+            tracking_note, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (order_id, delivery_no, operator_dc_code, shipped_by, ts, tracking_note, ts),
+    )
+    delivery_id = int(cur.lastrowid)
+    for order_item_id, _item, qty in selected:
+        master_conn.execute(
+            """INSERT INTO store_order_delivery_items
+               (delivery_id, order_item_id, warehouse_code, item_id, quantity,
+                op_no, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                delivery_id,
+                order_item_id,
+                operator_dc_code,
+                item_ids[order_item_id],
+                qty,
+                line_keys[order_item_id],
+                ts,
+            ),
+        )
+        updated = master_conn.execute(
+            """UPDATE store_order_items
+                  SET shipped_quantity = shipped_quantity + ?,
+                      ship_op_no = ?,
+                      dc_item_id = ?,
+                      status = CASE
+                          WHEN shipped_quantity + ? >= quantity - 0.000000001
+                              THEN 'fulfilled'
+                          WHEN shipped_quantity + ? > 0 THEN 'partial'
+                          ELSE status END
+                WHERE id = ?
+                  AND shipped_quantity + ? <= quantity + 0.000000001
+                  AND (ship_op_no IS NULL OR ship_op_no <> ?)""",
+            (
+                qty,
+                op_no,
+                item_ids[order_item_id],
+                qty,
+                qty,
+                order_item_id,
+                qty,
+                op_no,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError(
+                f"order_item_id={order_item_id} 行累计超发或本批已应用"
+            )
+    return delivery_id
+
+
+def _finalise_order_state(
+    master_conn: sqlite3.Connection,
+    order_id: int,
+    shipped_by: int,
+    tracking_note: str | None,
+    selected: list[tuple[int, dict[str, Any], float]],
+    ts: str,
+) -> bool:
+    """Re-aggregate every line inside the master lock and transition once.
+
+    Returns True only for the call whose conditional
+    ``UPDATE … WHERE status='approved'`` actually moved the order, so the
+    route emits exactly one ``store_order_shipped`` notification even when two
+    warehouses ship their last lines back to back.
+    """
+    rows = master_conn.execute(
+        """SELECT id, quantity, shipped_quantity
+             FROM store_order_items WHERE order_id=?""",
+        (order_id,),
+    ).fetchall()
+    is_fully_shipped = bool(rows) and all(
+        parse_qty(row["shipped_quantity"]) >= parse_qty(row["quantity"]) - 1e-9
+        for row in rows
+    )
+    if not is_fully_shipped:
+        _insert_status_history(
+            master_conn,
+            order_id,
+            ORDER_STATUS_APPROVED,
+            ORDER_STATUS_APPROVED,
+            shipped_by,
+            f"本批发货 {sum(qty for _, _, qty in selected):g} 件",
+        )
+        return False
+    moved = master_conn.execute(
+        """UPDATE store_orders
+              SET status=?, shipped_by=?, shipped_at=?, updated_at=?
+            WHERE id=? AND status=?""",
+        (ORDER_STATUS_SHIPPED, shipped_by, ts, ts, order_id, ORDER_STATUS_APPROVED),
+    )
+    if moved.rowcount != 1:
+        return False
+    _insert_status_history(
+        master_conn,
+        order_id,
+        ORDER_STATUS_APPROVED,
+        ORDER_STATUS_SHIPPED,
+        shipped_by,
+        tracking_note,
+    )
+    return True
+
+
+def ship_partial(
+    master_conn: sqlite3.Connection,
+    wh_conn_factory,
+    *,
+    order_id: int,
+    operator_dc_code: str,
+    op_no: str,
+    line_qty: dict[int, float],
+    shipped_by: int,
+    tracking_note: str | None = None,
+) -> dict[str, Any]:
+    """Ship one source warehouse's lines under a caller-supplied idempotency key.
+
+    Protocol (spec v2 §7/§8):
+      1. Validate every line's frozen source equals ``operator_dc_code``.
+      2. Warehouse db ``BEGIN IMMEDIATE``: conditional atomic decrement
+         (``WHERE quantity >= ?``) + ``stock_movements(op_no)``; a line already
+         carrying this request's derived key is skipped (retry-safe).
+      3. Master db ``BEGIN IMMEDIATE``: insert batch header + line rows
+         (``store_order_delivery_items.op_no`` UNIQUE → same request returns
+         the existing batch), accumulate ``shipped_quantity`` with a guard,
+         re-read **all** lines inside the lock and conditionally migrate
+         ``approved → shipped`` exactly once.
+    """
+    if not op_no:
+        raise ValueError("op_no is required")
+    master_conn.row_factory = sqlite3.Row
+    order = get_order_detail(master_conn, order_id)
+    if order is None:
+        raise ValueError(f"order_id={order_id} not found")
+    selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
+    selected_ids = [order_item_id for order_item_id, _, _ in selected]
+    line_keys = {oid: _line_op_no(op_no, oid) for oid in selected_ids}
+
+    existing = _find_existing_batch(master_conn, order_id, line_keys)
+    if existing is not None:
+        return _ship_result(
+            master_conn,
+            order_id,
+            delivery_id=existing,
+            op_no=op_no,
+            warehouse_code=operator_dc_code,
+            selected_ids=selected_ids,
+            idempotent=True,
+        )
+
+    if order["status"] != ORDER_STATUS_APPROVED:
+        raise ValueError(
+            f"order must be approved to ship, got {order['status']!r}"
+        )
+
+    ts = now()
+    item_ids = _apply_warehouse_shipment(
+        master_conn,
+        wh_conn_factory,
+        operator_dc_code,
+        order,
+        selected,
+        line_keys,
+        shipment_action_for(order),
+        ts,
+    )
+
+    try:
+        master_conn.execute("BEGIN IMMEDIATE")
+        current = master_conn.execute(
+            "SELECT status FROM store_orders WHERE id=?", (order_id,)
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"order_id={order_id} not found")
+        existing = _find_existing_batch(master_conn, order_id, line_keys)
+        if existing is not None:
+            master_conn.rollback()
+            return _ship_result(
+                master_conn,
+                order_id,
+                delivery_id=existing,
+                op_no=op_no,
+                warehouse_code=operator_dc_code,
+                selected_ids=selected_ids,
+                idempotent=True,
+            )
+        if current["status"] != ORDER_STATUS_APPROVED:
+            raise ValueError(
+                f"order must be approved to ship, got {current['status']!r}"
+            )
+        try:
+            delivery_id = _insert_master_batch(
+                master_conn,
+                order_id,
+                operator_dc_code,
+                selected,
+                line_keys,
+                item_ids,
+                op_no,
+                shipped_by,
+                tracking_note,
+                ts,
+            )
+        except sqlite3.IntegrityError:
+            master_conn.rollback()
+            existing = _find_existing_batch(master_conn, order_id, line_keys)
+            if existing is not None:
+                return _ship_result(
+                    master_conn,
+                    order_id,
+                    delivery_id=existing,
+                    op_no=op_no,
+                    warehouse_code=operator_dc_code,
+                    selected_ids=selected_ids,
+                    idempotent=True,
+                )
+            raise
+        transitioned = _finalise_order_state(
+            master_conn, order_id, shipped_by, tracking_note, selected, ts
+        )
+        master_conn.commit()
+    except Exception:
+        if master_conn.in_transaction:
+            master_conn.rollback()
+        raise
+
+    return _ship_result(
+        master_conn,
+        order_id,
+        delivery_id=delivery_id,
+        op_no=op_no,
+        warehouse_code=operator_dc_code,
+        selected_ids=selected_ids,
+        transitioned_to_shipped=transitioned,
+    )
+
+
+REVERSAL_OP_NO_PREFIX: str = "REV:"
+
+
+def reconcile_orphan_shipments(
+    master_conn: sqlite3.Connection,
+    wh_conn_factory,
+) -> list[dict[str, Any]]:
+    """Reverse warehouse stock movements that have no master batch row.
+
+    A crash between the warehouse commit and the master batch INSERT leaves
+    stock already deducted but no delivery record. This job adds the quantity
+    back with a red reversal movement keyed ``REV:<line_op_no>`` and returns
+    the affected rows as the alert payload. Re-running is a no-op because the
+    reversal key is checked first.
+    """
+    master_conn.row_factory = sqlite3.Row
+    warehouses = master_conn.execute(
+        "SELECT code FROM warehouses WHERE warehouse_type=? ORDER BY code",
+        (WAREHOUSE_TYPE_DC,),
+    ).fetchall()
+    reconciled: list[dict[str, Any]] = []
+    for warehouse in warehouses:
+        code = warehouse["code"]
+        wh_conn = wh_conn_factory(code)
+        try:
+            wh_conn.row_factory = sqlite3.Row
+            columns = {
+                row[1] for row in wh_conn.execute("PRAGMA table_info(stock_movements)")
+            }
+            if "op_no" not in columns:
+                continue
+            wh_conn.execute("BEGIN IMMEDIATE")
+            rows = wh_conn.execute(
+                """SELECT id, item_id, action, delta, op_no
+                     FROM stock_movements
+                    WHERE op_no IS NOT NULL AND delta < 0
+                    ORDER BY id"""
+            ).fetchall()
+            for row in rows:
+                op_no = str(row["op_no"])
+                if op_no.startswith(REVERSAL_OP_NO_PREFIX):
+                    continue
+                delivered = master_conn.execute(
+                    "SELECT 1 FROM store_order_delivery_items WHERE op_no=? LIMIT 1",
+                    (op_no,),
+                ).fetchone()
+                if delivered is not None:
+                    continue
+                reversal_key = REVERSAL_OP_NO_PREFIX + op_no
+                if wh_conn.execute(
+                    "SELECT 1 FROM stock_movements WHERE op_no=? LIMIT 1",
+                    (reversal_key,),
+                ).fetchone() is not None:
+                    continue
+                quantity = parse_qty(-parse_qty(row["delta"]))
+                if quantity <= 0:
+                    continue
+                wh_conn.execute(
+                    "UPDATE items SET quantity = quantity + ? WHERE id=?",
+                    (quantity, row["item_id"]),
+                )
+                wh_conn.execute(
+                    """INSERT INTO stock_movements
+                       (item_id, action, delta, note, created_at, op_no)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["item_id"],
+                        row["action"],
+                        quantity,
+                        f"红字冲销 孤儿发货 op_no={op_no}",
+                        now(),
+                        reversal_key,
+                    ),
+                )
+                reconciled.append(
+                    {
+                        "warehouse_code": code,
+                        "movement_id": int(row["id"]),
+                        "item_id": int(row["item_id"]),
+                        "quantity": quantity,
+                        "op_no": op_no,
+                    }
+                )
+            wh_conn.commit()
+        except Exception:
+            try:
+                wh_conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            wh_conn.close()
+    return reconciled
+
+
 def ship_order(
     master_conn: sqlite3.Connection,
     order_id: int,
     third: int | dict[int, float],
     shipped_by: int | None = None,
     tracking_note: str | None = None,
+    *,
+    op_no: str | None = None,
 ) -> dict[str, Any]:
     """Ship an approved order (v3 partial-ship entry-point).
 
@@ -1646,10 +2226,9 @@ def ship_order(
        ``ship_order(master, order_id, shipped_items_map: dict[int, float],
        shipped_by: int, tracking_note=None)``
        where ``shipped_items_map`` maps ``store_order_items.id`` to the
-       quantity being shipped this batch. The same order can be shipped
-       multiple times; ``store_order_items.shipped_quantity`` accumulates
-       until every line is fully shipped, at which point the order's main
-       status flips to ``shipped``.
+       quantity being shipped this batch. The operation warehouse is derived
+       from the selected lines' frozen sources (all must agree); HTTP callers
+       should pass ``operator_dc_code`` through ``ship_partial`` instead.
 
     2. **Legacy full ship (v1/v2):**
        ``ship_order(master, order_id, shipped_by: int, tracking_note=None)``
@@ -1662,11 +2241,13 @@ def ship_order(
         if shipped_by is None:
             raise ValueError("ship_order: shipped_by is required when shipped_items_map is passed")
         return _ship_order_partial_impl(
-            master_conn, order_id, third, shipped_by, tracking_note,
+            master_conn, order_id, third, shipped_by, tracking_note, op_no=op_no,
         )
     if isinstance(third, int):
         # Legacy: ``third`` IS ``shipped_by``; ``tracking_note`` follows positionally.
-        return _ship_order_full_impl(master_conn, order_id, third, tracking_note)
+        return _ship_order_full_impl(
+            master_conn, order_id, third, tracking_note, op_no=op_no,
+        )
     raise TypeError(
         "ship_order: third arg must be dict[int, float] (v3 partial) or "
         f"int (legacy shipped_by), got {type(third).__name__}"
@@ -1678,15 +2259,23 @@ def ship_order_full(
     order_id: int,
     shipped_by: int,
     tracking_note: str | None = None,
+    *,
+    operator_dc_code: str | None = None,
+    op_no: str | None = None,
 ) -> dict[str, Any]:
     """Legacy-friendly helper: ship all remaining quantity in a single batch.
 
-    Public entry-point for v2-era tests that exercise the one-shot semantics.
-    Internally delegates to ``ship_order`` with a dict covering every
-    outstanding line; the underlying logic is identical to the partial-ship
-    path with all quantities maxed out at once.
+    ``operator_dc_code`` scopes the batch to one warehouse's outstanding
+    lines; without it the order must be single-warehouse (legacy tests).
     """
-    return ship_order(master_conn, order_id, shipped_by, tracking_note)
+    return _ship_order_full_impl(
+        master_conn,
+        order_id,
+        shipped_by,
+        tracking_note,
+        operator_dc_code=operator_dc_code,
+        op_no=op_no,
+    )
 
 
 def _ship_order_full_impl(
@@ -1694,6 +2283,9 @@ def _ship_order_full_impl(
     order_id: int,
     shipped_by: int,
     tracking_note: str | None,
+    *,
+    operator_dc_code: str | None = None,
+    op_no: str | None = None,
 ) -> dict[str, Any]:
     """Legacy one-shot: build a full-batch map and run partial-ship on it."""
     master_conn.row_factory = sqlite3.Row
@@ -1705,15 +2297,33 @@ def _ship_order_full_impl(
             f"order must be approved to ship, got {order['status']!r}"
         )
     items_map: dict[int, float] = {}
+    sources: set[str] = set()
     for item in order["order_items"]:
+        source = _line_source_warehouse(order, item)
+        if operator_dc_code is not None and source != operator_dc_code:
+            continue
         already = parse_qty(item.get("shipped_quantity") or 0)
         remaining = parse_qty(item["quantity"]) - already
         if remaining > 0:
             items_map[int(item["id"])] = remaining
+            sources.add(source)
     if not items_map:
+        if operator_dc_code is not None:
+            raise ValueError(f"操作仓 {operator_dc_code} 无可发货明细")
         raise ValueError("订单已全部发齐，无需再次发货")
-    return _ship_order_partial_impl(
-        master_conn, order_id, items_map, shipped_by, tracking_note,
+    if operator_dc_code is None:
+        if len(sources) != 1:
+            raise ValueError("订单跨仓，必须显式指定操作仓")
+        operator_dc_code = next(iter(sources))
+    return ship_partial(
+        master_conn,
+        open_warehouse_db,
+        order_id=order_id,
+        operator_dc_code=operator_dc_code,
+        op_no=op_no or generate_op_no(),
+        line_qty=items_map,
+        shipped_by=shipped_by,
+        tracking_note=tracking_note,
     )
 
 
@@ -1723,213 +2333,48 @@ def _ship_order_partial_impl(
     shipped_items_map: dict[int, float],
     shipped_by: int,
     tracking_note: str | None,
+    *,
+    op_no: str | None = None,
 ) -> dict[str, Any]:
-    """Partial-ship core (v3): idempotent per-batch accumulator.
+    """Backwards-compatible wrapper around the cross-warehouse protocol.
 
-    Behaviour:
-      - Validates the order is ``approved`` (raises ``ValueError`` otherwise).
-      - For each ``(order_item_id, qty)`` in ``shipped_items_map``:
-        * Resolves the order item; raises ``ValueError`` if not part of the
-          order or ``qty <= 0`` (silently skipped when ``qty == 0`` so the
-          UI's blank rows are no-ops).
-        * Validates ``qty + shipped_quantity <= quantity + 1e-9``; raises
-          ``ValueError`` on over-shoot.
-        * Validates DC stock is sufficient (``qty <= dc items.quantity``);
-          raises ``ValueError`` otherwise. DC 库存**永不跌为负**
-          （2026-10-10 决策反转：原 A7「允许欠货出库」已废止）。
-        * Decrements ``dc.items.quantity`` by ``qty``.
-        * Writes a ``stock_movements`` row with ``action='门店订货出库'``,
-          ``delta=-qty`` and ``note`` containing the order number plus a
-          ``partial`` marker plus the batch quantity.
-        * Updates ``store_order_items.shipped_quantity`` and bumps the
-          line's ``status`` to ``partial`` / ``fulfilled``.
-      - Writes one ``store_order_deliveries`` row per batch (multiple
-        partial batches produce multiple delivery rows).
-      - When every line is fully shipped, flips ``store_orders.status`` to
-        ``shipped`` (sets ``shipped_by`` / ``shipped_at``) and writes a
-        ``store_order_status_history`` row. Otherwise the status stays
-        ``approved`` and a no-op ``approved→approved`` history row is
-        written for audit.
-
-    Returns a dict containing ``order_id``, ``shipped_items``,
-    ``delivery_id``, ``is_fully_shipped``, ``new_order_status``. The route
-    layer is responsible for emitting the ``store_order_shipped``
-    notification when ``is_fully_shipped`` is True.
+    Resolves the operation warehouse from the selected lines' frozen sources;
+    HTTP callers pass an explicit session warehouse to ``ship_partial``.
     """
     master_conn.row_factory = sqlite3.Row
     order = get_order_detail(master_conn, order_id)
     if order is None:
         raise ValueError(f"order_id={order_id} not found")
-    if order["status"] != ORDER_STATUS_APPROVED:
-        raise ValueError(
-            f"order must be approved to ship, got {order['status']!r}"
-        )
-
-    items_by_id: dict[int, dict[str, Any]] = {
-        int(it["id"]): it for it in order["order_items"]
-    }
-    validated: list[tuple[int, dict[str, Any], float]] = []
+    items_by_id = {int(it["id"]): it for it in order["order_items"]}
+    sources: set[str] = set()
     for raw_id, raw_qty in shipped_items_map.items():
-        try:
-            order_item_id = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        item = items_by_id.get(order_item_id)
-        if item is None:
-            raise ValueError(
-                f"order_item_id={order_item_id} 不属于 order_id={order_id}"
-            )
         try:
             qty = parse_qty(raw_qty)
         except (TypeError, ValueError):
             continue
-        if qty <= 0:
-            # qty == 0: silent skip per v3 design §4.1 (UI no-op for blank rows).
+        try:
+            item = items_by_id.get(int(raw_id))
+        except (TypeError, ValueError):
+            item = None
+        if item is None or qty <= 0:
             continue
-        already_shipped = parse_qty(item.get("shipped_quantity") or 0)
-        target_qty = parse_qty(item["quantity"])
-        if qty + already_shipped > target_qty + 1e-9:
-            raise ValueError(
-                f"累计发货 {qty + already_shipped:g} 超过订单数 "
-                f"{target_qty:g}（order_item_id={order_item_id}）"
-            )
-        validated.append((order_item_id, item, qty))
-
-    if not validated:
-        raise ValueError("本批发货数量全部为空，请至少填写一项")
-
-    dc_code = order["dc_warehouse_code"]
-    ship_action = shipment_action_for(order)
-    dc_conn = open_warehouse_db(dc_code)
-    try:
-        dc_conn.row_factory = sqlite3.Row
-        ts = now()
-        dc_item_id_map: dict[int, int] = {}
-        for order_item_id, item, qty in validated:
-            canonical_id = int(item["canonical_id"])
-            dc_item = dc_conn.execute(
-                "SELECT id, quantity FROM items WHERE canonical_id=?",
-                (canonical_id,),
-            ).fetchone()
-            if dc_item is None:
-                raise ValueError(
-                    f"DC 仓 {dc_code} 缺少 canonical_id={canonical_id}（{item.get('canonical_name')}）"
-                )
-            dc_item_id = int(dc_item["id"])
-            dc_item_id_map[order_item_id] = dc_item_id
-            # ⚠️ 2026-10-10 决策反转：禁止超库存发货（原 v3 A7「允许欠货出库、
-            # 库存可跌为负」已废止）。本批发货量必须 ≤ DC 当前库存，否则整批
-            # 拒绝 —— 外层 try/except 回滚，保证 all-or-nothing，库存永不跌负。
-            # 注：同一 canonical 若被多行引用，本循环逐行重读（同连接可见前序
-            # UPDATE），因此也天然按累计量校验。
-            available = parse_qty(dc_item["quantity"])
-            if qty > available + 1e-9:
-                raise ValueError(
-                    f"库存不足：{item.get('canonical_name')} 本批发货 {qty:g}，"
-                    f"配送中心现有库存 {available:g}"
-                )
-            new_qty = parse_qty(available - qty)
-            dc_conn.execute(
-                "UPDATE items SET quantity=? WHERE id=?",
-                (new_qty, dc_item_id),
-            )
-            dc_conn.execute(
-                """INSERT INTO stock_movements
-                   (item_id, action, delta, note, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (
-                    dc_item_id, ship_action, -qty,
-                    f"{ship_action} #{order['order_no']} partial {qty:g}", ts,
-                ),
-            )
-        dc_conn.commit()
-    except Exception:
-        dc_conn.rollback()
-        dc_conn.close()
-        raise
+        sources.add(_line_source_warehouse(order, item))
+    if not sources:
+        operator_dc_code = order["dc_warehouse_code"]
+    elif len(sources) == 1:
+        operator_dc_code = next(iter(sources))
     else:
-        dc_conn.close()
-
-    ts = now()
-    delivery_no = _generate_delivery_no(master_conn)
-    cur = master_conn.execute(
-        """INSERT INTO store_order_deliveries
-           (order_id, delivery_no, shipped_by, shipped_at, tracking_note, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (order_id, delivery_no, shipped_by, ts, tracking_note, ts),
+        raise ValueError("订单跨仓，必须显式指定操作仓")
+    return ship_partial(
+        master_conn,
+        open_warehouse_db,
+        order_id=order_id,
+        operator_dc_code=operator_dc_code,
+        op_no=op_no or generate_op_no(),
+        line_qty=shipped_items_map,
+        shipped_by=shipped_by,
+        tracking_note=tracking_note,
     )
-    delivery_id = int(cur.lastrowid)
-
-    new_item_states: dict[int, tuple[float, str]] = {}
-    for order_item_id, item, qty in validated:
-        already_shipped = parse_qty(item.get("shipped_quantity") or 0)
-        target_qty = parse_qty(item["quantity"])
-        new_shipped = parse_qty(already_shipped + qty)
-        if abs(new_shipped - target_qty) < 1e-9:
-            item_status = ORDER_ITEM_STATUS_FULFILLED
-        elif new_shipped > 0:
-            item_status = ORDER_ITEM_STATUS_PARTIAL
-        else:
-            item_status = ORDER_ITEM_STATUS_PENDING
-        new_item_states[order_item_id] = (new_shipped, item_status)
-        master_conn.execute(
-            """UPDATE store_order_items
-               SET shipped_quantity=?, dc_item_id=?, status=?
-               WHERE id=?""",
-            (new_shipped, dc_item_id_map[order_item_id], item_status, order_item_id),
-        )
-
-    # Use the freshly-built new_item_states (in-memory) rather than the stale
-    # ``order["order_items"]`` snapshot loaded at function start. This catches
-    # the cumulative shipped_quantity accurately across multiple batches.
-    final_shipped_by_id: dict[int, float] = {
-        int(it["id"]): parse_qty(it.get("shipped_quantity") or 0)
-        for it in order["order_items"]
-    }
-    final_shipped_by_id.update(
-        {oid: new_shipped for oid, (new_shipped, _) in new_item_states.items()}
-    )
-    is_fully_shipped = all(
-        abs(final_shipped_by_id[int(it["id"])] - parse_qty(it["quantity"])) < 1e-9
-        for it in order["order_items"]
-    )
-    new_order_status = order["status"]
-    if is_fully_shipped:
-        master_conn.execute(
-            """UPDATE store_orders
-               SET status=?, shipped_by=?, shipped_at=?, updated_at=?
-               WHERE id=?""",
-            (ORDER_STATUS_SHIPPED, shipped_by, ts, ts, order_id),
-        )
-        _insert_status_history(
-            master_conn, order_id, order["status"], ORDER_STATUS_SHIPPED,
-            shipped_by, tracking_note,
-        )
-        new_order_status = ORDER_STATUS_SHIPPED
-    else:
-        _insert_status_history(
-            master_conn, order_id, order["status"], order["status"],
-            shipped_by, f"本批发货 {sum(int(q) for _, _, q in validated)} 件",
-        )
-
-    master_conn.commit()
-
-    # Return the refreshed order detail enriched with v3 metadata so existing
-    # callers (route layer passing the dict to ``notify_order_event``) keep
-    # working unchanged.
-    result = get_order_detail(master_conn, order_id) or {}
-    result.update(
-        {
-            "shipped_items": [
-                {"order_item_id": oid, "shipped_quantity": new_item_states[oid][0]}
-                for oid, _, _ in validated
-            ],
-            "delivery_id": delivery_id,
-            "is_fully_shipped": is_fully_shipped,
-            "new_order_status": new_order_status,
-        }
-    )
-    return result
 
 
 # Order statuses in which the storefront is allowed to receive goods.

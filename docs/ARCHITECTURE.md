@@ -1487,6 +1487,39 @@ sequenceDiagram
     T-->>A: JSON-RPC result
 ```
 
+### 7.3 跨库发货提交协议（2026-10-29，多仓履约 Task 5）
+
+`POST /store-ordering/orders/<id>/ship` 的**操作仓恒为当前 DC 会话仓**，平台管理员也
+不例外：门店会话或未选仓直接 403（`tests/test_ship_op_protocol.py` 场景 h）。订单需在
+该仓有来源行（`order_participants`）才可操作；表单行 ID 的来源不是操作仓即整批拒绝，
+不扣任何库存（场景 c）。
+
+提交分两段短事务，由 `store_ordering_pure.ship_partial()` 串起：
+
+1. **仓库库** `BEGIN IMMEDIATE` → `fulfillment_pure.resolve_fulfillment_item()` 解析本仓
+   唯一有效履约行 → 条件原子扣减 `UPDATE items SET quantity=quantity-? WHERE id=?
+   AND quantity>=?`（`rowcount==0` → 库存不足，整批回滚）→ 写
+   `stock_movements(action, delta=-qty, op_no)` → COMMIT。
+2. **master** `BEGIN IMMEDIATE` → INSERT 批次头（`store_order_deliveries.warehouse_code`）
+   + 逐行 `store_order_delivery_items` → 行累计
+   `UPDATE store_order_items SET shipped_quantity=shipped_quantity+?,
+   ship_op_no=? … WHERE … shipped_quantity+?<=quantity AND ship_op_no<>?` →
+   **锁内重读全部行**聚合 → `UPDATE store_orders SET status='shipped' … WHERE
+   status='approved'`，`changes()==1` 才写状态历史；路由仅在该条件迁移成功时发一条
+   `store_order_shipped` 通知（场景 f：两仓各发最后一行 → shipped/通知各恰一次）。
+
+**幂等键**：详情页下发隐藏字段 `op_no`（`generate_op_no()` = uuid4 hex），表单回传；
+缺省时服务端补生成（旧客户端兼容）。`store_order_delivery_items.op_no` 是单列 UNIQUE，
+因此写入时按行派生 `line_op_no = f"{op_no}:{order_item_id}"`，仓库流水的 `op_no`
+用同一派生键；重试经派生键命中既有批次 → 返回原 `delivery_id`、不重复扣减、不重复
+通知（场景 b）。仓库段按派生键跳过已应用行，master 段唯一冲突同样回落幂等返回。
+
+**孤儿对账**：仓库已提交而 master 批次未落（场景 d 故障注入）由
+`reconcile_orphan_shipments(master_conn, wh_conn_factory)` 兜底——扫描各 DC 仓
+`op_no IS NOT NULL AND delta<0` 且无对应 `store_order_delivery_items` 的流水，
+回加库存并写 `op_no='REV:<line_op_no>'` 红字冲销；重跑按 REV 键判重，幂等。
+库存差额的恢复只在人工调用对账作业时发生，不作为正常请求路径。
+
 ---
 
 ## 8. 鉴权架构
@@ -1835,6 +1868,14 @@ stateDiagram-v2
         DC 发货禁止超库存（v3 A7 反转）
     end note
 ```
+
+**跨仓发货（2026-10-29，多仓履约 Task 5）**：发货协议见 §7.3。行级来源固化后，
+本仓发货只处理 `COALESCE(source_warehouse_code, 头仓) = 会话仓` 的未发齐行；旧入口
+收口也遵守同一口径——表单空提交的全发兜底与旧 `qty` 字段都**仅作用本仓**，不会越仓
+发货（`tests/test_ship_op_protocol.py` 场景 g）。`ship_partial()` 是唯一跨库提交入口；
+`ship_order` / `ship_order_full` 保留为纯函数兼容包装（单一来源仓时自动推导操作仓，
+跨仓必须显式传 `operator_dc_code`）。所有失败点均以 `op_no` 可恢复：同键重试幂等，
+仓库已提交而主库未落由 `reconcile_orphan_shipments` 红字冲销。
 
 **通知**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out（收件人按事件方向选 DC 审批人 / 门店用户，排除操作者自己）。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
 

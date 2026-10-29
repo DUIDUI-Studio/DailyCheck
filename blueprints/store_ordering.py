@@ -710,6 +710,8 @@ def order_detail(order_id: int) -> str:
         total_amount=total_amount,
         dc_items_info=dc_items_info,
         is_dc_view=is_dc_view,
+        # 发货幂等键：页面下发、随表单回传；同一页面重复提交只扣一次。
+        ship_op_no=sop.generate_op_no(),
         store_inflows=store_inflows,
         transfer=transfer_ctx,
         can_review=(
@@ -1066,34 +1068,38 @@ def cancel_order_route(order_id: int) -> str:
 @require_warehouse_type("distribution_center")
 @require_role("staff")
 def ship_order_route(order_id: int) -> str:
-    """DC 部分/全部发货（v3）。
+    """DC 部分/全部发货（v3 + 多仓履约 Task 5）。
 
-    守卫说明（兼容层，保持 require_role）：DC staff 发货是既有行为。`order.ship`
-    权限点归 manager 包，若改走 @require_permission("order.ship") 会让 DC staff
-    失去发货能力（非白名单行为变化）——故本路由维持 require_role("staff")，
-    仅保留 DC 类型守卫。见施工图 §1.2-E 修正说明。
+    操作仓 = 当前会话仓，平台管理员也不例外（spec §7/§9：管理员须显式处于
+    DC 会话；门店会话直接 403）。订单需在该仓有来源行才可操作。
 
     表单字段约定：
+      - ``op_no``：本批发货的幂等键（详情页下发，提交回传）。缺省时服务端
+        生成一个新的（旧客户端兼容）；重试同一 ``op_no`` 不会重复扣减。
       - ``shipped_items[N]=qty``：多值，每行一个明细的本批发货数。N 是
-        ``store_order_items.id``，与 order_detail.html 中的 input name 配对。
-        新 UI 的每个数量 input 都带该 name（即使留空也会随表单提交），因此
-        「字段存在」是「新 UI 提交」的可靠信号。
-      - ``qty``：兼容 v1/v2 的「全量一次发货」字段；填了就给所有明细
-        各发 qty 件（仍受累计上限校验）。
+        ``store_order_items.id``。字段存在但全部为空 → 拒绝，绝不全发。
+      - ``qty``：兼容 v1/v2 的「全量一次发货」字段；仅作用于**本仓**未发行。
       - 上述两者都缺省（且表单不含任何 ``shipped_items[`` 字段）：走
-        ``ship_order_full``（legacy full-ship），把每个明细的剩余可发数量
-        一次性发齐。仅用于无 shipped_items 字段的旧客户端 / 老测试。
+        ``ship_order_full``，把**本仓**每个明细的剩余可发数量一次性发齐。
 
-    ⚠️ 安全护栏（2026-10-10）：一旦表单携带 ``shipped_items[`` 字段但全部
-    为空/0，视为「用户未填写」→ 直接 flash 拒绝，**绝不**退化为整单全发。
-    这是「DC 只发 2、却被记发 100」缺陷的直接堵口。
-
-    通知：仅在订单全部发齐后写一条 ``store_order_shipped``；partial 不发
-    通知避免刷屏（v3 设计 §10.4）。
+    通知：仅在本次调用真正触发 approved→shipped 条件迁移后写一条
+    ``store_order_shipped``（锁内 changes()==1 才写）；partial 与幂等重试不发。
     """
     tracking_note = (request.form.get("tracking_note") or "").strip() or None
+    wh = g.get("warehouse")
+    if wh is None or wh["warehouse_type"] != sop.WAREHOUSE_TYPE_DC:
+        # 平台管理员在门店会话 / 未选仓 → 未显式指定操作仓，拒绝（场景 h）。
+        abort(403)
+    operator_dc_code = str(wh["code"])
+
     master = get_master_db()
-    _assert_order_belongs_to_current_dc(master, order_id)
+    detail = sop.get_order_detail(master, order_id)
+    if detail is None:
+        abort(404)
+    if operator_dc_code not in sop.order_participants(master, order_id):
+        abort(403)
+
+    op_no = (request.form.get("op_no") or "").strip() or sop.generate_op_no()
 
     # 1. 解析 shipped_items[N] = qty 形式（v3 多值表单）。
     shipped_items_map: dict[int, float] = {}
@@ -1114,54 +1120,59 @@ def ship_order_route(order_id: int) -> str:
         flash("请至少填写一项发货数量")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 2. 兼容 v2 全量字段 'qty'：所有未发齐明细都发 qty。
+    # 2. 兼容 v2 全量字段 'qty'：仅作用本仓未发齐明细。
     if not shipped_items_map:
         raw_qty = request.form.get("qty")
         if raw_qty is not None and raw_qty != "":
             qty_value = parse_qty(raw_qty)
             if qty_value > 0:
-                detail = sop.get_order_detail(master, order_id)
-                if detail is not None:
-                    for it in detail["order_items"]:
-                        already = parse_qty(it.get("shipped_quantity") or 0)
-                        remaining = parse_qty(it["quantity"]) - already
-                        if remaining > 0:
-                            shipped_items_map[int(it["id"])] = min(
-                                qty_value, remaining
-                            )
+                for it in detail["order_items"]:
+                    source = it.get("source_warehouse_code") or detail["dc_warehouse_code"]
+                    if source != operator_dc_code:
+                        continue
+                    already = parse_qty(it.get("shipped_quantity") or 0)
+                    remaining = parse_qty(it["quantity"]) - already
+                    if remaining > 0:
+                        shipped_items_map[int(it["id"])] = min(qty_value, remaining)
 
-    # 3. 都没填（且不含 shipped_items 字段）→ 走 legacy full-ship（旧客户端兼容）。
-    used_full_ship_fallback = False
+    # 3. 都没填（且不含 shipped_items 字段）→ 本仓 legacy full-ship（旧客户端兼容）。
     if not shipped_items_map:
         try:
             order = sop.ship_order_full(
-                master, order_id, g.user["id"], tracking_note
+                master,
+                order_id,
+                g.user["id"],
+                tracking_note,
+                operator_dc_code=operator_dc_code,
+                op_no=op_no,
             )
-            used_full_ship_fallback = True
         except ValueError as e:
             flash(f"出库失败：{e}")
             return redirect(url_for("store_ordering.shipment_list"))
     else:
         try:
-            order = sop.ship_order(
-                master, order_id, shipped_items_map,
-                shipped_by=g.user["id"], tracking_note=tracking_note,
+            order = sop.ship_partial(
+                master,
+                sop.open_warehouse_db,
+                order_id=order_id,
+                operator_dc_code=operator_dc_code,
+                op_no=op_no,
+                line_qty=shipped_items_map,
+                shipped_by=g.user["id"],
+                tracking_note=tracking_note,
             )
         except ValueError as e:
             flash(f"出库失败：{e}")
             return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 4. 通知：仅全部发齐才触发 store_order_shipped 通知（v3 §10.4）。
-    is_fully_shipped = bool(order.get("is_fully_shipped")) or (
-        order.get("status") == sop.ORDER_STATUS_SHIPPED and used_full_ship_fallback
-    )
-    if is_fully_shipped:
+    # 4. 通知：仅本次调用真正完成 approved→shipped 迁移才触发（幂等重试不发）。
+    if order.get("transitioned_to_shipped"):
         sop.notify_order_event(
             master, sop.EVENT_ORDER_SHIPPED, order, g.user["id"]
         )
 
     # 5. flash 文案：全部发齐 → "出库成功"；部分 → "本批发货 X 件"。
-    if is_fully_shipped:
+    if order.get("is_fully_shipped"):
         flash("出库成功")
     else:
         shipped_total = sum(
