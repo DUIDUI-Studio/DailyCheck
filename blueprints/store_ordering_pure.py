@@ -1433,27 +1433,34 @@ def list_orders(
     limit: int = 200,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Query orders with optional filters."""
+    """Query orders with optional filters.
+
+    ⚠️ 所有 WHERE 条件必须用 ``so.`` 限定列名（Issue #23）：本查询 JOIN 了
+    ``users`` 与 ``warehouses``，两张表都有 ``created_at`` 列 —— 用未限定列名
+    拼日期条件会让 SQLite 抛 ``ambiguous column name: created_at``，
+    带日期筛选的订单板整页 500。其余列（``status`` / ``store_warehouse_code`` 等）
+    今天恰好不重名，但同样限定，避免将来加列时再踩同一个坑。
+    """
     master_conn.row_factory = sqlite3.Row
     where_parts: list[str] = []
     params: list[Any] = []
     if store_warehouse_code:
-        where_parts.append("store_warehouse_code = ?")
+        where_parts.append("so.store_warehouse_code = ?")
         params.append(store_warehouse_code)
     if dc_warehouse_code:
-        where_parts.append("dc_warehouse_code = ?")
+        where_parts.append("so.dc_warehouse_code = ?")
         params.append(dc_warehouse_code)
     if status:
-        where_parts.append("status = ?")
+        where_parts.append("so.status = ?")
         params.append(status)
     if flow_type:
-        where_parts.append("flow_type = ?")
+        where_parts.append("so.flow_type = ?")
         params.append(flow_type)
     if start_date:
-        where_parts.append("created_at >= ?")
+        where_parts.append("so.created_at >= ?")
         params.append(f"{start_date} 00:00:00")
     if end_date:
-        where_parts.append("created_at <= ?")
+        where_parts.append("so.created_at <= ?")
         params.append(f"{end_date} 23:59:59")
     where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     params.extend([limit, offset])
@@ -1488,19 +1495,22 @@ def count_orders_by_status(
 
     过滤下推到 SQL 的 GROUP BY，不把订单全表捞回来在应用层数——Issue #19 的
     合并订单页要在页签上显示各状态计数。
+
+    ⚠️ 列名同样用 ``so.`` 限定（Issue #23）：本函数当前无 JOIN，列名不歧义，
+    但保持与 ``list_orders`` 同一写法 —— 将来给这里加 JOIN 时不会突然 ambiguous。
     """
     master_conn.row_factory = sqlite3.Row
     where_parts: list[str] = []
     params: list[Any] = []
     if store_warehouse_code:
-        where_parts.append("store_warehouse_code = ?")
+        where_parts.append("so.store_warehouse_code = ?")
         params.append(store_warehouse_code)
     if dc_warehouse_code:
-        where_parts.append("dc_warehouse_code = ?")
+        where_parts.append("so.dc_warehouse_code = ?")
         params.append(dc_warehouse_code)
     where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
     rows = master_conn.execute(
-        f"SELECT status, COUNT(*) AS n FROM store_orders {where} GROUP BY status",
+        f"SELECT so.status, COUNT(*) AS n FROM store_orders so {where} GROUP BY so.status",
         params,
     ).fetchall()
     return {str(r["status"]): int(r["n"]) for r in rows}

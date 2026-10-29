@@ -1885,7 +1885,14 @@ stateDiagram-v2
 **订单板合并（2026-10-24，Issue #19）**：`admin_orders`（`/admin/orders`，平台视角）与 `review_list`（`/review`，配送中心视角）原是两个模块、两张模板（`orders.html` / `review.html`）两套筛选，导航里并列出现，用户反馈「功能重复」。现合并为**一份实现 + 一张模板**：视图 `_render_order_board()`（`blueprints/store_ordering.py`）同时服务两个端点，模板 `templates/store_ordering/order_board.html`（状态页签 = 全部 / 待审批 / 待出库 / 已发货 / 已送达 / 已拒绝 / 已取消，计数来自 `store_ordering_pure.count_orders_by_status()` 的 SQL `GROUP BY status`——不在应用层捞全表再数）；原 `review.html` 已删除。
 数据范围按身份裁剪、**逻辑上不放宽**：`is_admin` → 全量且 `?dc=` / `?store=` 生效；非管理员 → `dc_warehouse_code` 硬锁当前仓库，且**忽略** query 里的 `?dc=` / `?store=`（否则改一个参数就能枚举别家配送中心的订单）。权限意图两侧统一为 `dc>role:staff`（admin 由装饰器直通）——`admin_orders` 因此从 `role:admin` 改为 `dc>role:staff`，DC staff 可访问该 URL，但可见数据集仍是本 DC。`tests/test_store_ordering_board.py` 逐条锁死：同页面两 URL / 范围锁定 / 越权参数无效 / 导航单入口（admin 与 DC 各一条断言）/ admin 全量与跨仓筛选 / 门店 403 / 页签计数与过滤。导航（`base.html` + `land.html`）只保留一项：admin 落 `/admin/orders`「订单管理」，DC 落 `/review`「订货审批」；`/shipments` 仍是 302 到 `/review` 的旧别名。
 
+
 详见 `docs/2026-10-19-dc-transfer-design.md`；测试 `tests/test_dc_transfer.py`。
+
+### 10.3.2 订单板日期筛选（2026-10-24，Issue #23）
+
+**WHERE 列名必须限定（2026-10-24，Issue #23）**：`store_ordering_pure.list_orders()` 的查询 `FROM store_orders so` 同时 `LEFT JOIN users` 与 `LEFT JOIN warehouses`——这三张表**都有 `created_at` 列**。此前 WHERE 子句用未限定列名拼日期条件（`created_at >= ?`），带 `?start_date=` / `?end_date=` 的订单板整页 500（`sqlite3.OperationalError: ambiguous column name: created_at`）；`ORDER BY so.created_at` 是限定过的，所以只有日期过滤炸，不带日期不炸。**铁律：凡查询 JOIN 了多张可能同名列的表，WHERE / GROUP BY / ORDER BY 的列名一律带表别名前缀**（本处统一 `so.`）。本次把 `list_orders()` 与 `count_orders_by_status()` 的全部条件都限定（不只 `created_at`——`status` / `store_warehouse_code` 等今天恰好不重名，但将来给 `users` / `warehouses` 加同名列时同样会炸）。**受影响 URL 有三条**（共用同一 `list_orders()`，但范围裁剪各不相同，必须逐条验）：`/store-ordering/admin/orders`（平台）、`/store-ordering/review`（DC）、`/store-ordering/orders`（门店「我的订单」）。回归 `tests/test_store_ordering_date_filter.py`（17 用例：纯层最小复现 / 区间过滤 / **边界含当日 00:00:00 与 23:59:59**（种子订单刻意落在区间两个端点上，`>=` 改 `>`、`23:59:59` 改 `23:59:58` 均会让本文件打红）/ 与其他过滤叠加 / 计数口径一致 / 三条 URL 带日期参数 200 + 内容过滤）。页签计数**不吃日期条件**（`count_orders_by_status()` 签名没有 start/end，`_render_order_board()` 也没传）：带日期筛选时列表是区间内订单、页签仍是全时段计数。这是**既有行为，本次未改**（改它属产品口径变更），本 PR 只保证它不因加前缀而漂移。
+
+**已知盲区（2026-10-24，未修，待 owner 拍板）**：蓝绿 `verify.sh` 的「八项」没有任何一项带 `start_date` / `?end_date` 参数——既有 bug 至今没被 verify 拦住（绿 verify 全绿 ≠ 用户路径全通）。加第 9 项要同步改 `docs/agent-framework/workflow.md`（红线 6 路径）且蓝绿子系统是最高危面，故本次未动；本 PR 的回归测试会被 verify 第 1 项（集成测试 pytest）跑到，算部分补网。
 
 ### 10.4 Canonical 扇出流程
 
