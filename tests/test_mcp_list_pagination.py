@@ -74,9 +74,12 @@ def pagination_env(tmp_path, monkeypatch):
             "VALUES (?, ?, ?, '出库', 0, ?)",
             (SEED_ITEM_ID, float(i), f"outbound-{i}", TS),
         )
+        # Issue #72 / PR #76 起 restock 列表读 restock_requests（入库单实体），
+        # 不再读 stock_movements。分页用例因此种到新数据源，语义等价。
         conn.execute(
-            "INSERT INTO stock_movements (item_id, action, delta, note, created_at) "
-            "VALUES (?, 'restock', ?, ?, ?)",
+            "INSERT INTO restock_requests "
+            "(item_id, requested_quantity, reason, status, created_at) "
+            "VALUES (?, ?, ?, '入库', ?)",
             (SEED_ITEM_ID, float(i), f"restock-{i}", TS),
         )
     conn.commit()
@@ -250,6 +253,9 @@ class TestRestockListPagination:
             assert warehouse.count_restock_movements(conn) == SEED_ROWS
             rows = warehouse.list_restock_movements(conn, limit=10, offset=5)
             assert len(rows) == 10
+            # 新数据源的 row 形状：quantity / status 来自 restock_requests。
+            assert rows[0]["quantity"] == 115.0
+            assert rows[0]["status"] == "入库"
             assert warehouse.count_restock_movements(conn) == SEED_ROWS
         finally:
             conn.close()

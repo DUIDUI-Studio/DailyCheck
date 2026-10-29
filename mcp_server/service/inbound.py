@@ -49,6 +49,13 @@ def list_restock(
     limit: int = 100,
     offset: int = 0,
 ) -> dict:
+    """List inbound restock requests (入库单) for a warehouse, paginated.
+
+    Rows come from `restock_requests` (read path switched in Issue #72).
+    Shape per row: {id, item_id, item_name, quantity, status, reason,
+    created_at}, newest first. Envelope: {items, total, limit, offset,
+    truncated} (Issue #74).
+    """
     if not warehouse_code:
         raise ValidationError("warehouse_code_required")
     if not check_warehouse(ctx, warehouse_code):

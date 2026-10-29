@@ -110,23 +110,33 @@ def create_restock(
 
 
 def count_restock_movements(conn: sqlite3.Connection) -> int:
-    """入库流水总数（与 list_restock_movements 同一过滤口径）。"""
-    row = conn.execute(
-        "SELECT COUNT(*) AS total FROM stock_movements WHERE action = 'restock'"
-    ).fetchone()
+    """入库单总数（与 list_restock_movements 同一数据源）。"""
+    row = conn.execute("SELECT COUNT(*) AS total FROM restock_requests").fetchone()
     return int(row["total"])
 
 
 def list_restock_movements(
     conn: sqlite3.Connection, limit: int = 100, offset: int = 0
 ) -> list[dict]:
+    """List inbound restock requests (入库单), newest first.
+
+    Data source: `restock_requests` LEFT JOINed with `items`. Each row:
+    {id, item_id, item_name, quantity, status, reason, created_at}.
+
+    History: this used to read `stock_movements` rows filtered on
+    `action='restock'`, but the inbound flow writes `action='补货入库'` there
+    — so the MCP list came back empty for every warehouse (Issue #72).
+
+    Pagination: `ORDER BY created_at DESC, id DESC` is part of the contract —
+    without the id tie-break, offset paging can repeat or skip same-second rows.
+    """
     rows = conn.execute(
-        """SELECT s.id, s.item_id, i.name AS item_name,
-                  s.delta AS qty, s.action AS reason, s.created_at
-           FROM stock_movements s
-           JOIN items i ON i.id = s.item_id
-           WHERE s.action = 'restock'
-           ORDER BY s.created_at DESC, s.id DESC
+        """SELECT r.id, r.item_id, i.name AS item_name,
+                  r.requested_quantity AS quantity, r.status, r.reason,
+                  r.created_at
+           FROM restock_requests r
+           LEFT JOIN items i ON i.id = r.item_id
+           ORDER BY r.created_at DESC, r.id DESC
            LIMIT ? OFFSET ?""",
         (limit, offset),
     ).fetchall()

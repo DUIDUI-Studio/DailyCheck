@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
+from mcp_server.service import inbound as inbound_service
 from mcp_server.service.auth import AuthContext
 from mcp_server.service.inbound import create_restock, list_restock
 
@@ -103,7 +104,8 @@ class TestListRestock:
         mock_context.__exit__ = MagicMock(return_value=False)
         mock_context.execute.return_value.fetchall.return_value = [
             {"id": 1, "item_id": 1, "item_name": "Item 1",
-             "qty": 10, "reason": "restock", "created_at": "2024-01-01"}
+             "quantity": 10, "status": "入库", "reason": "restock",
+             "created_at": "2024-01-01"}
         ]
         mock_context.execute.return_value.fetchone.return_value = {"total": 1}
         mock_conn.return_value = mock_context
@@ -116,4 +118,33 @@ class TestListRestock:
         assert result["offset"] == 0
         assert result["truncated"] is False
         assert len(result["items"]) == 1
-        assert result["items"][0]["qty"] == 10
+        assert result["items"][0]["quantity"] == 10
+        assert result["items"][0]["status"] == "入库"
+
+
+def test_create_restock_then_list_restock_reads_it_back(warehouse_db, monkeypatch):
+    """写入后立即读回：create_restock 落库 → list_restock 立刻返回同一条入库单."""
+    monkeypatch.setattr(
+        inbound_service,
+        "resolve_warehouse",
+        lambda code: {"code": code, "db_path": warehouse_db},
+    )
+    ctx = AuthContext(1, [], [], None)
+
+    created = create_restock(1, 5, "WH001", ctx, reason="demo")
+    result = list_restock("WH001", ctx)
+    rows = result["items"]
+
+    assert created["item_id"] == 1
+    assert created["quantity"] == 5
+    assert result["total"] == 1
+    assert result["limit"] == 100
+    assert result["offset"] == 0
+    assert result["truncated"] is False
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == 1
+    assert rows[0]["item_name"] == "Item A"
+    assert rows[0]["quantity"] == 5
+    assert rows[0]["status"] == "入库"
+    assert rows[0]["reason"] == "demo"
+    assert rows[0]["created_at"]

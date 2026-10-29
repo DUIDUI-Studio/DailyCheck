@@ -100,9 +100,9 @@ def get_tools() -> list[Tool]:
             name="restock_list",
             title="List Restocks",
             description=(
-                "List restock records for a warehouse with pagination. "
-                "Returns: {items: [{id, item_id, item_name, qty, reason, created_at}], "
-                "total, limit, offset, truncated}."
+                "List inbound restock requests for a warehouse with pagination. "
+                "Returns: {items: [{id, item_id, item_name, quantity, status, reason, "
+                "created_at}], total, limit, offset, truncated}."
             ),
             inputSchema={
                 "type": "object",
