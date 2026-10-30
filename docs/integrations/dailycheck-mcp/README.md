@@ -50,22 +50,31 @@ curl -s http://<host>:5100/health \
 
 ## 3. Authentication
 
-DailyCheck uses **two-layer auth**, both required:
+The transport middleware accepts **either** of two credential modes (not both at once):
 
-1. **Transport middleware** reads `Bearer <TOKEN>` from the `Authorization` header and compares it byte-for-byte against the `DAILYCHECK_MCP_TOKEN` environment variable on the server. Mismatch → **HTTP 401** `{"error":"unauthorized"}` — no further processing.
-2. **Tool-layer auth** (for `tools/call`) looks up the same token in the `agent_tokens` table (PBKDF2-SHA256 hash). If the hash is not found → `isError=true` with `{"error":"unauthorized","message":"invalid token"}`.
+1. **`agent_tokens` table (production path)** — the middleware looks up the `Bearer <TOKEN>` prefix in `agent_tokens`, verifies the PBKDF2-SHA256 hash against a non-revoked row, and publishes that row's request-scoped `AuthContext` (token id, warehouse/path ACL, rate limit). No server-side env var is needed for this path.
+2. **Server env `DAILYCHECK_MCP_TOKEN` (dev / legacy)** — a byte-for-byte match against the server process env short-circuits transport authentication and bypasses the per-token rate limit; production deployments should leave it unset. For `tools/call` the tool layer still resolves ACLs by looking this env value up in `agent_tokens` (and rejects the call if it is absent).
 
-In practice this means **the token is one value**, configured identically on both sides. The server admin must:
+If neither matches → **HTTP 401** `{"error":"unauthorized","message":"Invalid or missing token"}` and no tool code runs.
+
+For `tools/call`, the tool layer uses the `AuthContext` published by the middleware — it does **not** re-authenticate the same raw token. In stdio mode (no HTTP request) it falls back to the process-level `DAILYCHECK_MCP_TOKEN` and looks that value up in `agent_tokens`. If no usable context exists, the tool result is `{"error":"unauthorized","message":"..."}` with HTTP 200.
+
+The server admin provisions a scoped token once:
 
 ```bash
 # Generate a token once (UI: Admin → Agent Tokens)
 flask create-agent-token external-reader \
   --warehouses wh_001 \
-  --read-paths consumption,inventory
+  --read-paths "/api/v1/items,/api/v1/movements,/api/v1/consumption"
 
-# Set the env var so the middleware accepts it
-export DAILYCHECK_MCP_TOKEN="<raw-token-from-create>"
+# Optional write scope — paths are pure paths, NEVER prefixed with an HTTP method
+flask create-agent-token juleng-sync \
+  --warehouses wh_000 \
+  --read-paths "/api/v1/outbound,/api/v1/restock" \
+  --write-paths "/api/v1/outbound,/api/v1/restock"
 ```
+
+`--read-paths` / `--write-paths` accept comma-separated **path patterns**. A value such as `"POST /api/v1/outbound"` never matches — `check_path` picks the read/write list from the HTTP method and only runs path matching. Omit `--warehouses` only if the token should see every warehouse.
 
 | Failure | HTTP | response shape |
 |---|---|---|
@@ -280,9 +289,27 @@ Always check **both**: HTTP status, JSON-RPC top-level error, AND `result.isErro
 
 - **No caching layer**: every call hits SQLite on disk. p50 ~50 ms, p99 ~500 ms on the reference dataset (~3 warehouses × 67 items × ~200 movements each).
 - **No write-then-read consistency gap**: all inventory writes commit to `master.db` or `db/warehouses/<code>.db` **before** the call returns.
-- **Idempotency**: read tools (`items_list`, `warehouse_consumption`, …) are safe to retry. **Write tools** (`restock_create`, `outbound_create`) are **not idempotent** — see [integration-checklist.md](./integration-checklist.md#idempotency) before issuing them.
+- **Idempotency**: read tools (`items_list`, `warehouse_consumption`, …) are safe to retry. **Write tools** (`restock_create`, `outbound_create`) are idempotent only with the paired `doc_no`/`line_no` contract described below — see [integration-checklist.md](./integration-checklist.md#idempotency) before issuing them.
 - **Concurrency**: the SQLite connection pool is single-writer; high-frequency parallel writes from multiple integrations can serialize. Use one process per warehouse and avoid burst writes.
 - **Time zone**: all `*_date` fields and `created_at` strings are in the server's local time (Asia/Shanghai). No timezone suffix; treat as naive datetimes in client code.
+
+### 7.1 Tool-call audit log (Issue #85)
+
+Every `tools/call` that actually reaches a tool handler appends exactly one JSON line to `BASE_DIR/access.log`:
+
+```json
+{"ts":"...","agent_token_id":7,"path":"/api/mcp/","method":"tools/call","status":200,"duration_ms":12,"tool_name":"restock_list"}
+```
+
+| Field | Meaning |
+|---|---|
+| `agent_token_id` | `agent_tokens.id` of the request's AuthContext; `null` when no request-scoped context existed |
+| `status` | **Business** result: `200` success, the `McpError` HTTP status (400/401/403/404/…), `400` unknown tool, `500` unexpected exception. A transport HTTP 200 does not imply `status: 200` |
+| `duration_ms` | Monotonic-clock duration, non-negative |
+| `tool_name` | Tool called (bounded to 128 chars) |
+
+The record never contains the raw token, token hash, `Authorization` header, arguments, `reason`, exception stacks or response bodies. Boundary: 401/429 rejected by `AuthMiddleware`, SDK parameter-validation rejections, `initialize` and `tools/list` do **not** enter `call_tool` and produce no access-log line — use the proxy/uvicorn logs for those. A failed log write never changes the tool response.
+
 
 ## 8. Examples
 
@@ -302,3 +329,89 @@ Before going live, work through [integration-checklist.md](./integration-checkli
 ---
 
 **Last verified**: tested against commit `fd8e87f` on `main` against the local Docker dev container. See [integration-checklist.md § Verification](./integration-checklist.md#verification) for how to re-run.
+
+## Document line writes (Issue #87 / warehouse v7)
+
+`restock_create` and `outbound_create` retain required `item_id`, `quantity`,
+`warehouse_code` and optional nullable `reason`. Both quantities accept numbers,
+including `0.25`. New optional arguments are `doc_no`, `line_no`, and `factor`
+(default `1`). New service arguments are keyword-only after `reason`, so existing
+positional Python callers continue to work.
+
+| Argument | Contract |
+|---|---|
+| `item_id` | Positive integer; bool, float and string rejected |
+| `quantity`, `factor` | Finite positive JSON numbers; bool, string, explicit null, NaN/Infinity rejected |
+| `doc_no` | Opaque case-sensitive string, 1–128 characters / at most 512 UTF-8 bytes |
+| `line_no` | Opaque case-sensitive string, 1–64 characters / at most 256 UTF-8 bytes; `01` differs from `1` |
+| Identity pair | Omit both or provide both; explicit null, controls and edge whitespace rejected; no automatic trim/casefold |
+
+Structured callers use `<source>:<external_doc_no>` (for example
+`juleng:JL-20261030-001`); source convention is `[a-z][a-z0-9_-]{0,31}` and the
+external portion may contain more colons. This is a caller convention: the server
+does **not** reject a doc_no without a prefix. The complete opaque string is the
+identity, independent of token rotation and item ID. Warehouses and directions
+have separate key spaces.
+
+```json
+{"name":"outbound_create","arguments":{"item_id":43,"quantity":1,"factor":10,"warehouse_code":"wh_000","doc_no":"juleng:JL-20261030-001","line_no":"01","reason":"source mirror"}}
+```
+
+Effective base quantity is `quantity * factor`, rounded once to two decimal places
+with Decimal HALF_EVEN. `1 * 10` deducts 10, `.125 * 10` deducts 1.25, `1.005 * 1`
+becomes 1.00, and `.001 * 1` is rejected as zero. Nonfinite/overflowed results and
+values that lose cents on SQLite REAL round-trip are rejected. Send original
+source quantity with its factor, or an already converted base quantity with
+factor=1. Web auxiliary-unit division is a different contract.
+
+Create returns existing `id` (integer), `item_id`, effective `quantity` and
+`warehouse_code`, plus `doc_no`, `line_no`, numeric `input_quantity`/`factor`,
+`status`, `rolled_back` (null for restock), `replayed`, `applied`. First write is
+`replayed=false, applied=true`; exact replay returns the original ID with
+`replayed=true, applied=false` and performs no stock/movement writes. Numeric
+representations `1` and `1.0` are equivalent. Different item, original quantity or
+factor conflicts even if products match; changed reason does not overwrite the
+first reason. Without a key, every call creates a new row, even with equal reason.
+Factor can be supplied without a key, but such calls cannot safely auto-retry.
+
+Rollback returns stored effective quantity once; replay after rollback stays
+rolled back. Web deletion permanently consumes the key and subsequent create
+returns `document_line_deleted`, never recreates the row. List envelopes, total,
+LEFT JOIN orphan rows and `created_at DESC,id DESC` order are unchanged (#72/#74).
+Each list row gains `doc_no`, `line_no`, `input_quantity` (canonical decimal string
+or null), `factor` (number); `quantity` remains effective base units. Historical
+and Web-created rows keep NULL identity/input and factor=1; reasons are never
+backfilled as identities.
+
+### Warehouse migration and sync cutover
+
+Web/init and the MCP first warehouse connection share a validated v7 migration;
+no Web warm-up is required. Existing files open in mode=rw. Dedicated single-target
+entry: `python -m db.warehouse_migrate --db /absolute/path/warehouse.db status|up`
+(or `down --target 6`, which deliberately refuses destructive downgrade).
+`--db` is mandatory; missing files, master DB, wrong schemas and future versions
+are rejected. Do **not** use `flask migrate --db <warehouse> up`: that uses the
+master registry (still v6). `db/migrate.py` is the legacy inventory-copy path.
+
+Realpath-based flock covers backup, baseline through v6, and registered v7;
+symlink aliases share the lock, green copies have their own. Every actual stage
+gets a SQLite backup API hot backup, checked with integrity_check, under adjacent
+`backups/migrations/`; errors block migration. v7 adds columns, partial unique
+indexes, permanent `document_write_keys` and version stamp in one transaction.
+Legacy v0–5 baseline may retain partial DDL and can be retried; it never stamps v7.
+Current v7 is a read-only version fast path without repeated backups/ALTERs.
+
+Prod owns cutover and production verification. Pause old writers, save a stable
+source cursor/ID set and reconcile historical set H against new set N: H never
+calls new create; only verified N gets structured keys. Cover overlap, same-second
+rows, multiple pages and late arrivals; reason alone is insufficient proof.
+Quarantine unknown outcomes and do not advance the cursor across them. Keep H
+and checkpoints durable; conflicts/rollback/deleted results require reconciliation,
+not new identities. No client synchronizer or production scripts are introduced.
+
+Preferred rollback stops new sync calls and rolls back code while preserving v7
+columns/indexes/journal. A verified pre-v7 backup restore requires stopped writers,
+closed connections and no unaccounted new business writes, with matching restored
+source checkpoint. Never overwrite an online DB or delete journal keys to retry.
+Prod independently exercises green-copy migration, WAL backup/restore and its
+standard observation window; green migration does not upgrade the real database.

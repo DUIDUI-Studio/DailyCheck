@@ -72,7 +72,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="restock_create",
             title="Create Restock",
-            description="Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code}.",
+            description='Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.',
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -81,7 +81,7 @@ def get_tools() -> list[Tool]:
                         "description": "Item ID",
                     },
                     "quantity": {
-                        "type": "integer",
+                        "type": "number",
                         "description": "Quantity to restock",
                     },
                     "warehouse_code": {
@@ -89,11 +89,15 @@ def get_tools() -> list[Tool]:
                         "description": "Warehouse code (e.g. WH001)",
                     },
                     "reason": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Reason for restock (optional)",
                     },
+                    'doc_no': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'description': 'Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.'},
+                    'line_no': {'type': 'string', 'minLength': 1, 'maxLength': 64, 'description': 'Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.'},
+                    'factor': {'type': 'number', 'exclusiveMinimum': 0, 'default': 1, 'description': 'Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.'},
                 },
                 "required": ["item_id", "quantity", "warehouse_code"],
+                "dependentRequired": {"doc_no": ["line_no"], "line_no": ["doc_no"]},
             },
         ),
         Tool(
@@ -102,7 +106,7 @@ def get_tools() -> list[Tool]:
             description=(
                 "List inbound restock requests for a warehouse with pagination. "
                 "Returns: {items: [{id, item_id, item_name, quantity, status, reason, "
-                "created_at}], total, limit, offset, truncated}."
+                "created_at, doc_no, line_no, input_quantity, factor}], total, limit, offset, truncated}."
             ),
             inputSchema={
                 "type": "object",
@@ -187,7 +191,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="outbound_create",
             title="Create Outbound",
-            description="Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint. Returns: {id, item_id, quantity, warehouse_code}.",
+            description='Create an outbound record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.',
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -204,11 +208,15 @@ def get_tools() -> list[Tool]:
                         "description": "Warehouse code (e.g. WH001)",
                     },
                     "reason": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Reason for outbound (optional)",
                     },
+                    'doc_no': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'description': 'Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.'},
+                    'line_no': {'type': 'string', 'minLength': 1, 'maxLength': 64, 'description': 'Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.'},
+                    'factor': {'type': 'number', 'exclusiveMinimum': 0, 'default': 1, 'description': 'Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.'},
                 },
                 "required": ["item_id", "quantity", "warehouse_code"],
+                "dependentRequired": {"doc_no": ["line_no"], "line_no": ["doc_no"]},
             },
         ),
         Tool(

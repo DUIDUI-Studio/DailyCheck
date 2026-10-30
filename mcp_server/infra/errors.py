@@ -31,3 +31,14 @@ class NotFoundError(McpError):
 class ValidationError(McpError):
     def __init__(self, message: str) -> None:
         super().__init__("validation_error", message, 400)
+
+
+class WriteError(McpError):
+    """Business write outcome, serialized through the existing MCP error envelope."""
+
+    def __init__(self, code: str, message: str, http_status: int = 409, **details) -> None:
+        super().__init__(code, message, http_status)
+        self.details = details
+
+    def to_dict(self) -> dict:
+        return {**super().to_dict(), **self.details}

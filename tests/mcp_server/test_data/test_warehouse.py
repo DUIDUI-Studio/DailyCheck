@@ -134,6 +134,7 @@ def test_create_restock_increases_quantity():
 
     # Create restock (use None to get default action='restock')
     restock_id = warehouse.create_restock(conn, 1, 5, None)
+    conn.commit()
 
     assert restock_id is not None
 
@@ -192,7 +193,8 @@ def test_list_restock_movements_reads_restock_requests():
     assert len(rows) == 3
     for row in rows:
         assert set(row) == {
-            "id", "item_id", "item_name", "quantity", "status", "reason", "created_at"
+            "id", "item_id", "item_name", "quantity", "status", "reason", "created_at",
+            "doc_no", "line_no", "input_quantity", "factor"
         }
     # created_at DESC —— 最新入库在前
     assert [r["created_at"] for r in rows] == [
@@ -354,6 +356,9 @@ def create_restock_requests_table(conn: sqlite3.Connection) -> None:
         "id INTEGER PRIMARY KEY, item_id INTEGER, requested_quantity REAL, "
         "reason TEXT, status TEXT DEFAULT '提交', created_at TEXT)"
     )
+
+    for definition in ("doc_no TEXT", "line_no TEXT", "input_quantity TEXT", "factor TEXT NOT NULL DEFAULT '1'"):
+        conn.execute("ALTER TABLE restock_requests ADD COLUMN " + definition)
 
 
 def create_production_runs_table(conn: sqlite3.Connection) -> None:

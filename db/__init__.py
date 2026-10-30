@@ -1533,10 +1533,18 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 #   v5 → products.is_hidden（配方归档：有生产记录的产品不可删，改隐藏；
 #        列表默认隐藏、管理员可切换，2026-10-25）
 #   v6 → stock_movements.op_no（多仓履约发货/收货回链）
-WAREHOUSE_SCHEMA_VERSION = 6
+#   v7 → document line identity/conversion and permanent write journal (#87)
+WAREHOUSE_SCHEMA_VERSION = 7
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
+    """Upgrade a validated warehouse, with per-stage backups and process locking."""
+    from db.warehouse_migrate import upgrade
+
+    upgrade(db_path)
+
+
+def _migrate_warehouse_baseline(db_path: Path) -> None:
     """Run idempotent column-add migrations on an EXISTING warehouse db.
 
     Version-gated: the first call on a db runs the full script and stamps
@@ -1550,7 +1558,7 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
     if not db_path.exists():
         return
     with closing(sqlite3.connect(db_path)) as conn:
-        if conn.execute("PRAGMA user_version").fetchone()[0] >= WAREHOUSE_SCHEMA_VERSION:
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 6:
             return
         conn.executescript(WAREHOUSE_SCHEMA)
         movement_cols = {r[1] for r in conn.execute("PRAGMA table_info(stock_movements)")}
@@ -1716,5 +1724,55 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         )
         conn.commit()
         # Stamp the db so future calls short-circuit on the version read.
-        conn.execute(f"PRAGMA user_version = {WAREHOUSE_SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 6")
         conn.commit()
+
+
+
+def migrate_warehouse_document_columns(conn: sqlite3.Connection) -> None:
+    """Registered v7 helper; caller owns transaction and version stamp."""
+    columns = {
+        "doc_no": "TEXT DEFAULT NULL",
+        "line_no": "TEXT DEFAULT NULL",
+        "input_quantity": "TEXT DEFAULT NULL",
+        "factor": "TEXT NOT NULL DEFAULT '1'",
+    }
+    for table, index in (("restock_requests", "uq_restock_document_line"),
+                         ("outbound_requests", "uq_outbound_document_line")):
+        existing = {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        actual = {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name in columns:
+            col = actual[name]
+            if (col[2].upper() != "TEXT" or col[3] != int(name == "factor")
+                    or col[4] not in (("'1'",) if name == "factor" else (None, "NULL"))):
+                raise RuntimeError(f"incompatible document column: {table}.{name}")
+        sql = (f"CREATE UNIQUE INDEX {index} ON {table} "
+               "(doc_no COLLATE BINARY,line_no COLLATE BINARY) "
+               "WHERE doc_no IS NOT NULL AND line_no IS NOT NULL")
+        conn.execute(sql.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS"))
+        found = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (index,)).fetchone()
+        def normalize(value):
+            return "".join(value.split()).replace("IFNOTEXISTS", "")
+        if not found or normalize(found[0]) != normalize(sql):
+            raise RuntimeError(f"incompatible document index: {index}")
+    journal_sql = """CREATE TABLE document_write_keys (
+        direction TEXT NOT NULL CHECK(direction IN ('outbound','restock')),
+        doc_no TEXT COLLATE BINARY NOT NULL,
+        line_no TEXT COLLATE BINARY NOT NULL,
+        request_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        input_quantity TEXT NOT NULL,
+        factor TEXT NOT NULL,
+        effective_quantity TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(direction,doc_no,line_no),
+        UNIQUE(direction,request_id)
+    )"""
+    conn.execute(journal_sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
+    found = conn.execute("SELECT sql FROM sqlite_master WHERE name='document_write_keys'").fetchone()
+    if normalize(found[0]) != normalize(journal_sql):
+        raise RuntimeError("incompatible document journal")

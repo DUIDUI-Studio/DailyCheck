@@ -50,30 +50,13 @@ class TestCreateRestock:
         with pytest.raises(NotFoundError):
             create_restock(999, 10, "WH001", ctx)
 
-    @patch("mcp_server.service.inbound.check_warehouse")
-    @patch("mcp_server.service.inbound.resolve_warehouse")
-    @patch("mcp_server.service.inbound.warehouse_connection")
-    def test_create_restock_success(
-        self, mock_conn, mock_resolve, mock_check
-    ):
-        """测试成功创建入库记录"""
-        mock_check.return_value = True
-        mock_resolve.return_value = {"code": "WH001", "db_path": "/tmp/test.db"}
-
-        mock_context = MagicMock()
-        mock_context.__enter__ = MagicMock(return_value=mock_context)
-        mock_context.__exit__ = MagicMock(return_value=False)
-        mock_context.execute.return_value.fetchone.return_value = True
-        mock_context.execute.return_value.lastrowid = 123
-        mock_conn.return_value = mock_context
-
-        ctx = AuthContext(1, [], [], None)
-        result = create_restock(1, 10, "WH001", ctx, reason="test restock")
-
-        assert result["id"] == 123
-        assert result["item_id"] == 1
+    def test_create_restock_success(self, warehouse_db, monkeypatch):
+        monkeypatch.setattr(inbound_service, "resolve_warehouse",
+                            lambda code: {"code": code, "db_path": warehouse_db})
+        result = create_restock(1, 10, "WH001", AuthContext(1, [], [], None), "test restock")
+        assert type(result["id"]) is int
         assert result["quantity"] == 10
-        assert result["warehouse_code"] == "WH001"
+        assert list_restock("WH001", AuthContext(1, [], [], None))["items"][0]["id"] == result["id"]
 
 
 class TestListRestock:
@@ -105,7 +88,8 @@ class TestListRestock:
         mock_context.execute.return_value.fetchall.return_value = [
             {"id": 1, "item_id": 1, "item_name": "Item 1",
              "quantity": 10, "status": "入库", "reason": "restock",
-             "created_at": "2024-01-01"}
+             "created_at": "2024-01-01", "doc_no": None, "line_no": None,
+             "input_quantity": None, "factor": "1"}
         ]
         mock_context.execute.return_value.fetchone.return_value = {"total": 1}
         mock_conn.return_value = mock_context

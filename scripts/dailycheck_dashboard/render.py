@@ -29,7 +29,8 @@ class RenderInput:
     prs: list[dict] = field(default_factory=list)
     worktrees: list[dict] = field(default_factory=list)
     inbox_stats: dict = field(default_factory=dict)
-    reducer_state: dict = field(default_factory=dict)
+    # Issue 数据回退旧缓存时的 fetched_at（非空 → 页面标注「陈旧缓存」）
+    issues_stale_at: str = ""
     diff: dict | None = None  # 与上次快照的 KPI 差值（v1: {open_issues: +1, ...}）
     # 运维事实（ops_parse 采集；任一源失败留在 ops_unavailable 里，不阻塞整页）
     deploy_events: list[dict] = field(default_factory=list)
@@ -220,11 +221,10 @@ ${ops_css}
 
 <nav>
     <a href="#ops">① 交付看板</a>
-    <a href="#monitor">② 任务运行</a>
-    <a href="#issues">③ Issue 追踪</a>
-    <a href="#prs">④ PR 管线</a>
-    <a href="#worktrees">⑤ Worktree</a>
-    <a href="#inbox">⑥ Inbox 事件</a>
+    <a href="#issues">② Issue 追踪</a>
+    <a href="#prs">③ PR 管线</a>
+    <a href="#worktrees">④ Worktree</a>
+    <a href="#inbox">⑤ Inbox 事件</a>
 </nav>
 
 <div class="banner ${banner_class}">
@@ -261,16 +261,8 @@ ${ops_css}
 
 ${ops_html}
 
-<h2 id="monitor">
-    <span class="no">2</span>
-    任务运行监控 · 触发链组件
-    <span class="hint">PR webhook → inbox.jsonl → 生成快照</span>
-</h2>
-
-${reducer_cards}
-
 <h2 id="issues">
-    <span class="no">3</span>
+    <span class="no">2</span>
     Issue 追踪
     <span class="hint">Open ${open_issues_count} · 总 ${issues_total}</span>
 </h2>
@@ -278,7 +270,7 @@ ${reducer_cards}
 ${issues_html}
 
 <h2 id="prs">
-    <span class="no">4</span>
+    <span class="no">3</span>
     PR 管线
     <span class="hint">已合并（近 7 天）${merged_7d_count} · 未合并（CLOSED）${closed_unmerged_count} · 全部 ${prs_total}</span>
 </h2>
@@ -286,7 +278,7 @@ ${issues_html}
 ${prs_html}
 
 <h2 id="worktrees">
-    <span class="no">5</span>
+    <span class="no">4</span>
     Worktree 在用
     <span class="hint">${worktrees_count} 个</span>
 </h2>
@@ -294,7 +286,7 @@ ${prs_html}
 ${worktrees_html}
 
 <h2 id="inbox">
-    <span class="no">6</span>
+    <span class="no">5</span>
     Inbox 事件（dc-webhook-receiver 写入）
     <span class="hint">实时扫描 inbox.jsonl</span>
 </h2>
@@ -322,88 +314,6 @@ ${worktrees_html}
 # ============================================================
 # 渲染（按章节分块）
 # ============================================================
-def _render_reducer_monitor(reducer_state: dict, input: RenderInput) -> str:
-    """Render only facts available in reducer state; unavailable is not zero."""
-    dashboard_card = f"""
-    <div class="task ok">
-        <div class="th">
-            <span class="tn">📊 Dashboard · 本次渲染</span>
-            <span class="b ok">已渲染</span>
-        </div>
-        <div class="tm">触发：{_esc(input.trigger_kind)} · delivery={_esc((input.trigger_event_id or "—")[:16])}</div>
-        <div class="tl">HTML 快照 + SQLite 历史已由当前进程写入。</div>
-    </div>"""
-    if not reducer_state.get("available"):
-        return f"""
-<div class="tasks">
-    <div class="task warn">
-        <div class="th">
-            <span class="tn">🧭 Prod Agent reducer</span>
-            <span class="b miss">不可用</span>
-        </div>
-        <div class="tm">reducer 状态不可用，队列与 merge-ready 不显示为 0。</div>
-        <div class="tl">检查 reducer SQLite 路径与读取权限。</div>
-    </div>
-    {dashboard_card}
-</div>"""
-
-    queue = reducer_state.get("queue") or {}
-    pending = int(queue.get("pending", 0))
-    claimed = int(queue.get("claimed", 0))
-    done = int(queue.get("done", 0))
-    provider = reducer_state.get("provider") or {}
-    provider_state = str(provider.get("state") or "unknown")
-    cooldown_until_ms = provider.get("cooldown_until_ms")
-    cooldown_text = (
-        f"until {_ts_to_iso(cooldown_until_ms)} (cooldown_ms={cooldown_until_ms})"
-        if cooldown_until_ms
-        else "无 active cooldown"
-    )
-    merge_ready = reducer_state.get("merge_ready") or []
-    if merge_ready:
-        merge_rows = "".join(
-            (
-                f"<div>PR #{_esc(row.get('pr_number'))} · "
-                f"{_esc(str(row.get('head_sha') or '')[:8])} · "
-                f"{_esc(_ts_to_iso(row.get('ready_at_ms')))}</div>"
-            )
-            for row in merge_ready
-        )
-        merge_status = f'<span class="b ok">{len(merge_ready)} 个</span>'
-    else:
-        merge_rows = "<div>merge-ready PR 无记录</div>"
-        merge_status = '<span class="b miss">无记录</span>'
-
-    return f"""
-<div class="tasks">
-    <div class="task {'ok' if pending == 0 and claimed == 0 else 'pending'}">
-        <div class="th">
-            <span class="tn">🧭 Reducer queue</span>
-            <span class="b info">durable</span>
-        </div>
-        <div class="tm">pending {pending} · claimed {claimed} · done {done}</div>
-        <div class="tl">只有 MERGE_READY 与 deploy_result 进入 provider queue。</div>
-    </div>
-    <div class="task {'warn' if provider_state == 'open' else 'ok'}">
-        <div class="th">
-            <span class="tn">⚡ Hermes provider</span>
-            <span class="b {'warn' if provider_state == 'open' else 'ok'}">{_esc(provider_state)}</span>
-        </div>
-        <div class="tm">{_esc(cooldown_text)}</div>
-        <div class="tl">连续失败：{_esc(provider.get('consecutive_failures', '—'))}</div>
-    </div>
-    <div class="task {'ok' if merge_ready else 'pending'}">
-        <div class="th">
-            <span class="tn">✅ Current merge-ready</span>
-            {merge_status}
-        </div>
-        <div class="tm">来自 reducer pr_state 的当前事实。</div>
-        <div class="tl">{merge_rows}</div>
-    </div>
-    {dashboard_card}
-</div>"""
-
-
 def render(input: RenderInput) -> str:
     """主入口。返回完整 HTML 字符串。"""
     diff = input.diff or {}
@@ -437,10 +347,9 @@ def render(input: RenderInput) -> str:
     origin_main_short = (input.origin_main_sha or "—")[:8]
 
     # 章节 HTML
-    issues_html = _render_issues(input.issues)
+    issues_html = _render_issues(input.issues, stale_at=input.issues_stale_at)
     prs_html = _render_prs(input.prs)
     worktrees_html = _render_worktrees(input.worktrees)
-    reducer_cards = _render_reducer_monitor(input.reducer_state, input)
     ops_html = render_ops.render_ops_block(
         events=input.deploy_events,
         prs=input.prs,
@@ -485,7 +394,6 @@ def render(input: RenderInput) -> str:
     diff_merged=_diff_arrow(diff.get("merged_7d_total"), s.get("merged_7d_total", 0)),
     diff_wt=_diff_arrow(diff.get("worktrees_total"), s.get("worktrees_total", 0)),
     diff_closed=_diff_arrow(diff.get("closed_unmerged"), closed_unmerged),
-        reducer_cards=reducer_cards,
         trigger_kind=_esc(input.trigger_kind),
         trigger_event_id_short=_esc((input.trigger_event_id or "—")[:16]),
         html_path_display=_esc("snapshots/<id>.html + latest.html"),
@@ -546,13 +454,19 @@ def _count_merged_7d(prs: list[dict]) -> int:
 # ============================================================
 # 章节渲染
 # ============================================================
-def _render_issues(issues: list[dict]) -> str:
+def _render_issues(issues: list[dict], stale_at: str = "") -> str:
     open_issues = [i for i in issues if i.get("state") == "OPEN"]
     closed_recent = sorted(
         [i for i in issues if i.get("state") == "CLOSED" and i.get("closed_at")],
         key=lambda x: x.get("closed_at") or "",
         reverse=True,
     )[:5]
+    stale_note = (
+        f'<div class="issue warn"><div class="id">陈旧缓存 {_esc(stale_at)}'
+        "（Gitea 拉取失败，显示上次成功数据）</div></div>"
+        if stale_at
+        else ""
+    )
     if not open_issues:
         body = '<div class="issue warn"><div class="id">无 Open Issue</div></div>'
     else:
@@ -569,7 +483,7 @@ def _render_issues(issues: list[dict]) -> str:
             f'<div class="inner"><div class="tbl"><table><tr><th>#</th><th>标题</th><th>关闭日</th></tr>{rows}</table></div></div>'
             '</details>'
         )
-    return body + "\n" + details
+    return stale_note + body + "\n" + details
 
 
 def _render_issue_row(i: dict) -> str:

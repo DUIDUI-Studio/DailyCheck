@@ -16,7 +16,7 @@ Expected:
 {"status":"ok","checks":{"mcp_server":"ok","transport":"ok","db":"ok"}}
 ```
 
-If you see `401` instead, the server is up but the env var `DAILYCHECK_MCP_TOKEN` on the server side does not match the one you're sending. **Talk to the server admin before continuing.**
+If you see `401` instead, the transport middleware rejected the credential: either the server env `DAILYCHECK_MCP_TOKEN` (dev/legacy path) does not match, or the token was not found/revoked in the `agent_tokens` table (production path). **Talk to the server admin before continuing.**
 
 ---
 
@@ -27,16 +27,18 @@ The token must allow **only** what this integration needs. Required flags at tok
 ```bash
 flask create-agent-token <name> \
   --warehouses wh_001,wh_002        # only the warehouses this app reads
-  --read-paths consumption,inventory # only the tool namespaces it calls
+  --read-paths "/api/v1/items,/api/v1/movements"  # pure paths, no HTTP method prefix
 ```
 
 What each flag means:
 
 | Flag | Effect of over-permissioning | Recommended default |
 |---|---|---|
-| `--warehouses` | Reads/writes data for any warehouse the user has access to | explicit list |
-| `--read-paths` | Can call any tool | explicit list of namespace prefixes |
-| `--write-paths` | Can mutate state | **omit unless required** |
+| `--warehouses` | Omitting it stores `null` = every warehouse | explicit list |
+| `--read-paths` | Matching read tools beyond this integration's needs | explicit path patterns |
+| `--write-paths` | Can mutate state | **omit unless required**; pure paths such as `/api/v1/restock` |
+
+Path patterns are matched against the tool's logical path (`/api/v1/...`), never against `"METHOD /path"`. A non-wildcard pattern also matches its sub-paths, so `/api/v1/outbound` covers `/api/v1/outbound/rollback`.
 
 Self-test:
 ```bash
@@ -86,37 +88,31 @@ curl -sS https://mcp.example.com/health \
 
 ## 3. Idempotency for write tools
 
-Read tools (`items_list`, `warehouse_consumption`, `item_consumption`, …) are inherently idempotent. **Write tools are not.**
+Read tools are safe to retry. `restock_create` / `outbound_create` are idempotent
+when both `doc_no` and `line_no` are provided (warehouse v7, Issue #87); unkeyed
+calls still create a fresh record every time. Use the original source quantity
+and `factor` (default1), or base quantity and factor1, never both conversions.
 
-| Tool | Idempotent? | Risk if retried |
-|---|---|---|
-| `restock_create` | ❌ | duplicates inbound records → double-incremented stock |
-| `outbound_create` | ❌ | duplicate outbound → double-decremented stock + possible negative inventory |
-| `outbound_rollback` | partial — same `request_id` rolled back twice is a no-op the second time | OK to retry once |
+| Tool | Retry contract |
+|---|---|
+| keyed create | Same warehouse/direction/opaque doc_no/line_no and payload returns original ID, replayed=true/applied=false; zero additional stock/movements |
+| unkeyed create | Reconcile request/list after an unknown outcome; no automatic application retry |
+| outbound_rollback | Stored effective quantity returns at most once; repeat reports already_rolled_back, with no additional stock movement |
 
-For `restock_create` and `outbound_create`, the contract today offers **no idempotency-key field**. Until one is added, the only safe pattern is:
+Use caller namespace `<source>:<external_doc_no>`; the server accepts opaque
+strings without that prefix too. Preserve line leading zeros and original
+quantity/factor on retries. A changed payload conflicts even if the product is
+equal. Deleted keys remain consumed; rollback/deletion never licenses a new
+create for the same external line. Parse text JSON errors even at HTTP200 and
+isError=false. Cache failures with committed=true are already accounted for;
+keyed retry repairs invalidation while replaying, unkeyed retry_safe=false needs
+reconciliation. See [README contract](./README.md#document-line-writes-issue-87--warehouse-v7)
+and [business outcomes](./errors.md#document-write-outcomes-87).
 
-1. Track every outbound write by `(external_idempotency_key, dailycheck_request_id)` in your own DB.
-2. Before sending, check your table for the key.
-3. After the call lands, store the key + DailyCheck's response id.
-4. Retry only the network layer, not the application layer.
-
-Or, simpler: serialize all writes from this integration through a single-connection queue so retries don't fork.
-
-Self-test: send the same `outbound_create` twice with `idempotency_key=ABC`:
-
-```bash
-PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"outbound_create","arguments":{"warehouse_code":"wh_001","item_id":42,"quantity":1,"reason":"smoke-test-ABC"}}}'
-
-curl -sS -X POST "$DAILYCHECK_MCP_URL/api/mcp/" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Accept: application/json" -H "Content-Type: application/json" \
-  -d "$PAYLOAD"
-
-# Send it again — observe that two rows are created.
-```
-
-Until idempotency keys exist, **do not retry application-level writes**.
+Cutover is a Prod operation: stop old writers, durably reconcile historical set H
+and new set N, keep overlap/same-second/late-row evidence, quarantine unknown
+outcomes and stop the cursor there. Only N calls keyed create. Keep H and source
+checkpoints through code rollback or verified offline backup restoration.
 
 ---
 
@@ -197,6 +193,8 @@ recent = datetime.now(timezone(timedelta(hours=8))) - timedelta(days=7)
 - Error reports sent to Sentry / Bugsnag.
 - HTTP access logs (use `Authorization: Bearer <REDACTED>` filter at the proxy).
 
+The server's own `access.log` follows the same rule: it records only the request token id (`agent_token_id`), logical operation (`tools/call`), tool name, business status and duration — never the raw token, `Authorization` header, arguments or reason. See [README §7.1](./README.md#71-tool-call-audit-log-issue-85).
+
 If you write an MCP reverse proxy in front of the server, **strip the `Authorization` header before logging**. Nginx:
 
 ```nginx
@@ -251,4 +249,4 @@ All three must produce the same `serverInfo.name` and end with `Done.` (Python) 
 
 ---
 
-**Last verified**: tested against commit `fd8e87f` on `main`. The auth flow assumed here is the current **two-layer** model: middleware checks `Bearer == $DAILYCHECK_MCP_TOKEN` AND tool layer checks the same token's hash in `agent_tokens`. If the server changes this, all tests under §1 will fail loudly.
+**Last verified**: the auth flow assumed here is the transport model in [README §3](./README.md#3-authentication): the middleware accepts **either** a server-side `DAILYCHECK_MCP_TOKEN` env match (dev/legacy bypass) **or** a non-revoked `agent_tokens` row; the tool layer then consumes the request-scoped `AuthContext` rather than re-authenticating the same raw token. If the server changes this, all tests under §1 will fail loudly.

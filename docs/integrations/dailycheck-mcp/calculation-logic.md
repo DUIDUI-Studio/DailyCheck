@@ -37,14 +37,14 @@
 |------|------|
 | 原始表 | `items`, `restock_requests`, `stock_movements` |
 | 计算逻辑 | 1. INSERT `restock_requests`（status='入库'）<br>2. `items.quantity += qty`<br>3. INSERT `stock_movements(action='补货入库', delta=+qty)` |
-| 输出字段 | `id, item_id, quantity, warehouse_code` |
+| 输出字段 | `id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied` |
 
 ### outbound_create
 | 项目 | 说明 |
 |------|------|
 | 原始表 | `items`, `outbound_requests`, `stock_movements` |
 | 计算逻辑 | 1. 校验 `qty ≤ current_qty`（不足则拦截）<br>2. INSERT `outbound_requests`（status='出库', rolled_back=0）<br>3. `items.quantity -= qty`<br>4. INSERT `stock_movements(action='出库', delta=-qty)`<br>5. 失效 `procurement_cache` 中该品记录 |
-| 输出字段 | `id, item_id, quantity, warehouse_code` |
+| 输出字段 | `id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied` |
 
 ### outbound_rollback
 | 项目 | 说明 |
@@ -235,3 +235,24 @@ warehouse_turnover_value = Σ(各品 cogs_value) / Σ(各品 avg_inventory × un
 ```
 
 
+
+## 单据行写契约（#87）
+
+两个 create 的 `quantity` 均为 number（来源单位），`factor` 默认1。
+`effective_quantity = (Decimal(str(quantity)) * Decimal(str(factor))).quantize(0.01,
+ROUND_HALF_EVEN)`，局部精度覆盖输入位数；量化为0、非有限、溢出或 REAL 往返丢分位拒绝。
+例如库存100，1×10→90，重放仍90，rollback读stored requested_quantity归还10→100。
+`.25×1=.25`、`.125×10=1.25`、`1.005×1=1.00`、`1.015×1=1.02`。
+不调用 Web aux_to_base/grams_to_stock，不重复乘 factor。
+
+`BEGIN IMMEDIATE` / busy_timeout=5000 后才读键/库存；request、journal、items、
+movement 同事务 commit，data helper 不自行 commit。outbound 条件 UPDATE quantity>=量
+并核验 rowcount；唯一冲突整笔 rollback 后在新事务重查键，不吞其他 IntegrityError。
+按 warehouse/direction/doc_no/line_no 幂等；journal 主键跨物理删除永久保留，request
+部分唯一索引只覆盖非NULL身份。replay 比较 item/规范化原始量/factor/有效量，reason不参与。
+rollback、Web rollback/delete、restock status/delete 在同一写锁内读状态与决定，撤销最多一次。
+
+成功输出额外包含 doc_no/line_no/input_quantity/factor/status/rolled_back/replayed/applied。
+两个列表只增加4字段（input_quantity是字符串或null、factor是number），原total/信封/排序不变。
+历史/Web行不伪造输入量，保留NULL/'1'。outbound create/rollback 在warehouse提交释放锁后
+才失效master缓存；失败不补偿库存，带键重试仅重放并重试缓存失效。restock沿用原缓存政策。

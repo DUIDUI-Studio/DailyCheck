@@ -241,7 +241,7 @@ Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver`
 - **CLI 与 watcher 兼容**：`event_reducer.py ingest` 从 stdin 读一行并输出单行 JSON；`drain` 取一条 due work；`status` / `inspect --pr N` 分别做总体与单 PR 观测；`complete` / `fail` 只接受匹配 lease。shell 对 `suppress` 返回 0、对 `defer` 返回 75、对 `trigger` 用 stdlib sender 把原样 body、真实 event 头和稳定的语义 `X-GitHub-Delivery` 发到本地 Hermes route；sender 不跟随任何 3xx，避免把签名 body/header 转发到别处。HMAC secret 只从 `webhook_subscriptions.json` 的对应 route 读取且不回显，HTTP 2xx 入队后 complete 并返回 0。任何未消费失败返回非 0，watcher 原有 delivery-ID 安全和 timeout/backoff 行为不变。
 - **第二条 recovery 路径**：`dc-prod-agent-drain.{service,timer}` 每 30s 调 `dc-notify-prod-agent --drain`，只在 timer 启动后启用；它与 watcher 可并发但 SQLite claim 使其不会为同一 PR 产生第二个 active wake。timer 服务失败保持非 0，journal 可见，不会伪装成功。
 - **rollout**：前置是 `wdg-ci` 与 `dailycheck-deploy` route 可读（已有 `wdg-pr` secret 不需要移除或改写），且 `agent.gateway_timeout` 小于 20 分钟 lease；Gitea token 必须对 PR/status API 可读。部署 reducer/helper/adapter/sender/breaker 后跑 `event_reducer.py status`，用 synthetic opened→running→success→duplicate 验证零/零/一次/零 provider 调用，再观察 24h 的 pending/claimed 与 gate_reason。**rollback**：停用 drain 与 breaker timer，恢复上一版 adapter/sender/reducer，保留 SQLite 与 breaker cursor 供审计；不把 DB 当第二事件源，也不回写 inbox。
-- **测试**：`tests/test_merge_readiness.py` 覆盖 exact context 解析/匹配、open/head/mergeable、missing/running/failure、malformed response 与凭证 fail-closed；`tests/test_event_reducer.py` 覆盖生产 CLI 用真实 readiness client + fake curl 的 ready/not-ready 事件仓库流、PR 零 queue、旧 head lease 失效、非就绪静默、全绿一次 `MERGE_READY`、重复事件 suppress、watcher retry、deploy 保留、429 cooldown、RFC JSON/NaN、redaction、shell HTTP 与并发 drain。`tests/test_dashboard_reducer.py` 验证 dashboard 只读 reducer 投影及 unavailable 不伪零；`tests/test_provider_breaker.py` 继续覆盖 cooldown 与 secret 不落盘。
+- **测试**：`tests/test_merge_readiness.py` 覆盖 exact context 解析/匹配、open/head/mergeable、missing/running/failure、malformed response 与凭证 fail-closed；`tests/test_event_reducer.py` 覆盖生产 CLI 用真实 readiness client + fake curl 的 ready/not-ready 事件仓库流、PR 零 queue、旧 head lease 失效、非就绪静默、全绿一次 `MERGE_READY`、重复事件 suppress、watcher retry、deploy 保留、429 cooldown、RFC JSON/NaN、redaction、shell HTTP 与并发 drain。`tests/test_provider_breaker.py` 继续覆盖 cooldown 与 secret 不落盘。
 
 - **输入层损坏不崩（Issue #66 审核 H-1 / M-3 / L-6，2026-10-17 加固）**：① `WatcherState.load()` 的异常网从 `(OSError, json.JSONDecodeError)` 放宽为 `(OSError, ValueError, RecursionError)` —— 覆盖非 UTF-8 状态文件的 `UnicodeDecodeError`、`json.loads` 对 **>4300 位整数字面量**抛的 ValueError（`sys.get_int_max_str_digits()` 默认 4300，比 `float()` 的 309 位阈值更早触发）、超深嵌套 JSON 的 `RecursionError`；修复前三者直穿 `main()` → `Restart=always` 崩溃循环。② `_parse_record()` 的异常网同样放宽为 `(ValueError, RecursionError)` —— 单条含 >4300 位整数 / 超深嵌套的 inbox 行此前会让 `process_once` 抛出并**反复崩在同一行**（该行永远进不了 `bad_hashes`，故永不跳过）。③ `_delivery_id()` 拒绝**无法 UTF-8 编码**的 id（inbox 行里 `"\ud800"` 这类孤立代理字符能被 `json.loads` 解出，但 `print` / 状态写盘都会抛 `UnicodeEncodeError`）→ 按坏行处理（指纹去重 + `!r` 转义打印）。三处均与孪生副本 `deploy/scripts/dailycheck_dashboard_on_pr.py` 同口径；同 PR 另修两条同型缺陷：① 两侧 `action` 为 list / dict 等**不可哈希**值时 `x in frozenset` 抛 TypeError → 崩溃循环（M-1-r4，先判 `isinstance(action, str)`）；② `triggered:` 日志的 `pr_number` / `pr_head_sha` 未转义 → 代理字符值崩溃循环（H-1-r3，统一过 `_short()`）。`tests/test_inbox_watcher.py` 在同 PR 内由 38 用例扩至 84
 
@@ -253,7 +253,8 @@ Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver`
 - **核心包** `scripts/dailycheck_dashboard/`（dev 端，可 commit）：
   - `__main__.py`：CLI 三子命令 — `render`（拉数据 + 渲染 + 落 db）/ `history`（列最近 N 快照）/ `diff`（最近两次 KPI 对比）
   - `db.py`：SQLite 封装（`snapshots` 主表 + `issues_snapshot` / `prs_snapshot` / `worktrees_snapshot` 三个子表 + `schema_version` 幂等迁移；autocommit 模式 + WAL + `synchronous=NORMAL`）
-  - `fetchers.py`：**Gitea REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`limit=50` 最多 6 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 `/pulls` 的 state 只有 open/closed，「已合并」靠 `merged`/`merged_at` 判）。**不用 gh CLI**（Gitea 没有 gh）。地址按运行位置取（生产 `172.28.129.216:3000`、本机 `hub01:3000`），可用 `GITEA_API_BASE` 覆盖。仓库 private，**没有匿名兜底**：token 依次取 `GITEA_TOKEN` → `/root/.gitea-token` → `~/.config/gitea-token`，全无则抛 `FetchError`（宁可显性失败，也不返回空列表被读成「今日 0 个合并」）。⚠️ Gitea 时间戳带 `+08:00`，`_norm_ts` 必须真正换算成 UTC（截断补 `Z` 会让交付周期差 8 小时）。**Issue #56 起**另有 `fetch_reducer_state()` 用 `mode=ro` 直接读 reducer SQLite，投影 pending/claimed/done、provider state/cooldown 与 `pr_state.merge_ready_*`；不 import runtime reducer，DB 缺失/损坏时返回 `available=false`，页面明确显示不可用而不是伪报 0
+  - `fetchers.py`：**Gitea REST API 直连**（`/repos/{repo}/issues` 与 `/pulls`，`limit=50` 最多 6 页；字段驼峰/小写→snake_case 规范化；`state` 还原成 `OPEN`/`CLOSED`/`MERGED` 三值，因为 `/pulls` 的 state 只有 open/closed，「已合并」靠 `merged`/`merged_at` 判）。**不用 gh CLI**（Gitea 没有 gh）。地址按运行位置取（生产 `172.28.129.216:3000`、本机 `hub01:3000`），可用 `GITEA_API_BASE` 覆盖。仓库 private，**没有匿名兜底**：token 依次取 `GITEA_TOKEN` → `/root/.gitea-token` → `~/.config/gitea-token`，全无则抛 `FetchError`（宁可显性失败，也不返回空列表被读成「今日 0 个合并」）。⚠️ Gitea 时间戳带 `+08:00`，`_norm_ts` 必须真正换算成 UTC（截断补 `Z` 会让交付周期差 8 小时）。⚠️ **Issue/PR 过滤（Issue #98，2026-10-30 实测）**：Gitea 28.1.0 起 `/issues` 返回的**真 issue 也带 `pull_request` 键，值为 `null`**（PR 为 dict，旧版 Gitea 真 issue 不含该键）；判据必须是 `it.get("pull_request") is None`，用 `"pull_request" not in it` 会把真 issue 全剔成 `Open 0 · 总 0` 的假零
+  - `issues_cache.py`：Issue 列表**每日缓存**（`ISSUES_CACHE_TTL_SECONDS = 24h`，Owner 2026-10-30 降频拍板）。命中（`fetched_at` 距今 < TTL）直接用缓存、不发 Gitea 请求；过期/缺失则拉取，成功回写；**拉取失败但缓存存在（哪怕过期）→ 回退旧缓存并在 Issue 追踪卡标注「陈旧缓存 <fetched_at>」**（拉不到 ≠ 没有，不显示假零）；拉取失败且无缓存 → 抛 `FetchError` 走既有降级。缓存文件 `/var/lib/dailycheck-dashboard/issues_cache.json`（`--issues-cache` 可覆盖），结构 `{"fetched_at": "<ISO8601>", "issues": [...]}`；open_issues KPI / diff / 告警阈值自动吃缓存后的数据
   - `render.py`：HTML 渲染（`string.Template` 内嵌 CSS，零三方依赖，KPI 卡片差异行用 `↑N` / `↓N` / `→` 三态箭头）
   - **零三方依赖**：纯 stdlib（`sqlite3` / `subprocess` / `json` / `urllib` / `pathlib` / `string.Template`）
 - **触发 listener** `deploy/scripts/dailycheck_dashboard_on_pr.py`（VPS 端，systemd 拉起）：订阅 `inbox.jsonl`，收到 PR 事件（`{opened,synchronize,reopened}`）→ 调 `python -m scripts.dailycheck_dashboard render --trigger-kind pr_xxx --trigger-event-id <delivery_id>`。**与 `dc-inbox-watcher` 完全独立、互不干扰**（各自一份 handled_ids state-file；同一 inbox.jsonl 多读者，写者只有 receiver）。⚠️ 该脚本是 `scripts/prod_agent/inbox_watcher.py` 的**同源孪生副本**（退避语义、状态归一化规则共享，默认参数与触发方式有意不同）——**任一侧改动必须同步另一侧**，历史上出现过「一侧修、另一侧漏」的单侧漂移（Issue #51 → #66）。⚠️ **孪生口径已收口（2026-10-17，Issue #66 收口 #51）**：规则 7（损坏状态归一化 + 留痕 + `sane_ahead` 上界）现已**两侧同时落地**——本侧首发，孪生侧 `inbox_watcher.py` 随同一 PR 补齐（`_sane_next` / `_normalize_failure` / `_str_set` / `_next_at` / `_attempts` / `retry_due` / `state.sane_ahead`，主循环 gating 同为 `sig != last_sig or retry_due(state)`）。收口背景（按**实测**记录）：Issue #51 的修复分支（`6b70183`）只有 `retry_due` + `_next_at`，**不含** `_normalize_failure` / `_sane_next` / `_str_set` / `sane_ahead`——8 种条目级损坏形态与 3 种容器级形态**全部零 WARNING**，即「合并 #51 并不等于孪生侧收口」；故 owner 于 2026-10-17 拍板由 #66 统一收口，**#51 已关闭（not planned，留收口说明）**，本 PR 为该缺陷族唯一落点。⚠️ **修复前的风险口径（不得低估）**：在役 `dc-inbox-watcher` 对**非数值 / 溢出** `next` 是**抛异常崩溃**（`next="x"` → `ValueError`、`next=10**309` → `OverflowError`；`state.save()` 不执行 → 条目永久留在状态文件 → `Restart=always` 永久崩溃循环），「静默锁死」只描述**有限但越界**（如 `1e308`）这一种形态——两者现已同时关闭
@@ -262,6 +263,7 @@ Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver`
 **数据布局**：
 - **SQLite db**（VPS）：`/var/lib/dailycheck-dashboard/dashboard.db` —— 单文件、`synchronous=NORMAL` 适配 flush 频次
 - **HTML 快照**（VPS）：`/var/lib/dailycheck-dashboard/snapshots/<id>.html` + `/var/lib/dailycheck-dashboard/latest.html`（latest 同步刷新供 nginx / curl 读）
+- **Issue 缓存**（VPS）：`/var/lib/dailycheck-dashboard/issues_cache.json`（在 unit 的 `ReadWritePaths` 之下）
 - **dev 副本**（可选）：脚本 `--db` / `--html-dir` / `--html-latest` 参数全部可覆盖；Mac 本地手动跑也走同一份代码
 - **dashboard.html 不入 git**：`.gitignore` 已隐式 ignore `reports/` 整目录，dev 端手写产物天然不污染 git history
 
@@ -294,6 +296,8 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 - **handled_ids 独立 state**：dashboard trigger 用 `dashboard_trigger_state.json`（与 inbox-watcher 的 `inbox_watcher_state.json` 物理隔离），同一 delivery_id 各自去重
 - **退避重试**：触发非 0 / 超时 → 指数退避（2s→120s 封顶，比 inbox-watcher 的 1s→60s 更宽容，因 render 偶尔慢）+ WARNING 留痕，绝不静默丢弃。**退避到期自身即驱动一轮处理（Issue #66 修复）**：主循环的 `process_once` 触发条件 =「inbox 文件签名变化 **或** `retry_due(state)`」—— 重试不写 inbox（receiver 单向 append-only），签名不会变，只看签名会让失败条目在下一条新事件到来前永不重试。**损坏状态在 `TriggerState.load()` 边界一次性归一化并留痕**（`_normalize_failure` / `_sane_next` / `_str_set`，全模块唯一口径；上界 `sane_ahead` 存在状态对象上，归一化点与使用点共用）：`next` 非数值 / `None` / `±inf` / `NaN` / ≥309 位整数（`float()` 抛 **OverflowError**，不是 ValueError）/ 负数 / 超出 `now + sane_ahead` → 一律钳制为 `0.0`（等价「已到期」，下一轮重试后自愈重写）；`n` 非数值 / 越界（>1024）/ ±inf / 负数 → 归 `0`；**容器级**损坏（`failures` 不是对象、`handled_ids`/`bad_hashes` 不是列表、集合含非字符串元素）→ 归一为合法形态；非 dict 的条目值丢弃。**凡发生钳制或丢弃（条目级与容器级）都打一条 `state 损坏` WARNING**（不静默——否则运维无法从 journal 区分「状态正常」与「损坏但被静默降级」；`handled_ids` 静默清空会导致同一 delivery 被重复触发）。退避时长用 `math.ldexp` 计算，天文位数的 `n`（`10**18` / `int(1e300)`，旧式 `base * 2**(n-1)` 实测挂死 >8s / >5min）直接封顶 `retry_max`。归一化的异常网必须覆盖 `OSError` + `ValueError`（含 `json.JSONDecodeError`、非 UTF-8 字节的 `UnicodeDecodeError`、`json.loads` 对 **>4300 位整数字面量**抛的 ValueError）+ `RecursionError`（超深嵌套 JSON）；同一异常网也用于 `_parse_record()`（inbox 行，否则单条畸形行会让服务反复崩在同一行）；**一切来自状态文件 / inbox 的键值进日志前必须 `repr` 转义**（孤立代理字符原样 `print` 抛 `UnicodeEncodeError`，那又是一条直穿 `main()` → systemd 崩溃循环的路径）
 - **run-as-unit**：单实例（Type=simple，inbox append-only 无并发需求）；`MemoryMax=512M`（dashboard render 子进程 + gh 子进程峰值）
+
+**任务运行监控面板移除（2026-10-30，Owner 拍板，Issue #98）**：页面不再渲染「触发链组件 / reducer queue / Hermes provider / merge-ready / Dashboard · 本次渲染」整块；随之删除 `fetchers.fetch_reducer_state`、`RenderInput.reducer_state`、`--reducer-db` CLI 参数与 `tests/test_dashboard_reducer.py`（Inbox 事件 KPI 卡 `fetch_inbox_stats` 保留）。生产沙箱（WAL + `ProtectSystem=strict`）下 reducer 读取失败的问题**因此不修**。
 
 **响应式排版（2026-10-16 起，手机 / iPad 适配）**：
 - 产物为**单文件自包含 HTML**，内嵌 CSS 三档断点：**≤480px 小屏手机** / **≤760px 手机**（KPI 2 列、任务卡单列、nav 单行横滚、字号与留白收紧、`env(safe-area-inset-bottom)` 防 iPhone 底栏遮挡）/ **≤1024px 平板档**（iPad 竖屏仅留白微调，KPI 保持 4 列桌面布局）
@@ -848,6 +852,8 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
 
+**PR1 不直接开放 MCP 的设计依据（历史阶段）**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。PR1 机器人只暴露 9 项 LLM schema（v1 是 6 个只读函数）+ 4 个旧名兼容实现，查询连接固定 `mode=ro`，七项 canonical 写一律禁止 bot 执行——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。**唯一例外**是 #78 D4 批准的三写（`restock_create` / `outbound_create` / `outbound_rollback`），在 PR1 阶段它是有条件、尚不可执行的未来能力，不改变 `mode=ro` 查询边界，详见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+
 **MCP 接入边界（Issue #80 PR2）**：依据 [Owner #78 comment 714](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-714)（选项 [635](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-635)，审计 [634](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-634)）复用原 14 + 八读共 22 项 MCP handler；五自有与四旧名保留，共 31 个可配置名称。动态展示仍是 MCP 注册集合 + 五自有；发现新工具不会授予执行权限。七个 canonical 写禁止，`get_price` 隐藏。唯一写例外是 `restock_create` / `outbound_create` / `outbound_rollback`，必须通过下述护栏；提示词不作为授权依据。
 
 **链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
@@ -880,6 +886,8 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `get_item_consumption` | 「最近消耗了多少」原来完全答不了。数据在 `stock_movements`，**按动作取 `SUM(-delta)`**（出库 / 门店订货出库 / 总仓调货出库），补货入库和出库回退是正数，混进来会把消耗抵消掉 |
 | `list_orders` | 订单在 `master.db` 的 `store_orders`，原来没接。返回带 `{BASE}/store-ordering/orders/<id>` 链接——群里只给订单号等于没给 |
 | `get_project_help` | 「你能干什么」由模型自由发挥时格式每次都不一样。改成固定文案（`bot/help_text.py`）原样转发 |
+
+> **口径提醒（Issue #78）**：上表是 **bot 已实现的读取函数**（dispatch 10 项，其中 `get_price` 不在 LLM schema、保持隐藏）。LLM 实际 schema 是 9 项（`bot/tool_schema.py`）；展示层由实时 MCP 注册 29 项 + 五自有 = 34 主行构成，四个旧名作为子条目挂在父 MCP 行下，**展示不等于执行**。批准边界、九项故障回退与三写限定例外见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 两个数据侧的坑写在这里，免得下次又踩：
 
@@ -935,6 +943,8 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | **认证成功、心跳正常，但员工发消息毫无反应** | 长连接被腾讯侧掐断（`no close frame received or sent`），断连窗口内到达的消息**直接丢失**——长连接模式企微不存离线消息，也没有补拉接口。心搏 `lastsnd` 仍每 30s 归零，**看着完全健康** | 只能重启进程/重连恢复。排查口诀：`journalctl` 里搜不到「提问」就是消息没到进程，先看有无断连记录，**不要先怀疑凭证和配置** |
 
 **测试**（`tests/bot/`，99 用例）：工具层（只读边界拒绝三种写 / 仓名容错 / 跨仓汇总 / 售价缺失语义 / 停用品项不可见 / 主数据停用不可见）、数字对账（多精度变体容差 / 阈值边界 / 年份与百分数排除 / 顺序去重）、结果裁剪（保持合法 JSON / 砍不动时明确报错）、凭证装载与 @ 前缀剥离。
+
+**运行契约（Issue #78 / #88，2026-10-30 起）**：Owner 按 [comment 714](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-714) 采纳 D1–D7。展示集合 `D(t)=get_tools()∪五自有` 动态计算（当前 34 主行），四旧名挂父 MCP 子条目；执行集合仍是已实现 schema ∩ 消息配置快照 ∩ 身份/范围。七项 canonical 写只展示、默认 off、不可执行；D4 仅批准 `restock_create` / `outbound_create` / `outbound_rollback` 三写作有条件例外：PR1 不可执行，#80 PR2 接入上述独立护栏通道，生产启写仍需真实身份与范围策略核实；查询连接仍 `mode=ro`。八读由 #80 接入并逐项验收，`replenishment_board` 由 #81 承接。完整契约见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ---
 
@@ -1388,19 +1398,30 @@ erDiagram
 ```mermaid
 flowchart LR
     Start["get_warehouse_db()<br/>每个请求调"] --> ReadVersion{"PRAGMA<br/>user_version<br/>>= WAREHOUSE_SCHEMA_VERSION?"}
-    ReadVersion -->|Yes| Skip["跳过（单次 PRAGMA 读）"]
+    ReadVersion -->|Yes| Skip["跳过（只读目标/版本检查）"]
     ReadVersion -->|No| Migrate["migrate_warehouse_db_columns()<br/>PRAGMA table_info 守卫<br/>+ idempotent ALTER<br/>+ 创建索引"]
-    Migrate --> Stamp["PRAGMA user_version = 6"]
+    Migrate --> Stamp["legacy ≤6 → registered v7<br/>BEGIN IMMEDIATE + stamp + commit"]
     Stamp --> Skip
 ```
 
-- **`WAREHOUSE_SCHEMA_VERSION = 6`**，改了 ALTER 块必须 bump。
+- **`WAREHOUSE_SCHEMA_VERSION = 7`**，改了 ALTER 块必须 bump。
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前注册表到 **v3**（`bot_agent_config`，Issue #79）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v6**（含多仓履约/路由播种/收货协议；本次不改）。
 
 ---
+
+**warehouse v7（Issue #87）**：独立 `migrations/warehouse.py:WAREHOUSE_MIGRATIONS`
+（不进入 master MIGRATIONS/v6），`db/warehouse_migrate.py` 为显式单仓 status/up/down 入口，
+必须传 `--db`；禁止用 master 的 `flask migrate --db <warehouse> up`。
+统一 wrapper 校验既有文件/warehouse表/future版，realpath相邻 flock 保护 SQLite API热备
+（integrity_check，backups/migrations）及两阶段升级：旧幂等baseline最多stamp6，再由注册项
+在 BEGIN IMMEDIATE 中添加doc_no/line_no/input_quantity/factor、部分唯一索引和永久journal，
+同事务stamp7。v7失败全回滚；旧baseline可能留部分DDL，可重试补齐。v7 down安全拒绝，
+首选保留schema/data的代码回退；备份恢复只在Prod协调停写与来源checkpoint后执行。
+MCP warehouse_connection非只读路径在connect/yield前调wrapper，无需Web预热，mode=rw拒绝静默建空库；bot显式read_only路径不触发迁移，直接mode=ro打开已初始化仓库，保留查询零写入边界；
+master_connection不迁移warehouse。软链共享真实路径锁，绿副本独立迁移；已v7不重复备份/ALTER。
 
 ## 5. 应用层模块图
 
@@ -1475,6 +1496,10 @@ flowchart TB
 
 ---
 
+Web单据撤销/删除接线（#87）：outbound rollback/delete、restock status/delete 从读取
+状态开始取同一warehouse BEGIN IMMEDIATE锁，成功commit；异常及early return显式rollback。
+新增MCP身份不进入Web表单，Web新行仍保留NULL身份/input和factor默认1。
+
 ## 6. 蓝图依赖关系
 
 **Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
@@ -1534,6 +1559,9 @@ flowchart LR
 
 ---
 
+MCP与Web单据写路径通过同一SQLite写锁协调（#87），不新增蓝图依赖。
+request物理删除只撤销库存/流水，不删除永久journal，避免后续MCP重放复活。
+
 ## 7. 请求生命周期
 
 ### 7.1 Web（Cookie 会话）
@@ -1578,6 +1606,7 @@ sequenceDiagram
     participant ASGI as Starlette (uvicorn)
     participant MW as AuthMiddleware
     participant T as MCP Tool Handler
+    participant L as access.log (JSONL)
     participant DB as SQLite
 
     A->>ASGI: POST /api/mcp/ {jsonrpc:2.0, method:"tools/call", params:{name:"outbound_create", arguments:{...}}}
@@ -1599,8 +1628,12 @@ sequenceDiagram
     T->>T: check_path(ctx, method, path)
     T->>DB: 业务查询（read 或 write）
     DB-->>T: 行数据
+    T->>L: finally: write_mcp_access_log(token_id, tool_name, status, duration_ms)
+    L-->>T: 写入失败静默忽略（不改变响应）
     T-->>A: JSON-RPC result
 ```
+
+**工具调用审计（Issue #85）**：`protocol/server.py::call_tool` 在 `finally` 中为每次进入该路由的调用追加恰好一条 JSONL 记录。`status` 是业务结果（成功 200 / `McpError.http_status` / 未知工具 400 / 非预期异常 500），不是 HTTP 传输状态；`agent_token_id` 取自 AuthMiddleware 发布的请求级 `AuthContext`，缺失时为 `null`，绝不回退到进程 env token 重新认证。日志写入失败被吞掉，handler 不会重跑。未进入 `call_tool` 的 401/429、SDK 参数校验、`initialize` / `tools/list` 仍只有传输层日志。细节见 §9.5。
 
 ### 7.3 跨库发货提交协议（2026-10-29，多仓履约 Task 5）
 
@@ -1829,7 +1862,7 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -1933,6 +1966,23 @@ flowchart LR
 > 此前读 `stock_movements` 且过滤 `action='restock'`，而入库流程写入的是 `action='补货入库'`，
 > 因此该工具恒返回空数组。写路径（`restock_create`）未改动；分页信封见上方 Issue #74 契约。
 
+**单据行写契约（Issue #87）**：restock_create/outbound_create 保持原required三字段，quantity均number；
+reason后新增keyword-only doc_no/line_no/factor（默认1）。doc/line成对、不接受显式null，保留大小写/
+前导零；doc_no为opaque字符串，`<source>:<external_doc_no>`是调用方约定，不强制前缀。
+Decimal局部context计算来源quantity×factor，仅一次2dp HALF_EVEN，拒绝非正/非有限/REAL丢分位。
+requested_quantity仍存基础有效量；新MCP保存规范化input_quantity/factor，历史/Web保持NULL/'1'。
+两request表部分唯一索引（非NULL doc+line）及document_write_keys主键(direction,doc_no,line_no)
+共同保护，同事务写request/journal/items/movement；journal跨物理删除永久保留、不回填reason。
+service BEGIN IMMEDIATE + busy_timeout=5000后读键/库存，出库条件UPDATE quantity>=量并核验rowcount；
+data不commit；UNIQUE异常rollback后新事务重查，其他完整性异常不吞。相同载荷replay返回原id，
+replayed=true/applied=false；变更item/原始量/factor即409，reason不覆盖。回滚重放不复活，删除后409。
+发布的tools.json与运行时注册项的工具描述逐字一致，由schema契约回归钉住。
+create额外返回doc_no/line_no/input_quantity/factor/status/rolled_back/replayed/applied；
+list只增加doc_no/line_no/input_quantity（字符串或null）/factor（number），#72/#74信封/total/排序不变。
+MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁内判状态。
+warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
+retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
+
 ### 9.3 双传输模式
 
 | 模式 | 入口 | 鉴权 | 用途 |
@@ -1965,6 +2015,27 @@ flowchart TB
     ACL -->|Yes| Exec[执行业务]
     ACL -->|No| Forbidden[403 ForbiddenError]
 ```
+
+### 9.5 工具调用审计（access.log，Issue #85）
+
+`mcp_server/protocol/server.py::call_tool` 已接通既有的 `infra/access_log.py::write_mcp_access_log`。每次**实际进入** `call_tool` 的调用在 `finally` 中追加恰好一条 JSONL 记录到 `BASE_DIR/access.log`；handler 只执行一次。
+
+| 字段 | 值 / 语义 |
+|------|-----------|
+| `ts` | UTC ISO-8601 时间戳 |
+| `agent_token_id` | 请求级 `AuthContext.token_id`；无已认证上下文为 `null`。不从进程 env token 重新认证，避免串号 |
+| `path` | 固定 `/api/mcp/`（MCP 层无 HTTP path 语义） |
+| `method` | 固定 `tools/call` |
+| `status` | 业务结果：成功 `200`、`McpError.http_status` 原值（如 400/401/403/404）、未知工具 `400`、非预期异常 `500`。**HTTP 传输状态不参与判定** |
+| `duration_ms` | 单调时钟计算的毫秒耗时，非负 |
+| `tool_name` | 可选扩展字段；未知工具也会记录，长度上限 128 字符 |
+
+边界与隐私：
+
+- 只覆盖进入工具层的 `tools/call`。401/429 在 `AuthMiddleware` 提前返回、SDK 参数校验拒绝、`initialize` / `tools/list` 均**不**产生该记录，仍走既有 uvicorn/传输日志。
+- 记录只含上述元数据；不写 raw token、token hash、`Authorization`、arguments、`reason`、异常堆栈或响应内容。未知工具名经 `json.dumps` 转义并限长，不会注入多条物理日志行。
+- `write_mcp_access_log` 内部吞掉所有异常；`call_tool` 再兜一层，日志失败不会改变既有响应、不会重放业务。
+- 回归：`tests/test_mcp_access_log.py`（根目录，CI 可收集）。真实生产文件路径不在测试中写入，测试用临时路径替换 `_ACCESS_LOG_PATH`。
 
 ---
 
@@ -2352,9 +2423,16 @@ flowchart LR
 
 ## 12. 测试架构
 
+Issue #87 根目录 `test_mcp_document_writes.py` / `test_warehouse_document_migrations.py`
+覆盖旧位置调用、小数、HALF_EVEN与REAL精度边界、重放/冲突/删除后不复活、4写故障注入、
+提交后缓存故障、SQLite条件UPDATE、multiprocessing.Barrier+独立连接的create和Web/MCP撤销竞争；
+新库/旧v0/4/5/6/部分列/无Web预热首读首写、软链竞态、目标隔离、热备/恢复和down拒绝。
+8项临时变异分别杀死journal唯一性、锁前库存读取、data提前commit、重复factor、HALF_UP、
+跳过MCP预迁移、提前stamp以及删除清journal。MCP小夹具也走真实完整仓库迁移。
+
 Issue #72 的入库读链路回归：`tests/mcp_server/test_data/test_warehouse.py` 用
 `restock_requests` 播种 N>1 条（`status` 覆盖 `'入库'` 与 `'提交'`），锁
-`list_restock_movements` 返回 N 条、七字段齐全（`id` / `item_id` / `item_name` /
+`list_restock_movements` 返回 N 条、原七字段齐全（#87额外增加四个身份/换算字段）（`id` / `item_id` / `item_name` /
 `quantity` / `status` / `reason` / `created_at`）、`created_at DESC`；另有一条
 「`restock_requests` 为空但 `stock_movements` 存在 `action='restock'` 流水行时返回空」
 锁定数据源已切换。`tests/mcp_server/test_service/test_inbound.py` 与
@@ -2378,6 +2456,14 @@ Issue #47 的研发配方页回归在 `tests/test_recipe_bom_delete.py`（20 例
 删除往返 / AJAX 拒绝返 ok:false / AJAX 成功返 ok:true / 重复原料整批回滚并指明第几行 /
 正常保存不误伤 / 保存表单不再提交 bom_delete[] / 新建撞重复不留半保存配方」。
 详见 §13.13。
+
+Issue #85 的工具调用审计回归放在根目录 `tests/test_mcp_access_log.py`（CI 可收集，
+不进 `tests/mcp_server/`）：通过 `build_server()` 注册的真实 `call_tool` 路由覆盖成功
+读/写、McpError 403/400、未知工具 400、非预期异常 500；断言每次进入路由恰一条 JSONL、
+`agent_token_id` 来自请求级 `AuthContext`、`duration_ms >= 0`、失败状态不冒充
+`status=200`，以及日志不含 token/`Authorization`/arguments/reason。测试用临时路径替换
+`_ACCESS_LOG_PATH`，不写生产 `access.log`。变异验证：临时去掉 writer 调用后 10/12 用例转红
+（保留的 2 例分别是直接调用 writer 的兼容性用例与「写日志失败不影响响应」用例，符合预期）。
 
 ```mermaid
 flowchart TB
@@ -2485,7 +2571,7 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 ### 13.1 Schema 迁移
 
 - ✅ 任何新列**只**加到 `migrate_warehouse_db_columns()`，**不**进 `WAREHOUSE_SCHEMA`（tests 断言）
-- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 5）
+- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 7）
 - ✅ master.db 任何 schema 变更同步进 `init_master_db()`，否则 prod 首请求 `no such column`
 - ✅ `init_master_db()` 用 `fcntl.flock` 保护 gunicorn 多 worker
 
@@ -2509,6 +2595,9 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 
 - 所有数量用 `Decimal` + 2dp 量化（`_helpers.parse_qty` / `fmt_qty`）
 - float 会被 `0.1+0.2=0.30000000000000004` 污染
+- MCP单据行只按来源量×factor一次HALF_EVEN，rollback读取stored requested_quantity；
+  不复用Web辅单位除法。键跨rollback/delete永久保留；Prod切换需持久H/N互斥清单，
+  未知结果隔离不推进游标，历史reason不自动认领，代码回退期间停止新sync。
 
 ### 13.5 主数据铁律
 
@@ -2675,6 +2764,8 @@ with app.test_client() as c, c.session_transaction() as s:
 **验收证据**：[`2026-10-30-bot-mcp-pr2-validation.md`](2026-10-30-bot-mcp-pr2-validation.md)；关键临时库矩阵位于 `tests/bot/test_mcp_integration.py`，实际请求捕获位于 `test_agent_requests.py`（均不在 CI 忽略的 tests/mcp_server 中）。
 
 
+**与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，PR1 阶段不可执行；#80 PR2 实现三写护栏，生产未核实真实 userid 或未配置写范围时仍拒写。D2 八读、三写护栏与 D7 显式启用由 #80 实现，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
@@ -2739,6 +2830,7 @@ with app.test_client() as c, c.session_transaction() as s:
 ### 集成
 
 - `docs/integrations/dailycheck-mcp/` — MCP 接入文档 + examples
+- [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md) — Bot 工具运行契约（#78 批准口径：D1–D7、三写限定例外、PR1 / #80 / #81 阶段）
 
 ### 工作记忆
 
