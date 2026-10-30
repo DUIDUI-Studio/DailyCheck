@@ -69,3 +69,13 @@ Owner D3 明确排除七写：`canonical_create/canonical_update/canonical_claim
 ## 生产交接
 
 主站/MCP 代码与依赖按标准候选部署流程验证。bot 不在蓝绿流程内，生产侧需人工同步 `/opt/dailycheck-bot` 的 bot/MCP/业务复用模块与独立 venv 依赖，主站部署成功不能证明 bot 生效。Owner 真实 userid、受信范围策略与审计日志写权限是启写前置；未核实时保持拒写。八读由管理员逐项显式启用，六个 canonical 读须核定全局信息授权；观察写回执/审计、白名单热加载、mode=ro、依赖导入与单 BotID 单连接。补货看板预测不在本 PR，归 #81。
+
+## 独立 Review BLOCKER 修复（第二轮候选）
+
+首轮 Reviewer 对 `759a9dd` 的八项门禁给出 PASS，唯一 BLOCKER 是相对数据库路径：旧 bot 按 `db_dir().parent`、MCP 按 CWD、canonical 按代码根解释同一个 `db/warehouses/*.db`，独立 bot 布局下出现硬失败或静默空 bindings。此前 22 项对账只覆盖绝对元数据路径；该覆盖缺口已补齐。
+
+- 新增共享纯 resolver `warehouse_paths.resolve_warehouse_path`，bot 的显式读上下文及最小写上下文均携带 `warehouse_base_dir=db_dir().parent`；旧工具、MCP UoW、无缓存采购与 canonical bindings 共用解析规则。绝对路径保留，非 bot 的默认 CWD/BASE_DIR 行为保留，不靠生产 WorkingDirectory 掩盖。
+- 新临时库回归把数据根、代码根、CWD 分开，master 中播种 CLI 标准相对值 `db/warehouses/wh_a.db`；CWD 另放库存为 900 的同名诱饵库。22 项批准工具全部实调通过，库存读为目标库的 100；三写各自变为 103/96/102，诱饵库仍为 900；canonical bindings 保持两仓且只读调用的递归三库字节快照不变。缺失 wh_b 时 canonical_detail 明确失败、不创建文件，不再静默部分返回。
+- 已同步更新的 origin/main（多仓履约与评估账本）。最新 MCP 订单范围采用参与仓谓词；旧 list_orders 的行与状态汇总复用同一谓词，保留近 N 天与链接接口，避免头仓不再参与履约时通过旧接口绕过限制。新增头仓与实际来源仓不一致的拒绝回归。
+- 第二轮 bot 定向 **268 passed**。相关 MCP/管理/服务专项 **295 passed、2 个相同既有失败**。原四项权限/只读变异重新检出，另加入相对写库根、canonical 根、缺库静默跳过、旧订单参与仓四项变异，共八项 exit 1；恢复源码后测试通过。同步 main 后最终全量为 **3017 passed / 14 failed（258.87s）**，失败集合仍与开工基线逐名一致，known_failures 门禁 exit 0；全部改动 Python Ruff 零告警、arch_map 与 diff 检查通过。
+- 审计结果故障提示改为返回副本，避免原地修改 service 结果。Prod 须核对 bot 实际加载的审计模块位置与日志归属：若模块同步至 `/opt/dailycheck-bot`，日志默认为 `/opt/dailycheck-bot/admin_audit.log`；主站通常为 `/root/DailyCheck/admin_audit.log`，不能假定二者同文件，需分别核对追加权限、轮转和观察责任。

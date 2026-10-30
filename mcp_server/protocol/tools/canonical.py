@@ -84,7 +84,7 @@ def canonical_detail_impl(args: dict, *, ctx=None) -> dict:
     ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical/<id>"):
         raise ForbiddenError("forbidden_path")
-    return svc_detail(canonical_id, read_only=ctx.read_only)
+    return svc_detail(canonical_id, read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir)
 
 
 def canonical_categories_impl(args: dict, *, ctx=None) -> list[dict]:

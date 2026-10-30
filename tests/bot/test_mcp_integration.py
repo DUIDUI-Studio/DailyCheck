@@ -72,7 +72,7 @@ def call(name, args, config, access):
 
 
 def snapshot(path):
-    return {p.name: p.read_bytes() for p in path.glob("*.db")}
+    return {str(p.relative_to(path)): p.read_bytes() for p in path.rglob("*.db")}
 
 
 ARGS = {
@@ -427,3 +427,84 @@ def test_legacy_date_cutoff_keeps_midnight_boundary_without_negative_delta_filte
     old, _ = call('get_item_consumption', {'sku_or_name': 'F1', 'days': 30}, config, sender())
     assert old['total_consumed'] == 24  # 20 + cutoff 5 - positive action delta 1.
     assert old['by_warehouse'][0]['movement_count'] == 3
+
+
+@pytest.fixture
+def relative_db(setup_db, monkeypatch):
+    """Production shape: separate code/CWD/data roots and CLI-standard metadata."""
+    import shutil
+
+    import config
+    import db
+    import mcp_server.data.unit_of_work as uow
+
+    root = setup_db / 'data-root'
+    data = root / 'db'
+    warehouses = data / 'warehouses'
+    warehouses.mkdir(parents=True)
+    for source in setup_db.glob('*.db'):
+        source.rename(data / source.name if source.name == 'master.db' else warehouses / source.name)
+    master = data / 'master.db'
+    with sqlite3.connect(master) as conn:
+        for code in ('wh_a', 'wh_b'):
+            conn.execute('UPDATE warehouses SET db_path=? WHERE code=?', (f'db/warehouses/{code}.db', code))
+    cwd = setup_db / 'bot-working-directory'
+    decoys = cwd / 'db' / 'warehouses'
+    decoys.mkdir(parents=True)
+    for source in warehouses.glob('*.db'):
+        shutil.copyfile(source, decoys / source.name)
+        with sqlite3.connect(decoys / source.name) as conn:
+            conn.execute('UPDATE items SET quantity=900')
+    code_root = setup_db / 'bot-code'
+    code_root.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv('DAILYCHECK_DB_DIR', str(data))
+    monkeypatch.setattr(config, 'BASE_DIR', code_root)
+    monkeypatch.setattr(config, 'MASTER_DB', master)
+    monkeypatch.setattr(db, 'MASTER_DB', master)
+    monkeypatch.setattr(uow, 'MASTER_DB', master)
+    return data, decoys
+
+
+@pytest.mark.parametrize('name', sorted(MCP_NAMES))
+def test_relative_paths_use_bot_data_root_for_all_approved_tools(relative_db, name):
+    data, decoys = relative_db
+    config = cfg(data, **{f'tool.{n}': 1 for n in EXTRA_READS})
+    access = sender(warehouses=None, global_read=True)
+    before = snapshot(data)
+    result, payload = call(name, ARGS[name], config, access)
+    assert payload is not None and result.get('ok') is not False, result
+    if name not in WRITE_PATHS:
+        assert snapshot(data) == before
+    if name in ('items_list', 'items_detail'):
+        assert payload['items'][0]['current_stock'] == 100
+    if name == 'canonical_detail':
+        assert payload['bound_warehouse_count'] == 2
+        assert {row['warehouse_code'] for row in payload['bindings']} == {'wh_a', 'wh_b'}
+    with sqlite3.connect(data / 'warehouses' / 'wh_a.db') as conn:
+        quantity = conn.execute('SELECT quantity FROM items WHERE id=1').fetchone()[0]
+    assert quantity == {'restock_create': 103, 'outbound_create': 96, 'outbound_rollback': 102}.get(name, 100)
+    with sqlite3.connect(decoys / 'wh_a.db') as conn:
+        assert conn.execute('SELECT quantity FROM items WHERE id=1').fetchone()[0] == 900
+
+
+def test_relative_canonical_missing_warehouse_fails_instead_of_reporting_zero_bindings(relative_db):
+    data, _ = relative_db
+    config = cfg(data, **{'tool.canonical_detail': 1})
+    (data / 'warehouses' / 'wh_b.db').unlink()
+    result, payload = call('canonical_detail', {'canonical_id': 1}, config, sender(warehouses=None, global_read=True))
+    assert payload is None and 'warehouse database missing: wh_b' in result['message']
+    assert not (data / 'warehouses' / 'wh_b.db').exists()
+
+
+def test_legacy_order_rows_and_totals_follow_current_routed_participant_policy(setup_db):
+    config = cfg(setup_db, **{'tool.store_order_list': 1})
+    with sqlite3.connect(setup_db / 'master.db') as conn:
+        conn.execute("UPDATE store_orders SET dc_warehouse_code='wh_a' WHERE id=2")
+        conn.execute("INSERT INTO store_order_items (order_id, canonical_id, quantity, unit, source_warehouse_code, created_at) VALUES (2, 1, 3, '箱', 'wh_b', datetime('now'))")
+    old, _ = call('list_orders', {}, config, sender())
+    current, _ = call('store_order_list', {}, config, sender())
+    assert old['count'] == sum(old['status_summary'].values()) == current['total'] == 1
+    assert [order['order_no'] for order in old['orders']] == ['O1']
+    other, _ = call('list_orders', {}, config, sender(warehouses=('wh_b',)))
+    assert [order['order_no'] for order in other['orders']] == ['O2']

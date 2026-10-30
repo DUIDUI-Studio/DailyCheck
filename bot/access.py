@@ -25,10 +25,12 @@ class SenderAccess:
     identity_verified: bool = False
 
     def read_context(self) -> AuthContext:
+        from bot.tools import db_dir
+
         return AuthContext(
             token_id=0, allowed_read_paths=list(self.read_paths), allowed_write_paths=[],
             allowed_warehouses=None if self.warehouses is None else list(self.warehouses),
-            read_only=True,
+            read_only=True, warehouse_base_dir=str(db_dir().parent),
         )
 
 

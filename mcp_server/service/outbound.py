@@ -49,7 +49,7 @@ def create_outbound(
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], base_dir=ctx.warehouse_base_dir) as conn:
         if not item_exists(conn, item_id):
             raise NotFoundError("item_not_found")
         # Check stock
@@ -87,7 +87,7 @@ def list_outbound(
         raise NotFoundError("warehouse_not_found")
     limit = parse_limit(limit)
     offset = parse_offset(offset)
-    with warehouse_connection(wh["db_path"], read_only=ctx.read_only) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         items = _list_outbound(conn, limit=limit, offset=offset)
         total = _count_outbound(conn)
     return {
@@ -112,7 +112,7 @@ def rollback_outbound(
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], base_dir=ctx.warehouse_base_dir) as conn:
         try:
             req = _rollback_outbound(conn, request_id)
         except ValueError as e:

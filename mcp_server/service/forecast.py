@@ -43,7 +43,7 @@ def get_forecast(
     horizon = parse_horizon(horizon_days)
     if horizon is None:
         raise ValidationError("invalid_horizon")
-    with warehouse_connection(wh["db_path"], read_only=ctx.read_only) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         if not item_exists(conn, item_id):
             raise NotFoundError("not_found")
         movements = fetch_item_movements_30d(conn, item_id)

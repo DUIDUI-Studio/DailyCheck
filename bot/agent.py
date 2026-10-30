@@ -298,7 +298,7 @@ def _run_tool(
         except OSError:
             logger.exception("工具审计结果追加失败：%s", detail)
             if isinstance(result, dict):
-                result["audit_warning"] = "审计结果追加失败，请管理员核对 attempt 与服务日志"
+                result = {**result, "audit_warning": "审计结果追加失败，请管理员核对 attempt 与服务日志"}
     return _to_tool_text(result if isinstance(result, dict) else {"items": result}), payload
 
 

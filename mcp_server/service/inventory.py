@@ -31,7 +31,7 @@ def list_items(warehouse_code: str, ctx: AuthContext) -> list[dict]:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"], read_only=ctx.read_only) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         return _list_items(conn)
 
 
@@ -40,7 +40,7 @@ def get_item(item_id: int, warehouse_code: str, ctx: AuthContext) -> dict:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"], read_only=ctx.read_only) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         item = _get_item(conn, item_id)
     if item is None:
         raise NotFoundError("not_found")
@@ -52,7 +52,7 @@ def list_movements(warehouse_code: str, ctx: AuthContext) -> list[dict]:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"], read_only=ctx.read_only) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         return _list_movements(conn)
 
 

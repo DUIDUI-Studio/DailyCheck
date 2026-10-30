@@ -112,14 +112,16 @@ def list_canonical(
     }
 
 
-def get_canonical_detail(canonical_id: int, *, read_only: bool = False) -> dict:
+def get_canonical_detail(
+    canonical_id: int, *, read_only: bool = False, base_dir: str | None = None,
+) -> dict:
     """单条主数据 + 别名 + 跨仓绑定概览。"""
     with master_connection(read_only=read_only) as conn:
         try:
             detail = cp.get_canonical_item_detail(conn, int(canonical_id))
         except ValueError as e:
             raise NotFoundError(str(e)) from None
-        bindings = cp.collect_bindings(conn, warehouse_types=cp.BINDING_ALL_TYPES, read_only=read_only)
+        bindings = cp.collect_bindings(conn, warehouse_types=cp.BINDING_ALL_TYPES, read_only=read_only, base_dir=base_dir)
     matching: list[dict] = []
     for wh_code, rows in bindings.items():
         for r in rows:

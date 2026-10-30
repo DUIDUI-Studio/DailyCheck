@@ -45,7 +45,7 @@ def execute(name: str, args: dict, config: BotAgentConfig, sender: SenderAccess)
             raise ForbiddenError("forbidden_path: 没有此写路径权限")
         if not isinstance(warehouse, str) or not warehouse or not check_warehouse(read_ctx, warehouse):
             raise ForbiddenError("forbidden_warehouse: 没有此仓库权限")
-        ctx = AuthContext(0, [], [path], [warehouse])
+        ctx = AuthContext(0, [], [path], [warehouse], warehouse_base_dir=read_ctx.warehouse_base_dir)
     else:
         if not (check_path(read_ctx, "GET", path) or (
             name.startswith("store_order_") and check_path(read_ctx, "GET", path + "/")

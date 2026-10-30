@@ -866,6 +866,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 **查询只读边界与三写限定例外**：
 
 1. `bot/tools.py` 仍只有查询，SQLite 连接仍 `file:...?mode=ro`；MCP 查询显式传 `AuthContext(allowed_write_paths=[], read_only=True)`，UoW 也以 `mode=ro` 打开，禁止查询触发迁移/缓存写入。库初始化和迁移归应用生命周期；缺库不创建。
+   `warehouse_paths.resolve_warehouse_path` 是仓库元数据路径的共享解析器：bot 读/最小写上下文显式携带 `warehouse_base_dir=db_dir().parent`，UoW、无缓存采购与 canonical bindings 都用此根解析相对路径，和旧 bot 工具一致，不依赖进程 CWD 或代码根。绝对路径保持原值；HTTP/stdio 未传根时保留原有行为。canonical 只读详情遇到缺失仓库库明确失败，不静默返回零绑定。
 2. `bot/mcp_tools.py` 只允许固定批准池；原三写须先通过消息快照开关、可信 frame userid 白名单、部署策略路径/仓范围检查，然后才构造仅含本次路径与单仓的写上下文。无 MCP 进程 token/遗留 ContextVar 继承，不 patch `resolve_ctx`。
 3. 每次写调用先落审计 attempt（日志不可写则不执行），完成或拒绝后记录 who/tool/args/result/duration；最终回复追加真实结果回执，模型摘要不能省略。七项 canonical 写始终无 bot schema/adapter。
 
@@ -1851,7 +1852,7 @@ flowchart LR
 
 ### 9.2 29 个 MCP 工具
 
-**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。消费 handler 原缺路径检查由 bot adapter 的固定路径矩阵补齐；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
+**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 原缺路径检查由 bot adapter 的固定路径矩阵补齐；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
@@ -2473,7 +2474,7 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 去掉 limit clamp / 数据层忽略 offset）均实测打红对应用例。该文件同样落在 `tests/`
 根目录，CI 会跑。
 
-**Bot PR2（Issue #80）**：`tests/bot/test_mcp_integration.py` 覆盖 22 项 schema→dispatch→临时库真实调用、19 读路径 ACL、全局读显式授权、三写允许/拒绝/并发/回执/审计、只读 SQLite 拒绝误写、缺库不创建、旧消费口径与父子开关；`test_agent_requests.py` 捕获 restock 关闭及八读逐项启停的真实请求构造。隔离 bot venv 不装入主站；四个权限/只读变异均由定向测试检出。
+**Bot PR2（Issue #80）**：`tests/bot/test_mcp_integration.py` 覆盖 22 项 schema→dispatch→临时库真实调用、19 读路径 ACL、全局读显式授权、三写允许/拒绝/并发/回执/审计、只读 SQLite 拒绝误写、缺库不创建、旧消费口径与父子开关；`test_agent_requests.py` 捕获 restock 关闭及八读逐项启停的真实请求构造。隔离 bot venv 不装入主站；权限/只读及相对路径、缺库、参与仓范围变异均由定向测试检出。
 
 **Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。CI 的 `--ignore=tests/mcp_server` 不影响这些文件。
 
@@ -2665,10 +2666,10 @@ with app.test_client() as c, c.session_transaction() as s:
 
 - `D = get_tools()` 实时注册名 + bot 五自有；34 是当前快照，不是永久行数。未知注册项展示待确认且不能执行。
 - 批准 MCP 池固定在 `bot/tool_contract.py`：原 14 + 八读（19 读、3 写），另保留四旧名和五自有；schema 从 MCP 注册项复用、参数拒绝额外字段，派发只取批准名。七个 canonical 写和 get_price 即使配置 on 仍拒绝。
-- 正常配置原 14（含三写）与旧九项默认 on，新增八读默认 off。实际请求 tools 和入口共用同一条消息的一次配置快照；入口另外落实可信发送者、路径与仓范围。父 off 阻断旧名，子名仍保留独立偏好/计数。配置和部署策略修改均在下一条消息生效，不改正在处理的快照。
+- 正常配置原 14（含三写）与旧九项默认 on，新增八读默认 off。实际请求 tools 和入口共用同一条消息的一次配置快照；入口另外落实可信发送者、路径与仓范围。父 off 阻断旧名，子名仍保留独立偏好/计数。订单旧名的行与状态总数复用当前 MCP 参与仓谓词（无明细存量单才回退头仓），不能绕过多仓履约的范围限制。配置和部署策略修改均在下一条消息生效，不改正在处理的快照。
 - 配置失败回退**固定旧九只读 + medium、空写白名单**，不从扩大后的 schema 推导回退集；degraded 也不能绕过 sender ACL。所有读上下文的 `allowed_write_paths=[]`。
 - `get_item_consumption` 保留 1–365 days、动作流水与日期 cutoff；MCP `item_consumption` 保留固定窗口、未回滚业务单据含生产领料/镜像去重口径。不可静默替换，也不可用 item_forecast/shortage 代替补货看板预测。
-- 采购查询复用 `compute_store_procurement`/`aggregate_hub`，通过显式只读参数绕过初始化及缓存写；hub 在聚合前按授权仓过滤。canonical 详情只读收集 bindings，不做迁移；六个 canonical 读仍为全局数据，必须全局显式授权，不伪称按仓裁切。
+- 采购查询复用 `compute_store_procurement`/`aggregate_hub`，通过显式只读参数绕过初始化及缓存写；hub 在聚合前按授权仓过滤。canonical 详情只读收集 bindings，不做迁移；仓库相对路径由上下文的受信数据根统一解析，缺库明确失败；六个 canonical 读仍为全局数据，必须全局显式授权，不伪称按仓裁切。
 - 审计复用 `append_admin_audit`，who 是可信 frame userid；每次调用记录工具/参数/真实结果或拒绝/耗时。写前 attempt 失败则不执行；写后结果审计失败保留真实回执并记录服务日志供核对。计数仍为 `bot_tool_calls.log`，不写业务库。
 
 **验收证据**：[`2026-10-30-bot-mcp-pr2-validation.md`](2026-10-30-bot-mcp-pr2-validation.md)；关键临时库矩阵位于 `tests/bot/test_mcp_integration.py`，实际请求捕获位于 `test_agent_requests.py`（均不在 CI 忽略的 tests/mcp_server 中）。

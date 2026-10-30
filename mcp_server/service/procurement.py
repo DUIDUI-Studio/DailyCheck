@@ -6,6 +6,7 @@ from mcp_server.data.master import list_all_warehouses, resolve_warehouse
 from mcp_server.data.unit_of_work import master_connection
 from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
 from mcp_server.service.auth import AuthContext, check_warehouse
+from warehouse_paths import resolve_warehouse_path
 
 
 def _get_store_procurement_json():
@@ -25,7 +26,7 @@ def procurement_store(warehouse_code: str, ctx: AuthContext) -> dict:
     store_func = _get_store_procurement_json()
     if store_func is None:
         raise NotFoundError("procurement_not_available")
-    body = _readonly_store(warehouse_code) if ctx.read_only else store_func(warehouse_code)
+    body = _readonly_store(warehouse_code, ctx) if ctx.read_only else store_func(warehouse_code)
     if body is None:
         raise NotFoundError("warehouse_not_found")
     return body
@@ -49,13 +50,13 @@ def procurement_hub(
     for wh in whs:
         if wh is None or not check_warehouse(ctx, wh["code"]):
             continue
-        body = _readonly_store(wh["code"]) if ctx.read_only else store_func(wh["code"])
+        body = _readonly_store(wh["code"], ctx) if ctx.read_only else store_func(wh["code"])
         if body:
             result.append(body)
     return aggregate_hub(result)
 
 
-def _readonly_store(warehouse_code: str) -> dict | None:
+def _readonly_store(warehouse_code: str, ctx: AuthContext) -> dict | None:
     """Thin no-cache adapter; schema initialization remains an app lifecycle action."""
     from datetime import datetime, timezone
 
@@ -70,7 +71,8 @@ def _readonly_store(warehouse_code: str) -> dict | None:
         ).fetchone()
     values = (int(row["cover_days"]), float(row["min_absolute"])) if row else (14, 0.0)
     items = compute_store_procurement(
-        warehouse_code, wh["db_path"], config_values=values, read_only=True,
+        warehouse_code, str(resolve_warehouse_path(wh["db_path"], ctx.warehouse_base_dir)),
+        config_values=values, read_only=True,
     )
     for item in items:
         item.pop("_computed_at", None)

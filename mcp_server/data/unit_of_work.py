@@ -6,6 +6,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 
 from mcp_server.config import MASTER_DB
+from warehouse_paths import resolve_warehouse_path
 
 
 @contextmanager
@@ -20,8 +21,11 @@ def master_connection(*, read_only: bool = False) -> Generator[sqlite3.Connectio
 
 
 @contextmanager
-def warehouse_connection(db_path: str, *, read_only: bool = False) -> Generator[sqlite3.Connection, None, None]:
+def warehouse_connection(
+    db_path: str, *, read_only: bool = False, base_dir: str | None = None,
+) -> Generator[sqlite3.Connection, None, None]:
     """warehouse DB 连接，row_factory = Row。"""
+    db_path = resolve_warehouse_path(db_path, base_dir)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) if read_only else sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:

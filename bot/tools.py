@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp_server.service.auth import AuthContext, check_warehouse
+from warehouse_paths import resolve_warehouse_path
 
 # 与 reports_health_pure._visible_items_clause 保持一致：
 # 停用行 + 主数据停用行都不对外展示。这里内联一份常量，避免为四个只读查询
@@ -57,8 +58,7 @@ def _connect_ro(path: Path) -> sqlite3.Connection:
 
 def _resolve_path(stored: str) -> Path:
     """``warehouses.db_path`` 可能是相对路径，相对 BASE_DIR 解析。"""
-    path = Path(stored)
-    return path if path.is_absolute() else _base_dir() / path
+    return resolve_warehouse_path(stored, _base_dir())
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -652,9 +652,12 @@ def list_orders(status: str | None = None, days: int = 7, limit: int = 20, *, ct
     scope_params: list[Any] = []
     if ctx is not None and ctx.allowed_warehouses is not None:
         codes = ctx.allowed_warehouses
-        marks = ",".join("?" for _ in codes)
-        scope_sql = f" AND (store_warehouse_code IN ({marks}) OR dc_warehouse_code IN ({marks})) "
-        scope_params = [*codes, *codes]
+        # Use the current MCP participant policy; a routed order's header DC
+        # must not bypass the permissions of its actual source warehouses.
+        from mcp_server.service.store_order import _visibility_params, _visibility_sql
+
+        scope_sql = f" AND {_visibility_sql('o', len(codes))} "
+        scope_params = _visibility_params(codes)
         sql += scope_sql
         params.extend(scope_params)
     if status:
@@ -667,8 +670,8 @@ def list_orders(status: str | None = None, days: int = 7, limit: int = 20, *, ct
         with _connect_ro(master) as conn:
             rows = conn.execute(sql, params).fetchall()
             counts = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM store_orders "
-                "WHERE created_at >= date('now', ?) " + scope_sql + " GROUP BY status",
+                "SELECT o.status, COUNT(*) AS n FROM store_orders o "
+                "WHERE o.created_at >= date('now', ?) " + scope_sql + " GROUP BY o.status",
                 [f"-{days} day", *scope_params],
             ).fetchall()
     except sqlite3.Error as exc:
