@@ -817,7 +817,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
 
-**为什么不走 MCP**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人只暴露 6 个只读函数，**工具集里没有写能力**——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。
+**为什么不走 MCP**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人当前只暴露 9 项 LLM schema（v1 是 6 个只读函数）+ 4 个旧名兼容实现，查询连接固定 `mode=ro`，七项 canonical 写一律禁止 bot 执行——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。**唯一例外**是 #78 D4 批准的三写（`restock_create` / `outbound_create` / `outbound_rollback`），它是有条件、当前不可执行的未来能力，不改变 `mode=ro` 查询边界，详见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 **链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
 
@@ -845,6 +845,8 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `get_item_consumption` | 「最近消耗了多少」原来完全答不了。数据在 `stock_movements`，**只算负向动作**（出库 / 门店订货出库 / 总仓调货出库），补货入库和出库回退是正数，混进来会把消耗抵消掉 |
 | `list_orders` | 订单在 `master.db` 的 `store_orders`，原来没接。返回带 `{BASE}/store-ordering/orders/<id>` 链接——群里只给订单号等于没给 |
 | `get_project_help` | 「你能干什么」由模型自由发挥时格式每次都不一样。改成固定文案（`bot/help_text.py`）原样转发 |
+
+> **口径提醒（Issue #78）**：上表是 **bot 已实现的读取函数**（dispatch 10 项，其中 `get_price` 不在 LLM schema、保持隐藏）。LLM 实际 schema 是 9 项（`bot/tool_schema.py`）；展示层由实时 MCP 注册 29 项 + 五自有 = 34 主行构成，四个旧名作为子条目挂在父 MCP 行下，**展示不等于执行**。批准边界、九项故障回退与三写限定例外见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 两个数据侧的坑写在这里，免得下次又踩：
 
@@ -898,6 +900,8 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | **认证成功、心跳正常，但员工发消息毫无反应** | 长连接被腾讯侧掐断（`no close frame received or sent`），断连窗口内到达的消息**直接丢失**——长连接模式企微不存离线消息，也没有补拉接口。心搏 `lastsnd` 仍每 30s 归零，**看着完全健康** | 只能重启进程/重连恢复。排查口诀：`journalctl` 里搜不到「提问」就是消息没到进程，先看有无断连记录，**不要先怀疑凭证和配置** |
 
 **测试**（`tests/bot/`，99 用例）：工具层（只读边界拒绝三种写 / 仓名容错 / 跨仓汇总 / 售价缺失语义 / 停用品项不可见 / 主数据停用不可见）、数字对账（多精度变体容差 / 阈值边界 / 年份与百分数排除 / 顺序去重）、结果裁剪（保持合法 JSON / 砍不动时明确报错）、凭证装载与 @ 前缀剥离。
+
+**运行契约（Issue #78 / #88，2026-10-30 起）**：Owner 按 [comment 714](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-714) 采纳 D1–D7。展示集合 `D(t)=get_tools()∪五自有` 动态计算（当前 34 主行），四旧名挂父 MCP 子条目；执行集合仍是已实现 schema ∩ 消息配置快照 ∩ 身份/范围。七项 canonical 写只展示、默认 off、不可执行；D4 仅批准 `restock_create` / `outbound_create` / `outbound_rollback` 三写作有条件例外，**当前不可执行**，查询连接仍 `mode=ro`。八读由 #80 接入并逐项验收，`replenishment_board` 由 #81 承接。完整契约见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ---
 
@@ -1619,7 +1623,7 @@ flowchart TB
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，只暴露 6 个只读函数——不要为了「复用」把 MCP 的写工具接进对话链路。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，当前只暴露 9 项 LLM schema（查询连接 `mode=ro`），七项 canonical 写禁止 bot 执行；#78 D4 批准的三写只是有条件、当前不可执行的未来例外——不要为了「复用」把 MCP 的写工具接进对话链路。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -2387,6 +2391,8 @@ with app.test_client() as c, c.session_transaction() as s:
 
 **回归**：见 §12 的五个测试文件；关键断言做过变异验证（把 `_tool_schemas_for` 改回全量、把 `_run_tool` 的 allowed 检查删掉、把顶层 `reasoning_effort` 塞进 messages、把非法值回退改成保留半套开关，分别会打红对应用例）。
 
+**与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，**当前不可执行**。D2 八读、三写护栏与 D7 显式启用归 #80，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
@@ -2451,6 +2457,7 @@ with app.test_client() as c, c.session_transaction() as s:
 ### 集成
 
 - `docs/integrations/dailycheck-mcp/` — MCP 接入文档 + examples
+- [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md) — Bot 工具运行契约（#78 批准口径：D1–D7、三写限定例外、PR1 / #80 / #81 阶段）
 
 ### 工作记忆
 
