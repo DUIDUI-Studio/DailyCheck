@@ -348,6 +348,10 @@ class TestLevelsAndOthers:
                 id INTEGER PRIMARY KEY, status TEXT, created_at TEXT,
                 delivered_at TEXT, dc_warehouse_code TEXT,
                 store_warehouse_code TEXT);
+            -- 参与仓谓词（跨仓单按行来源仓命中；本用例订单无明细行 → 头仓兜底）
+            CREATE TABLE store_order_items (
+                id INTEGER PRIMARY KEY, order_id INTEGER,
+                source_warehouse_code TEXT);
         """)
         conn.execute("INSERT INTO store_orders (status, created_at, delivered_at,"
                      " dc_warehouse_code) VALUES ('pending', ?, NULL, 'wh_x')",
@@ -652,6 +656,10 @@ class TestTimestampTolerance:
                 id INTEGER PRIMARY KEY, status TEXT, created_at TEXT,
                 delivered_at TEXT, dc_warehouse_code TEXT,
                 store_warehouse_code TEXT);
+            -- 参与仓谓词（跨仓单按行来源仓命中；本用例订单无明细行 → 头仓兜底）
+            CREATE TABLE store_order_items (
+                id INTEGER PRIMARY KEY, order_id INTEGER,
+                source_warehouse_code TEXT);
         """)
         conn.execute("INSERT INTO store_orders (status, created_at, delivered_at,"
                      " dc_warehouse_code) VALUES ('delivered', ?, ?, 'wh_x')",
@@ -688,6 +696,10 @@ class TestTimestampTolerance:
                 id INTEGER PRIMARY KEY, status TEXT, created_at TEXT,
                 delivered_at TEXT, dc_warehouse_code TEXT,
                 store_warehouse_code TEXT);
+            -- 参与仓谓词（跨仓单按行来源仓命中；本用例订单无明细行 → 头仓兜底）
+            CREATE TABLE store_order_items (
+                id INTEGER PRIMARY KEY, order_id INTEGER,
+                source_warehouse_code TEXT);
         """)
         conn.execute("INSERT INTO store_orders (status, created_at, delivered_at,"
                      " dc_warehouse_code) VALUES ('delivered', ?, ?, 'wh_x')",

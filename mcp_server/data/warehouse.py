@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import sqlite3
+from decimal import Decimal
 
 
 def list_items(conn: sqlite3.Connection) -> list[dict]:
@@ -82,6 +83,11 @@ def create_restock(
     item_id: int,
     quantity: float,
     reason: str | None,
+    *,
+    doc_no: str | None = None,
+    line_no: str | None = None,
+    input_quantity: str | None = None,
+    factor: str = "1",
 ) -> dict:
     """Create inbound restock: INSERT restock_requests + update stock.
 
@@ -91,21 +97,31 @@ def create_restock(
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cur = conn.execute(
         """INSERT INTO restock_requests
-           (item_id, requested_quantity, reason, status, created_at)
-           VALUES (?, ?, ?, '入库', ?)""",
-        (item_id, quantity, reason or "", now),
+           (item_id, requested_quantity, reason, status, created_at,
+            doc_no, line_no, input_quantity, factor)
+           VALUES (?, ?, ?, '入库', ?, ?, ?, ?, ?)""",
+        (item_id, quantity, reason or "", now, doc_no, line_no, input_quantity, factor),
     )
     req_id = int(cur.lastrowid)
-    conn.execute(
+    if doc_no is not None:
+        conn.execute(
+            """INSERT INTO document_write_keys
+               (direction,doc_no,line_no,request_id,item_id,input_quantity,factor,
+                effective_quantity,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            ("restock", doc_no, line_no, req_id, item_id, input_quantity, factor,
+             format(Decimal(str(quantity)), ".2f"), reason or "", now),
+        )
+    updated = conn.execute(
         "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
         (quantity, now, item_id),
     )
+    if updated.rowcount != 1:
+        raise ValueError("item_stock_update_failed")
     cur2 = conn.execute(
         """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
            VALUES (?, '补货入库', ?, ?, ?)""",
         (item_id, quantity, f"补货记录#{req_id}入库", now),
     )
-    conn.commit()
     return {"id": req_id, "movement_id": cur2.lastrowid}
 
 
@@ -133,14 +149,19 @@ def list_restock_movements(
     rows = conn.execute(
         """SELECT r.id, r.item_id, i.name AS item_name,
                   r.requested_quantity AS quantity, r.status, r.reason,
-                  r.created_at
+                  r.created_at, r.doc_no, r.line_no, r.input_quantity,
+                  r.factor
            FROM restock_requests r
            LEFT JOIN items i ON i.id = r.item_id
            ORDER BY r.created_at DESC, r.id DESC
            LIMIT ? OFFSET ?""",
         (limit, offset),
     ).fetchall()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    for item in items:
+        text = item["factor"]
+        item["factor"] = float(text) if "." in text else int(text)
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +173,11 @@ def create_outbound(
     item_id: int,
     quantity: float,
     reason: str | None,
+    *,
+    doc_no: str | None = None,
+    line_no: str | None = None,
+    input_quantity: str | None = None,
+    factor: str = "1",
 ) -> int:
     """Create an outbound request and deduct from stock.
 
@@ -161,21 +187,31 @@ def create_outbound(
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cur = conn.execute(
         """INSERT INTO outbound_requests
-           (item_id, requested_quantity, reason, status, rolled_back, created_at)
-           VALUES (?, ?, ?, '出库', 0, ?)""",
-        (item_id, quantity, reason or "", now),
+           (item_id, requested_quantity, reason, status, rolled_back, created_at,
+            doc_no, line_no, input_quantity, factor)
+           VALUES (?, ?, ?, '出库', 0, ?, ?, ?, ?, ?)""",
+        (item_id, quantity, reason or "", now, doc_no, line_no, input_quantity, factor),
     )
     req_id = int(cur.lastrowid)
-    conn.execute(
-        "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
-        (quantity, now, item_id),
+    if doc_no is not None:
+        conn.execute(
+            """INSERT INTO document_write_keys
+               (direction,doc_no,line_no,request_id,item_id,input_quantity,factor,
+                effective_quantity,reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            ("outbound", doc_no, line_no, req_id, item_id, input_quantity, factor,
+             format(Decimal(str(quantity)), ".2f"), reason or "", now),
+        )
+    updated = conn.execute(
+        "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ? AND quantity >= ?",
+        (quantity, now, item_id, quantity),
     )
+    if updated.rowcount != 1:
+        raise ValueError("insufficient_stock")
     conn.execute(
         """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
            VALUES (?, '出库', ?, ?, ?)""",
         (item_id, -quantity, f"出库记录#{req_id}出库", now),
     )
-    conn.commit()
     return req_id
 
 
@@ -201,14 +237,19 @@ def list_outbound(
     rows = conn.execute(
         """SELECT o.id, o.item_id, i.name AS item_name,
                   o.requested_quantity AS quantity, o.reason,
-                  o.status, o.rolled_back, o.created_at
+                  o.status, o.rolled_back, o.created_at, o.doc_no, o.line_no,
+                  o.input_quantity, o.factor
            FROM outbound_requests o
            LEFT JOIN items i ON i.id = o.item_id
            ORDER BY o.created_at DESC, o.id DESC
            LIMIT ? OFFSET ?""",
         (limit, offset),
     ).fetchall()
-    return [dict(r) for r in rows]
+    items = [dict(r) for r in rows]
+    for item in items:
+        text = item["factor"]
+        item["factor"] = float(text) if "." in text else int(text)
+    return items
 
 
 def rollback_outbound(conn: sqlite3.Connection, req_id: int) -> dict:
@@ -226,22 +267,25 @@ def rollback_outbound(conn: sqlite3.Connection, req_id: int) -> dict:
         raise ValueError("outbound_request_not_found")
     if int(req["rolled_back"]) == 1:
         raise ValueError("already_rolled_back")
+    changed = conn.execute(
+        "UPDATE outbound_requests SET rolled_back = 1 WHERE id = ? AND rolled_back = 0",
+        (req_id,),
+    )
+    if changed.rowcount != 1:
+        raise ValueError("already_rolled_back")
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     qty = float(req["requested_quantity"])
-    conn.execute(
+    updated = conn.execute(
         "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
         (qty, now, int(req["item_id"])),
     )
+    if updated.rowcount != 1:
+        raise ValueError("item_not_found")
     conn.execute(
         """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
            VALUES (?, '出库回退', ?, ?, ?)""",
         (int(req["item_id"]), qty, f"回退出库记录#{req_id}", now),
     )
-    conn.execute(
-        "UPDATE outbound_requests SET rolled_back = 1 WHERE id = ?",
-        (req_id,),
-    )
-    conn.commit()
     return dict(req)
 
 

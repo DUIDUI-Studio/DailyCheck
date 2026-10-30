@@ -44,7 +44,7 @@ def test_grams_to_stock_is_aux_to_base():
 
 def test_migrate_adds_aux_columns_to_legacy_db(tmp_path):
     """旧 warehouse db（只有 gram_per_unit 列）跑迁移后应获得 aux_unit, aux_rate 列。"""
-    from db import migrate_warehouse_db_columns
+    from db import WAREHOUSE_SCHEMA, migrate_warehouse_db_columns
 
     wh_path = tmp_path / "old_wh.db"
     # 模拟旧 db：手动建表（缺 aux_*）
@@ -89,6 +89,8 @@ def test_migrate_adds_aux_columns_to_legacy_db(tmp_path):
     """)
     # categories 插入不到一个对应给 G2，先补一个
     conn.execute("INSERT INTO categories (name, created_at) VALUES ('调味酱', '2026-01-01 00:00:00')")
+    # Keep old item columns, but supply the complete warehouse target tables.
+    conn.executescript(WAREHOUSE_SCHEMA)
     conn.commit()
     conn.close()
 
@@ -116,7 +118,7 @@ def test_migrate_adds_aux_columns_to_legacy_db(tmp_path):
 
 def test_migrate_idempotent(tmp_path):
     """再次调 migrate 不应覆盖已有 aux_unit/aux_rate 值。"""
-    from db import migrate_warehouse_db_columns
+    from db import WAREHOUSE_SCHEMA, migrate_warehouse_db_columns
 
     wh_path = tmp_path / "old_wh2.db"
     conn = sqlite3.connect(wh_path)
@@ -147,6 +149,7 @@ def test_migrate_idempotent(tmp_path):
         INSERT INTO items (sku, name, category_id, quantity, unit, gram_per_unit, updated_at)
             VALUES ('G1', '牛乳', 1, 10, '箱', 1000, '2026-01-01');
     """)
+    conn.executescript(WAREHOUSE_SCHEMA)
     conn.commit()
     conn.close()
 

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Generator
+from pathlib import Path
 
 from mcp_server.config import MASTER_DB
 
@@ -22,7 +23,12 @@ def master_connection() -> Generator[sqlite3.Connection, None, None]:
 @contextmanager
 def warehouse_connection(db_path: str) -> Generator[sqlite3.Connection, None, None]:
     """warehouse DB 连接，row_factory = Row。"""
-    conn = sqlite3.connect(db_path)
+    from db import migrate_warehouse_db_columns
+    from db.warehouse_migrate import connect_existing
+
+    path = Path(db_path).resolve()
+    migrate_warehouse_db_columns(path)
+    conn = connect_existing(path)
     conn.row_factory = sqlite3.Row
     try:
         yield conn

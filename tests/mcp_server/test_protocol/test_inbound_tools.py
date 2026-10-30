@@ -44,7 +44,8 @@ def test_restock_create_then_restock_list_reads_back(warehouse_db, monkeypatch):
     assert envelope["truncated"] is False
     assert len(rows) == 1
     assert set(rows[0]) == {
-        "id", "item_id", "item_name", "quantity", "status", "reason", "created_at"
+        "id", "item_id", "item_name", "quantity", "status", "reason", "created_at",
+        "doc_no", "line_no", "input_quantity", "factor"
     }
     assert rows[0]["item_id"] == 1
     assert rows[0]["item_name"] == "Item A"

@@ -366,14 +366,37 @@ def compute_restock_health(db, cutoff: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 门店履约（master.db store_orders，按当前仓 = dc_warehouse_code 过滤）
+# 门店履约（master.db store_orders，按参与仓过滤）
 # ---------------------------------------------------------------------------
+
+def _participation_predicate(alias: str = "so") -> str:
+    """参与仓谓词（镜像 `store_ordering_pure.order_participation_sql`）。
+
+    跨仓单的行来源仓不等于头仓：只看 `dc_warehouse_code` 会让非主仓的积压 /
+    在途 / 履约周期漏算。用 EXISTS 而非 JOIN 明细，避免一单多行把计数放大。
+    头仓仅在**没有任何明细行**时兜底（历史数据与最小 schema）；
+    来源为 NULL 的行由 COALESCE 回落头仓，与原口径一致。
+
+    本模块是顶层纯模块，刻意不回引 `blueprints`（见文件头注释），
+    故此处独立落地同一谓词，改口径时两处必须同步。
+    """
+    return (
+        f"({alias}.store_warehouse_code = ? "
+        f"OR EXISTS (SELECT 1 FROM store_order_items soi_p "
+        f"WHERE soi_p.order_id = {alias}.id "
+        f"AND COALESCE(soi_p.source_warehouse_code, {alias}.dc_warehouse_code) = ?) "
+        f"OR ({alias}.dc_warehouse_code = ? "
+        f"AND NOT EXISTS (SELECT 1 FROM store_order_items soi_e "
+        f"WHERE soi_e.order_id = {alias}.id)))"
+    )
+
 
 def compute_fulfillment(master, wh_code: str | None, now: datetime) -> dict:
     """返回 {backlog, in_transit, avg_cycle_days}；wh_code 为 None 时全 None。
 
-    口径：本仓参与（dc_warehouse_code 或 store_warehouse_code 命中）的
-    store_orders——DC 是履约方、门店是下单方，两视角都看自己的单。
+    口径：本仓参与的 store_orders——DC 是履约方、门店是下单方，两视角都看
+    自己的单；参与 = 门店仓或**任一明细行来源仓**命中（跨仓单在非主仓不再
+    漏算，EXISTS 防止多行翻倍）。
     积压 = status IN (pending, approved)；在途 = shipped；
     平均履约周期 = delivered 且 delivered_at/created_at 齐全订单的均值（天，1 位小数）；
     时间戳形态无法解析的行不计入均值（丢样本）并留 WARNING——聚类型指标豁免
@@ -381,18 +404,19 @@ def compute_fulfillment(master, wh_code: str | None, now: datetime) -> dict:
     """
     if wh_code is None:
         return {"backlog": None, "in_transit": None, "avg_cycle_days": None}
+    participation = _participation_predicate("so")
     row = master.execute(
-        """SELECT SUM(CASE WHEN status IN ('pending','approved') THEN 1 ELSE 0 END) AS backlog,
-                  SUM(CASE WHEN status = 'shipped' THEN 1 ELSE 0 END) AS in_transit
-           FROM store_orders
-           WHERE dc_warehouse_code = ? OR store_warehouse_code = ?""",
-        (wh_code, wh_code)).fetchone()
+        f"""SELECT SUM(CASE WHEN so.status IN ('pending','approved') THEN 1 ELSE 0 END) AS backlog,
+                  SUM(CASE WHEN so.status = 'shipped' THEN 1 ELSE 0 END) AS in_transit
+           FROM store_orders so
+           WHERE {participation}""",
+        (wh_code, wh_code, wh_code)).fetchone()
     cycle: list[float] = []
     for r in master.execute(
-        """SELECT created_at, delivered_at FROM store_orders
-           WHERE (dc_warehouse_code = ? OR store_warehouse_code = ?)
-             AND status = 'delivered' AND delivered_at IS NOT NULL""",
-        (wh_code, wh_code)).fetchall():
+        f"""SELECT so.created_at, so.delivered_at FROM store_orders so
+           WHERE {participation}
+             AND so.status = 'delivered' AND so.delivered_at IS NOT NULL""",
+        (wh_code, wh_code, wh_code)).fetchall():
         try:
             c = parse_event_ts(r["created_at"])
             d = parse_event_ts(r["delivered_at"])

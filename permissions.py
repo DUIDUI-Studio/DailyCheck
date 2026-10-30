@@ -97,18 +97,75 @@ def _resolve_permissions() -> frozenset[str]:
         return frozenset()
 
 
-def has_permission(*codes: str) -> bool:
+def has_permission(
+    user_id: int | str | None = None,
+    perm: str | None = None,
+    *codes: str,
+    warehouse_code: str | None = None,
+) -> bool:
     """Non-decorator query: True iff the user holds every code.
 
-    Platform superadmins always pass. Safe to call from handlers and templates
-    (the Phase-2 UI exposes it as the `can()` helper).
+    Accept both legacy ``has_permission(*codes)`` and explicit
+    ``has_permission(user_id, perm, warehouse_code=...)`` calls. Legacy calls
+    retain the current request's permission cache and superadmin bypass.
     """
+    if isinstance(user_id, int):
+        requested = ((perm,) if perm is not None else ()) + codes
+        if warehouse_code is None:
+            warehouse = g.get("warehouse")
+            warehouse_code = warehouse["code"] if warehouse is not None else None
+        return _has_target_permission(user_id, requested, warehouse_code)
+    codes = ((user_id,) if user_id is not None else ()) + (
+        (perm,) if perm is not None else ()
+    ) + codes
     user = g.get("user")
     if user is None:
         return False
     if user["is_admin"]:
         return True
+    if warehouse_code is not None:
+        return _has_target_permission(user["id"], codes, warehouse_code)
     return set(codes) <= current_permissions()
+
+
+def _has_target_permission(
+    user_id: int, codes: tuple[str, ...], warehouse_code: str | None,
+) -> bool:
+    """Resolve explicit targets in a separate, request-only cache; fail closed."""
+    try:
+        from db import get_master_db
+
+        master = get_master_db()
+        user = master.execute(
+            "SELECT is_admin, tenant_id FROM users WHERE id=?", (user_id,),
+        ).fetchone()
+        if user is None:
+            return False
+        if user[0]:
+            return True
+        tenant_id = g.get("tenant_id") or 1
+        if warehouse_code is None or user[1] != tenant_id:
+            return False
+        cache = g.setdefault("target_perm_sets", {})
+        key = (user_id, warehouse_code, tenant_id)
+        if key not in cache:
+            rows = master.execute(
+                """
+                SELECT DISTINCT rp.permission_code
+                  FROM warehouse_users wu
+                  JOIN warehouses w ON w.id = wu.warehouse_id AND w.tenant_id = ?
+                  JOIN roles r ON r.code = wu.role
+                   AND (r.is_builtin = 1 OR r.tenant_id = ?)
+                  JOIN role_permissions rp ON rp.role_id = r.id
+                 WHERE wu.user_id = ? AND w.code = ?
+                """,
+                (tenant_id, tenant_id, user_id, warehouse_code),
+            ).fetchall()
+            cache[key] = frozenset(row[0] for row in rows)
+        return set(codes) <= cache[key]
+    except Exception as exc:  # noqa: BLE001 — fail-closed by design
+        current_app.logger.warning("[permissions] target resolve failed: %s", exc)
+        return False
 
 
 def current_relative_path() -> str:

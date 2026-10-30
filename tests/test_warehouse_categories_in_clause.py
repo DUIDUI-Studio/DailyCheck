@@ -3,11 +3,9 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-import pytest
-
 
 def _make_warehouse(master_path: Path, wh_path: Path, cats: list[str]) -> None:
-    from db import init_master_db
+    from db import WAREHOUSE_SCHEMA, init_master_db
     init_master_db()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     m = sqlite3.connect(master_path)
@@ -32,6 +30,8 @@ def _make_warehouse(master_path: Path, wh_path: Path, cats: list[str]) -> None:
         w.execute(
             "INSERT INTO categories (name, description, created_at) VALUES (?, ?, ?)",
             (c, "", ts))
+    # Target validation requires the warehouse business tables, with no category seeds.
+    w.executescript(WAREHOUSE_SCHEMA)
     w.commit()
     w.close()
 
@@ -46,8 +46,8 @@ def test_returns_all_categories_in_wh(tmp_path, monkeypatch):
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_path.parent)
     _make_warehouse(master_path, wh_path, ["常温物料", "水果", "包装材料", "冷冻&冷藏食品", "定制周边"])
 
-    from blueprints._helpers import warehouse_categories_in_clause
     from app import create_app
+    from blueprints._helpers import warehouse_categories_in_clause
     app = create_app()
     with app.test_request_context():
         from flask import g
@@ -69,8 +69,8 @@ def test_empty_categories_returns_safe_clause(tmp_path, monkeypatch):
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", wh_path.parent)
     _make_warehouse(master_path, wh_path, [])
 
-    from blueprints._helpers import warehouse_categories_in_clause
     from app import create_app
+    from blueprints._helpers import warehouse_categories_in_clause
     app = create_app()
     with app.test_request_context():
         from flask import g

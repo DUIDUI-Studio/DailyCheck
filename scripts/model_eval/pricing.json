@@ -1,0 +1,36 @@
+{
+  "_comment": "占位价：全部 0.0，由 Owner 填写真实单价（每 1M token，单位见 currency）。模型名必须与 transcript 里的 message.model / turn_context.payload.model 完全一致；未列出的模型 cost=null 并记 warning，不会 crash。",
+  "currency": "CNY",
+  "prices": {
+    "qwen3.8-max": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    "qwen3.8-flash": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    "deepseek-flash": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    "gpt-6.1-sol": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    },
+    "MiniMax-M3": {
+      "input": 0.0,
+      "output": 0.0,
+      "cache_read": 0.0,
+      "cache_write": 0.0
+    }
+  }
+}

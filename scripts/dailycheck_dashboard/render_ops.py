@@ -22,6 +22,15 @@ CST = timezone(CST_OFFSET)
 AXIS_MAX_MIN = 90
 MAX_WATERFALL_ROWS = 6
 MAX_MATRIX_ROWS = 6
+MAX_EVAL_ROWS = 40
+
+# 复杂度分档 → 表头文案（与 ledger_db.complexity_band 的键一一对应）
+EVAL_BAND_LABELS = {
+    "low": "<4.0",
+    "mid": "4.0–6.4",
+    "high": "≥6.5",
+    "unknown": "未知",
+}
 
 # source → (中文名, 颜色 class)
 SOURCE_LABELS = {
@@ -139,6 +148,9 @@ OPS_CSS = """
     .mx td:first-child{text-align:left;color:var(--t2);font-variant-numeric:tabular-nums}
     .pip{display:inline-block;width:9px;height:9px;border-radius:50%}
     .pip.ok{background:#22c55e}.pip.no{background:#ef4444}.pip.na{background:#e5e7eb}
+    .ev .n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+    .ev .k{white-space:nowrap;font-weight:600}
+    .ev .m{font-variant-numeric:tabular-nums;white-space:nowrap}
     .al{list-style:none;margin:0;padding:0;font-size:12.5px}
     .al li{display:flex;justify-content:space-between;gap:10px;padding:6px 0}
     .al li+li{border-top:1px solid #f4f5f7}
@@ -176,6 +188,8 @@ def render_ops_block(
     unavailable: list[str] | None = None,
     pr_data_ok: bool = True,
     loop_integrity: dict | None = None,
+    eval_groups: list[dict] | None = None,
+    eval_unavailable: bool = False,
 ) -> str:
     """返回整段运维区块 HTML（KPI 条 + 瀑布 + token + 验证矩阵 + 闭环完整性 + 归因）。"""
     unavailable = unavailable or []
@@ -196,6 +210,17 @@ def render_ops_block(
     # 「数据盲区」本身也是要暴露的事实——否则整块消失，盲区就永远看不见。
     loop_html = _render_loop_integrity(loop_integrity)
 
+    # 派单账本：只有调用方明确给了数据或「源不可用」才渲染，避免程序化调用
+    # （测试 / 旧调用点）凭空多出一个空壳区块。
+    eval_html = ""
+    if eval_groups or eval_unavailable:
+        eval_html = render_eval_block(
+            groups=eval_groups or [],
+            prs=prs,
+            pr_data_ok=pr_data_ok,
+            unavailable=eval_unavailable,
+        )
+
     if not body_parts:
         note = "运维数据源暂不可用"
         if unavailable:
@@ -205,6 +230,8 @@ def render_ops_block(
             + '<div class="ops-empty">' + note
             + "。仪表盘其余区块不受影响；接入后本区块自动出现。</div>"
             + loop_html
+            # 账本坏了也是独立事实：明确告诉读者是「模型效能」这一块不可用
+            + eval_html
         )
 
     anomaly = _render_anomaly(events, verifications, token_rows)
@@ -212,7 +239,7 @@ def render_ops_block(
     if unavailable:
         stamp += "<span><b>不可用源：</b>" + _esc("、".join(unavailable)) + "</span>"
     stamp += "</div>"
-    return kpi_html + "\n".join(body_parts) + loop_html + anomaly + stamp
+    return kpi_html + "\n".join(body_parts) + loop_html + anomaly + eval_html + stamp
 
 
 # ------------------------------------------------------------ KPI
@@ -582,4 +609,188 @@ def _render_anomaly(events: list[dict], verifications: list[dict], token_rows: l
         + li("部署会话（近 7 日）", f"{deploy_sessions} 个", "ok")
         + li("成本口径", "未接入价目表", "hot")
         + "</ul></div>"
+    )
+
+
+# ------------------------------------------------------------ 模型效能评估
+def _fmt_cost(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if value == 0:
+        return "$0.00"
+    if abs(value) < 0.01:
+        return f"${value:.4f}"
+    return f"${value:,.2f}"
+
+
+def _eval_pr_cell(group: dict, pr_by_num: dict, pr_data_ok: bool) -> str:
+    """关联 PR 状态：已合并 / 开放 / 关闭未合并。拉不到 PR 列表时出「—」。"""
+    numbers = group.get("pr_numbers") or []
+    if not numbers:
+        return '<td class="n">—</td>'
+    if not pr_data_ok:
+        return '<td class="n" title="Gitea PR 拉取失败，状态不可得">—</td>'
+
+    merged = opened = closed = unknown = 0
+    for number in numbers:
+        meta = pr_by_num.get(int(number))
+        if meta is None:
+            unknown += 1
+            continue
+        state = (meta.get("state") or "").upper()
+        if state == "MERGED":
+            merged += 1
+        elif state == "OPEN":
+            opened += 1
+        elif state == "CLOSED":
+            closed += 1
+        else:
+            unknown += 1
+
+    if merged + opened + closed == 0:
+        return '<td class="n" title="PR 状态不可得">—</td>'
+    title = f"已合并 {merged} · 开放 {opened} · 关闭未合并 {closed}"
+    if unknown:
+        title += f" · 状态未知 {unknown}"
+    return f'<td class="n" title="{_esc(title)}">{merged}/{opened}/{closed}</td>'
+
+
+def _eval_cycle_cell(group: dict, pr_by_num: dict) -> str:
+    """平均交付周期：dispatch ts → PR merged_at（仅统计可得样本）。"""
+    cycles: list[int] = []
+    for number, ts in group.get("pr_rows") or []:
+        meta = pr_by_num.get(int(number))
+        if meta is None:
+            continue
+        dispatched = _parse_iso(ts)
+        merged = _parse_iso(meta.get("merged_ts"))
+        if dispatched is None or merged is None:
+            continue
+        cycles.append(max(0, int((merged - dispatched).total_seconds())))
+    if not cycles:
+        return '<td class="n" title="无已合并 PR 可算">—</td>'
+    avg = int(sum(cycles) / len(cycles))
+    return f'<td class="n" title="{len(cycles)} 个已合并 PR 样本">{_fmt_sec(avg)}</td>'
+
+
+def render_eval_block(
+    *,
+    groups: list[dict],
+    prs: list[dict],
+    pr_data_ok: bool = True,
+    unavailable: bool = False,
+) -> str:
+    """模型效能评估表：每行 = role × 模型 × 复杂度档。
+
+    数据来自派单账本（Issue #91 采集，Issue #92 摄取）；PR 状态从既有 fetch_prs
+    数据 join，不额外拉 Gitea。所有用户可控字段一律过 _esc。
+    底部汇总窗口内总成本 / 总派单 / 数据覆盖率（有 tokens 的行 / 总行）。
+    """
+    pr_by_num = {int(p["number"]): p for p in prs if p.get("number") is not None}
+    hint = "派单账本 · role × 模型 × 复杂度档"
+    if unavailable:
+        hint += " · 本轮回落到库内历史"
+    header = (
+        '<h2 id="eval"><span class="no">6</span>模型效能评估'
+        f'<span class="hint">{_esc(hint)}</span></h2>'
+    )
+
+    if not groups:
+        if unavailable:
+            msg = "模型效能数据源不可用（派单账本缺失或无法解析）"
+        else:
+            msg = "派单账本暂无数据（窗口内无派单记录）"
+        return header + f'<div class="ops-empty">{_esc(msg)}。其余区块不受影响。</div>'
+
+    rows = groups[:MAX_EVAL_ROWS]
+    body: list[str] = []
+    for group in rows:
+        dispatches = int(group.get("dispatches") or 0)
+        if dispatches <= 0:
+            continue
+        band = group.get("band") or "unknown"
+        band_label = EVAL_BAND_LABELS.get(band, band)
+        role = group.get("role") or "unknown"
+        model = group.get("model") or "unknown"
+        role_label = "未知" if role == "unknown" else role
+        model_label = "未知" if model == "unknown" else model
+
+        issue_rows = int(group.get("issue_rows") or 0)
+        retries = int(group.get("retries") or 0)
+        if issue_rows:
+            rate = retries / dispatches * 100
+            retry_cell = f"{rate:.0f}%"
+            retry_title = f"重派 {retries} 次 / 派单 {dispatches}（{issue_rows} 行带 issue 关联）"
+        else:
+            retry_cell = "—"
+            retry_title = "无 issue 关联，不可判重派"
+
+        null_rows = int(group.get("null_rows") or 0)
+        tokens = int(group.get("tokens") or 0)
+        if null_rows >= dispatches:
+            token_cell = "—"
+            token_title = "全部行无 tokens 数据"
+        else:
+            token_cell = _fmt_tok(tokens)
+            token_title = f"{tokens:,} tokens" + (
+                f"（{null_rows} 行无数据已跳过）" if null_rows else ""
+            )
+
+        cost_rows = int(group.get("cost_rows") or 0)
+        if cost_rows:
+            cost_cell = _fmt_cost(float(group.get("cost") or 0))
+            cost_title = f"{cost_rows}/{dispatches} 行有成本数据"
+        else:
+            cost_cell = "—"
+            cost_title = "全部行无成本数据"
+
+        pr_cell = _eval_pr_cell(group, pr_by_num, pr_data_ok)
+        cycle_cell = _eval_cycle_cell(group, pr_by_num)
+
+        body.append(
+            "<tr>"
+            f'<td class="k">{_esc(role_label)}</td>'
+            f'<td class="k">{_esc(model_label)}</td>'
+            f'<td class="m">{_esc(band_label)}</td>'
+            f'<td class="n">{dispatches}</td>'
+            f'<td class="n" title="{_esc(retry_title)}">{_esc(retry_cell)}</td>'
+            f'<td class="n" title="{_esc(token_title)}">{_esc(token_cell)}</td>'
+            f'<td class="n" title="{_esc(cost_title)}">{_esc(cost_cell)}</td>'
+            f"{pr_cell}{cycle_cell}"
+            "</tr>"
+        )
+
+    total_dispatch = sum(int(g.get("dispatches") or 0) for g in groups)
+    total_cost = sum(float(g.get("cost") or 0) for g in groups)
+    cost_rows = sum(int(g.get("cost_rows") or 0) for g in groups)
+    data_rows = sum(
+        int(g.get("dispatches") or 0) - int(g.get("null_rows") or 0) for g in groups
+    )
+    coverage = (data_rows / total_dispatch * 100) if total_dispatch else 0.0
+
+    cost_total = _fmt_cost(total_cost) if cost_rows else "—"
+    hint_extra = (
+        f'<span style="color:var(--t3)">仅显示前 {len(rows)} 组（共 {len(groups)} 组）</span>'
+        if len(groups) > len(rows) else ""
+    )
+
+    return (
+        header
+        + '<div class="note"><div class="tbl"><table class="ev">'
+        "<thead><tr>"
+        "<th>角色</th><th>模型</th><th>复杂度</th>"
+        '<th class="n">派单</th><th class="n">重派率</th>'
+        '<th class="n">Tokens</th><th class="n">估算成本</th>'
+        '<th class="n" title="已合并 / 开放 / 关闭未合并">PR 状态</th>'
+        '<th class="n">平均交付周期</th>'
+        "</tr></thead>"
+        f'<tbody>{"".join(body)}</tbody></table></div>'
+        '<div class="lg">'
+        f"<span><b>窗口内总成本：</b>{_esc(cost_total)}"
+        f"（{cost_rows}/{total_dispatch} 行有数据）</span>"
+        f"<span><b>总派单：</b>{total_dispatch}</span>"
+        f"<span><b>数据覆盖率：</b>{coverage:.0f}%"
+        f"（{data_rows}/{total_dispatch} 行有 tokens）</span>"
+        + (f"<span>{hint_extra}</span>" if hint_extra else "")
+        + "</div></div>"
     )

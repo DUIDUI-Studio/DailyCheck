@@ -117,24 +117,42 @@ def _storefront_or_admin(view: Callable) -> Callable:
     return wrapped
 
 
-def _order_viewable(order: dict[str, Any]) -> bool:
-    """Order can be viewed if it belongs to current store, current DC, or user is admin."""
+def _order_viewable(master: sqlite3.Connection, order: dict[str, Any]) -> bool:
+    """Order can be viewed by the current store, any participating DC, or admin.
+
+    多仓履约（Task 8 / spec §10）：可见性收敛到「参与仓」——订单明细行的
+    来源仓（历史 NULL 行回落头仓）任一命中即可见。没有任何明细行的存量脏数据
+    回落到头仓，与订单板口径一致。
+    """
     if _is_admin():
         return True
     wh = g.get("warehouse")
     if wh is None:
         return False
     code = wh["code"]
-    return order["store_warehouse_code"] == code or order["dc_warehouse_code"] == code
+    if order["store_warehouse_code"] == code:
+        return True
+    participants = sop.order_participants(master, int(order["id"]))
+    if participants:
+        return code in participants
+    return order["dc_warehouse_code"] == code
 
 
 def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: int) -> None:
+    """403 unless the session warehouse is a participant of the order (admin bypass)."""
     if _is_admin():
         return
-    order_dc = sop.get_order_dc_code(master, order_id)
-    if order_dc is None:
+    current = _current_warehouse_code()
+    head_dc = sop.get_order_dc_code(master, order_id)
+    if head_dc is None:
         abort(404)
-    if order_dc != _current_warehouse_code():
+    participants = sop.order_participants(master, order_id)
+    if participants:
+        if current not in participants:
+            abort(403)
+        return
+    # 历史无明细行的单据只有头仓可用（与订单板兜底一致）。
+    if head_dc != current:
         abort(403)
 
 
@@ -145,7 +163,11 @@ def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: in
 @bp.route("/catalog")
 @require_login
 def catalog() -> str:
-    """Show DC selector or item catalog for the selected DC."""
+    """Show DC selector or item catalog for the selected DC.
+
+    多仓开关开时不出现选择器：目录按 item_routing 合并各来源仓
+    （``_catalog_multi_warehouse``）。
+    """
     # DC users and admins in a DC warehouse go straight to the review queue.
     if _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC:
         return redirect(url_for("store_ordering.review_list"))
@@ -154,6 +176,9 @@ def catalog() -> str:
         return redirect(url_for("core.dashboard"))
 
     master = get_master_db()
+    if sop.multi_warehouse_enabled():
+        return _catalog_multi_warehouse(master)
+
     dc_code = request.args.get("dc") or session.get("store_ordering_dc")
     dcs = _list_dcs(master)
 
@@ -164,6 +189,9 @@ def catalog() -> str:
             items=None,
             selected_dc=None,
             cart_summary=None,
+            multi_warehouse=False,
+            draft_store_code=None,
+            valid_draft_items={},
         )
 
     # Validate DC exists.
@@ -226,6 +254,77 @@ def catalog() -> str:
         current_cat=category_code or "",
         keyword=keyword or "",
         cart_summary=cart_summary,
+        multi_warehouse=False,
+        draft_store_code=None,
+        valid_draft_items={},
+    )
+
+
+def _catalog_multi_warehouse(master: sqlite3.Connection) -> str:
+    """One catalogue for the storefront: no DC selector, routing decides source.
+
+    The session key ``store_ordering_dc`` is deprecated — multi-warehouse mode
+    never reads or writes it, and any leftover value is dropped so a stale
+    single-DC choice cannot leak into the new flow.
+    """
+    session.pop("store_ordering_dc", None)
+    store_code = _current_warehouse_code()
+    if not store_code:
+        flash("当前未绑定门店仓库")
+        return redirect(url_for("core.dashboard"))
+
+    category_code = request.args.get("cat", "").strip() or None
+    keyword = request.args.get("q", "").strip() or None
+
+    cart = sop.get_or_create_cart(master, g.user["id"], store_code, None)
+    cart_items = sop.list_cart_items(master, cart["id"])
+    cart_summary = {
+        "count": len(cart_items),
+        "total_qty": sum(i["quantity"] for i in cart_items),
+    }
+
+    items = sop.list_available_routed_items(master, store_code, category_code, keyword)
+    # Unfiltered set drives draft restore: an item hidden by the current chip
+    # or search stays in the draft, while a genuinely invalid one is dropped.
+    valid_items = sop.list_available_routed_items(master, store_code)
+    valid_draft_items = {
+        str(it["canonical_id"]): it.get("canonical_name") for it in valid_items
+    }
+
+    suggestions: dict[int, int] = {}
+    if not _is_admin():
+        try:
+            from db import get_warehouse_db
+            suggestions = sop.compute_suggested_order_qty(
+                get_warehouse_db(), master, store_code,
+            )
+        except Exception:
+            suggestions = {}
+
+    code_name_pairs: list[tuple[str, str]] = []
+    seen_codes: set[str] = set()
+    for it in items:
+        code = it.get("category_code") or ""
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        code_name_pairs.append((code, str(it.get("category_name") or code)))
+    category_names = sorted(code_name_pairs, key=lambda pair: pair[1])
+
+    return render_template(
+        "store_ordering/catalog.html",
+        dcs=[],
+        selected_dc=None,
+        items=items,
+        suggestions=suggestions,
+        categories=[code for code, _ in category_names],
+        category_names=category_names,
+        current_cat=category_code or "",
+        keyword=keyword or "",
+        cart_summary=cart_summary,
+        multi_warehouse=True,
+        draft_store_code=store_code,
+        valid_draft_items=valid_draft_items,
     )
 
 
@@ -239,32 +338,39 @@ def add_to_cart() -> str:
     affordances). The catalog page renders an inline modal-driven batch form
     pointing at /cart/add-batch.
     """
-    dc_code = request.form.get("dc") or session.get("store_ordering_dc")
-    if not dc_code:
+    multi = sop.multi_warehouse_enabled()
+    dc_code = request.form.get("dc") or (None if multi else session.get("store_ordering_dc"))
+    if not multi and not dc_code:
         flash("请先选择配送中心")
         return redirect(url_for("store_ordering.catalog"))
-    session["store_ordering_dc"] = dc_code
+    if not multi:
+        session["store_ordering_dc"] = dc_code
+
+    def _catalog_redirect() -> Any:
+        if multi:
+            return redirect(url_for("store_ordering.catalog"))
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
 
     canonical_id = request.form.get("canonical_id", type=int)
     quantity = parse_qty(request.form.get("quantity", "0"))
     unit = (request.form.get("unit") or "件").strip() or "件"
     if canonical_id is None or quantity <= 0:
         flash("请选择品项并填写有效数量")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
 
     master = get_master_db()
     store_code = _current_warehouse_code()
     if not store_code:
         flash("当前未绑定门店仓库")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
     try:
         sop.add_cart_item(master, cart["id"], canonical_id, quantity, unit)
     except ValueError as e:
         flash(str(e))
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
     flash("已加入购物车")
-    return redirect(url_for("store_ordering.catalog", dc=dc_code))
+    return _catalog_redirect()
 
 
 @bp.route("/cart/add-batch", methods=["POST"])
@@ -280,23 +386,30 @@ def cart_add_batch() -> str:
 
     Items with empty qty are skipped. After processing, redirect to /cart.
     """
-    dc_code = request.form.get("dc") or session.get("store_ordering_dc")
-    if not dc_code:
+    multi = sop.multi_warehouse_enabled()
+    dc_code = request.form.get("dc") or (None if multi else session.get("store_ordering_dc"))
+    if not multi and not dc_code:
         flash("请先选择配送中心")
         return redirect(url_for("store_ordering.catalog"))
-    session["store_ordering_dc"] = dc_code
+    if not multi:
+        session["store_ordering_dc"] = dc_code
+
+    def _catalog_redirect() -> Any:
+        if multi:
+            return redirect(url_for("store_ordering.catalog"))
+        return redirect(url_for("store_ordering.catalog", dc=dc_code))
 
     selected_list = request.form.getlist("selected[]")
     qty_list = request.form.getlist("qty[]")
     unit_list = request.form.getlist("unit[]")
     if len(selected_list) != len(qty_list) or len(selected_list) != len(unit_list):
         flash("表单字段不一致，请重试")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
 
     store_code = _current_warehouse_code()
     if not store_code:
         flash("当前未绑定门店仓库")
-        return redirect(url_for("store_ordering.catalog", dc=dc_code))
+        return _catalog_redirect()
 
     master = get_master_db()
     cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
@@ -342,9 +455,10 @@ def cart_add_batch() -> str:
 @_storefront_or_admin
 def cart_view() -> str:
     """Show cart."""
-    dc_code = session.get("store_ordering_dc")
+    multi = sop.multi_warehouse_enabled()
+    dc_code = None if multi else session.get("store_ordering_dc")
     store_code = _current_warehouse_code()
-    if not dc_code or not store_code:
+    if (not multi and not dc_code) or not store_code:
         flash("购物车为空")
         return redirect(url_for("store_ordering.catalog"))
     master = get_master_db()
@@ -357,6 +471,8 @@ def cart_view() -> str:
         items=items,
         dc_code=dc_code,
         cart_total=cart_total,
+        multi_warehouse=multi,
+        draft_store_code=store_code,
     )
 
 
@@ -401,9 +517,10 @@ def remove_cart_item_route(cart_item_id: int) -> str:
 @_storefront_or_admin
 def clear_cart_route() -> str:
     """Clear cart."""
-    dc_code = session.get("store_ordering_dc")
+    multi = sop.multi_warehouse_enabled()
+    dc_code = None if multi else session.get("store_ordering_dc")
     store_code = _current_warehouse_code()
-    if dc_code and store_code:
+    if (multi or dc_code) and store_code:
         master = get_master_db()
         cart = sop.get_or_create_cart(master, g.user["id"], store_code, dc_code)
         sop.clear_cart(master, cart["id"])
@@ -482,14 +599,30 @@ def _save_payment_proofs(master: sqlite3.Connection, order_id: int, files: list[
         flash(f"有 {skipped} 个付款凭证未能保存，请在订单详情页核对后重新提交")
 
 
+def _snapshot_dicts(form) -> tuple[dict[int, float], dict[int, float]]:
+    """Read the cart-page price/multiple snapshot carried by the submit form."""
+    prices: dict[int, float] = {}
+    multiples: dict[int, float] = {}
+    for key in form:
+        try:
+            if key.startswith("snapshot_price_"):
+                prices[int(key[len("snapshot_price_"):])] = float(form[key] or 0)
+            elif key.startswith("snapshot_multiple_"):
+                multiples[int(key[len("snapshot_multiple_"):])] = float(form[key] or 0)
+        except (TypeError, ValueError):
+            continue
+    return prices, multiples
+
+
 @bp.route("/cart/submit", methods=["GET", "POST"])
 @require_permission("order.create")
 @_storefront_or_admin
 def submit_order_route() -> str:
     """Submit cart as order."""
-    dc_code = session.get("store_ordering_dc")
+    multi = sop.multi_warehouse_enabled()
+    dc_code = None if multi else session.get("store_ordering_dc")
     store_code = _current_warehouse_code()
-    if not dc_code or not store_code:
+    if (not multi and not dc_code) or not store_code:
         flash("请先选择配送中心并添加商品")
         return redirect(url_for("store_ordering.catalog"))
 
@@ -501,14 +634,18 @@ def submit_order_route() -> str:
         flash("购物车为空")
         return redirect(url_for("store_ordering.cart_view"))
 
-    # v3.1: 校验购物车里品项在 DC 端仍可订（防止「先加购后被下架」漏提交）
+    # v3.1: 校验购物车里品项在来源仓仍可订（防止「先加购后被下架」漏提交）
     cart_canonicals = [int(it["canonical_id"]) for it in items if it.get("canonical_id")]
-    unorderable = sop.list_unorderable_cart_canonicals(master, dc_code, cart_canonicals)
+    if multi:
+        unorderable = sop.list_unorderable_routed_canonicals(master, cart_canonicals)
+    else:
+        unorderable = sop.list_unorderable_cart_canonicals(master, dc_code, cart_canonicals)
 
     expected_date = _tomorrow()
     note = ""
     errors: dict[str, Any] = {
-        "shortages": [], "unbound": [], "unorderable": unorderable, "multiples": [],
+        "shortages": [], "unbound": [], "unorderable": unorderable,
+        "multiples": [], "price_changed": [],
     }
 
     if request.method == "POST":
@@ -516,6 +653,8 @@ def submit_order_route() -> str:
         note = (request.form.get("note") or "").strip()
         uploads = _collect_payment_proofs()
         proof_error = _validate_payment_proofs(uploads)
+        price_snapshot, multiple_snapshot = _snapshot_dicts(request.form)
+        confirm_price_change = request.form.get("confirm_price_change") == "1"
         if expected_date < _today():
             flash("期望到货日期不能早于今天")
         elif unorderable:
@@ -527,31 +666,47 @@ def submit_order_route() -> str:
         else:
             validation = sop.validate_cart_for_submit(master, cart)
             if not validation["ok"]:
-                errors = validation
+                errors.update(validation)
                 if validation.get("multiples"):
                     flash("提交失败：部分品项数量不符合起订倍数，请先调整数量")
                 else:
                     flash("提交失败，请检查门店绑定")
             else:
-                order = sop.submit_order(
-                    master, cart["id"], g.user["id"],
-                    _date_input(expected_date), note or None,
-                )
-                # 凭证在订单落库后写：需要 order_id 才能建目录。
-                # 单个文件失败只记日志，不回滚订单 —— 单已经下了，
-                # 凭证缺失可让门店在补传入口补（本期先提示重传）。
-                _save_payment_proofs(master, order["id"], uploads)
-                sop.notify_order_event(master, sop.EVENT_ORDER_SUBMITTED, order, g.user["id"])
-                # 站内通知之后补一条对外通道（企微群）；后台线程发送，
-                # 失败不影响本次提交 —— 见 _notify_wecom_new_order。
-                _notify_wecom_new_order(order)
-                session.pop("store_ordering_dc", None)
-                flash(f"订单 {order['order_no']} 提交成功")
-                return redirect(url_for("store_ordering.order_detail", order_id=order["id"]))
+                order: dict[str, Any] | None = None
+                try:
+                    result = sop.submit_order(
+                        master, cart["id"], g.user["id"],
+                        _date_input(expected_date), note or None,
+                        price_snapshot=price_snapshot or None,
+                        multiple_snapshot=multiple_snapshot or None,
+                        confirm_price_change=confirm_price_change,
+                    )
+                except ValueError as exc:
+                    # 缺路由 / 专属品 / 履约行无法解析：整单退回并列明品项。
+                    flash(str(exc))
+                    result = None
+                if result is not None:
+                    if result.get("price_changed"):
+                        errors["price_changed"] = result["price_changed"]
+                        flash("以下品项的价格/起订倍数已变化，请确认后重新提交")
+                    else:
+                        order = result
+                if order is not None:
+                    # 凭证在订单落库后写：需要 order_id 才能建目录。
+                    # 单个文件失败只记日志，不回滚订单 —— 单已经下了，
+                    # 凭证缺失可让门店在补传入口补（本期先提示重传）。
+                    _save_payment_proofs(master, order["id"], uploads)
+                    sop.notify_order_event(master, sop.EVENT_ORDER_SUBMITTED, order, g.user["id"])
+                    # 站内通知之后补一条对外通道（企微群）；后台线程发送，
+                    # 失败不影响本次提交 —— 见 _notify_wecom_new_order。
+                    _notify_wecom_new_order(order)
+                    session.pop("store_ordering_dc", None)
+                    flash(f"订单 {order['order_no']} 提交成功")
+                    return redirect(url_for("store_ordering.order_detail", order_id=order["id"]))
 
     validation = sop.validate_cart_for_submit(master, cart)
     if not validation["ok"]:
-        errors = validation
+        errors.update(validation)
 
     return render_template(
         "store_ordering/submit.html",
@@ -565,6 +720,8 @@ def submit_order_route() -> str:
         note=note,
         errors=errors,
         today=_date_input(_today()),
+        multi_warehouse=multi,
+        price_changes=errors.get("price_changed") or [],
     )
 
 
@@ -620,7 +777,7 @@ def order_detail(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     role = g.role["role"] if g.role else None
     wh_type = _current_warehouse_type()
@@ -645,6 +802,35 @@ def order_detail(order_id: int) -> str:
         order["shipping_fee"] = 0.0
 
     is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC
+    current_wh_code = _current_warehouse_code()
+
+    # 多仓履约（Task 8 / D4）：审批按钮按「全部参与仓 order.approve」展示；
+    # 缺权时把缺失仓清单显示在页面上，而不是只给一个无信息的 403。
+    review_allowed = False
+    review_missing: list[str] = []
+    if is_dc_view:
+        review_allowed, review_missing = sop.can_act_on_order(
+            int(g.user["id"]), order_id, perm="order.approve",
+        )
+
+    # 跨仓进度徽标：本仓 x/y 待发 · 全单 m/n（按行数，不按数量）。
+    own_lines = [
+        item for item in order["order_items"]
+        if item.get("effective_source_warehouse_code") == current_wh_code
+    ]
+    ship_progress = {
+        "is_multi": bool(order.get("is_multi_warehouse")),
+        "own_pending": sum(
+            1 for item in own_lines
+            if parse_qty(item["quantity"]) - parse_qty(item.get("shipped_quantity") or 0) > 0
+        ),
+        "own_total": len(own_lines),
+        "all_pending": sum(
+            1 for item in order["order_items"]
+            if parse_qty(item["quantity"]) - parse_qty(item.get("shipped_quantity") or 0) > 0
+        ),
+        "all_total": len(order["order_items"]),
+    }
 
     # Store-side inflow log: stock_movements with action='门店订货入库' for the
     # order's store warehouse, joined to canonical_items for the name.
@@ -710,16 +896,20 @@ def order_detail(order_id: int) -> str:
         total_amount=total_amount,
         dc_items_info=dc_items_info,
         is_dc_view=is_dc_view,
+        # 发货幂等键：页面下发、随表单回传；同一页面重复提交只扣一次。
+        ship_op_no=sop.generate_op_no(),
+        # 收货幂等键（多仓履约 Task 6）：与发货同模式，门店侧重复提交只入库一次。
+        receive_op_no=sop.generate_op_no(),
         store_inflows=store_inflows,
         transfer=transfer_ctx,
-        can_review=(
-            wh_type == sop.WAREHOUSE_TYPE_DC
-            and role in ("manager", "admin")
-        ),
+        can_review=(is_dc_view and review_allowed),
+        review_missing_warehouses=review_missing,
         can_ship=(
             wh_type == sop.WAREHOUSE_TYPE_DC
             and role in ("staff", "manager", "admin")
         ),
+        current_warehouse_code=current_wh_code,
+        ship_progress=ship_progress,
         can_deliver=(
             wh_type == "storefront"
             and role in ("manager", "admin")
@@ -741,7 +931,7 @@ def payment_proof_download(order_id: int, proof_id: int):
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     proof = ppp.get_proof(master, order_id, proof_id)
     if proof is None:
@@ -785,28 +975,41 @@ _ORDER_STATUS_TABS: tuple[tuple[str, str], ...] = (
 
 
 def _render_order_board() -> str:
-    """合并后的订单页：审批 + 订单管理同一份实现、同一张模板（Issue #19）。"""
+    """合并后的订单页：审批 + 订单管理同一份实现、同一张模板（Issue #19）。
+
+    多仓履约（Task 8 / D7）补充：
+      - 非管理员的数据范围从「头仓 = 本仓」改为**参与仓口径**（任意行来源仓
+        等于本仓），并忽略 `?warehouse=`（防越权枚举）；
+      - 平台管理员新增 `?warehouse=` 参与仓筛选，`?dc=`（头仓）保留；
+      - 跨仓单若无任何非管理员用户能对全部参与仓审批，给平台管理员恰一条
+        站内告警，并在行上显示「无全权审批人」徽标。
+    """
     master = get_master_db()
     is_admin = _is_admin()
     status = request.args.get("status", "").strip()
     start_date = request.args.get("start_date", "").strip()
     end_date = request.args.get("end_date", "").strip()
+    current_wh = _current_warehouse_code()
 
     if is_admin:
         store = request.args.get("store", "").strip()
         dc = request.args.get("dc", "").strip()
+        warehouse = request.args.get("warehouse", "").strip()
     else:
         store = ""
-        dc = _current_warehouse_code() or ""
+        dc = ""
+        warehouse = ""
 
-    # 非管理员且拿不到当前仓库 code 时必须给空集，绝不能退化成「不加 dc 过滤」——
-    # 那会把全平台订单吐给一个范围不明的登录用户。
-    scope_ok = bool(is_admin or dc)
+    # 非管理员锁本仓（参与仓口径）；拿不到当前仓库 code 时必须给空集，绝
+    # 不能退化成「不加过滤」——那会把全平台订单吐给范围不明的登录用户。
+    participant = warehouse or (None if is_admin else current_wh)
+    scope_ok = bool(is_admin or participant)
     orders = (
         sop.list_orders(
             master,
             store_warehouse_code=store or None,
             dc_warehouse_code=dc or None,
+            participant_warehouse_code=participant,
             status=status or None,
             start_date=start_date or None,
             end_date=end_date or None,
@@ -821,10 +1024,22 @@ def _render_order_board() -> str:
             master,
             store_warehouse_code=store or None,
             dc_warehouse_code=dc or None,
+            participant_warehouse_code=participant,
         )
         if scope_ok
         else {}
     )
+
+    # 无全权审批人诊断：只在跨仓待审批单上评估；幂等写入（每单每管理员一条）。
+    for order in orders:
+        codes = [p["code"] for p in order.get("participant_warehouses") or []]
+        order["no_full_approver"] = (
+            order.get("status") == sop.ORDER_STATUS_PENDING
+            and len(codes) > 1
+            and not sop.has_full_approver(master, codes)
+        )
+        if order["no_full_approver"]:
+            sop.alert_no_full_approver(master, order)
 
     # 页签必须留在当前 URL 上：从 /review 进来的用户点页签不该被弹到 /admin/orders。
     endpoint = (
@@ -843,6 +1058,7 @@ def _render_order_board() -> str:
                 status=code or None,
                 store=store or None,
                 dc=dc or None,
+                warehouse=warehouse or None,
                 start_date=start_date or None,
                 end_date=end_date or None,
             ),
@@ -857,8 +1073,10 @@ def _render_order_board() -> str:
         status=status,
         store=store,
         dc=dc,
+        warehouse=warehouse,
         start_date=start_date,
         end_date=end_date,
+        current_warehouse_code=current_wh,
         stores=_list_stores(master) if is_admin else [],
         dcs=_list_dcs(master) if is_admin else [],
         is_admin_view=is_admin,
@@ -884,7 +1102,11 @@ def review_list() -> str:
 @require_warehouse_type("distribution_center")
 @require_permission("order.approve")
 def review_order_route(order_id: int) -> str:
-    """Approve or reject an order."""
+    """Approve or reject an order.
+
+    D5/D12（多仓履约）：操作者须对订单**全部参与仓**持有 `order.approve`；
+    平台管理员绕过。任一参与仓缺权 → 403，并在错误页列出缺失仓清单。
+    """
     decision = request.form.get("decision", "").strip()
     note = (request.form.get("note") or "").strip()
     if decision not in (sop.ORDER_STATUS_APPROVED, sop.ORDER_STATUS_REJECTED):
@@ -896,6 +1118,13 @@ def review_order_route(order_id: int) -> str:
 
     master = get_master_db()
     _assert_order_belongs_to_current_dc(master, order_id)
+    allowed, missing = sop.can_act_on_order(
+        int(g.user["id"]), order_id, perm="order.approve",
+    )
+    if not allowed:
+        if missing:
+            abort(403, description="缺少审批权限的参与仓：" + "、".join(missing))
+        abort(403, description="当前用户无权审批该订单")
     try:
         order = sop.review_order(master, order_id, decision, g.user["id"], note or None)
     except ValueError as e:
@@ -1020,7 +1249,7 @@ def cancel_order_route(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
 
     reason = (request.form.get("reason") or "").strip()
@@ -1031,21 +1260,23 @@ def cancel_order_route(order_id: int) -> str:
     status = order["status"]
     actor_id = int(g.user["id"])
     is_requestor = int(order["requested_by"]) == actor_id
-    wh_type = _current_warehouse_type()
-    role = g.role["role"] if g.role else None
 
     if status == sop.ORDER_STATUS_PENDING:
         if not (is_requestor or _is_admin()):
             flash("只有下单人或管理员可以取消待审批订单")
             return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     elif status == sop.ORDER_STATUS_APPROVED:
-        # DC 已审批：必须当前 DC 的 manager/admin 或平台管理员
-        if not _is_admin():
-            if wh_type != sop.WAREHOUSE_TYPE_DC or role not in ("manager", "admin"):
+        # D12（多仓履约）：取消已审批订单 = 审批级动作，须对**全部参与仓**
+        # 持有 order.approve；平台管理员绕过。缺失仓在提示里列清楚。
+        allowed, missing = sop.can_act_on_order(
+            actor_id, order_id, perm="order.approve"
+        )
+        if not allowed:
+            if missing:
+                flash("取消已审批订单需对全部参与仓具备审批权限，缺少：" + "、".join(missing))
+            else:
                 flash("审批后只能由配送中心经理以上或管理员取消")
-                return redirect(url_for("store_ordering.order_detail", order_id=order_id))
-            if order["dc_warehouse_code"] != _current_warehouse_code():
-                abort(403)
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     else:
         flash(f"订单当前状态 {status} 不可取消")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
@@ -1066,34 +1297,38 @@ def cancel_order_route(order_id: int) -> str:
 @require_warehouse_type("distribution_center")
 @require_role("staff")
 def ship_order_route(order_id: int) -> str:
-    """DC 部分/全部发货（v3）。
+    """DC 部分/全部发货（v3 + 多仓履约 Task 5）。
 
-    守卫说明（兼容层，保持 require_role）：DC staff 发货是既有行为。`order.ship`
-    权限点归 manager 包，若改走 @require_permission("order.ship") 会让 DC staff
-    失去发货能力（非白名单行为变化）——故本路由维持 require_role("staff")，
-    仅保留 DC 类型守卫。见施工图 §1.2-E 修正说明。
+    操作仓 = 当前会话仓，平台管理员也不例外（spec §7/§9：管理员须显式处于
+    DC 会话；门店会话直接 403）。订单需在该仓有来源行才可操作。
 
     表单字段约定：
+      - ``op_no``：本批发货的幂等键（详情页下发，提交回传）。缺省时服务端
+        生成一个新的（旧客户端兼容）；重试同一 ``op_no`` 不会重复扣减。
       - ``shipped_items[N]=qty``：多值，每行一个明细的本批发货数。N 是
-        ``store_order_items.id``，与 order_detail.html 中的 input name 配对。
-        新 UI 的每个数量 input 都带该 name（即使留空也会随表单提交），因此
-        「字段存在」是「新 UI 提交」的可靠信号。
-      - ``qty``：兼容 v1/v2 的「全量一次发货」字段；填了就给所有明细
-        各发 qty 件（仍受累计上限校验）。
+        ``store_order_items.id``。字段存在但全部为空 → 拒绝，绝不全发。
+      - ``qty``：兼容 v1/v2 的「全量一次发货」字段；仅作用于**本仓**未发行。
       - 上述两者都缺省（且表单不含任何 ``shipped_items[`` 字段）：走
-        ``ship_order_full``（legacy full-ship），把每个明细的剩余可发数量
-        一次性发齐。仅用于无 shipped_items 字段的旧客户端 / 老测试。
+        ``ship_order_full``，把**本仓**每个明细的剩余可发数量一次性发齐。
 
-    ⚠️ 安全护栏（2026-10-10）：一旦表单携带 ``shipped_items[`` 字段但全部
-    为空/0，视为「用户未填写」→ 直接 flash 拒绝，**绝不**退化为整单全发。
-    这是「DC 只发 2、却被记发 100」缺陷的直接堵口。
-
-    通知：仅在订单全部发齐后写一条 ``store_order_shipped``；partial 不发
-    通知避免刷屏（v3 设计 §10.4）。
+    通知：仅在本次调用真正触发 approved→shipped 条件迁移后写一条
+    ``store_order_shipped``（锁内 changes()==1 才写）；partial 与幂等重试不发。
     """
     tracking_note = (request.form.get("tracking_note") or "").strip() or None
+    wh = g.get("warehouse")
+    if wh is None or wh["warehouse_type"] != sop.WAREHOUSE_TYPE_DC:
+        # 平台管理员在门店会话 / 未选仓 → 未显式指定操作仓，拒绝（场景 h）。
+        abort(403)
+    operator_dc_code = str(wh["code"])
+
     master = get_master_db()
-    _assert_order_belongs_to_current_dc(master, order_id)
+    detail = sop.get_order_detail(master, order_id)
+    if detail is None:
+        abort(404)
+    if operator_dc_code not in sop.order_participants(master, order_id):
+        abort(403)
+
+    op_no = (request.form.get("op_no") or "").strip() or sop.generate_op_no()
 
     # 1. 解析 shipped_items[N] = qty 形式（v3 多值表单）。
     shipped_items_map: dict[int, float] = {}
@@ -1114,54 +1349,59 @@ def ship_order_route(order_id: int) -> str:
         flash("请至少填写一项发货数量")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 2. 兼容 v2 全量字段 'qty'：所有未发齐明细都发 qty。
+    # 2. 兼容 v2 全量字段 'qty'：仅作用本仓未发齐明细。
     if not shipped_items_map:
         raw_qty = request.form.get("qty")
         if raw_qty is not None and raw_qty != "":
             qty_value = parse_qty(raw_qty)
             if qty_value > 0:
-                detail = sop.get_order_detail(master, order_id)
-                if detail is not None:
-                    for it in detail["order_items"]:
-                        already = parse_qty(it.get("shipped_quantity") or 0)
-                        remaining = parse_qty(it["quantity"]) - already
-                        if remaining > 0:
-                            shipped_items_map[int(it["id"])] = min(
-                                qty_value, remaining
-                            )
+                for it in detail["order_items"]:
+                    source = it.get("source_warehouse_code") or detail["dc_warehouse_code"]
+                    if source != operator_dc_code:
+                        continue
+                    already = parse_qty(it.get("shipped_quantity") or 0)
+                    remaining = parse_qty(it["quantity"]) - already
+                    if remaining > 0:
+                        shipped_items_map[int(it["id"])] = min(qty_value, remaining)
 
-    # 3. 都没填（且不含 shipped_items 字段）→ 走 legacy full-ship（旧客户端兼容）。
-    used_full_ship_fallback = False
+    # 3. 都没填（且不含 shipped_items 字段）→ 本仓 legacy full-ship（旧客户端兼容）。
     if not shipped_items_map:
         try:
             order = sop.ship_order_full(
-                master, order_id, g.user["id"], tracking_note
+                master,
+                order_id,
+                g.user["id"],
+                tracking_note,
+                operator_dc_code=operator_dc_code,
+                op_no=op_no,
             )
-            used_full_ship_fallback = True
         except ValueError as e:
             flash(f"出库失败：{e}")
             return redirect(url_for("store_ordering.shipment_list"))
     else:
         try:
-            order = sop.ship_order(
-                master, order_id, shipped_items_map,
-                shipped_by=g.user["id"], tracking_note=tracking_note,
+            order = sop.ship_partial(
+                master,
+                sop.open_warehouse_db,
+                order_id=order_id,
+                operator_dc_code=operator_dc_code,
+                op_no=op_no,
+                line_qty=shipped_items_map,
+                shipped_by=g.user["id"],
+                tracking_note=tracking_note,
             )
         except ValueError as e:
             flash(f"出库失败：{e}")
             return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 4. 通知：仅全部发齐才触发 store_order_shipped 通知（v3 §10.4）。
-    is_fully_shipped = bool(order.get("is_fully_shipped")) or (
-        order.get("status") == sop.ORDER_STATUS_SHIPPED and used_full_ship_fallback
-    )
-    if is_fully_shipped:
+    # 4. 通知：仅本次调用真正完成 approved→shipped 迁移才触发（幂等重试不发）。
+    if order.get("transitioned_to_shipped"):
         sop.notify_order_event(
             master, sop.EVENT_ORDER_SHIPPED, order, g.user["id"]
         )
 
     # 5. flash 文案：全部发齐 → "出库成功"；部分 → "本批发货 X 件"。
-    if is_fully_shipped:
+    if order.get("is_fully_shipped"):
         flash("出库成功")
     else:
         shipped_total = sum(
@@ -1181,7 +1421,7 @@ def deliver_order_route(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     if _current_warehouse_type() != "storefront":
         flash("只有门店可确认收货")
@@ -1210,6 +1450,8 @@ def receive_order_route(order_id: int) -> str:
       order_item_id: the store_order_items.id being received
       quantity:      base-unit quantity being received this batch
       note:          optional free-text note
+      op_no:         idempotency key issued by the detail page (Task 6); the
+                     line-level key is ``op_no:order_item_id``
 
     Permission: storefront manager/admin (or platform admin). DC users are
     redirected to review list by `_storefront_or_admin`.
@@ -1218,7 +1460,7 @@ def receive_order_route(order_id: int) -> str:
     order = sop.get_order_detail(master, order_id)
     if order is None:
         abort(404)
-    if not _order_viewable(order):
+    if not _order_viewable(master, order):
         abort(403)
     if _current_warehouse_type() != "storefront":
         flash("只有门店可以收货")
@@ -1231,26 +1473,35 @@ def receive_order_route(order_id: int) -> str:
     order_item_id = request.form.get("order_item_id", type=int)
     quantity = parse_qty(request.form.get("quantity", "0"))
     note = (request.form.get("note") or "").strip() or None
+    # 收货幂等键（多仓履约 Task 6）：详情页下发、提交回传；重试同一 op_no
+    # 不会重复入库。旧客户端不带该字段时服务端生成新的一次性键。
+    op_no = (request.form.get("op_no") or "").strip() or sop.generate_op_no()
 
     if order_item_id is None or quantity <= 0:
         flash("请填写有效的收货数量")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     try:
-        result = sop.receive_order_item(
+        result = sop.receive_partial(
             master,
+            sop.open_warehouse_db,
             order_id=order_id,
-            order_item_id=order_item_id,
-            qty=quantity,
-            actor_id=g.user["id"],
+            op_no=op_no,
+            item_qty={order_item_id: quantity},
+            received_by=g.user["id"],
             note=note,
         )
     except ValueError as e:
         flash(str(e))
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    if result["is_fully_received"]:
-        # Notify only when the whole order is fulfilled (matches v2 §9.3).
+    if result["idempotent"]:
+        # 同一 op_no 的重复提交：不重复入库，也不重复发通知。
+        flash("该批收货已处理，重复提交未重复入库")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+
+    if result["transitioned_to_delivered"]:
+        # 收齐：仅条件迁移 changes()==1 的那次调用发通知（spec §8）。
         refreshed = sop.get_order_detail(master, order_id)
         if refreshed is not None:
             sop.notify_order_event(

@@ -14,12 +14,14 @@ import logging
 import sqlite3
 import tempfile
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from flask import g
 
 from config import MASTER_DB, WAREHOUSE_DB_DIR
+from migrations.multi_warehouse_fulfillment import DELIVERY_ITEMS_DDL, ITEM_ROUTING_DDL
 from permissions_manifest import (
     BUILTIN_PACKAGE_SIZES,
     BUILTIN_ROLE_CODES,
@@ -467,7 +469,7 @@ CREATE TABLE IF NOT EXISTS store_order_carts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     store_warehouse_code TEXT NOT NULL,
-    dc_warehouse_code TEXT NOT NULL,
+    dc_warehouse_code TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (user_id, store_warehouse_code),
@@ -544,6 +546,8 @@ CREATE TABLE IF NOT EXISTS store_order_items (
     canonical_id INTEGER NOT NULL,
     dc_item_id INTEGER,                 -- 配送中心仓内 items.id（出库时回填）
     store_item_id INTEGER,              -- 门店仓内 items.id（用于收货/入库，P0 仅记录）
+    source_warehouse_code TEXT,          -- 提交时固化的行来源仓
+    ship_op_no TEXT,                     -- 最近一次发货操作号（幂等守卫）
     quantity REAL NOT NULL,             -- 订货数量（基础单位）
     unit TEXT NOT NULL,
     fulfilled_quantity REAL NOT NULL DEFAULT 0,
@@ -577,6 +581,7 @@ CREATE TABLE IF NOT EXISTS store_order_deliveries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL,
     delivery_no TEXT NOT NULL UNIQUE,
+    warehouse_code TEXT,                -- 本批次实际发货仓
     shipped_by INTEGER,
     shipped_at TEXT NOT NULL,
     delivered_at TEXT,
@@ -601,6 +606,10 @@ CREATE TABLE IF NOT EXISTS store_order_receipts (
     received_by INTEGER NOT NULL,
     note TEXT,
     created_at TEXT NOT NULL,
+    -- 收货幂等键 = f'{op_no}:{order_item_id}'（多仓履约 Task 6，§7 勘误约定）
+    op_no TEXT UNIQUE,
+    -- 0 = master 已落 receipt、门店库加库未回写；1 = 已入库完成
+    applied INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (order_id) REFERENCES store_orders(id) ON DELETE CASCADE,
     FOREIGN KEY (order_item_id) REFERENCES store_order_items(id) ON DELETE CASCADE,
     FOREIGN KEY (received_by) REFERENCES users(id)
@@ -790,6 +799,8 @@ CREATE INDEX IF NOT EXISTS idx_owner_approvals_status
 # master.db 上会因列已存在而崩溃。沿用 warehouses.warehouse_type 的迁移模式：
 # 由 init_master_db() 的 PRAGMA 守卫负责幂等 ALTER。
 
+MASTER_SCHEMA += DELIVERY_ITEMS_DDL + ";\n" + ITEM_ROUTING_DDL + ";\n"
+
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
 WAREHOUSE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
@@ -821,6 +832,7 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     action TEXT NOT NULL,
     delta REAL NOT NULL,
     note TEXT,
+    op_no TEXT,                         -- 外部发货/收货操作号
     created_at TEXT NOT NULL,
     FOREIGN KEY (item_id) REFERENCES items(id)
 );
@@ -1316,6 +1328,12 @@ def init_master_db() -> None:
 
                 # Phase 3: 权限点目录 + 5 内置角色 + 角色-权限包（幂等播种）。
                 # 必须在 flock 块内——gunicorn 多 worker 并发启动时防重复播种竞态。
+                # 显式路由 FK 依赖默认租户；新安装与存量库启动均幂等物化。
+                conn.execute(
+                    "INSERT OR IGNORE INTO tenants (id, name, status, created_at) "
+                    "VALUES (1, '默认租户', 'active', ?)",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+                )
                 _seed_permissions_and_roles(conn)
 
                 # 启动断言（防空包全站 403 的沉默失败）：告警而非 raise，
@@ -1514,10 +1532,19 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 #        （docs/2026-10-20-production-loss-design.md，2026-10-20）
 #   v5 → products.is_hidden（配方归档：有生产记录的产品不可删，改隐藏；
 #        列表默认隐藏、管理员可切换，2026-10-25）
-WAREHOUSE_SCHEMA_VERSION = 5
+#   v6 → stock_movements.op_no（多仓履约发货/收货回链）
+#   v7 → document line identity/conversion and permanent write journal (#87)
+WAREHOUSE_SCHEMA_VERSION = 7
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:
+    """Upgrade a validated warehouse, with per-stage backups and process locking."""
+    from db.warehouse_migrate import upgrade
+
+    upgrade(db_path)
+
+
+def _migrate_warehouse_baseline(db_path: Path) -> None:
     """Run idempotent column-add migrations on an EXISTING warehouse db.
 
     Version-gated: the first call on a db runs the full script and stamps
@@ -1531,9 +1558,12 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
     if not db_path.exists():
         return
     with closing(sqlite3.connect(db_path)) as conn:
-        if conn.execute("PRAGMA user_version").fetchone()[0] >= WAREHOUSE_SCHEMA_VERSION:
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 6:
             return
         conn.executescript(WAREHOUSE_SCHEMA)
+        movement_cols = {r[1] for r in conn.execute("PRAGMA table_info(stock_movements)")}
+        if "op_no" not in movement_cols:
+            conn.execute("ALTER TABLE stock_movements ADD COLUMN op_no TEXT")
         # v5: 配方归档位。有生产记录的产品不允许物理删除（历史成本口径要留），
         # 管理员改为隐藏；新建库由 DDL 直接带列，老库在这里补。
         product_cols = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
@@ -1694,5 +1724,55 @@ def migrate_warehouse_db_columns(db_path: Path) -> None:
         )
         conn.commit()
         # Stamp the db so future calls short-circuit on the version read.
-        conn.execute(f"PRAGMA user_version = {WAREHOUSE_SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version = 6")
         conn.commit()
+
+
+
+def migrate_warehouse_document_columns(conn: sqlite3.Connection) -> None:
+    """Registered v7 helper; caller owns transaction and version stamp."""
+    columns = {
+        "doc_no": "TEXT DEFAULT NULL",
+        "line_no": "TEXT DEFAULT NULL",
+        "input_quantity": "TEXT DEFAULT NULL",
+        "factor": "TEXT NOT NULL DEFAULT '1'",
+    }
+    for table, index in (("restock_requests", "uq_restock_document_line"),
+                         ("outbound_requests", "uq_outbound_document_line")):
+        existing = {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        actual = {r[1]: r for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name in columns:
+            col = actual[name]
+            if (col[2].upper() != "TEXT" or col[3] != int(name == "factor")
+                    or col[4] not in (("'1'",) if name == "factor" else (None, "NULL"))):
+                raise RuntimeError(f"incompatible document column: {table}.{name}")
+        sql = (f"CREATE UNIQUE INDEX {index} ON {table} "
+               "(doc_no COLLATE BINARY,line_no COLLATE BINARY) "
+               "WHERE doc_no IS NOT NULL AND line_no IS NOT NULL")
+        conn.execute(sql.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS"))
+        found = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (index,)).fetchone()
+        def normalize(value):
+            return "".join(value.split()).replace("IFNOTEXISTS", "")
+        if not found or normalize(found[0]) != normalize(sql):
+            raise RuntimeError(f"incompatible document index: {index}")
+    journal_sql = """CREATE TABLE document_write_keys (
+        direction TEXT NOT NULL CHECK(direction IN ('outbound','restock')),
+        doc_no TEXT COLLATE BINARY NOT NULL,
+        line_no TEXT COLLATE BINARY NOT NULL,
+        request_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        input_quantity TEXT NOT NULL,
+        factor TEXT NOT NULL,
+        effective_quantity TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(direction,doc_no,line_no),
+        UNIQUE(direction,request_id)
+    )"""
+    conn.execute(journal_sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS"))
+    found = conn.execute("SELECT sql FROM sqlite_master WHERE name='document_write_keys'").fetchone()
+    if normalize(found[0]) != normalize(journal_sql):
+        raise RuntimeError("incompatible document journal")

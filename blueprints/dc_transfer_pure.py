@@ -200,11 +200,12 @@ def create_transfer_order(
     for item in resolved:
         master_conn.execute(
             """INSERT INTO store_order_items
-               (order_id, canonical_id, quantity, unit, fulfilled_quantity,
-                shipped_quantity, status, created_at)
-               VALUES (?, ?, ?, ?, 0, 0, ?, ?)""",
+               (order_id, canonical_id, source_warehouse_code, quantity, unit,
+                fulfilled_quantity, shipped_quantity, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)""",
             (
-                order_id, item["canonical_id"], item["quantity"], item["unit"],
+                order_id, item["canonical_id"], from_warehouse_code,
+                item["quantity"], item["unit"],
                 sop.ORDER_ITEM_STATUS_PENDING, ts,
             ),
         )

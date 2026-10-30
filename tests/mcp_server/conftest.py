@@ -26,12 +26,12 @@ CREATE TABLE restock_requests (
 def warehouse_db(tmp_path):
     """建一个含 1 个库存品的仓库库，返回 db 文件路径。"""
     db_path = tmp_path / "wh001.db"
+    from db import init_warehouse_db
+    init_warehouse_db(db_path)
     conn = sqlite3.connect(db_path)
-    conn.executescript(WAREHOUSE_SCHEMA)
-    conn.execute("INSERT INTO categories (id, name) VALUES (1, '调味酱')")
     conn.execute(
-        "INSERT INTO items (id, sku, name, category_id, quantity, unit) "
-        "VALUES (1, 'SKU1', 'Item A', 1, 10, 'pcs')"
+        "INSERT INTO items (id, sku, name, category_id, quantity, unit, updated_at) "
+        "VALUES (1, 'SKU1', 'Item A', 1, 10, 'pcs', '2026-10-30')"
     )
     conn.commit()
     conn.close()

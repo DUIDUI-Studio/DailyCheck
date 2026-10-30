@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}履约路由配置{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>履约路由配置</h2>
+  <a class="btn-sm" href="{{ url_for('canonical.canonical_list') }}">品项主数据</a>
+</div>
+{% if error %}
+<p role="alert">{{ error }}</p>
+{% else %}
+<p class="muted">为每个品项指定配送中心。保存或删除配置不影响已提交订单。</p>
+<div class="form-section" role="status">
+  <strong>待配置</strong>：多仓候选 {{ pending.ambiguous|length }} 项，未配置来源 {{ pending.missing|length }} 项。
+  新增绑定后，请在此显式配置履约仓。
+</div>
+<div style="overflow-x: auto;">
+<table class="data-table">
+  <thead><tr><th>品项</th><th>配置状态</th><th>履约配送中心</th><th>操作</th></tr></thead>
+  <tbody>
+  {% for item in items %}
+  {% set route = configured.get(item.id) %}
+  <tr{% if item.id in pending.ambiguous or item.id in pending.missing %} class="routing-pending" style="background: var(--warning-bg, #fff3cd);"{% endif %}>
+    <td><strong>{{ item.name }}</strong><br><small>{{ item.canonical_sku }}{% if item.status != 'active' %} · 已停用{% endif %}</small></td>
+    <td>{% if route %}已配置{% elif item.id in pending.ambiguous %}<strong>待配置 · 多仓候选</strong>{% elif item.id in pending.missing %}<strong>待配置 · 未配置来源</strong>{% else %}不参与播种{% endif %}</td>
+    <td>
+      <form method="post" action="{{ url_for('item_routing.set_route', canonical_id=item.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label for="dc-{{ item.id }}" class="muted">{{ item.name }}的履约仓</label>
+        <select id="dc-{{ item.id }}" name="dc_code" required>
+          <option value="">选择配送中心</option>
+          {% for wh in warehouses %}<option value="{{ wh.code }}"{% if route and route.fulfillment_warehouse_code == wh.code %} selected{% endif %}>{{ wh.name }}（{{ wh.code }}）</option>{% endfor %}
+        </select>
+        <button type="submit" class="btn-sm primary">保存</button>
+      </form>
+    </td>
+    <td>{% if route %}
+      <form method="post" action="{{ url_for('item_routing.delete_route', canonical_id=item.id) }}" onsubmit="return confirm('删除此路由？此品项将等待重新配置。');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn-sm">删除</button>
+      </form>
+      <small class="muted">{{ route.updated_at }}</small>
+    {% endif %}</td>
+  </tr>
+  {% else %}<tr><td colspan="4" class="muted">暂无主数据品项</td></tr>{% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

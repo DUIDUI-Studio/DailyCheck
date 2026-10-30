@@ -10,7 +10,7 @@
   {% endif %}
 </div>
 
-{% if not selected_dc %}
+{% if not multi_warehouse and not selected_dc %}
   <p class="muted">请先选择配送中心：</p>
   <div class="inv-grid">
     {% for dc in dcs %}
@@ -28,23 +28,34 @@
     {% endfor %}
   </div>
 {% else %}
+  {% if multi_warehouse %}
+  <p class="muted">目录已合并全部履约仓可订品项，下单后系统自动按品项分仓发货。</p>
+  {% else %}
   <p class="muted">
     当前配送中心：<strong>{{ selected_dc }}</strong>
     <a href="{{ url_for('store_ordering.catalog') }}">切换</a>
   </p>
+  {% endif %}
 
   <form method="get" class="inv-search">
-    <input type="hidden" name="dc" value="{{ selected_dc }}" />
+    {% if not multi_warehouse %}<input type="hidden" name="dc" value="{{ selected_dc }}" />{% endif %}
     <input name="q" value="{{ keyword }}" placeholder="搜索品项" />
     <button type="submit">查询</button>
   </form>
 
   {% if category_names %}
   <div class="cat-bar" role="tablist" aria-label="按品类筛选">
+    {% if multi_warehouse %}
+    <a class="cat-chip {% if not current_cat %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', q=keyword) }}" role="tab">全部</a>
+    {% for code, name in category_names %}
+    <a class="cat-chip {% if current_cat == code %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', cat=code, q=keyword) }}" role="tab">{{ name }}</a>
+    {% endfor %}
+    {% else %}
     <a class="cat-chip {% if not current_cat %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, q=keyword) }}" role="tab">全部</a>
     {% for code, name in category_names %}
     <a class="cat-chip {% if current_cat == code %}is-active{% endif %}" href="{{ url_for('store_ordering.catalog', dc=selected_dc, cat=code, q=keyword) }}" role="tab">{{ name }}</a>
     {% endfor %}
+    {% endif %}
   </div>
   {% endif %}
 
@@ -53,11 +64,15 @@
   <div id="catalog-draft-bar" class="calc-hint" style="margin:0 0 10px" hidden>
     已填 <strong id="catalog-draft-count">0</strong> 项（含其他品类筛选下的选择），点「加入购物车」会一并提交。
   </div>
+  <div id="catalog-draft-legacy" class="calc-hint" style="margin:0 0 10px" hidden>
+    检测到旧版按配送中心保存的草稿，已丢弃，请重新选择。
+  </div>
+  <div id="catalog-draft-invalid" class="calc-hint warn" style="margin:0 0 10px" hidden></div>
 
   {# Batch-add-to-cart form. Each card ships 3 hidden inputs (selected[]/qty[]/unit[]); the JS fills qty/unit when the user confirms the modal. #}
   <form method="post" action="{{ url_for('store_ordering.cart_add_batch') }}" id="catalog-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="hidden" name="dc" value="{{ selected_dc }}" />
+    {% if not multi_warehouse %}<input type="hidden" name="dc" value="{{ selected_dc }}" />{% endif %}
 
     {% if items %}
     <div class="inv-grid">
@@ -124,7 +139,7 @@
       <button type="submit" class="btn">加入购物车</button>
     </div>
     {% else %}
-    <p class="empty">该配送中心暂无可订商品</p>
+    <p class="empty">{% if multi_warehouse %}暂无可订商品{% else %}该配送中心暂无可订商品{% endif %}</p>
     {% endif %}
   </form>
 {% endif %}
@@ -182,10 +197,60 @@
   // survive the full page reload caused by a category chip or search submit.
   // Only canonical_ids are stored, so items hidden by the current filter stay
   // in the draft until they are added to the cart or explicitly cleared.
+  {# Draft v2 (multi-warehouse): keyed by user + storefront, not by DC. #}
+  {% if multi_warehouse %}
+  var DRAFT_PREFIX = 'dc.catalogDraft.v2:';
+  var DRAFT_SCOPE = {{ ((g.user['id'] | string) ~ ':' ~ (draft_store_code or '')) | tojson }};
+  var LEGACY_DRAFT_PREFIX = 'dc.catalogDraft.v1:' + {{ ((g.user['id'] | string) ~ ':') | tojson }};
+  var VALID_DRAFT_ITEMS = {{ valid_draft_items | tojson }};
+  {% else %}
   var DRAFT_PREFIX = 'dc.catalogDraft.v1:';
   var DRAFT_SCOPE = {{ ((g.user['id'] | string) ~ ':' ~ (selected_dc or '')) | tojson }};
+  {% endif %}
   var DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   var DRAFT_KEY = DRAFT_PREFIX + DRAFT_SCOPE;
+
+  // Legacy drafts were scoped by DC; the new flow has no DC, so drop them
+  // (never silently re-interpret an old selection under a new warehouse).
+  function discardLegacyDrafts() {
+    if (typeof LEGACY_DRAFT_PREFIX === 'undefined') return;
+    var doomed = [];
+    try {
+      for (var i = 0; i < window.localStorage.length; i++) {
+        var key = window.localStorage.key(i);
+        if (key && key.indexOf(LEGACY_DRAFT_PREFIX) === 0) doomed.push(key);
+      }
+      for (var j = 0; j < doomed.length; j++) window.localStorage.removeItem(doomed[j]);
+    } catch (e) {
+      return;
+    }
+    if (doomed.length) {
+      var note = document.getElementById('catalog-draft-legacy');
+      if (note) note.removeAttribute('hidden');
+    }
+  }
+
+  // Restore only what is still orderable; invalid lines surface a prompt.
+  function pruneInvalidDraft() {
+    if (typeof VALID_DRAFT_ITEMS === 'undefined') return;
+    var items = readDraft();
+    var ids = Object.keys(items);
+    var dropped = [];
+    for (var i = 0; i < ids.length; i++) {
+      if (!Object.prototype.hasOwnProperty.call(VALID_DRAFT_ITEMS, ids[i])) {
+        delete items[ids[i]];
+        dropped.push('#' + ids[i]);
+      }
+    }
+    if (dropped.length) {
+      writeDraft(items);
+      var box = document.getElementById('catalog-draft-invalid');
+      if (box) {
+        box.textContent = '以下草稿品项已失效，已从草稿中移除：' + dropped.join('、');
+        box.removeAttribute('hidden');
+      }
+    }
+  }
 
   function readDraft() {
     try {
@@ -284,6 +349,8 @@
 
   // Idempotent: wipe every visible card, then re-apply whatever the draft holds.
   function restoreDraft() {
+    discardLegacyDrafts();
+    pruneInvalidDraft();
     var cards = document.querySelectorAll('.inv-card[data-canonical-id]');
     for (var i = 0; i < cards.length; i++) clearCardSelection(cards[i]);
     var draft = readDraft();

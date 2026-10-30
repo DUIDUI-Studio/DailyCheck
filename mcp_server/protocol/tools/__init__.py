@@ -72,7 +72,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="restock_create",
             title="Create Restock",
-            description="Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code}.",
+            description='Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.',
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -81,7 +81,7 @@ def get_tools() -> list[Tool]:
                         "description": "Item ID",
                     },
                     "quantity": {
-                        "type": "integer",
+                        "type": "number",
                         "description": "Quantity to restock",
                     },
                     "warehouse_code": {
@@ -89,11 +89,15 @@ def get_tools() -> list[Tool]:
                         "description": "Warehouse code (e.g. WH001)",
                     },
                     "reason": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Reason for restock (optional)",
                     },
+                    'doc_no': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'description': 'Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.'},
+                    'line_no': {'type': 'string', 'minLength': 1, 'maxLength': 64, 'description': 'Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.'},
+                    'factor': {'type': 'number', 'exclusiveMinimum': 0, 'default': 1, 'description': 'Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.'},
                 },
                 "required": ["item_id", "quantity", "warehouse_code"],
+                "dependentRequired": {"doc_no": ["line_no"], "line_no": ["doc_no"]},
             },
         ),
         Tool(
@@ -102,7 +106,7 @@ def get_tools() -> list[Tool]:
             description=(
                 "List inbound restock requests for a warehouse with pagination. "
                 "Returns: {items: [{id, item_id, item_name, quantity, status, reason, "
-                "created_at}], total, limit, offset, truncated}."
+                "created_at, doc_no, line_no, input_quantity, factor}], total, limit, offset, truncated}."
             ),
             inputSchema={
                 "type": "object",
@@ -187,7 +191,7 @@ def get_tools() -> list[Tool]:
         Tool(
             name="outbound_create",
             title="Create Outbound",
-            description="Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint. Returns: {id, item_id, quantity, warehouse_code}.",
+            description='Create an outbound record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.',
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -204,11 +208,15 @@ def get_tools() -> list[Tool]:
                         "description": "Warehouse code (e.g. WH001)",
                     },
                     "reason": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Reason for outbound (optional)",
                     },
+                    'doc_no': {'type': 'string', 'minLength': 1, 'maxLength': 128, 'description': 'Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.'},
+                    'line_no': {'type': 'string', 'minLength': 1, 'maxLength': 64, 'description': 'Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.'},
+                    'factor': {'type': 'number', 'exclusiveMinimum': 0, 'default': 1, 'description': 'Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.'},
                 },
                 "required": ["item_id", "quantity", "warehouse_code"],
+                "dependentRequired": {"doc_no": ["line_no"], "line_no": ["doc_no"]},
             },
         ),
         Tool(
@@ -640,9 +648,15 @@ def get_tools() -> list[Tool]:
             title="List Store Orders",
             description=(
                 "List store orders (store ordering / DC transfer documents) visible to "
-                "this token. Read-only. Optional filters: warehouse_code (matches "
-                "either the store side or the DC side of an order), status, limit, "
-                "offset. Returns: {orders: [{id, order_no, store_warehouse_code, "
+                "this token. Read-only. Visibility is by participating warehouse: an "
+                "order is visible when the token is allowed on its store warehouse or "
+                "on ANY participating warehouse (a line's source warehouse, with the "
+                "header DC as legacy fallback). ACL expansion (explicit): a token "
+                "allowed on any participating warehouse can read the full order, "
+                "including line items fulfilled by other warehouses and their amounts. "
+                "Optional filters: warehouse_code (matches the store side or any "
+                "participating warehouse of an order), status, limit, offset. Returns: "
+                "{orders: [{id, order_no, store_warehouse_code, "
                 "dc_warehouse_code, flow_type, status, requested_by, expected_delivery_date, "
                 "created_at, updated_at, ...}], total, limit, offset, truncated}."
             ),
@@ -653,7 +667,8 @@ def get_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "Optional warehouse code filter; matches an order whose "
-                            "store side or DC side is this warehouse (e.g. wh_000)."
+                            "store warehouse or any participating warehouse is this "
+                            "warehouse (e.g. wh_000)."
                         ),
                     },
                     "status": {
@@ -690,11 +705,16 @@ def get_tools() -> list[Tool]:
             title="Get Store Order Detail",
             description=(
                 "Get one store order with its header, line items, deliveries, receipts "
-                "and status history. Read-only. Returns: {order: {id, order_no, "
+                "and status history. Read-only. Visible when the token is allowed on the "
+                "store warehouse or on ANY participating warehouse; ACL expansion "
+                "(explicit): such a token can read the full order, including line items "
+                "fulfilled by other warehouses, their amounts and the receipt history. "
+                "Returns: {order: {id, order_no, "
                 "store_warehouse_code, dc_warehouse_code, flow_type, status, ...}, "
                 "items: [{id, canonical_id, canonical_name, dc_item_id, dc_item_bound, "
-                "quantity, fulfilled_quantity, shipped_quantity, unit, status}], "
-                "deliveries: [...], receipts: [...], status_history: [...]}."
+                "source_warehouse_code, quantity, fulfilled_quantity, shipped_quantity, "
+                "unit, status}], deliveries: [{..., warehouse_code}], receipts: [...], "
+                "status_history: [...]}."
             ),
             inputSchema={
                 "type": "object",
