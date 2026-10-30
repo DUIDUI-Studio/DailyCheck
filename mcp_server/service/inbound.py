@@ -1,6 +1,8 @@
 """入库服务。"""
 from __future__ import annotations
 
+from functools import partial
+
 from mcp_server.data.master import resolve_warehouse
 from mcp_server.data.unit_of_work import warehouse_connection
 from mcp_server.data.warehouse import count_restock_movements as _count_restock_movements
@@ -30,8 +32,10 @@ def create_restock(
     documents.authorize(warehouse_code, ctx)
     payload = documents.validate(item_id, quantity, reason, doc_no, line_no, factor)
     wh = documents.resolve(warehouse_code, ctx, resolve_warehouse)
+    connection = (partial(warehouse_connection, base_dir=ctx.warehouse_base_dir)
+                  if ctx.warehouse_base_dir is not None else warehouse_connection)
     return documents.create("restock", payload, warehouse_code, wh, reason,
-                            warehouse_connection, _create_restock)
+                            connection, _create_restock)
 
 
 def list_restock(
@@ -56,7 +60,7 @@ def list_restock(
         raise NotFoundError("warehouse_not_found")
     limit = parse_limit(limit)
     offset = parse_offset(offset)
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         items = _list_restock_movements(conn, limit=limit, offset=offset)
         total = _count_restock_movements(conn)
     return {

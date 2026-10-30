@@ -76,6 +76,7 @@ def _wrap_value_error(err: ValueError) -> None:
 
 def list_canonical(
     *,
+    read_only: bool = False,
     status: str | None = None,
     category_code: str | None = None,
     q: str | None = None,
@@ -85,7 +86,7 @@ def list_canonical(
     """列主数据 + 命中总数。"""
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
-    with master_connection() as conn:
+    with master_connection(read_only=read_only) as conn:
         items = cp.list_canonical_items(
             conn,
             status=status or None,
@@ -111,14 +112,16 @@ def list_canonical(
     }
 
 
-def get_canonical_detail(canonical_id: int) -> dict:
+def get_canonical_detail(
+    canonical_id: int, *, read_only: bool = False, base_dir: str | None = None,
+) -> dict:
     """单条主数据 + 别名 + 跨仓绑定概览。"""
-    with master_connection() as conn:
+    with master_connection(read_only=read_only) as conn:
         try:
             detail = cp.get_canonical_item_detail(conn, int(canonical_id))
         except ValueError as e:
             raise NotFoundError(str(e)) from None
-        bindings = cp.collect_bindings(conn, warehouse_types=cp.BINDING_ALL_TYPES)
+        bindings = cp.collect_bindings(conn, warehouse_types=cp.BINDING_ALL_TYPES, read_only=read_only, base_dir=base_dir)
     matching: list[dict] = []
     for wh_code, rows in bindings.items():
         for r in rows:
@@ -131,20 +134,20 @@ def get_canonical_detail(canonical_id: int) -> dict:
     }
 
 
-def list_canonical_categories() -> list[dict]:
+def list_canonical_categories(*, read_only: bool = False) -> list[dict]:
     """品类筛选下拉（附每品类主数据条数）。"""
-    with master_connection() as conn:
+    with master_connection(read_only=read_only) as conn:
         return cp.list_canonical_categories(conn)
 
 
-def list_fanout_targets() -> list[dict]:
+def list_fanout_targets(*, read_only: bool = False) -> list[dict]:
     """可作为扇出目标的仓：storefront / rd / distribution_center。
 
     2026-10-10 补：配送中心也是扇出目标 —— /items 的新增入口已全仓关闭，
     而门店订货目录从「DC 自己的 items 行」出发 (list_available_dc_items)，
     DC 没有绑定行 ⇒ 品项永远订不到。
     """
-    with master_connection() as conn:
+    with master_connection(read_only=read_only) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """SELECT code, name, warehouse_type FROM warehouses
@@ -159,9 +162,9 @@ def list_fanout_targets() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def list_open_conflicts(canonical_id: int | None = None) -> list[dict]:
+def list_open_conflicts(canonical_id: int | None = None, *, read_only: bool = False) -> list[dict]:
     """列出 status='open' 的冲突；可选按 canonical_id 过滤。"""
-    with master_connection() as conn:
+    with master_connection(read_only=read_only) as conn:
         conn.row_factory = sqlite3.Row
         sql = (
             "SELECT c.*, ci.canonical_sku, ci.name AS canonical_name "
@@ -178,9 +181,9 @@ def list_open_conflicts(canonical_id: int | None = None) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_fanout_event(event_id: int) -> dict | None:
+def get_fanout_event(event_id: int, *, read_only: bool = False) -> dict | None:
     """单次扇出事件详情（含 per-仓 / per-item 应用结果）。"""
-    with master_connection() as conn:
+    with master_connection(read_only=read_only) as conn:
         conn.row_factory = sqlite3.Row
         ev = conn.execute(
             "SELECT * FROM canonical_publish_events WHERE id=?",

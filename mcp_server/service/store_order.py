@@ -269,7 +269,7 @@ def list_store_orders(
         if resolve_warehouse(warehouse_code) is None:
             raise NotFoundError("warehouse_not_found")
 
-    with master_connection() as conn:
+    with master_connection(read_only=ctx.read_only) as conn:
         orders = _fetch_orders(
             conn, codes, warehouse_code, status or None, limit, offset
         )
@@ -296,7 +296,7 @@ def get_store_order_detail(ctx: AuthContext, order_id: int) -> dict:
     except (TypeError, ValueError):
         raise ValidationError("order_id required") from None
 
-    with master_connection() as conn:
+    with master_connection(read_only=ctx.read_only) as conn:
         detail = sop.get_order_detail(conn, order_id)
         visible = (
             detail is not None

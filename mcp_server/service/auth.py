@@ -35,6 +35,8 @@ class AuthContext:
     allowed_write_paths: list[str]
     allowed_warehouses: list[str] | None  # None = all warehouses
     rate_limit: int | None = None  # 每分钟配额，None = 默认（rate_limit_pure）
+    read_only: bool = False  # Explicit bot query connection boundary.
+    warehouse_base_dir: str | None = None  # Bot data root, independent of code/CWD.
 
 
 def authenticate(authorization_header: str) -> AuthContext | None:

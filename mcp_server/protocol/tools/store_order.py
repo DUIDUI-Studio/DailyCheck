@@ -53,9 +53,9 @@ def _check_read_path(ctx, path: str) -> bool:
     """
     return check_path(ctx, "GET", path) or check_path(ctx, "GET", path + "/")
 
-def store_order_list_impl(args: dict) -> dict:
+def store_order_list_impl(args: dict, *, ctx=None) -> dict:
     """列门店订单。可选 warehouse_code / status / limit / offset 过滤。"""
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not _check_read_path(ctx, LIST_PATH):
         raise ForbiddenError("forbidden_path")
     return svc_list_store_orders(
@@ -67,9 +67,9 @@ def store_order_list_impl(args: dict) -> dict:
     )
 
 
-def store_order_detail_impl(args: dict) -> dict:
+def store_order_detail_impl(args: dict, *, ctx=None) -> dict:
     """单个门店订单详情：头 + items + deliveries + receipts + status_history。"""
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not _check_read_path(ctx, DETAIL_PATH):
         raise ForbiddenError("forbidden_path")
     order_id = args.get("order_id")

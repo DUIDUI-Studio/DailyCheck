@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from functools import partial
 
 from mcp_server.data.master import resolve_warehouse
 from mcp_server.data.unit_of_work import master_connection, warehouse_connection
@@ -44,8 +45,10 @@ def create_outbound(
     documents.authorize(warehouse_code, ctx)
     payload = documents.validate(item_id, quantity, reason, doc_no, line_no, factor)
     wh = documents.resolve(warehouse_code, ctx, resolve_warehouse)
+    connection = (partial(warehouse_connection, base_dir=ctx.warehouse_base_dir)
+                  if ctx.warehouse_base_dir is not None else warehouse_connection)
     response = documents.create("outbound", payload, warehouse_code, wh, reason,
-                                warehouse_connection, _create_outbound)
+                                connection, _create_outbound)
     documents.invalidate(_mark_invalid, item_id, response["id"], payload.doc_no is not None)
     return response
 
@@ -65,7 +68,7 @@ def list_outbound(
         raise NotFoundError("warehouse_not_found")
     limit = parse_limit(limit)
     offset = parse_offset(offset)
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         items = _list_outbound(conn, limit=limit, offset=offset)
         total = _count_outbound(conn)
     return {
@@ -84,9 +87,11 @@ def rollback_outbound(
 ) -> dict:
     """Return stored effective quantity at most once, including Web races."""
     wh = documents.resolve(warehouse_code, ctx, resolve_warehouse)
+    connection = (partial(warehouse_connection, base_dir=ctx.warehouse_base_dir)
+                  if ctx.warehouse_base_dir is not None else warehouse_connection)
     already = False
     try:
-        with warehouse_connection(wh["db_path"]) as conn:
+        with connection(wh["db_path"]) as conn:
             conn.execute("PRAGMA busy_timeout=5000")
             try:
                 conn.execute("BEGIN IMMEDIATE")

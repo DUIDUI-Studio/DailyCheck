@@ -7,3 +7,4 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_bot_tool_call_log(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_TOOL_CALL_LOG", str(tmp_path / "bot_tool_calls.log"))
+    monkeypatch.setattr("blueprints.audit_pure.ADMIN_AUDIT_LOG", tmp_path / "admin_audit.log")

@@ -852,7 +852,9 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 可行路径只有**企微智能机器人 + API 模式 → 长连接**。它只覆盖企业内部通讯录；外部群、微信个人用户没有官方通道。
 
-**为什么不走 MCP**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。机器人当前只暴露 9 项 LLM schema（v1 是 6 个只读函数）+ 4 个旧名兼容实现，查询连接固定 `mode=ro`，七项 canonical 写一律禁止 bot 执行——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。**唯一例外**是 #78 D4 批准的三写（`restock_create` / `outbound_create` / `outbound_rollback`），它是有条件、当前不可执行的未来能力，不改变 `mode=ro` 查询边界，详见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+**PR1 不直接开放 MCP 的设计依据（历史阶段）**：MCP 那 29 个工具里有 10 个是写操作（`restock_create` / `outbound_create` / `canonical_*`）。把它们交给 LLM，员工说一句「帮我下 10 箱」就可能真被调用，提示词拦不住注入。PR1 机器人只暴露 9 项 LLM schema（v1 是 6 个只读函数）+ 4 个旧名兼容实现，查询连接固定 `mode=ro`，七项 canonical 写一律禁止 bot 执行——这是绕不过去的边界。MCP 保留原用途（外部 AI 客户端协商），机器人直接 import 查询函数，少一跳序列化也少一个进程。**唯一例外**是 #78 D4 批准的三写（`restock_create` / `outbound_create` / `outbound_rollback`），在 PR1 阶段它是有条件、尚不可执行的未来能力，不改变 `mode=ro` 查询边界，详见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+
+**MCP 接入边界（Issue #80 PR2）**：依据 [Owner #78 comment 714](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-714)（选项 [635](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-635)，审计 [634](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-634)）复用原 14 + 八读共 22 项 MCP handler；五自有与四旧名保留，共 31 个可配置名称。动态展示仍是 MCP 注册集合 + 五自有；发现新工具不会授予执行权限。七个 canonical 写禁止，`get_price` 隐藏。唯一写例外是 `restock_create` / `outbound_create` / `outbound_rollback`，必须通过下述护栏；提示词不作为授权依据。
 
 **链路**（VPS 主动出站，入站端口 0 个，不动 nginx / 安全组 / 蓝绿）：
 
@@ -861,23 +863,27 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
   → WSS 长连接（VPS 主动建立 wss://openws.work.weixin.qq.com:443）
   → bot/serve.py 剥 @ 前缀
   → bot/agent.py 调 MiniMax（function calling，最多 3 轮）
-  → bot/tools.py 只读查 SQLite（跨 6 个仓）
+  → bot/tools.py 只读查询 / bot/mcp_tools.py 显式上下文调用 MCP handler
+  → 三写独立护栏通道（开关 + 真实 userid + 路径/仓库权限）
   → reply_stream 分段覆盖推送
   → 员工看到打字机效果
 ```
 
-**三层只读防护**（任一层单独都够用）：
+**查询只读边界与三写限定例外**：
 
-1. **工具集**：`bot/tools.py` 只有 SELECT，不 import 任何写 service
-2. **数据库**：`file:...?mode=ro` 打开，SQLite 层直接拒绝 UPDATE / DELETE / INSERT（`tests/bot/test_tools.py::TestReadOnlyBoundary` 守着）
-3. **提示词**：只作第三层，**不作为安全依据**
+1. `bot/tools.py` 仍只有查询，SQLite 连接仍 `file:...?mode=ro`；MCP 查询显式传 `AuthContext(allowed_write_paths=[], read_only=True)`，UoW 也以 `mode=ro` 打开，禁止查询触发迁移/缓存写入。库初始化和迁移归应用生命周期；缺库不创建。
+   `warehouse_paths.resolve_warehouse_path` 是仓库元数据路径的共享解析器：bot 读/最小写上下文显式携带 `warehouse_base_dir=db_dir().parent`，UoW、无缓存采购与 canonical bindings 都用此根解析相对路径，和旧 bot 工具一致，不依赖进程 CWD 或代码根。绝对路径保持原值；HTTP/stdio 未传根时保留原有行为。canonical 只读详情遇到缺失仓库库明确失败，不静默返回零绑定。
+2. `bot/mcp_tools.py` 只允许固定批准池；原三写须先通过消息快照开关、可信 frame userid 白名单、部署策略路径/仓范围检查，然后才构造仅含本次路径与单仓的写上下文。无 MCP 进程 token/遗留 ContextVar 继承，不 patch `resolve_ctx`。
+3. 每次写调用先落审计 attempt（日志不可写则不执行），完成或拒绝后记录 who/tool/args/result/duration；最终回复追加真实结果回执，模型摘要不能省略。七项 canonical 写始终无 bot schema/adapter。
 
-**工具集（10 个只读函数）**。v1 只有 6 个（搜索 / 详情 / 价格 / 低库存 / 仓清单 / 仓内品项），2026-10-21 按实际提问补了 4 个：
+**部署策略**：PR1 表不能表达路径/仓范围，所以 `BOT_AUTH_POLICY` 指向运维维护的 JSON 文件（按真实 userid 键控，字段 `read_paths`、`write_paths`、`warehouses`、`global_read`）。每消息读一次；配置了文件时未知用户/坏文件拒绝所有数据权限；未配置文件保留旧全仓库存读、写范围为空、全局 canonical 读不授权。六个 canonical 读必须显式 `global_read=true` **且** `warehouses=null`，不把受限仓提升为全局。`BOT_OWNER_USERID` 只可在 Owner/Prod 取得真实 userid 证据后设置；未设置时保留历史白名单默认 `LinJi`，但身份核实门槛拒绝所有写入。
+
+**旧查询工具（10 个实现函数，9 个 schema，get_price 隐藏）**。v1 只有 6 个（搜索 / 详情 / 价格 / 低库存 / 仓清单 / 仓内品项），2026-10-21 按实际提问补了 4 个：
 
 | 工具 | 补它的原因 |
 |---|---|
 | `list_store_overview` | 员工问「各门店库存状况」，原来只能逐个仓调 `list_warehouse_items`，模型查一两个就开始编，剩下几家直接答「没出现在清单里」。**必须一次返回全部** |
-| `get_item_consumption` | 「最近消耗了多少」原来完全答不了。数据在 `stock_movements`，**只算负向动作**（出库 / 门店订货出库 / 总仓调货出库），补货入库和出库回退是正数，混进来会把消耗抵消掉 |
+| `get_item_consumption` | 「最近消耗了多少」原来完全答不了。数据在 `stock_movements`，**按动作取 `SUM(-delta)`**（出库 / 门店订货出库 / 总仓调货出库），补货入库和出库回退是正数，混进来会把消耗抵消掉 |
 | `list_orders` | 订单在 `master.db` 的 `store_orders`，原来没接。返回带 `{BASE}/store-ordering/orders/<id>` 链接——群里只给订单号等于没给 |
 | `get_project_help` | 「你能干什么」由模型自由发挥时格式每次都不一样。改成固定文案（`bot/help_text.py`）原样转发 |
 
@@ -890,7 +896,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 **价格语义**：`items.selling_price` 是本仓售价；`price_follow_canonical=1` 时改取 `canonical_items.selling_price`（Q6 预留开关，生产当前全 0）。两者都为 0 时返回 `null` 并标「售价未维护」，**绝不报 0 元**——把未维护当 0 是最容易让员工误判的坑。成本价 `unit_cost` 一并返回（Eric 2026-10-21 明确「售价和成本两个接口都预留」）。
 
-**数字对账**（`bot/verify_pure.py`）：模型不改库，但会**算错数**（把六个仓自己加一遍）。回复生成后，把工具返回的数字收成可信集合，扫回复里 > 20 且无出处的数字；命中就用一次无工具的小调用只订正数字（超时 10s，失败保留原答）。`BOT_VERIFY_NUMBERS=0` 一键关闭。
+**数字对账**（`bot/verify_pure.py`）：模型会**算错数**（把六个仓自己加一遍）。回复生成后，把工具返回的数字收成可信集合，扫回复里 > 20 且无出处的数字；命中就用一次无工具的小调用只订正数字（超时 10s，失败保留原答）。`BOT_VERIFY_NUMBERS=0` 一键关闭。
 
 两个容易做错的细节（都踩过）：**可信集合要包含字符串字段里的数字**——品名规格（`标签纸40*30`）和 `note` 里的计数都是我们自己生成的事实，只认数字类型会让模型照抄品名反被判成幻觉；**规格表达式要整段跳过**（`40*30` / `20 × 30` / `21x29`），那是尺寸不是库存量。
 
@@ -908,6 +914,8 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 | `DAILYCHECK_DB_DIR` | 是 | 库目录，生产 `/root/DailyCheck/db` |
 | `LLM_API_KEY` | 是 | MiniMax key（缺省回退读 WorkBuddy MCP 配置） |
 | `LLM_BASE_URL` / `LLM_MODEL` | 否 | 缺省 `https://api.minimaxi.com` / `MiniMax-M3.1-Flash` |
+| `BOT_OWNER_USERID` | 启写前 | Owner/Prod 核实的真实企微 userid；未设置拒写，不把历史 LinJi 当成证据 |
+| `BOT_AUTH_POLICY` | 启写/限制读范围前 | 按 userid 的受信 JSON 路径/仓库策略文件；每消息加载，未配写范围为空 |
 | `BOT_VERIFY_NUMBERS` | 否 | `0` 关闭数字对账 |
 | `BOT_PUBLIC_BASE_URL` | 否 | 消息里链接的域名，缺省 `https://kjtang.cn`。**不能用 127.0.0.1**，群里点不开 |
 | `BOT_TOOL_CALL_LOG` | 否 | 工具调用计数 JSONL 路径；缺省 `<DAILYCHECK_DB_DIR>/../bot_tool_calls.log`（bot 写入端与 Web 读取端共用该推导） |
@@ -919,7 +927,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 - 入口 `/admin/bot-agent`（GET）与 `/admin/bot-agent/save`（POST），均 `@require_platform_admin`；保留 Flask-WTF 默认 CSRF；审计复用 `blueprints/audit_pure.append_admin_audit`。
 - 配置落 `master.db.bot_agent_config(key TEXT PRIMARY KEY, value TEXT, updated_at, updated_by)`，键为 `tool.<name>` / `llm.reasoning_effort` / `write.allowed_userids`；迁移 v3 注册，`init_master_db()` 同步幂等建表（新库与存量库都覆盖）。
 - 展示集合 `D = get_tools()` 实时 29 项 + bot 五自有 = **34 主行**；四个旧名（`list_warehouses` / `list_warehouse_items` / `get_item_detail` / `get_item_consumption`）作为兼容子条目，`get_price` 单列诊断（D1=A / D6=A）。行集合**不复制静态清单**：新增注册项会自动出现并标「待确认」。
-- 执行集合 `E = TOOL_NAMES(9) ∩ 当前消息配置快照`；MCP 名称或未知名称即使配置成 on 也不会进入 E。PR1 不接入 MCP 执行能力、不开放任何写操作执行路径。
+- PR2 执行池为批准 MCP 22 + 旧九项；原 14 与旧九项正常配置默认 on，八读默认 off/逐项显式启用。四旧名须同时满足子/父开关；UI 保留独立子偏好和计数。PR1 保存的旧九项键继续生效；新键缺省遵循 PR2 默认，不迁移/覆盖旧配置。
 - `bot/agent.py:answer_stream()` **每条消息只调用一次** `load_effective_config()`；同一快照用于 `tools` 数组、`_run_tool` 过滤与 `reasoning_effort`。主答与数字校正辅助调用都在请求体**顶层**携带 `reasoning_effort`。
 - 回退：缺表 / 锁库 / 读取异常 / 非法配置值 → 现有 9 项全开 + `medium`；回退绝不启用新写能力。
 - 计数：`bot/usage.py` 在真实工具调用后向 DB 同级的 `bot_tool_calls.log` 追加 JSON 行（`BOT_TOOL_CALL_LOG` 可覆盖）；页面只聚合最近 7 天，不另造遥测平台。
@@ -936,7 +944,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 **测试**（`tests/bot/`，99 用例）：工具层（只读边界拒绝三种写 / 仓名容错 / 跨仓汇总 / 售价缺失语义 / 停用品项不可见 / 主数据停用不可见）、数字对账（多精度变体容差 / 阈值边界 / 年份与百分数排除 / 顺序去重）、结果裁剪（保持合法 JSON / 砍不动时明确报错）、凭证装载与 @ 前缀剥离。
 
-**运行契约（Issue #78 / #88，2026-10-30 起）**：Owner 按 [comment 714](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-714) 采纳 D1–D7。展示集合 `D(t)=get_tools()∪五自有` 动态计算（当前 34 主行），四旧名挂父 MCP 子条目；执行集合仍是已实现 schema ∩ 消息配置快照 ∩ 身份/范围。七项 canonical 写只展示、默认 off、不可执行；D4 仅批准 `restock_create` / `outbound_create` / `outbound_rollback` 三写作有条件例外，**当前不可执行**，查询连接仍 `mode=ro`。八读由 #80 接入并逐项验收，`replenishment_board` 由 #81 承接。完整契约见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+**运行契约（Issue #78 / #88，2026-10-30 起）**：Owner 按 [comment 714](http://hub01:3000/eric/dailycheck/issues/78#issuecomment-714) 采纳 D1–D7。展示集合 `D(t)=get_tools()∪五自有` 动态计算（当前 34 主行），四旧名挂父 MCP 子条目；执行集合仍是已实现 schema ∩ 消息配置快照 ∩ 身份/范围。七项 canonical 写只展示、默认 off、不可执行；D4 仅批准 `restock_create` / `outbound_create` / `outbound_rollback` 三写作有条件例外：PR1 不可执行，#80 PR2 接入上述独立护栏通道，生产启写仍需真实身份与范围策略核实；查询连接仍 `mode=ro`。八读由 #80 接入并逐项验收，`replenishment_board` 由 #81 承接。完整契约见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ---
 
@@ -1412,10 +1420,12 @@ flowchart LR
 在 BEGIN IMMEDIATE 中添加doc_no/line_no/input_quantity/factor、部分唯一索引和永久journal，
 同事务stamp7。v7失败全回滚；旧baseline可能留部分DDL，可重试补齐。v7 down安全拒绝，
 首选保留schema/data的代码回退；备份恢复只在Prod协调停写与来源checkpoint后执行。
-MCP warehouse_connection在connect/yield前调wrapper，无需Web预热，mode=rw拒绝静默建空库；
+MCP warehouse_connection非只读路径在connect/yield前调wrapper，无需Web预热，mode=rw拒绝静默建空库；bot显式read_only路径不触发迁移，直接mode=ro打开已初始化仓库，保留查询零写入边界；
 master_connection不迁移warehouse。软链共享真实路径锁，绿副本独立迁移；已v7不重复备份/ALTER。
 
 ## 5. 应用层模块图
+
+**Bot PR2 复用接线**：`bot.agent` → `bot.mcp_tools` → 22 个批准 MCP handler/service；`bot.tools` 保留旧查询接口。采购计算新增显式配置/只读参数供无缓存只读调用，canonical bindings 新增只读收集模式；没有新增蓝图、路由、表或预测算法。
 
 ```mermaid
 flowchart TB
@@ -1491,6 +1501,8 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 新增MCP身份不进入Web表单，Web新行仍保留NULL身份/input和factor默认1。
 
 ## 6. 蓝图依赖关系
+
+**Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
 
 ```mermaid
 flowchart LR
@@ -1850,7 +1862,7 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，当前只暴露 9 项 LLM schema（查询连接 `mode=ro`），七项 canonical 写禁止 bot 执行；#78 D4 批准的三写只是有条件、当前不可执行的未来例外——不要为了「复用」把 MCP 的写工具接进对话链路。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -1872,6 +1884,8 @@ flowchart LR
 ```
 
 ### 9.2 29 个 MCP 工具
+
+**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 原缺路径检查由 bot adapter 的固定路径矩阵补齐；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
@@ -2546,6 +2560,8 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 去掉 limit clamp / 数据层忽略 offset）均实测打红对应用例。该文件同样落在 `tests/`
 根目录，CI 会跑。
 
+**Bot PR2（Issue #80）**：`tests/bot/test_mcp_integration.py` 覆盖 22 项 schema→dispatch→临时库真实调用、19 读路径 ACL、全局读显式授权、三写允许/拒绝/并发/回执/审计、只读 SQLite 拒绝误写、缺库不创建、旧消费口径与父子开关；`test_agent_requests.py` 捕获 restock 关闭及八读逐项启停的真实请求构造。隔离 bot venv 不装入主站；权限/只读及相对路径、缺库、参与仓范围变异均由定向测试检出。
+
 **Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。CI 的 `--ignore=tests/mcp_server` 不影响这些文件。
 
 ---
@@ -2735,20 +2751,20 @@ with app.test_client() as c, c.session_transaction() as s:
 
 回归：`tests/test_recipe_bom_delete.py`（20 例，冰激凌配方页 10 + 出品配方页 9 + 跨页权限 1）。变异验证：整包还原成 `origin/main` 的 bug 版 → 20 例中 17 例变红；定向还原「旧 IntegrityError 处理」→ 3 例红；把 `bom_delete[]` checkbox 放回保存表单 → 1 例红。
 
-### 13.14 Bot 配置热加载与执行集合（2026-10-29 起，Issue #79 PR1）
+### 13.14 Bot 配置热加载与执行集合（Issue #79 PR1 / #80 PR2）
 
-**背景**：`get_tools()` 从原计划的 14 项漂移到 29 项，而 bot schema 只有 9 项；任何「把 UI 行写死成 19」或「拿展示清单当执行授权」都会在下次注册新工具时静默失真（#78 契约核对的核心结论）。PR1 因此把**展示集合 D** 与**执行集合 E** 分开：
+- `D = get_tools()` 实时注册名 + bot 五自有；34 是当前快照，不是永久行数。未知注册项展示待确认且不能执行。
+- 批准 MCP 池固定在 `bot/tool_contract.py`：原 14 + 八读（19 读、3 写），另保留四旧名和五自有；schema 从 MCP 注册项复用、参数拒绝额外字段，派发只取批准名。七个 canonical 写和 get_price 即使配置 on 仍拒绝。
+- 正常配置原 14（含三写）与旧九项默认 on，新增八读默认 off。实际请求 tools 和入口共用同一条消息的一次配置快照；入口另外落实可信发送者、路径与仓范围。父 off 阻断旧名，子名仍保留独立偏好/计数。订单旧名的行与状态总数复用当前 MCP 参与仓谓词（无明细存量单才回退头仓），不能绕过多仓履约的范围限制。配置和部署策略修改均在下一条消息生效，不改正在处理的快照。
+- 配置失败回退**固定旧九只读 + medium、空写白名单**，不从扩大后的 schema 推导回退集；degraded 也不能绕过 sender ACL。所有读上下文的 `allowed_write_paths=[]`。
+- `get_item_consumption` 保留 1–365 days、动作流水与日期 cutoff；MCP `item_consumption` 保留固定窗口、未回滚业务单据含生产领料/镜像去重口径。不可静默替换，也不可用 item_forecast/shortage 代替补货看板预测。
+- 采购查询复用 `compute_store_procurement`/`aggregate_hub`，通过显式只读参数绕过初始化及缓存写；hub 在聚合前按授权仓过滤。canonical 详情只读收集 bindings，不做迁移；仓库相对路径由上下文的受信数据根统一解析，缺库明确失败；六个 canonical 读仍为全局数据，必须全局显式授权，不伪称按仓裁切。
+- 审计复用 `append_admin_audit`，who 是可信 frame userid；每次调用记录工具/参数/真实结果或拒绝/耗时。写前 attempt 失败则不执行；写后结果审计失败保留真实回执并记录服务日志供核对。计数仍为 `bot_tool_calls.log`，不写业务库。
 
-- `D = get_tools()` 实时注册名 + bot 五自有；页面不存工具清单，新增注册项自动出现（无元数据时标「待确认」）。
-- `E = TOOL_NAMES(9) ∩ 消息开始时的配置快照`。MCP 名称/未知名称/旧名映射都不能凭配置扩大 E；PR1 不新增 MCP adapter，也不开放写操作。
-- `bot_agent_config` 的 `tool.<name>` 只对 9 项生效；旧名子条目有独立开关但**不旁路**其父 MCP 的未接入状态（父行本来就不在执行集合）。
-- 配置读取**每条消息一次**（`answer_stream`），不是每轮工具调用一次；这样同一条回复的多轮工具调用看到同一套开关，避免半途切换。
-- 失败回退固定为「9 项 + medium」而不是「全量 + 默认」：宁可少能力，也不把未验收的 MCP/写工具带进故障路径。
-- 调用计数是 JSONL 追加（`bot_tool_calls.log`），不是新遥测平台；bot 的 SQLite 连接保持 `mode=ro`，计数不写业务库。
+**验收证据**：[`2026-10-30-bot-mcp-pr2-validation.md`](2026-10-30-bot-mcp-pr2-validation.md)；关键临时库矩阵位于 `tests/bot/test_mcp_integration.py`，实际请求捕获位于 `test_agent_requests.py`（均不在 CI 忽略的 tests/mcp_server 中）。
 
-**回归**：见 §12 的五个测试文件；关键断言做过变异验证（把 `_tool_schemas_for` 改回全量、把 `_run_tool` 的 allowed 检查删掉、把顶层 `reasoning_effort` 塞进 messages、把非法值回退改成保留半套开关，分别会打红对应用例）。
 
-**与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，**当前不可执行**。D2 八读、三写护栏与 D7 显式启用归 #80，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+**与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，PR1 阶段不可执行；#80 PR2 实现三写护栏，生产未核实真实 userid 或未配置写范围时仍拒写。D2 八读、三写护栏与 D7 显式启用由 #80 实现，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ## 14. pre-existing 风险清单
 

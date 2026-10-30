@@ -1,14 +1,20 @@
 """Inventory MCP Tools."""
 from __future__ import annotations
 
+from mcp_server.infra.errors import ForbiddenError
 from mcp_server.service.auth import check_path, check_warehouse, resolve_ctx
 from mcp_server.service.inventory import (
-    list_items as svc_list_items,
     get_item as svc_get_item,
+)
+from mcp_server.service.inventory import (
+    list_items as svc_list_items,
+)
+from mcp_server.service.inventory import (
     list_movements as svc_list_movements,
+)
+from mcp_server.service.inventory import (
     list_warehouses_for_token as svc_list_warehouses,
 )
-from mcp_server.infra.errors import ForbiddenError
 
 
 def _get_ctx():
@@ -20,9 +26,9 @@ def _get_ctx():
     return resolve_ctx()
 
 
-def items_list_impl(args: dict) -> list[dict]:
+def items_list_impl(args: dict, *, ctx=None) -> list[dict]:
     warehouse_code = args.get("warehouse_code")
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/items"):
         raise ForbiddenError("forbidden_path")
     if warehouse_code and not check_warehouse(ctx, warehouse_code):
@@ -30,10 +36,10 @@ def items_list_impl(args: dict) -> list[dict]:
     return svc_list_items(warehouse_code, ctx)
 
 
-def items_detail_impl(args: dict) -> list[dict]:
+def items_detail_impl(args: dict, *, ctx=None) -> list[dict]:
     item_id = args.get("item_id")
     warehouse_code = args.get("warehouse_code")
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/items/<id>"):
         raise ForbiddenError("forbidden_path")
     if warehouse_code and not check_warehouse(ctx, warehouse_code):
@@ -43,9 +49,9 @@ def items_detail_impl(args: dict) -> list[dict]:
     return [result] if result else []
 
 
-def movements_list_impl(args: dict) -> list[dict]:
+def movements_list_impl(args: dict, *, ctx=None) -> list[dict]:
     warehouse_code = args.get("warehouse_code")
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/movements"):
         raise ForbiddenError("forbidden_path")
     if warehouse_code and not check_warehouse(ctx, warehouse_code):
@@ -53,6 +59,6 @@ def movements_list_impl(args: dict) -> list[dict]:
     return svc_list_movements(warehouse_code, ctx)
 
 
-def warehouse_list_impl(_args: dict) -> list[dict]:
-    ctx = _get_ctx()
+def warehouse_list_impl(_args: dict, *, ctx=None) -> list[dict]:
+    ctx = ctx if ctx is not None else _get_ctx()
     return svc_list_warehouses(ctx)

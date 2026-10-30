@@ -1,14 +1,4 @@
-"""企微 Bot 管理配置台（Issue #79 PR1）。
-
-参照 ``/admin/agent-tokens`` 的接线：平台管理员守卫、默认 CSRF、共享审计。
-页面只写 ``master.db.bot_agent_config`` 的配置值；MCP 行实时来自
-``get_tools()``，不复制静态清单，也不因展示/开关而接入新的执行能力。
-
-PR1 的边界：
-- 只有现有 9 个 bot 工具可被开关影响（``bot.tool_schema.TOOL_NAMES``）。
-- 29 个 MCP 注册项只展示，写操作全部标红且不开放执行。
-- ``write.allowed_userids`` 只登记，PR1 没有任何写执行路径。
-"""
+"""Bot configuration console; fixed approved pool controls execution, discovery only display."""
 from __future__ import annotations
 
 import os

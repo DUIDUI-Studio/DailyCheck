@@ -1,22 +1,17 @@
 """Forecast 服务，复用 forecast_pure.py。"""
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from mcp_server.data.master import resolve_warehouse
-from mcp_server.data.warehouse import item_exists
-from mcp_server.data.unit_of_work import warehouse_connection
-from mcp_server.service.auth import AuthContext, check_warehouse
-from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
+from blueprints.consumption import fetch_item_movements_30d
 
 # 复用 forecast_pure 的核心逻辑
-from blueprints.forecast_pure import compute_daily_avg, classify_confidence, compute_forecast_total
-from blueprints.consumption import fetch_item_movements_30d
+from blueprints.forecast_pure import classify_confidence, compute_daily_avg, compute_forecast_total
+from mcp_server.data.master import resolve_warehouse
+from mcp_server.data.unit_of_work import warehouse_connection
+from mcp_server.data.warehouse import item_exists
+from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
+from mcp_server.service.auth import AuthContext, check_warehouse
 
 
 def parse_horizon(raw) -> int | None:
@@ -48,7 +43,7 @@ def get_forecast(
     horizon = parse_horizon(horizon_days)
     if horizon is None:
         raise ValidationError("invalid_horizon")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         if not item_exists(conn, item_id):
             raise NotFoundError("not_found")
         movements = fetch_item_movements_30d(conn, item_id)

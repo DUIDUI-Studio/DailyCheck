@@ -47,7 +47,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "查询某个品项在各仓库的库存数量、安全库存、单位、售价和成本。"
                 "凡是问「还有多少」「库存多少」「剩几箱」「够不够」「在哪个仓」"
                 "「多少钱」「价格多少」都用这个。"
-                "默认查全部仓库并给出总量；只有员工明确提到某个仓时才传 warehouse_code。"
+                "默认查全部获授权仓库并给出总量；只有员工明确提到某个仓时才传 warehouse_code。"
             ),
             "parameters": {
                 "type": "object",
@@ -109,7 +109,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "warehouse_code": {
                         "type": "string",
-                        "description": "仓库编码，留空则查全部仓库",
+                        "description": "仓库编码，留空则查获授权仓库",
                     },
                     "limit": {
                         "type": "integer",
@@ -128,7 +128,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "list_warehouses",
             "description": (
-                "列出所有仓库的编码和名称。"
+                "列出获授权仓库的编码和名称。"
                 "当员工提到的仓库名你无法对应到编码时，先调这个确认，不要猜。"
             ),
             "parameters": {

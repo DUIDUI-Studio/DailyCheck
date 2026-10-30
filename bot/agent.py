@@ -23,13 +23,18 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 from typing import Any
 
 import aiohttp
+from jsonschema import validate
+from jsonschema.exceptions import ValidationError as SchemaError
 
+from blueprints.audit_pure import append_admin_audit
 from bot import tools
+from bot.access import SenderAccess, load_sender_access
 from bot.agent_config import (
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
@@ -39,9 +44,11 @@ from bot.agent_config import (
     resolve_model_name,
 )
 from bot.prompt import SYSTEM_PROMPT
+from bot.tool_contract import LEGACY_PATHS, MCP_NAMES, mcp_schemas
 from bot.tool_schema import TOOL_NAMES, TOOL_SCHEMAS
 from bot.usage import record_tool_call
 from bot.verify_pure import build_correction_prompt, collect_numbers, find_untraceable
+from mcp_server.service.auth import check_path
 
 logger = logging.getLogger("bot.agent")
 
@@ -110,8 +117,8 @@ def _config() -> tuple[str, str, str]:
 
 def _tool_schemas_for(enabled_tools: Collection[str]) -> list[dict[str, Any]]:
     """只暴露本条消息有效配置允许的工具（顺序与注册表一致）。"""
-    allowed = frozenset(enabled_tools) & TOOL_NAMES
-    return [schema for schema in TOOL_SCHEMAS if schema["function"]["name"] in allowed]
+    allowed = frozenset(enabled_tools) & (TOOL_NAMES | MCP_NAMES)
+    return [schema for schema in [*TOOL_SCHEMAS, *mcp_schemas()] if schema["function"]["name"] in allowed]
 
 
 def _request_payload(
@@ -145,7 +152,7 @@ def _default_config() -> BotAgentConfig:
 _PROMPT_CACHE: str | None = None
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(sender: SenderAccess | None = None) -> str:
     """把仓库清单直接拼进提示词。
 
     实测教训：不写清单时，模型会先调一次 ``list_warehouses`` 去查编码，
@@ -155,20 +162,24 @@ def build_system_prompt() -> str:
     缓存到进程生命周期；新增仓库后重启进程即可刷新。
     """
     global _PROMPT_CACHE
-    if _PROMPT_CACHE is not None:
+    if sender is None and _PROMPT_CACHE is not None:
         return _PROMPT_CACHE
 
-    brief = tools.warehouse_brief()
+    if sender and not check_path(sender.read_context(), "GET", "/api/v1/warehouses"):
+        return SYSTEM_PROMPT
+    brief = tools.warehouse_brief(ctx=sender.read_context()) if sender else tools.warehouse_brief()
     if not brief:
         return SYSTEM_PROMPT
 
     lines = "\n".join(f"- {w['name']}：{w['code']}" for w in brief)
-    _PROMPT_CACHE = (
+    prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         "## 仓库清单（已确认，直接用编码，不要为了查编码再调用 list_warehouses）\n"
         f"{lines}\n"
     )
-    return _PROMPT_CACHE
+    if sender is None:
+        _PROMPT_CACHE = prompt
+    return prompt
 
 
 # 结果过长时优先砍这些列表字段——它们是「条数多」而不是「字段长」，
@@ -222,49 +233,73 @@ def _run_tool(
     name: str,
     raw_args: str,
     allowed_tools: Collection[str] | None = None,
+    *,
+    config: BotAgentConfig | None = None,
+    sender: SenderAccess | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
-    """执行单个工具。
-
-    ``allowed_tools`` 是**同一条消息**的有效执行集合（消息开始时读取一次）。
-    被关闭的工具、旧历史/伪造调用一律返回 ``unknown_tool``，且不进入 dispatch。
-    默认值仅用于调试/旧单测；消息链必须显式传快照。
-
-    返回 ``(给模型看的文本, 完整结果对象)`` 两样东西：文本可能被裁剪过，而
-    对象始终完整——数字对账必须看完整数据，不能看裁过的版本。
-    """
-    allowed = (TOOL_NAMES if allowed_tools is None else frozenset(allowed_tools)) & TOOL_NAMES
-    if name not in allowed:
-        return json.dumps({"ok": False, "error": "unknown_tool", "name": name}), None
+    """One execution gate for current schemas, forged calls and stale history."""
+    started = time.monotonic()
+    args: Any = raw_args
+    payload: dict[str, Any] | None = None
+    result: Any = None
+    who = sender or SenderAccess("")
+    allowed = (config.enabled_tools if config else (
+        TOOL_NAMES if allowed_tools is None else frozenset(allowed_tools)
+    )) & (TOOL_NAMES | MCP_NAMES)
     try:
         args = json.loads(raw_args) if raw_args.strip() else {}
-    except json.JSONDecodeError:
-        return json.dumps({"ok": False, "error": "invalid_arguments_json"}), None
-    if not isinstance(args, dict):
-        return json.dumps({"ok": False, "error": "arguments_must_be_object"}), None
+        if name not in allowed:
+            result = {"ok": False, "error": "unknown_tool", "name": name,
+                      "message": "工具未启用或未批准，不能执行"}
+        else:
+            json.dumps(args, allow_nan=False)  # Reject NaN/Infinity before any DB call.
+            if not isinstance(args, dict):
+                raise ValueError("arguments_must_be_object")
+            schemas = {s["function"]["name"]: s["function"]["parameters"]
+                       for s in [*TOOL_SCHEMAS, *mcp_schemas()]}
+            validate(args, schemas[name])
+            if name in MCP_NAMES:
+                from bot.mcp_tools import execute
 
-    try:
-        result = _DISPATCH[name](**args)
-    except TypeError as exc:
+                # A caller supplying only a name set never gains write authority.
+                from bot.tool_contract import WRITE_PATHS
+
+                if name in WRITE_PATHS:
+                    # If audit storage is unavailable, do not start a mutation.
+                    append_admin_audit(who.userid or None, json.dumps({
+                        "who": who.userid or None, "tool": name, "args": args,
+                        "result": {"phase": "attempt"}, "duration_ms": 0,
+                    }, ensure_ascii=False))
+                result = execute(name, args, config or _default_config(), who)
+            else:
+                ctx = who.read_context()
+                path = LEGACY_PATHS.get(name)
+                if path and not check_path(ctx, "GET", path):
+                    raise PermissionError("forbidden_path: 没有此查询路径权限")
+                result = _DISPATCH[name](**args, **({"ctx": ctx} if sender else {}))
+            payload = result if isinstance(result, dict) else {"items": result}
+            record_tool_call(name, ok=not (isinstance(result, dict) and result.get("ok") is False))
+    except json.JSONDecodeError:
+        result = {"ok": False, "error": "invalid_arguments_json", "message": "工具参数不是合法 JSON"}
+    except (TypeError, ValueError, SchemaError) as exc:
+        result = {"ok": False, "error": "bad_arguments", "message": str(exc)}
         record_tool_call(name, ok=False)
-        return (
-            json.dumps(
-                {"ok": False, "error": "bad_arguments", "message": str(exc)},
-                ensure_ascii=False,
-            ),
-            None,
-        )
-    except Exception as exc:  # noqa: BLE001 - 单个工具失败不该中断整轮对话
+    except Exception as exc:  # Single-call failures must not abort the message.
+        result = {"ok": False, "error": "tool_failed", "message": str(exc)}
         record_tool_call(name, ok=False)
         logger.warning("工具 %s 执行失败: %s", name, exc)
-        return (
-            json.dumps(
-                {"ok": False, "error": "tool_failed", "message": str(exc)},
-                ensure_ascii=False,
-            ),
-            None,
-        )
-    record_tool_call(name, ok=True)
-    return _to_tool_text(result), result
+    finally:
+        detail = json.dumps({
+            "who": who.userid or None, "tool": name, "args": args, "result": result,
+            "duration_ms": round((time.monotonic() - started) * 1000, 2),
+        }, ensure_ascii=False)
+        try:
+            append_admin_audit(who.userid or None, detail)
+        except OSError:
+            logger.exception("工具审计结果追加失败：%s", detail)
+            if isinstance(result, dict):
+                result = {**result, "audit_warning": "审计结果追加失败，请管理员核对 attempt 与服务日志"}
+    return _to_tool_text(result if isinstance(result, dict) else {"items": result}), payload
 
 
 async def _stream_once(
@@ -476,13 +511,15 @@ async def answer_stream(
     history: list[dict[str, str]] | None = None,
     on_delta: DeltaCallback | None = None,
     on_progress: DeltaCallback | None = None,
+    *, userid: str | None = None,
 ) -> str:
     """流式回答。每收到一段文本就回调 on_delta，返回值是完整答案。
 
     ``on_progress`` 在工具跑完、等模型组织语言的那几秒里给一句状态。
     模型首 token 有 2 秒左右的固定开销，这段空白靠状态提示填。
     """
-    messages: list[dict[str, Any]] = [{"role": "system", "content": build_system_prompt()}]
+    sender = load_sender_access(userid)
+    messages: list[dict[str, Any]] = [{"role": "system", "content": build_system_prompt(sender)}]
     if history:
         messages.extend(history[-HISTORY_TURNS:])
     messages.append({"role": "user", "content": question})
@@ -492,6 +529,7 @@ async def answer_stream(
 
     tool_payloads: list[dict[str, Any]] = []
     last_content = ""
+    receipts: list[str] = []
 
     for round_index in range(MAX_TOOL_ROUNDS):
         message = await _stream_once(messages, on_delta, config)
@@ -516,6 +554,7 @@ async def answer_stream(
                     (call.get("function") or {}).get("name", ""),
                     (call.get("function") or {}).get("arguments", ""),
                     config.enabled_tools,
+                    config=config, sender=sender,
                 )
                 for call in tool_calls
             ]
@@ -524,6 +563,11 @@ async def answer_stream(
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": text})
             if payload is not None:
                 tool_payloads.append(payload)
+            tool_name = (call.get("function") or {}).get("name", "")
+            from bot.tool_contract import WRITE_PATHS
+
+            if tool_name in WRITE_PATHS:
+                receipts.append(f"{tool_name} 执行回执：{text}")
 
         if on_progress is not None:
             await on_progress("已查到数据，正在整理…")
@@ -533,9 +577,10 @@ async def answer_stream(
             "这个问题要查的东西有点多，能再具体一点吗？比如告诉我品项名或者仓库名。"
         )
 
-    return await _verified_answer(
+    content = await _verified_answer(
         question, content, tool_payloads, on_delta, config.reasoning_effort
     )
+    return content + ("\n\n" + "\n".join(receipts) if receipts else "")
 
 
 async def answer(question: str, history: list[dict[str, str]] | None = None) -> str:

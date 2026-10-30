@@ -130,14 +130,14 @@ def test_model_name_is_read_only_and_effort_has_five_choices(
     assert 'value="none"' not in html
 
 
-def test_write_rows_are_marked_red_and_not_connected(logged_client):
+def test_write_rows_are_marked_red_and_connected(logged_client):
     client, _ = logged_client
 
     html = client.get("/admin/bot-agent").get_data(as_text=True)
     block = _row_block(html, "restock_create")
 
     assert 'data-write="1"' in block
-    assert 'data-status-code="not_connected"' in block
+    assert 'data-status-code="connected"' in block
     assert "写" in block
     assert "风险" in html or "写操作" in html
 

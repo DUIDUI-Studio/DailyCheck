@@ -40,7 +40,7 @@ def warehouse_consumption(
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         return _list_summary(conn, days=days, sort_by=sort_by, limit=limit)
 
 
@@ -67,7 +67,7 @@ def item_consumption(
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         if not get_item(conn, item_id):
             raise NotFoundError("item_not_found")
         result = _get_item_consumption(conn, item_id)

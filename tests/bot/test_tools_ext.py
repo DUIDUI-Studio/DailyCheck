@@ -324,4 +324,4 @@ class TestProjectHelp:
         assert emoji.search(tools.get_project_help()["text"]) is None
 
     def test_明确说明只读(self, env):
-        assert "不能改" in tools.get_project_help()["text"]
+        assert "执行回执" in tools.get_project_help()["text"]

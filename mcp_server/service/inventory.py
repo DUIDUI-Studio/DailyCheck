@@ -1,15 +1,19 @@
 """库存查询服务。"""
 from __future__ import annotations
 
-from mcp_server.data.master import resolve_warehouse, list_all_warehouses
+from mcp_server.data.master import list_all_warehouses, resolve_warehouse
+from mcp_server.data.unit_of_work import warehouse_connection
+from mcp_server.data.warehouse import (
+    get_item as _get_item,
+)
 from mcp_server.data.warehouse import (
     list_items as _list_items,
-    get_item as _get_item,
+)
+from mcp_server.data.warehouse import (
     list_movements as _list_movements,
 )
-from mcp_server.data.unit_of_work import warehouse_connection
-from mcp_server.service.auth import AuthContext, check_warehouse
 from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
+from mcp_server.service.auth import AuthContext, check_warehouse
 
 
 def list_warehouses_for_token(ctx: AuthContext) -> list[dict]:
@@ -27,7 +31,7 @@ def list_items(warehouse_code: str, ctx: AuthContext) -> list[dict]:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         return _list_items(conn)
 
 
@@ -36,7 +40,7 @@ def get_item(item_id: int, warehouse_code: str, ctx: AuthContext) -> dict:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         item = _get_item(conn, item_id)
     if item is None:
         raise NotFoundError("not_found")
@@ -48,7 +52,7 @@ def list_movements(warehouse_code: str, ctx: AuthContext) -> list[dict]:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only, base_dir=ctx.warehouse_base_dir) as conn:
         return _list_movements(conn)
 
 

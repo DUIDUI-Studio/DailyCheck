@@ -1,4 +1,4 @@
-"""`/admin/bot-agent` 的纯逻辑（Issue #79 PR1）。
+"""`/admin/bot-agent` 的纯逻辑（Issue #79 PR1 / #80 PR2）。
 
 行集合来自运行时 ``get_tools()``（29 项）+ bot 自有 5 项 = 34 主行；
 四个旧名作为已接入的兼容子条目挂在对应 MCP 行下（D1=A）。
@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bot.agent_config import REASONING_EFFORTS, BotAgentConfig
+from bot.tool_contract import EXTRA_READS, MCP_NAMES
 
 # 显示层：name -> (中文用途, 是否写操作)。只覆盖当前 29 个注册项；
 # 缺失条目走 fallback，页面仍然显示（证明行集合不是这张表）。
@@ -58,7 +59,7 @@ OWN_TOOLS: tuple[tuple[str, str], ...] = (
 LEGACY_TOOLS: dict[str, tuple[str, str]] = {
     "list_warehouses": (
         "warehouse_list",
-        "旧名兼容：列出所有仓库编码 / 名称（bot 自有实现，没有 MCP 令牌仓范围）。",
+        "旧名兼容：列出当前发送者获授权的仓库编码 / 名称。",
     ),
     "list_warehouse_items": (
         "items_list",
@@ -120,7 +121,7 @@ def _legacy_row(
         connected=True,
         status="旧名兼容（已接入）",
         status_code="legacy",
-        enabled=name in effective.enabled_tools,
+        enabled=name in (effective.configured_tools if effective.configured_tools is not None else effective.enabled_tools),
         call_count=counts.get(name, 0),
         maps_to=parent,
     )
@@ -147,8 +148,12 @@ def build_tool_rows(
             status_code = "pending"
         else:
             purpose, write = meta
-            status = "未接入（PR1 仅展示，PR2 才可能执行）"
-            status_code = "not_connected"
+            if name in MCP_NAMES:
+                status = "已接入（新增读须显式开启）" if name in EXTRA_READS else "已接入"
+                status_code = "connected"
+            else:
+                status = "Owner 排除：本轮禁止执行"
+                status_code = "excluded"
 
         children = tuple(
             _legacy_row(child, name, effective, counts)
@@ -160,11 +165,11 @@ def build_tool_rows(
                 name=name,
                 purpose=purpose,
                 write=write,
-                executable=False,
-                connected=False,
+                executable=name in MCP_NAMES,
+                connected=name in MCP_NAMES,
                 status=status,
                 status_code=status_code,
-                enabled=None,
+                enabled=name in effective.enabled_tools if name in MCP_NAMES else None,
                 call_count=counts.get(name, 0),
                 children=children,
             )
@@ -188,10 +193,10 @@ def build_tool_rows(
 
 
 def switchable_tool_names() -> frozenset[str]:
-    """当前可被页面开关真正控制的工具（现有 9 项）。
+    """当前可被页面开关控制的批准池（旧九项 + MCP 22 项）。
 
-    配置只写这些键；MCP 名称即使被伪造 POST 也不会落库、更不会进入执行集合。
+    配置只写批准名称；七个 canonical 写和未知注册项不会落库或执行。
     """
     from bot.tool_schema import TOOL_NAMES
 
-    return frozenset(TOOL_NAMES)
+    return frozenset(TOOL_NAMES | MCP_NAMES)
