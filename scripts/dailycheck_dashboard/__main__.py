@@ -18,10 +18,10 @@ from zoneinfo import ZoneInfo
 # （scripts/ 不在 sys.path 时，__main__.py 显式注入父目录）
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-    from scripts.dailycheck_dashboard import db, fetchers, ops_db, ops_parse
+    from scripts.dailycheck_dashboard import db, fetchers, ledger_db, ops_db, ops_parse
     from scripts.dailycheck_dashboard import render as render_mod
 else:
-    from . import db, fetchers, ops_db, ops_parse
+    from . import db, fetchers, ledger_db, ops_db, ops_parse
     from . import render as render_mod
 
 # 默认路径（与 deploy/systemd/dc-dashboard-generator.service 保持一致）
@@ -37,6 +37,8 @@ DEFAULT_REPO = "eric/dailycheck"   # 2026-10-22 起仓库迁至自托管 Gitea
 DEFAULT_AUDIT_LOG = Path("/var/lib/dailycheck-deploy/audit.log")
 DEFAULT_VERIF_DIR = Path("/root/DailyCheck/backups/prod-verifications")
 DEFAULT_HERMES_DB = Path("/root/.hermes/state.db")
+# 派单账本（Issue #91 采集器产出，scp 桥落到 VPS；本机缺失 → 该区块降级）
+DEFAULT_LEDGER = Path("/var/lib/dailycheck-dashboard/ledger/ledger.jsonl")
 
 # CST+8 用于显示时间戳
 CST = ZoneInfo("Asia/Shanghai")
@@ -154,18 +156,25 @@ def cmd_render(args: argparse.Namespace) -> int:
         "Hermes state.db", ops_unavailable,
         lambda: ops_parse.fetch_token_usage(Path(args.hermes_db), days=args.token_days),
     )
+    ledger_rows = _collect(
+        "派单账本", ops_unavailable,
+        lambda: ledger_db.parse_ledger(Path(args.ledger)),
+    )
     _log(
         f"  ops: deploy={len(deploy_events)} verif={len(verifications)} "
-        f"token={len(token_rows)} 人工接管={loop_integrity.get('manual_records', 0)} "
+        f"token={len(token_rows)} ledger={len(ledger_rows)} "
+        f"人工接管={loop_integrity.get('manual_records', 0)} "
         f"异常事件={loop_integrity.get('events') or '无'} 不可用={ops_unavailable or '无'}"
     )
 
     # 1c. 落事件表（幂等 upsert）；写失败不阻塞渲染
     try:
         ops_db.init_ops_schema(db_path)
+        ledger_db.init_ledger_schema(db_path)
         ops_db.upsert_deploy_events(db_path, deploy_events)
         ops_db.upsert_token_daily(db_path, token_rows)
         ops_db.upsert_verifications(db_path, verifications)
+        ledger_db.upsert_dispatch_ledger(db_path, ledger_rows)
     except (sqlite3.Error, OSError, ValueError) as exc:
         _log(f"  ops db 写入失败（忽略，不影响渲染）：{exc}")
 
@@ -179,6 +188,21 @@ def cmd_render(args: argparse.Namespace) -> int:
     _log(
         f"  ops(渲染用): deploy={len(deploy_events)} verif={len(verifications)} "
         f"token={len(token_rows)}"
+    )
+
+    # 派单账本聚合：优先用库内事实（含历史轮次），写库失败时才退回本轮内存数据。
+    # 与上面三个源同一降级口径：账本缺失只让评估区块显示「数据源不可用」。
+    try:
+        eval_groups = ledger_db.aggregate_dispatch_ledger(db_path)
+    except (sqlite3.Error, ValueError) as exc:
+        _log(f"  eval 聚合失败（忽略，不影响渲染）：{exc}")
+        eval_groups = []
+    if not eval_groups and ledger_rows:
+        eval_groups = ledger_db.aggregate_rows(ledger_rows)
+    _log(
+        f"  eval: groups={len(eval_groups)} "
+        f"rows={sum(int(g.get('dispatches') or 0) for g in eval_groups)} "
+        f"源不可用={'是' if '派单账本' in ops_unavailable else '否'}"
     )
 
     # 2. 与上次快照对比（diff）
@@ -209,6 +233,8 @@ def cmd_render(args: argparse.Namespace) -> int:
         verifications=verifications,
         token_rows=token_rows,
         loop_integrity=loop_integrity,
+        eval_groups=eval_groups,
+        eval_unavailable="派单账本" in ops_unavailable,
         ops_unavailable=ops_unavailable,
         ops_fetched_at=ops_fetched_at,
         pr_data_ok=pr_data_ok,
@@ -336,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="prod-verifications 目录（八项验证报告）")
     p_render.add_argument("--hermes-db", default=str(DEFAULT_HERMES_DB),
                           help="Hermes state.db（只读，取 token 用量）")
+    p_render.add_argument("--ledger", default=str(DEFAULT_LEDGER),
+                          help="派单账本 JSONL（Issue #91 采集器产出；缺失则评估区块降级）")
     p_render.add_argument("--token-days", type=int, default=7,
                           help="token 汇总回溯天数（默认 7）")
     p_render.set_defaults(func=cmd_render)
