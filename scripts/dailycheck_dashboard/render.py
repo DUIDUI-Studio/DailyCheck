@@ -37,6 +37,9 @@ class RenderInput:
     token_rows: list[dict] = field(default_factory=list)
     # 闭环完整性（人工接管率 / 异常事件 / 数据盲区），与 deploy_events 同源派生
     loop_integrity: dict = field(default_factory=dict)
+    # 派单账本聚合（role × model × 复杂度档），由 ledger_db 查询后传入
+    eval_groups: list[dict] = field(default_factory=list)
+    eval_unavailable: bool = False
     ops_unavailable: list[str] = field(default_factory=list)
     ops_fetched_at: str = ""
     # PR 列表是否真的拿到了：拉不到时 KPI 显示「—」而不是 0（两种事实不能混）
@@ -447,6 +450,8 @@ def render(input: RenderInput) -> str:
         unavailable=input.ops_unavailable,
         pr_data_ok=input.pr_data_ok,
         loop_integrity=input.loop_integrity,
+        eval_groups=input.eval_groups,
+        eval_unavailable=input.eval_unavailable,
     )
 
     # PR 状态分布计数

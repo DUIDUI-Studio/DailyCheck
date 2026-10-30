@@ -22,6 +22,7 @@
 #   /var/lib/dailycheck-deploy/audit.log      部署阶段时间戳（只读）
 #   /root/DailyCheck/backups/prod-verifications  八项验证报告（只读，ProtectHome=read-only 够）
 #   /root/.hermes/state.db                    token 用量（只读打开，2GB 不复制）
+#   /var/lib/dailycheck-dashboard/ledger/ledger.jsonl  派单账本（Issue #91 采集，scp 桥落盘）
 
 [Unit]
 Description=DailyCheck ops dashboard refresh (one-shot render)
@@ -37,6 +38,7 @@ Environment="PATH=/root/DailyCheck/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment=PYTHONUNBUFFERED=1
 
 ExecStart=/root/DailyCheck/.venv/bin/python -m scripts.dailycheck_dashboard render \
+    --ledger /var/lib/dailycheck-dashboard/ledger/ledger.jsonl \
     --trigger-kind timer
 
 # 渲染要拉 gh + 读 2GB state.db 的聚合，给足余量；卡死也不能拖住下一次
