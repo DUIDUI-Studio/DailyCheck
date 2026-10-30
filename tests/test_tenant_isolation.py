@@ -38,7 +38,7 @@ def two_tenants(tmp_path, monkeypatch):
     init_warehouse_db(wh2)
 
     m = sqlite3.connect(master_path)
-    m.execute("INSERT INTO tenants (id, name, created_at) VALUES (1, '默认', ?)", (TS,))
+    m.execute("INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (1, '默认', ?)", (TS,))
     m.execute("INSERT INTO tenants (id, name, created_at) VALUES (2, '客户B', ?)", (TS,))
     # 用户 10 = 租户 1 仓内 admin（非平台管理员）；用户 20 = 租户 2 普通用户；
     # 用户 99 = 平台管理员（租户 1）。

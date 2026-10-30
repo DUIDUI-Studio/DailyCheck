@@ -88,6 +88,27 @@
 
 <form method="post" enctype="multipart/form-data" class="grid cols-1" style="margin-top:16px;max-width:480px;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if multi_warehouse %}
+  {# 多仓：把本页展示的价格/起订倍数随单带回，提交时据此判断是否已变化。 #}
+  {% for item in items %}
+  <input type="hidden" name="snapshot_price_{{ item.canonical_id }}" value="{{ '' if item.unit_price is none else item.unit_price }}" />
+  <input type="hidden" name="snapshot_multiple_{{ item.canonical_id }}" value="{{ '' if item.order_multiple is none else item.order_multiple }}" />
+  {% endfor %}
+  {% endif %}
+  {% if price_changes %}
+  <div class="alert danger">
+    <p><strong>以下品项的价格/起订倍数已变化，请确认后重新提交：</strong></p>
+    <ul>
+      {% for c in price_changes %}
+      <li>{{ c.name }}：{{ '单价' if c.field == 'price' else '起订倍数' }} {{ c.old }} → {{ c.new }}</li>
+      {% endfor %}
+    </ul>
+    <label>
+      <input type="checkbox" name="confirm_price_change" value="1" required />
+      我已确认以上变化，按新价格/起订倍数提交
+    </label>
+  </div>
+  {% endif %}
   <label>
     <span>期望到货日期</span>
     <input type="date" name="expected_delivery_date" value="{{ expected_date }}" min="{{ today }}" required />

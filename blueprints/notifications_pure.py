@@ -26,6 +26,8 @@ ALLOWED_EVENT_TYPES = frozenset({
     "store_order_cancelled",
     # 总仓调货发起（2026-10-19）：通知分仓经理/管理员准备接收
     "dc_transfer_created",
+    # 多仓履约 Task 8：跨仓单无全权审批人时给平台管理员的诊断告警
+    "store_order_no_approver_alert",
     # 用户反馈提单（2026-10-17）：扇出给所有平台超管，见 blueprints/feedback.py
     "feedback_submitted",
 })

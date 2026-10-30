@@ -417,3 +417,246 @@ def test_other_user_cannot_modify_my_cart_item(store_env):
         data={},
     )
     assert resp.status_code == 403
+
+
+# —— 收货幂等键（多仓履约 Task 6）—— #
+# 收货路由要求门店 manager/admin。本文件 fixture 的 user 1 是 staff，
+# 因此测试前仅调整 setup（改角色），不改任何语义断言。
+
+
+def _promote_user1_to_store_manager(env):
+    master = sqlite3.connect(str(env["master_path"]))
+    master.execute(
+        "UPDATE warehouse_users SET role='manager' WHERE user_id=1 AND warehouse_id=2"
+    )
+    master.commit()
+    master.close()
+
+
+def _build_shipped_order(env, qty=10.0):
+    """下单 → DC 审批 → DC 发货；返回 (order_id, order_item_id)。"""
+    client = env["client"]
+    _login_as(client, 1, 2)
+    client.post(
+        "/store-ordering/cart/add",
+        data={"dc": "dc_test", "canonical_id": 101, "quantity": str(qty), "unit": "件"},
+    )
+    client.post(
+        "/store-ordering/cart/submit",
+        data={"expected_delivery_date": datetime.now().strftime("%Y-%m-%d"), "note": ""},
+    )
+    master = sqlite3.connect(str(env["master_path"]))
+    master.row_factory = sqlite3.Row
+    order_id = master.execute(
+        "SELECT id FROM store_orders ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    master.close()
+    _login_as(client, 2, 1)
+    client.post(
+        f"/store-ordering/orders/{order_id}/review",
+        data={"decision": "approved", "note": "ok"},
+    )
+    client.post(f"/store-ordering/orders/{order_id}/ship", data={"tracking_note": ""})
+    master = sqlite3.connect(str(env["master_path"]))
+    master.row_factory = sqlite3.Row
+    order_item_id = master.execute(
+        "SELECT id FROM store_order_items WHERE order_id=?", (order_id,)
+    ).fetchone()["id"]
+    master.close()
+    return order_id, order_item_id
+
+
+def _store_qty(env, canonical_id=101):
+    store = sqlite3.connect(str(env["store_path"]))
+    store.row_factory = sqlite3.Row
+    row = store.execute(
+        "SELECT quantity FROM items WHERE canonical_id=?", (canonical_id,)
+    ).fetchone()
+    store.close()
+    return row["quantity"]
+
+
+def test_order_detail_receive_form_carries_fresh_op_no(store_env):
+    """详情页下发的收货 op_no 非空，且每次渲染换新键。"""
+    order_id, _ = _build_shipped_order(store_env)
+    _promote_user1_to_store_manager(store_env)
+    _login_as(store_env["client"], 1, 2)
+
+    body1 = store_env["client"].get(f"/store-ordering/orders/{order_id}").data.decode()
+    body2 = store_env["client"].get(f"/store-ordering/orders/{order_id}").data.decode()
+    values1 = re.findall(r'name="op_no" value="([^"]+)"', body1)
+    values2 = re.findall(r'name="op_no" value="([^"]+)"', body2)
+    assert values1 and all(v.strip() for v in values1)
+    assert values2 and all(v.strip() for v in values2)
+    assert set(values1).isdisjoint(values2)
+
+
+def test_receive_route_uses_submitted_op_no(store_env):
+    """路由回传的 op_no 落成行级键 op_no:order_item_id，库存只加一次。"""
+    order_id, order_item_id = _build_shipped_order(store_env)
+    _promote_user1_to_store_manager(store_env)
+    _login_as(store_env["client"], 1, 2)
+    assert _store_qty(store_env) == 7.0  # fixture 初始库存
+
+    resp = store_env["client"].post(
+        f"/store-ordering/orders/{order_id}/receive",
+        data={
+            "op_no": "client-key-1",
+            "order_item_id": order_item_id,
+            "quantity": "2",
+            "note": "",
+        },
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    assert _store_qty(store_env) == 9.0
+
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    op_nos = [
+        r["op_no"]
+        for r in master.execute(
+            "SELECT op_no FROM store_order_receipts WHERE order_id=?", (order_id,)
+        )
+    ]
+    master.close()
+    assert op_nos == [f"client-key-1:{order_item_id}"]
+
+
+def test_receive_route_same_op_no_does_not_double_add(store_env):
+    """同 op_no + 同数量重放：库存不再增加、不重复落 receipt；
+    同 op_no 换数量：拒绝（幂等键不可复用），库存不变。"""
+    order_id, order_item_id = _build_shipped_order(store_env)
+    _promote_user1_to_store_manager(store_env)
+    _login_as(store_env["client"], 1, 2)
+    amount = "3"
+
+    first = store_env["client"].post(
+        f"/store-ordering/orders/{order_id}/receive",
+        data={
+            "op_no": "retry-key",
+            "order_item_id": order_item_id,
+            "quantity": amount,
+            "note": "",
+        },
+        follow_redirects=True,
+    )
+    assert first.status_code == 200
+    assert _store_qty(store_env) == 10.0
+
+    replay = store_env["client"].post(
+        f"/store-ordering/orders/{order_id}/receive",
+        data={
+            "op_no": "retry-key",
+            "order_item_id": order_item_id,
+            "quantity": amount,
+            "note": "",
+        },
+        follow_redirects=True,
+    )
+    assert replay.status_code == 200
+    assert "重复提交未重复入库" in replay.data.decode()
+    assert _store_qty(store_env) == 10.0
+
+    conflicting = store_env["client"].post(
+        f"/store-ordering/orders/{order_id}/receive",
+        data={
+            "op_no": "retry-key",
+            "order_item_id": order_item_id,
+            "quantity": "5",
+            "note": "",
+        },
+        follow_redirects=True,
+    )
+    assert conflicting.status_code == 200
+    assert "不同数量" in conflicting.data.decode()
+    assert _store_qty(store_env) == 10.0
+
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    count = master.execute(
+        "SELECT COUNT(*) AS c FROM store_order_receipts WHERE order_id=?", (order_id,)
+    ).fetchone()["c"]
+    master.close()
+    assert count == 1
+
+
+# —— 多仓履约 Task 7：开关开时去 DC / 废弃 session 键 —— #
+
+
+def _enable_multi_warehouse(monkeypatch):
+    import config as config_module
+
+    monkeypatch.setattr(config_module, "MULTI_WAREHOUSE_FULFILLMENT", True, raising=False)
+
+
+def _seed_routing(master_path, canonical_id, dc_code="dc_test"):
+    master = sqlite3.connect(str(master_path))
+    master.execute(
+        "INSERT OR REPLACE INTO item_routing "
+        "(tenant_id, canonical_id, fulfillment_warehouse_code, updated_at, updated_by) "
+        "VALUES (1, ?, ?, ?, NULL)",
+        (canonical_id, dc_code, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    master.commit()
+    master.close()
+
+
+def test_multi_warehouse_catalog_ignores_legacy_session_dc(store_env, monkeypatch):
+    _enable_multi_warehouse(monkeypatch)
+    _seed_routing(store_env["master_path"], 101)
+    client = store_env["client"]
+    with client.session_transaction() as s:
+        s["store_ordering_dc"] = "dc_test"
+
+    body = client.get("/store-ordering/catalog").data.decode()
+    assert "选择配送中心" not in body
+    assert "测试包材A" in body
+    with client.session_transaction() as s:
+        assert "store_ordering_dc" not in s
+
+
+def test_multi_warehouse_cart_writes_null_dc(store_env, monkeypatch):
+    _enable_multi_warehouse(monkeypatch)
+    _seed_routing(store_env["master_path"], 101)
+    client = store_env["client"]
+    client.post(
+        "/store-ordering/cart/add",
+        data={"canonical_id": 101, "quantity": "3", "unit": "件"},
+    )
+    body = client.get("/store-ordering/cart").data.decode()
+    assert "配送中心：" not in body
+    assert "测试包材A" in body
+
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    row = master.execute("SELECT dc_warehouse_code FROM store_order_carts").fetchone()
+    master.close()
+    assert row["dc_warehouse_code"] is None
+
+
+def test_multi_warehouse_submit_needs_no_session_dc(store_env, monkeypatch):
+    _enable_multi_warehouse(monkeypatch)
+    _seed_routing(store_env["master_path"], 101)
+    client = store_env["client"]
+    client.post(
+        "/store-ordering/cart/add",
+        data={"canonical_id": 101, "quantity": "2", "unit": "件"},
+    )
+    tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
+    resp = client.post(
+        "/store-ordering/cart/submit",
+        data={"expected_delivery_date": tomorrow, "note": ""},
+        follow_redirects=True,
+    )
+    assert "提交成功" in resp.data.decode()
+
+    master = sqlite3.connect(str(store_env["master_path"]))
+    master.row_factory = sqlite3.Row
+    order = master.execute("SELECT * FROM store_orders ORDER BY id DESC LIMIT 1").fetchone()
+    line = master.execute(
+        "SELECT * FROM store_order_items WHERE order_id=?", (order["id"],)
+    ).fetchone()
+    master.close()
+    assert order["dc_warehouse_code"] == "dc_test"
+    assert line["source_warehouse_code"] == "dc_test"

@@ -54,6 +54,16 @@
       {% endfor %}
     </select>
   </label>
+  {# 多仓履约 D7：参与仓筛选按「任意行来源仓」匹配，与上面按头仓的「配送中心」不同。 #}
+  <label>
+    <span>参与仓</span>
+    <select name="warehouse">
+      <option value="">全部</option>
+      {% for d in dcs %}
+        <option value="{{ d.code }}" {% if warehouse == d.code %}selected{% endif %}>{{ d.name }} ({{ d.code }})</option>
+      {% endfor %}
+    </select>
+  </label>
   {% endif %}
   <label>
     <span>开始日期</span>
@@ -99,9 +109,19 @@
         {% else %}
         <span class="status-pill {{ o.status }}">{{ status_labels[o.status] or o.status }}</span>
         {% endif %}
+        {% if o.no_full_approver %}
+        <span class="status-pill rejected" title="没有任何非管理员用户对该单全部参与仓都有审批权">无全权审批人</span>
+        {% endif %}
       </td>
       <td>{{ fmt_warehouse(o.store_warehouse_name, o.store_warehouse_code) }}</td>
-      <td>{{ fmt_warehouse(o.dc_warehouse_name, o.dc_warehouse_code) }}</td>
+      <td>
+        {{ fmt_warehouse(o.dc_warehouse_name, o.dc_warehouse_code) }}
+        {% if o.is_multi_warehouse %}
+        <div class="muted" style="font-size:12px">
+          参与仓：{% for p in o.participant_warehouses %}{{ p.name }}{% if not loop.last %}、{% endif %}{% endfor %}
+        </div>
+        {% endif %}
+      </td>
       <td>{{ o.created_at }}</td>
       <td>{{ o.expected_delivery_date or '—' }}</td>
       <td>

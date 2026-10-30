@@ -1,13 +1,13 @@
 """Store-order service-layer tests.
 
-Targets mcp_server.service.store_order — pure unit tests with mocks.
-We do NOT exercise blueprints.store_ordering_pure directly; we verify the
-service layer raises the right MCP errors, translates the OR-shaped
-warehouse scope into the AND-shaped filters sop.list_orders understands,
-and shapes the returned rows into the MCP contract.
+Targets mcp_server.service.store_order — unit tests with a mix of mocks and
+real in-memory SQLite. We verify the service layer raises the right MCP
+errors, uses the shared "participating warehouse" SQL predicate for list /
+count / detail, and shapes the returned rows into the MCP contract.
 """
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,6 +38,51 @@ def _mock_conn():
     return conn
 
 
+class _RealConnCtx:
+    """Expose a real sqlite connection through the master_connection ctx API."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def _visibility_db(
+    rows: list[tuple[int, str | None, str | None, list[str | None]]],
+) -> sqlite3.Connection:
+    """In-memory subset of master.db: store_orders + store_order_items."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE store_orders (
+            id INTEGER PRIMARY KEY,
+            store_warehouse_code TEXT,
+            dc_warehouse_code TEXT
+        );
+        CREATE TABLE store_order_items (
+            order_id INTEGER,
+            source_warehouse_code TEXT
+        );
+        """
+    )
+    for order_id, store_code, dc_code, sources in rows:
+        conn.execute(
+            "INSERT INTO store_orders VALUES (?, ?, ?)",
+            (order_id, store_code, dc_code),
+        )
+        for source in sources:
+            conn.execute(
+                "INSERT INTO store_order_items VALUES (?, ?)",
+                (order_id, source),
+            )
+    return conn
+
+
 def _order(order_id: int, created_at: str, **extra) -> dict:
     row = {
         "id": order_id,
@@ -50,35 +95,81 @@ def _order(order_id: int, created_at: str, **extra) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# _scope_pairs —— OR 可见性 → AND 过滤器组合
+# _scope_filters —— 可见性 → list_orders 调用参数
 # ─────────────────────────────────────────────────────────────────────
 
-class TestScopePairs:
+class TestScopeFilters:
     def test_unrestricted_token_needs_no_filter(self):
-        assert svc._scope_pairs(None, None) == [(None, None)]
+        assert svc._scope_filters(None, None) == [{}]
 
-    def test_unrestricted_token_with_warehouse_filter(self):
-        assert svc._scope_pairs(None, "WH001") == [
-            ("WH001", None),
-            (None, "WH001"),
+    def test_warehouse_filter_uses_store_and_participant_scopes(self):
+        assert svc._scope_filters(None, "WH001") == [
+            {"store_warehouse_code": "WH001"},
+            {"participant_warehouse_code": "WH001"},
         ]
 
-    def test_store_or_dc_expands_to_two_calls_per_code(self):
-        assert svc._scope_pairs(["WH001", "WH002"], None) == [
-            ("WH001", None),
-            (None, "WH001"),
-            ("WH002", None),
-            (None, "WH002"),
+    def test_each_allowed_code_expands_to_store_and_participant(self):
+        assert svc._scope_filters(["WH002", "WH001"], None) == [
+            {"store_warehouse_code": "WH001"},
+            {"participant_warehouse_code": "WH001"},
+            {"store_warehouse_code": "WH002"},
+            {"participant_warehouse_code": "WH002"},
         ]
 
-    def test_warehouse_filter_crosses_with_scope(self):
-        """(store∈V ∪ dc∈V) ∧ (store=W ∪ dc=W) 展开成 4 个 AND 组合。"""
-        assert svc._scope_pairs(["WH001", "WH002"], "WH001") == [
-            ("WH001", None),
-            (None, "WH001"),
-            ("WH002", "WH001"),
-            ("WH001", "WH002"),
-        ]
+    def test_empty_scope_has_no_scopes(self):
+        assert svc._scope_filters([], None) == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _visibility_sql —— 列表/计数/详情共用的参与仓谓词
+# ─────────────────────────────────────────────────────────────────────
+
+class TestVisibilityPredicate:
+    @pytest.fixture
+    def conn(self):
+        conn = _visibility_db([
+            # 跨仓单：门店 S、头仓 HEAD，行来源 A + B
+            (1, "S", "HEAD", ["A", "B"]),
+            # 迁移前历史行：来源 NULL → COALESCE 头仓
+            (2, "S", "HEAD", [None]),
+            # 无明细行存量单：只有头仓可用
+            (3, "S", "HEAD", []),
+        ])
+        yield conn
+        conn.close()
+
+    def _visible(self, conn, order_id: int, code: str) -> bool:
+        row = conn.execute(
+            f"SELECT 1 FROM store_orders so WHERE so.id = ? "
+            f"AND {svc._visibility_sql('so', 1)}",
+            [order_id, *svc._visibility_params([code])],
+        ).fetchone()
+        return row is not None
+
+    @pytest.mark.parametrize(
+        ("order_id", "code", "expected"),
+        [
+            (1, "S", True),
+            (1, "A", True),      # 参与仓 A 命中即整单可见
+            (1, "B", True),
+            (1, "HEAD", False),  # 有明细行时头仓不再兜底
+            (1, "C", False),
+            (2, "HEAD", True),   # NULL 来源回落头仓
+            (2, "A", False),
+            (3, "HEAD", True),   # 无明细行存量单
+            (3, "A", False),
+        ],
+    )
+    def test_predicate_membership(self, conn, order_id, code, expected):
+        assert self._visible(conn, order_id, code) is expected
+
+    def test_multi_line_same_warehouse_counts_once(self, conn):
+        count = conn.execute(
+            f"SELECT COUNT(*) FROM store_orders so WHERE "
+            f"{svc._visibility_sql('so', 1)}",
+            svc._visibility_params(["A"]),
+        ).fetchone()[0]
+        assert count == 1
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -210,7 +301,7 @@ class TestStoreOrderDetail:
                     "fulfilled_quantity": 0.0,
                 }
             ],
-            "deliveries": [{"id": 21, "delivery_no": "DN-1"}],
+            "deliveries": [{"id": 21, "delivery_no": "DN-1", "warehouse_code": "WH002"}],
             "receipts": [],
             "status_history": [{"id": 31, "to_status": "shipped"}],
         }
@@ -229,7 +320,9 @@ class TestStoreOrderDetail:
         assert result["items"][0]["dc_item_bound"] is False
         assert result["items"][0]["quantity"] == 10.0
         assert result["items"][0]["fulfilled_quantity"] == 0.0
-        assert result["deliveries"] == [{"id": 21, "delivery_no": "DN-1"}]
+        assert result["deliveries"] == [
+            {"id": 21, "delivery_no": "DN-1", "warehouse_code": "WH002"}
+        ]
         assert result["receipts"] == []
         assert result["status_history"] == [{"id": 31, "to_status": "shipped"}]
 
@@ -266,8 +359,8 @@ class TestStoreOrderDetail:
 
     @patch("mcp_server.service.store_order.master_connection")
     def test_out_of_scope_order_is_invisible(self, mock_conn):
-        conn = _mock_conn()
-        mock_conn.return_value = conn
+        conn = _visibility_db([(4, "WH001", "WH999", [])])
+        mock_conn.return_value = _RealConnCtx(conn)
         detail = {
             "id": 4,
             "store_warehouse_code": "WH001",
@@ -277,14 +370,14 @@ class TestStoreOrderDetail:
             "mcp_server.service.store_order.sop.get_order_detail",
             return_value=detail,
         ):
-            # token 只授权 WH003：store 侧 WH001、dc 侧 WH999 都不在范围内 → 不可见
+            # token 只授权 WH003：门店 WH001、头仓 WH999 都不在范围内 → 不可见
             with pytest.raises(NotFoundError):
                 svc.get_store_order_detail(_ctx(["WH003"]), 4)
 
     @patch("mcp_server.service.store_order.master_connection")
-    def test_dc_side_hit_makes_order_visible(self, mock_conn):
-        conn = _mock_conn()
-        mock_conn.return_value = conn
+    def test_legacy_header_hit_makes_order_visible(self, mock_conn):
+        conn = _visibility_db([(3, "WH999", "WH002", [])])
+        mock_conn.return_value = _RealConnCtx(conn)
         detail = {
             "id": 3,
             "store_warehouse_code": "WH999",
@@ -296,6 +389,34 @@ class TestStoreOrderDetail:
         ):
             result = svc.get_store_order_detail(_ctx(["WH002"]), 3)
         assert result["order"]["id"] == 3
+
+    @patch("mcp_server.service.store_order.master_connection")
+    def test_any_participant_grants_the_full_order(self, mock_conn):
+        """B-only token 读跨仓单：详情返回他仓行、金额与收货历史。"""
+        conn = _visibility_db([(1, "STORE", "WH_A", ["WH_A", "WH_B"])])
+        mock_conn.return_value = _RealConnCtx(conn)
+        detail = {
+            "id": 1,
+            "store_warehouse_code": "STORE",
+            "dc_warehouse_code": "WH_A",
+            "order_items": [
+                {"id": 11, "source_warehouse_code": "WH_A", "quantity": 1.0},
+                {"id": 12, "source_warehouse_code": "WH_B", "quantity": 2.0},
+            ],
+            "deliveries": [{"id": 21, "warehouse_code": "WH_A"}],
+            "receipts": [{"id": 31, "quantity": 1.0}],
+            "status_history": [],
+        }
+        with patch(
+            "mcp_server.service.store_order.sop.get_order_detail",
+            return_value=detail,
+        ):
+            result = svc.get_store_order_detail(_ctx(["WH_B"]), 1)
+        assert {i["source_warehouse_code"] for i in result["items"]} == {
+            "WH_A", "WH_B",
+        }
+        assert result["deliveries"][0]["warehouse_code"] == "WH_A"
+        assert result["receipts"] == [{"id": 31, "quantity": 1.0}]
 
     def test_invalid_order_id_raises_validation_error(self):
         with pytest.raises(ValidationError):

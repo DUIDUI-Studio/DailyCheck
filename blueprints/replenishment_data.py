@@ -614,6 +614,27 @@ def store_stock_and_consumption(
 # ---------------------------------------------------------------------------
 
 
+def load_routing_map() -> dict[int, str]:
+    """canonical_id → 履约来源仓（item_routing，租户 1）。
+
+    开关关闭或路由表不可读时返回空 dict：调用方据此回落到现状算法
+    （所有 DC 都按下游拉动），保证开关关时行为恒等。路由存在但某个
+    canonical 未配置 → 该 canonical 同样维持现状算法，不静默归零。
+    """
+    if not getattr(config, "MULTI_WAREHOUSE_FULFILLMENT", False):
+        return {}
+    try:
+        init_master_db()
+        with closing(sqlite3.connect(config.MASTER_DB)) as conn:
+            rows = conn.execute(
+                "SELECT canonical_id, fulfillment_warehouse_code FROM item_routing "
+                "WHERE tenant_id = 1"
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {int(cid): str(code) for cid, code in rows}
+
+
 def build_board(
     today: date | None = None,
     params: R.PolicyParams | None = None,
@@ -631,6 +652,10 @@ def build_board(
     `scope` 只影响**展示与汇总**，不影响任何一行的计算：DC 的日需求永远
     取「全部门店消耗之和」（下游拉动），所以切到 DC 视角时看到的仍然是
     全局需求 —— 这正是「我作为配送中心要考虑各门店」的含义。
+
+    多仓履约（spec §10）：门店需求只拉动 `item_routing` 指向的来源仓；
+    同 canonical 的非来源仓镜像保留自己的水位逻辑（用本仓出库史），不承接
+    门店需求。未配置路由的 canonical 保持上面这套现状算法不变。
     """
     params = params or load_params()
     today = today or date.today()
@@ -638,6 +663,7 @@ def build_board(
     warehouses = scan["live"]
     skipped: list[dict] = scan["missing"]
     excluded: list[dict] = scan["excluded"]
+    routing = load_routing_map()
 
     raw: dict[str, tuple[dict, dict]] = {}
     failed: list[dict] = []
@@ -692,14 +718,33 @@ def build_board(
     # 订货目录开关：门店能不能订某个品项，取决于 **DC** 的 is_orderable
     # （`store_ordering_pure.list_available_dc_items` 只放行 DC 侧 =1 的品项），
     # 跟门店自己那行无关。DC 行才用它自己的标记。
+    #
+    # 多仓（spec §10）：有路由时开关从**来源仓**解析。旧实现按仓遍历 last-wins，
+    # 双 DC 镜像同 canonical 时会被后一个 DC 覆盖，来源仓自采（=0）的品项会被
+    # 错误当成统配。未配置路由的 canonical 维持 last-wins 现状。
     dc_orderable: dict[int, bool] = {}
+    orderable_by_dc: dict[str, dict[int, bool]] = {}
     for wh in warehouses:
         if wh["warehouse_type"] != DC_TYPE:
             continue
+        flags: dict[int, bool] = {}
         for _iid, _item in raw.get(wh["code"], ({}, {}))[0].items():
             _cid = _item.get("canonical_id")
             if _cid is not None:
-                dc_orderable[int(_cid)] = bool(_item.get("is_orderable", 1))
+                value = bool(_item.get("is_orderable", 1))
+                flags[int(_cid)] = value
+                dc_orderable[int(_cid)] = value
+        orderable_by_dc[wh["code"]] = flags
+    for _cid, _source_code in routing.items():
+        source_flags = orderable_by_dc.get(_source_code)
+        if source_flags is not None and _cid in source_flags:
+            dc_orderable[_cid] = source_flags[_cid]
+    # 只认「来源仓确实绑定该 canonical」的路由：过期/脏路由不生效，
+    # 避免把需求静默判给一个没有这行的仓（=静默归零）。
+    routed_source: dict[int, str] = {
+        cid: code for cid, code in routing.items()
+        if cid in orderable_by_dc.get(code, {})
+    }
 
     # --- 三口径：盘点实测 + 产量推算（领料口径在各仓循环里从 use_series 现算）---
     channel_raw: dict[str, dict[int, dict]] = {}
@@ -730,8 +775,12 @@ def build_board(
             use_series = series[iid]
             source = "own"
             if is_dc and cid is not None and int(cid) in downstream_series:
-                use_series = downstream_series[int(cid)]
-                source = "downstream"
+                # 有路由时只有来源仓承接门店需求；镜像仓留在自己那条出库史
+                # 上算水位（不承接、也不归零）。无路由 → 现状（全部承接）。
+                routed = routed_source.get(int(cid))
+                if routed is None or routed == wh["code"]:
+                    use_series = downstream_series[int(cid)]
+                    source = "downstream"
 
             on_order = float(item.get("on_order_restock") or 0.0)
             if not is_dc and cid is not None:

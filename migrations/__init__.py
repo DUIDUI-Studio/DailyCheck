@@ -14,6 +14,18 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 
+from migrations.multi_warehouse_fulfillment import (
+    migrate_multi_warehouse_fulfillment,
+    registered_down,
+    registered_up,
+)
+from migrations.receipt_op_protocol import registered_down as receipt_op_down
+from migrations.receipt_op_protocol import registered_up as receipt_op_up
+from migrations.seed_item_routing import registered_down as seed_routing_down
+from migrations.seed_item_routing import registered_up as seed_routing_up
+
+__all__ = ["MIGRATIONS", "Migration", "migrate_multi_warehouse_fulfillment"]
+
 Migration = tuple[int, str, Callable[[sqlite3.Connection], None],
                   Callable[[sqlite3.Connection], None]]
 
@@ -92,4 +104,12 @@ MIGRATIONS: list[Migration] = [
      _m002_up, _m002_down),
     (3, "bot-agent config: bot_agent_config 键值表（Issue #79 PR1）",
      _m003_up, _m003_down),
+    # 多仓履约三条迁移在合入 main 时顺延到 4/5/6：main 已先占用 v3（bot_agent_config），
+    # 版本号绝不复用 —— 已跑到 v3 的库若再遇同号迁移会被静默跳过。
+    (4, "multi-warehouse fulfillment: 行来源/批次仓/购物车可空/op_no/item_routing",
+     registered_up, registered_down),
+    (5, "item_routing: 同租户 DC 路由一次性播种与审计清单",
+     seed_routing_up, seed_routing_down),
+    (6, "receipt protocol: store_order_receipts.op_no UNIQUE + applied 标记",
+     receipt_op_up, receipt_op_down),
 ]

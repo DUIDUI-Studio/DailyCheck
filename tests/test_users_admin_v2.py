@@ -66,7 +66,7 @@ def users_v2_env(tmp_path, monkeypatch):
     init_warehouse_db(wh_t2)
 
     m = sqlite3.connect(master_path)
-    m.execute("INSERT INTO tenants (id, name, created_at) VALUES (1, '默认', ?)", (TS,))
+    m.execute("INSERT OR IGNORE INTO tenants (id, name, created_at) VALUES (1, '默认', ?)", (TS,))
     m.execute("INSERT INTO tenants (id, name, created_at) VALUES (2, '客户B', ?)", (TS,))
     # super=admin(1), userA(2), userB(3), userC(4), userD(5, inactive)
     rows = [

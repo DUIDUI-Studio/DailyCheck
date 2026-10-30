@@ -12,9 +12,9 @@
 
 ## 0. 一览
 
-- 蓝图 23 个（已装配 22 / 未装配 1）
-- 路由 **186** 条（按鉴权强度：平台超管 61 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
-- 数据表 **64** 张，`WAREHOUSE_SCHEMA_VERSION = 5`
+- 蓝图 24 个（已装配 23 / 未装配 1）
+- 路由 **189** 条（按鉴权强度：平台超管 64 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 8 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 数据表 **64** 张，`WAREHOUSE_SCHEMA_VERSION = 6`
 - MCP 工具域 8 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
 
@@ -41,6 +41,7 @@
 | `import_items` | `import_items.py` | 4 | 在役 |
 | `procurement` | `procurement.py` | 4 | 在役 |
 | `agent_tokens` | `agent_tokens.py` | 3 | 在役 |
+| `item_routing` | `item_routing.py` | 3 | 在役 |
 | `notifications` | `notifications.py` | 3 | 在役 |
 | `bot_admin` | `bot_admin.py` | 2 | 在役 |
 | `dc_transfer` | `dc_transfer.py` | 2 | 在役 |
@@ -154,6 +155,14 @@
 | `import_items.preview` | GET | `/preview` | 角色 | admin |
 | `import_items.upload_form` | GET | `` | 角色 | admin |
 | `import_items.upload_parse` | POST | `` | 角色 | admin |
+
+### `item_routing`
+
+| endpoint | 方法 | 规则 | 鉴权 | 明细 |
+|---|---|---|---|---|
+| `item_routing.admin` | GET | `/admin/item-routing` | 平台超管 |  |
+| `item_routing.delete_route` | POST | `/admin/item-routing/<int:canonical_id>/delete` | 平台超管 |  |
+| `item_routing.set_route` | POST | `/admin/item-routing/<int:canonical_id>` | 平台超管 |  |
 
 ### `items`
 
@@ -361,7 +370,7 @@
 
 ## 3. 数据层
 
-- `WAREHOUSE_SCHEMA_VERSION = 5`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
+- `WAREHOUSE_SCHEMA_VERSION = 6`（改 ALTER 块须 bump，见 ARCHITECTURE.md §4）
 - 表 64 张：
 
 - `adjustment_requests` · `agent_tokens` · `approval_policies` · `audit_log`

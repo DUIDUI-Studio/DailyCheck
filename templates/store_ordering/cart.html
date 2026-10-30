@@ -3,7 +3,7 @@
 {% block content %}
 <div class="page-header">
   <h2>购物车</h2>
-  <span class="muted">配送中心：{{ dc_code }}</span>
+  {% if not multi_warehouse %}<span class="muted">配送中心：{{ dc_code }}</span>{% endif %}
 </div>
 
 {% if items %}
@@ -76,10 +76,25 @@
   // another category filter), so the catalog draft is spent. Key mirrors
   // templates/store_ordering/catalog.html.
   try {
+    {% if multi_warehouse %}
+    window.localStorage.removeItem(
+      'dc.catalogDraft.v2:' +
+      {{ ((g.user['id'] | string) ~ ':' ~ (draft_store_code or '')) | tojson }}
+    );
+    // New flow is keyed by store, not DC: sweep any legacy per-DC drafts.
+    var legacyPrefix = 'dc.catalogDraft.v1:' + {{ ((g.user['id'] | string) ~ ':') | tojson }};
+    var doomed = [];
+    for (var i = 0; i < window.localStorage.length; i++) {
+      var key = window.localStorage.key(i);
+      if (key && key.indexOf(legacyPrefix) === 0) doomed.push(key);
+    }
+    for (var j = 0; j < doomed.length; j++) window.localStorage.removeItem(doomed[j]);
+    {% else %}
     window.localStorage.removeItem(
       'dc.catalogDraft.v1:' +
       {{ ((g.user['id'] | string) ~ ':' ~ (dc_code or '')) | tojson }}
     );
+    {% endif %}
   } catch (e) { /* private mode / quota: nothing to clear */ }
 })();
 </script>
