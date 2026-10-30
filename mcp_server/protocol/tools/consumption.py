@@ -1,7 +1,6 @@
 """Consumption MCP Tools."""
 from __future__ import annotations
 
-
 from mcp_server.service.auth import resolve_ctx
 from mcp_server.service.consumption import (
     item_consumption as svc_item_consumption,
@@ -20,7 +19,7 @@ def _get_ctx():
     return resolve_ctx()
 
 
-def warehouse_consumption_impl(args: dict) -> list[dict]:
+def warehouse_consumption_impl(args: dict, *, ctx=None) -> list[dict]:
     """Return per-item consumption summary for a warehouse.
 
     Includes rank, consume_qty, daily_avg, turnover_rate, consume_pct.
@@ -30,7 +29,7 @@ def warehouse_consumption_impl(args: dict) -> list[dict]:
     days: int = args.get("days", 7)
     sort_by: str = args.get("sort_by", "qty")
     limit: int = min(args.get("limit", 100), 200)
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     return svc_warehouse_consumption(
         warehouse_code=warehouse_code,
         ctx=ctx,
@@ -40,7 +39,7 @@ def warehouse_consumption_impl(args: dict) -> list[dict]:
     )
 
 
-def item_consumption_impl(args: dict) -> dict:
+def item_consumption_impl(args: dict, *, ctx=None) -> dict:
     """Return consumption stats for a single item.
 
     Includes: 7d, 14d, 30d, monthly totals + weekly breakdown + daily avg.
@@ -50,7 +49,7 @@ def item_consumption_impl(args: dict) -> dict:
     warehouse_code: str = args["warehouse_code"]
     include_turnover: bool = bool(args.get("include_turnover", False))
     turnover_days: int = args.get("turnover_days", 30)
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     return svc_item_consumption(
         item_id=item_id,
         warehouse_code=warehouse_code,

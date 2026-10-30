@@ -66,7 +66,7 @@ def list_restock(
         raise NotFoundError("warehouse_not_found")
     limit = parse_limit(limit)
     offset = parse_offset(offset)
-    with warehouse_connection(wh["db_path"]) as conn:
+    with warehouse_connection(wh["db_path"], read_only=ctx.read_only) as conn:
         items = _list_restock_movements(conn, limit=limit, offset=offset)
         total = _count_restock_movements(conn)
     return {

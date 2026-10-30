@@ -183,3 +183,49 @@ def test_run_tool_records_real_call_for_seven_day_count(monkeypatch, tmp_path):
     assert json.loads(text) == {"ok": True}
     counts = read_tool_call_counts(path=log, now=datetime.now(timezone.utc))
     assert counts["list_orders"] == 1
+
+
+def test_pr2_actual_request_excludes_disabled_restock_and_execution_rejects(monkeypatch, tmp_path):
+    import sqlite3
+
+    from bot.agent_config import load_effective_config
+
+    master = tmp_path / 'master.db'
+    with sqlite3.connect(master) as conn:
+        conn.execute('CREATE TABLE bot_agent_config (key TEXT, value TEXT)')
+        conn.execute("INSERT INTO bot_agent_config VALUES ('tool.restock_create','0')")
+    config = load_effective_config(master)
+    fake = _capture(monkeypatch)
+    asyncio.run(_stream_once([{'role': 'user', 'content': '入库3箱'}], None, config))
+    request = fake.last.posts[-1]['json']
+    names = {tool['function']['name'] for tool in request['tools']}
+    assert 'restock_create' not in names
+    assert {'outbound_create', 'outbound_rollback'} <= names
+    text, payload = _run_tool('restock_create', '{"warehouse_code":"wh_a","item_id":1,"quantity":3}', config=config)
+    assert payload is None and json.loads(text)['error'] == 'unknown_tool'
+
+
+def test_all_eight_new_reads_are_explicit_opt_in_and_removed_on_next_message(monkeypatch, tmp_path):
+    import sqlite3
+
+    from bot.agent_config import load_effective_config
+    from bot.tool_contract import EXTRA_READS
+
+    master = tmp_path / 'master.db'
+    with sqlite3.connect(master) as conn:
+        conn.execute('CREATE TABLE bot_agent_config (key TEXT PRIMARY KEY, value TEXT)')
+    fake = _capture(monkeypatch)
+    for name in sorted(EXTRA_READS):
+        with sqlite3.connect(master) as conn:
+            conn.execute('INSERT OR REPLACE INTO bot_agent_config VALUES (?, ?)', ('tool.' + name, '1'))
+        config = load_effective_config(master)
+        asyncio.run(_stream_once([{'role': 'user', 'content': '查询'}], None, config))
+        names = {t['function']['name'] for t in fake.last.posts[-1]['json']['tools']}
+        assert name in names
+        with sqlite3.connect(master) as conn:
+            conn.execute('UPDATE bot_agent_config SET value=? WHERE key=?', ('0', 'tool.' + name))
+        config = load_effective_config(master)
+        asyncio.run(_stream_once([{'role': 'user', 'content': '查询'}], None, config))
+        names = {t['function']['name'] for t in fake.last.posts[-1]['json']['tools']}
+        assert name not in names
+        assert _run_tool(name, '{}', config=config)[1] is None

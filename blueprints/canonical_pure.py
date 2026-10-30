@@ -2381,6 +2381,7 @@ BINDING_ALL_TYPES: tuple[str, ...] = ("storefront", "rd", "distribution_center")
 def collect_bindings(
     master_conn: sqlite3.Connection,
     *,
+    read_only: bool = False,
     warehouse_types: tuple[str, ...] = BINDING_STOREFRONT_ONLY,
 ) -> dict[str, list[dict]]:
     """T9 —— 跨仓收集 (warehouse_code, items.id, canonical_id, sku, name, unit)。
@@ -2408,8 +2409,9 @@ def collect_bindings(
         if not db_path.exists():
             continue
         # 直连仓库必须先补幂等列迁移，否则旧库会撞 no such column: is_active
-        migrate_warehouse_db_columns(db_path)
-        with sqlite3.connect(db_path) as conn:
+        if not read_only:
+            migrate_warehouse_db_columns(db_path)
+        with sqlite3.connect(f"file:{db_path}?mode=ro" if read_only else db_path, uri=read_only) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT id, sku, name, unit, canonical_id,

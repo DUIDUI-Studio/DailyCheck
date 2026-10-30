@@ -21,7 +21,10 @@ from bot.agent_config import (
     load_effective_config,
     normalize_reasoning_effort,
 )
+from bot.tool_contract import EXTRA_READS, MCP_NAMES
 from bot.tool_schema import TOOL_NAMES
+
+NORMAL_DEFAULTS = TOOL_NAMES | (MCP_NAMES - EXTRA_READS)
 
 _TABLE_SQL = """
 CREATE TABLE bot_agent_config (
@@ -66,7 +69,7 @@ def test_empty_table_uses_defaults(tmp_path):
 
     assert cfg.degraded is False
     assert cfg.reasoning_effort == DEFAULT_REASONING_EFFORT
-    assert set(cfg.enabled_tools) == TOOL_NAMES
+    assert set(cfg.enabled_tools) == NORMAL_DEFAULTS
 
 
 @pytest.mark.parametrize("effort", REASONING_EFFORTS)
@@ -96,7 +99,7 @@ def test_valid_tool_switch_disables_one_tool(tmp_path):
     assert cfg.reasoning_effort == "high"
     assert "list_orders" not in cfg.enabled_tools
     assert "search_items" in cfg.enabled_tools
-    assert set(cfg.enabled_tools) < TOOL_NAMES
+    assert set(cfg.enabled_tools) < NORMAL_DEFAULTS
 
 
 def test_invalid_effort_none_falls_back(tmp_path):
@@ -138,7 +141,7 @@ def test_read_error_falls_back(tmp_path, monkeypatch):
     assert set(cfg.enabled_tools) == TOOL_NAMES
 
 
-def test_mcp_and_unknown_tool_names_never_enter_execution_set(tmp_path):
+def test_only_approved_mcp_names_enter_execution_set(tmp_path):
     """MCP 名称/未知名称即使被写成 1，也不能扩大现有 9 项执行集合。"""
     master = _make_master(
         tmp_path / "master.db",
@@ -151,7 +154,7 @@ def test_mcp_and_unknown_tool_names_never_enter_execution_set(tmp_path):
 
     cfg = load_effective_config(master)
 
-    assert set(cfg.enabled_tools) == TOOL_NAMES
+    assert set(cfg.enabled_tools) == NORMAL_DEFAULTS
 
 
 def test_write_userids_are_parsed_but_do_not_enable_writes(tmp_path):
@@ -163,7 +166,7 @@ def test_write_userids_are_parsed_but_do_not_enable_writes(tmp_path):
     cfg = load_effective_config(master)
 
     assert cfg.write_allowed_userids == ("U1", "U2")
-    assert set(cfg.enabled_tools) == TOOL_NAMES, "PR1 不因白名单开放写执行"
+    assert set(cfg.enabled_tools) == NORMAL_DEFAULTS, "白名单本身不改变工具开关"
 
 
 @pytest.mark.parametrize("bad", ["none", "", "HIGHEST", "off"])
@@ -179,3 +182,12 @@ def test_config_object_requires_valid_effort():
             enabled_tools=frozenset(TOOL_NAMES),
             write_allowed_userids=(),
         )
+
+
+def test_blob_whitelist_corruption_falls_back_to_fixed_read_only_set(tmp_path):
+    master = _make_master(tmp_path / 'master.db')
+    with sqlite3.connect(master) as conn:
+        conn.execute('INSERT INTO bot_agent_config (key, value) VALUES (?, ?)', ('write.allowed_userids', b'owner'))
+    config = load_effective_config(master)
+    assert config.degraded and config.enabled_tools == TOOL_NAMES
+    assert config.write_allowed_userids == ()

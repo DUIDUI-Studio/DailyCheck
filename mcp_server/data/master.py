@@ -6,7 +6,7 @@ from mcp_server.data.unit_of_work import master_connection
 
 def resolve_warehouse(code: str) -> dict | None:
     """根据 code 查询 warehouse 元信息，返回 Row 或 None。"""
-    with master_connection() as conn:
+    with master_connection(read_only=True) as conn:
         row = conn.execute(
             "SELECT code, name, db_path, warehouse_type FROM warehouses "
             "WHERE code = ?",
@@ -17,7 +17,7 @@ def resolve_warehouse(code: str) -> dict | None:
 
 def list_all_warehouses() -> list[dict]:
     """返回所有 warehouse 元信息。"""
-    with master_connection() as conn:
+    with master_connection(read_only=True) as conn:
         rows = conn.execute(
             "SELECT code, name, db_path, warehouse_type FROM warehouses "
             "ORDER BY code"

@@ -38,10 +38,10 @@
   </section>
 
   <section class="card" style="margin-bottom:16px;padding:14px 16px;border-color:#fca5a5">
-    <h3 style="margin-top:0;color:#991b1b">写操作白名单（仅登记）</h3>
+    <h3 style="margin-top:0;color:#991b1b">写操作白名单</h3>
     <p class="muted" style="margin:0 0 8px;font-size:13px">
-      本 PR 不开放任何写操作执行路径。此名单只为 PR2 的写护栏预留，
-      当前不会让任何写工具进入执行集合；默认空 = 不允许任何人。
+      三项写开关默认开启；执行仍需真实企微发送者在白名单内，且部署策略允许目标路径与仓库。
+      默认仅经核实的 owner userid；未核实或白名单为空时拒写。保存后下一条消息生效。
     </p>
     <label style="display:block">
       允许的企微 userid（逗号分隔）
@@ -72,7 +72,7 @@
           <div class="muted" style="font-size:13px">{{ row.purpose }}</div>
           {% if row.write %}
           <div style="color:#b91c1c;font-size:12px;margin-top:2px">
-            风险：写操作；PR1 只展示，不进入执行集合。
+            风险：{% if row.executable %}增加/扣减库存或回滚出库。开启后白名单内且有范围权限的人可执行，并留回执与审计。{% else %}本轮禁止执行，配置不能解锁。{% endif %}
           </div>
           {% endif %}
         </td>
@@ -94,7 +94,7 @@
           </label>
           {% else %}
           <label style="display:inline-flex;align-items:center;gap:4px;font-weight:normal;color:#9ca3af"
-                 title="PR1 未接入，开关不生效">
+                 title="未批准或未接入，不能执行">
             <input type="checkbox" disabled> 未接入
           </label>
           {% endif %}

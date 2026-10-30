@@ -17,7 +17,7 @@ def _get_ctx():
     return resolve_ctx()
 
 
-def outbound_create_impl(args: dict) -> dict:
+def outbound_create_impl(args: dict, *, ctx=None) -> dict:
     """Create an outbound request: deduct stock + write movement record.
 
     Mirrors the Flask /outbound/submit endpoint exactly.
@@ -26,15 +26,15 @@ def outbound_create_impl(args: dict) -> dict:
     quantity: float = args["quantity"]
     warehouse_code: str = args["warehouse_code"]
     reason: str | None = args.get("reason")
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "POST", "/api/v1/outbound"):
         raise ForbiddenError("forbidden_path")
     return svc_create_outbound(item_id, quantity, warehouse_code, ctx, reason)
 
 
-def outbound_list_impl(args: dict) -> dict:
+def outbound_list_impl(args: dict, *, ctx=None) -> dict:
     warehouse_code: str = args["warehouse_code"]
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/outbound"):
         raise ForbiddenError("forbidden_path")
     return svc_list_outbound(
@@ -45,11 +45,11 @@ def outbound_list_impl(args: dict) -> dict:
     )
 
 
-def outbound_rollback_impl(args: dict) -> dict:
+def outbound_rollback_impl(args: dict, *, ctx=None) -> dict:
     """Roll back an outbound request: return stock to warehouse."""
     request_id: int = args["request_id"]
     warehouse_code: str = args["warehouse_code"]
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "POST", "/api/v1/outbound/rollback"):
         raise ForbiddenError("forbidden_path")
     return svc_rollback_outbound(request_id, warehouse_code, ctx)

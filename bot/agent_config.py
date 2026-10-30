@@ -1,16 +1,4 @@
-"""Bot 有效配置（Issue #79 PR1）：每条消息读取一次。
-
-设计边界
---------
-- **只读** master.db 的 ``bot_agent_config``，不 import 任何业务写 service。
-- **只收窄现有 9 项**：``TOOL_NAMES`` 是当前唯一可执行的 bot 工具集；
-  ``tool.<mcp 名称>`` 或未知名称写成 on 也不能扩大执行集合（PR1 不接入 MCP）。
-- **失败回退**：缺表 / 锁库 / 读取异常 / 坏配置 → 9 项全开 + ``medium``。
-  回退绝不启用新写能力（9 项本来就是只读工具）。
-- ``reasoning_effort`` 只接受 5 档；非法值（含 ``none``）不允许进入模型请求。
-
-本模块刻意只依赖 stdlib + ``bot.tool_schema``，方便 Flask 配置页与 bot 进程共用。
-"""
+"""Per-message PR2 configuration, with a fixed PR1 read-only failure fallback."""
 from __future__ import annotations
 
 import logging
@@ -21,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bot.tool_contract import EXTRA_READS, LEGACY_PARENTS, MCP_NAMES
 from bot.tool_schema import TOOL_NAMES
 
 logger = logging.getLogger("bot.agent_config")
@@ -71,8 +60,7 @@ def resolve_model_name(env: Mapping[str, str] | None = None) -> str:
 class BotAgentConfig:
     """一次消息的有效配置快照。
 
-    ``enabled_tools`` 永远只会是 ``TOOL_NAMES`` 的子集；MCP 工具/未知名称
-    不会出现在这里（PR1 不接入 MCP 执行能力）。
+    只包含固定批准池；动态注册项与七个 canonical 写永远不能通过配置授权。
     """
 
     reasoning_effort: str
@@ -80,13 +68,14 @@ class BotAgentConfig:
     write_allowed_userids: tuple[str, ...]
     degraded: bool = False
     degraded_reason: str | None = None
+    configured_tools: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         normalized = normalize_reasoning_effort(self.reasoning_effort)
         if normalized != self.reasoning_effort:
             raise ConfigError("reasoning_effort 必须使用小写规范值")
-        if not self.enabled_tools <= TOOL_NAMES:
-            raise ConfigError("enabled_tools 含非现有 bot 工具名")
+        if not self.enabled_tools <= (TOOL_NAMES | MCP_NAMES):
+            raise ConfigError("enabled_tools 含未批准工具名")
 
 
 def _fallback(reason: str) -> BotAgentConfig:
@@ -97,6 +86,12 @@ def _fallback(reason: str) -> BotAgentConfig:
         degraded=True,
         degraded_reason=reason,
     )
+
+
+def verified_owner_userid() -> str:
+    """Operator assertion after Owner/Prod verification; never infer from historical LinJi."""
+    value = (os.environ.get("BOT_OWNER_USERID") or "").strip()
+    return value if value and "," not in value and not any(c.isspace() for c in value) else ""
 
 
 def normalize_userids(raw: str | None) -> tuple[str, ...]:
@@ -122,7 +117,7 @@ def _read_rows(path: Path) -> list[tuple[Any, Any]]:
 def load_effective_config(
     master_db_path: str | Path | None = None,
 ) -> BotAgentConfig:
-    """读取一次有效配置；任何异常都回退到 9 项 + medium。
+    """读取一次配置；原 14 默认 on，八读显式 on，任何异常仅回退旧九项。
 
     调用方（``bot.agent.answer_stream``）必须在每条消息开始时只调用一次，
     并把返回的快照同时用于请求体与 ``_run_tool`` 过滤。
@@ -142,8 +137,8 @@ def load_effective_config(
         return _fallback(reason)
 
     reasoning_effort = DEFAULT_REASONING_EFFORT
-    enabled = set(TOOL_NAMES)
-    write_userids: tuple[str, ...] = ()
+    enabled = set(TOOL_NAMES | (MCP_NAMES - EXTRA_READS))
+    write_userids = (verified_owner_userid() or "LinJi",)
 
     try:
         for key, value in rows:
@@ -153,16 +148,24 @@ def load_effective_config(
                 write_userids = normalize_userids(value)
             elif isinstance(key, str) and key.startswith(TOOL_KEY_PREFIX):
                 name = key[len(TOOL_KEY_PREFIX):]
-                # 只认现有 9 项；MCP/未知名称忽略，绝不扩大执行集合。
-                if name in TOOL_NAMES:
+                # 只认批准池；未知项/七个 canonical 写无法通过配置解锁。
+                if name in TOOL_NAMES | MCP_NAMES:
                     if not parse_tool_enabled(value):
                         enabled.discard(name)
-    except ConfigError as exc:
+                    else:
+                        enabled.add(name)
+    except (ConfigError, TypeError, AttributeError) as exc:
         logger.warning("bot 配置非法，回退 9 项 + medium（%s）", exc)
         return _fallback(str(exc))
+
+    configured_tools = frozenset(enabled)
+    for child, parent in LEGACY_PARENTS.items():
+        if parent not in enabled:
+            enabled.discard(child)
 
     return BotAgentConfig(
         reasoning_effort=reasoning_effort,
         enabled_tools=frozenset(enabled),
         write_allowed_userids=write_userids,
+        configured_tools=configured_tools,
     )

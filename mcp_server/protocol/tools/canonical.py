@@ -63,12 +63,13 @@ def _ctx():
 # 读
 # ─────────────────────────────────────────────────────────────────────
 
-def canonical_list_impl(args: dict) -> dict:
+def canonical_list_impl(args: dict, *, ctx=None) -> dict:
     """列主数据。可选 status / category_code / 关键词 q + limit / offset。"""
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical"):
         raise ForbiddenError("forbidden_path")
     return svc_list(
+        read_only=ctx.read_only,
         status=args.get("status"),
         category_code=args.get("category_code"),
         q=args.get("q"),
@@ -77,50 +78,51 @@ def canonical_list_impl(args: dict) -> dict:
     )
 
 
-def canonical_detail_impl(args: dict) -> dict:
+def canonical_detail_impl(args: dict, *, ctx=None) -> dict:
     """单条主数据详情（canonical + aliases + 跨仓 bindings）。"""
     canonical_id = int(args["canonical_id"])
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical/<id>"):
         raise ForbiddenError("forbidden_path")
-    return svc_detail(canonical_id)
+    return svc_detail(canonical_id, read_only=ctx.read_only)
 
 
-def canonical_categories_impl(args: dict) -> list[dict]:
+def canonical_categories_impl(args: dict, *, ctx=None) -> list[dict]:
     """列主数据品类（供分类筛选下拉）。"""
     _ = args
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical/categories"):
         raise ForbiddenError("forbidden_path")
-    return svc_categories()
+    return svc_categories(read_only=ctx.read_only)
 
 
-def canonical_fanout_targets_impl(args: dict) -> list[dict]:
+def canonical_fanout_targets_impl(args: dict, *, ctx=None) -> list[dict]:
     """可作为扇出目标的仓（storefront + rd + distribution_center）。"""
     _ = args
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical/fanout-targets"):
         raise ForbiddenError("forbidden_path")
-    return svc_targets()
+    return svc_targets(read_only=ctx.read_only)
 
 
-def canonical_conflicts_impl(args: dict) -> list[dict]:
+def canonical_conflicts_impl(args: dict, *, ctx=None) -> list[dict]:
     """列 open 冲突；可选 canonical_id 过滤。"""
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical/conflicts"):
         raise ForbiddenError("forbidden_path")
     return svc_conflicts(
+        read_only=ctx.read_only,
         canonical_id=int(args["canonical_id"]) if args.get("canonical_id") else None,
     )
 
 
-def canonical_fanout_event_impl(args: dict) -> dict:
+def canonical_fanout_event_impl(args: dict, *, ctx=None) -> dict:
     """单次扇出事件详情（含 per-仓 / per-item 应用结果）。"""
     event_id = int(args["event_id"])
-    ctx = _ctx()
+    ctx = ctx if ctx is not None else _ctx()
     if not check_path(ctx, "GET", "/api/v1/canonical/fanout/event/<id>"):
         raise ForbiddenError("forbidden_path")
-    return svc_event(event_id)
+    return svc_event(event_id, read_only=ctx.read_only)
 
 
 # ─────────────────────────────────────────────────────────────────────

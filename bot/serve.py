@@ -100,7 +100,8 @@ async def _progress_ticker(push: Any, stop: asyncio.Event) -> None:
 async def _handle_text(client: WSClient, frame: dict) -> None:
     body = frame.get("body") or {}
     msgid = str(body.get("msgid") or "stream")
-    userid = str((body.get("from") or {}).get("userid") or "")
+    raw_userid = (body.get("from") or {}).get("userid")
+    userid = raw_userid if isinstance(raw_userid, str) else ""
     raw = str((body.get("text") or {}).get("content") or "")
     question = strip_mention(raw)
 
@@ -146,6 +147,7 @@ async def _handle_text(client: WSClient, frame: dict) -> None:
         reply = await agent.answer_stream(
             question,
             history=HISTORY.get(userid),
+            userid=userid,
             on_delta=on_delta,
             on_progress=on_progress,
         )

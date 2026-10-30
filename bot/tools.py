@@ -1,5 +1,6 @@
 """库存查询工具层 —— 给 LLM 调用的只读工具。
 
+本模块是只读查询通道；#80 三写例外由 bot.mcp_tools 独立执行。
 安全边界有三层，缺一不可：
 
 1. **工具集里没有写能力**：本模块只做 SELECT，不 import 任何写 service。
@@ -23,6 +24,8 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+from mcp_server.service.auth import AuthContext, check_warehouse
 
 # 与 reports_health_pure._visible_items_clause 保持一致：
 # 停用行 + 主数据停用行都不对外展示。这里内联一份常量，避免为四个只读查询
@@ -67,17 +70,17 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def list_warehouses() -> list[dict[str, Any]]:
+def list_warehouses(*, ctx: AuthContext | None = None) -> list[dict[str, Any]]:
     """列出所有仓库（code + name）。只返回启用的。"""
     master = db_dir() / "master.db"
     if not master.exists():
         return []
     with _connect_ro(master) as conn:
         rows = conn.execute("SELECT code, name FROM warehouses ORDER BY code").fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows if ctx is None or check_warehouse(ctx, r["code"])]
 
 
-def _warehouse_map() -> dict[str, dict[str, Any]]:
+def _warehouse_map(ctx: AuthContext | None = None) -> dict[str, dict[str, Any]]:
     """code -> {name, db_path, warehouse_type}。一次查全，供跨仓遍历用。
 
     ``warehouse_type`` 是后加的列（旧库没有），所以带一次回退：宁可拿不到
@@ -96,10 +99,10 @@ def _warehouse_map() -> dict[str, dict[str, Any]]:
             rows = conn.execute(
                 "SELECT code, name, db_path, '' AS warehouse_type FROM warehouses ORDER BY code"
             ).fetchall()
-    return {r["code"]: dict(r) for r in rows}
+    return {r["code"]: dict(r) for r in rows if ctx is None or check_warehouse(ctx, r["code"])}
 
 
-def resolve_warehouse_code(code_or_name: str | None) -> str | None:
+def resolve_warehouse_code(code_or_name: str | None, *, ctx: AuthContext | None = None) -> str | None:
     """仓名 → 编码。模型经常直接传「配送中心仓库」而不是 wh_000，就地容错。
 
     匹配顺序：精确编码 → 名称完全相等 → 名称互相包含。都不中返回 None，
@@ -108,7 +111,7 @@ def resolve_warehouse_code(code_or_name: str | None) -> str | None:
     if not code_or_name:
         return None
     key = code_or_name.strip()
-    wh_map = _warehouse_map()
+    wh_map = _warehouse_map(ctx)
     if key in wh_map:
         return key
     for code, meta in wh_map.items():
@@ -120,9 +123,9 @@ def resolve_warehouse_code(code_or_name: str | None) -> str | None:
     return None
 
 
-def warehouse_brief() -> list[dict[str, str]]:
+def warehouse_brief(*, ctx: AuthContext | None = None) -> list[dict[str, str]]:
     """给提示词用的仓库清单（code + name），避免模型为了查编码多跑一轮。"""
-    return [{"code": c, "name": m["name"]} for c, m in _warehouse_map().items()]
+    return [{"code": c, "name": m["name"]} for c, m in _warehouse_map(ctx).items()]
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +171,7 @@ def resolve_price(item: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _match_items(keyword: str, limit: int = 20) -> list[dict[str, Any]]:
+def _match_items(keyword: str, limit: int = 20, *, ctx: AuthContext | None = None) -> list[dict[str, Any]]:
     """跨仓按名称/SKU 模糊匹配，返回去重后的品项骨架。
 
     员工不会说 SKU，会说「面粉」。这里同时匹配 name 和 sku，且要求
@@ -180,7 +183,7 @@ def _match_items(keyword: str, limit: int = 20) -> list[dict[str, Any]]:
     like = f"%{keyword}%"
     seen: dict[str, dict[str, Any]] = {}
 
-    for meta in _warehouse_map().values():
+    for meta in _warehouse_map(ctx).values():
         path = _resolve_path(meta["db_path"])
         if not path.exists():
             continue
@@ -258,9 +261,9 @@ def _item_detail_in_warehouse(
 # ---------------------------------------------------------------------------
 
 
-def search_items(keyword: str, limit: int = 20) -> dict[str, Any]:
+def search_items(keyword: str, limit: int = 20, *, ctx: AuthContext | None = None) -> dict[str, Any]:
     """按名称或 SKU 模糊搜索品项。员工说不准名字时先调这个。"""
-    matches = _match_items(keyword, limit=limit)
+    matches = _match_items(keyword, ctx=ctx, limit=limit)
     return {
         "ok": True,
         "keyword": keyword,
@@ -270,10 +273,12 @@ def search_items(keyword: str, limit: int = 20) -> dict[str, Any]:
     }
 
 
-def get_item_detail(sku_or_name: str, warehouse_code: str | None = None) -> dict[str, Any]:
+def get_item_detail(sku_or_name: str, warehouse_code: str | None = None, *, ctx: AuthContext | None = None) -> dict[str, Any]:
     """查品项在各仓的库存与价格。不给 warehouse_code 就查全部仓。"""
-    wh_map = _warehouse_map()
-    resolved = resolve_warehouse_code(warehouse_code)
+    wh_map = _warehouse_map(ctx)
+    resolved = resolve_warehouse_code(warehouse_code, ctx=ctx)
+    if warehouse_code and resolved is None:
+        return {"ok": False, "error": "forbidden_warehouse", "message": "仓库不存在或无权限"}
     targets = {resolved: wh_map[resolved]} if resolved else wh_map
     if not targets:
         return {"ok": False, "error": "no_warehouse", "message": "没有可查询的仓库"}
@@ -330,14 +335,14 @@ def get_price(sku_or_name: str) -> dict[str, Any]:
     }
 
 
-def list_warehouse_items(warehouse_code: str, limit: int = 30) -> dict[str, Any]:
+def list_warehouse_items(warehouse_code: str, limit: int = 30, *, ctx: AuthContext | None = None) -> dict[str, Any]:
     """列某个仓有哪些品项。品项多的仓只给分类概览 + 有库存的前 N 条。
 
     一个仓动辄上百个品项，全念给员工没有意义。先给「共多少、按分类怎么分」，
     再列库存最多的几条，员工要细节会自己追问。
     """
-    wh_map = _warehouse_map()
-    resolved = resolve_warehouse_code(warehouse_code)
+    wh_map = _warehouse_map(ctx)
+    resolved = resolve_warehouse_code(warehouse_code, ctx=ctx)
     meta = wh_map.get(resolved) if resolved else None
     if not meta:
         return {
@@ -394,10 +399,12 @@ def list_warehouse_items(warehouse_code: str, limit: int = 30) -> dict[str, Any]
     }
 
 
-def list_low_stock(warehouse_code: str | None = None, limit: int = 15) -> dict[str, Any]:
+def list_low_stock(warehouse_code: str | None = None, limit: int = 15, *, ctx: AuthContext | None = None) -> dict[str, Any]:
     """列出低于安全库存的品项，按缺口从大到小。"""
-    wh_map = _warehouse_map()
-    resolved = resolve_warehouse_code(warehouse_code)
+    wh_map = _warehouse_map(ctx)
+    resolved = resolve_warehouse_code(warehouse_code, ctx=ctx)
+    if warehouse_code and resolved is None:
+        return {"ok": False, "error": "forbidden_warehouse", "message": "仓库不存在或无权限"}
     targets = {resolved: wh_map[resolved]} if resolved else wh_map
     if not targets:
         return {"ok": False, "error": "no_warehouse", "message": "没有可查询的仓库"}
@@ -468,7 +475,7 @@ _TYPE_LABEL = {
 _TYPE_ORDER = {"storefront": 0, "distribution_center": 1, "rd": 2}
 
 
-def list_store_overview() -> dict[str, Any]:
+def list_store_overview(*, ctx: AuthContext | None = None) -> dict[str, Any]:
     """各仓/门店的库存概览：品项数、缺货数、低于安全库存数、有货品项数。
 
     员工问「各门店库存状况」时用这个。**必须一次返回全部**——如果让模型
@@ -479,7 +486,7 @@ def list_store_overview() -> dict[str, Any]:
     让人误读成「库存很多」。要看量得落到具体品项。
     """
     rows: list[dict[str, Any]] = []
-    for code, meta in _warehouse_map().items():
+    for code, meta in _warehouse_map(ctx).items():
         path = _resolve_path(meta["db_path"])
         if not path.exists():
             continue
@@ -523,7 +530,8 @@ def list_store_overview() -> dict[str, Any]:
 
 
 def get_item_consumption(
-    sku_or_name: str, days: int = 30, warehouse_code: str | None = None
+    sku_or_name: str, days: int = 30, warehouse_code: str | None = None,
+    *, ctx: AuthContext | None = None,
 ) -> dict[str, Any]:
     """某品项最近 N 天的消耗量，按仓给出，基于库存流水 ``stock_movements``。
 
@@ -531,8 +539,10 @@ def get_item_consumption(
     近期没有任何流水，如实返回 0 条流水，而不是拿当前库存倒推一个数。
     """
     days = max(1, min(int(days or 30), 365))
-    wh_map = _warehouse_map()
-    resolved = resolve_warehouse_code(warehouse_code)
+    wh_map = _warehouse_map(ctx)
+    resolved = resolve_warehouse_code(warehouse_code, ctx=ctx)
+    if warehouse_code and resolved is None:
+        return {"ok": False, "error": "forbidden_warehouse", "message": "仓库不存在或无权限"}
     targets = {resolved: wh_map[resolved]} if resolved else wh_map
 
     placeholders = ",".join("?" for _ in CONSUME_ACTIONS)
@@ -616,7 +626,7 @@ _ORDER_STATUS_LABEL = {
 }
 
 
-def list_orders(status: str | None = None, days: int = 7, limit: int = 20) -> dict[str, Any]:
+def list_orders(status: str | None = None, days: int = 7, limit: int = 20, *, ctx: AuthContext | None = None) -> dict[str, Any]:
     """查门店订单（含可直接点的链接）。
 
     ``status`` 留空 = 最近的订单全查。员工问「哪些订单还没处理」时传
@@ -629,7 +639,7 @@ def list_orders(status: str | None = None, days: int = 7, limit: int = 20) -> di
     days = max(1, min(int(days or 7), 365))
     limit = max(1, min(int(limit or 20), 50))
     base = public_base()
-    names = {c: m["name"] for c, m in _warehouse_map().items()}
+    names = {c: m["name"] for c, m in _warehouse_map(ctx).items()}
 
     sql = (
         "SELECT o.id, o.order_no, o.store_warehouse_code, o.dc_warehouse_code, "
@@ -638,6 +648,15 @@ def list_orders(status: str | None = None, days: int = 7, limit: int = 20) -> di
         "FROM store_orders o WHERE o.created_at >= date('now', ?) "
     )
     params: list[Any] = [f"-{days} day"]
+    scope_sql = ""
+    scope_params: list[Any] = []
+    if ctx is not None and ctx.allowed_warehouses is not None:
+        codes = ctx.allowed_warehouses
+        marks = ",".join("?" for _ in codes)
+        scope_sql = f" AND (store_warehouse_code IN ({marks}) OR dc_warehouse_code IN ({marks})) "
+        scope_params = [*codes, *codes]
+        sql += scope_sql
+        params.extend(scope_params)
     if status:
         sql += "AND o.status = ? "
         params.append(status)
@@ -649,8 +668,8 @@ def list_orders(status: str | None = None, days: int = 7, limit: int = 20) -> di
             rows = conn.execute(sql, params).fetchall()
             counts = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM store_orders "
-                "WHERE created_at >= date('now', ?) GROUP BY status",
-                (f"-{days} day",),
+                "WHERE created_at >= date('now', ?) " + scope_sql + " GROUP BY status",
+                [f"-{days} day", *scope_params],
             ).fetchall()
     except sqlite3.Error as exc:
         return {"ok": False, "error": "query_failed", "message": str(exc)}
@@ -682,7 +701,7 @@ def list_orders(status: str | None = None, days: int = 7, limit: int = 20) -> di
     }
 
 
-def get_project_help() -> dict[str, Any]:
+def get_project_help(*, ctx: AuthContext | None = None) -> dict[str, Any]:
     """系统的能力介绍。员工问「你能干什么」「怎么用」「有哪些功能」时返回。
 
     文案是固定的（``bot/help_text.py``），不交给模型自由发挥——这类回答会被

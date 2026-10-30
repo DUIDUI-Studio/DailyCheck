@@ -158,7 +158,7 @@ def _outbound_30d_sum(wh_path: str, item_id: int) -> float:
     return float(row["total"] or 0)
 
 
-def _weighted_daily_avg(wh_path: str, item_id: int) -> float:
+def _weighted_daily_avg(wh_path: str, item_id: int, *, read_only: bool = False) -> float:
     """Linear-decay weighted average of outbound qty over last 30d.
 
     Mirrors blueprints.forecast_pure.compute_daily_avg exactly so the
@@ -166,7 +166,7 @@ def _weighted_daily_avg(wh_path: str, item_id: int) -> float:
     numbers). Returns 0.0 if no recent outbounds.
     """
     from decimal import Decimal
-    with closing(sqlite3.connect(wh_path)) as w:
+    with closing(sqlite3.connect(f"file:{wh_path}?mode=ro" if read_only else wh_path, uri=read_only)) as w:
         w.row_factory = sqlite3.Row
         rows = w.execute(
             """SELECT requested_quantity, created_at
@@ -197,9 +197,9 @@ def _weighted_daily_avg(wh_path: str, item_id: int) -> float:
     return float(Decimal(str(raw)).quantize(Decimal('0.01')))
 
 
-def _in_transit_qty(wh_path: str, item_id: int) -> float:
+def _in_transit_qty(wh_path: str, item_id: int, *, read_only: bool = False) -> float:
     """Sum of open restock_requests (status not '已到货' / '已取消')."""
-    with closing(sqlite3.connect(wh_path)) as w:
+    with closing(sqlite3.connect(f"file:{wh_path}?mode=ro" if read_only else wh_path, uri=read_only)) as w:
         w.row_factory = sqlite3.Row
         row = w.execute(
             """SELECT COALESCE(SUM(requested_quantity), 0) AS total
@@ -211,7 +211,10 @@ def _in_transit_qty(wh_path: str, item_id: int) -> float:
     return float(row["total"] or 0)
 
 
-def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
+def compute_store_procurement(
+    wh_code: str, wh_path: str, *, config_values: tuple[int, float] | None = None,
+    read_only: bool = False,
+) -> list[dict]:
     """Compute procurement suggestions for one warehouse (no cache read).
 
     Returns a list of {item_id, item_name, current_qty, in_transit_qty,
@@ -220,10 +223,10 @@ def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
     Items with safety_stock <= current + in_transit are excluded too
     (suggested_qty would be 0, no actionable signal).
     """
-    cover_days, min_absolute = _get_config()
+    cover_days, min_absolute = config_values if config_values is not None else _get_config()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     out: list[dict] = []
-    with closing(sqlite3.connect(wh_path)) as w:
+    with closing(sqlite3.connect(f"file:{wh_path}?mode=ro" if read_only else wh_path, uri=read_only)) as w:
         w.row_factory = sqlite3.Row
         items = w.execute(
             "SELECT id, name, quantity, unit FROM items ORDER BY id"
@@ -231,7 +234,7 @@ def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
     for it in items:
         # Replicate forecast's cold-start threshold: n<7 records.
         n = 0
-        with closing(sqlite3.connect(wh_path)) as w:
+        with closing(sqlite3.connect(f"file:{wh_path}?mode=ro" if read_only else wh_path, uri=read_only)) as w:
             w.row_factory = sqlite3.Row
             n = w.execute(
                 """SELECT COUNT(*) AS c FROM outbound_requests
@@ -241,10 +244,10 @@ def compute_store_procurement(wh_code: str, wh_path: str) -> list[dict]:
             ).fetchone()["c"]
         if n < 7:
             continue
-        avg = _weighted_daily_avg(wh_path, it["id"])
+        avg = _weighted_daily_avg(wh_path, it["id"], read_only=read_only)
         if avg <= 0:
             continue
-        in_transit = _in_transit_qty(wh_path, it["id"])
+        in_transit = _in_transit_qty(wh_path, it["id"], read_only=read_only)
         current = float(it["quantity"])
         safety = compute_safety_stock(avg, cover_days, min_absolute)
         forecast_horizon = round(avg * cover_days, 2)

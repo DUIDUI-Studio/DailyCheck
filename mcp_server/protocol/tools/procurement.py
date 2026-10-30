@@ -1,12 +1,14 @@
 """Procurement MCP Tools."""
 from __future__ import annotations
 
+from mcp_server.infra.errors import ForbiddenError
 from mcp_server.service.auth import check_path, check_warehouse, resolve_ctx
 from mcp_server.service.procurement import (
-    procurement_store as svc_store,
     procurement_hub as svc_hub,
 )
-from mcp_server.infra.errors import ForbiddenError
+from mcp_server.service.procurement import (
+    procurement_store as svc_store,
+)
 
 
 def _get_ctx():
@@ -18,9 +20,9 @@ def _get_ctx():
     return resolve_ctx()
 
 
-def procurement_store_impl(args: dict) -> dict:
+def procurement_store_impl(args: dict, *, ctx=None) -> dict:
     warehouse_code: str = args["warehouse_code"]
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/procurement/store"):
         raise ForbiddenError("forbidden_path")
     if not check_warehouse(ctx, warehouse_code):
@@ -28,9 +30,9 @@ def procurement_store_impl(args: dict) -> dict:
     return svc_store(warehouse_code, ctx)
 
 
-def procurement_hub_impl(args: dict) -> list[dict]:
+def procurement_hub_impl(args: dict, *, ctx=None) -> list[dict]:
     warehouse_code: str | None = args.get("warehouse_code")
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/procurement/hub"):
         raise ForbiddenError("forbidden_path")
     if warehouse_code and not check_warehouse(ctx, warehouse_code):

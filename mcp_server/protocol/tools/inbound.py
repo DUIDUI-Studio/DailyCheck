@@ -16,12 +16,12 @@ def _get_ctx():
     return resolve_ctx()
 
 
-def restock_create_impl(args: dict) -> dict:
+def restock_create_impl(args: dict, *, ctx=None) -> dict:
     item_id: int = args["item_id"]
     quantity: int = args["quantity"]
     warehouse_code: str = args["warehouse_code"]
     reason: str | None = args.get("reason")
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "POST", "/api/v1/restock"):
         raise ForbiddenError("forbidden_path")
     if not check_warehouse(ctx, warehouse_code):
@@ -29,9 +29,9 @@ def restock_create_impl(args: dict) -> dict:
     return svc_create_restock(item_id, quantity, warehouse_code, ctx, reason)
 
 
-def restock_list_impl(args: dict) -> dict:
+def restock_list_impl(args: dict, *, ctx=None) -> dict:
     warehouse_code: str = args["warehouse_code"]
-    ctx = _get_ctx()
+    ctx = ctx if ctx is not None else _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/restock"):
         raise ForbiddenError("forbidden_path")
     if not check_warehouse(ctx, warehouse_code):
