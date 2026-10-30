@@ -1949,6 +1949,7 @@ requested_quantity仍存基础有效量；新MCP保存规范化input_quantity/fa
 service BEGIN IMMEDIATE + busy_timeout=5000后读键/库存，出库条件UPDATE quantity>=量并核验rowcount；
 data不commit；UNIQUE异常rollback后新事务重查，其他完整性异常不吞。相同载荷replay返回原id，
 replayed=true/applied=false；变更item/原始量/factor即409，reason不覆盖。回滚重放不复活，删除后409。
+发布的tools.json与运行时注册项的工具描述逐字一致，由schema契约回归钉住。
 create额外返回doc_no/line_no/input_quantity/factor/status/rolled_back/replayed/applied；
 list只增加doc_no/line_no/input_quantity（字符串或null）/factor（number），#72/#74信封/total/排序不变。
 MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁内判状态。

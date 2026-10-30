@@ -126,7 +126,7 @@
     },
     {
       "name": "restock_list",
-      "description": "List inbound restock requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, status, reason, created_at}], total, limit, offset, truncated}. Each row also includes doc_no, line_no, input_quantity (decimal string or null), factor (number); quantity remains base units.",
+      "description": "List inbound restock requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, status, reason, created_at, doc_no, line_no, input_quantity, factor}], total, limit, offset, truncated}.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -210,7 +210,7 @@
     },
     {
       "name": "outbound_create",
-      "description": "Create an outbound request: deduct stock and write movement record. Mirrors the Flask outbound_submit endpoint. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
+      "description": "Create an outbound record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -269,7 +269,7 @@
     },
     {
       "name": "outbound_list",
-      "description": "List outbound requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, reason, status, rolled_back, created_at}], total, limit, offset, truncated}. Each row also includes doc_no, line_no, input_quantity (decimal string or null), factor (number); quantity remains base units.",
+      "description": "List outbound requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, reason, status, rolled_back, created_at}], total, limit, offset, truncated}.",
       "inputSchema": {
         "type": "object",
         "properties": {

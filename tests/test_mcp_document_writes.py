@@ -140,6 +140,8 @@ def test_schema_published_matches_runtime():
         ]
     }
     for tool in get_tools():
+        if tool.name in published:
+            assert tool.description == published[tool.name]["description"]
         if tool.name in ("restock_create", "outbound_create"):
             schema = getattr(tool, "inputSchema", None) or tool.input_schema
             assert schema == published[tool.name]["inputSchema"]
