@@ -16,7 +16,7 @@ Expected:
 {"status":"ok","checks":{"mcp_server":"ok","transport":"ok","db":"ok"}}
 ```
 
-If you see `401` instead, the server is up but the env var `DAILYCHECK_MCP_TOKEN` on the server side does not match the one you're sending. **Talk to the server admin before continuing.**
+If you see `401` instead, the transport middleware rejected the credential: either the server env `DAILYCHECK_MCP_TOKEN` (dev/legacy path) does not match, or the token was not found/revoked in the `agent_tokens` table (production path). **Talk to the server admin before continuing.**
 
 ---
 
@@ -27,16 +27,18 @@ The token must allow **only** what this integration needs. Required flags at tok
 ```bash
 flask create-agent-token <name> \
   --warehouses wh_001,wh_002        # only the warehouses this app reads
-  --read-paths consumption,inventory # only the tool namespaces it calls
+  --read-paths "/api/v1/items,/api/v1/movements"  # pure paths, no HTTP method prefix
 ```
 
 What each flag means:
 
 | Flag | Effect of over-permissioning | Recommended default |
 |---|---|---|
-| `--warehouses` | Reads/writes data for any warehouse the user has access to | explicit list |
-| `--read-paths` | Can call any tool | explicit list of namespace prefixes |
-| `--write-paths` | Can mutate state | **omit unless required** |
+| `--warehouses` | Omitting it stores `null` = every warehouse | explicit list |
+| `--read-paths` | Matching read tools beyond this integration's needs | explicit path patterns |
+| `--write-paths` | Can mutate state | **omit unless required**; pure paths such as `/api/v1/restock` |
+
+Path patterns are matched against the tool's logical path (`/api/v1/...`), never against `"METHOD /path"`. A non-wildcard pattern also matches its sub-paths, so `/api/v1/outbound` covers `/api/v1/outbound/rollback`.
 
 Self-test:
 ```bash
@@ -197,6 +199,8 @@ recent = datetime.now(timezone(timedelta(hours=8))) - timedelta(days=7)
 - Error reports sent to Sentry / Bugsnag.
 - HTTP access logs (use `Authorization: Bearer <REDACTED>` filter at the proxy).
 
+The server's own `access.log` follows the same rule: it records only the request token id (`agent_token_id`), logical operation (`tools/call`), tool name, business status and duration — never the raw token, `Authorization` header, arguments or reason. See [README §7.1](./README.md#71-tool-call-audit-log-issue-85).
+
 If you write an MCP reverse proxy in front of the server, **strip the `Authorization` header before logging**. Nginx:
 
 ```nginx
@@ -251,4 +255,4 @@ All three must produce the same `serverInfo.name` and end with `Done.` (Python) 
 
 ---
 
-**Last verified**: tested against commit `fd8e87f` on `main`. The auth flow assumed here is the current **two-layer** model: middleware checks `Bearer == $DAILYCHECK_MCP_TOKEN` AND tool layer checks the same token's hash in `agent_tokens`. If the server changes this, all tests under §1 will fail loudly.
+**Last verified**: the auth flow assumed here is the transport model in [README §3](./README.md#3-authentication): the middleware accepts **either** a server-side `DAILYCHECK_MCP_TOKEN` env match (dev/legacy bypass) **or** a non-revoked `agent_tokens` row; the tool layer then consumes the request-scoped `AuthContext` rather than re-authenticating the same raw token. If the server changes this, all tests under §1 will fail loudly.

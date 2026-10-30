@@ -16,8 +16,13 @@ def write_mcp_access_log(
     path: str,
     status: int,
     duration_ms: int,
+    tool_name: str | None = None,
 ) -> None:
-    """追加一条 JSON 记录到 access.log。异常静默吞掉。"""
+    """追加一条 JSON 记录到 access.log。异常静默吞掉。
+
+    `tool_name` 是 Issue #85 新增的可选字段，MCP `tools/call` 用它区分具体
+    工具；既有调用方不传时记录形状保持不变。
+    """
     try:
         rec = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
@@ -27,6 +32,8 @@ def write_mcp_access_log(
             "status": int(status),
             "duration_ms": int(duration_ms),
         }
+        if tool_name is not None:
+            rec["tool_name"] = tool_name
         with open(_ACCESS_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:

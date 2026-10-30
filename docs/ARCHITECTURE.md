@@ -1446,6 +1446,7 @@ sequenceDiagram
     participant ASGI as Starlette (uvicorn)
     participant MW as AuthMiddleware
     participant T as MCP Tool Handler
+    participant L as access.log (JSONL)
     participant DB as SQLite
 
     A->>ASGI: POST /api/mcp/ {jsonrpc:2.0, method:"tools/call", params:{name:"outbound_create", arguments:{...}}}
@@ -1467,8 +1468,12 @@ sequenceDiagram
     T->>T: check_path(ctx, method, path)
     T->>DB: 业务查询（read 或 write）
     DB-->>T: 行数据
+    T->>L: finally: write_mcp_access_log(token_id, tool_name, status, duration_ms)
+    L-->>T: 写入失败静默忽略（不改变响应）
     T-->>A: JSON-RPC result
 ```
+
+**工具调用审计（Issue #85）**：`protocol/server.py::call_tool` 在 `finally` 中为每次进入该路由的调用追加恰好一条 JSONL 记录。`status` 是业务结果（成功 200 / `McpError.http_status` / 未知工具 400 / 非预期异常 500），不是 HTTP 传输状态；`agent_token_id` 取自 AuthMiddleware 发布的请求级 `AuthContext`，缺失时为 `null`，绝不回退到进程 env token 重新认证。日志写入失败被吞掉，handler 不会重跑。未进入 `call_tool` 的 401/429、SDK 参数校验、`initialize` / `tools/list` 仍只有传输层日志。细节见 §9.5。
 
 ---
 
@@ -1752,6 +1757,27 @@ flowchart TB
     ACL -->|Yes| Exec[执行业务]
     ACL -->|No| Forbidden[403 ForbiddenError]
 ```
+
+### 9.5 工具调用审计（access.log，Issue #85）
+
+`mcp_server/protocol/server.py::call_tool` 已接通既有的 `infra/access_log.py::write_mcp_access_log`。每次**实际进入** `call_tool` 的调用在 `finally` 中追加恰好一条 JSONL 记录到 `BASE_DIR/access.log`；handler 只执行一次。
+
+| 字段 | 值 / 语义 |
+|------|-----------|
+| `ts` | UTC ISO-8601 时间戳 |
+| `agent_token_id` | 请求级 `AuthContext.token_id`；无已认证上下文为 `null`。不从进程 env token 重新认证，避免串号 |
+| `path` | 固定 `/api/mcp/`（MCP 层无 HTTP path 语义） |
+| `method` | 固定 `tools/call` |
+| `status` | 业务结果：成功 `200`、`McpError.http_status` 原值（如 400/401/403/404）、未知工具 `400`、非预期异常 `500`。**HTTP 传输状态不参与判定** |
+| `duration_ms` | 单调时钟计算的毫秒耗时，非负 |
+| `tool_name` | 可选扩展字段；未知工具也会记录，长度上限 128 字符 |
+
+边界与隐私：
+
+- 只覆盖进入工具层的 `tools/call`。401/429 在 `AuthMiddleware` 提前返回、SDK 参数校验拒绝、`initialize` / `tools/list` 均**不**产生该记录，仍走既有 uvicorn/传输日志。
+- 记录只含上述元数据；不写 raw token、token hash、`Authorization`、arguments、`reason`、异常堆栈或响应内容。未知工具名经 `json.dumps` 转义并限长，不会注入多条物理日志行。
+- `write_mcp_access_log` 内部吞掉所有异常；`call_tool` 再兜一层，日志失败不会改变既有响应、不会重放业务。
+- 回归：`tests/test_mcp_access_log.py`（根目录，CI 可收集）。真实生产文件路径不在测试中写入，测试用临时路径替换 `_ACCESS_LOG_PATH`。
 
 ---
 
@@ -2092,6 +2118,14 @@ Issue #47 的研发配方页回归在 `tests/test_recipe_bom_delete.py`（20 例
 删除往返 / AJAX 拒绝返 ok:false / AJAX 成功返 ok:true / 重复原料整批回滚并指明第几行 /
 正常保存不误伤 / 保存表单不再提交 bom_delete[] / 新建撞重复不留半保存配方」。
 详见 §13.13。
+
+Issue #85 的工具调用审计回归放在根目录 `tests/test_mcp_access_log.py`（CI 可收集，
+不进 `tests/mcp_server/`）：通过 `build_server()` 注册的真实 `call_tool` 路由覆盖成功
+读/写、McpError 403/400、未知工具 400、非预期异常 500；断言每次进入路由恰一条 JSONL、
+`agent_token_id` 来自请求级 `AuthContext`、`duration_ms >= 0`、失败状态不冒充
+`status=200`，以及日志不含 token/`Authorization`/arguments/reason。测试用临时路径替换
+`_ACCESS_LOG_PATH`，不写生产 `access.log`。变异验证：临时去掉 writer 调用后 10/12 用例转红
+（保留的 2 例分别是直接调用 writer 的兼容性用例与「写日志失败不影响响应」用例，符合预期）。
 
 ```mermaid
 flowchart TB
