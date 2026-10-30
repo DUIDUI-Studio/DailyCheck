@@ -1058,6 +1058,52 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 ---
 
+### 3.16 模型效能账本采集器 `scripts/model_eval/`（Issue #91，2026-10-30 起）
+
+**目标**：把 Nightly Dispatch Drain 的派单事件与本机 Agent transcript 按 worktree 路径 join，产出「每次派单一行」的 token / 成本账本，供后续看板评估区块消费。现有看板只有「日 × source」聚合，缺 model × role × dispatch 维度。
+
+**数据源（全部只读）**：
+
+| 源 | 路径 | 关键字段 |
+|---|---|---|
+| 派单事件 | `~/.local/state/dailycheck/automation/state/dispatch.jsonl` | 只取 `type=="dispatch"`；`ts` / `issue` / `data.{worker_id,task_id,worktree_path,model,effort,agent,role,complexity_score,pr}` |
+| Claude transcript | `~/.claude/projects/<sanitized-cwd>/<session>.jsonl` | `cwd`、`message.model`、`message.usage`（input/output/cache_read/cache_write/reasoning） |
+| Codex rollout | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `session_meta`/`turn_context` 的 `cwd`+`model`；`token_usage_record.thread_token_usage`（现行）或 `token_count.info.total_token_usage`（legacy） |
+| 价目表 | `scripts/model_eval/pricing.json` | 每 1M token 单价（CNY），占位价 0.0 由 Owner 填真实值 |
+
+**join 规则**：session 的 `cwd == 派单 worktree_path` 才归属该派单；同一 worktree 被多次派单复用时，按 session 文件 mtime 落在 `[本次派单 ts, 同 worktree 下次派单 ts)` 切分。历史派单行没有 `worktree_path` 时仍入账本，`tokens/cost=null` + `warnings=["no_worktree_path"]`（降级不丢行）。
+
+**token 口径（易错点）**：
+
+- **Claude 必须按 `message.id` 去重后求和** —— 实测同一条 assistant 消息在 transcript 里会重复写 3 行，直接逐行求和会放大数倍。
+- **Codex 的累计值只取末次** —— `thread_token_usage` / `total_token_usage` 是累计快照，逐事件求和必然高估；`input_tokens` 含 `cached_input_tokens`，采集时拆成 `input`（非缓存）与 `cache_read`，避免缓存命中按全价重复计价。
+- `reasoning` 单独记录，不参与计价（价目表无 reasoning 单价）。
+
+**账本行 schema**（JSONL，每次派单一行）：
+
+```
+{ts, issue, role, agent, model_requested, model_effective, effort, complexity_score,
+ worker_id, task_id, worktree_path, pr,
+ tokens:{input,output,cache_read,cache_write,reasoning}|null, cost|null, warnings:[str]}
+```
+
+`cost` = tokens × pricing 单价之和；pricing 缺该模型 → `cost=null` + `no_pricing:<model>`，不抛异常。`model_effective` 取归属 session 里实际生效的模型（多个模型时逗号拼接 + `multiple_models` warning）。
+
+**运行**：
+
+```bash
+python3 -m scripts.model_eval collect            # 落盘 ~/.local/state/dailycheck/eval/ledger.jsonl
+python3 -m scripts.model_eval collect --dry-run  # 只打印，不写盘
+```
+
+参数：`--dispatch-jsonl` / `--out` / `--claude-dir` / `--codex-dir` / `--pricing` / `--dry-run`。**幂等 = 全量重生成**（每次从 dispatch.jsonl 重建，同输入同输出；写临时文件后 `os.replace` 原子替换）。transcript 逐行流式读取，单文件解析失败只降级该文件（warning），不中断整次采集；`dispatch.jsonl` 本身不可读才退出码 2。
+
+**写入边界**：只读 transcript 与 automation state，唯一写入路径是 `--out`（默认 `~/.local/state/dailycheck/eval/`），**绝不写 `~/.local/state/dailycheck/automation/`**。
+
+**测试**：`tests/test_model_eval_collect.py`（13 用例：Claude+Codex 正常 join / message.id 去重 / worktree 复用按 mtime 切分 / 窗口外 session 不归属 / 缺 worktree_path 降级 / pricing 缺模型 / Codex 累计值取末次（现行 + legacy 两格式）/ 损坏行容错 / dispatch 不可读退出码 / 幂等两次输出一致 / dry-run 不落盘）。
+
+---
+
 ## 4. 数据架构
 
 ### 4.1 整体形态
