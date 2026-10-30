@@ -448,7 +448,13 @@ def test_review_and_ship_other_dc_order_forbidden(dc_env):
 
 
 def test_admin_can_review_and_ship_any_dc_order(dc_env):
-    """Platform admin logged into a storefront can still review/ship DC orders."""
+    """Platform admin logged into a storefront can still review DC orders.
+
+    Shipping is different: the operation warehouse is always the session
+    warehouse (multi-warehouse §7), so the ship segment switches the admin's
+    session to dc_test. Manually adapting only the setup, per coordinator
+    ruling; both assertions (302 + shipped) are unchanged.
+    """
     client = dc_env["client"]
     order_id = dc_env["order_id"]
 
@@ -466,8 +472,8 @@ def test_admin_can_review_and_ship_any_dc_order(dc_env):
     master.close()
     assert status == "approved"
 
-    # Admin ships the order as well.
-    _login_as(client, 5, 2)
+    # Admin ships the order as well — in an explicit DC session.
+    _login_as(client, 5, 1)
     resp = client.post(
         f"/store-ordering/orders/{order_id}/ship",
         data={"tracking_note": "admin ship"},

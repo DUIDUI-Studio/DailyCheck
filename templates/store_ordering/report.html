@@ -105,7 +105,7 @@
 <p class="empty">该筛选范围无数据</p>
 {% endif %}
 
-{# —— 维度 2：按 DC —— #}
+{# —— 维度 2：按 DC（多仓时即履约来源仓）—— #}
 <h3 style="margin-top:24px">按配送中心</h3>
 {% if report.by_dc %}
 <table class="data-table">
@@ -136,6 +136,7 @@
     {% endfor %}
   </tbody>
 </table>
+<p class="muted">运费为订单头级金额，按参与仓展示全单值；跨仓单会在多个源仓各出现一次，各行不可相加。</p>
 {% else %}
 <p class="empty">该筛选范围无数据</p>
 {% endif %}

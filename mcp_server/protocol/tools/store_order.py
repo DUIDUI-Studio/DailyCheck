@@ -6,9 +6,13 @@
   - ``GET /api/v1/store-orders``      —— 列表
   - ``GET /api/v1/store-orders/<id>`` —— 详情
 
-仓库级 ACL 落在服务层（``service/store_order.py``）：订单的
-``store_warehouse_code`` 或 ``dc_warehouse_code`` 任一命中 token 的
-``allowed_warehouses`` 即可见。
+仓库级 ACL 落在服务层（``service/store_order.py``），口径是**订单参与仓**
+（spec §10）：订单的门店仓、或任一明细行来源仓（历史 NULL 行回落头仓；
+无明细行的存量单回落头仓）命中 token 的 ``allowed_warehouses`` 即可见。
+
+ACL 扩权语义（显式）：token 命中**任一参与仓** → 可读**全单**，包括由其
+他参与仓履约的明细行、金额与收货历史。这是有意的扩权，已写入工具
+description 与 ``docs/integrations/dailycheck-mcp/``。
 """
 from __future__ import annotations
 

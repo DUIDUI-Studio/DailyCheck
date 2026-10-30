@@ -92,27 +92,33 @@ def _seed_master(master_path) -> None:
            VALUES (1, ?, ?, ?, 'store_order', 'shipped', 2, '2026-10-28', ?, ?, 3, ?)""",
         (SEED_ORDER_NO, WH_STORE, WH_DC, TS, TS, TS),
     )
-    for canonical_id, qty, dc_item_id in [
-        (101, 10.0, 501),
-        (102, 20.0, 502),
-        (103, 30.0, 503),
-        (104, 40.0, 504),
-        (105, 50.0, None),   # 尚未回填配送中心 items.id
-        (106, 60.0, None),
+    # 多仓履约 Task 10：行级来源仓让验收种子单成为跨仓单
+    # （前 3 行由头仓 wh_dc 履约，后 3 行由 wh_other_dc 履约）。
+    for canonical_id, qty, dc_item_id, source in [
+        (101, 10.0, 501, WH_DC),
+        (102, 20.0, 502, WH_DC),
+        (103, 30.0, 503, WH_DC),
+        (104, 40.0, 504, WH_OTHER_DC),
+        (105, 50.0, None, WH_OTHER_DC),   # 尚未回填配送中心 items.id
+        (106, 60.0, None, WH_OTHER_DC),
     ]:
         conn.execute(
             """INSERT INTO store_order_items
-               (order_id, canonical_id, dc_item_id, store_item_id, quantity, unit,
-                fulfilled_quantity, status, created_at)
-               VALUES (1, ?, ?, NULL, ?, '件', 0, 'pending', ?)""",
-            (canonical_id, dc_item_id, qty, TS),
+               (order_id, canonical_id, dc_item_id, store_item_id,
+                source_warehouse_code, quantity, unit, fulfilled_quantity, status, created_at)
+               VALUES (1, ?, ?, NULL, ?, ?, '件', 0, 'pending', ?)""",
+            (canonical_id, dc_item_id, source, qty, TS),
         )
-    for no, shipped_at in (("DN-20261025-0001", TS), ("DN-20261025-0002", TS)):
+    for no, shipped_at, wh in (
+        ("DN-20261025-0001", TS, WH_DC),
+        ("DN-20261025-0002", TS, WH_OTHER_DC),
+    ):
         conn.execute(
             """INSERT INTO store_order_deliveries
-               (order_id, delivery_no, shipped_by, shipped_at, tracking_note, created_at)
-               VALUES (1, ?, 3, ?, '首批', ?)""",
-            (no, shipped_at, TS),
+               (order_id, delivery_no, warehouse_code, shipped_by, shipped_at,
+                tracking_note, created_at)
+               VALUES (1, ?, ?, 3, ?, '首批', ?)""",
+            (no, wh, shipped_at, TS),
         )
     for from_status, to_status in ((None, "pending"), ("pending", "approved"),
                                     ("approved", "shipped")):
@@ -430,6 +436,83 @@ class TestStoreOrderAcl:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 跨仓可见性（Task 10 / spec §10）
+# ─────────────────────────────────────────────────────────────────────
+
+class TestCrossWarehouseVisibility:
+    """ACL 语义扩展：命中任一参与仓 → 可读全单（含他仓行/收货历史）。"""
+
+    def test_b_only_token_sees_cross_order_and_full_detail(self, store_order_env, auth_ctx):
+        """只授权 wh_other_dc 也能看到 wh_dc 头仓的跨仓单，并读到全部 6 行。"""
+        auth_ctx(_ctx([WH_OTHER_DC]))
+        result = store_order_list_impl({})
+        assert 1 in [o["id"] for o in result["orders"]]
+
+        detail = store_order_detail_impl({"order_id": 1})
+        assert detail["order"]["id"] == 1
+        assert detail["order"]["dc_warehouse_code"] == WH_DC
+        # 全单：包括由他仓 wh_dc 履约的行
+        assert len(detail["items"]) == 6
+        assert {i["source_warehouse_code"] for i in detail["items"]} == {
+            WH_DC, WH_OTHER_DC,
+        }
+        # 批次仓库是物流事实，不按 token 范围裁剪
+        assert {d["warehouse_code"] for d in detail["deliveries"]} == {
+            WH_DC, WH_OTHER_DC,
+        }
+
+    def test_dual_authorization_dedupes_the_order(self, store_order_env, auth_ctx):
+        """两个参与仓同时授权时，同一订单只出现一次。"""
+        auth_ctx(_ctx([WH_DC, WH_OTHER_DC]))
+        result = store_order_list_impl({})
+        ids = [o["id"] for o in result["orders"]]
+        assert ids.count(1) == 1
+        assert result["total"] == len(ids)
+
+    def test_explicit_participant_warehouse_filter(self, store_order_env, auth_ctx):
+        """warehouse_code 以「参与仓」口径过滤，而不是只看头仓。"""
+        auth_ctx(_ctx([WH_DC, WH_OTHER_DC]))
+        by_beta = store_order_list_impl({"warehouse_code": WH_OTHER_DC})
+        ids = [o["id"] for o in by_beta["orders"]]
+        assert 1 in ids, "wh_other_dc 是订单 1 的参与仓（3 行来源仓）"
+        assert 2 not in ids, "订单 2 只有 wh_dc 参与"
+        assert by_beta["total"] == len(ids)
+
+    def test_empty_scope_returns_nothing(self, store_order_env, auth_ctx):
+        auth_ctx(_ctx([]))
+        result = store_order_list_impl({})
+        assert result == {
+            "orders": [], "total": 0, "limit": 200, "offset": 0, "truncated": False,
+        }
+
+    def test_pagination_and_total_are_consistent(self, store_order_env, auth_ctx):
+        """逐页拼接结果 == 一次取全；total/truncated 与页边界一致。"""
+        auth_ctx(_ctx([WH_OTHER_DC]))
+        full = store_order_list_impl({})
+        assert full["truncated"] is False
+
+        collected: list[int] = []
+        offset = 0
+        while True:
+            page = store_order_list_impl({"limit": 1, "offset": offset})
+            assert page["total"] == full["total"]
+            collected.extend(o["id"] for o in page["orders"])
+            if not page["truncated"]:
+                break
+            offset += 1
+        assert collected == [o["id"] for o in full["orders"]]
+
+    def test_list_count_and_detail_agree_on_membership(self, store_order_env, auth_ctx):
+        """列表/计数/详情三处可见性收敛到同一谓词。"""
+        auth_ctx(_ctx([WH_OTHER_DC]))
+        result = store_order_list_impl({"limit": 500})
+        assert result["total"] == len(result["orders"])
+        for order in result["orders"]:
+            detail = store_order_detail_impl({"order_id": order["id"]})
+            assert detail["order"]["id"] == order["id"]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 工具注册（tools/list）
 # ─────────────────────────────────────────────────────────────────────
 
@@ -453,3 +536,13 @@ class TestStoreOrderToolRegistry:
         detail_schema = schemas["store_order_detail"]
         assert detail_schema["required"] == ["order_id"]
         assert set(detail_schema["properties"]) == {"order_id"}
+
+    def test_descriptions_declare_participant_acl_expansion(self):
+        """ACL 扩权语义必须写进 description（spec §10）。"""
+        descriptions = {t.name: t.description for t in get_tools()}
+        list_desc = descriptions["store_order_list"].lower()
+        assert "participating warehouse" in list_desc
+        assert "full order" in list_desc
+        detail_desc = descriptions["store_order_detail"].lower()
+        assert "participating warehouse" in detail_desc
+        assert "full order" in detail_desc

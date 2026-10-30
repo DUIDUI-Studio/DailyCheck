@@ -11,9 +11,15 @@
 权限模型：
   - 路径级：``GET /api/v1/store-orders`` 与 ``GET /api/v1/store-orders/<id>``，
     由 ``protocol/tools/store_order.py`` 用 ``check_path`` 校验。
-  - 仓库级：**订单可见性规则** —— ``store_warehouse_code`` 或
-    ``dc_warehouse_code`` 任一命中 token 的 ``allowed_warehouses`` 即可见；
-    ``allowed_warehouses is None`` 表示不限仓，全可见。
+  - 仓库级：**「订单参与仓」可见性**（spec §10）——订单的门店仓，或任一
+    明细行来源仓（历史 NULL 行回落头仓；无明细行的存量单回落头仓）命中
+    token 的 ``allowed_warehouses`` 即可见；``allowed_warehouses is None``
+    表示不限仓，全可见。
+  - ACL 扩权语义（显式）：token 命中**任一参与仓** → 可读**全单**，包括由
+    其他参与仓履约的明细行、金额与收货历史。这是有意的扩权，不是漏洞。
+
+列表、计数与详情三处可见性共用 ``_visibility_sql`` 同一段 SQL 谓词，
+避免「列表能看、详情 404」或计数与分页不一致。
 
 只读：本模块只调用纯函数的查询入口，不写任何表、不删任何行、不改 schema。
 """
@@ -40,6 +46,40 @@ _COLLECTION_KEYS = ("order_items", "deliveries", "receipts", "status_history")
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 统一可见性谓词
+# ─────────────────────────────────────────────────────────────────────
+
+def _visibility_sql(alias: str, code_count: int) -> str:
+    """「订单参与仓」SQL 谓词（spec §10），列表/计数/详情共用。
+
+    ``alias`` 是调用方传入的可信表别名（不来自用户输入）。谓词表达：
+
+      * 门店仓命中；或
+      * 任一明细行来源仓命中（``COALESCE(source_warehouse_code, 头仓)``
+        兼容迁移前的历史 NULL 行）；或
+      * 没有任何明细行的存量单，头仓命中。
+
+    ``EXISTS`` 保证多行同仓不会把订单计数翻倍。
+    """
+    marks = ",".join("?" for _ in range(code_count))
+    return (
+        f"({alias}.store_warehouse_code IN ({marks})"
+        f" OR EXISTS (SELECT 1 FROM store_order_items soi"
+        f" WHERE soi.order_id = {alias}.id"
+        f" AND COALESCE(soi.source_warehouse_code, {alias}.dc_warehouse_code)"
+        f" IN ({marks}))"
+        f" OR ({alias}.dc_warehouse_code IN ({marks}) AND NOT EXISTS ("
+        f"SELECT 1 FROM store_order_items legacy"
+        f" WHERE legacy.order_id = {alias}.id)))"
+    )
+
+
+def _visibility_params(codes: list[str]) -> list[str]:
+    """``_visibility_sql`` 的三组占位符按顺序各吃一遍仓库 code。"""
+    return [*codes, *codes, *codes]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 内部 helpers
 # ─────────────────────────────────────────────────────────────────────
 
@@ -61,49 +101,33 @@ def _normalize_offset(offset: object) -> int:
     return max(0, value)
 
 
-def _scope_pairs(
+def _scope_filters(
     codes: list[str] | None,
     warehouse_code: str | None,
-) -> list[tuple[str | None, str | None]]:
-    """把可见性 OR 规则翻译成 ``sop.list_orders`` 能表达的过滤器组合。
+) -> list[dict[str, object]]:
+    """把可见性翻译成 ``sop.list_orders`` 的调用参数组合。
 
     ``sop.list_orders`` 的 ``store_warehouse_code`` / ``dc_warehouse_code``
-    是 **AND** 关系，而 ACL 可见性是「store 命中 **OR** dc 命中」，
-    因此要把 OR 展开成若干次 AND 查询的并集：
+    是 AND 关系，一次调用表达不了 OR 可见性，所以按「门店侧」与「参与仓」
+    两个入口各查一次，再按订单 id 合并去重：
 
-      * 无 ``warehouse_code`` 过滤：``store ∈ codes`` ∪ ``dc ∈ codes``
-      * 有 ``warehouse_code`` 过滤（记作 W，调用方已保证 W ∈ codes）：
-        ``(store ∈ codes ∪ dc ∈ codes)`` ∧ ``(store = W ∪ dc = W)``
-
-    展开后每个组合都能用一次 ``list_orders`` 调用表达：
-
-      ==========================  ==========================================
-      组合                        含义
-      ==========================  ==========================================
-      ``(store=W, None)``         store = W
-      ``(None, W)``               dc = W
-      ``(X, W)`` / ``(W, X)``     store = X ∧ dc = W / dc = X ∧ store = W
-      ==========================  ==========================================
-
-    ``codes is None``（不限仓）时退化成单次无过滤调用。
+      * 显式 ``warehouse_code``（调用方已保证它在 token 范围内，因此该仓
+        命中的订单必然可见）：只需 ``store=W`` 与 ``participant=W`` 两次；
+      * 否则按 token 的每个仓展开 ``store=code`` 与 ``participant=code``；
+      * ``codes is None``（不限仓）：单次无过滤调用。
     """
-    if codes is None:
-        if warehouse_code is None:
-            return [(None, None)]
-        return [(warehouse_code, None), (None, warehouse_code)]
-
-    pairs: list[tuple[str | None, str | None]] = []
     if warehouse_code is not None:
-        pairs.append((warehouse_code, None))
-        pairs.append((None, warehouse_code))
+        return [
+            {"store_warehouse_code": warehouse_code},
+            {"participant_warehouse_code": warehouse_code},
+        ]
+    if codes is None:
+        return [{}]
+    scopes: list[dict[str, object]] = []
     for code in sorted(codes):
-        if warehouse_code is None:
-            pairs.append((code, None))
-            pairs.append((None, code))
-        elif code != warehouse_code:
-            pairs.append((code, warehouse_code))
-            pairs.append((warehouse_code, code))
-    return pairs
+        scopes.append({"store_warehouse_code": code})
+        scopes.append({"participant_warehouse_code": code})
+    return scopes
 
 
 def _order_key(row: dict) -> tuple[str, int]:
@@ -127,14 +151,13 @@ def _fetch_orders(
     """
     window = limit + offset
     merged: dict[int, dict] = {}
-    for store_code, dc_code in _scope_pairs(codes, warehouse_code):
+    for scope in _scope_filters(codes, warehouse_code):
         rows = sop.list_orders(
             conn,
-            store_warehouse_code=store_code,
-            dc_warehouse_code=dc_code,
             status=status or None,
             limit=window,
             offset=0,
+            **scope,
         )
         for row in rows:
             merged[int(row["id"])] = row
@@ -148,24 +171,17 @@ def _count_orders(
     warehouse_code: str | None,
     status: str | None,
 ) -> int:
-    """统计可见订单总数（与列表同一套过滤条件）。
-
-    ``sop.count_orders_by_status`` 的 store/dc 过滤也是 AND 关系，
-    表达不了本层的 OR 可见性，所以这里单独写一条 COUNT。
-    """
+    """统计可见订单总数（同一段 ``_visibility_sql`` 谓词）。"""
     where: list[str] = []
     params: list[object] = []
     if codes is not None:
-        placeholders = ",".join("?" for _ in codes)
-        where.append(
-            f"(store_warehouse_code IN ({placeholders}) "
-            f"OR dc_warehouse_code IN ({placeholders}))"
-        )
-        params.extend(codes)
-        params.extend(codes)
+        if not codes:
+            return 0
+        where.append(_visibility_sql("store_orders", len(codes)))
+        params.extend(_visibility_params(codes))
     if warehouse_code is not None:
-        where.append("(store_warehouse_code = ? OR dc_warehouse_code = ?)")
-        params.extend([warehouse_code, warehouse_code])
+        where.append(_visibility_sql("store_orders", 1))
+        params.extend(_visibility_params([warehouse_code]))
     if status:
         where.append("status = ?")
         params.append(status)
@@ -176,17 +192,22 @@ def _count_orders(
     return int(row["n"])
 
 
-def _is_visible(order: dict, codes: list[str] | None) -> bool:
-    """订单可见性：store 或 dc 任一命中 allowed_warehouses 即可见。
-
-    ``codes is None``（不限仓）→ 全可见。
-    """
+def _is_visible(
+    conn: sqlite3.Connection,
+    order_id: int,
+    codes: list[str] | None,
+) -> bool:
+    """详情可见性：与列表/计数同一段 SQL 谓词。"""
     if codes is None:
         return True
-    return (
-        order.get("store_warehouse_code") in codes
-        or order.get("dc_warehouse_code") in codes
-    )
+    if not codes:
+        return False
+    row = conn.execute(
+        f"SELECT 1 FROM store_orders so WHERE so.id = ? "
+        f"AND {_visibility_sql('so', len(codes))}",
+        [order_id, *_visibility_params(codes)],
+    ).fetchone()
+    return row is not None
 
 
 def _shape_item(row: dict) -> dict:
@@ -194,8 +215,11 @@ def _shape_item(row: dict) -> dict:
 
     ``dc_item_bound`` = True 表示该行已回填配送中心 items.id（出库时匹配上）；
     False 表示还没匹配上（订货行仍处于未发货态）。
+    ``source_warehouse_code`` 是行级来源仓（迁移前历史行可能为 NULL，
+    由头仓兜底），契约上始终存在该键。
     """
     item = dict(row)
+    item.setdefault("source_warehouse_code", None)
     dc_item_id = item.get("dc_item_id")
     item["dc_item_id"] = dc_item_id
     item["dc_item_bound"] = dc_item_id is not None
@@ -203,6 +227,13 @@ def _shape_item(row: dict) -> dict:
     item["fulfilled_quantity"] = float(item.get("fulfilled_quantity") or 0)
     item["shipped_quantity"] = float(item.get("shipped_quantity") or 0)
     return item
+
+
+def _shape_delivery(row: dict) -> dict:
+    """批次形状：``warehouse_code`` 是本批实际发货仓（物流事实）。"""
+    delivery = dict(row)
+    delivery.setdefault("warehouse_code", None)
+    return delivery
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -218,8 +249,10 @@ def list_store_orders(
 ) -> dict:
     """列门店订单（只读）。
 
-    ``warehouse_code`` 是可选的**单仓**过滤（该仓作为门店方或总仓方都算命中）；
-    ``status`` 是订单状态过滤。两者叠加在 token 的仓库范围之上。
+    ``warehouse_code`` 是可选的**单仓**过滤（该仓作为门店方或任一参与仓
+    都算命中）；``status`` 是订单状态过滤。两者叠加在 token 的仓库范围之上。
+
+    ACL 扩权语义：命中所返回订单的**任一参与仓**即可读，返回的是**全单**。
     """
     limit = _normalize_limit(limit)
     offset = _normalize_offset(offset)
@@ -255,7 +288,8 @@ def get_store_order_detail(ctx: AuthContext, order_id: int) -> dict:
     """单个门店订单详情（只读）。
 
     返回五段结构：``order``（头）+ ``items`` + ``deliveries`` +
-    ``receipts`` + ``status_history``。
+    ``receipts`` + ``status_history``。命中任一参与仓即返回**全单**
+    （含其他参与仓履约的行、金额与收货历史）。
     """
     try:
         order_id = int(order_id)
@@ -264,9 +298,11 @@ def get_store_order_detail(ctx: AuthContext, order_id: int) -> dict:
 
     with master_connection(read_only=ctx.read_only) as conn:
         detail = sop.get_order_detail(conn, order_id)
-    if detail is None:
-        raise NotFoundError("not_found")
-    if not _is_visible(detail, ctx.allowed_warehouses):
+        visible = (
+            detail is not None
+            and _is_visible(conn, order_id, ctx.allowed_warehouses)
+        )
+    if not visible or detail is None:
         # 范围外的订单「不可见」—— 与不存在同义，不泄露其存在性。
         raise NotFoundError("not_found")
 
@@ -274,7 +310,7 @@ def get_store_order_detail(ctx: AuthContext, order_id: int) -> dict:
     return {
         "order": header,
         "items": [_shape_item(r) for r in detail.get("order_items", [])],
-        "deliveries": detail.get("deliveries", []),
+        "deliveries": [_shape_delivery(r) for r in detail.get("deliveries", [])],
         "receipts": detail.get("receipts", []),
         "status_history": detail.get("status_history", []),
     }

@@ -107,7 +107,10 @@ def fmt_cover(days: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def pick_purchase_rows(rows: Iterable[dict]) -> list[dict]:
+def pick_purchase_rows(
+    rows: Iterable[dict],
+    routing: dict[int, str] | None = None,
+) -> list[dict]:
     """从看板 rows 挑出「本周该由 DC 向供应商采购」的行（**不截断**）。
 
     排序：断货风险优先，其次建议金额降序。
@@ -116,13 +119,26 @@ def pick_purchase_rows(rows: Iterable[dict]) -> list[dict]:
     数量解析不出来一律不放行。少列一项只是清单短一行，多列一项就会让
     采购员订错货、订多余的货 —— 两种错误的代价不对称，所以宁可漏。
     截断交给 `build_digest`，因为主题与摘要要用**全量**合计（见下方注释）。
+
+    `routing`（canonical_id → 履约来源仓，由调用方注入，纯层不碰 DB）：
+    双 DC 镜像同 canonical 时只保留路由来源仓那一行，避免同一批货在一张
+    采购单里出现两次（spec §10 / D11）。未配置路由的 canonical 不受影响。
     """
+    routing = routing or {}
     picked: list[dict] = []
     for row in rows or ():
         if not isinstance(row, dict):
             continue
         if row.get("warehouse_type") != DC_TYPE:
             continue
+        cid = row.get("canonical_id")
+        if cid is not None:
+            try:
+                source_dc = routing.get(int(cid))
+            except (TypeError, ValueError):
+                source_dc = None
+            if source_dc is not None and str(row.get("warehouse_code")) != source_dc:
+                continue
         if row.get("status") not in ACTION_STATUSES:
             continue
         # fail-closed：只有明确 True 才放行。缺字段意味着上游改过结构，
@@ -195,11 +211,14 @@ def build_digest(
     warnings: Sequence[str] | None = None,
     generated_at: datetime | None = None,
     dc_configured: bool = True,
+    routing: dict[int, str] | None = None,
 ) -> dict:
     """装配成可直接渲染的 digest dict（纯函数，输入什么就渲染什么）。
 
     `rows` 是看板 `build_board()` 的 `rows`（含所有仓、所有状态）；
     这里只挑 DC 的采购动作行，再为每行补齐门店库存与 7 天消耗。
+    `routing`（canonical_id → 履约来源仓）用于按路由去重 DC 行，见
+    `pick_purchase_rows`。
 
     **合计口径**：`item_count_total` / `total_value` 一律按**未截断的全量**
     计算。邮件只列前 `limit` 行，但主题和摘要必须说本周到底要花多少钱 ——
@@ -210,7 +229,7 @@ def build_digest(
     stores = list(stores or ())
     failed_codes = frozenset(str(c) for c in (failed_store_codes or ()))
 
-    picked = pick_purchase_rows(rows)
+    picked = pick_purchase_rows(rows, routing=routing)
     item_count_total = len(picked)
     total_value = 0.0
     for row in picked:

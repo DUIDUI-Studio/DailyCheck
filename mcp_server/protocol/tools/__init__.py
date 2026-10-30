@@ -640,9 +640,15 @@ def get_tools() -> list[Tool]:
             title="List Store Orders",
             description=(
                 "List store orders (store ordering / DC transfer documents) visible to "
-                "this token. Read-only. Optional filters: warehouse_code (matches "
-                "either the store side or the DC side of an order), status, limit, "
-                "offset. Returns: {orders: [{id, order_no, store_warehouse_code, "
+                "this token. Read-only. Visibility is by participating warehouse: an "
+                "order is visible when the token is allowed on its store warehouse or "
+                "on ANY participating warehouse (a line's source warehouse, with the "
+                "header DC as legacy fallback). ACL expansion (explicit): a token "
+                "allowed on any participating warehouse can read the full order, "
+                "including line items fulfilled by other warehouses and their amounts. "
+                "Optional filters: warehouse_code (matches the store side or any "
+                "participating warehouse of an order), status, limit, offset. Returns: "
+                "{orders: [{id, order_no, store_warehouse_code, "
                 "dc_warehouse_code, flow_type, status, requested_by, expected_delivery_date, "
                 "created_at, updated_at, ...}], total, limit, offset, truncated}."
             ),
@@ -653,7 +659,8 @@ def get_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "Optional warehouse code filter; matches an order whose "
-                            "store side or DC side is this warehouse (e.g. wh_000)."
+                            "store warehouse or any participating warehouse is this "
+                            "warehouse (e.g. wh_000)."
                         ),
                     },
                     "status": {
@@ -690,11 +697,16 @@ def get_tools() -> list[Tool]:
             title="Get Store Order Detail",
             description=(
                 "Get one store order with its header, line items, deliveries, receipts "
-                "and status history. Read-only. Returns: {order: {id, order_no, "
+                "and status history. Read-only. Visible when the token is allowed on the "
+                "store warehouse or on ANY participating warehouse; ACL expansion "
+                "(explicit): such a token can read the full order, including line items "
+                "fulfilled by other warehouses, their amounts and the receipt history. "
+                "Returns: {order: {id, order_no, "
                 "store_warehouse_code, dc_warehouse_code, flow_type, status, ...}, "
                 "items: [{id, canonical_id, canonical_name, dc_item_id, dc_item_bound, "
-                "quantity, fulfilled_quantity, shipped_quantity, unit, status}], "
-                "deliveries: [...], receipts: [...], status_history: [...]}."
+                "source_warehouse_code, quantity, fulfilled_quantity, shipped_quantity, "
+                "unit, status}], deliveries: [{..., warehouse_code}], receipts: [...], "
+                "status_history: [...]}."
             ),
             inputSchema={
                 "type": "object",

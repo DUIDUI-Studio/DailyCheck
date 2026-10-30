@@ -140,6 +140,13 @@ def test_create_transfer_skips_pending_approval(transfer_env):
     assert order["status_history"][-1]["to_status"] == sop.ORDER_STATUS_APPROVED
 
 
+def test_create_transfer_freezes_line_source_to_the_head_warehouse(transfer_env):
+    """多仓履约 Task 10：调货建单的明细行来源仓 = 头仓（发货仓）。"""
+    order = _create(transfer_env)
+    assert len(order["order_items"]) == 1
+    assert order["order_items"][0]["source_warehouse_code"] == "dc_test"
+
+
 def test_create_transfer_merges_same_canonical(transfer_env):
     order = _create(
         transfer_env,
