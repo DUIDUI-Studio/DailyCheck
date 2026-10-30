@@ -103,17 +103,33 @@ def test_fetch_prs_maps_rest_fields(monkeypatch):
 
 
 def test_fetch_issues_excludes_pull_requests(monkeypatch):
-    """GitHub 的 /issues 会把 PR 一并返回，必须按 pull_request 字段剔除。"""
+    """/issues 会把 PR 一并返回，必须按 pull_request 字段剔除。
+
+    Gitea 28.1.0 起真 issue 也带 `pull_request` 键（值为 null），旧版则没有该键；
+    判据必须是「值为 None」而不是「键不存在」，否则真 issue 会被全部剔成假零。
+    """
     payload = [
         {
+            # Gitea 28：真 issue，键存在但为 null → 必须保留
             "number": 200,
-            "title": "真 issue",
+            "title": "真 issue（Gitea 28）",
             "state": "open",
+            "pull_request": None,
             "created_at": "2026-10-17T01:00:00Z",
             "closed_at": None,
             "labels": [{"name": "bug"}],
         },
         {
+            # 旧版 Gitea：真 issue，无该键 → 必须保留
+            "number": 202,
+            "title": "真 issue（旧版）",
+            "state": "open",
+            "created_at": "2026-10-17T03:00:00Z",
+            "closed_at": None,
+            "labels": [],
+        },
+        {
+            # PR：该键为 dict → 必须剔除
             "number": 201,
             "title": "其实是 PR",
             "state": "open",
@@ -127,7 +143,7 @@ def test_fetch_issues_excludes_pull_requests(monkeypatch):
 
     issues = fetchers.fetch_issues()
 
-    assert [i["number"] for i in issues] == [200]
+    assert [i["number"] for i in issues] == [200, 202]
     assert issues[0]["state"] == "OPEN"
     assert issues[0]["labels"] == ["bug"]
 

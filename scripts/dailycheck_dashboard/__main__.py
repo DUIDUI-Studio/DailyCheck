@@ -18,10 +18,17 @@ from zoneinfo import ZoneInfo
 # （scripts/ 不在 sys.path 时，__main__.py 显式注入父目录）
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-    from scripts.dailycheck_dashboard import db, fetchers, ledger_db, ops_db, ops_parse
+    from scripts.dailycheck_dashboard import (
+        db,
+        fetchers,
+        issues_cache,
+        ledger_db,
+        ops_db,
+        ops_parse,
+    )
     from scripts.dailycheck_dashboard import render as render_mod
 else:
-    from . import db, fetchers, ledger_db, ops_db, ops_parse
+    from . import db, fetchers, issues_cache, ledger_db, ops_db, ops_parse
     from . import render as render_mod
 
 # 默认路径（与 deploy/systemd/dc-dashboard-generator.service 保持一致）
@@ -29,7 +36,8 @@ DEFAULT_DB = Path("/var/lib/dailycheck-dashboard/dashboard.db")
 DEFAULT_HTML_DIR = Path("/var/lib/dailycheck-dashboard/snapshots")
 DEFAULT_HTML_LATEST = Path("/var/lib/dailycheck-dashboard/latest.html")
 DEFAULT_INBOX = Path("/var/lib/dailycheck-prod-agent/inbox.jsonl")
-DEFAULT_REDUCER_DB = Path("/var/lib/dailycheck-prod-agent/event_reducer.sqlite3")
+# Issue 列表每日缓存（必须在 ReadWritePaths=/var/lib/dailycheck-dashboard 之下）
+DEFAULT_ISSUES_CACHE = Path("/var/lib/dailycheck-dashboard/issues_cache.json")
 DEFAULT_REPO_DIR = Path("/root/DailyCheck")
 DEFAULT_REPO = "eric/dailycheck"   # 2026-10-22 起仓库迁至自托管 Gitea
 
@@ -88,12 +96,22 @@ def cmd_render(args: argparse.Namespace) -> int:
     ops_unavailable: list[str] = []
 
     # 1. 拉数据（容错：单条失败不阻塞整体）
+    issues_cache_path = Path(args.issues_cache)
     try:
-        issues = fetchers.fetch_issues(DEFAULT_REPO)
-        _log(f"  issues: {len(issues)}")
+        issues, issues_meta = issues_cache.load_or_fetch_issues(issues_cache_path)
+        _log(f"  issues: {len(issues)} (source={issues_meta['source']})")
+        if issues_meta.get("cache_error"):
+            _log(f"  issues cache 写入失败（不影响渲染）：{issues_meta['cache_error']}")
     except fetchers.FetchError as exc:
         _log(f"  issues fetch FAILED: {exc}")
         issues = []
+        issues_meta = {"source": "unavailable", "fetched_at": None}
+    # 拉取失败回退旧缓存时，页面必须标注数据陈旧（拉不到 ≠ 没有）
+    issues_stale_at = (
+        (issues_meta.get("fetched_at") or "")
+        if issues_meta.get("source") == "stale"
+        else ""
+    )
 
     try:
         prs = fetchers.fetch_prs(DEFAULT_REPO)
@@ -121,12 +139,6 @@ def cmd_render(args: argparse.Namespace) -> int:
     except fetchers.FetchError as exc:
         _log(f"  inbox fetch FAILED: {exc}")
         inbox_stats = {"lines": 0, "deliveries": 0, "last_action_at": None, "last_pr_number": None}
-
-    reducer_state = fetchers.fetch_reducer_state(Path(args.reducer_db))
-    _log(
-        "  reducer state: "
-        + ("available" if reducer_state.get("available") else "unavailable")
-    )
 
     summary = fetchers.compute_summary(issues=issues, prs=prs, worktrees=worktrees)
     _log(f"  summary: {summary}")
@@ -227,7 +239,7 @@ def cmd_render(args: argparse.Namespace) -> int:
         prs=prs,
         worktrees=worktrees,
         inbox_stats=inbox_stats,
-        reducer_state=reducer_state,
+        issues_stale_at=issues_stale_at,
         diff=diff,
         deploy_events=deploy_events,
         verifications=verifications,
@@ -345,9 +357,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_render.add_argument("--html-latest", default=str(DEFAULT_HTML_LATEST), help="最新 HTML 路径")
     p_render.add_argument("--inbox", default=str(DEFAULT_INBOX), help="inbox.jsonl 路径")
     p_render.add_argument(
-        "--reducer-db",
-        default=str(DEFAULT_REDUCER_DB),
-        help="Prod Agent event reducer SQLite 路径（只读）",
+        "--issues-cache",
+        default=str(DEFAULT_ISSUES_CACHE),
+        help="Issue 列表每日缓存路径",
     )
     p_render.add_argument("--repo-dir", default=str(DEFAULT_REPO_DIR), help="git worktree 仓库根")
     p_render.add_argument(
