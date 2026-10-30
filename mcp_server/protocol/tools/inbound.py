@@ -18,7 +18,7 @@ def _get_ctx():
 
 def restock_create_impl(args: dict) -> dict:
     item_id: int = args["item_id"]
-    quantity: int = args["quantity"]
+    quantity: float = args["quantity"]
     warehouse_code: str = args["warehouse_code"]
     reason: str | None = args.get("reason")
     ctx = _get_ctx()
@@ -26,7 +26,10 @@ def restock_create_impl(args: dict) -> dict:
         raise ForbiddenError("forbidden_path")
     if not check_warehouse(ctx, warehouse_code):
         raise ForbiddenError("forbidden_warehouse")
-    return svc_create_restock(item_id, quantity, warehouse_code, ctx, reason)
+    return svc_create_restock(
+        item_id, quantity, warehouse_code, ctx, reason,
+        **{name: args[name] for name in ("doc_no", "line_no", "factor") if name in args},
+    )
 
 
 def restock_list_impl(args: dict) -> dict:

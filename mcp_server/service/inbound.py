@@ -5,43 +5,33 @@ from mcp_server.data.master import resolve_warehouse
 from mcp_server.data.unit_of_work import warehouse_connection
 from mcp_server.data.warehouse import count_restock_movements as _count_restock_movements
 from mcp_server.data.warehouse import create_restock as _create_restock
-from mcp_server.data.warehouse import item_exists
 from mcp_server.data.warehouse import list_restock_movements as _list_restock_movements
 from mcp_server.infra.errors import (
     ForbiddenError,
     NotFoundError,
     ValidationError,
 )
+from mcp_server.service import document_writes as documents
 from mcp_server.service.auth import AuthContext, check_warehouse
 from mcp_server.service.pagination import parse_limit, parse_offset
 
 
 def create_restock(
     item_id: int,
-    quantity: int,
+    quantity: float,
     warehouse_code: str,
     ctx: AuthContext,
     reason: str | None = None,
+    *,
+    doc_no=documents.OMITTED,
+    line_no=documents.OMITTED,
+    factor=1,
 ) -> dict:
-    if not warehouse_code:
-        raise ValidationError("warehouse_code_required")
-    if not check_warehouse(ctx, warehouse_code):
-        raise ForbiddenError("forbidden_warehouse")
-    if quantity <= 0:
-        raise ValidationError("quantity must be positive")
-    wh = resolve_warehouse(warehouse_code)
-    if wh is None:
-        raise NotFoundError("warehouse_not_found")
-    with warehouse_connection(wh["db_path"]) as conn:
-        if not item_exists(conn, item_id):
-            raise NotFoundError("item_not_found")
-        row_id = _create_restock(conn, item_id, quantity, reason)
-        return {
-            "id": row_id,
-            "item_id": item_id,
-            "quantity": quantity,
-            "warehouse_code": warehouse_code,
-        }
+    documents.authorize(warehouse_code, ctx)
+    payload = documents.validate(item_id, quantity, reason, doc_no, line_no, factor)
+    wh = documents.resolve(warehouse_code, ctx, resolve_warehouse)
+    return documents.create("restock", payload, warehouse_code, wh, reason,
+                            warehouse_connection, _create_restock)
 
 
 def list_restock(

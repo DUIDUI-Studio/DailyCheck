@@ -1317,19 +1317,30 @@ erDiagram
 ```mermaid
 flowchart LR
     Start["get_warehouse_db()<br/>每个请求调"] --> ReadVersion{"PRAGMA<br/>user_version<br/>>= WAREHOUSE_SCHEMA_VERSION?"}
-    ReadVersion -->|Yes| Skip["跳过（单次 PRAGMA 读）"]
+    ReadVersion -->|Yes| Skip["跳过（只读目标/版本检查）"]
     ReadVersion -->|No| Migrate["migrate_warehouse_db_columns()<br/>PRAGMA table_info 守卫<br/>+ idempotent ALTER<br/>+ 创建索引"]
-    Migrate --> Stamp["PRAGMA user_version = 6"]
+    Migrate --> Stamp["legacy ≤6 → registered v7<br/>BEGIN IMMEDIATE + stamp + commit"]
     Stamp --> Skip
 ```
 
-- **`WAREHOUSE_SCHEMA_VERSION = 6`**，改了 ALTER 块必须 bump。
+- **`WAREHOUSE_SCHEMA_VERSION = 7`**，改了 ALTER 块必须 bump。
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前注册表到 **v3**（`bot_agent_config`，Issue #79）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v6**（含多仓履约/路由播种/收货协议；本次不改）。
 
 ---
+
+**warehouse v7（Issue #87）**：独立 `migrations/warehouse.py:WAREHOUSE_MIGRATIONS`
+（不进入 master MIGRATIONS/v6），`db/warehouse_migrate.py` 为显式单仓 status/up/down 入口，
+必须传 `--db`；禁止用 master 的 `flask migrate --db <warehouse> up`。
+统一 wrapper 校验既有文件/warehouse表/future版，realpath相邻 flock 保护 SQLite API热备
+（integrity_check，backups/migrations）及两阶段升级：旧幂等baseline最多stamp6，再由注册项
+在 BEGIN IMMEDIATE 中添加doc_no/line_no/input_quantity/factor、部分唯一索引和永久journal，
+同事务stamp7。v7失败全回滚；旧baseline可能留部分DDL，可重试补齐。v7 down安全拒绝，
+首选保留schema/data的代码回退；备份恢复只在Prod协调停写与来源checkpoint后执行。
+MCP warehouse_connection在connect/yield前调wrapper，无需Web预热，mode=rw拒绝静默建空库；
+master_connection不迁移warehouse。软链共享真实路径锁，绿副本独立迁移；已v7不重复备份/ALTER。
 
 ## 5. 应用层模块图
 
@@ -1402,6 +1413,10 @@ flowchart TB
 
 ---
 
+Web单据撤销/删除接线（#87）：outbound rollback/delete、restock status/delete 从读取
+状态开始取同一warehouse BEGIN IMMEDIATE锁，成功commit；异常及early return显式rollback。
+新增MCP身份不进入Web表单，Web新行仍保留NULL身份/input和factor默认1。
+
 ## 6. 蓝图依赖关系
 
 ```mermaid
@@ -1458,6 +1473,9 @@ flowchart LR
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
 
 ---
+
+MCP与Web单据写路径通过同一SQLite写锁协调（#87），不新增蓝图依赖。
+request物理删除只撤销库存/流水，不删除永久journal，避免后续MCP重放复活。
 
 ## 7. 请求生命周期
 
@@ -1855,6 +1873,22 @@ flowchart LR
 > 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC, id DESC`）。
 > 此前读 `stock_movements` 且过滤 `action='restock'`，而入库流程写入的是 `action='补货入库'`，
 > 因此该工具恒返回空数组。写路径（`restock_create`）未改动；分页信封见上方 Issue #74 契约。
+
+**单据行写契约（Issue #87）**：restock_create/outbound_create 保持原required三字段，quantity均number；
+reason后新增keyword-only doc_no/line_no/factor（默认1）。doc/line成对、不接受显式null，保留大小写/
+前导零；doc_no为opaque字符串，`<source>:<external_doc_no>`是调用方约定，不强制前缀。
+Decimal局部context计算来源quantity×factor，仅一次2dp HALF_EVEN，拒绝非正/非有限/REAL丢分位。
+requested_quantity仍存基础有效量；新MCP保存规范化input_quantity/factor，历史/Web保持NULL/'1'。
+两request表部分唯一索引（非NULL doc+line）及document_write_keys主键(direction,doc_no,line_no)
+共同保护，同事务写request/journal/items/movement；journal跨物理删除永久保留、不回填reason。
+service BEGIN IMMEDIATE + busy_timeout=5000后读键/库存，出库条件UPDATE quantity>=量并核验rowcount；
+data不commit；UNIQUE异常rollback后新事务重查，其他完整性异常不吞。相同载荷replay返回原id，
+replayed=true/applied=false；变更item/原始量/factor即409，reason不覆盖。回滚重放不复活，删除后409。
+create额外返回doc_no/line_no/input_quantity/factor/status/rolled_back/replayed/applied；
+list只增加doc_no/line_no/input_quantity（字符串或null）/factor（number），#72/#74信封/total/排序不变。
+MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁内判状态。
+warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
+retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
 
 ### 9.3 双传输模式
 
@@ -2275,9 +2309,16 @@ flowchart LR
 
 ## 12. 测试架构
 
+Issue #87 根目录 `test_mcp_document_writes.py` / `test_warehouse_document_migrations.py`
+覆盖旧位置调用、小数、HALF_EVEN与REAL精度边界、重放/冲突/删除后不复活、4写故障注入、
+提交后缓存故障、SQLite条件UPDATE、multiprocessing.Barrier+独立连接的create和Web/MCP撤销竞争；
+新库/旧v0/4/5/6/部分列/无Web预热首读首写、软链竞态、目标隔离、热备/恢复和down拒绝。
+8项临时变异分别杀死journal唯一性、锁前库存读取、data提前commit、重复factor、HALF_UP、
+跳过MCP预迁移、提前stamp以及删除清journal。MCP小夹具也走真实完整仓库迁移。
+
 Issue #72 的入库读链路回归：`tests/mcp_server/test_data/test_warehouse.py` 用
 `restock_requests` 播种 N>1 条（`status` 覆盖 `'入库'` 与 `'提交'`），锁
-`list_restock_movements` 返回 N 条、七字段齐全（`id` / `item_id` / `item_name` /
+`list_restock_movements` 返回 N 条、原七字段齐全（#87额外增加四个身份/换算字段）（`id` / `item_id` / `item_name` /
 `quantity` / `status` / `reason` / `created_at`）、`created_at DESC`；另有一条
 「`restock_requests` 为空但 `stock_movements` 存在 `action='restock'` 流水行时返回空」
 锁定数据源已切换。`tests/mcp_server/test_service/test_inbound.py` 与
@@ -2406,7 +2447,7 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 ### 13.1 Schema 迁移
 
 - ✅ 任何新列**只**加到 `migrate_warehouse_db_columns()`，**不**进 `WAREHOUSE_SCHEMA`（tests 断言）
-- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 5）
+- ✅ 改 ALTER 块必须 bump `WAREHOUSE_SCHEMA_VERSION`（当前 = 7）
 - ✅ master.db 任何 schema 变更同步进 `init_master_db()`，否则 prod 首请求 `no such column`
 - ✅ `init_master_db()` 用 `fcntl.flock` 保护 gunicorn 多 worker
 
@@ -2430,6 +2471,9 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 
 - 所有数量用 `Decimal` + 2dp 量化（`_helpers.parse_qty` / `fmt_qty`）
 - float 会被 `0.1+0.2=0.30000000000000004` 污染
+- MCP单据行只按来源量×factor一次HALF_EVEN，rollback读取stored requested_quantity；
+  不复用Web辅单位除法。键跨rollback/delete永久保留；Prod切换需持久H/N互斥清单，
+  未知结果隔离不推进游标，历史reason不自动认领，代码回退期间停止新sync。
 
 ### 13.5 主数据铁律
 

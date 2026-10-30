@@ -151,31 +151,39 @@ def update_status(req_id: int):
         flash("状态非法")
         return redirect(url_for("restock.restock_list"))
     db = get_warehouse_db()
-    req = db.execute(
-        "SELECT item_id, requested_quantity, status FROM restock_requests WHERE id = ?",
-        (req_id,),
-    ).fetchone()
-    if req is None:
-        flash("补货记录不存在")
-        return redirect(url_for("restock.restock_list"))
-    old_status = req["status"]
-    if old_status != "入库" and status == "入库":
-        db.execute(
-            "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-            (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
-        )
-        db.execute(
-            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
-               VALUES (?, '补货入库', ?, ?, ?)""",
-            (
-                int(req["item_id"]),
-                parse_qty(req["requested_quantity"]),
-                f"补货记录#{req_id}入库",
-                now(),
-            ),
-        )
-    db.execute("UPDATE restock_requests SET status = ? WHERE id = ?", (status, req_id))
-    db.commit()
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        req = db.execute(
+            "SELECT item_id, requested_quantity, status FROM restock_requests WHERE id = ?",
+            (req_id,),
+        ).fetchone()
+        if req is None:
+            flash("补货记录不存在")
+            return redirect(url_for("restock.restock_list"))
+        old_status = req["status"]
+        if old_status != "入库" and status == "入库":
+            db.execute(
+                "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+                (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
+            )
+            db.execute(
+                """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+                   VALUES (?, '补货入库', ?, ?, ?)""",
+                (
+                    int(req["item_id"]),
+                    parse_qty(req["requested_quantity"]),
+                    f"补货记录#{req_id}入库",
+                    now(),
+                ),
+            )
+        db.execute("UPDATE restock_requests SET status = ? WHERE id = ?", (status, req_id))
+        db.commit()
+    finally:
+        # Also releases the write lock on validation/early return and exceptions.
+        if db.in_transaction:
+            db.rollback()
+
     audit("restock.status", "request", req_id, {"from": old_status, "to": status})
     flash("补货记录状态已更新")
     return redirect(url_for("restock.restock_list"))
@@ -185,44 +193,52 @@ def update_status(req_id: int):
 @require_permission("stock.restock")
 def delete(req_id: int):
     db = get_warehouse_db()
-    req = db.execute(
-        "SELECT item_id, requested_quantity, status FROM restock_requests WHERE id = ?",
-        (req_id,),
-    ).fetchone()
-    if req is None:
-        flash("补货记录不存在")
-        return redirect(url_for("restock.restock_list"))
-    if req["status"] == "入库":
-        item = db.execute(
-            "SELECT quantity FROM items WHERE id = ?",
-            (int(req["item_id"]),),
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        req = db.execute(
+            "SELECT item_id, requested_quantity, status FROM restock_requests WHERE id = ?",
+            (req_id,),
         ).fetchone()
-        if item is None:
-            flash("库存品不存在，无法删除该记录")
+        if req is None:
+            flash("补货记录不存在")
             return redirect(url_for("restock.restock_list"))
-        # Always allow rollback. If current quantity is less than the
-        # original restock amount, the resulting stock will go negative
-        # — flag it in the audit detail so the operator notices, but
-        # do not block. (Intentional: if a manager deletes a
-        # mis-recorded restock, refusing the rollback would force them
-        # to first reverse every downstream outbound / adjustment,
-        # which is far more work than accepting the negative balance.)
-        db.execute(
-            "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
-            (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
-        )
-        db.execute(
-            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
-               VALUES (?, '补货删除回滚', ?, ?, ?)""",
-            (
-                int(req["item_id"]),
-                -parse_qty(req["requested_quantity"]),
-                f"删除补货记录#{req_id}回滚",
-                now(),
-            ),
-        )
-    db.execute("DELETE FROM restock_requests WHERE id = ?", (req_id,))
-    db.commit()
+        if req["status"] == "入库":
+            item = db.execute(
+                "SELECT quantity FROM items WHERE id = ?",
+                (int(req["item_id"]),),
+            ).fetchone()
+            if item is None:
+                flash("库存品不存在，无法删除该记录")
+                return redirect(url_for("restock.restock_list"))
+            # Always allow rollback. If current quantity is less than the
+            # original restock amount, the resulting stock will go negative
+            # — flag it in the audit detail so the operator notices, but
+            # do not block. (Intentional: if a manager deletes a
+            # mis-recorded restock, refusing the rollback would force them
+            # to first reverse every downstream outbound / adjustment,
+            # which is far more work than accepting the negative balance.)
+            db.execute(
+                "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
+                (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
+            )
+            db.execute(
+                """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+                   VALUES (?, '补货删除回滚', ?, ?, ?)""",
+                (
+                    int(req["item_id"]),
+                    -parse_qty(req["requested_quantity"]),
+                    f"删除补货记录#{req_id}回滚",
+                    now(),
+                ),
+            )
+        db.execute("DELETE FROM restock_requests WHERE id = ?", (req_id,))
+        db.commit()
+    finally:
+        # Also releases the write lock on validation/early return and exceptions.
+        if db.in_transaction:
+            db.rollback()
+
     audit(
         "restock.delete",
         "request",
@@ -231,7 +247,8 @@ def delete(req_id: int):
             "item_id": int(req["item_id"]),
             "qty": parse_qty(req["requested_quantity"]),
             "status_at_delete": req["status"],
-            "quantity_after": parse_qty(item["quantity"]) - parse_qty(req["requested_quantity"]),
+            "quantity_after": (parse_qty(item["quantity"]) - parse_qty(req["requested_quantity"])
+                               if req["status"] == "入库" else None),
         },
     )
     flash("补货记录已删除")

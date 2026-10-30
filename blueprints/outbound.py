@@ -221,28 +221,36 @@ def outbound_submit():
 @require_permission("stock.outbound.rollback")
 def rollback(req_id: int):
     db = get_warehouse_db()
-    req = db.execute(
-        """SELECT item_id, requested_quantity, rolled_back
-           FROM outbound_requests WHERE id = ? AND status = '出库'""",
-        (req_id,),
-    ).fetchone()
-    if req is None:
-        flash("出库记录不存在")
-        return redirect(url_for("outbound.outbound_list"))
-    if int(req["rolled_back"]) == 1:
-        flash("该记录已回退，无需重复操作")
-        return redirect(url_for("outbound.outbound_list"))
-    db.execute(
-        "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-        (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
-    )
-    db.execute(
-        """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
-           VALUES (?, '出库回退', ?, ?, ?)""",
-        (int(req["item_id"]), parse_qty(req["requested_quantity"]), f"回退出库记录#{req_id}", now()),
-    )
-    db.execute("UPDATE outbound_requests SET rolled_back = 1 WHERE id = ?", (req_id,))
-    db.commit()
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        req = db.execute(
+            """SELECT item_id, requested_quantity, rolled_back
+               FROM outbound_requests WHERE id = ? AND status = '出库'""",
+            (req_id,),
+        ).fetchone()
+        if req is None:
+            flash("出库记录不存在")
+            return redirect(url_for("outbound.outbound_list"))
+        if int(req["rolled_back"]) == 1:
+            flash("该记录已回退，无需重复操作")
+            return redirect(url_for("outbound.outbound_list"))
+        db.execute(
+            "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+            (parse_qty(req["requested_quantity"]), now(), int(req["item_id"])),
+        )
+        db.execute(
+            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+               VALUES (?, '出库回退', ?, ?, ?)""",
+            (int(req["item_id"]), parse_qty(req["requested_quantity"]), f"回退出库记录#{req_id}", now()),
+        )
+        db.execute("UPDATE outbound_requests SET rolled_back = 1 WHERE id = ?", (req_id,))
+        db.commit()
+    finally:
+        # Also releases the write lock on validation/early return and exceptions.
+        if db.in_transaction:
+            db.rollback()
+
     audit("outbound.rollback", "request", req_id)
     flash("出库记录已回退")
     return redirect(url_for("outbound.outbound_list"))
@@ -262,29 +270,37 @@ def delete(req_id: int):
     rolled-back rows are silently removed without another reversal.
     """
     db = get_warehouse_db()
-    req = db.execute(
-        """SELECT item_id, requested_quantity, rolled_back
-           FROM outbound_requests WHERE id = ?""",
-        (req_id,),
-    ).fetchone()
-    if req is None:
-        flash("出库记录不存在")
-        return redirect(url_for("outbound.outbound_list"))
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        req = db.execute(
+            """SELECT item_id, requested_quantity, rolled_back
+               FROM outbound_requests WHERE id = ?""",
+            (req_id,),
+        ).fetchone()
+        if req is None:
+            flash("出库记录不存在")
+            return redirect(url_for("outbound.outbound_list"))
 
-    if int(req["rolled_back"]) == 0:
-        qty = parse_qty(req["requested_quantity"])
-        db.execute(
-            "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-            (qty, now(), int(req["item_id"])),
-        )
-        db.execute(
-            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
-               VALUES (?, '出库回退', ?, ?, ?)""",
-            (int(req["item_id"]), qty, f"删除出库记录#{req_id}回滚", now()),
-        )
+        if int(req["rolled_back"]) == 0:
+            qty = parse_qty(req["requested_quantity"])
+            db.execute(
+                "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+                (qty, now(), int(req["item_id"])),
+            )
+            db.execute(
+                """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+                   VALUES (?, '出库回退', ?, ?, ?)""",
+                (int(req["item_id"]), qty, f"删除出库记录#{req_id}回滚", now()),
+            )
 
-    db.execute("DELETE FROM outbound_requests WHERE id = ?", (req_id,))
-    db.commit()
+        db.execute("DELETE FROM outbound_requests WHERE id = ?", (req_id,))
+        db.commit()
+    finally:
+        # Also releases the write lock on validation/early return and exceptions.
+        if db.in_transaction:
+            db.rollback()
+
     audit("outbound.delete", "request", req_id, {
         "rolled_back": int(req["rolled_back"]),
         "qty": parse_qty(req["requested_quantity"]),

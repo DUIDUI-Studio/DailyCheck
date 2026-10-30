@@ -29,7 +29,10 @@ def outbound_create_impl(args: dict) -> dict:
     ctx = _get_ctx()
     if not check_path(ctx, "POST", "/api/v1/outbound"):
         raise ForbiddenError("forbidden_path")
-    return svc_create_outbound(item_id, quantity, warehouse_code, ctx, reason)
+    return svc_create_outbound(
+        item_id, quantity, warehouse_code, ctx, reason,
+        **{name: args[name] for name in ("doc_no", "line_no", "factor") if name in args},
+    )
 
 
 def outbound_list_impl(args: dict) -> dict:

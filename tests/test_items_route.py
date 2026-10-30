@@ -40,7 +40,7 @@ def test_staff_gets_403_on_items(tmp_path, monkeypatch):
     monkeypatch.setattr(db_module, "WAREHOUSE_DB_DIR", tmp_path)
     init_master_db()
     init_warehouse_db(wh_path)
-    _seed_master_user(master_path, is_admin=False, role="staff")
+    _seed_master_user(master_path, is_admin=False, role="staff", wh_db_path=str(wh_path))
 
     from app import create_app
     app = create_app()

@@ -86,37 +86,31 @@ curl -sS https://mcp.example.com/health \
 
 ## 3. Idempotency for write tools
 
-Read tools (`items_list`, `warehouse_consumption`, `item_consumption`, …) are inherently idempotent. **Write tools are not.**
+Read tools are safe to retry. `restock_create` / `outbound_create` are idempotent
+when both `doc_no` and `line_no` are provided (warehouse v7, Issue #87); unkeyed
+calls still create a fresh record every time. Use the original source quantity
+and `factor` (default1), or base quantity and factor1, never both conversions.
 
-| Tool | Idempotent? | Risk if retried |
-|---|---|---|
-| `restock_create` | ❌ | duplicates inbound records → double-incremented stock |
-| `outbound_create` | ❌ | duplicate outbound → double-decremented stock + possible negative inventory |
-| `outbound_rollback` | partial — same `request_id` rolled back twice is a no-op the second time | OK to retry once |
+| Tool | Retry contract |
+|---|---|
+| keyed create | Same warehouse/direction/opaque doc_no/line_no and payload returns original ID, replayed=true/applied=false; zero additional stock/movements |
+| unkeyed create | Reconcile request/list after an unknown outcome; no automatic application retry |
+| outbound_rollback | Stored effective quantity returns at most once; repeat reports already_rolled_back, with no additional stock movement |
 
-For `restock_create` and `outbound_create`, the contract today offers **no idempotency-key field**. Until one is added, the only safe pattern is:
+Use caller namespace `<source>:<external_doc_no>`; the server accepts opaque
+strings without that prefix too. Preserve line leading zeros and original
+quantity/factor on retries. A changed payload conflicts even if the product is
+equal. Deleted keys remain consumed; rollback/deletion never licenses a new
+create for the same external line. Parse text JSON errors even at HTTP200 and
+isError=false. Cache failures with committed=true are already accounted for;
+keyed retry repairs invalidation while replaying, unkeyed retry_safe=false needs
+reconciliation. See [README contract](./README.md#document-line-writes-issue-87--warehouse-v7)
+and [business outcomes](./errors.md#document-write-outcomes-87).
 
-1. Track every outbound write by `(external_idempotency_key, dailycheck_request_id)` in your own DB.
-2. Before sending, check your table for the key.
-3. After the call lands, store the key + DailyCheck's response id.
-4. Retry only the network layer, not the application layer.
-
-Or, simpler: serialize all writes from this integration through a single-connection queue so retries don't fork.
-
-Self-test: send the same `outbound_create` twice with `idempotency_key=ABC`:
-
-```bash
-PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"outbound_create","arguments":{"warehouse_code":"wh_001","item_id":42,"quantity":1,"reason":"smoke-test-ABC"}}}'
-
-curl -sS -X POST "$DAILYCHECK_MCP_URL/api/mcp/" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Accept: application/json" -H "Content-Type: application/json" \
-  -d "$PAYLOAD"
-
-# Send it again — observe that two rows are created.
-```
-
-Until idempotency keys exist, **do not retry application-level writes**.
+Cutover is a Prod operation: stop old writers, durably reconcile historical set H
+and new set N, keep overlap/same-second/late-row evidence, quarantine unknown
+outcomes and stop the cursor there. Only N calls keyed create. Keep H and source
+checkpoints through code rollback or verified offline backup restoration.
 
 ---
 

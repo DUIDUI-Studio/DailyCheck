@@ -205,3 +205,24 @@ Always treat **HTTP 200 with `isError=true`** as a failure. Treat **HTTP 401 as 
 - No retry-after hints. Construct your own backoff for transport-level retries (5xx, timeouts).
 - No pagination metadata. The `limit` argument caps results; paging is manual (`limit` + client-side offset filtering).
 - No `request-id` echo. Pass your own `id` and the server does not log it back.
+
+### Document write outcomes (#87)
+
+The service's 409/503 below are **business status attributes**, not promises of
+MCP HTTP transport codes. Always parse the text JSON `error` even when HTTP=200
+and `isError=false`.
+
+| `error` | `message` / fields | Action |
+|---|---|---|
+| `validation_error` | `invalid_quantity`, `invalid_factor`, `quantity_out_of_range`, identity/type validation | Fix input; zero writes |
+| `document_conflict` (409) | `document_line_payload_mismatch` | Reconcile changed item/original quantity/factor; no overwrite |
+| `document_line_state_conflict` (409) | `document_line_state_conflict` | Reconcile request vs journal; do not reapply stock |
+| `document_line_deleted` (409) | `document_line_deleted`, `request_id`, `committed=true` | Key was consumed; never recreate with the same external identity |
+| `database_busy` (503) | `database_busy`, `retry_safe` | Bounded lock wait (5000 ms); retry the same key with backoff when keyed |
+| `cache_invalidation_failed` (503) | `cache_invalidation_failed`, `request_id`, `committed=true`, `retry_safe` | Warehouse already committed; keyed create retry replays and repairs cache, never applies stock again |
+| `validation_error` | `already_rolled_back` | No second stock return; repeat rollback can first repair a failed cache invalidation |
+
+Unkeyed create has `retry_safe=false` after cache failure; reconcile request/list
+before any retry. A lost network reply or connection/commit error does not prove
+failure to commit: keyed callers retry the **same** identity. There is no atomic
+transaction across warehouse/master and no new background cache delivery service.

@@ -5,7 +5,6 @@
 #      引用 passed 数时必须写明口径，否则跨环境对比会误判。
 # 2026-10-13：nav_integration×2 随导航模块化修复并移除（失败集 18→16）。
 # 规则：清单只许收缩不许扩张；修复一个就删一行；新增失败不允许加进来。
-tests/mcp_server/test_service/test_inbound.py::TestCreateRestock::test_create_restock_success
 tests/test_aux_unit.py::test_create_item_with_game_syncs_gram_per_unit
 tests/test_aux_unit.py::test_create_item_no_aux_unit
 tests/test_forecast_pure.py::test_compute_daily_avg_single_today
