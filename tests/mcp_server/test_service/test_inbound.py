@@ -107,14 +107,19 @@ class TestListRestock:
              "quantity": 10, "status": "入库", "reason": "restock",
              "created_at": "2024-01-01"}
         ]
+        mock_context.execute.return_value.fetchone.return_value = {"total": 1}
         mock_conn.return_value = mock_context
 
         ctx = AuthContext(1, [], [], None)
         result = list_restock("WH001", ctx)
 
-        assert len(result) == 1
-        assert result[0]["quantity"] == 10
-        assert result[0]["status"] == "入库"
+        assert result["total"] == 1
+        assert result["limit"] == 100
+        assert result["offset"] == 0
+        assert result["truncated"] is False
+        assert len(result["items"]) == 1
+        assert result["items"][0]["quantity"] == 10
+        assert result["items"][0]["status"] == "入库"
 
 
 def test_create_restock_then_list_restock_reads_it_back(warehouse_db, monkeypatch):
@@ -127,10 +132,15 @@ def test_create_restock_then_list_restock_reads_it_back(warehouse_db, monkeypatc
     ctx = AuthContext(1, [], [], None)
 
     created = create_restock(1, 5, "WH001", ctx, reason="demo")
-    rows = list_restock("WH001", ctx)
+    result = list_restock("WH001", ctx)
+    rows = result["items"]
 
     assert created["item_id"] == 1
     assert created["quantity"] == 5
+    assert result["total"] == 1
+    assert result["limit"] == 100
+    assert result["offset"] == 0
+    assert result["truncated"] is False
     assert len(rows) == 1
     assert rows[0]["item_id"] == 1
     assert rows[0]["item_name"] == "Item A"

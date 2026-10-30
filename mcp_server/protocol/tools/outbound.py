@@ -1,13 +1,11 @@
 """Outbound MCP Tools."""
 from __future__ import annotations
 
-from mcp_server.service.auth import check_path, check_warehouse, resolve_ctx
-from mcp_server.service.outbound import (
-    create_outbound as svc_create_outbound,
-    list_outbound as svc_list_outbound,
-    rollback_outbound as svc_rollback_outbound,
-)
 from mcp_server.infra.errors import ForbiddenError
+from mcp_server.service.auth import check_path, resolve_ctx
+from mcp_server.service.outbound import create_outbound as svc_create_outbound
+from mcp_server.service.outbound import list_outbound as svc_list_outbound
+from mcp_server.service.outbound import rollback_outbound as svc_rollback_outbound
 
 
 def _get_ctx():
@@ -34,12 +32,17 @@ def outbound_create_impl(args: dict) -> dict:
     return svc_create_outbound(item_id, quantity, warehouse_code, ctx, reason)
 
 
-def outbound_list_impl(args: dict) -> list[dict]:
+def outbound_list_impl(args: dict) -> dict:
     warehouse_code: str = args["warehouse_code"]
     ctx = _get_ctx()
     if not check_path(ctx, "GET", "/api/v1/outbound"):
         raise ForbiddenError("forbidden_path")
-    return svc_list_outbound(warehouse_code, ctx)
+    return svc_list_outbound(
+        warehouse_code,
+        ctx,
+        limit=args.get("limit", 100),
+        offset=args.get("offset", 0),
+    )
 
 
 def outbound_rollback_impl(args: dict) -> dict:

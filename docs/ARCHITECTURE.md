@@ -1821,10 +1821,40 @@ flowchart LR
 
 > **统一可见性谓词（多仓履约 Task 10，spec §10）**：列表、计数与详情共用 `mcp_server/service/store_order.py::_visibility_sql()` 一段纯 SQL `EXISTS` 谓词（`EXISTS (… store_order_items soi WHERE soi.order_id = so.id AND COALESCE(soi.source_warehouse_code, so.dc_warehouse_code) IN (…))`，外加门店仓命中与无明细行存量单的头仓兜底）。`EXISTS` 保证多行同仓不把订单计数翻倍。`sop.list_orders` 仍是单仓 AND 过滤器，服务层按「门店侧 + 参与仓」两个入口各查一次再按订单 id 合并去重（`_scope_filters`），分页仍满足「各子集取前 `limit+offset` 行 → 合并去重 → 全局排序 → 切片」。列表 `total` 由同谓词的 COUNT 给出，因此 `list` / `total` / `truncated` / 详情成员关系一致。
 
+**列表分页（Issue #74）**：`outbound_list` / `restock_list` 返回分页信封
+`{items, total, limit, offset, truncated}`，口径与 `service/canonical.py` 一致：
+
+| 项 | 契约 |
+|---|---|
+| `limit` | 默认 100，clamp 到 `[1, 500]`（0 / 负数 → 1；>500 → 500） |
+| `offset` | 默认 0，clamp 到 `>=0`（负值 → 0） |
+| `total` | 与列表同一数据源的 `COUNT(*)`，**不随 limit/offset 变化** |
+| `truncated` | `total > offset + len(items)`（首页 True、末页 False） |
+
+数据层 `list_outbound` / `list_restock_movements` 各带 `LIMIT ? OFFSET ?` 与配套
+`count_outbound` / `count_restock_movements`；`ORDER BY created_at DESC, id DESC`
+的 `id` tie-break 是分页正确性的一部分（同秒多行时仅按 `created_at` 排序，
+逐页 OFFSET 可能重复/遗漏）。回归 `tests/test_mcp_list_pagination.py`（见 §12）。
+
+**口径一致性与入参校验（Prod 复审 B1-B3，2026-10-29）**：
+- `count_outbound` / `list_outbound` 统一 `LEFT JOIN items`。`outbound_requests.item_id` 虽有 FK
+  声明，但 SQLite 连接默认 `PRAGMA foreign_keys = 0`，库存品物理删除不会清理历史出库申请，
+  孤儿行真实存在（生产 `wh_003` 实测 17 行）；统一 LEFT JOIN 后 `total` 恒等于实际可翻页行数，
+  孤儿行 `item_name` 为 null 而非被静默丢弃，客户端按 `truncated` 翻页不会多出空页。
+- `mcp_server/service/pagination.py` 严格解析 `limit` / `offset`：非整数（None / 非数字字符串 /
+  小数 / 布尔）抛 MCP 结构化 `ValidationError`，由 `protocol/server.py::call_tool` 捕获，
+  不再让裸 `ValueError` / `TypeError` 穿透成非结构化错误。
+- 外部 agent 的机器可读契约 `docs/integrations/dailycheck-mcp/tools.json` 同步 `limit` / `offset`
+  与 `{items,total,limit,offset,truncated}` 信封描述。
+- 回归 `tests/test_mcp_list_pagination.py` 补孤儿行 fixture、`truncated` 终止判定、
+  类型守卫与实际 `call_tool` 的结构化错误序列化用例；生产同形种子（1630 条关联行 +
+  17 条孤儿行）返回 1647 条、17 页、末页 47 条且 `truncated=False`。变异仅将
+  `count_outbound` 改回 INNER JOIN，5 个出库分页用例转红。
+
 > **`restock_list` 的数据源（Issue #72，2026-10-27）**：读 `restock_requests` LEFT JOIN `items`，
-> 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC`）。
+> 返回 `{id, item_id, item_name, quantity, status, reason, created_at}`（`created_at DESC, id DESC`）。
 > 此前读 `stock_movements` 且过滤 `action='restock'`，而入库流程写入的是 `action='补货入库'`，
-> 因此该工具恒返回空数组。写路径（`restock_create`）未改动。
+> 因此该工具恒返回空数组。写路径（`restock_create`）未改动；分页信封见上方 Issue #74 契约。
 
 ### 9.3 双传输模式
 
@@ -2356,6 +2386,16 @@ flowchart TB
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
 
 **门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
+
+**MCP 列表分页（Issue #74）**：`tests/test_mcp_list_pagination.py`（39 用例，真实临时
+`master.db` + warehouse DB，默认种 120 条关联 outbound + 5 条孤儿 outbound / 120 条 restock，
+另含 1630 + 17 条生产同形出库种子）——逐页拼接与
+全量一致且无重复无遗漏、`total` 恒等于总行数、`truncated` 首末页翻转、limit/offset
+clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分页契约一致性，
+以及工具层端到端透传。断言用同一
+`created_at` 的 120 行钉住 `id DESC` tie-break；三处变异（`truncated` 恒 False /
+去掉 limit clamp / 数据层忽略 offset）均实测打红对应用例。该文件同样落在 `tests/`
+根目录，CI 会跑。
 
 **Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。CI 的 `--ignore=tests/mcp_server` 不影响这些文件。
 

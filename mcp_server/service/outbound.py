@@ -2,19 +2,19 @@
 from __future__ import annotations
 
 from mcp_server.data.master import resolve_warehouse
-from mcp_server.data.warehouse import (
-    create_outbound as _create_outbound,
-    item_exists,
-    list_outbound as _list_outbound,
-    rollback_outbound as _rollback_outbound,
-)
 from mcp_server.data.unit_of_work import master_connection, warehouse_connection
-from mcp_server.service.auth import AuthContext, check_warehouse
+from mcp_server.data.warehouse import count_outbound as _count_outbound
+from mcp_server.data.warehouse import create_outbound as _create_outbound
+from mcp_server.data.warehouse import item_exists
+from mcp_server.data.warehouse import list_outbound as _list_outbound
+from mcp_server.data.warehouse import rollback_outbound as _rollback_outbound
 from mcp_server.infra.errors import (
     ForbiddenError,
     NotFoundError,
     ValidationError,
 )
+from mcp_server.service.auth import AuthContext, check_warehouse
+from mcp_server.service.pagination import parse_limit, parse_offset
 
 
 def _mark_invalid(item_id: int) -> None:
@@ -72,7 +72,12 @@ def create_outbound(
         }
 
 
-def list_outbound(warehouse_code: str, ctx: AuthContext) -> list[dict]:
+def list_outbound(
+    warehouse_code: str,
+    ctx: AuthContext,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
     if not warehouse_code:
         raise ValidationError("warehouse_code required")
     if not check_warehouse(ctx, warehouse_code):
@@ -80,8 +85,18 @@ def list_outbound(warehouse_code: str, ctx: AuthContext) -> list[dict]:
     wh = resolve_warehouse(warehouse_code)
     if wh is None:
         raise NotFoundError("warehouse_not_found")
+    limit = parse_limit(limit)
+    offset = parse_offset(offset)
     with warehouse_connection(wh["db_path"]) as conn:
-        return _list_outbound(conn)
+        items = _list_outbound(conn, limit=limit, offset=offset)
+        total = _count_outbound(conn)
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "truncated": total > offset + len(items),
+    }
 
 
 def rollback_outbound(
@@ -103,9 +118,9 @@ def rollback_outbound(
         except ValueError as e:
             msg = str(e)
             if "not_found" in msg:
-                raise NotFoundError("outbound_request_not_found")
+                raise NotFoundError("outbound_request_not_found") from None
             if "already_rolled_back" in msg:
-                raise ValidationError("already_rolled_back")
+                raise ValidationError("already_rolled_back") from None
             raise
         _mark_invalid(req["item_id"])
         return {"id": request_id, "item_id": req["item_id"], "quantity": float(req["requested_quantity"])}

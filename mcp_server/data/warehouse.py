@@ -109,7 +109,15 @@ def create_restock(
     return {"id": req_id, "movement_id": cur2.lastrowid}
 
 
-def list_restock_movements(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+def count_restock_movements(conn: sqlite3.Connection) -> int:
+    """入库单总数（与 list_restock_movements 同一数据源）。"""
+    row = conn.execute("SELECT COUNT(*) AS total FROM restock_requests").fetchone()
+    return int(row["total"])
+
+
+def list_restock_movements(
+    conn: sqlite3.Connection, limit: int = 100, offset: int = 0
+) -> list[dict]:
     """List inbound restock requests (入库单), newest first.
 
     Data source: `restock_requests` LEFT JOINed with `items`. Each row:
@@ -118,6 +126,9 @@ def list_restock_movements(conn: sqlite3.Connection, limit: int = 100) -> list[d
     History: this used to read `stock_movements` rows filtered on
     `action='restock'`, but the inbound flow writes `action='补货入库'` there
     — so the MCP list came back empty for every warehouse (Issue #72).
+
+    Pagination: `ORDER BY created_at DESC, id DESC` is part of the contract —
+    without the id tie-break, offset paging can repeat or skip same-second rows.
     """
     rows = conn.execute(
         """SELECT r.id, r.item_id, i.name AS item_name,
@@ -125,8 +136,9 @@ def list_restock_movements(conn: sqlite3.Connection, limit: int = 100) -> list[d
                   r.created_at
            FROM restock_requests r
            LEFT JOIN items i ON i.id = r.item_id
-           ORDER BY r.created_at DESC LIMIT ?""",
-        (limit,),
+           ORDER BY r.created_at DESC, r.id DESC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -167,15 +179,34 @@ def create_outbound(
     return req_id
 
 
-def list_outbound(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+def count_outbound(conn: sqlite3.Connection) -> int:
+    """出库申请总数（与 list_outbound 完全同口径）。
+
+    `outbound_requests.item_id` 有 FK 声明，但 SQLite 连接默认
+    `PRAGMA foreign_keys = 0`，且库存品物理删除不会清理历史出库申请 ——
+    孤儿行真实存在（Prod 在 wh_003 实测 17 行）。因此计数与列表都用
+    LEFT JOIN items：孤儿行计入 total 且仍可翻到（item_name 为 null），
+    `total` 恒等于实际可翻页行数，客户端按 truncated 翻页不会多出空页。
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) AS total FROM outbound_requests o "
+        "LEFT JOIN items i ON i.id = o.item_id"
+    ).fetchone()
+    return int(row["total"])
+
+
+def list_outbound(
+    conn: sqlite3.Connection, limit: int = 100, offset: int = 0
+) -> list[dict]:
     rows = conn.execute(
         """SELECT o.id, o.item_id, i.name AS item_name,
                   o.requested_quantity AS quantity, o.reason,
                   o.status, o.rolled_back, o.created_at
            FROM outbound_requests o
-           JOIN items i ON i.id = o.item_id
-           ORDER BY o.created_at DESC LIMIT ?""",
-        (limit,),
+           LEFT JOIN items i ON i.id = o.item_id
+           ORDER BY o.created_at DESC, o.id DESC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
     ).fetchall()
     return [dict(r) for r in rows]
 

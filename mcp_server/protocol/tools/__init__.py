@@ -99,14 +99,31 @@ def get_tools() -> list[Tool]:
         Tool(
             name="restock_list",
             title="List Restocks",
-            description="List inbound restock requests for a warehouse. Returns: array of {id, item_id, item_name, quantity, status, reason, created_at}.",
+            description=(
+                "List inbound restock requests for a warehouse with pagination. "
+                "Returns: {items: [{id, item_id, item_name, quantity, status, reason, "
+                "created_at}], total, limit, offset, truncated}."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "warehouse_code": {
                         "type": "string",
                         "description": "Warehouse code (e.g. WH001)",
-                    }
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "default": 100,
+                        "description": "Page size (1-500, default 100).",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Page offset (default 0; negative values are treated as 0).",
+                    },
                 },
                 "required": ["warehouse_code"],
             },
@@ -197,14 +214,31 @@ def get_tools() -> list[Tool]:
         Tool(
             name="outbound_list",
             title="List Outbounds",
-            description="List outbound requests for a warehouse. Returns: array of {id, item_id, item_name, quantity, reason, status, rolled_back, created_at}.",
+            description=(
+                "List outbound requests for a warehouse with pagination. "
+                "Returns: {items: [{id, item_id, item_name, quantity, reason, status, "
+                "rolled_back, created_at}], total, limit, offset, truncated}."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "warehouse_code": {
                         "type": "string",
                         "description": "Warehouse code (e.g. WH001)",
-                    }
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "default": 100,
+                        "description": "Page size (1-500, default 100).",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Page offset (default 0; negative values are treated as 0).",
+                    },
                 },
                 "required": ["warehouse_code"],
             },
