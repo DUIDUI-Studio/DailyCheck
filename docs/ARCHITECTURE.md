@@ -2126,6 +2126,14 @@ HTTP 层 `BEGIN IMMEDIATE` 后 `apply_batch()` 重读整批基线并校验所有
 路由 GET 与 batch JSON 标记 no-store；沿用全局 CSRF / 平台管理员 / 租户 1，不放宽认证。
 
 
+**canonical 解绑 SQL 可移植性（Issue #108）**：`canonical_pure.unclaim_item` 的主库取消
+认领改为 `UPDATE ... WHERE id=(SELECT id ... ORDER BY id DESC LIMIT 1)`，保留原
+warehouse/local_item/status=approved 过滤与最新ID语义，避免依赖SQLite可选的
+`ENABLE_UPDATE_DELETE_LIMIT`。标准CPython3.12/3.13的SQLite3.50.4未启用该选项时，
+旧SQL会在仓库解绑已提交后抛语法错；本修复不改跨库提交顺序、不承诺额外跨库原子性，
+只消除确定性语法失败。备份、原回执及库存/价格/业务字段保持不变；无匹配approved记录
+仍正常解绑且不改主库其他记录。MCP handler权限与Bot七canonical写禁用保持原样。
+
 ### 10.3 Store Ordering 状态机
 
 **订单详情来源库存（Issue #109，2026-10-31）**：订单板自身没有库存列；
@@ -2482,6 +2490,12 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时master/warehouse
+数据库经实际MCP dispatch和TextContent序列化验证解绑回执、仅取消最新匹配approved记录、
+旧approved/新pending与rejected/其他仓及品项隔离、无匹配或空历史、默认note及重复解绑拒绝；
+逐字段核对库存/价格/非绑定字段不变，备份落临时目录。旧SQL在标准3.12/3.13先跑红；
+变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
 
 Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 master/两 DC/门店库，
 先提交跨仓单再改路由，以跨库同 local item ID 的不同 canonical/库存/价格/品类复现串读；
