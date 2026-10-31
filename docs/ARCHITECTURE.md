@@ -1983,9 +1983,11 @@ retry_safe（有键true）；带键重试修缓存不补库存，无键不得自
 
 `scripts/agent_framework/check_mcp_impact.py` 在 main 参考提交与 HEAD 的 merge-base 上读取
 Git diff（含删除/重命名两端）与完整 `registry.json` 前后快照。非测试 Python/SQL 与业务、DB、
-MCP、Bot、配置/权限路径保守触发 PR JSON 声明：新增/更新/不变/暂不开放、受影响工具、
+MCP、Bot、配置/权限路径及运行时依赖清单（含 requirements*.txt/.in、pyproject.toml、
+常见 lock/环境/解释器版本文件）保守触发 PR JSON 声明：新增/更新/不变/暂不开放、受影响工具、
 理由及测试证据。新旧工具名并集容纳新增名称；实际契约记录差异必须逐项覆盖，删除或重命名
-旧名须有 compatibility 处置声明。它只验证声明，不代替兼容协议测试或授予 Bot 能力。
+旧名须有 compatibility 处置声明。工具名只按非空/无重复/台账精确成员校验，不新增小写命名
+政策，登记有效性复用原 contracts checker。它只验证声明，不代替兼容协议测试或授予 Bot 能力。
 
 既有必需 reports job 先运行 `python -m scripts.mcp_contracts --check`，证明提交台账与全部
 实时声明/实现/维护文档一致，再运行影响门禁；两步退出码均保留。检查器不 import 历史代码，
@@ -2484,7 +2486,8 @@ Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时mast
 变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
 
 Issue #105 的 `tests/test_mcp_impact_gate.py` 用独立临时 Git 仓库验证 main 前进时的
-merge-base、新增工具、schema 变化、删除/重命名、非法/缺失声明及失败关闭；另验证模板占位
+merge-base、新增工具（含 SDK 合法的大小写/前导下划线名称）、schema 变化、删除/重命名、
+仅 requirements/pyproject 依赖变化、非法/缺失声明及失败关闭；另验证模板占位
 必须消解、现有 reports job 的两项检查确实保留失败退出码。示例和结构化格式与 workflow 同步。
 
 Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、

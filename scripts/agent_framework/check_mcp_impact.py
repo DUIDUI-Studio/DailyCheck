@@ -18,6 +18,11 @@ START = "<!-- mcp-impact:v1 -->"
 END = "<!-- /mcp-impact -->"
 LEDGER = "docs/integrations/dailycheck-mcp/registry.json"
 CATEGORIES = {"新增", "更新", "不变", "暂不开放"}
+DEPENDENCY_MANIFESTS = {
+    "pyproject.toml", "setup.cfg", "pipfile", "pipfile.lock", "poetry.lock",
+    "uv.lock", "pdm.lock", "pylock.toml", "pip.conf", ".python-version",
+    "environment.yml", "environment.yaml", "conda-lock.yml",
+}
 PLACEHOLDERS = {"待填", "待填写", "TODO", "TBD", "...", "…", "无", "N/A"}
 
 
@@ -33,6 +38,7 @@ def meaningful(value: Any) -> bool:
 def requires_assessment(paths: list[str]) -> bool:
     """Conservative: all non-test Python/SQL plus business/config/permission trees.
 
+    Runtime dependency manifests (including SDK/interpreter pins) are in scope.
     Shared calculations can live outside today's known module list. Treat future
     Python modules as in scope too, rather than silently missing that new location.
     Both sides of Git renames are supplied by changed_paths().
@@ -41,6 +47,13 @@ def requires_assessment(paths: list[str]) -> bool:
     for path in paths:
         if path.startswith("tests/"):
             continue
+        file = PurePosixPath(path)
+        if (
+            file.name.lower() in DEPENDENCY_MANIFESTS
+            or re.fullmatch(r"(?:requirements|constraints).*\.(?:txt|in)", file.name.lower())
+            or {"requirements", "constraints"} & set(file.parts[:-1])
+        ):
+            return True
         if path.startswith(prefixes) or path == LEDGER:
             return True
         if PurePosixPath(path).suffix.lower() in {".py", ".sql"}:
@@ -83,7 +96,7 @@ def declaration(body: str) -> list[dict[str, Any]] | None:
         if not isinstance(entry["category"], str) or entry["category"] not in CATEGORIES:
             raise ValueError("MCP category must be 新增/更新/不变/暂不开放")
         names = entry["tools"]
-        if not isinstance(names, list) or any(not isinstance(n, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", n) for n in names) or len(set(names)) != len(names):
+        if not isinstance(names, list) or any(not isinstance(n, str) or not n.strip() for n in names) or len(set(names)) != len(names):
             raise ValueError("MCP tools must be a unique array of tool names")
         if not meaningful(entry["reason"]):
             raise ValueError("MCP reason is empty or a placeholder")
@@ -156,7 +169,7 @@ def ledger(root: Path, ref: str, *, allow_missing: bool = False) -> dict[str, di
         raise ValueError(f"invalid MCP registry ledger at {ref}")
     records = {}
     for entry in data["tools"]:
-        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not re.fullmatch(r"[a-z][a-z0-9_]*", entry["name"]):
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"].strip():
             raise ValueError(f"invalid tool record at {ref}")
         if entry["name"] in records:
             raise ValueError(f"duplicate registry tool at {ref}: {entry['name']}")

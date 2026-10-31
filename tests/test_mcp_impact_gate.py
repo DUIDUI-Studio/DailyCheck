@@ -252,3 +252,46 @@ def test_default_base_is_origin_main_and_missing_reference_fails_closed(repo, mo
     assert gate.main([]) == 2
     git(repo, "update-ref", "refs/remotes/origin/main", "main")
     assert gate.main([]) == 0
+
+
+@pytest.mark.parametrize("path", [
+    "requirements.txt", "requirements-dev.txt", "requirements.in", "requirements-prod.in",
+    "requirements/production.txt", "deploy/requirements.txt", "constraints.txt",
+    "constraints/python312.txt", "pyproject.toml", "setup.cfg", "uv.lock", "poetry.lock",
+    "Pipfile", "Pipfile.lock", "pdm.lock", "pylock.toml", ".python-version", "environment.yml",
+])
+def test_dependency_manifests_require_assessment(path):
+    assert gate.assess("", [path], {}, {}) == ["missing MCP impact declaration"]
+
+
+@pytest.mark.parametrize("manifest", ["requirements.txt", "pyproject.toml"])
+def test_real_git_dependency_only_change_requires_declaration(repo, manifest):
+    target = repo / manifest
+    old = 'mcp>=1.0.0,<2\n' if manifest == "requirements.txt" else '[project]\ndependencies = ["mcp>=1.0.0,<2"]\n'
+    target.write_text(old, encoding="utf-8")
+    commit(repo, "base SDK manifest")
+    git(repo, "checkout", "-qb", "feature")
+    target.write_text(old.replace("1.0.0", "1.30.0"), encoding="utf-8")
+    commit(repo, "only SDK dependency change")
+    assert gate.changed_paths(repo, "main", "HEAD") == [manifest]
+    assert cli(repo, "").returncode == 1
+    result = cli(repo, body(entry(reason="升级 MCP1.x 依赖下限，工具声明和契约保持一致", evidence=["MCP1.x 协议回归通过；台账 --check 通过"])))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("name", ["FutureRead", "_private"])
+def test_real_git_registered_sdk_valid_name_preserved(repo, name):
+    from mcp.types import Tool
+
+    assert Tool(name=name, inputSchema={"type": "object"}).name == name
+    git(repo, "checkout", "-qb", "feature")
+    write_ledger(repo, [{"name": "known", "inputSchema": {}}, {"name": name}])
+    commit(repo, "registered SDK-valid tool name")
+    result = cli(repo, body(entry("新增", [name])))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert cli(repo, body(entry("新增", ["UnknownTool"]))).returncode == 1
+
+
+@pytest.mark.parametrize("names", [[""], ["   "], [12], ["known", "known"]])
+def test_names_still_require_nonempty_strings_and_no_duplicates(names):
+    assert gate.assess(body(entry(tools=names)), [], {"known": {}}, {"known": {}})

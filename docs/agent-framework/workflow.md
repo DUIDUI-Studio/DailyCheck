@@ -125,12 +125,16 @@ Web 页面无需自动开放 MCP。复杂 PR 可列多个 changes，工具名称
 
 `check_mcp_impact.py` 对 main 参考提交与 HEAD **先取 Git merge-base 再 diff**，包括删除和
 重命名两端。blueprints、db、migrations、mcp_server、bot、config、permissions 路径以及
-所有非 tests 的 Python/SQL（含未来共享计算模块）保守触发评估；纯文档/测试改动无声明可跳过，
-但若提供声明则必须有效。缺声明、非法类别、未知工具、空理由/测试证据、占位符均拒绝。
+所有非 tests 的 Python/SQL（含未来共享计算模块）及运行时依赖清单保守触发评估；纯文档/测试改动无声明可跳过，
+但若提供声明则必须有效。依赖清单包括 requirements*.txt/.in、requirements/constraints 目录、
+pyproject.toml、setup.cfg、常见 Python lock/环境与解释器版本文件；只改 SDK 依赖也不能漏评估。
+缺声明、非法类别、未知工具、空理由/测试证据、占位符均拒绝。
 本地命令：`python scripts/agent_framework/check_mcp_impact.py --base origin/main --body-file /tmp/body.md`。
 CI 用事件中的 main base SHA，不允许按 PR 自选比较基线。
 
 工具名取 merge-base 与 HEAD 的**完整统一台账并集**，因此新工具可正常声明为「新增」。
+名称只要求非空字符串、无重复、与台账精确匹配，不额外发明小写命名限制；实际登记有效性由
+原有 contracts checker 负责，已登记的 FutureRead 或 _private 等 SDK 合法名称同样可声明。
 实际台账/输入 schema/输出契约/ACL 等记录变化必须逐工具声明新增或更新，不许用「不变」或
 「暂不开放」遮盖。删除/重命名旧工具归更新，必须另填非空 compatibility，说明调用者迁移、
 旧名保留或其他明确处理；新名归新增。这里校验处置声明，实际兼容验证仍由专项测试负责。

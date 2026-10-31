@@ -2,7 +2,8 @@
 
 本规则由 workflow.md「MCP 影响评估」定义。使用 PR 模板的唯一标记块，JSON version=1、
 changes 非空；每项字段为 category、tools、reason、evidence，删除/重命名另加 compatibility。
-category 只能是新增/更新/不变/暂不开放。evidence 为非空字符串数组，填写实际测试命令与结果。
+工具名按台账原样精确匹配，不另设小写/下划线命名政策；SDK 合法并已登记的 FutureRead、
+_private 也可正常声明。category 只能是新增/更新/不变/暂不开放。evidence 为非空字符串数组，填写实际测试命令与结果。
 
 例如页面改动沿用查询，不需新工具：
 
@@ -56,3 +57,8 @@ compatibility 声明不是兼容性结论；实际协议兼容仍需专项回归
 `python scripts/agent_framework/check_mcp_impact.py --base origin/main --body-file /tmp/body.md`。
 CI 在既有 reports job 执行相同两步，base 固定为事件提供的 main SHA，内部取 merge-base；
 不能用其他基线把变化隐藏。不要求增加 branch protection，也不修改 known_failures 或 Bot 权限。
+
+只改运行时依赖也需要声明。例如只调整 requirements.txt 中 MCP1.x 下限或 pyproject.toml
+的依赖配置，缺标记块必须失败；可在「不变」说明依赖变化未改变工具契约，并提供该 SDK
+版本的协议回归和台账一致性结果。requirements*.txt/.in、requirements/constraints 目录、
+常见 Python lock 文件、环境/解释器版本文件也保守触发，不能靠只改依赖清单绕开评估。
