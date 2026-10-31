@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,7 @@ def _claude_line(
 
 def _write_claude(claude_dir: Path, worktree: str, session: str, rows: list[dict], mtime: str) -> Path:
     path = claude_dir / claude_dir_name(worktree) / f"{session}.jsonl"
+    rows = [dict(r, timestamp=mtime) if r.get("type") == "assistant" else r for r in rows]
     _write_jsonl(path, rows)
     stamp = _epoch(mtime)
     os.utime(path, (stamp, stamp))
@@ -98,6 +100,7 @@ def _total(input_tokens: int, output_tokens: int, cached: int = 0, reasoning: in
 
 def _write_codex(codex_dir: Path, name: str, rows: list[dict], mtime: str) -> Path:
     path = codex_dir / "2026" / "10" / "30" / f"rollout-{name}.jsonl"
+    rows = [dict(r, timestamp=datetime.fromtimestamp(_epoch(mtime) + i, timezone.utc).isoformat()) for i, r in enumerate(rows)]
     _write_jsonl(path, rows)
     stamp = _epoch(mtime)
     os.utime(path, (stamp, stamp))
@@ -114,6 +117,9 @@ def _price(input_: float = 1.0, output: float = 2.0, cache_read: float = 0.5, ca
 
 
 def _dispatch(ts: str, issue: int, **data) -> dict:
+    if parse_ts(ts) is not None:
+        data.setdefault("started_at", ts)
+        data.setdefault("ended_at", (datetime.fromtimestamp(_epoch(ts), timezone.utc) + timedelta(hours=2)).isoformat())
     return {"ts": ts, "type": "dispatch", "issue": issue, "data": data}
 
 
@@ -126,6 +132,7 @@ def _run_cli(tmp_path: Path, dispatch_rows: list[dict], prices: dict, *, dry_run
     out = tmp_path / "eval" / "ledger.jsonl"
     argv = [
         "collect",
+        "--no-orca",
         "--dispatch-jsonl",
         str(dispatch),
         "--out",
@@ -180,7 +187,8 @@ def test_normal_join_claude_and_codex(tmp_path, capsys):
     row = rows[0]
     assert row["issue"] == 91
     assert row["model_requested"] == "qwen3.8-max"
-    assert row["model_effective"] == "gpt-6.1-sol,qwen3.8-max"
+    assert row["model_effective"] is None
+    assert row["actual_models"] == ["gpt-6.1-sol", "qwen3.8-max"]
     assert row["agent"] == "mixed"
     assert row["tokens"] == {
         "input": 1500 + (2000 - 400),
@@ -208,7 +216,7 @@ def test_claude_duplicate_message_id_counted_once():
 # ============================================================
 # 同一 worktree 复用：按 mtime 切分
 # ============================================================
-def test_worktree_reuse_splits_by_mtime(tmp_path):
+def test_worktree_reuse_splits_by_measured_intervals(tmp_path):
     worktree = "/Users/x/orca/workspaces/DailyCheck/wt-reuse"
     _write_claude(
         tmp_path / "claude",
@@ -371,6 +379,7 @@ def test_corrupt_lines_degrade_without_dropping_row(tmp_path):
     code = main(
         [
             "collect",
+        "--no-orca",
             "--dispatch-jsonl",
             str(dispatch),
             "--out",
@@ -396,6 +405,7 @@ def test_unreadable_dispatch_file_exits_nonzero(tmp_path):
     code = main(
         [
             "collect",
+        "--no-orca",
             "--dispatch-jsonl",
             str(tmp_path / "missing.jsonl"),
             "--out",

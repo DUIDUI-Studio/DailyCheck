@@ -210,11 +210,11 @@ def test_aggregate_skips_null_tokens_and_cost(tmp_path):
     assert group["null_rows"] == 2
 
 
-def test_aggregate_counts_retries_per_issue(tmp_path):
+def test_aggregate_counts_explicit_retry_lineage(tmp_path):
     """同 issue 多行 dispatch → 重派 = 行数 - 唯一 issue 数。"""
     groups = _aggregate(tmp_path / "l.jsonl", [
         _row(worker_id="w1", issue=92),
-        _row(worker_id="w2", issue=92, ts="2026-10-30T03:00:00Z"),
+        _row(worker_id="w2", issue=92, ts="2026-10-30T03:00:00Z", retry_of="w1"),
         _row(worker_id="w3", issue=91, ts="2026-10-30T04:00:00Z"),
     ])
     group = groups[0]

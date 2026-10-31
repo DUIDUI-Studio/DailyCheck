@@ -470,3 +470,21 @@ def fetch_token_usage(state_db: Path, days: int = 7) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def parse_deploy_results(path: Path) -> list[dict]:
+    """Existing deploy_report events, supplementary evidence only (rc=0 is insufficient)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OpsParseError(f"部署结果不可用：{path}") from exc
+    out = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(item, dict) and item.get("pr") and item.get("sha"):
+            # Do not expose log paths, free-text reasons, or credentials in the dashboard.
+            out.append({k: item.get(k) for k in ("pr", "sha", "rc", "ts", "report_comment")})
+    return out
