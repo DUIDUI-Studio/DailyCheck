@@ -277,3 +277,74 @@ def test_known_failure_and_pass_cannot_hide_setup_error(run_pytest):
     session = json.loads(run["session"].read_text())
     assert session["counts"]["failed"] == session["counts"]["passed"] == session["counts"]["error"] == 1
     assert gate(run).returncode == 1
+
+
+@pytest.mark.parametrize("reuse_request", ["unset", "empty-file", "empty-evidence"])
+def test_local_reports_ignore_stale_defaults_without_explicit_reuse(run_pytest, tmp_path, reuse_request):
+    run = run_pytest("def test_old(): pass\n")
+    assert gate(run).returncode == 0
+    repo = run["repo"]
+    defaults = tmp_path / "sandbox-defaults"
+    stale = defaults / "ci-pytest/pytest-output.txt"
+    stale.parent.mkdir(parents=True)
+    shutil.copy2(run["output"], stale)
+    stale_evidence = Path(str(stale) + ".evidence.json")
+    shutil.copy2(run["evidence"], stale_evidence)
+    old_bytes = stale.read_bytes(), stale_evidence.read_bytes()
+    script = repo / "scripts/agent_framework/generate_reports.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text((ROOT / "scripts/agent_framework/generate_reports.sh").read_text().replace("/tmp/", str(defaults) + "/"))
+    plugin = repo / "scripts/ci/pytest_evidence.py"
+    plugin.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/ci/pytest_evidence.py", plugin)
+    (repo / ".gitignore").write_text("reports/\n.pytest_cache/\n**/__pycache__/\n")
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Isolated report test")
+    git("config", "user.email", "report-test@example.invalid")
+    git("add", ".")
+    git("commit", "-qm", "old tested source")
+    previous = git("rev-parse", "HEAD")
+    marker = tmp_path / "fresh-child-ran"
+    (repo / "tests/test_cases.py").write_text(
+        "from pathlib import Path\n\n\ndef test_current_first():\n"
+        f"    Path({str(marker)!r}).write_text('fresh')\n\n\n"
+        "def test_current_second():\n    assert True\n"
+    )
+    git("add", "tests/test_cases.py")
+    git("commit", "-qm", "current untested source")
+    current = git("rev-parse", "HEAD")
+    assert current != previous
+    tools = tmp_path / "quality-bin"
+    tools.mkdir()
+    for tool in ("radon", "bandit"):
+        stub = tools / tool
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+    env = {**os.environ, "PATH": f"{Path(sys.executable).parent}:{tools}:{os.environ['PATH']}",
+           "PYTHONPATH": str(repo), "PYTEST_ADDOPTS": "", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+           "TMPDIR": str(tmp_path), "BASE_SHA": previous, "HEAD_SHA": current}
+    env.pop("PYTEST_REUSE_FILE", None)
+    env.pop("PYTEST_REUSE_EVIDENCE", None)
+    if reuse_request == "empty-file":
+        env["PYTEST_REUSE_FILE"] = ""
+    elif reuse_request == "empty-evidence":
+        env["PYTEST_REUSE_EVIDENCE"] = ""
+    result = subprocess.run(["bash", str(script)], cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+    data = json.loads((repo / "reports/ci-summary.json").read_text())
+    assert data["head_sha"] == current
+    assert (stale.read_bytes(), stale_evidence.read_bytes()) == old_bytes
+    if reuse_request == "unset":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert marker.exists(), "stale default pair must not suppress the actual current pytest child"
+        assert data["pytest"] == {"passed": 2, "failed": 0, "gate_exit": 0, "native_exit": 0, "complete": True}
+        assert "running pytest" in result.stdout and "复用 test job" not in result.stdout
+    else:
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert not marker.exists(), "explicit invalid request must fail without fallback"
+        assert data["pytest"]["gate_exit"] == 1 and data["pytest"]["complete"] is False
+        assert data["pytest"]["native_exit"] is None
+    assert (repo / "reports/02-test-report.md").exists() and (repo / "reports/03-code-quality.md").exists()

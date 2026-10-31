@@ -2499,10 +2499,12 @@ tail 或摘要复用的退出码当作 pytest 成功。strict checker 可产出�
 的 portable evidence。compact helper 的 CLI 必须先验证证据，再将文本和证据放入 base64 JSON
 信封；下游 decode 再验证并还原文本/证据。保留的纯提取工具只是诊断 API，不能直接放行门禁。
 
-reports 复用必须携带真实证据，显式请求缺失或损坏时失败且不回退重跑；原生失败/无效证据仍
+reports 仅显式请求才复用真实证据；未请求时即使默认文件/证据都存在也必须 fresh pytest，
+显式空/缺失/损坏请求失败且不回退重跑；原生失败/无效证据仍
 生成02/03和ci-summary，缺失退出码记null，complete=false。有效证据/文本一同落reports，
 `check_reports.py` 重新校验hash/native/session/计数与known，而非仅相信gate_exit=0。
-同一必需 test/reports check 名称、完整MCP收集和临时数据库隔离保持不变。
+显式调用者负责路径来自本次候选/同一次流程；哈希和会话一致性绑定数据，不证明当前GitHEAD
+或操作/进程身份。同一必需 test/reports check 名称、完整MCP收集和临时数据库隔离保持不变。
 
 `tests/test_pytest_gate_completeness.py` 用真实 pytest 子进程覆盖完整成功/known-only/新失败、
 参数化含空格ID、收集/运行异常、KeyboardInterrupt、退出码1提前停止、零用例、截断/重复/

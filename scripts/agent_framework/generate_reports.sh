@@ -31,9 +31,11 @@ BANDIT_OUTPUT="/tmp/bandit-output-af.txt"
 # ============================================================
 # 报告 02：测试
 # ============================================================
-# 优先复用经过 hash/native/session 校验的摘要；显式请求缺失/损坏时拒绝，不能重跑掩盖。
-REUSE_FILE="${PYTEST_REUSE_FILE:-/tmp/ci-pytest/pytest-output.txt}"
-REUSE_EVIDENCE="${PYTEST_REUSE_EVIDENCE:-${REUSE_FILE}.evidence.json}"
+# 只有显式请求才复用 hash/native/session 摘要；默认路径存在不代表请求。
+# 调用者负责证据来自本次候选运行；哈希证明数据一致，不证明当前 HEAD 或执行身份。
+# 显式空/缺失/损坏请求拒绝，不重跑掩盖；未请求时始终 fresh pytest。
+REUSE_FILE="${PYTEST_REUSE_FILE-/tmp/ci-pytest/pytest-output.txt}"
+REUSE_EVIDENCE="${PYTEST_REUSE_EVIDENCE-${REUSE_FILE}.evidence.json}"
 PYTEST_EVIDENCE="/tmp/pytest-evidence-af.json"
 PYTEST_EXIT=null
 COMPLETE=false
@@ -45,9 +47,9 @@ GATE_RESULT="FAIL: pytest evidence unavailable"
 python3 -c 'from pathlib import Path; [Path(p).unlink(missing_ok=True) for p in __import__("sys").argv[1:]]' "${PYTEST_EVIDENCE}"
 : > "${PYTEST_OUTPUT}"
 
-if [[ -e "${REUSE_FILE}" || -e "${REUSE_EVIDENCE}" || -n "${PYTEST_REUSE_FILE+x}" || -n "${PYTEST_REUSE_EVIDENCE+x}" ]]; then
+if [[ -n "${PYTEST_REUSE_FILE+x}" || -n "${PYTEST_REUSE_EVIDENCE+x}" ]]; then
   echo "[generate_reports] 复用 test job 的 pytest 输出：${REUSE_FILE}（跳过重跑）"
-  if [[ -s "${REUSE_FILE}" ]] && cp "${REUSE_FILE}" "${PYTEST_OUTPUT}"; then
+  if [[ -n "${REUSE_FILE}" && -n "${REUSE_EVIDENCE}" && -s "${REUSE_FILE}" ]] && cp "${REUSE_FILE}" "${PYTEST_OUTPUT}"; then
     GATE_RESULT="$(python3 "${REPO_ROOT}/scripts/check_known_failures.py" "${PYTEST_OUTPUT}" \
       --evidence-file "${REUSE_EVIDENCE}" --write-evidence "${PYTEST_EVIDENCE}" 2>&1)"
     GATE_EXIT=$?

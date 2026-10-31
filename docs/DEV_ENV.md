@@ -125,6 +125,9 @@ python scripts/check_known_failures.py "${test_run_dir}/pytest.txt" \
 保留原生日志、native.exit、session.json 和 evidence.json 作为同一次运行的证据。
 
 CI compact handoff 使用带真实 native/session/hash 的 JSON 信封；报告复用必须同时提供
-`PYTEST_REUSE_FILE` 和 `PYTEST_REUSE_EVIDENCE`（strict checker生成的portable evidence）。
-显式请求复用时，缺失/空/损坏证据失败且不重跑掩盖；直接本地运行未请求复用时才允许fallback。
+`PYTEST_REUSE_FILE` 和 `PYTEST_REUSE_EVIDENCE`（strict checker生成的portable evidence），
+建议显式提供两条路径；仅给出文件时按其 `.evidence.json` sidecar 查找证据。
+未设置复用变量时一律 fresh pytest，即使默认路径有旧的有效文件/证据；显式空/缺失/损坏请求
+失败且不重跑掩盖。调用者负责证据来自本次候选/同一流程；哈希/会话只证明数据一致，
+不证明当前GitHEAD或操作/进程身份。
 失败仍产02/03/ci-summary；原生退出码未知记null。报告门禁会重新核对证据，不只看gate_exit。

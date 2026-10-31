@@ -92,8 +92,9 @@ def test_generate_reports_keeps_direct_execution_fallback():
         encoding="utf-8"
     )
 
-    assert 'REUSE_FILE="${PYTEST_REUSE_FILE:-/tmp/ci-pytest/pytest-output.txt}"' in script
-    assert 'if [[ -e "${REUSE_FILE}"' in script
+    assert 'REUSE_FILE="${PYTEST_REUSE_FILE-/tmp/ci-pytest/pytest-output.txt}"' in script
+    assert 'if [[ -n "${PYTEST_REUSE_FILE+x}"' in script
+    assert 'if [[ -e "${REUSE_FILE}"' not in script
     assert "refusing fallback" in script
     assert 'echo "[generate_reports] running pytest ..."' in script
 
