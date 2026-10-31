@@ -1887,37 +1887,26 @@ flowchart LR
 
 **Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 原缺路径检查由 bot adapter 的固定路径矩阵补齐；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
-| 工具 | 服务模块 | 路径 ACL | 仓库范围 |
-|------|----------|----------|----------|
-| `warehouse_list` | inventory | read | per-token |
-| `items_list` | inventory | read | per-token |
-| `items_detail` | inventory | read | per-token |
-| `movements_list` | inventory | read | per-token |
-| `restock_create` | inbound | write | per-token |
-| `restock_list` | inbound | read | per-token |
-| `outbound_create` | outbound | write | per-token |
-| `outbound_list` | outbound | read | per-token |
-| `outbound_rollback` | outbound | write | per-token |
-| `warehouse_consumption` | consumption | read | per-token |
-| `item_consumption` | consumption | read | per-token |
-| `item_forecast` | forecast | read | per-token |
-| `procurement_store` | procurement | read | per-token |
-| `procurement_hub` | procurement | read | per-token |
-| `canonical_list` | canonical | read | 全局（跨仓） |
-| `canonical_detail` | canonical | read | 全局（跨仓） |
-| `canonical_categories` | canonical | read | 全局（跨仓） |
-| `canonical_fanout_targets` | canonical | read | 全局（跨仓） |
-| `canonical_conflicts` | canonical | read | 全局（跨仓） |
-| `canonical_fanout_event` | canonical | read | 全局（跨仓） |
-| `canonical_create` | canonical | write | 全局（跨仓） |
-| `canonical_update` | canonical | write | 全局（跨仓） |
-| `canonical_claim` | canonical | write | per-token |
-| `canonical_unclaim` | canonical | write | per-token |
-| `canonical_fanout` | canonical | write | 显式传 warehouse_codes |
-| `canonical_resolve_conflict` | canonical | write | 全局（跨仓） |
-| `canonical_set_binding_active` | canonical | write | per-token |
-| `store_order_list` | store_order | read | per-token |
-| `store_order_detail` | store_order | read | per-token |
+**统一登记（Issue #104）**：`mcp_server/protocol/registry.py::REGISTRY` 是唯一工具登记，
+每项包含原始 `Tool` 声明、真实 callable handler、业务域、读写意图、路径/范围的**实际执行位置**、
+内部可验证输出 JSON shape、外部子集/Bot批准状态及回归引用。`tools.get_tools()` 深复制声明，
+`server._tool_map` 从登记派生；启动时拒绝重名/无效handler，检查命令另扫描全部工具模块，
+拒绝漏注册实现、漏实现和错误绑定。Bot 的显式批准白名单仍由 `bot/tool_contract.py` 独立持有，
+仅做一致性核对，不从动态发现授予权限；29运行项、16外部集成子集、22 Bot批准项、七canonical写禁用不变。
+
+完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
+及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留16项子集，不是完整注册表。
+`python -m scripts.mcp_contracts --write/--check` 确定性生成/只读校验三份产物，检查失败返回非零；
+命令无需服务或数据库，可供CI接线。输出 shape **不**传给SDK `outputSchema`，不启用
+`structuredContent`，保留原description/input与TextContent中的JSON业务形状。
+其中 `items_detail` 仍列表包装、`procurement_hub` 仍数组、`canonical_fanout_event` 缺事件仍null、
+`canonical_fanout` 实返 `per_canonical`；台账如实记录旧description差异，不借本次改包装。
+仓清单和两个消费handler历史上没有MCP路径检查，Bot adapter另做检查；全局canonical读、
+fanout目标无token仓过滤等现状均显式注明，不把元数据当成新增守卫或授权。
+
+**独立Bot部署接缝**：Bot也import `get_tools()`，新增registry模块树需要随Bot独立部署同步；
+主站蓝绿成功不证明Bot已加载新版本。Prod按标准流程核实Bot实际加载版本/依赖及代表性授权读，
+七canonical写排除和三写护栏保持原样；writer不接触生产。
 
 **门店订单只读域（Issue #73）**：`store_order_list` / `store_order_detail` 只读 `master.db` 的门店订单五张表（`store_orders` / `store_order_items` / `store_order_deliveries` / `store_order_receipts` / `store_order_status_history`），无迁移、无写语义、无删除语义。策略来源复用 `blueprints/store_ordering_pure.list_orders` / `.get_order_detail`（与 `service/canonical.py` 复用 `canonical_pure` 同一先例），`mcp_server/service/store_order.py` 只负责 ACL 翻译与返回形状整理。
 
@@ -1988,13 +1977,18 @@ retry_safe（有键true）；带键重试修缓存不补库存，无键不得自
 | 模式 | 入口 | 鉴权 | 用途 |
 |------|------|------|------|
 | **stdio** | `flask mcp` | 进程 env `DAILYCHECK_MCP_TOKEN` | 本地 Claude Code |
-| **HTTP/SSE + StreamableHTTP** | `python -m mcp_server` (HTTP 模式) | Bearer → agent_tokens 表（per-token 仓库/路径 ACL） | 远程 Agent |
+| **HTTP/SSE + StreamableHTTP** | `python -m mcp_server --transport http` | Bearer → agent_tokens 表（per-token 仓库/路径 ACL） | 远程 Agent |
 
 **HTTP 入口路径**：
 - `/sse`（legacy SSE）
 - `/messages/`（SSE POST）
 - `/api/mcp/`（StreamableHTTP，**推荐**）
-- `/health`（不需鉴权）
+- `/health`（同样需Bearer鉴权；HTTP 200/503，顶层status仍为ok，监控须看HTTP和checks）
+
+CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确传入
+`--transport http --host 0.0.0.0 --port 5100`。StreamableHTTP manager配置
+`json_response=True, stateless=True`；legacy SSE端点仍挂载。health的DB检查仅`SELECT 1`，
+不证明schema完整或工具成功；所有HTTP路由都经过AuthMiddleware。MCP代码变动须重启进程。
 
 ### 9.4 鉴权回退链
 
@@ -2468,6 +2462,15 @@ Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时mast
 逐字段核对库存/价格/非绑定字段不变，备份落临时目录。旧SQL在标准3.12/3.13先跑红；
 变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
 
+Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、
+原始29声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
+全部29项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
+call_tool派发/序列化验证最小输出shape；七canonical写只在临时库与临时备份目录实调，
+不用Bot扩权或生产库。新增登记需同步该参数矩阵；形状元数据不改变运行时返回。
+生成校验命令`python -m scripts.mcp_contracts --check`还核对AGENT/CLAUDE工具集合与测试引用；
+真实Starlette health与CLI回归锁住Bearer覆盖health、200/503及默认stdio/HTTP参数，
+使文档口径可验证。命令适用于CI，本Issue不改workflow接线。
+
 Issue #87 根目录 `test_mcp_document_writes.py` / `test_warehouse_document_migrations.py`
 覆盖旧位置调用、小数、HALF_EVEN与REAL精度边界、重放/冲突/删除后不复活、4写故障注入、
 提交后缓存故障、SQLite条件UPDATE、multiprocessing.Barrier+独立连接的create和Web/MCP撤销竞争；
@@ -2873,6 +2876,8 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/runbook-dr.md`](runbook-dr.md) — 灾难恢复手册（备份/还原/整机重建）
 
 ### 集成
+
+- [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md) / `registry.json` — MCP完整29项生成契约；`tools.json`仅16项外部集成子集，校验入口`scripts.mcp_contracts`。
 
 - `docs/integrations/dailycheck-mcp/` — MCP 接入文档 + examples
 - [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md) — Bot 工具运行契约（#78 批准口径：D1–D7、三写限定例外、PR1 / #80 / #81 阶段）

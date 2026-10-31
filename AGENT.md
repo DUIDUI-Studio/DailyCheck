@@ -33,7 +33,7 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 ```
    - Flask：http://localhost:8080（systemd `dailycheck-app.service`）
    - MCP HTTP：http://localhost:5100（Bearer `dev-mcp-token-for-testing`）
-- MCP 两种模式：`flask mcp`（stdio）/ `python3 -m mcp_server`（HTTP/SSE）
+- MCP 两种模式：`flask mcp`（stdio）/ `python3 -m mcp_server --transport http`（HTTP/SSE）
 
 ## 目录结构
 - `app.py`：Flask 应用工厂 `create_app`，注册蓝图、过滤器、CLI
@@ -82,7 +82,12 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 | `is_admin` | — | 平台管理员（全局绕过仓库角色检查） |
 
 ## MCP 服务器（29 个工具）
-通过 Model Context Protocol 提供 AI Agent 数据访问，支持 stdio（`flask mcp`）与 HTTP/SSE（`python3 -m mcp_server`，:5100）两种模式；Bearer Token（环境变量 `DAILYCHECK_MCP_TOKEN`）或 `agent_tokens` 表票据认证，支持路径级 ACL 与仓库范围权限。
+
+权威登记：`mcp_server/protocol/registry.py`；完整生成台账与实调输出契约见
+[`registry.md`](docs/integrations/dailycheck-mcp/registry.md) / `registry.json`。
+`python -m scripts.mcp_contracts --check` 校验29项与实现/生成文档，外部 `tools.json`
+明确仅16项；Bot批准池仍22项，七项canonical写禁止Bot执行。
+通过 Model Context Protocol 提供 AI Agent 数据访问，支持 stdio（`flask mcp`）与 HTTP/SSE（`python3 -m mcp_server --transport http`，:5100）两种模式；Bearer Token（环境变量 `DAILYCHECK_MCP_TOKEN`）或 `agent_tokens` 表票据认证，支持路径级 ACL 与仓库范围权限。
 工具：`warehouse_list` / `items_list` / `items_detail` / `movements_list` / `restock_create` / `restock_list` / `item_forecast` / `procurement_store` / `procurement_hub` / `outbound_create` / `outbound_list` / `outbound_rollback` / `warehouse_consumption` / `item_consumption` / `canonical_list` / `canonical_detail` / `canonical_categories` / `canonical_fanout_targets` / `canonical_conflicts` / `canonical_fanout_event` / `canonical_create` / `canonical_update` / `canonical_claim` / `canonical_unclaim` / `canonical_fanout` / `canonical_resolve_conflict` / `canonical_set_binding_active` / `store_order_list` / `store_order_detail`
 
 ## 常见维护任务
