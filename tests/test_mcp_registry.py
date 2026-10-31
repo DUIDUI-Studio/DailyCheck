@@ -99,11 +99,21 @@ def test_registry_rejects_missing_duplicate_and_orphan_implementations(monkeypat
         mcp_contracts.validate_implementation_set()
 
 
+
+def copy_maintenance_files(target_root):
+    for name in ("AGENT.md", "CLAUDE.md", "tests/test_mcp_registry.py",
+                 "docs/integrations/dailycheck-mcp/calculation-logic.md"):
+        target = target_root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((ROOT / name).read_text())
+
+
 def test_generated_artifacts_match_and_check_detects_drift(tmp_path, monkeypatch, capsys):
     for path, expected in mcp_contracts.generated_artifacts().items():
         assert (ROOT / path).read_text() == expected
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_text(expected)
+    copy_maintenance_files(tmp_path)
     monkeypatch.setattr(mcp_contracts, 'ROOT', tmp_path)
     assert mcp_contracts.main(['--check']) == 0
     for path in mcp_contracts.generated_artifacts():
@@ -199,10 +209,7 @@ def test_nullable_fanout_event_and_optional_turnover_shapes(contract_env):
 
 def test_entry_guide_inventory_and_test_references_reject_drift(tmp_path):
     mcp_contracts.validate_maintenance_references()
-    for name in ("AGENT.md", "CLAUDE.md", "tests/test_mcp_registry.py"):
-        target = tmp_path / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text((ROOT / name).read_text())
+    copy_maintenance_files(tmp_path)
     for name in ("AGENT.md", "CLAUDE.md"):
         target = tmp_path / name
         original = target.read_text()
@@ -260,3 +267,27 @@ def test_documented_health_auth_and_db_status_use_actual_app(registry_db, monkey
         assert response.json()['checks']['db'].startswith('error:')
     guide = (ROOT / 'docs/mcp-configuration.md').read_text()
     assert 'including `/health`' in guide and 'HTTP 503' in guide
+
+
+@pytest.mark.parametrize('old,new', [
+    ('实时 29 项', '合计 27 项'),
+    ('`store_order_list` / `store_order_detail`', '未说明订单范围'),
+    ('[完整工具台账](./registry.md)', '没有权威台账链接'),
+])
+def test_calculation_scope_drift_cannot_pass_check(tmp_path, monkeypatch, capsys, old, new):
+    copy_maintenance_files(tmp_path)
+    for path, expected in mcp_contracts.generated_artifacts().items():
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(expected)
+    monkeypatch.setattr(mcp_contracts, 'ROOT', tmp_path)
+    assert mcp_contracts.main(['--check']) == 0
+    guide = tmp_path / 'docs/integrations/dailycheck-mcp/calculation-logic.md'
+    original = guide.read_text()
+    assert old in original
+    changed = original.replace(old, new, 1)
+    guide.write_text(changed)
+    assert mcp_contracts.main(['--check']) == 1
+    assert 'calculation scope drift' in capsys.readouterr().out
+    assert guide.read_text() == changed
+    guide.write_text(original)
+    assert mcp_contracts.main(['--check']) == 0

@@ -2467,7 +2467,9 @@ Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch
 全部29项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
 call_tool派发/序列化验证最小输出shape；七canonical写只在临时库与临时备份目录实调，
 不用Bot扩权或生产库。新增登记需同步该参数矩阵；形状元数据不改变运行时返回。
-生成校验命令`python -m scripts.mcp_contracts --check`还核对AGENT/CLAUDE工具集合与测试引用；
+生成校验命令`python -m scripts.mcp_contracts --check`还核对AGENT/CLAUDE工具集合与测试引用，
+以及维护中的`calculation-logic.md`入口29/16口径、订单只读范围和权威台账链接；
+旧27项入口、缺订单说明或缺台账链接均由回归/变异证明不能通过校验；其历史公式段落不重写。
 真实Starlette health与CLI回归锁住Bearer覆盖health、200/503及默认stdio/HTTP参数，
 使文档口径可验证。命令适用于CI，本Issue不改workflow接线。
 

@@ -56,6 +56,22 @@ def validate_implementation_set() -> None:
 
 
 
+
+def calculation_scope_reference() -> str:
+    """Count and scope reference for the maintained calculation guide intro."""
+    canonical = sum(entry.domain == "canonical" for entry in REGISTRY)
+    orders = [entry.name for entry in REGISTRY if entry.domain == "store_order"]
+    base = len(REGISTRY) - canonical - len(orders)
+    external = sum(entry.external_subset for entry in REGISTRY)
+    order_names = " / ".join(f"`{name}`" for name in orders)
+    return (
+        f"> 当前工具范围：实时 {len(REGISTRY)} 项（基础 {base} 项 + 订单只读 {len(orders)} 项 + canonical 主数据 {canonical} 项）；"
+        f"外部 tools.json 仅为 {external} 项子集，不代表授权。\n"
+        "> 本文说明基础工具的计算口径；所有名称、输入/实际输出形状和 ACL 范围以[完整工具台账](./registry.md)为准。\n"
+        f"> 订单读取：{order_names} 只读，按参与仓可见全单（含其他仓明细与金额）；详见[订单读取契约](./README.md)。"
+    )
+
+
 def validate_maintenance_references(root: Path = ROOT) -> None:
     """Keep the remaining entry-guide inventories and test references verifiable."""
     names = {entry.name for entry in REGISTRY}
@@ -72,6 +88,11 @@ def validate_maintenance_references(root: Path = ROOT) -> None:
             listed = re.findall(r"^\| `([a-z_]+)` \|", section, re.M)
         if len(listed) != len(names) or set(listed) != names:
             raise ValueError(f"tool inventory names drift: {filename}")
+
+    calculation = root / ARTIFACT_DIR / "calculation-logic.md"
+    intro = calculation.read_text(encoding="utf-8").split("\n---", 1)[0]
+    if calculation_scope_reference() not in intro:
+        raise ValueError(f"calculation scope drift: {ARTIFACT_DIR / 'calculation-logic.md'}")
 
     function_names = {}
     for entry in REGISTRY:
@@ -174,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     try:
-        validate_maintenance_references()
+        validate_maintenance_references(ROOT)
         artifacts = generated_artifacts()
         drift = []
         for path, expected in artifacts.items():
