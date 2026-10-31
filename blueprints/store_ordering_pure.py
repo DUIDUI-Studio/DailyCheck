@@ -19,7 +19,11 @@ from typing import Any
 
 import config
 from blueprints._helpers import now, parse_qty
-from blueprints.fulfillment_pure import parse_price_and_multiple, resolve_fulfillment_item
+from blueprints.fulfillment_pure import (
+    FulfillmentError,
+    parse_price_and_multiple,
+    resolve_fulfillment_item,
+)
 from blueprints.item_routing_pure import get_routing
 from blueprints.notifications_pure import emit_event
 from blueprints.procurement_pure import (
@@ -1591,10 +1595,12 @@ def get_dc_items_for_order_detail(
     发货已禁止超库存（2026-10-10），新建订单的 ``dc_available`` 不会为负；
     历史遗留的负库存行仍会原样返回，模板以红色高亮提示。
 
-    Lookup strategy for ``dc_available`` (per F4=A: DC 库存始终可见):
-      - 优先用 ``store_order_items.dc_item_id``（出库后回填的 dc 仓 items.id）
-      - 若 ``dc_item_id`` 为 NULL（pending 阶段还没出库），按 ``canonical_id``
-        在 DC 仓 ``items`` 表查询；仍找不到则 ``dc_available=0.0``。
+    Resolve each line in its recorded source warehouse (header fallback only
+    for legacy NULL sources), never through current routing. The fulfillment
+    resolver rejects missing/disabled/alias/ambiguous/conflicting bindings;
+    a frozen ``dc_item_id`` must also match its result. Unsafe or unavailable
+    rows retain the existing zero stock/price and canonical-category fallback.
+    Source connections are read-only: rendering cannot create or migrate a DB.
     """
     master_conn.row_factory = sqlite3.Row
     order_row = master_conn.execute(
@@ -1607,45 +1613,59 @@ def get_dc_items_for_order_detail(
 
     rows = master_conn.execute(
         """SELECT soi.id AS order_item_id, soi.canonical_id,
-                  soi.dc_item_id, ci.name AS canonical_name, ci.category_code
+                  soi.dc_item_id, ci.name AS canonical_name, ci.category_code,
+                  COALESCE(soi.source_warehouse_code, ?) AS source_warehouse_code
            FROM store_order_items soi
            JOIN canonical_items ci ON ci.id = soi.canonical_id
            WHERE soi.order_id=?""",
-        (order_id,),
+        (dc_code, order_id),
     ).fetchall()
 
-    dc_conn = open_warehouse_db(dc_code)
+    dc_conns: dict[str, sqlite3.Connection | None] = {}
     try:
         out: dict[int, dict[str, Any]] = {}
         for r in rows:
+            source = r["source_warehouse_code"]
+            if source not in dc_conns:
+                path = config.WAREHOUSE_DB_DIR / f"{source}.db"
+                try:
+                    dc_conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+                except sqlite3.OperationalError:
+                    # A missing/unavailable source must not create an empty DB
+                    # or hide valid lines from other participating warehouses.
+                    dc_conn = None
+                if dc_conn is not None:
+                    dc_conn.row_factory = sqlite3.Row
+                    # Keep resolver and enrichment on the same read snapshot.
+                    dc_conn.execute("BEGIN")
+                dc_conns[source] = dc_conn
+            dc_conn = dc_conns[source]
             dc_available = 0.0
             unit_price = 0.0
             category_name = ""
             dc_row = None
-            if r["dc_item_id"] is not None:
-                dc_row = dc_conn.execute(
-                    """SELECT i.quantity, i.selling_price, i.unit_cost,
-                              c.name AS category_name
-                       FROM items i
-                       LEFT JOIN categories c ON c.id = i.category_id
-                       WHERE i.id=?""",
-                    (r["dc_item_id"],),
-                ).fetchone()
-            if dc_row is None and r["canonical_id"] is not None:
-                # Fallback: resolve DC stock via canonical_id (used pre-shipment).
-                dc_row = dc_conn.execute(
-                    """SELECT i.quantity, i.selling_price, i.unit_cost,
-                              c.name AS category_name
-                       FROM items i
-                       LEFT JOIN categories c ON c.id = i.category_id
-                       WHERE i.canonical_id=?""",
-                    (int(r["canonical_id"]),),
-                ).fetchone()
+            if dc_conn is not None:
+                try:
+                    resolved = resolve_fulfillment_item(
+                        master_conn, dc_conn,
+                        canonical_id=int(r["canonical_id"]), warehouse_code=source,
+                    )
+                except FulfillmentError:
+                    resolved = None
+                if resolved is not None and (
+                    r["dc_item_id"] is None or r["dc_item_id"] == resolved["item_id"]
+                ):
+                    dc_row = dc_conn.execute(
+                        """SELECT i.quantity, i.selling_price, i.unit_cost,
+                                  c.name AS category_name
+                           FROM items i
+                           LEFT JOIN categories c ON c.id = i.category_id
+                           WHERE i.id=? AND i.canonical_id=?""",
+                        (resolved["item_id"], int(r["canonical_id"])),
+                    ).fetchone()
             if dc_row is not None:
                 dc_available = parse_qty(dc_row["quantity"])
-                selling = float(dc_row["selling_price"] or 0)
-                cost = float(dc_row["unit_cost"] or 0)
-                unit_price = selling if selling > 0 else cost
+                unit_price, _ = parse_price_and_multiple(dc_row)
                 if dc_row["category_name"]:
                     category_name = str(dc_row["category_name"])
             if not category_name and r["category_code"]:
@@ -1663,7 +1683,9 @@ def get_dc_items_for_order_detail(
             }
         return out
     finally:
-        dc_conn.close()
+        for dc_conn in dc_conns.values():
+            if dc_conn is not None:
+                dc_conn.close()
 
 
 def _participants_by_order(

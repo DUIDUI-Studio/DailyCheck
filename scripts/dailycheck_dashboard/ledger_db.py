@@ -20,9 +20,10 @@ from pathlib import Path
 from .db import _now_iso, connect
 from .ops_parse import OpsParseError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 TOKEN_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning")
+BASE_TOKEN_KEYS = TOKEN_KEYS[:-1]
 
 # 复杂度分档（与 Issue #92 约定一致）：<4.0 / 4.0–6.4 / >=6.5 / unknown
 BAND_LOW = "low"
@@ -66,6 +67,9 @@ def init_ledger_schema(db_path: Path) -> None:
     with connect(db_path) as conn:
         with closing(conn.cursor()) as cur:
             cur.executescript(_LEDGER_DDL)
+            columns = {r[1] for r in cur.execute("PRAGMA table_info(dispatch_ledger)")}
+            if "facts_json" not in columns:
+                cur.execute("ALTER TABLE dispatch_ledger ADD COLUMN facts_json TEXT")
 
 
 # ------------------------------------------------------------ 解析
@@ -146,13 +150,20 @@ def _norm_warnings(raw) -> list[str] | None:
 
 def _normalise(obj: dict) -> dict | None:
     """账本行 → 内部行。缺 ts / worker_id 的行没有幂等身份，直接丢。"""
+    from .eval_facts import row_key
     ts = _norm_ts(obj.get("ts"))
     worker_id = _as_str(obj.get("worker_id"))
+    if obj.get("schema_version", 1) >= 2:
+        worker_id = worker_id or row_key(obj)
+        # Stable sentinel is storage identity only; the fact timestamp remains unknown.
+        ts = ts or "1970-01-01T00:00:00Z"
     if ts is None or worker_id is None:
         return None
     return {
+        **obj,
         "ts": ts,
         "worker_id": worker_id,
+        "fact_ts": _norm_ts(obj.get("ts")),
         "issue": _as_int(obj.get("issue")),
         "role": _as_str(obj.get("role")),
         "agent": _as_str(obj.get("agent")),
@@ -220,8 +231,8 @@ def upsert_dispatch_ledger(db_path: Path, rows: list[dict]) -> int:
                         (worker_id, ts, issue, role, agent, model_requested,
                          model_effective, effort, complexity_score, task_id,
                          worktree_path, pr, tokens_json, cost, warnings_json,
-                         updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         updated_at, facts_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -243,6 +254,7 @@ def upsert_dispatch_ledger(db_path: Path, rows: list[dict]) -> int:
                             json.dumps(r["warnings"], ensure_ascii=False)
                             if r.get("warnings") is not None else None,
                             now,
+                            json.dumps(r, ensure_ascii=False),
                         )
                         for r in rows
                     ],
@@ -273,6 +285,11 @@ def _load_rows(db_path: Path) -> list[dict]:
             out: list[dict] = []
             for row in cur.fetchall():
                 item = dict(row)
+                facts = _load_json(item.pop("facts_json", None))
+                if isinstance(facts, dict):
+                    item.update(facts)
+                    if "fact_ts" in facts:
+                        item["ts"] = facts["fact_ts"]
                 item["tokens"] = _load_json(item.pop("tokens_json", None))
                 item["warnings"] = _load_json(item.pop("warnings_json", None))
                 out.append(item)
@@ -299,20 +316,17 @@ def _token_total(tokens: dict | None) -> int:
     if not isinstance(tokens, dict):
         return 0
     return sum(
-        value for key in TOKEN_KEYS
+        value for key in BASE_TOKEN_KEYS
         if isinstance(value := tokens.get(key), int) and not isinstance(value, bool)
     )
 
 
 def _dedupe(rows: list[dict]) -> list[dict]:
     """与 DB 的 (worker_id, ts) 主键同口径：后出现的行覆盖先出现的。"""
-    seen: dict[tuple[str, str], dict] = {}
+    from .eval_facts import row_key
+    seen = {}
     for row in rows:
-        worker_id = row.get("worker_id")
-        ts = row.get("ts")
-        if not worker_id or not ts:
-            continue
-        seen[(worker_id, ts)] = row
+        seen[row_key(row)] = row
     return list(seen.values())
 
 
@@ -362,6 +376,9 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
         issue = row.get("issue")
         if issue is not None:
             group["_issue_counts"][issue] = group["_issue_counts"].get(issue, 0) + 1
+        group.setdefault("_retry_ids", set())
+        if row.get("retry_of"):
+            group["_retry_ids"].add(row.get("dispatch_id") or row.get("worker_id"))
 
         pr = row.get("pr")
         if pr is not None:
@@ -373,7 +390,7 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
         pr_rows = group.pop("_pr_rows")
         group["issue_rows"] = sum(issue_counts.values())
         # 重派次数 = 同 issue 的派单行数 - 该 issue 的唯一派单次数
-        group["retries"] = sum(count - 1 for count in issue_counts.values())
+        group["retries"] = len(group.pop("_retry_ids", set()))
         group["pr_rows"] = sorted(pr_rows, key=lambda item: item[1])
         group["pr_numbers"] = sorted({pr for pr, _ in pr_rows})
         out.append(group)
@@ -385,3 +402,8 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
 def aggregate_dispatch_ledger(db_path: Path) -> list[dict]:
     """从 dispatch_ledger 表读全部行并聚合（窗口 = 库内已摄取的全部账本）。"""
     return aggregate_rows(_load_rows(db_path))
+
+
+def load_execution_rows(db_path: Path) -> list[dict]:
+    """All retained history, including deleted worktrees; never join to git's live list."""
+    return _dedupe(_load_rows(db_path))
