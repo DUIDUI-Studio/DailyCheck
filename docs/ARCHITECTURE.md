@@ -1979,6 +1979,20 @@ MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁�
 warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
 retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
 
+### MCP 变更影响门禁（Issue #105）
+
+`scripts/agent_framework/check_mcp_impact.py` 在 main 参考提交与 HEAD 的 merge-base 上读取
+Git diff（含删除/重命名两端）与完整 `registry.json` 前后快照。非测试 Python/SQL 与业务、DB、
+MCP、Bot、配置/权限路径保守触发 PR JSON 声明：新增/更新/不变/暂不开放、受影响工具、
+理由及测试证据。新旧工具名并集容纳新增名称；实际契约记录差异必须逐项覆盖，删除或重命名
+旧名须有 compatibility 处置声明。它只验证声明，不代替兼容协议测试或授予 Bot 能力。
+
+既有必需 reports job 先运行 `python -m scripts.mcp_contracts --check`，证明提交台账与全部
+实时声明/实现/维护文档一致，再运行影响门禁；两步退出码均保留。检查器不 import 历史代码，
+不访问业务数据库。PR 模板与权威 workflow 定义同一声明格式，示例见
+`docs/agent-framework/mcp-impact.md`；缺声明/非法字段/未知工具/无理由或证据均拒绝。
+纯页面新增可以说明不变或暂不开放，无自动开放 MCP 的要求；批准池与运行时 ACL 不变。
+
 ### 9.3 双传输模式
 
 | 模式 | 入口 | 鉴权 | 用途 |
@@ -2468,6 +2482,10 @@ Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时mast
 旧approved/新pending与rejected/其他仓及品项隔离、无匹配或空历史、默认note及重复解绑拒绝；
 逐字段核对库存/价格/非绑定字段不变，备份落临时目录。旧SQL在标准3.12/3.13先跑红；
 变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
+
+Issue #105 的 `tests/test_mcp_impact_gate.py` 用独立临时 Git 仓库验证 main 前进时的
+merge-base、新增工具、schema 变化、删除/重命名、非法/缺失声明及失败关闭；另验证模板占位
+必须消解、现有 reports job 的两项检查确实保留失败退出码。示例和结构化格式与 workflow 同步。
 
 Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、
 原始29声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
