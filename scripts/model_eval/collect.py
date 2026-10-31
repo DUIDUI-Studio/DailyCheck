@@ -12,12 +12,14 @@
 降级策略：单个 transcript 文件解析失败只影响该文件（warning 记到对应账本行）；
 pricing 缺模型 → cost=null + warning；dispatch.jsonl 本身不可读才退出非 0。
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -31,6 +33,7 @@ from .collect_pure import (
     parse_claude_transcript,
     parse_codex_transcript,
     parse_ts,
+    preserve_history,
 )
 
 DEFAULT_DISPATCH = "~/.local/state/dailycheck/automation/state/dispatch.jsonl"
@@ -62,7 +65,9 @@ def _recent_files(root: Path, pattern: str, min_mtime: float) -> Iterator[Path]:
         yield path
 
 
-def _recent_claude_files(claude_dir: Path, worktrees: list[str], min_mtime: float) -> Iterator[Path]:
+def _recent_claude_files(
+    claude_dir: Path, worktrees: list[str], min_mtime: float
+) -> Iterator[Path]:
     if not claude_dir.is_dir():
         return
     if worktrees:
@@ -95,18 +100,54 @@ def _parse_file(path: Path, source: str, parser, mtime: float) -> Transcript:
         )
 
 
+def project_paths(dispatch_events: list[dict]) -> set[str]:
+    """Exact project worktree paths, including recorded deleted trees and current roots."""
+    paths = {wt for wt in (event_worktree(e) for e in dispatch_events) if wt}
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        paths.update(
+            line[len("worktree ") :]
+            for line in result.stdout.splitlines()
+            if line.startswith("worktree ")
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass  # recorded project paths still provide a conservative boundary
+    return {
+        normalized
+        for path in paths
+        for alias in (path, os.path.realpath(path))
+        if (normalized := normalize_path(alias))
+    }
+
+
+def filter_project_transcripts(
+    transcripts: list[Transcript], paths: set[str]
+) -> tuple[list[Transcript], int]:
+    """Never infer membership from a basename, Issue number, or absent repo field."""
+    kept = [t for t in transcripts if t.cwd is not None and t.cwd in paths]
+    return kept, len(transcripts) - len(kept)
+
+
 def discover_transcripts(
     dispatch_events: list[dict],
     claude_dir: Path,
     codex_dir: Path,
 ) -> tuple[list[Transcript], list[str]]:
     """发现并解析可能归属派单的 transcript（按 ts 下界 + Claude 目录名预筛）。"""
-    worktrees = sorted({wt for wt in (event_worktree(event) for event in dispatch_events) if wt})
+    worktrees = sorted(project_paths(dispatch_events))
     # 没有任何派单带 worktree_path 时，所有行都会降级为 no_worktree_path —— 无需扫盘。
     if not worktrees:
         return [], []
 
-    starts = [ts for ts in (parse_ts(event.get("ts")) for event in dispatch_events) if ts is not None]
+    starts = [
+        ts for ts in (parse_ts(event.get("ts")) for event in dispatch_events) if ts is not None
+    ]
     min_mtime = min(starts) if starts else 0.0
 
     transcripts: list[Transcript] = []
@@ -127,6 +168,9 @@ def discover_transcripts(
             continue
         transcripts.append(_parse_file(path, "codex", parse_codex_transcript, mtime))
 
+    transcripts, excluded = filter_project_transcripts(transcripts, set(worktrees))
+    if excluded:
+        warnings.append(f"out_of_project_or_unknown_cwd_filtered:{excluded}")
     return transcripts, warnings
 
 
@@ -195,10 +239,35 @@ def run_collect(args: argparse.Namespace) -> int:
     pricing, pricing_warnings = load_pricing(pricing_path)
     warnings.extend(pricing_warnings)
 
+    if not args.no_orca:
+        from .lifecycle import enrich_dispatches
+
+        events, lifecycle_warnings = enrich_dispatches(events)
+        warnings.extend(lifecycle_warnings)
+
     transcripts, transcript_warnings = discover_transcripts(events, claude_dir, codex_dir)
     warnings.extend(transcript_warnings)
 
     rows = build_ledger(events, transcripts, pricing)
+    try:
+        previous = [
+            json.loads(line)
+            for line in out_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError):
+        previous = []
+    paths = project_paths(events)
+    previous = [
+        r
+        for r in previous
+        if isinstance(r, dict)
+        and (
+            r.get("record_kind") != "unattributed_session"
+            or normalize_path(r.get("worktree_path")) in paths
+        )
+    ]
+    rows = preserve_history(rows, previous)
     payload = dumps_ledger(rows)
 
     if args.dry_run:
@@ -227,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--claude-dir", default=DEFAULT_CLAUDE_DIR)
     collect.add_argument("--codex-dir", default=DEFAULT_CODEX_DIR)
     collect.add_argument("--pricing", default=DEFAULT_PRICING)
+    collect.add_argument("--no-orca", action="store_true", help="离线模式：不查询 Orca 生命周期")
     collect.add_argument("--dry-run", action="store_true", help="只打印 JSONL，不落盘")
     return parser
 

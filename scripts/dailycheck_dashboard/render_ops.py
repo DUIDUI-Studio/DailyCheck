@@ -189,6 +189,9 @@ def render_ops_block(
     pr_data_ok: bool = True,
     loop_integrity: dict | None = None,
     eval_groups: list[dict] | None = None,
+    eval_rows: list[dict] | None = None,
+    eval_deploy_results: list[dict] | None = None,
+    eval_snapshot: str | None = None,
     eval_unavailable: bool = False,
 ) -> str:
     """返回整段运维区块 HTML（KPI 条 + 瀑布 + token + 验证矩阵 + 闭环完整性 + 归因）。"""
@@ -213,7 +216,12 @@ def render_ops_block(
     # 派单账本：只有调用方明确给了数据或「源不可用」才渲染，避免程序化调用
     # （测试 / 旧调用点）凭空多出一个空壳区块。
     eval_html = ""
-    if eval_groups or eval_unavailable:
+    if eval_rows or eval_unavailable:
+        from .eval_view import render_worktree_eval
+        eval_html = render_worktree_eval(rows=eval_rows or [], prs=prs, snapshot=eval_snapshot,
+                                         pr_data_ok=pr_data_ok, unavailable=eval_unavailable,
+                                         deploy_results=eval_deploy_results or [])
+    elif eval_groups:
         eval_html = render_eval_block(
             groups=eval_groups or [],
             prs=prs,
@@ -617,10 +625,10 @@ def _fmt_cost(value: float | None) -> str:
     if value is None:
         return "—"
     if value == 0:
-        return "$0.00"
+        return "CNY 0.00"
     if abs(value) < 0.01:
-        return f"${value:.4f}"
-    return f"${value:,.2f}"
+        return f"CNY {value:.4f}"
+    return f"CNY {value:,.2f}"
 
 
 def _eval_pr_cell(group: dict, pr_by_num: dict, pr_data_ok: bool) -> str:

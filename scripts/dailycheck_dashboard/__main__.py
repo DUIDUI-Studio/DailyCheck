@@ -202,19 +202,17 @@ def cmd_render(args: argparse.Namespace) -> int:
         f"token={len(token_rows)}"
     )
 
-    # 派单账本聚合：优先用库内事实（含历史轮次），写库失败时才退回本轮内存数据。
-    # 与上面三个源同一降级口径：账本缺失只让评估区块显示「数据源不可用」。
+    # Retain historical execution facts even after a worktree is removed.
     try:
-        eval_groups = ledger_db.aggregate_dispatch_ledger(db_path)
+        eval_rows = ledger_db.load_execution_rows(db_path)
     except (sqlite3.Error, ValueError) as exc:
-        _log(f"  eval 聚合失败（忽略，不影响渲染）：{exc}")
-        eval_groups = []
-    if not eval_groups and ledger_rows:
-        eval_groups = ledger_db.aggregate_rows(ledger_rows)
-    _log(
-        f"  eval: groups={len(eval_groups)} "
-        f"rows={sum(int(g.get('dispatches') or 0) for g in eval_groups)} "
-        f"源不可用={'是' if '派单账本' in ops_unavailable else '否'}"
+        _log(f"  eval 事实读取失败，使用本轮数据：{exc}")
+        eval_rows = []
+    if not eval_rows:
+        eval_rows = ledger_rows
+    eval_deploy_results = _collect(
+        "部署结果", ops_unavailable,
+        lambda: ops_parse.parse_deploy_results(Path(args.deploy_results)),
     )
 
     # 2. 与上次快照对比（diff）
@@ -245,7 +243,8 @@ def cmd_render(args: argparse.Namespace) -> int:
         verifications=verifications,
         token_rows=token_rows,
         loop_integrity=loop_integrity,
-        eval_groups=eval_groups,
+        eval_rows=eval_rows,
+        eval_deploy_results=eval_deploy_results,
         eval_unavailable="派单账本" in ops_unavailable,
         ops_unavailable=ops_unavailable,
         ops_fetched_at=ops_fetched_at,
@@ -374,6 +373,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="prod-verifications 目录（八项验证报告）")
     p_render.add_argument("--hermes-db", default=str(DEFAULT_HERMES_DB),
                           help="Hermes state.db（只读，取 token 用量）")
+    p_render.add_argument("--deploy-results", default="/var/lib/dailycheck-deploy/events.jsonl",
+                          help="现有生产部署结果事件（只读；不单独证明 delivered）")
     p_render.add_argument("--ledger", default=str(DEFAULT_LEDGER),
                           help="派单账本 JSONL（Issue #91 采集器产出；缺失则评估区块降级）")
     p_render.add_argument("--token-days", type=int, default=7,
