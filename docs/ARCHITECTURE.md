@@ -1488,6 +1488,7 @@ flowchart TB
 **约定**：`xxx.py`（蓝图，含 Flask 视图）和 `xxx_pure.py`（纯函数/类，便于测试和复用）成对出现。改业务规则时**优先改 pure**，再让蓝图调它。
 
 `fulfillment_pure.py` 按显式来源仓解析唯一有效履约行，别名/停用行不参与，缺失/多绑定/单位或阻断冲突失败关闭；返回原始成本与库存，独立价格/倍数 helper 沿用订货规则，且不回查当前路由（测试：`tests/test_fulfillment_pure.py`）。
+订单详情库存/价格/品类 enrichment 也复用该解析器，并核对已固化的仓内行 ID，避免跨仓同 ID 串读（Issue #109，详 §10.3）。
 
 **UI 导航结构（2026-10-13 导航模块化起）**：面向用户的信息架构收敛为 **7 模块** —
 总览 / 库存管理 / 生产管理 / 门店订货 / 采购 / 通知 / 管理员，三个载体（桌面侧边栏 /
@@ -1553,6 +1554,8 @@ flowchart LR
 - `store_ordering_pure.list_available_dc_items()` 同时读取 DC 与当前门店仓：DC 行决定
   目录范围/价格/起订倍数，门店行按 `canonical_id` 以 `SUM(quantity)` 提供
   `store_quantity` 展示值。
+- `get_dc_items_for_order_detail()` 按订单行固化来源分别建立只读仓库连接，复用
+  `resolve_fulfillment_item()` / `parse_price_and_multiple()`；详情查询不触发仓库迁移。
 - `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
   `master.db.store_orders` 给订单发货流水补订单链接。
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
@@ -2110,6 +2113,17 @@ HTTP 层 `BEGIN IMMEDIATE` 后 `apply_batch()` 重读整批基线并校验所有
 
 ### 10.3 Store Ordering 状态机
 
+**订单详情来源库存（Issue #109，2026-10-31）**：订单板自身没有库存列；
+`/store-ordering/orders/<id>` 才显示履约仓库存并为门店/DC/平台视角提供单价。
+`get_dc_items_for_order_detail()` 按行取 `COALESCE(source_warehouse_code, 头仓)`，
+在该来源仓复用履约解析器的唯一有效绑定结果，已有 `dc_item_id` 必须与结果相同；
+只有历史 NULL 行 ID 才允许按 canonical 解析。缺行、解绑、停用、别名、歧义、单位/
+阻断冲突或固化 ID 不匹配时，沿用零库存/零单价和 canonical 品类兜底，不换仓、不换行。
+库存、售价优先/成本兜底和本地品类来自同一经验证的行；历史负库存仍保留。
+每个来源仓复用一条 `mode=ro` 连接和读事务，缺失/不可打开的仓库显示兜底且不影响
+其他来源行，不创建物理库、不迁移、不改订单快照。当前路由变更或跨仓创建开关不改变
+存量单来源；`/inventory` 仍是当前会话仓库存，不作 DC 汇总。
+
 **订单审批与出库可见性（Issue #64，2026-10-27）**：审批只更新订单状态并授权后续
 发货，**不预留、不锁定库存**；DC 确认发货时才校验现有库存、扣减 `items.quantity`
 并写入 `stock_movements`。`/outbound` 原先只读 `outbound_requests`，因此订单发货
@@ -2453,6 +2467,13 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 master/两 DC/门店库，
+先提交跨仓单再改路由，以跨库同 local item ID 的不同 canonical/库存/价格/品类复现串读；
+覆盖门店/DC/平台订单板到详情渲染、历史 NULL 来源/行 ID、固化 ID 缺失/错绑/替换、
+停用/别名/歧义/单位/阻断冲突、无效重复绑定、缺库不创建、负库存/成本兜底、
+查询前后库文件不变和 `/inventory` 当前仓语义。临时变异验证头仓代替来源、
+忽略固化 ID、歧义取首行和允许建缺库均会被回归检出。
 
 Issue #87 根目录 `test_mcp_document_writes.py` / `test_warehouse_document_migrations.py`
 覆盖旧位置调用、小数、HALF_EVEN与REAL精度边界、重放/冲突/删除后不复活、4写故障注入、
