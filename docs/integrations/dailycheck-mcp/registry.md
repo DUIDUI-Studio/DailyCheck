@@ -22,8 +22,8 @@ Read/write classifies business intent; legacy HTTP/stdio reads may run migration
 | `outbound_create` | outbound | write | `POST /api/v1/outbound` | handler | warehouse_code checked in service | yes | yes |
 | `outbound_list` | outbound | read | `GET /api/v1/outbound` | handler | warehouse_code checked in service | yes | yes |
 | `outbound_rollback` | outbound | write | `POST /api/v1/outbound/rollback` | handler | warehouse_code checked in service | yes | yes |
-| `warehouse_consumption` | consumption | read | `GET /api/v1/consumption/warehouse` | none; Bot adapter checks the documented path | warehouse_code checked in service | yes | yes |
-| `item_consumption` | consumption | read | `GET /api/v1/consumption/item/<id>` | none; Bot adapter checks the documented path | warehouse_code checked in service | yes | yes |
+| `warehouse_consumption` | consumption | read | `GET /api/v1/consumption/warehouse` | handler | warehouse_code checked in service | yes | yes |
+| `item_consumption` | consumption | read | `GET /api/v1/consumption/item/<id>` | handler | warehouse_code checked in service | yes | yes |
 | `canonical_list` | canonical | read | `GET /api/v1/canonical` | handler | global; no token warehouse filtering | no | yes |
 | `canonical_detail` | canonical | read | `GET /api/v1/canonical/<id>` | handler | global bindings; no token warehouse filtering | no | yes |
 | `canonical_categories` | canonical | read | `GET /api/v1/canonical/categories` | handler | global; no token warehouse filtering | no | yes |

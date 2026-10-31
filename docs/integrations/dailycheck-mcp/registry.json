@@ -1045,7 +1045,7 @@
       "access": {
         "method": "GET",
         "path": "/api/v1/consumption/warehouse",
-        "path_enforcement": "none; Bot adapter checks the documented path",
+        "path_enforcement": "handler",
         "warehouse_scope": "warehouse_code checked in service"
       },
       "output_contract": {
@@ -1134,7 +1134,7 @@
       "access": {
         "method": "GET",
         "path": "/api/v1/consumption/item/<id>",
-        "path_enforcement": "none; Bot adapter checks the documented path",
+        "path_enforcement": "handler",
         "warehouse_scope": "warehouse_code checked in service"
       },
       "output_contract": {

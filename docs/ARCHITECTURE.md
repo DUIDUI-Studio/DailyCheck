@@ -1907,7 +1907,8 @@ flowchart LR
 `structuredContent`，保留原description/input与TextContent中的JSON业务形状。
 其中 `items_detail` 仍列表包装、`procurement_hub` 仍数组、`canonical_fanout_event` 缺事件仍null、
 `canonical_fanout` 实返 `per_canonical`；台账如实记录旧description差异，不借本次改包装。
-仓清单和两个消费handler历史上没有MCP路径检查，Bot adapter另做检查；全局canonical读、
+仓清单仍无MCP路径检查，Bot adapter另做检查；两个消费handler已由#103补齐GET路径检查，
+登记元数据随已审查依赖同步，仓库范围仍在service校验。全局canonical读、
 fanout目标无token仓过滤等现状均显式注明，不把元数据当成新增守卫或授权。
 
 **独立Bot部署接缝**：Bot也import `get_tools()`，新增registry模块树需要随Bot独立部署同步；

@@ -1,8 +1,10 @@
 """Registry coverage, preserved wire declarations and real SQLite output contracts."""
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
+import inspect
 import json
 import secrets
 import sqlite3
@@ -291,3 +293,17 @@ def test_calculation_scope_drift_cannot_pass_check(tmp_path, monkeypatch, capsys
     assert guide.read_text() == changed
     guide.write_text(original)
     assert mcp_contracts.main(['--check']) == 0
+
+
+def test_integrated_consumption_acl_metadata_matches_enforced_paths():
+    for entry in registry.REGISTRY:
+        if entry.domain != 'consumption':
+            continue
+        assert entry.access.path_enforcement == 'handler'
+        tree = ast.parse(inspect.getsource(entry.handler))
+        checks = [call for call in ast.walk(tree) if isinstance(call, ast.Call)
+                  and isinstance(call.func, ast.Name) and call.func.id == 'check_path']
+        assert any(len(call.args) == 3 and ast.literal_eval(call.args[1]) == entry.access.method
+                   and ast.literal_eval(call.args[2]) == entry.access.path for call in checks)
+    warehouse = next(entry for entry in registry.REGISTRY if entry.name == 'warehouse_list')
+    assert warehouse.access.path_enforcement.startswith('none;')
