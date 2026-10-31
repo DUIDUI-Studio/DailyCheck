@@ -1,8 +1,7 @@
 # DailyCheck CI：测试门禁 + 四报告门禁。部署不在此工作流——蓝绿部署由 Prod Agent
 #
 # 零新增失败门禁：tests/known_failures.txt 是已知 pre-existing 失败基线（只许收缩）。
-# tests/mcp_server 在 runner 上不经容器、无法等价复现，故 CI 跳过（known_failures.txt
-# 仍收录其 2 条，本地/容器全量跑时同样受门禁约束）。商业化前须归零并恢复 CI 覆盖。
+# 全量包含 tests/mcp_server；MCP 测试使用临时 SQLite 与日志，不依赖容器或真实库。
 name: CI
 
 env:
@@ -56,11 +55,12 @@ jobs:
             echo "no python files changed, skip"
           fi
 
-      - name: Pytest (full suite, mcp_server excluded — container-gated, see header)
+      - name: Pytest (full suite, including MCP)
         run: |
           set +e
-          /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE \
-            --ignore=tests/mcp_server > /tmp/pytest-output.txt 2>&1
+          DAILYCHECK_DB_DIR="$(mktemp -d)" \
+            /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE \
+            > /tmp/pytest-output.txt 2>&1
           tail -3 /tmp/pytest-output.txt
 
       - name: Zero-new-failure gate

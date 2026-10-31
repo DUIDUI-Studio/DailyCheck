@@ -36,3 +36,59 @@ def warehouse_db(tmp_path):
     conn.commit()
     conn.close()
     return str(db_path)
+
+
+@pytest.fixture(autouse=True)
+def mcp_test_env(tmp_path, monkeypatch):
+    """Every MCP test gets an initialized master and cannot open host databases.
+
+    Patch import-bound constants as well as config: changing only the environment
+    after collection leaves UoW pointing at the default master.db. The SQLite
+    guard catches future missed aliases, including read-only URI connections.
+    """
+    from pathlib import Path
+    from urllib.parse import parse_qs, unquote, urlsplit
+
+    import config
+    import db
+    import mcp_server.config as mcp_config
+    from mcp_server.data import unit_of_work
+    from mcp_server.infra import access_log
+    from mcp_server.service.auth import _current_auth
+
+    root = tmp_path.resolve()
+    master = root / "master.db"
+    warehouses = root / "warehouses"
+    warehouses.mkdir()
+    log = root / "access.log"
+    monkeypatch.setenv("DAILYCHECK_DB_DIR", str(root))
+    monkeypatch.delenv("DAILYCHECK_MCP_TOKEN", raising=False)
+    monkeypatch.setattr(config, "DB_DIR", root)
+    for module in (config, db, mcp_config, unit_of_work):
+        monkeypatch.setattr(module, "MASTER_DB", master)
+    for module in (config, db):
+        monkeypatch.setattr(module, "WAREHOUSE_DB_DIR", warehouses)
+    monkeypatch.setattr(access_log, "_ACCESS_LOG_PATH", log)
+
+    connect = sqlite3.connect
+
+    def isolated_connect(database, *args, **kwargs):
+        value = str(database)
+        if value not in ("", ":memory:"):
+            if value.startswith("file:"):
+                uri = urlsplit(value)
+                value = unquote(uri.path)
+                if value == ":memory:" or parse_qs(uri.query).get("mode") == ["memory"]:
+                    return connect(database, *args, **kwargs)
+            path = Path(value).resolve()
+            if not path.is_relative_to(root):
+                raise AssertionError(f"MCP test attempted to open a non-test database: {path}")
+        return connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", isolated_connect)
+    token = _current_auth.set(None)
+    try:
+        db.init_master_db()
+        yield {"root": root, "master": master, "warehouses": warehouses, "log": log}
+    finally:
+        _current_auth.reset(token)

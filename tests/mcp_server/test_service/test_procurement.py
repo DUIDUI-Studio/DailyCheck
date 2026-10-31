@@ -1,10 +1,11 @@
 """Procurement 服务测试。"""
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
-from mcp_server.service import procurement as procurement_module
-from mcp_server.service.procurement import procurement_store, procurement_hub
+
+from mcp_server.infra.errors import ForbiddenError, NotFoundError, ValidationError
 from mcp_server.service.auth import AuthContext
-from mcp_server.infra.errors import ForbiddenError, ValidationError, NotFoundError
+from mcp_server.service.procurement import procurement_hub, procurement_store
 
 
 class TestProcurementStore:
@@ -145,12 +146,15 @@ class TestProcurementHub:
         # 空列表，因为仓库不存在
         assert result == []
 
-    @patch("mcp_server.service.procurement.check_warehouse")
-    def test_procurement_hub_not_available(self, mock_check):
-        """测试服务不可用"""
-        mock_check.return_value = True
-
-        with patch("mcp_server.service.procurement._get_store_procurement_json", return_value=None):
-            ctx = AuthContext(1, [], [], None)
-            result = procurement_hub(ctx)
-            assert result == []
+    @pytest.mark.parametrize("warehouse_code", [None, "WH001"])
+    def test_procurement_hub_not_available(self, warehouse_code):
+        """Missing procurement implementation must degrade before any warehouse DB lookup."""
+        with (
+            patch("mcp_server.service.procurement._get_store_procurement_json", return_value=None),
+            patch("mcp_server.service.procurement.list_all_warehouses") as list_warehouses,
+            patch("mcp_server.service.procurement.resolve_warehouse") as resolve_warehouse,
+        ):
+            ctx = AuthContext(1, [], [], ["WH001"])
+            assert procurement_hub(ctx, warehouse_code) == []
+            list_warehouses.assert_not_called()
+            resolve_warehouse.assert_not_called()
