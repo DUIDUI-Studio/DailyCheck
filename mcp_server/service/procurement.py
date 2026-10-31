@@ -38,15 +38,15 @@ def procurement_hub(
 ) -> list[dict]:
     if warehouse_code and not check_warehouse(ctx, warehouse_code):
         raise ForbiddenError("forbidden_warehouse")
+    store_func = _get_store_procurement_json()
+    if store_func is None:
+        return []
     if warehouse_code:
         wh = resolve_warehouse(warehouse_code)
         whs = [wh] if wh else []
     else:
         whs = [dict(r) for r in list_all_warehouses()]
     result = []
-    store_func = _get_store_procurement_json()
-    if store_func is None:
-        return result
     for wh in whs:
         if wh is None or not check_warehouse(ctx, wh["code"]):
             continue

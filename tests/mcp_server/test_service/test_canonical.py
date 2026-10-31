@@ -329,7 +329,7 @@ class TestFanoutCanonical:
             )
 
     @patch("mcp_server.service.canonical.master_connection")
-    def test_whitelist_with_dc_passes(self, mock_conn):
+    def test_whitelist_with_dc_passes(self, mock_conn, warehouse_db):
         ctx = MagicMock()
         ctx.__enter__ = MagicMock(return_value=ctx)
         ctx.__exit__ = MagicMock(return_value=False)
@@ -339,7 +339,7 @@ class TestFanoutCanonical:
         # second call = load wh rows for opening conns (we close them right after)
         row = MagicMock()
         row.__getitem__.side_effect = lambda k: {"code": "wh_000",
-                                                 "db_path": "/tmp/x",
+                                                 "db_path": warehouse_db,
                                                  "warehouse_type": "distribution_center"}[k]
         ctx.execute.return_value.fetchall.return_value = [row]
         mock_conn.return_value = ctx
