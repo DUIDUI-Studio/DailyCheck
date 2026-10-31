@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "DailyCheck MCP server tool registry — 基础工具（14 个）的输入契约；canonical_* 主数据治理工具（13 个）见 docs/ARCHITECTURE.md §9.2。合计 27 个工具。",
+  "description": "DailyCheck external integration subset: 16 tools; runtime registry: 29 tools including 13 canonical tools. Subset membership is documentation, not authorization. Full maintenance ledger: registry.json.",
   "server": null,
   "tools": [
     {

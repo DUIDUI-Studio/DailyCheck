@@ -10,50 +10,8 @@ from mcp.types import TextContent, Tool
 
 from mcp_server.infra.access_log import write_mcp_access_log
 from mcp_server.infra.errors import McpError
+from mcp_server.protocol.registry import get_handlers
 from mcp_server.protocol.tools import get_tools
-from mcp_server.protocol.tools.canonical import (
-    canonical_categories_impl,
-    canonical_claim_impl,
-    canonical_conflicts_impl,
-    canonical_create_impl,
-    canonical_detail_impl,
-    canonical_fanout_event_impl,
-    canonical_fanout_impl,
-    canonical_fanout_targets_impl,
-    canonical_list_impl,
-    canonical_resolve_conflict_impl,
-    canonical_set_binding_active_impl,
-    canonical_unclaim_impl,
-    canonical_update_impl,
-)
-from mcp_server.protocol.tools.consumption import (
-    item_consumption_impl,
-    warehouse_consumption_impl,
-)
-from mcp_server.protocol.tools.forecast import item_forecast_impl
-from mcp_server.protocol.tools.inbound import (
-    restock_create_impl,
-    restock_list_impl,
-)
-from mcp_server.protocol.tools.inventory import (
-    items_detail_impl,
-    items_list_impl,
-    movements_list_impl,
-    warehouse_list_impl,
-)
-from mcp_server.protocol.tools.outbound import (
-    outbound_create_impl,
-    outbound_list_impl,
-    outbound_rollback_impl,
-)
-from mcp_server.protocol.tools.procurement import (
-    procurement_hub_impl,
-    procurement_store_impl,
-)
-from mcp_server.protocol.tools.store_order import (
-    store_order_detail_impl,
-    store_order_list_impl,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -85,37 +43,7 @@ def _bounded_tool_name(name: str) -> str:
     return name[:_MAX_TOOL_NAME_LEN]
 
 
-_tool_map = {
-    "warehouse_list": warehouse_list_impl,
-    "items_list": items_list_impl,
-    "items_detail": items_detail_impl,
-    "movements_list": movements_list_impl,
-    "restock_create": restock_create_impl,
-    "restock_list": restock_list_impl,
-    "item_forecast": item_forecast_impl,
-    "procurement_store": procurement_store_impl,
-    "procurement_hub": procurement_hub_impl,
-    "outbound_create": outbound_create_impl,
-    "outbound_list": outbound_list_impl,
-    "outbound_rollback": outbound_rollback_impl,
-    "warehouse_consumption": warehouse_consumption_impl,
-    "item_consumption": item_consumption_impl,
-    "canonical_list": canonical_list_impl,
-    "canonical_detail": canonical_detail_impl,
-    "canonical_categories": canonical_categories_impl,
-    "canonical_fanout_targets": canonical_fanout_targets_impl,
-    "canonical_conflicts": canonical_conflicts_impl,
-    "canonical_fanout_event": canonical_fanout_event_impl,
-    "canonical_create": canonical_create_impl,
-    "canonical_update": canonical_update_impl,
-    "canonical_claim": canonical_claim_impl,
-    "canonical_unclaim": canonical_unclaim_impl,
-    "canonical_fanout": canonical_fanout_impl,
-    "canonical_resolve_conflict": canonical_resolve_conflict_impl,
-    "canonical_set_binding_active": canonical_set_binding_active_impl,
-    "store_order_list": store_order_list_impl,
-    "store_order_detail": store_order_detail_impl,
-}
+_tool_map = get_handlers()
 
 
 def build_server() -> Server:
