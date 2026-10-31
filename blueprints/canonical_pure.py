@@ -1712,8 +1712,11 @@ def unclaim_item(
     master_conn.execute(
         """UPDATE canonical_claim_requests
            SET status='cancelled', reviewed_by=?, reviewed_at=?, review_note=?
-           WHERE warehouse_code=? AND local_item_id=? AND status='approved'
-           ORDER BY id DESC LIMIT 1""",
+           WHERE id = (
+               SELECT id FROM canonical_claim_requests
+               WHERE warehouse_code=? AND local_item_id=? AND status='approved'
+               ORDER BY id DESC LIMIT 1
+           )""",
         (reviewed_by, _now_str(), reason or "unclaimed",
          warehouse_code, local_item_id),
     )

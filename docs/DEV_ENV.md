@@ -55,7 +55,8 @@ docker exec -it wdg-systemd bash
 
 | 改动类型 | 生效方式 |
 |---|---|
-| 业务代码 (`app.py` / `blueprints/*` / `mcp_server/*`) | bind mount + Flask `--debug` 自动 reload |
+| Flask 业务代码 (`app.py` / `blueprints/*`) | bind mount + Flask `--debug` 自动 reload |
+| MCP 代码 (`mcp_server/*`，含工具登记) | bind mount 后必须重启 `dailycheck-mcp`；无 reloader |
 | systemd unit (`deploy/systemd/*.service`) | `systemctl restart dailycheck-{app,mcp}` |
 | install 脚本 (`scripts/install-in-wdg-systemd.sh`) | bind mount + 重新跑 |
 | WDG 容器配置 | 改 `wdg-data-foundation/docker-compose.yml` + `docker compose up -d` |
@@ -78,10 +79,13 @@ DAILYCHECK_SECRET_KEY=dev-key-change-me flask --app app run --host 0.0.0.0 --por
 `/etc/systemd/system/dailycheck-*.service` 是容器运行时安装,**不在镜像里**。
 wdg-systemd 容器一旦重建,unit 就没了,需要重跑 `install-in-wdg-systemd.sh`。
 
-### 2. `python3 -m mcp_server` 入口
+### 2. `python3 -m mcp_server` 入口（默认 stdio）
 
 确保 unit 里 `Environment=PATH=/var/www/.local/bin:...` 包含 pip 装包路径,
-否则找不到 `mcp` 命令(MCP service `ExecStart` 用 `python3 -m mcp_server` 也行)。
+否则找不到 `mcp` 命令。HTTP service 的 `ExecStart` 必须显式使用
+`python3 -m mcp_server --transport http --host 0.0.0.0 --port 5100`；裸入口默认 stdio。
+HTTP 的 `/api/mcp/`、`/sse`、`/messages/` 与 `/health` 都由 Bearer middleware 保护。
+健康检查需同时看 HTTP 200/503 与 `checks`，不能仅看顶层 `status`。
 
 ### 3. Flask debug + bind mount
 

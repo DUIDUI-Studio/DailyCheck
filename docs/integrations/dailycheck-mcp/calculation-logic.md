@@ -1,7 +1,9 @@
 # MCP 工具数据计算逻辑对照表
 
 > 生成日期：2026-07-21
-> 覆盖工具：14 个基础 MCP 工具（warehouse_list / items_list / items_detail / movements_list / restock_create / restock_list / outbound_create / outbound_list / outbound_rollback / warehouse_consumption / item_consumption / item_forecast / procurement_store / procurement_hub）；canonical_* 13 个主数据治理工具见 `docs/ARCHITECTURE.md` §9.2，合计 27 个工具。
+> 当前工具范围：实时 29 项（基础 14 项 + 订单只读 2 项 + canonical 主数据 13 项）；外部 tools.json 仅为 16 项子集，不代表授权。
+> 本文说明基础工具的计算口径；所有名称、输入/实际输出形状和 ACL 范围以[完整工具台账](./registry.md)为准。
+> 订单读取：`store_order_list` / `store_order_detail` 只读，按参与仓可见全单（含其他仓明细与金额）；详见[订单读取契约](./README.md)。
 
 ---
 
