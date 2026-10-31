@@ -312,3 +312,15 @@ def test_minimal_legacy_schema_explicitly_skips_without_writes(routing_db, caplo
     registered_up(master)
     assert "跳过" in caplog.text
     assert master.total_changes == before
+
+
+def test_diagnostics_distinguishes_unique_unconfigured_from_no_binding(routing_db):
+    master, whs = routing_db
+    canonical(master)
+    canonical(master, 2, status="inactive")
+    bind(whs["A"])
+    master.commit()
+    api = routing_api()
+    assert api.routing_pending(master)["missing"] == [1]
+    assert api.routing_diagnostics(master) == {1: {"codes": ["A"], "exclusive_only": False}}
+    assert api.get_routing(master, 1) is None

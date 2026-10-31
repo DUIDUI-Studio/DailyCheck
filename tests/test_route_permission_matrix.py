@@ -156,6 +156,9 @@ _MATRIX_CASES = [
     ("agent_tokens.list_tokens", "GET", 2, True, None),
     ("users.list_users", "GET", 2, True, None),
     ("canonical.canonical_edit", "GET", 3, True, None),
+    ("item_routing.batch", "POST", 2, True, None),
+    ("item_routing.batch", "POST", 3, True, None),
+    ("item_routing.batch", "POST", 1, False, None),
     # —— 权限点收紧 ——
     ("stocktake.approve", "POST", 2, True, {"batch_id": 1}),   # 终裁①：staff 失去审批
     ("stocktake.approve", "POST", 3, False, {"batch_id": 1}),  # manager 保留

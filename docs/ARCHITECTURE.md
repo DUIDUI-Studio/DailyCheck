@@ -2072,10 +2072,41 @@ flowchart TB
 `routing_pending(master_conn, wh_db_map=None)` 只读打开登记的 DC 库动态诊断；缺库/坏库
 显式失败，不把不完整扫描误当唯一候选。新增唯一绑定仍等待管理员显式配置。
 新蓝图 `item_routing.py` 在 `app.py` 注册，入口 `/admin/item-routing`（主数据列表可达），
-沿用 `@require_platform_admin`、仅租户 1、全局 CSRF，权限清单三个端点标为 PLATFORM；
-支持列表、待配置高亮、设置与删除，设置记录 `updated_by/updated_at`，变更沿用仓内 audit_log。
+沿用 `@require_platform_admin`、仅租户 1、全局 CSRF，权限清单四个端点（含 `POST /admin/item-routing/batch`）均标为 PLATFORM；
+支持完整列表、筛选、批量草稿以及兼容的单条设置/删除，设置记录 `updated_by/updated_at`。
 路由配置不改已提交订单；纯函数不 commit，由调用方管理事务。
 验证见 `tests/test_item_routing_pure.py` / `tests/test_item_routing_route.py`。
+
+**路由草稿编辑器（Issue #100，2026-10-31）**：初次 GET 返回租户 1 全部品项（含停用），
+品类由 `canonical_categories.code` 关联；专用 `item-routing.css/js?v=1` 用原生 JS
+在浏览器组合筛选名称/SKU（不分大小写）、主数据品类、已保存仓、路由配置状态、已修改，
+每页 50 项；200 仅为单批变更上限，绝不截断列表。桌面紧凑三列、≤1099px 卡片，
+页面局部约束 app-shell/grid 自动最小宽度；长文本换行，select 旁完整显示已选仓名。
+保存栏 sticky 位于移动底栏上方，ResizeObserver 测量含 safe-area 的实际导航高度。
+`routing_diagnostics()` 单次只读扫描直接给出候选；路由配置状态、品项启停与候选诊断
+分别展示，既有 missing（含唯一候选但尚未配置）不再标作“无来源”。不改目标仓绑定校验语义。
+
+草稿 Map 以 canonical_id 为键，独立于可见页，筛选仓/配置状态始终按已保存值；改回原值
+即删草稿，支持逐项撤销、确认放弃全部、beforeunload，**不写 localStorage**。
+勾选仅当前页，换筛选/页清空勾选；统一设仓仅暂存。唯一底栏核对所有草稿（含隐藏项），
+清除路由必须在核对中提示后续订货影响。保存期间冻结编辑/重复提交；只有逐项核验成功
+响应才清草稿，400/409/503/认证或网络异常保留草稿及品项错误。网络结果未知允许原基线
+安全重放；409 可逐项核对服务器值并明确确认新基线，不能静默覆盖。
+
+batch JSON 为 `{changes:[{canonical_id, operation:"set"|"delete", dc_code, baseline:
+{dc_code, updated_at}}]}`；delete 的 dc_code 为 null，原来无路由的基线两字段都为 null。
+拒绝空批次、重复 ID、类型/操作错误、跨租户/非 DC/不存在品项、>200 项。
+HTTP 层 `BEGIN IMMEDIATE` 后 `apply_batch()` 重读整批基线并校验所有项，再执行写入；
+只 commit 一次，错误整批 rollback。当前仓已等于目标时跳过（不更新时间，支持重试）；
+其他仓或时间戳不符返回 409 与 current 值，整批零写。仓码+秒级 updated_at 是本范围的
+基础覆盖保护，**不宣称严格 ABA 保护**，不新增 schema/自动播种/自动路由。
+
+审计沿用当前仓 `auth.audit()`（独立 commit），与 master **不跨库原子**。批量及兼容单条
+均先 master commit 再审计；批量记录 batch_id、actor、每项 old/new 与 changed。
+提交后审计失败保留真实成功响应（`audit_recorded=false`），服务日志携带批次及差异便于追查；
+不得把成功路由写入说成回滚，不在 master 提交前发出成功审计。
+路由 GET 与 batch JSON 标记 no-store；沿用全局 CSRF / 平台管理员 / 租户 1，不放宽认证。
+
 
 ### 10.3 Store Ordering 状态机
 

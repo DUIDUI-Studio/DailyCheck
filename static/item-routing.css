@@ -1,0 +1,97 @@
+/* Local layout boundaries also contain the desktop app-shell's automatic grid minimum. */
+body:has(.routing-editor) .app-shell { min-width: 0; }
+body:has(.routing-editor) main { width: 100%; min-width: 0; }
+.routing-editor { min-width: 0; --routing-nav-height: 70px; }
+.routing-editor * { min-width: 0; }
+.routing-editor [hidden] { display: none !important; }
+.routing-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.routing-heading h2 { margin: 3px 0 8px; font-size: 25px; letter-spacing: -.5px; }
+.routing-heading a { flex: 0 0 auto; width: auto; white-space: normal; text-align: right; }
+.routing-eyebrow { margin: 0; font-size: 11px; font-weight: 600; color: var(--brand); letter-spacing: 1.4px; }
+.routing-intro { color: var(--muted); line-height: 1.7; margin: 4px 0 20px; }
+.routing-controls { margin: 0; padding: 0; border: 0; }
+.routing-editor button { width: auto; flex: 0 0 auto; cursor: pointer; white-space: normal; }
+.routing-editor button:disabled { cursor: default; opacity: .5; }
+.routing-editor input, .routing-editor select { max-width: 100%; font-size: 16px; }
+.routing-editor input[type=checkbox] { width: 18px; height: 18px; margin: 0; flex: 0 0 18px; accent-color: var(--brand); }
+.routing-editor :focus-visible { outline: 3px solid #079b90; outline-offset: 3px; }
+.routing-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.routing-summary button { background: #fff; color: var(--muted); border-color: var(--border); padding: 10px 16px; }
+.routing-summary button strong { margin-left: 12px; color: var(--text); font-variant-numeric: tabular-nums; }
+.routing-summary button.is-current { background: var(--brand-ink); color: white; border-color: var(--brand-ink); }
+.routing-summary button.is-current strong { color: white; }
+.routing-filters { display: grid; grid-template-columns: minmax(0, 1.4fr) repeat(3, minmax(0, 1fr)); gap: 12px; padding: 16px; background: white; border: 1px solid var(--border); border-radius: 14px; }
+.routing-filters label > span { font-size: 12px; }
+.routing-filter-actions { grid-column: 1/-1; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.routing-check { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; }
+.routing-quiet { background: transparent; color: var(--brand-ink); border-color: var(--border); }
+.routing-bulk { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 14px 2px; color: var(--muted); font-size: 12px; }
+.routing-bulk-target { flex: 1 1 160px; max-width: 310px; }
+.routing-list-head, .routing-row { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr) minmax(0, 1.2fr); gap: 18px; }
+.routing-list-head { padding: 12px 16px; color: var(--muted); font-size: 11px; letter-spacing: .5px; }
+.routing-list { background: white; border: 1px solid var(--border); border-radius: 14px; }
+.routing-row { padding: 16px; border-bottom: 1px solid var(--border); align-items: start; scroll-margin-bottom: 200px; }
+.routing-row:last-child { border-bottom: 0; }
+.routing-row.is-dirty { background: #f2faf8; box-shadow: inset 3px 0 var(--brand); }
+.routing-row.has-error { box-shadow: inset 3px 0 #b45309; }
+.routing-identity { display: flex; align-items: start; gap: 10px; }
+.routing-identity > label { padding-top: 4px; min-height: 44px; min-width: 22px; }
+.routing-item-name { display: block; font-size: 14px; line-height: 1.6; }
+.routing-row p, .routing-row small, .routing-row strong, .routing-row label, .routing-row span { overflow-wrap: anywhere; white-space: normal; }
+.routing-sku { display: block; font-size: 11px; color: var(--muted); line-height: 1.6; margin-top: 3px; }
+.routing-category { display: block; font-size: 11px; color: var(--muted); margin-top: 7px; }
+.routing-pill { display: inline-block; border-radius: 5px; padding: 4px 7px; font-size: 11px; font-weight: 600; background: #ecf6f3; color: var(--brand-ink); margin: 0 4px 5px 0; }
+.routing-pill.pending { color: #92400e; background: #fff5dd; }
+.routing-pill.inactive { background: #f1f2f4; color: #4b5563; }
+.routing-diagnostic, .routing-time { display: block; font-size: 11px; line-height: 1.7; color: var(--muted); }
+.routing-editor-label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+.routing-diff { margin: 8px 0 0; font-size: 12px; color: var(--brand-ink); line-height: 1.6; }
+.routing-row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.routing-row-actions button { font-size: 11px; padding: 7px 9px; background: white; color: var(--brand-ink); border-color: var(--border); }
+.routing-row-error { color: #92400e; font-size: 12px; line-height: 1.6; margin: 8px 0; }
+.routing-pagination, .routing-pagination > div { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.routing-pagination { padding: 18px 0 26px; font-size: 12px; color: var(--muted); }
+.routing-pagination button { background: white; color: var(--brand-ink); border-color: var(--border); }
+.routing-savebar { position: sticky; bottom: calc(var(--routing-nav-height) + 10px); z-index: 90; display: flex; justify-content: space-between; align-items: center; gap: 16px; border: 1px solid #b8d9d2; border-radius: 14px; background: #fff; padding: 14px 16px; box-shadow: 0 6px 26px #0b4f4a20; }
+.routing-savebar small { display: block; font-size: 11px; line-height: 1.6; color: var(--muted); margin-top: 4px; }
+.routing-save-actions { display: flex; gap: 8px; }
+.routing-editor { padding-bottom: 32px; }
+.routing-message, .routing-warning { padding: 12px 14px; background: #fff5dd; color: #78350f; border: 1px solid #ecd39c; border-radius: 10px; line-height: 1.7; overflow-wrap: anywhere; margin-bottom: 14px; }
+.routing-empty { padding: 45px 16px; text-align: center; background: white; border-radius: 14px; }
+.routing-empty p { color: var(--muted); line-height: 1.8; }
+.routing-preview { width: min(640px, calc(100% - 28px)); max-height: 85dvh; border: 1px solid var(--border); border-radius: 16px; padding: 22px; color: var(--text); }
+.routing-preview::backdrop { background: #12263a80; }
+.routing-preview ul { padding: 0; list-style: none; }
+.routing-preview li { padding: 12px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; line-height: 1.7; }
+.routing-preview li small { display: block; color: var(--muted); }
+.routing-dialog-actions { display: flex; gap: 10px; justify-content: end; position: sticky; bottom: -22px; padding: 14px 0; background: white; }
+.routing-sr { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+@media (min-width: 961px) { body:has(.routing-editor) { grid-template-columns: 240px minmax(0, 1fr); } .routing-editor { --routing-nav-height: 0px; } }
+@media (max-width: 1099px) {
+  .routing-editor button, .routing-editor select, .routing-editor input:not([type=checkbox]):not([type=hidden]) { min-height: 44px; }
+  .routing-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .routing-list-head { display: none; }
+  .routing-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; background: none; border: 0; }
+  .routing-row { display: flex; flex-direction: column; gap: 12px; background: white; border: 1px solid var(--border); border-radius: 14px; }
+  .routing-row:last-child { border-bottom: 1px solid var(--border); }
+  .routing-row > div { width: 100%; }
+  .routing-row-actions button { min-height: 44px; font-size: 13px; }
+  .routing-time { margin-top: 5px; }
+}
+@media (max-width: 640px) {
+  .routing-heading { align-items: start; }
+  .routing-heading h2 { font-size: 22px; }
+  .routing-heading a { max-width: 100px; font-size: 11px; }
+  .routing-list { grid-template-columns: minmax(0, 1fr); }
+  .routing-filters { padding: 12px; gap: 10px; }
+  .routing-search { grid-column: 1/-1; }
+  .routing-filter-actions { gap: 8px; }
+  .routing-summary { gap: 6px; }
+  .routing-summary button { flex: 1 1 auto; padding: 10px 8px; font-size: 12px; }
+  .routing-summary button strong { margin-left: 5px; }
+  .routing-savebar { flex-direction: column; align-items: stretch; gap: 10px; padding: 12px; }
+  .routing-save-actions button { flex: 1 1 auto; min-height: 44px; }
+  .routing-savebar strong { font-size: 13px; }
+  .routing-savebar small { display: inline; margin-left: 8px; }
+  .routing-preview { padding: 16px; }
+}

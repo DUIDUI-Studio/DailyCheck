@@ -180,6 +180,7 @@ ROUTE_MATRIX: dict[str, str] = {
     # 内容含部署阶段耗时 / 会话 token 用量，属内部运维信息 → 仅平台超管。
     "ops.ops_dashboard": PLATFORM,
     "item_routing.admin": PLATFORM,
+    "item_routing.batch": PLATFORM,
     "item_routing.set_route": PLATFORM,
     "item_routing.delete_route": PLATFORM,
     # ---- owner_approvals（待拍板队列：Prod Agent 登记红线 PR，owner 一键批）----
