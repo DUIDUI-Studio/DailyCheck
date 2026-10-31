@@ -14,7 +14,7 @@
 
 判断规则：
   报告 01：PR body 含 "## 报告 1/4" + "## Checklist" + "## 生产侧事项" + 状态全 ✅
-  报告 02：ci-summary.json pytest.failed == 0 && gate_exit == 0
+  报告 02：完整 native/session/hash 证据一致 && gate_exit == 0
   报告 03：ci-summary.json ruff.warnings == 0 && bandit.high_vuln == 0
   报告 04：reports/pr-<num>/04-*.md 存在 + 含 "## 4. 启动日志摘要" + "## 7. 报告签名"
 
@@ -33,6 +33,13 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from scripts.check_known_failures import (  # noqa: E402
+    load_known_ids,
+    unexpected_failures,
+    validate_evidence,
+)
+
 REPORTS_DIR = REPO_ROOT / "reports"
 CI_SUMMARY = REPORTS_DIR / "ci-summary.json"
 
@@ -70,16 +77,33 @@ def check_report_02_and_03() -> dict:
     bandit_high = _as_int_or_none(bandit_high_raw)
     radon_high = _as_int_or_none(radon_high_raw)
 
-    print(f"[check_reports] 报告 02: pytest failed={failed}, gate_exit={gate}（全绿标准=gate_exit==0，failed 数仅记录）")
+    print(f"[check_reports] 报告 02: pytest failed={failed}, gate_exit={gate}（全绿还须真实 native/session/hash 完整证据）")
     print(f"[check_reports] 报告 03: ruff warnings={ruff_warn}, bandit high={bandit_high}, radon high={radon_high}")
 
-    # 报告 02 全绿定义：known_failures gate 通过（gate_exit=0）。
-    # 理由：DailyCheck 基线 16 failed 是 known_failures 内的，不算"未绿"。
-    # "零新增门禁"在 ci.yml 已先验过 pytest 输出比对 known_failures.txt。
+    # 报告 02 必须重新核对完整结果证据；不能仅相信摘要中的 gate_exit=0。
+    # 已知失败仍允许，但真实 native/session/hash、结果计数与清单都须一致。
     # 报告 03 全绿定义：ruff + bandit 高危都 0（radon 不强求，因 C/D 函数级别仅参考）。
+    completion_pass = False
+    try:
+        pytest_summary = summary.get("pytest", {})
+        evidence = json.loads((CI_SUMMARY.parent / "pytest-evidence.json").read_text(encoding="utf-8"))
+        text = (CI_SUMMARY.parent / "pytest-output.txt").read_text(encoding="utf-8")
+        counts = validate_evidence(text, evidence)
+        completion_pass = (
+            pytest_summary.get("complete") is True
+            and type(pytest_summary.get("native_exit")) is int
+            and pytest_summary["native_exit"] == evidence["native_exit"]
+            and type(pytest_summary.get("passed")) is int
+            and type(failed) is int
+            and pytest_summary["passed"] == counts["passed"]
+            and failed == counts["failed"]
+            and not unexpected_failures(evidence["session"]["failed_nodeids"], load_known_ids())
+        )
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        print("[check_reports] 报告 02 缺少或损坏真实 native/session/hash 证据")
     quality_pass = ruff_warn == 0 and (bandit_high is None or bandit_high == 0)
     return {
-        "test_pass": gate == 0,
+        "test_pass": type(gate) is int and gate == 0 and completion_pass,
         "quality_pass": quality_pass,
         "summary": summary,
     }
