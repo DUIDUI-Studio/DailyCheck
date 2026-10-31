@@ -144,7 +144,12 @@ def _source_tokens(usage, raw, provider):
         )
     )
     for field, key in cache:
-        if not measured or key in raw and not valid(raw[key]):
+        if (
+            not measured
+            or (provider == "claude" and key not in raw)
+            or key in raw
+            and not valid(raw[key])
+        ):
             result[field] = None
             if provider == "codex":
                 result["input"] = None
@@ -613,6 +618,8 @@ def preserve_history(rows: list[dict], previous: list[dict]) -> list[dict]:
     for row in rows:
         key = record_key(row)
         old = prior.pop(key, {})
+        if old.get("legacy_usage_audit") and not row.get("legacy_usage_audit"):
+            row["legacy_usage_audit"] = old["legacy_usage_audit"]
         for field in (
             "worktree_instance_id",
             "worktree_id",
@@ -658,7 +665,7 @@ def preserve_history(rows: list[dict], previous: list[dict]) -> list[dict]:
                 continue
             _finish_usage(old, {})
         out.append(old)
-    return out
+    return reconcile_legacy_overlap(out)
 
 
 def record_key(row: dict) -> str:
@@ -678,3 +685,69 @@ def record_key(row: dict) -> str:
             ).encode()
         ).hexdigest()
     )
+
+
+def reconcile_legacy_overlap(rows: list[dict]) -> list[dict]:
+    """Exclude only possibly overlapping ID-less totals; retain their values as audit facts.
+
+    An old whole-dispatch total has no event identity. It cannot safely be added to new
+    event-based usage in the same possible session/worktree. Disjoint projects, hosts,
+    instances, paths or explicit provider sessions still retain their known history.
+    """
+
+    def positive(tokens):
+        return isinstance(tokens, dict) and any(
+            isinstance(tokens.get(k), int) and not isinstance(tokens[k], bool) and tokens[k] > 0
+            for k in BASE_KEYS
+        )
+
+    measured = [
+        r
+        for r in rows
+        if isinstance(r.get("usage_events"), list)
+        and any(positive(e.get("tokens")) for e in r["usage_events"])
+    ]
+
+    def may_overlap(old, new):
+        for key in ("repo_id", "host_id", "worktree_instance_id"):
+            if old.get(key) and new.get(key) and old[key] != new[key]:
+                return False
+        a, b = normalize_path(old.get("worktree_path")), normalize_path(new.get("worktree_path"))
+        if a and b and a != b:
+            return False
+        sessions = {e.get("session_id") for e in new["usage_events"] if e.get("session_id")}
+        if old.get("session_id") and sessions and old["session_id"] not in sessions:
+            return False
+        return True
+
+    result = []
+    for row in rows:
+        if (
+            not isinstance(row.get("usage_events"), list)
+            and positive(row.get("tokens"))
+            and any(may_overlap(row, new) for new in measured)
+        ):
+            audit = row.get("legacy_usage_audit") or {
+                key: row.get(key)
+                for key in ("tokens", "model_effective", "collected_at", "ts", "cost", "currency")
+            }
+            audit = {
+                **audit,
+                "attribution_status": "overlap_unknown",
+                "reason": "ID-less historical total may overlap measured events",
+            }
+            row = {
+                **row,
+                "legacy_usage_audit": audit,
+                "tokens": None,
+                "usage_events": [],
+                "cost": None,
+                "warnings": list(
+                    dict.fromkeys(
+                        (row.get("warnings") or [])
+                        + ["legacy_usage_overlap_unknown:not_added_to_known_total"]
+                    )
+                ),
+            }
+        result.append(row)
+    return result

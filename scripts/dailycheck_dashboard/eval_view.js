@@ -64,6 +64,13 @@
     }
     return total;
   }
+  function latestActivity(f) {
+    return Math.max(
+      f.at ?? -Infinity,
+      ...f.events.map((e) => e.last_at ?? e.at ?? -Infinity),
+      f.interval?.[1] ?? -Infinity,
+    );
+  }
   function select(data, opts = {}) {
     const lo = opts.start ?? -Infinity,
       hi = opts.end ?? Infinity,
@@ -180,7 +187,7 @@
     };
   }
   // Exposed as a deterministic oracle for browser projection parity tests.
-  window.__dailycheckEval = { select, summarize, union };
+  window.__dailycheckEval = { select, summarize, union, latestActivity };
   function options(id, values) {
     for (const v of uniq(values).sort()) {
       const o = document.createElement("option");
@@ -254,7 +261,7 @@
         return `<details><summary>${esc(fs[0].worker || (fs[0].kind === "execution" ? "身份未识别执行" : "未归属会话"))} · ${esc(uniq(fs.map((f) => label(f.role))).join(" / "))} · ${s.executions} 次执行 · ${tok(s.total)} Token · ${dur(s.worker_seconds)}</summary><div class="ev-details-body">${fs
           .map((f) => {
             const ss = summarize([f]);
-            return `<details><summary>${esc(f.dispatch || f.id)} · ${esc(f.agent)} / ${esc(f.effort || "effort 未知")} · ${f.retry_of ? "重试" : "执行"} · ${tok(ss.total)}</summary><dl><dt>Task / Issue</dt><dd>${esc(f.task || "—")} / ${esc(f.issue ? "#" + f.issue : "—")}</dd><dt>Provider session</dt><dd>${esc(f.session || uniq(f.events.map((e) => e.session_id)).join(" / ") || "—")}</dd><dt>请求 / 实际</dt><dd>${esc(f.requested || "—")} → ${esc(f.models.map(label).join(" / "))}${f.requested && !f.models.includes(f.requested) && !f.models.includes("unknown") ? " · 请求与实际不同" : ""}</dd><dt>开始 / 结束</dt><dd>${esc(f.started_at || "—")} / ${esc(f.ended_at || "—")}${f.running ? " · 运行已确证至采集快照" : ""}</dd><dt>已知用量</dt><dd>${esc(tokenDetail(ss))}${ss.token_coverage < 1 ? " · 分项缺失/未测量" : ""}</dd><dt>执行 / 重试链</dt><dd>${esc(f.dispatch || "未知")} / ${esc(f.retry_of || "无显式 retry_of")}</dd><dt>来源 / 新鲜度</dt><dd>${esc(f.collected_at || "采集时间未知")} · ${esc(label(f.freshness))}</dd><dt>数据警告</dt><dd>${esc(f.warnings.join(" · ") || "—")}</dd></dl><div class="tbl"><table><thead><tr><th>模型段 / 会话事件</th><th>事件时间 CST</th><th>Token 分项</th></tr></thead><tbody>${f.events.map((e) => `<tr><td>${esc(label(e.model))}<small class="ev-muted">${esc(e.first_event_id || e.event_id)}${e.event_count ? " … " + esc(e.last_event_id) + " · " + e.event_count + " 个源事件" : ""}${e.counter_reset ? " · 计数器重置" : ""}</small></td><td>${e.at == null ? "按派单时间归档" : esc(stamp(e.at)) + " · CST 日模型桶"}</td><td>${esc(tokenDetail({ tokens: e.tokens }))}${e.complete ? "" : " · 部分分项"}</td></tr>`).join("") || '<tr><td colspan="3">缺少用量事件</td></tr>'}</tbody></table></div></details>`;
+            return `<details><summary>${esc(f.dispatch || f.id)} · ${esc(f.agent)} / ${esc(f.effort || "effort 未知")} · ${f.retry_of ? "重试" : "执行"} · ${tok(ss.total)}</summary><dl><dt>Task / Issue</dt><dd>${esc(f.task || "—")} / ${esc(f.issue ? "#" + f.issue : "—")}</dd><dt>Provider session</dt><dd>${esc(f.session || uniq(f.events.map((e) => e.session_id)).join(" / ") || "—")}</dd><dt>请求 / 实际</dt><dd>${esc(f.requested || "—")} → ${esc(f.models.map(label).join(" / "))}${f.requested && !f.models.includes(f.requested) && !f.models.includes("unknown") ? " · 请求与实际不同" : ""}</dd><dt>开始 / 结束</dt><dd>${esc(f.started_at || "—")} / ${esc(f.ended_at || "—")}${f.running ? " · 运行已确证至采集快照" : ""}</dd><dt>已知用量</dt><dd>${esc(tokenDetail(ss))}${ss.token_coverage < 1 ? " · 分项缺失/未测量" : ""}</dd><dt>执行 / 重试链</dt><dd>${esc(f.dispatch || "未知")} / ${esc(f.retry_of || "无显式 retry_of")}</dd><dt>来源 / 新鲜度</dt><dd>${esc(f.collected_at || "采集时间未知")} · ${esc(label(f.freshness))}</dd>${f.legacy_usage_audit ? `<dt>历史待核对用量</dt><dd>${esc(tokenDetail({ tokens: f.legacy_usage_audit.tokens }))} · 可能与事件用量重叠，未加入已知合计</dd>` : ""}<dt>数据警告</dt><dd>${esc(f.warnings.join(" · ") || "—")}</dd></dl><div class="tbl"><table><thead><tr><th>模型段 / 会话事件</th><th>事件时间 CST</th><th>Token 分项</th></tr></thead><tbody>${f.events.map((e) => `<tr><td>${esc(label(e.model))}<small class="ev-muted">${esc(e.first_event_id || e.event_id)}${e.event_count ? " … " + esc(e.last_event_id) + " · " + e.event_count + " 个源事件" : ""}${e.counter_reset ? " · 计数器重置" : ""}</small></td><td>${e.at == null ? "按派单时间归档" : esc(stamp(e.at)) + " · CST 日模型桶"}</td><td>${esc(tokenDetail({ tokens: e.tokens }))}${e.complete ? "" : " · 部分分项"}</td></tr>`).join("") || '<tr><td colspan="3">缺少用量事件</td></tr>'}</tbody></table></div></details>`;
           })
           .join("")}</div></details>`;
       })
@@ -288,13 +295,7 @@
           ? g.workers
           : sorting === "time"
             ? (g.worker_seconds ?? -1)
-            : Math.max(
-                ...g.facts.flatMap((f) => [
-                  f.at ?? -Infinity,
-                  ...f.events.map((e) => e.at ?? -Infinity),
-                  f.interval?.[1] ?? -Infinity,
-                ]),
-              );
+            : Math.max(...g.facts.map(latestActivity));
     groups.sort((a, b) =>
       sorting === "name"
         ? a.facts[0].name.localeCompare(b.facts[0].name, "zh-CN")

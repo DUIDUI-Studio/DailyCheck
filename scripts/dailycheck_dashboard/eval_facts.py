@@ -6,7 +6,12 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 
-from scripts.model_eval.collect_pure import BASE_KEYS, normalize_path, parse_ts
+from scripts.model_eval.collect_pure import (
+    BASE_KEYS,
+    normalize_path,
+    parse_ts,
+    reconcile_legacy_overlap,
+)
 from scripts.model_eval.collect_pure import record_key as row_key
 
 REQUIRED_CHECKS = ("CI / test (pull_request)", "CI / agent-framework-reports (pull_request)")
@@ -95,7 +100,9 @@ def prepare_facts(
         unique[row_key(row)] = row
     facts, seen_events = [], set()
     pr_by_key = {(p.get("repo_id") or DEFAULT_REPO, int(p["number"])): p for p in prs}
-    for rid, row in unique.items():
+    reconciled = reconcile_legacy_overlap(list(unique.values()))
+    for row in reconciled:
+        rid = row_key(row)
         repo, host = row.get("repo_id") or DEFAULT_REPO, row.get("host_id") or "unknown"
         path = normalize_path(row.get("worktree_path"))
         instance = row.get("worktree_instance_id")
@@ -221,7 +228,8 @@ def prepare_facts(
                 "started_at": row.get("started_at"),
                 "ended_at": row.get("ended_at"),
                 "running": row.get("running") is True,
-                "at": parse_ts(row.get("ts")),
+                "at": parse_ts(row["fact_ts"] if "fact_ts" in row else row.get("ts")),
+                "legacy_usage_audit": row.get("legacy_usage_audit"),
                 "prs": links,
                 "issue": row.get("issue"),
                 "freshness": fresh,

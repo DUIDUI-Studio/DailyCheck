@@ -410,13 +410,13 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 **持久化**：原 JSONL 字段兼容，v2 增加实例/Dispatch/session/生命周期与 usage_events；
 原 `dispatch_ledger` 仅增量添加 facts_json，UTC 身份幂等，保留删除工作树历史。
 缺时间的存储哨兵查询后恢复 null，不能成为业务时间。源失败退回历史并显示陈旧/未知，
-新鲜度取源 collected_at，非 DB updated_at。各源独立降级。
+新鲜度取源 collected_at，非 DB updated_at。各源独立降级。内存回退也恢复 fact_ts，\n存储哨兵不能重现为业务日期；日桶最近活动排序使用 last_at，不使用日首。
 
 **数量和 Token**：repo+host+worktree instance 优先，历史路径归组标近似；Worker 认
 process incarnation，缺身份执行与未归属会话单列，Dispatch 不冒充人数，retry_of 才算重试。
 PR 按 repo+number 去重、顶部跨树再去重，准确 head_ref 可建立分支关联。
 Token 基础项互斥，reasoning 仅为输出子项；多模型事件按实际段过滤，不拼接假模型。
-无事件时间的历史整次用量明确按派单时间归档，模型不可拆分总量单列。
+无事件时间的历史整次用量明确按派单时间归档，模型不可拆分总量单列。\n缺 Claude 缓存字段保持 null/partial；无事件 ID 的历史总量若可能与新事件重叠，\n保留 legacy_usage_audit 原值及原因、详情可见，排除出已知合计并降低覆盖；已证明\n不同实例/路径/会话的历史及来源失败但没有重叠的已知用量仍保留。
 
 **时间**：默认近 7 天、CST 日边界转 UTC 半开区间；执行区间截断窗口，同 Worker
 先求并集再跨 Worker 累加，工作树历时另算。缺结束只在 agent projection.liveness

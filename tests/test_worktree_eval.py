@@ -163,10 +163,13 @@ def test_window_event_and_legacy_dispatch_attribution_cst_boundary():
                 ts=before,
                 started_at=None,
                 ended_at=None,
-                usage_events=[evt(at=before), evt("e2", at=boundary)],
+                usage_events=[
+                    evt(at=before, session_id="measured"),
+                    evt("e2", at=boundary, session_id="measured"),
+                ],
             ),
-            row("d2", ts=before, started_at=None, ended_at=None),
-            row("d3", ts=boundary, started_at=None, ended_at=None),
+            row("d2", ts=before, started_at=None, ended_at=None, session_id="legacy-2"),
+            row("d3", ts=boundary, started_at=None, ended_at=None, session_id="legacy-3"),
         ]
     )
     s = ef.summarize(
@@ -799,3 +802,93 @@ def test_actual_v1_table_migrates_without_dropping_legacy_rows(tmp_path):
 def test_issue_hash_search_matches_explicit_issue_number():
     data = facts([row(issue=102), row("d2", issue=103)])
     assert len(ef.select_facts(data, query="#102")) == 1
+
+
+def test_recent_activity_uses_last_source_time_inside_same_day_bucket():
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    if not shutil.which("node"):
+        pytest.skip("Node optional in pytest; real-browser recency check is a release gate")
+    source = Path("scripts/dailycheck_dashboard/eval_view.js").read_text()
+    function = re.search(r"function latestActivity\(f\) \{[\s\S]*?\n  \}", source).group()
+    first = {"at": None, "events": [{"at": 1, "last_at": 9}], "interval": None}
+    later_day_start = {"at": None, "events": [{"at": 2, "last_at": 3}], "interval": None}
+    command = (
+        function
+        + "\nconsole.log(JSON.stringify(["
+        + ",".join("latestActivity(" + json.dumps(f) + ")" for f in (first, later_day_start))
+        + "]));"
+    )
+    result = subprocess.run(["node", "-e", command], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == [9, 3]
+
+
+def test_claude_absent_cache_fields_are_unknown_partial_and_codex_semantics_stay():
+    source = {
+        "type": "assistant",
+        "sessionId": "s",
+        "message": {
+            "id": "cache-missing",
+            "model": "m1",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        },
+    }
+    event = parse_claude_transcript([json.dumps(source)], "/s", 0).events[0]
+    assert event["tokens"]["cache_read"] is None and event["tokens"]["cache_write"] is None
+    assert event["complete"] is False
+    result = ef.summarize(facts([row(usage_events=[event])]))
+    assert result["total"] == 15 and result["token_coverage"] == 0
+    assert parse_codex(codex_sample()).events[0]["tokens"]["cache_write"] == 0
+
+
+def test_retained_v1_reassignment_excludes_overlap_but_preserves_audit_and_coverage():
+    from scripts.model_eval.collect_pure import preserve_history
+
+    old = row("A")
+    current_a = row("A", tokens=None, usage_events=[])
+    current_b = row("B", usage_events=[evt()])
+    retained = preserve_history([current_a, current_b], [old])
+    summary = ef.summarize(facts(retained))
+    assert summary["total"] == 135 and summary["token_coverage"] == 1 and summary["rows"] == 2
+    audit = next(r for r in retained if r["dispatch_id"] == "A")["legacy_usage_audit"]
+    assert audit["tokens"] == usage() and audit["attribution_status"] == "overlap_unknown"
+    assert any("overlap_unknown" in w for w in retained[0]["warnings"])
+    refreshed = preserve_history([row("A", tokens=None, usage_events=[]), current_b], retained)
+    assert refreshed[0]["legacy_usage_audit"]["tokens"] == usage()
+    assert ef.summarize(facts(refreshed))["total"] == 135
+
+
+def test_v1_history_known_totals_survive_source_failure_and_disjoint_event_sources():
+    from scripts.model_eval.collect_pure import preserve_history
+
+    old = row("A")
+    retained = preserve_history([row("A", tokens=None, usage_events=[])], [old])
+    assert ef.summarize(facts(retained))["total"] == 135
+    separate = row("B", worktree_path="/other", worktree_instance_id="other", usage_events=[evt()])
+    retained = preserve_history([row("A", tokens=None, usage_events=[]), separate], [old])
+    assert ef.summarize(facts(retained))["total"] == 270
+    assert "legacy_usage_audit" not in retained[0]
+
+
+def test_db_read_migration_reconciles_v1_overlap_even_without_collector_retention():
+    old = row("A")
+    measured = row("B", usage_events=[evt()])
+    projected = facts([old, measured])
+    assert ef.summarize(projected)["total"] == 135
+    assert projected[0]["legacy_usage_audit"]["tokens"] == usage()
+
+
+def test_db_failure_memory_fallback_restores_unknown_business_time(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(json.dumps(row(ts=None, started_at=None, ended_at=None)) + "\n")
+    parsed = ledger_db.parse_ledger(path)
+    assert parsed[0]["ts"] == "1970-01-01T00:00:00Z"  # storage identity only
+    prepared = facts(parsed)
+    assert prepared[0]["at"] is None
+    assert ef.select_facts(prepared, start=0, end=2e9) == []
+    assert ef.summarize(ef.select_facts(prepared))["total"] == 135
+    actual_epoch = facts([ledger_db._normalise(row(ts="1970-01-01T00:00:00Z"))])
+    assert actual_epoch[0]["at"] == 0
