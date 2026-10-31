@@ -41,12 +41,13 @@ if [[ -s "${REUSE_FILE}" ]]; then
   PYTEST_EXIT=0
 else
   echo "[generate_reports] running pytest ..."
-  python3 -m pytest \
+  TEST_DB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")" || exit 2
+  DAILYCHECK_DB_DIR="${TEST_DB_DIR}" python3 -m pytest \
     --basetemp=/tmp/pytest-dc-af \
-    -q --tb=no \
-    --ignore=tests/mcp_server \
+    -q --tb=no -rfE \
     > "${PYTEST_OUTPUT}" 2>&1
   PYTEST_EXIT=$?
+  rm -rf "${TEST_DB_DIR}"
 fi
 
 # 提取数字（pytest -q 输出形如 "5 failed, 800 passed in 30.5s"）
@@ -55,7 +56,7 @@ FAILED=$(echo "${PYTEST_SUMMARY}" | grep -oE '[0-9]+ failed' | head -1 | grep -o
 PASSED=$(echo "${PYTEST_SUMMARY}" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '[0-9]+' || echo "0")
 
 # 跑 known_failures 门禁
-GATE_RESULT="$(python3 "${REPO_ROOT}/scripts/check_known_failures.py" "${PYTEST_OUTPUT}" 2>&1)" || true
+GATE_RESULT="$(python3 "${REPO_ROOT}/scripts/check_known_failures.py" "${PYTEST_OUTPUT}" 2>&1)"
 GATE_EXIT=$?
 
 cat > "${OUT_DIR}/02-test-report.md" <<EOF
