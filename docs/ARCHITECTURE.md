@@ -173,6 +173,7 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
 **铁律**：
 - **nginx 备份绝不写 `sites-enabled/`** —— 主配置 `include sites-enabled/*` 会把 `.bak` 当配置加载 → duplicate upstream 永久 fail（Issue #24 Bug A）。统一落 `BACKUP_DIR`（默认 `/var/lib/dailycheck-blue-green-backups/`）。
 - **`verify.sh` 禁用 `set -e`** —— check 失败由 `OVERALL_PASS` 跟踪，`trap _write_report EXIT` 兜底保证任何失败路径都写报告（Issue #24 Bug B）。
+- **check 1 全量与测试隔离（Issue #103）** —— 包含 MCP 目录，pytest 的 `DAILYCHECK_DB_DIR` 与 basetemp 落独立临时目录；结束后清理测试目录，并原样返回零新增门禁结果。部署数据库隔离证据与其余七项验证保持原有语义。
 - **check 1 禁止兜底** —— 真跑 pytest（`-rf` 产出 FAILED 行）+ 复用 `scripts/check_known_failures.py` 判「失败集 ⊆ known_failures.txt」，不允许把失败兜成 PASS。
 - **check 2 禁止静默跳过** —— `scripts/playwright/sim_user.py`（纯 stdlib）真走 登录→选仓→总览→库存→健康报表 5 路径（含 CSRF 回填）；凭据走 `SIM_USER_USER` / `SIM_USER_PASSWORD` 环境变量，缺失直接 FAIL。末条 `/report/health`（Issue #38 补）需 **manager+ 账号**（平台 admin 放行），403 按失败处理不降级；同时校验落点须停在 `/report/health`——会话丢失会 302 到 `/login` 再返回 200，只看 status 会假绿。
 - **check 2 凭据必须 provision 进「绿」库（Issue #34）** —— sim_user 的 HTTP 凭据校验发生在**绿进程持有的库**上，而 verify.sh 跑的 wrapper shell 不在绿 unit 环境里。因此 `_ensure_sim_user_in_green_db()` 必须用**显式 `DAILYCHECK_DB_DIR=${GREEN_DB}` 覆盖**（子 shell 内赋值，禁止继承调用者环境）幂等 ensure 账号，且必须带 **`--admin`**（非 admin 用户在选仓页只看到 `warehouse_users` 绑定的仓，而 create-user 不写绑定 → 空选仓页 → 探针路径 3 必失败）；探针前再复核「绿库有该账号 + 密码匹配 + 未停用（`is_active`）+ 有可见仓」（覆盖 up.sh 快照里同名不同密码 / 已停用 / 非 admin 账号的情形），并在**写库之前**先用「路径形态 + inode 相异」双闸自证 `${GREEN_DB}` 不是蓝库（check 7 排在 check 2 之后，误配时否则会先把一个已知口令的 admin 写进 production 真库）。**裸跑 `flask create-user` 会写蓝库（production 真库）** —— 绿库查无此人导致路径 2 恒 401，实测见 Issue #34；任何新增的「verify 里要碰 DB 的步骤」都必须照此 pin env 到目标侧库。
@@ -1633,6 +1634,11 @@ sequenceDiagram
     T-->>A: JSON-RPC result
 ```
 
+**消费工具 ACL（Issue #103）**：`warehouse_consumption` / `item_consumption` 在 handler 内先按
+`GET /api/v1/consumption/warehouse` / `GET /api/v1/consumption/item/<id>` 调用既有
+`check_path`，再进入带仓库范围检查的服务层。空读路径、仅写路径或不相干读路径失败关闭；
+路径授权与仓库白名单必须同时满足，拒绝发生在仓库解析、打开和迁移之前。
+
 **工具调用审计（Issue #85）**：`protocol/server.py::call_tool` 在 `finally` 中为每次进入该路由的调用追加恰好一条 JSONL 记录。`status` 是业务结果（成功 200 / `McpError.http_status` / 未知工具 400 / 非预期异常 500），不是 HTTP 传输状态；`agent_token_id` 取自 AuthMiddleware 发布的请求级 `AuthContext`，缺失时为 `null`，绝不回退到进程 env token 重新认证。日志写入失败被吞掉，handler 不会重跑。未进入 `call_tool` 的 401/429、SDK 参数校验、`initialize` / `tools/list` 仍只有传输层日志。细节见 §9.5。
 
 ### 7.3 跨库发货提交协议（2026-10-29，多仓履约 Task 5）
@@ -1885,7 +1891,7 @@ flowchart LR
 
 ### 9.2 29 个 MCP 工具
 
-**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 原缺路径检查由 bot adapter 的固定路径矩阵补齐；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
+**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
 | 工具 | 服务模块 | 路径 ACL | 仓库范围 |
 |------|----------|----------|----------|
@@ -2454,6 +2460,28 @@ flowchart LR
 
 ## 12. 测试架构
 
+**完整 MCP 门禁（Issue #103，2026-10-31 起）**：CI test job、`verify.sh` check 1 与
+`generate_reports.sh` 的本地 fallback 都收集 `tests/mcp_server/`，不再整目录排除。
+三入口均给 pytest 注入临时 `DAILYCHECK_DB_DIR`；verify/fallback 在结束后清理该目录。
+CI 继续把原生 pytest 摘要交给 reports job 复用，不重复全量执行。
+`generate_reports.sh` 保留 known-failure checker 的真实退出码，即使失败仍生成报告，
+`ci-summary.json` 的 `gate_exit` 与最终退出码不得被恒真后缀覆盖；已知失败清单只许收缩。
+
+`tests/mcp_server/conftest.py` 的 autouse fixture 为每例初始化临时 master，覆盖 root/db/
+MCP config/UoW 的导入期路径绑定并隔离 access.log 与认证 ContextVar；SQLite 连接守卫
+拒绝打开该例目录以外的文件（含 URI/软链解析），防止遗漏新别名后触及默认或真实库。
+采购 hub 在实现不可用时先返回空结果，不再为降级路径读取仓库列表；测试分别断言全仓/
+指定仓分支不执行 DB lookup。蓝绿 config 默认路径用例显式清除外层 DB env 后再验证默认值。
+
+`test_protocol/test_consumption_http.py` 用 loopback 临时端口的真实 Uvicorn、生产 Starlette
+app/lifespan、数据库 Bearer token 与 StreamableHTTP initialize/initialized/tools-call 链覆盖
+两消费工具的空/错误/兄弟路径/仅写路径拒绝、正确/父级/通配路径成功、空仓范围/跨仓拒绝，
+并验证每次审计归属与跨 token 请求不串身份。拒绝前后对 master、旧版本仓库及迁移产物做
+完整文件字节快照，确保连隐式迁移也未发生。`tests/test_mcp_full_suite_gates.py` 在脚本
+沙箱执行 verify 的 pytest/checker 与 reports 的复用/fallback 四象限：已知失败可通过、
+新增 MCP 失败必拦截，失败仍产出报告。测试环境以 requirements 的 MCP 1.x 和 CI Python
+3.12 为准；本地 `.venv` 若为 MCP 2.x 不作为兼容性证据。
+
 Issue #87 根目录 `test_mcp_document_writes.py` / `test_warehouse_document_migrations.py`
 覆盖旧位置调用、小数、HALF_EVEN与REAL精度边界、重放/冲突/删除后不复活、4写故障注入、
 提交后缓存故障、SQLite条件UPDATE、multiprocessing.Barrier+独立连接的create和Web/MCP撤销竞争；
@@ -2551,13 +2579,13 @@ flowchart TB
 
 **外部通知基线（2026-10-16，`feat/store-order-wecom-notify`，基于 `1aa9cbc`）**：14 failed / 1156 passed（CI 口径 `pytest tests/ --ignore=tests/mcp_server`，`--basetemp=/tmp/pytest-dc`）。失败集与 `known_failures.txt` 逐行一致（14/16，`mcp_server` 两条在该口径下不收集），`scripts/check_known_failures.py` exit 0，零新增。新增 `test_wecom_notify_pure.py` 44 用例 + `test_wecom_notify_hook.py` 4 用例，全部 **monkeypatch `urllib.request.urlopen`、不透网**，夹具 webhook 为运行期拼接的假地址（不含真实 key）。
 
-⚠️ **基线数字必须写明口径**（两套数字不能混用）：
+⚠️ **历史基线数字必须写明口径**（以下为 #103 之前，两套历史数字不能混用；当前 CI/本地均全量含 MCP）：
 - **CI 口径** = `pytest tests/ --ignore=tests/mcp_server`：**以本文件最近一条基线为准**（2026-10-16：14 failed / 1156 passed）。CI 以此为准，`known_failures.txt` 的 `mcp_server` 两行在 CI 里永不触发（属超集）。
 - **本地全量** = `pytest tests/`（本地 python3.12 能跑 mcp 测试：2 failed / 78 passed）：失败数 = CI 口径 + 2（2026-10-15 实测 16 failed / 1006 passed；passed 数随新增用例变化，引用旧值须换算）。
 - 「零新增对比法」比对的是**失败集逐行**，不是 passed 总数；引用总数时必须带口径，否则跨环境对比会误判。
 
 **CI 门禁（2026-10-10 起，`.github/workflows/ci.yml`；2026-10-22 起由 hub1 上的 Gitea Actions 执行）**：
-- ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（`--ignore=tests/mcp_server`，容器门控）→ `scripts/check_known_failures.py` 零新增断言。
+- ruff（仅改动 .py，pin 0.16.10）→ pytest 全量（含 MCP、临时 DB）→ `scripts/check_known_failures.py` 零新增断言。
 - `tests/known_failures.txt` = 已知失败清单，**只许收缩不许扩张**（修复一个删一行）。
 - **防假绿（2026-10-11 起）**：门禁对 pytest 收集错误 / 空输出 / 0 passed 一律拒绝放行（收集错误不产生 FAILED 行，坏依赖曾致门禁空过假绿）。测试三方依赖（如 openpyxl）必须进 requirements.txt。
 - **部署 job 已移除（2026-10-25，`f293746`）**：CI 只做门禁与通知；生产部署归 Prod Agent 蓝绿（§3.4/§3.8）。`scripts/deploy_vps.sh` 保留为应急手动路径，CI 不再调用。
@@ -2579,7 +2607,7 @@ flowchart TB
 - `mcp_server×2 / aux_unit×2 / forecast_pure×8 / items_route×2 / procurement_route×1 / recipe_cost_route×1`
 - （`nav_integration×2` 已于 2026-10-13 随导航模块化修复并移除）
 
-**门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录，**CI 会跑**（CI 用 `--ignore=tests/mcp_server` 跳过 MCP 服务层目录）。
+**门店订单 MCP 只读工具（Issue #73）**：`tests/test_store_order_mcp.py`（24 用例，真实 `master.db` 种子，覆盖「一单 6 行明细、2 次发货、0 次收货」验收种子 + ACL 三件套 + `tools/list` 注册一致性）与 `tests/mcp_server/test_service/test_store_order.py`（18 用例，mock 层，钉住 OR 可见性 → AND 过滤器的展开规则与返回形状）。前者落在 `tests/` 根目录；Issue #103 起 CI 同时收集根目录与 MCP 服务层目录。
 
 **MCP 列表分页（Issue #74）**：`tests/test_mcp_list_pagination.py`（39 用例，真实临时
 `master.db` + warehouse DB，默认种 120 条关联 outbound + 5 条孤儿 outbound / 120 条 restock，
@@ -2593,7 +2621,7 @@ clamp、非法类型的结构化错误、外部 `tools.json` 与运行时的分�
 
 **Bot PR2（Issue #80）**：`tests/bot/test_mcp_integration.py` 覆盖 22 项 schema→dispatch→临时库真实调用、19 读路径 ACL、全局读显式授权、三写允许/拒绝/并发/回执/审计、只读 SQLite 拒绝误写、缺库不创建、旧消费口径与父子开关；`test_agent_requests.py` 捕获 restock 关闭及八读逐项启停的真实请求构造。隔离 bot venv 不装入主站；权限/只读及相对路径、缺库、参与仓范围变异均由定向测试检出。
 
-**Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。CI 的 `--ignore=tests/mcp_server` 不影响这些文件。
+**Bot 管理配置台（Issue #79 PR1）**：`tests/test_bot_admin.py`（路由鉴权 / 默认 CSRF / 动态 34 主行 / 注入注册项 / 保存审计 / 7 天计数 / 非法值拒绝）、`tests/test_bot_admin_migration.py`（init 幂等 + v3 up/down）、`tests/bot/test_agent_config.py`（缺表/锁库/坏配置回退、五档校验、只收窄 9 项）、`tests/bot/test_agent_requests.py`（捕获真实请求体：顶层 `reasoning_effort`、tools 过滤、辅助调用、每消息只读一次）、`tests/bot/test_usage.py`（7 天边界/坏行/真实追加）。Issue #103 起 CI 全量收集这些文件与 MCP 目录。
 
 ---
 
@@ -2792,7 +2820,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - 采购查询复用 `compute_store_procurement`/`aggregate_hub`，通过显式只读参数绕过初始化及缓存写；hub 在聚合前按授权仓过滤。canonical 详情只读收集 bindings，不做迁移；仓库相对路径由上下文的受信数据根统一解析，缺库明确失败；六个 canonical 读仍为全局数据，必须全局显式授权，不伪称按仓裁切。
 - 审计复用 `append_admin_audit`，who 是可信 frame userid；每次调用记录工具/参数/真实结果或拒绝/耗时。写前 attempt 失败则不执行；写后结果审计失败保留真实回执并记录服务日志供核对。计数仍为 `bot_tool_calls.log`，不写业务库。
 
-**验收证据**：[`2026-10-30-bot-mcp-pr2-validation.md`](2026-10-30-bot-mcp-pr2-validation.md)；关键临时库矩阵位于 `tests/bot/test_mcp_integration.py`，实际请求捕获位于 `test_agent_requests.py`（均不在 CI 忽略的 tests/mcp_server 中）。
+**验收证据**：[`2026-10-30-bot-mcp-pr2-validation.md`](2026-10-30-bot-mcp-pr2-validation.md)；关键临时库矩阵位于 `tests/bot/test_mcp_integration.py`，实际请求捕获位于 `test_agent_requests.py`（Issue #103 起与 tests/mcp_server 一并进入完整 CI 门禁）。
 
 
 **与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，PR1 阶段不可执行；#80 PR2 实现三写护栏，生产未核实真实 userid 或未配置写范围时仍拒写。D2 八读、三写护栏与 D7 显式启用由 #80 实现，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
@@ -2801,7 +2829,7 @@ with app.test_client() as c, c.session_transaction() as s:
 
 | 风险 | 严重度 | 状态 | 处理 |
 |------|--------|------|------|
-| 15 failed 测试（本地全量口径，2026-10-27 起） | 中 | pre-existing（Issue #72 收缩 1 条：MCP 入库读链路用例修复） | 商业化前必须归零 |
+| 14 条已知失败（全量含 MCP，Issue #103 起） | 中 | 清单未扩张；MCP 采购降级、默认 DB 环境依赖及测试库隔离已修复，CI/verify/reports 恢复完整收集 | 商业化前必须归零 |
 | 订货目录把 DC 库存误作门店库存 | 中 | **已修复（Issue #67，2026-10-27）** | `list_available_dc_items()` 按 `canonical_id` 汇总本店全部绑定行 `SUM(items.quantity)`；重复绑定不再只取首行，未绑定行固定为 0，卡片/弹窗/`data-stock` 均不回退 DC 库存 |
 | 时区不一致 | **高** | pre-existing（`render_ops` 一处已修，2026-10-18） | 多租户改造前必修。已修的一处：`render_ops._render_kpis` 的「今日」判据曾用 `time.strftime`（进程本地时区）→ 在 UTC 环境（CI / dev 容器）与 `_cst_day()`（显式 +8h）错位，UTC 16:00–24:00 窗口内「今日部署 / 今日合并 PR」恒显 0；改为 `datetime.now(CST)` 与三处 +8 同源（§13.3）。**其余站点仍是 pre-existing**：全仓 `datetime.now()` / SQL `datetime('now')` 混用未收敛 |
 | **测试隐式依赖本机端口 / 环境** | 中 | pre-existing（2026-10-18 CI 实 hit） | `deploy_pipeline.sh` 的观察窗会真探 `http://127.0.0.1:8080/`。**本机 dev 容器在听该端口（返 302）→ 观察窗放行 → 用例通过；CI runner 无监听 → curl 得 000 → 触发「观察窗异常」→ 回滚 → exit 24**，表现为「本地全绿、CI 判红」。凡跑编排/部署脚本的测试必须注入 fake 外部命令（既有 `_observe_tools()` 提供 fake curl / journalctl；`blue_green_testenv.py` 提供 fake systemctl），不得依赖本机恰好有服务在跑。**新增这类用例前先看同文件既有测试怎么脱真环境**——本次就是漏抄了既有模式 |

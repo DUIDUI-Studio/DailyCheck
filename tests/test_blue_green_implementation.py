@@ -1212,7 +1212,7 @@ def _import_config_with(env: dict[str, str]) -> str:
     return r.stdout.strip()
 
 
-def test_config_db_dir_env_override(tmp_path):
+def test_config_db_dir_env_override(tmp_path, monkeypatch):
     """DAILYCHECK_DB_DIR 设置时三路径整体迁移；未设置时保持 repo 内 db/。"""
     import json
 
@@ -1222,6 +1222,7 @@ def test_config_db_dir_env_override(tmp_path):
     assert got["MASTER_DB"] == str(green_db / "master.db")
     assert got["WAREHOUSE_DB_DIR"] == str(green_db / "warehouses")
 
+    monkeypatch.delenv("DAILYCHECK_DB_DIR", raising=False)
     default = json.loads(_import_config_with({}))
     repo_db = Path(__file__).resolve().parent.parent / "db"
     assert default["DB_DIR"] == str(repo_db)

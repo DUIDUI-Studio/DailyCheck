@@ -1,7 +1,8 @@
 """Consumption MCP Tools."""
 from __future__ import annotations
 
-from mcp_server.service.auth import resolve_ctx
+from mcp_server.infra.errors import ForbiddenError
+from mcp_server.service.auth import check_path, resolve_ctx
 from mcp_server.service.consumption import (
     item_consumption as svc_item_consumption,
 )
@@ -30,6 +31,8 @@ def warehouse_consumption_impl(args: dict, *, ctx=None) -> list[dict]:
     sort_by: str = args.get("sort_by", "qty")
     limit: int = min(args.get("limit", 100), 200)
     ctx = ctx if ctx is not None else _get_ctx()
+    if not check_path(ctx, "GET", "/api/v1/consumption/warehouse"):
+        raise ForbiddenError("forbidden_path")
     return svc_warehouse_consumption(
         warehouse_code=warehouse_code,
         ctx=ctx,
@@ -50,6 +53,8 @@ def item_consumption_impl(args: dict, *, ctx=None) -> dict:
     include_turnover: bool = bool(args.get("include_turnover", False))
     turnover_days: int = args.get("turnover_days", 30)
     ctx = ctx if ctx is not None else _get_ctx()
+    if not check_path(ctx, "GET", "/api/v1/consumption/item/<id>"):
+        raise ForbiddenError("forbidden_path")
     return svc_item_consumption(
         item_id=item_id,
         warehouse_code=warehouse_code,
