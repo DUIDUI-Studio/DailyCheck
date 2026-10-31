@@ -398,21 +398,40 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 
 ---
 
-#### 3.6.2 模型效能评估（派单账本摄取，Issue #92，2026-10-30 起）
+#### 3.6.2 模型效能评估（工作树事实，Issue #102，2026-10-31）
 
-**目标**：回答「哪个 role × 模型 × 复杂度档花多少钱、重派几次、产出的 PR 是否合并」，而不是只看 token 总量。
+**主维度**：每棵工作树一行，展开 Worker → Dispatch → provider 会话/实际模型事件；
+角色 × 模型 × 复杂度是同一事实的辅助视图。`eval_facts.py` 统一身份、事件、PR、
+覆盖与时间口径；`eval_view.py` + 内嵌 `eval_view.js` 在既有静态报表内完成筛选、
+排序、分页、键盘展开和手机卡片，不增加服务或改变 `/ops` 平台超管权限。
+完整事件在账本留审计，HTML 按执行/会话/模型/CST 日精确聚合用量，保留事件数与首末
+引用；日窗口总计不截断，运行区间不压缩，避免全历史原始事件膨胀刷新载荷。
 
-**数据流**：Mac 侧采集器（Issue #91）每次派单写一行 JSONL → scp 桥落 VPS `/var/lib/dailycheck-dashboard/ledger/ledger.jsonl` → `render --ledger` 摄取 → `dispatch_ledger` 表 → `render_eval_block` 渲染。scp 桥与目录创建属生产侧事项（见 PR「生产侧事项」），本仓库只负责读取与降级。
+**持久化**：原 JSONL 字段兼容，v2 增加实例/Dispatch/session/生命周期与 usage_events；
+原 `dispatch_ledger` 仅增量添加 facts_json，UTC 身份幂等，保留删除工作树历史。
+缺时间的存储哨兵查询后恢复 null，不能成为业务时间。源失败退回历史并显示陈旧/未知，
+新鲜度取源 collected_at，非 DB updated_at。各源独立降级。
 
-**schema（与 #91 约定，不得单方面改名）**：`ts / issue / role / agent / model_requested / model_effective / effort / complexity_score / worker_id / task_id / worktree_path / pr / tokens{input,output,cache_read,cache_write,reasoning} / cost / warnings`；`tokens / cost / complexity_score / model_*` 均可为 null（历史降级行）。
+**数量和 Token**：repo+host+worktree instance 优先，历史路径归组标近似；Worker 认
+process incarnation，缺身份执行与未归属会话单列，Dispatch 不冒充人数，retry_of 才算重试。
+PR 按 repo+number 去重、顶部跨树再去重，准确 head_ref 可建立分支关联。
+Token 基础项互斥，reasoning 仅为输出子项；多模型事件按实际段过滤，不拼接假模型。
+无事件时间的历史整次用量明确按派单时间归档，模型不可拆分总量单列。
 
-**存储与幂等（`ledger_db.py`）**：新表 `dispatch_ledger`，主键 `(worker_id, ts)` + `INSERT OR REPLACE`（沿用 `ops_db.py` 口径）；`ts` 解析后统一归一为 UTC `...Z` —— `+08:00` / `Z` 两种写法是同一事实，不归一会在幂等键上产生两行。聚合按 `role × model_effective × 复杂度档`（`<4.0` / `4.0–6.4` / `>=6.5` / `unknown`），返回派单数、tokens / cost 合计（null 跳过求和但计入 `null_rows`）、重派次数（同 issue 多行 dispatch → 行数减一）、关联 PR 与派单时间。
+**时间**：默认近 7 天、CST 日边界转 UTC 半开区间；执行区间截断窗口，同 Worker
+先求并集再跨 Worker 累加，工作树历时另算。缺结束只在 agent projection.liveness
+确证 live 时计至 observed_at；PTY live、mtime、PR merge、最后日志均不能补时长。
+缺字段显示未知/已知下界和独立覆盖，不能伪零。
 
-**渲染（`render_ops.render_eval_block`）**：第 6 节（异常归因保持 5，不重排既有章节号）。每行 = role × model × 复杂度档，列 = 派单 / 重派率 / tokens / 估算成本 / PR 状态（已合并 / 开放 / 关闭未合并，从既有 `fetch_prs` 数据 join，**不新拉 Gitea**）/ 平均交付周期（dispatch ts → PR `merged_ts`，仅统计可得样本）。底部汇总窗口内总成本、总派单、数据覆盖率（有 tokens 的行 / 总行）。所有用户可控字段走 `_esc`。PR 列表拉取失败或 PR 不在结果集中时出「—」，不输出 0。
+**交付**：merged 不等于 delivered；完整成功须当前 SHA 两 required CI、Issue 关闭、
+合并和相应 production SHA 的验证/完整观察窗成功及引用。复用 PR fetch 保留 SHA，
+读取既有 deploy events.jsonl 为补充，rc=0 不单独证明交付；证据不足显示 awaiting/unknown。
+主视图不显示成本；兼容成本为 CNY，采集占位零价不解释为免费。
 
-**降级**：账本缺失 / 整份不可解析 → `OpsParseError` → 既有 `_collect` 记入 `ops_unavailable`，评估区块显示「数据源不可用」；单行损坏（半行 scp）只跳过该行。源不可用时若库内已有历史，回落到库内数据渲染并在 hint 注明「本轮回落到库内历史」。写库失败不阻塞渲染，聚合退回本轮内存数据。`dc-dashboard-refresh.service` 的 `ExecStart` 已显式传 `--ledger`（默认值兜底，不加也能跑）。
-
-**测试**：`tests/test_dashboard_ledger.py`（26 用例：时区归一 / 半行跳过 / 整份不可解析降级 / 非有限数值剔除 / 幂等 upsert / 同键 last-wins / 分档边界 / null 求和与覆盖率 / 重派计数 / PR 状态 join / 交付周期 / HTML 转义 / 数据源不可用 / 未接线不渲染）。
+**测试/设计**：`tests/test_worktree_eval.py` + 既有采集/账本/ops 测试；变异验证覆盖
+去重、累计/推理、区间、并发归属、窗口、agent 存活与交付证据；浏览器检查真实 `/ops`
+以及桌面/手机/平板。完整字段、边界及既有 cron 原子同步接线见
+[`2026-10-31-worktree-model-eval-design.md`](2026-10-31-worktree-model-eval-design.md)。
 
 ---
 
@@ -1093,49 +1112,35 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 ---
 
-### 3.16 模型效能账本采集器 `scripts/model_eval/`（Issue #91，2026-10-30 起）
+### 3.16 模型效能账本采集器 `scripts/model_eval/`（Issue #91 / #102）
 
-**目标**：把 Nightly Dispatch Drain 的派单事件与本机 Agent transcript 按 worktree 路径 join，产出「每次派单一行」的 token / 成本账本，供后续看板评估区块消费。现有看板只有「日 × source」聚合，缺 model × role × dispatch 维度。
+**只读来源**：automation dispatch.jsonl；公开 Orca worker-list（本仓库、分页）、
+worker-show、worktree-show；Claude transcript 与 Codex rollout；CNY 价目表。
+`lifecycle.py` 记录可审计 process incarnation、Task/Dispatch/retry、工作树实例和
+真实执行起止/agent 存活证明，不读写 Orca 内部数据库。CLI 失败保留历史与覆盖警告，
+Run-scoped 查询明确不覆盖其他 Run，`--no-orca` 支持离线测试。
 
-**数据源（全部只读）**：
+**用量关联**：精确唯一 preamble Task/Dispatch 标识或显式 provider session 优先，
+其次 cwd + 唯一可证明执行区间；长会话按事件切任务，同树并发不可确认则保留未归属。
+全局发现后按本项目记录路径/当前 git worktree 清单证明 cwd，陌生或未知 cwd 过滤且仅报
+数量，其他项目的未归属会话不得默认归 DailyCheck；主目录 root 会话可保留。
+mtime 只用于发现候选文件，不参与归属/时长。Claude message.id 去重；Codex 现行与
+legacy 二选一，有时间按累计增量/重置段，无时间取末次总量；无法拆模型单列。
+Token = input + output + cache_read + cache_write；reasoning 已在 output 内，不重复计。
+缺量/缺价/占位零价为 null。旧 JSONL 字段保留，v2 增量扩展见 §3.6.2 与设计文档。
 
-| 源 | 路径 | 关键字段 |
-|---|---|---|
-| 派单事件 | `~/.local/state/dailycheck/automation/state/dispatch.jsonl` | 只取 `type=="dispatch"`；`ts` / `issue` / `data.{worker_id,task_id,worktree_path,model,effort,agent,role,complexity_score,pr}` |
-| Claude transcript | `~/.claude/projects/<sanitized-cwd>/<session>.jsonl` | `cwd`、`message.model`、`message.usage`（input/output/cache_read/cache_write/reasoning） |
-| Codex rollout | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `session_meta`/`turn_context` 的 `cwd`+`model`；`token_usage_record.thread_token_usage`（现行）或 `token_count.info.total_token_usage`（legacy） |
-| 价目表 | `scripts/model_eval/pricing.json` | 每 1M token 单价（CNY），占位价 0.0 由 Owner 填真实值 |
+**输出**：`python -m scripts.model_eval collect` 原子写本机 ledger，保留已归档身份及
+源消失的历史用量（保持原采集时间，不能假装新鲜）；`--dry-run` 只输出 JSONL。
+不写 automation state，不修改 Orca，不碰生产。
 
-**join 规则**：session 的 `cwd == 派单 worktree_path` 才归属该派单；同一 worktree 被多次派单复用时，按 session 文件 mtime 落在 `[本次派单 ts, 同 worktree 下次派单 ts)` 切分。历史派单行没有 `worktree_path` 时仍入账本，`tokens/cost=null` + `warnings=["no_worktree_path"]`（降级不丢行）。
+**传输入口**：`python -m scripts.model_eval.publish --destination <approved-host>`
+提供本地锁、collect → 唯一远端 staging → 原子 rename，任何阶段失败非零退出。
+`--dry-run` 仅打印 argv；目标参数禁 shell 字符。复用现有本机 cron，启用/频次/主目录
+代码更新由 owner/Prod 运维接手，开发不安装新 daemon、不改 cron、不操作 VPS。
+既有目的端 ledger 路径与 15 分钟静态 HTML 刷新架构不变。
 
-**token 口径（易错点）**：
-
-- **Claude 必须按 `message.id` 去重后求和** —— 实测同一条 assistant 消息在 transcript 里会重复写 3 行，直接逐行求和会放大数倍。
-- **Codex 的累计值只取末次** —— `thread_token_usage` / `total_token_usage` 是累计快照，逐事件求和必然高估；`input_tokens` 含 `cached_input_tokens`，采集时拆成 `input`（非缓存）与 `cache_read`，避免缓存命中按全价重复计价。
-- `reasoning` 单独记录，不参与计价（价目表无 reasoning 单价）。
-
-**账本行 schema**（JSONL，每次派单一行）：
-
-```
-{ts, issue, role, agent, model_requested, model_effective, effort, complexity_score,
- worker_id, task_id, worktree_path, pr,
- tokens:{input,output,cache_read,cache_write,reasoning}|null, cost|null, warnings:[str]}
-```
-
-`cost` = tokens × pricing 单价之和；pricing 缺该模型 → `cost=null` + `no_pricing:<model>`，不抛异常。`model_effective` 取归属 session 里实际生效的模型（多个模型时逗号拼接 + `multiple_models` warning）。
-
-**运行**：
-
-```bash
-python3 -m scripts.model_eval collect            # 落盘 ~/.local/state/dailycheck/eval/ledger.jsonl
-python3 -m scripts.model_eval collect --dry-run  # 只打印，不写盘
-```
-
-参数：`--dispatch-jsonl` / `--out` / `--claude-dir` / `--codex-dir` / `--pricing` / `--dry-run`。**幂等 = 全量重生成**（每次从 dispatch.jsonl 重建，同输入同输出；写临时文件后 `os.replace` 原子替换）。transcript 逐行流式读取，单文件解析失败只降级该文件（warning），不中断整次采集；`dispatch.jsonl` 本身不可读才退出码 2。
-
-**写入边界**：只读 transcript 与 automation state，唯一写入路径是 `--out`（默认 `~/.local/state/dailycheck/eval/`），**绝不写 `~/.local/state/dailycheck/automation/`**。
-
-**测试**：`tests/test_model_eval_collect.py`（13 用例：Claude+Codex 正常 join / message.id 去重 / worktree 复用按 mtime 切分 / 窗口外 session 不归属 / 缺 worktree_path 降级 / pricing 缺模型 / Codex 累计值取末次（现行 + legacy 两格式）/ 损坏行容错 / dispatch 不可读退出码 / 幂等两次输出一致 / dry-run 不落盘）。
+**回归**：`tests/test_model_eval_collect.py`、`tests/test_worktree_eval.py`，覆盖显式与
+并发归属、实际模型段、累计/重置、源失败、历史保留、原子同步顺序与失败隔离。
 
 ---
 

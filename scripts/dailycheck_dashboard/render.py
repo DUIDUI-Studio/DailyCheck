@@ -41,6 +41,8 @@ class RenderInput:
     # 派单账本聚合（role × model × 复杂度档），由 ledger_db 查询后传入
     eval_groups: list[dict] = field(default_factory=list)
     eval_unavailable: bool = False
+    eval_rows: list[dict] = field(default_factory=list)
+    eval_deploy_results: list[dict] = field(default_factory=list)
     ops_unavailable: list[str] = field(default_factory=list)
     ops_fetched_at: str = ""
     # PR 列表是否真的拿到了：拉不到时 KPI 显示「—」而不是 0（两种事实不能混）
@@ -360,6 +362,9 @@ def render(input: RenderInput) -> str:
         pr_data_ok=input.pr_data_ok,
         loop_integrity=input.loop_integrity,
         eval_groups=input.eval_groups,
+        eval_rows=input.eval_rows,
+        eval_deploy_results=input.eval_deploy_results,
+        eval_snapshot=input.created_at,
         eval_unavailable=input.eval_unavailable,
     )
 
