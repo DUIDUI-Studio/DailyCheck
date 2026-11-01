@@ -42,7 +42,7 @@
 
 ## 1. 项目一句话
 
-**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 29 个工具。**
+**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 32 个工具。**
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
@@ -71,7 +71,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["29 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail)"]
+        Tools["32 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail / wms_stock_list)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -1881,7 +1881,7 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（32 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -1890,7 +1890,7 @@ flowchart LR
     subgraph MCP["mcp_server/ 进程 (uvicorn :5100)"]
         Main["main.py<br/>lifespan + AuthMiddleware + 健康检查"]
         Protocol["protocol/<br/>server.py + tools/"]
-        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical / store_order"]
+        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical / store_order / wms"]
         Data["data/<br/>master.py / warehouse.py / unit_of_work.py"]
         Infra["infra/<br/>errors.py / access_log.py"]
     end
@@ -1902,19 +1902,19 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 29 个 MCP 工具
+### 9.2 32 个 MCP 工具
 
-**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
+**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 32 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
 **统一登记（Issue #104）**：`mcp_server/protocol/registry.py::REGISTRY` 是唯一工具登记，
 每项包含原始 `Tool` 声明、真实 callable handler、业务域、读写意图、路径/范围的**实际执行位置**、
 内部可验证输出 JSON shape、外部子集/Bot批准状态及回归引用。`tools.get_tools()` 深复制声明，
 `server._tool_map` 从登记派生；启动时拒绝重名/无效handler，检查命令另扫描全部工具模块，
 拒绝漏注册实现、漏实现和错误绑定。Bot 的显式批准白名单仍由 `bot/tool_contract.py` 独立持有，
-仅做一致性核对，不从动态发现授予权限；29运行项、16外部集成子集、22 Bot批准项、七canonical写禁用不变。
+仅做一致性核对，不从动态发现授予权限；32运行项、19外部集成子集、22 Bot批准项、七canonical写禁用不变。
 
 完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
-及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留16项子集，不是完整注册表。
+及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留19项子集，不是完整注册表。
 `python -m scripts.mcp_contracts --write/--check` 确定性生成/只读校验三份产物，检查失败返回非零；
 JSON 对象键递归排序，保留全部元数据和值及数组次序，消除 SDK 字段声明顺序造成的文本漂移；
 `--check` 仍逐字校验，不放行真实内容变化、非规范格式或尾随文本。
@@ -1993,6 +1993,23 @@ list只增加doc_no/line_no/input_quantity（字符串或null）/factor（number
 MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁内判状态。
 warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
 retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
+
+#### 9.2.1 外部 WMS 只读桥接（3 项）
+
+`wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 读的不是 DailyCheck 自己的
+SQLite，而是租仓方 WMS（SQL Server）中**本货主**的数据。边界如下，改动前必须逐条确认：
+
+- **只读**：`mcp_server/service/wms.py` 只拼 SELECT，不提供任何写入路径。
+- **单货主固定**：货主 ID 来自 `DAILYCHECK_WMS_CUSTOMER_ID`（默认 155），**不接受调用方
+  传入**。上游同库还挂着其他数十家货主，放开传参等于横向越权。
+- **凭据只走环境变量**（`DAILYCHECK_WMS_HOST` / `PORT` / `USER` / `PASSWORD` /
+  `DATABASE` / `TDS_VERSION`），不落库、不入日志；`WmsConfig.__repr__` 不回显口令。
+- **驱动与配置都可选**：未装 `pymssql` 返回 `wms_driver_missing`，未配置返回
+  `wms_not_configured`；两种情况都不会影响其余工具注册与启动。
+- **不进 Bot 池**：`bot_approved=False`，企微侧读不到外部系统；外部调用方仍走既有
+  `/api/v1/wms/*` 路径 ACL 与 `agent_tokens` 票据。
+- **CI 不连上游**：上游是第三方生产库，契约测试用桩数据跑 dispatch/serialization，
+  真实连通性只在部署环境验证。
 
 ### 9.3 双传输模式
 

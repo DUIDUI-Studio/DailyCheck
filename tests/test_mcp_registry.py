@@ -32,15 +32,18 @@ CANONICAL_WRITES = {
     "canonical_create", "canonical_update", "canonical_claim", "canonical_unclaim",
     "canonical_fanout", "canonical_resolve_conflict", "canonical_set_binding_active",
 }
+# 外部 WMS 只读桥接：不进 Bot 批准池（Bot 只碰 DailyCheck 自己的 SQLite），
+# 因此不能算进 CANONICAL_WRITES 的“非 Bot 工具”集合断言里。
+WMS_READS = {"wms_stock_list", "wms_stock_summary", "wms_documents_list"}
 
 
 def test_registry_matches_every_implementation_and_dispatch():
     mcp_contracts.validate_implementation_set()
-    assert len(NAMES) == len(set(NAMES)) == 29
+    assert len(NAMES) == len(set(NAMES)) == 32
     assert {tool.name for tool in get_tools()} == set(server._tool_map) == set(NAMES)
     assert server._tool_map == registry.get_handlers()
-    assert {e.name for e in registry.REGISTRY if not e.bot_approved} == CANONICAL_WRITES
-    assert sum(e.external_subset for e in registry.REGISTRY) == 16
+    assert {e.name for e in registry.REGISTRY if not e.bot_approved} == CANONICAL_WRITES | WMS_READS
+    assert sum(e.external_subset for e in registry.REGISTRY) == 19
     assert sum(e.bot_approved for e in registry.REGISTRY) == 22
     assert {e.name for e in registry.REGISTRY if e.mode == 'write'} == CANONICAL_WRITES | {
         'restock_create', 'outbound_create', 'outbound_rollback',
@@ -216,6 +219,30 @@ def test_contract_cli_runs_from_repository():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# External-WMS tools never touch a live database in CI: the upstream SQL Server
+# is a third-party system behind its own allowlist. Stub the service runner so
+# the dispatch/serialization contract still gets exercised end to end.
+_WMS_ROWS = {
+    "wms_stock_list": [{
+        "goods_code": "SC0001", "goods_name": "原味基础奶浆", "unit": "箱", "qty": 37.0,
+        "warehouse": "朴宇冷库", "zone": "C库", "position": "CD-31-1A", "lot_no": None,
+    }],
+    "wms_stock_summary": [{"warehouse": "朴宇冷库", "sku_count": 10, "total_qty": 165.0}],
+    "wms_documents_list": [{
+        "doc_no": "112610310017", "biz_date": "2026-10-31", "warehouse": "朴宇冷库",
+        "qty": 86.0, "supplier": None, "issued_by": "王学风",
+    }],
+}
+
+
+def stub_wms(monkeypatch, name):
+    from mcp_server.service import wms as svc_wms
+    monkeypatch.setenv("DAILYCHECK_WMS_HOST", "wms.invalid")
+    monkeypatch.setenv("DAILYCHECK_WMS_USER", "u")
+    monkeypatch.setenv("DAILYCHECK_WMS_PASSWORD", "p")
+    monkeypatch.setattr(svc_wms, "_run", lambda sql, params, cfg=None: list(_WMS_ROWS[name]))
+
+
 @pytest.fixture
 def contract_env(registry_db, monkeypatch):
     import blueprints.canonical_pure as cp
@@ -236,8 +263,8 @@ def contract_env(registry_db, monkeypatch):
 
 
 @pytest.mark.parametrize('name', NAMES)
-def test_registered_tool_real_serialized_shape(contract_env, name):
-    """Reuse #80's real DB scenario; exercise real dispatch/serialization for all29."""
+def test_registered_tool_real_serialized_shape(contract_env, name, monkeypatch):
+    """Reuse #80's real DB scenario; exercise real dispatch/serialization for all32."""
     path, route = contract_env
     entry = next(e for e in registry.REGISTRY if e.name == name)
     ctx = AuthContext(1, ['*'], ['*'], None, read_only=entry.mode == 'read', warehouse_base_dir=str(path))
@@ -250,10 +277,15 @@ def test_registered_tool_real_serialized_shape(contract_env, name):
         'canonical_fanout': {'canonical_ids': [1], 'warehouse_codes': ['wh_b']},
         'canonical_resolve_conflict': {'conflict_id': 1, 'decision': 'waive'},
         'canonical_set_binding_active': {'warehouse_code': 'wh_a', 'canonical_id': 1, 'active': False},
+        'wms_stock_list': {},
+        'wms_stock_summary': {},
+        'wms_documents_list': {'direction': 'in'},
     }
     if name == 'canonical_claim':
         with sqlite3.connect(path / 'wh_a.db') as conn:
             conn.execute('UPDATE items SET canonical_id=NULL WHERE id=1')
+    if entry.domain == 'wms':
+        stub_wms(monkeypatch, name)
     args = extra_args[name] if name in extra_args else ARGS[name]
     result = asyncio.run(route(name, args))
     assert len(result) == 1 and result[0].type == 'text'
