@@ -1628,14 +1628,32 @@ def get_dc_items_for_order_detail(
         try:
             return operation(*args, **kwargs)
         except sqlite3.DatabaseError as exc:
-            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
-            if code in {
-                sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CANTOPEN,
-                sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_IOERR,
-                sqlite3.SQLITE_PERM,
-            } or (code == sqlite3.SQLITE_ERROR and str(exc).startswith(
-                ("no such table:", "no such column:")
-            )):
+            # Programming/constraint/internal errors are never availability,
+            # even on a driver without SQLite error-code metadata.
+            if type(exc) not in (sqlite3.DatabaseError, sqlite3.OperationalError):
+                raise
+            message = str(exc)
+            missing_schema = message.startswith(("no such table:", "no such column:"))
+            code = getattr(exc, "sqlite_errorcode", None)
+            if code is not None:
+                # Stable SQLite primary codes: PERM, BUSY, LOCKED, IOERR,
+                # CORRUPT, CANTOPEN, NOTADB. Python 3.10 exports no constants.
+                primary = code & 0xFF
+                unavailable = primary in {3, 5, 6, 10, 11, 14, 26} or (
+                    primary == 1 and missing_schema
+                )
+            else:
+                # Python 3.10 also has no exception sqlite_errorcode attribute.
+                # Match only SQLite's known read-availability messages.
+                unavailable = missing_schema or message in {
+                    "access permission denied", "database is locked",
+                    "database table is locked", "database schema is locked",
+                    "disk I/O error", "database disk image is malformed",
+                    "unable to open database file", "file is not a database",
+                } or message.startswith((
+                    "database table is locked:", "database schema is locked:",
+                ))
+            if unavailable:
                 raise SourceUnavailable from exc
             # Syntax/binding defects and attempted writes are not missing stock.
             raise

@@ -267,7 +267,6 @@ def test_source_availability_faults_at_snapshot_and_fetch_close(env, monkeypatch
             if phase == "begin" and sql == "BEGIN" and not fired:
                 fired = True
                 error = sqlite3.DatabaseError("database disk image is malformed")
-                error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
                 raise error
             return super().execute(sql, *args, **kwargs)
 
@@ -276,7 +275,6 @@ def test_source_availability_faults_at_snapshot_and_fetch_close(env, monkeypatch
             if phase == "resolver_fetch" and "FROM items WHERE" in self.statement and not fired:
                 fired = True
                 error = sqlite3.DatabaseError("database disk image is malformed")
-                error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
                 raise error
             return super().fetchall()
 
@@ -285,7 +283,6 @@ def test_source_availability_faults_at_snapshot_and_fetch_close(env, monkeypatch
             if phase == "enrichment_fetch" and "LEFT JOIN categories" in self.statement and not fired:
                 fired = True
                 error = sqlite3.DatabaseError("database disk image is malformed")
-                error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
                 raise error
             return super().fetchone()
 
@@ -294,4 +291,24 @@ def test_source_availability_faults_at_snapshot_and_fetch_close(env, monkeypatch
     assert_isolated(env, _info(env), bad=201)
     assert fired
     assert len(opened) == 2
+    assert_closed(opened)
+
+
+
+@pytest.mark.parametrize("error_type", [sqlite3.ProgrammingError, sqlite3.IntegrityError,
+                                       sqlite3.InternalError])
+def test_legacy_metadata_free_programming_errors_are_not_availability(env, monkeypatch, error_type):
+    original_cursor = sqlite3.Cursor
+
+    class BrokenCursor(original_cursor):
+        def execute(self, sql, *args, **kwargs):
+            if "FROM items WHERE" in sql:
+                # A known availability-looking message must not override error type.
+                raise error_type("database is locked")
+            return super().execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "Cursor", BrokenCursor)
+    opened = track_sources(monkeypatch)
+    with pytest.raises(error_type, match="database is locked"):
+        _info(env)
     assert_closed(opened)
