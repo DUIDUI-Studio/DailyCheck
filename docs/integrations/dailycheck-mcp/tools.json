@@ -4,116 +4,70 @@
   "server": null,
   "tools": [
     {
-      "name": "warehouse_list",
       "description": "List all warehouses accessible to this token, returning code and display name. Returns: array of {code, name}.",
       "inputSchema": {
-        "type": "object",
         "properties": {},
-        "required": []
-      }
+        "required": [],
+        "type": "object"
+      },
+      "name": "warehouse_list"
     },
     {
-      "name": "items_list",
       "description": "List all items in a warehouse. Returns: array of {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
           "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "items_list"
     },
     {
-      "name": "items_detail",
       "description": "Get full details for a single inventory item by ID. Returns: {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
           "item_id": {
-            "type": "integer",
-            "description": "Item ID"
+            "description": "Item ID",
+            "type": "integer"
           },
           "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "item_id",
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "items_detail"
     },
     {
-      "name": "movements_list",
       "description": "List recent stock movements (outbound requests and stocktake adjustments) for a warehouse. Returns: array of {id, type, item_id, item_name, qty, reason, created_at}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
           "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "movements_list"
     },
     {
-      "name": "restock_create",
       "description": "Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
       "inputSchema": {
-        "type": "object",
-        "properties": {
-          "item_id": {
-            "type": "integer",
-            "description": "Item ID"
-          },
-          "quantity": {
-            "type": "number",
-            "description": "Quantity to restock"
-          },
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Reason for restock (optional)"
-          },
-          "doc_no": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "description": "Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid."
-          },
-          "line_no": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64,
-            "description": "Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid."
-          },
-          "factor": {
-            "type": "number",
-            "exclusiveMinimum": 0,
-            "default": 1,
-            "description": "Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key."
-          }
-        },
-        "required": [
-          "item_id",
-          "quantity",
-          "warehouse_code"
-        ],
         "dependentRequired": {
           "doc_no": [
             "line_no"
@@ -121,142 +75,142 @@
           "line_no": [
             "doc_no"
           ]
-        }
-      }
+        },
+        "properties": {
+          "doc_no": {
+            "description": "Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "factor": {
+            "default": 1,
+            "description": "Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.",
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "line_no": {
+            "description": "Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Quantity to restock",
+            "type": "number"
+          },
+          "reason": {
+            "description": "Reason for restock (optional)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "quantity",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "name": "restock_create"
     },
     {
-      "name": "restock_list",
       "description": "List inbound restock requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, status, reason, created_at, doc_no, line_no, input_quantity, factor}], total, limit, offset, truncated}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
           "limit": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 500,
             "default": 100,
-            "description": "Page size (1-500, default 100)."
+            "description": "Page size (1-500, default 100).",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
           },
           "offset": {
-            "type": "integer",
-            "minimum": 0,
             "default": 0,
-            "description": "Page offset (default 0; negative values are treated as 0)."
+            "description": "Page offset (default 0; negative values are treated as 0).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
-          "warehouse_code"
-        ]
-      }
-    },
-    {
-      "name": "item_forecast",
-      "description": "Get consumption forecast for an item. Returns: {item_id, warehouse_code, horizon_days, daily_avg, forecast_total, confidence, computed_at, data_status}.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "item_id": {
-            "type": "integer",
-            "description": "Item ID"
-          },
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
-          "horizon_days": {
-            "type": "integer",
-            "description": "Forecast horizon in days (1-90, default 14)"
-          }
-        },
-        "required": [
-          "item_id",
-          "warehouse_code"
-        ]
-      }
-    },
-    {
-      "name": "procurement_store",
-      "description": "Get procurement recommendations for a store. Returns: {warehouse_code, computed_at, items: [{item_id, item_name, current_qty, in_transit_qty, daily_avg, forecast_total_horizon, safety_stock, suggested_qty}]}.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          }
-        },
-        "required": [
-          "warehouse_code"
-        ]
-      }
-    },
-    {
-      "name": "procurement_hub",
-      "description": "Get procurement recommendations aggregated across all warehouses. Returns: {computed_at, items: [{item_id, item_name, total_suggested_qty, stores_needing, stores_detail}]}.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (optional, for specific warehouse)"
-          }
-        },
-        "required": []
-      }
-    },
-    {
-      "name": "outbound_create",
-      "description": "Create an outbound record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "item_id": {
-            "type": "integer",
-            "description": "Item ID"
-          },
-          "quantity": {
-            "type": "number",
-            "description": "Quantity to outbound (must be <= current stock)"
-          },
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Reason for outbound (optional)"
-          },
-          "doc_no": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "description": "Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid."
-          },
-          "line_no": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64,
-            "description": "Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid."
-          },
-          "factor": {
-            "type": "number",
-            "exclusiveMinimum": 0,
-            "default": 1,
-            "description": "Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key."
-          }
-        },
-        "required": [
-          "item_id",
-          "quantity",
           "warehouse_code"
         ],
+        "type": "object"
+      },
+      "name": "restock_list"
+    },
+    {
+      "description": "Get consumption forecast for an item. Returns: {item_id, warehouse_code, horizon_days, daily_avg, forecast_total, confidence, computed_at, data_status}.",
+      "inputSchema": {
+        "properties": {
+          "horizon_days": {
+            "description": "Forecast horizon in days (1-90, default 14)",
+            "type": "integer"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "name": "item_forecast"
+    },
+    {
+      "description": "Get procurement recommendations for a store. Returns: {warehouse_code, computed_at, items: [{item_id, item_name, current_qty, in_transit_qty, daily_avg, forecast_total_horizon, safety_stock, suggested_qty}]}.",
+      "inputSchema": {
+        "properties": {
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "name": "procurement_store"
+    },
+    {
+      "description": "Get procurement recommendations aggregated across all warehouses. Returns: {computed_at, items: [{item_id, item_name, total_suggested_qty, stores_needing, stores_detail}]}.",
+      "inputSchema": {
+        "properties": {
+          "warehouse_code": {
+            "description": "Warehouse code (optional, for specific warehouse)",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "procurement_hub"
+    },
+    {
+      "description": "Create an outbound record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
+      "inputSchema": {
         "dependentRequired": {
           "doc_no": [
             "line_no"
@@ -264,146 +218,199 @@
           "line_no": [
             "doc_no"
           ]
-        }
-      }
+        },
+        "properties": {
+          "doc_no": {
+            "description": "Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "factor": {
+            "default": 1,
+            "description": "Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.",
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "line_no": {
+            "description": "Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Quantity to outbound (must be <= current stock)",
+            "type": "number"
+          },
+          "reason": {
+            "description": "Reason for outbound (optional)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "quantity",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "name": "outbound_create"
     },
     {
-      "name": "outbound_list",
       "description": "List outbound requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, reason, status, rolled_back, created_at}], total, limit, offset, truncated}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
           "limit": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 500,
             "default": 100,
-            "description": "Page size (1-500, default 100)."
+            "description": "Page size (1-500, default 100).",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
           },
           "offset": {
-            "type": "integer",
-            "minimum": 0,
             "default": 0,
-            "description": "Page offset (default 0; negative values are treated as 0)."
+            "description": "Page offset (default 0; negative values are treated as 0).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "outbound_list"
     },
     {
-      "name": "outbound_rollback",
       "description": "Roll back an outbound request: return stock to warehouse. Returns: {id, item_id, quantity}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
           "request_id": {
-            "type": "integer",
-            "description": "Outbound request ID to roll back"
+            "description": "Outbound request ID to roll back",
+            "type": "integer"
           },
           "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "request_id",
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "outbound_rollback"
     },
     {
-      "name": "warehouse_consumption",
       "description": "Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage. Returns: {items: [{rank, item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_qty, active_days, daily_avg, turnover_rate, consume_pct, first_date, last_date}], warehouse_turnover: {window_days, warehouse_cogs_value, warehouse_avg_inventory_value, turnover_value, items_with_turnover, items_total, data_quality, method}}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
           "days": {
-            "type": "integer",
+            "description": "Time window: 7, 14, or 30 days (default 7)",
             "enum": [
               7,
               14,
               30
             ],
-            "description": "Time window: 7, 14, or 30 days (default 7)"
+            "type": "integer"
+          },
+          "limit": {
+            "description": "Max items to return (default 100, max 200)",
+            "type": "integer"
           },
           "sort_by": {
-            "type": "string",
+            "description": "Sort by: qty (default), value, turnover, name",
             "enum": [
               "qty",
               "value",
               "turnover",
               "name"
             ],
-            "description": "Sort by: qty (default), value, turnover, name"
+            "type": "string"
           },
-          "limit": {
-            "type": "integer",
-            "description": "Max items to return (default 100, max 200)"
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "warehouse_consumption"
     },
     {
-      "name": "item_consumption",
       "description": "Return consumption stats for a single item: 7d / 14d / 30d / monthly totals, weekly breakdown. Opt-in include_turnover adds a stocktake-anchored inventory turnover estimate. Returns: {item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_7d{qty,window_days,daily_avg}, consume_14d{...}, consume_30d{...}, consume_monthly{...}, weekly[{...}], [opt-in when include_turnover=true: inventory_turnover]}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "item_id": {
-            "type": "integer",
-            "description": "Item ID"
-          },
-          "warehouse_code": {
-            "type": "string",
-            "description": "Warehouse code (e.g. WH001)"
-          },
           "include_turnover": {
-            "type": "boolean",
+            "default": false,
             "description": "If true, also return inventory_turnover (stocktake-anchored average-inventory estimate). Default false.",
-            "default": false
+            "type": "boolean"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
           },
           "turnover_days": {
-            "type": "integer",
+            "default": 30,
+            "description": "Window for the inventory_turnover calculation (default 30).",
             "enum": [
               7,
               14,
               30
             ],
-            "description": "Window for the inventory_turnover calculation (default 30).",
-            "default": 30
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
           }
         },
         "required": [
           "item_id",
           "warehouse_code"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "item_consumption"
     },
     {
-      "name": "store_order_list",
       "description": "List store orders (store ordering / DC transfer documents) visible to this token. Read-only. Visibility is by participating warehouse: an order is visible when the token is allowed on its store warehouse or on ANY participating warehouse (a line's source warehouse, with the header DC as legacy fallback). ACL expansion (explicit): a token allowed on any participating warehouse can read the full order, including line items fulfilled by other warehouses and their amounts. Optional filters: warehouse_code (matches the store side or any participating warehouse of an order), status, limit, offset. Returns: {orders: [{id, order_no, store_warehouse_code, dc_warehouse_code, flow_type, status, requested_by, expected_delivery_date, created_at, updated_at, ...}], total, limit, offset, truncated}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
-          "warehouse_code": {
-            "type": "string",
-            "description": "Optional warehouse code filter; matches an order whose store warehouse or any participating warehouse is this warehouse (e.g. wh_000)."
+          "limit": {
+            "default": 200,
+            "description": "Page size (1-500, default 200).",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Page offset (default 0).",
+            "minimum": 0,
+            "type": "integer"
           },
           "status": {
-            "type": "string",
+            "description": "Optional order status filter.",
             "enum": [
               "pending",
               "approved",
@@ -412,40 +419,33 @@
               "delivered",
               "cancelled"
             ],
-            "description": "Optional order status filter."
+            "type": "string"
           },
-          "limit": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 500,
-            "default": 200,
-            "description": "Page size (1-500, default 200)."
-          },
-          "offset": {
-            "type": "integer",
-            "minimum": 0,
-            "default": 0,
-            "description": "Page offset (default 0)."
+          "warehouse_code": {
+            "description": "Optional warehouse code filter; matches an order whose store warehouse or any participating warehouse is this warehouse (e.g. wh_000).",
+            "type": "string"
           }
         },
-        "required": []
-      }
+        "required": [],
+        "type": "object"
+      },
+      "name": "store_order_list"
     },
     {
-      "name": "store_order_detail",
       "description": "Get one store order with its header, line items, deliveries, receipts and status history. Read-only. Visible when the token is allowed on the store warehouse or on ANY participating warehouse; ACL expansion (explicit): such a token can read the full order, including line items fulfilled by other warehouses, their amounts and the receipt history. Returns: {order: {id, order_no, store_warehouse_code, dc_warehouse_code, flow_type, status, ...}, items: [{id, canonical_id, canonical_name, dc_item_id, dc_item_bound, source_warehouse_code, quantity, fulfilled_quantity, shipped_quantity, unit, status}], deliveries: [{..., warehouse_code}], receipts: [...], status_history: [...]}.",
       "inputSchema": {
-        "type": "object",
         "properties": {
           "order_id": {
-            "type": "integer",
-            "description": "Store order id (store_orders.id)."
+            "description": "Store order id (store_orders.id).",
+            "type": "integer"
           }
         },
         "required": [
           "order_id"
-        ]
-      }
+        ],
+        "type": "object"
+      },
+      "name": "store_order_detail"
     }
   ]
 }
