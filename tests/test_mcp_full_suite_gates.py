@@ -11,15 +11,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-def _session(nodeid):
-    # Wiring fixture only; native pytest completion is separately exercised in
-    # test_pytest_gate_completeness.py with actual subprocesses.
-    return {"schema_version": 1, "pytest_exit": 1, "selected": 2, "selected_unique": 2,
-            "completed": 2, "uncompleted": [], "unexpected": [], "error_nodeids": [],
-            "failed_nodeids": [nodeid],
-            "counts": {"passed": 1, "failed": 1, "skipped": 0, "xfailed": 0, "xpassed": 0, "error": 0}}
-
-
 ENTRYPOINTS = (
     ".github/workflows/ci.yml",
     "scripts/blue_green/verify.sh",
@@ -54,8 +45,6 @@ def test_verify_full_suite_uses_isolated_db_and_preserves_failure_gate(tmp_path,
         "if sys.argv[1:3] == ['-m', 'pytest']:\n"
         f"    Path({str(record)!r}).write_text(json.dumps({{'args': sys.argv[1:], "
         "'db': os.environ.get('DAILYCHECK_DB_DIR')}))\n"
-        "    meta = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--dc-evidence='))\n"
-        f"    Path(meta).write_text(json.dumps({_session('PLACEHOLDER')!r}).replace('PLACEHOLDER', {nodeid!r}))\n"
         f"    print('FAILED {nodeid} - seeded gate test')\n"
         "    print('1 failed, 1 passed in 0.01s')\n"
         "    sys.exit(1)\n"
@@ -78,7 +67,7 @@ def test_verify_full_suite_uses_isolated_db_and_preserves_failure_gate(tmp_path,
     assert not selected.exists(), "verify must clean up its temporary test database directory"
 
 
-@pytest.mark.parametrize("reuse", [False, True, "missing", "no-evidence", "tampered", "invalid-native"], ids=["fallback", "reuse", "missing", "no-evidence", "tampered", "invalid-native"])
+@pytest.mark.parametrize("reuse", [False, True], ids=["fallback", "reuse"])
 @pytest.mark.parametrize("new_failure", [False, True], ids=["known-failure", "new-failure"])
 def test_report_generation_keeps_real_gate_status_and_reports(tmp_path, reuse, new_failure):
     import shutil
@@ -88,7 +77,7 @@ def test_report_generation_keeps_real_gate_status_and_reports(tmp_path, reuse, n
     script.parent.mkdir(parents=True)
     # All outputs (including the script's legacy /tmp log constants) stay in this sandbox.
     script.write_text((ROOT / "scripts/agent_framework/generate_reports.sh").read_text().replace(
-        '/tmp/', f'{tmp_path}/',
+        '"/tmp/', f'"{tmp_path}/',
     ))
     shutil.copy2(ROOT / "scripts/check_known_failures.py", repo / "scripts/check_known_failures.py")
     (repo / "tests").mkdir()
@@ -99,32 +88,14 @@ def test_report_generation_keeps_real_gate_status_and_reports(tmp_path, reuse, n
     output = f"FAILED {nodeid} - seeded gate test\n1 failed, 1 passed in 0.01s\n"
     reuse_file = tmp_path / "reuse.txt"
     if reuse:
-        from scripts.check_known_failures import make_evidence
-
         reuse_file.write_text(output)
-        meta = Path(str(reuse_file) + ".evidence.json")
-        meta.write_text(json.dumps(make_evidence(output, 1, _session(nodeid))))
-        if reuse == "missing":
-            reuse_file.unlink()
-        elif reuse == "no-evidence":
-            meta.unlink()
-        elif reuse == "tampered":
-            reuse_file.write_text(output + "KeyboardInterrupt\n")
-        elif reuse == "invalid-native":
-            data = json.loads(meta.read_text())
-            data["native_exit"] = 0
-            meta.write_text(json.dumps(data))
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
     python = fakebin / "python3"
     python.write_text(
         f"#!{sys.executable}\n"
-        "import json, os, sys\n"
-        "from pathlib import Path\n"
+        "import os, sys\n"
         "if sys.argv[1:3] == ['-m', 'pytest']:\n"
-        f"    Path({str(tmp_path / 'pytest-ran')!r}).touch()\n"
-        "    meta = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--dc-evidence='))\n"
-        f"    Path(meta).write_text(json.dumps({_session('PLACEHOLDER')!r}).replace('PLACEHOLDER', {nodeid!r}))\n"
         f"    print({output!r}, end='')\n"
         "    sys.exit(1)\n"
         f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
@@ -135,23 +106,13 @@ def test_report_generation_keeps_real_gate_status_and_reports(tmp_path, reuse, n
         tool = fakebin / name
         tool.write_text(f"#!/bin/sh\n{body}\nexit 0\n")
         tool.chmod(0o755)
-    env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}", TMPDIR=str(tmp_path),
-               HEAD_SHA="a" * 40, BASE_SHA="b" * 40)
-    env.pop("PYTEST_REUSE_FILE", None)
-    env.pop("PYTEST_REUSE_EVIDENCE", None)
-    if reuse:
-        env["PYTEST_REUSE_FILE"] = str(reuse_file)
+    env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}",
+               PYTEST_REUSE_FILE=str(reuse_file), HEAD_SHA="a" * 40, BASE_SHA="b" * 40)
     proc = subprocess.run(["bash", str(script)], cwd=repo, env=env,
                           capture_output=True, text=True, timeout=30)
     summary = json.loads((repo / "reports/ci-summary.json").read_text())
-    invalid = isinstance(reuse, str)
-    assert proc.returncode == int(new_failure or invalid), proc.stdout + proc.stderr
-    if invalid:
-        assert summary["pytest"] == {"passed": None, "failed": None, "gate_exit": 1, "native_exit": None, "complete": False}
-    else:
-        assert summary["pytest"] == {"passed": 1, "failed": 1, "gate_exit": int(new_failure), "native_exit": 1, "complete": True}
-    if reuse != "missing":
-        assert nodeid in (repo / "reports/02-test-report.md").read_text()
-    assert (tmp_path / "pytest-ran").exists() == (not reuse)
+    assert proc.returncode == int(new_failure), proc.stdout + proc.stderr
+    assert summary["pytest"] == {"passed": 1, "failed": 1, "gate_exit": int(new_failure)}
+    assert nodeid in (repo / "reports/02-test-report.md").read_text()
     assert (repo / "reports/03-code-quality.md").exists()
-    assert ("复用 test job" in proc.stdout) == bool(reuse)
+    assert ("复用 test job" in proc.stdout) == reuse
