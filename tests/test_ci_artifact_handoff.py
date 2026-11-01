@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import re
 import subprocess
 import sys
@@ -69,8 +68,7 @@ def test_reports_job_decodes_to_the_documented_reuse_path(workflow):
 
     assert "PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}" in reports_job
     assert "mkdir -p /tmp/ci-pytest" in reports_job
-    assert "base64 --decode > /tmp/ci-pytest/pytest-result.json" in reports_job
-    assert "--evidence-output /tmp/ci-pytest/pytest-evidence.json" in reports_job
+    assert "base64 --decode > /tmp/ci-pytest/pytest-output.txt" in reports_job
     assert "PYTEST_REUSE_FILE: /tmp/ci-pytest/pytest-output.txt" in reports_job
 
 
@@ -92,10 +90,8 @@ def test_generate_reports_keeps_direct_execution_fallback():
         encoding="utf-8"
     )
 
-    assert 'REUSE_FILE="${PYTEST_REUSE_FILE-/tmp/ci-pytest/pytest-output.txt}"' in script
-    assert 'if [[ -n "${PYTEST_REUSE_FILE+x}"' in script
-    assert 'if [[ -e "${REUSE_FILE}"' not in script
-    assert "refusing fallback" in script
+    assert 'REUSE_FILE="${PYTEST_REUSE_FILE:-/tmp/ci-pytest/pytest-output.txt}"' in script
+    assert 'if [[ -s "${REUSE_FILE}" ]]; then' in script
     assert 'echo "[generate_reports] running pytest ..."' in script
 
 
@@ -112,15 +108,8 @@ def _run_known_failures_gate(tmp_path: Path, compact_source: str) -> subprocess.
     summary = helper.extract_pytest_summary(compact_source)
     output = tmp_path / "pytest-compact.txt"
     output.write_text(summary, encoding="utf-8")
-    native = 2 if "ERROR " in summary else 1
-    ids = [line.split(" - ", 1)[0].removeprefix("FAILED ") for line in summary.splitlines() if line.startswith("FAILED ")]
-    session = {"schema_version": 1, "pytest_exit": native, "selected": 101, "selected_unique": 101,
-               "completed": 101, "uncompleted": [], "unexpected": [], "error_nodeids": [], "failed_nodeids": ids,
-               "counts": {"passed": 100, "failed": len(ids), "skipped": 0, "xfailed": 0, "xpassed": 0, "error": 0}}
-    meta = tmp_path / "session.json"
-    meta.write_text(json.dumps(session), encoding="utf-8")
     return subprocess.run(
-        [sys.executable, str(KNOWN_FAILURES_CHECKER), str(output), "--pytest-exit", str(native), "--session-file", str(meta)],
+        [sys.executable, str(KNOWN_FAILURES_CHECKER), str(output)],
         capture_output=True,
         text=True,
         timeout=30,

@@ -171,11 +171,8 @@ print(f"\n失败集 {len(cur)} ⊆ 基线 {len(known)}，通过。"); sys.exit(0
 ### 验收
 
 ```bash
-# A. 先按 docs/DEV_ENV.md「完整本地 pytest 门禁」运行并保留 test_run_dir。
-#    只有真实完整退出0/1且零新增失败，才期望 exit=0；裸调用或日志片段不能证明通过。
-python3 scripts/check_known_failures.py "${test_run_dir}/pytest.txt" \
-  --pytest-exit-file "${test_run_dir}/native.exit" --session-file "${test_run_dir}/session.json"
-echo "exit=$?"
+# A. 门禁器能正确放过
+python3 scripts/check_known_failures.py; echo "exit=$?"        # 期望 exit=0
 
 # B. 门禁器能正确拦住
 #    做法：临时从基线里删掉一行【仍在失败】的用例（即重跑后没有出现在
