@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}总仓调货 · 发送单{% endblock %}
+{% block title %}总仓调货 · {{ '收货单' if scope == 'incoming' else '发送单' }}{% endblock %}
 {% block content %}
 {% set doc_pill = {
   'awaiting_ship': 'pending',
@@ -10,24 +10,28 @@
 } %}
 
 <div class="page-header">
-  <h2>总仓调货 · 发送单</h2>
+  <h2>总仓调货 · {{ '收货单' if scope == 'incoming' else '发送单' }}</h2>
   {% if can_create %}
   <a class="btn-action primary" href="{{ url_for('dc_transfer.transfer_new') }}">＋ 新建调货单</a>
   {% endif %}
 </div>
 
-<p class="muted">总仓主动发往分仓的调货单。<b>创建即生效（无需审批）</b>，由总仓发货、分仓接收；发货与收货均支持多次部分操作。分仓侧不另设页面，收到的调货单直接出现在其「本店订单」里。</p>
+<div class="order-actions">
+  <a class="btn-action {{ 'primary' if scope == 'outgoing' else 'ghost' }}" href="{{ url_for('dc_transfer.transfer_list') }}">发送单</a>
+  <a class="btn-action {{ 'primary' if scope == 'incoming' else 'ghost' }}" href="{{ url_for('dc_transfer.transfer_list', scope='incoming') }}">收货单</a>
+</div>
+<p class="muted">配送中心可向其他配送中心或门店调货。<b>创建即生效（无需审批）</b>，发货与收货均支持多次部分操作。此处按当前仓库查看发送或收货单；门店仍在「本店订单」中收货。</p>
 
 {% if transfers %}
 <table class="data-table" style="margin-top:16px;">
   <thead>
     <tr>
       <th>调货单号</th>
-      <th>发送单状态</th>
+      <th>{{ '收货状态' if scope == 'incoming' else '发送单状态' }}</th>
       <th>发出仓</th>
       <th>接收仓</th>
       <th>已发 / 已收</th>
-      <th>待发</th>
+      <th>{{ '待收' if scope == 'incoming' else '待发' }}</th>
       <th>创建时间</th>
       <th></th>
     </tr>
@@ -36,11 +40,11 @@
     {% for t in transfers %}
     <tr>
       <td>{{ t.order_no }}</td>
-      <td><span class="status-pill {{ doc_pill[t.doc_state] }}">{{ t.doc_state_label }}</span></td>
+      <td><span class="status-pill {{ t.status if scope == 'incoming' else doc_pill[t.doc_state] }}">{{ t.rcv_state_label if scope == 'incoming' else t.doc_state_label }}</span></td>
       <td>{{ t.dc_warehouse_code }}</td>
       <td>{{ t.store_warehouse_code }}</td>
       <td>{{ t.shipped_qty | fmt_qty }} / {{ t.received_qty | fmt_qty }}</td>
-      <td>{{ t.pending_ship_qty | fmt_qty }}</td>
+      <td>{{ (t.pending_receive_qty if scope == 'incoming' else t.pending_ship_qty) | fmt_qty }}</td>
       <td>{{ t.created_at }}</td>
       <td>
         <a class="btn-sm" href="{{ url_for('store_ordering.order_detail', order_id=t.id) }}">详情</a>
@@ -50,6 +54,6 @@
   </tbody>
 </table>
 {% else %}
-<p class="empty">暂无调货发送单</p>
+<p class="empty">暂无调货{{ '收货单' if scope == 'incoming' else '发送单' }}</p>
 {% endif %}
 {% endblock %}

@@ -66,7 +66,7 @@
 {# —— 顶部信息卡：A4 总金额 + 元信息 —— #}
 <div class="info-card">
   <div class="info-card-grid">
-    <div><strong>{{ '收货分仓' if is_transfer else '门店' }}：</strong>{{ fmt_warehouse(order.store_warehouse_name, order.store_warehouse_code) }}</div>
+    <div><strong>{{ '收货仓' if is_transfer else '门店' }}：</strong>{{ fmt_warehouse(order.store_warehouse_name, order.store_warehouse_code) }}</div>
     <div><strong>{{ '发出总仓' if is_transfer else '配送中心' }}：</strong>{{ fmt_warehouse(order.dc_warehouse_name, order.dc_warehouse_code) }}</div>
     <div><strong>{{ '发起人' if is_transfer else '下单人' }}：</strong>{{ order.requested_by_username or order.requested_by }}</div>
     <div><strong>创建时间：</strong>{{ order.created_at }}</div>
@@ -316,7 +316,7 @@
 
 {# —— 门店入库流水（storefront 视角）：直接读门店仓 stock_movements —— #}
 {% if not is_dc_view %}
-<h3>门店入库流水</h3>
+<h3>{{ '收货入库流水' if is_dc_receiver else '门店入库流水' }}</h3>
 {% if store_inflows %}
 <table class="data-table">
   <thead>
@@ -335,7 +335,7 @@
   </tbody>
 </table>
 {% else %}
-<p class="empty">暂无门店入库流水（收货后会自动写入）</p>{% endif %}
+<p class="empty">暂无{{ '收货入库流水' if is_dc_receiver else '门店入库流水' }}（收货后会自动写入）</p>{% endif %}
 {% endif %}
 
 {# —— 发货历史（如有）—— #}
@@ -402,12 +402,13 @@
   {% if can_deliver and ns.has_receivable %}
   <form method="post" action="{{ url_for('store_ordering.deliver_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="op_no" value="{{ receive_op_no }}">
     <button type="submit" class="btn-action ghost">一次性收货已到货物</button>
   </form>
   {% endif %}
 
   {# —— P1-4: 取消按钮 —— #}
-  {% if order.status == 'pending' or order.status == 'approved' %}
+  {% if (order.status == 'pending' or order.status == 'approved') and (not is_transfer or can_cancel_transfer) %}
   <form method="post" action="{{ url_for('store_ordering.cancel_order_route', order_id=order.id) }}" class="inline-form" data-ajax data-ajax-mode="reload-stay" data-ajax-confirm="确认取消该{{ doc_label }}?">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input name="reason" placeholder="取消原因（必填）" required />
@@ -415,7 +416,9 @@
   </form>
   {% endif %}
 
-  {% if is_transfer and is_dc_view %}
+  {% if is_transfer and is_dc_receiver %}
+  <a class="btn-action ghost" href="{{ url_for('dc_transfer.transfer_list', scope='incoming') }}">返回调货收货单</a>
+  {% elif is_transfer and is_dc_view %}
   <a class="btn-action ghost" href="{{ url_for('dc_transfer.transfer_list') }}">返回调货列表</a>
   {% elif is_transfer %}
   <a class="btn-action ghost" href="{{ url_for('store_ordering.store_orders_list') }}">返回我的订单</a>
