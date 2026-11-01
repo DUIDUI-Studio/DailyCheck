@@ -1652,6 +1652,7 @@ def get_dc_items_for_order_detail(
                     "unable to open database file", "file is not a database",
                 } or message.startswith((
                     "database table is locked:", "database schema is locked:",
+                    "malformed database schema (",
                 ))
             if unavailable:
                 raise SourceUnavailable from exc

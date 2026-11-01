@@ -1435,6 +1435,8 @@ master_connection不迁移warehouse。软链共享真实路径锁，绿副本独
 
 ## 5. 应用层模块图
 
+Issue #111 final legacy correction recognizes the anchored stored-schema corruption envelope without changing other module boundaries.
+
 **Bot PR2 复用接线**：`bot.agent` → `bot.mcp_tools` → 22 个批准 MCP handler/service；`bot.tools` 保留旧查询接口。采购计算新增显式配置/只读参数供无缓存只读调用，canonical bindings 新增只读收集模式；没有新增蓝图、路由、表或预测算法。
 
 ```mermaid
@@ -1514,6 +1516,8 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 新增MCP身份不进入Web表单，Web新行仍保留NULL身份/input和factor默认1。
 
 ## 6. 蓝图依赖关系
+
+The metadata-free source cursor recognizes `malformed database schema (` only after the exact exception-type guard; master and write paths remain untagged.
 
 **Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
 
@@ -2133,6 +2137,8 @@ HTTP 层 `BEGIN IMMEDIATE` 后 `apply_batch()` 重读整批基线并校验所有
 
 ### 10.3 Store Ordering 状态机
 
+Issue #111: the stored-schema corruption envelope accepts varying object names and optional reasons on Python 3.10. Authoritative numeric codes still take precedence; generic malformed/syntax/incomplete messages, negative error types, master errors and attempted writes continue to propagate.
+
 **订单详情来源库存（Issue #109，2026-10-31）**：订单板自身没有库存列；
 `/store-ordering/orders/<id>` 才显示履约仓库存并为门店/DC/平台视角提供单价。
 `get_dc_items_for_order_detail()` 按行取 `COALESCE(source_warehouse_code, 头仓)`，
@@ -2499,6 +2505,8 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #111 final regressions use real incomplete/no-suffix/syntax/duplicate-column/punctuation schema-corrupt files through helper and production-style HTTP on actual Python 3.10/3.12, including legacy header fallback. They verify healthy values, byte equality, per-source latch/closure, exact exception identity, metadata precedence, master origin and real healthy/corrupt attempted-write errors. Prefix-removal, single-message, type/master/write and existing identity/timeout/snapshot mutations must fail.
 
 Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 master/两 DC/门店库，
 先提交跨仓单再改路由，以跨库同 local item ID 的不同 canonical/库存/价格/品类复现串读；
