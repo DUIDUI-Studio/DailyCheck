@@ -88,6 +88,9 @@ _run() {
 # 状态跟踪（Mac mini bash 3.x 不支持关联数组，用普通变量）
 R1="⏳"; R2="⏳"; R3="⏳"; R4="⏳"; R5="⏳"; R6="⏳"; R7="⏳"; R8="⏳"
 N1=""; N2=""; N3=""; N4=""; N5=""; N6=""; N7=""; N8=""
+# Issue #123：失败明细要能落到 pipeline 日志（deploy_report 只取尾部 40 行），
+# 故按编号记住检查名；bash 3.x 用索引数组即可。
+CHECK_NAME=()
 OVERALL_PASS=1
 
 # ============================================================
@@ -311,7 +314,7 @@ _ensure_sim_user_in_green_db() {
   (
     cd "${REPO_ROOT}" || exit 1
     DAILYCHECK_DB_DIR="${GREEN_DB}" "${DC_PYTHON_BIN}" -m flask \
-      --app app create-user "${SIM_USER_USER}" "${SIM_USER_PASSWORD}" --admin
+      --app app create-user --admin -- "${SIM_USER_USER}" "${SIM_USER_PASSWORD}"
   ) 2>&1 | sed 's/^/[verify]   /'
   local rc="${PIPESTATUS[0]}"
   if [[ ${rc} -ne 0 ]]; then
@@ -382,6 +385,7 @@ _verify_check2_sim_user() {
 
 _run_check() {
   local num="$1" name="$2" cmd="$3"
+  CHECK_NAME[${num}]="${name}"
   echo "[verify] ${num}. ${name} ..."
   if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
     echo "[DRY-RUN] would: ${cmd}"
@@ -424,6 +428,27 @@ _run_check() {
     return 1
   fi
 }
+
+# <<< emit-failure-summary:start >>>
+# Issue #123：失败明细必须进 stdout（pipeline 日志 → deploy_report 尾部 40 行），
+# 否则 PR 评论只能看到 rc=21，无法指出是哪个 check 失败（#119 定位耗时 2 小时）。
+_emit_failure_summary() {
+  [[ "${OVERALL_PASS}" -eq 1 ]] && return 0
+  echo "[verify] === 失败明细 ==="
+  local n state note
+  for n in 1 2 3 4 5 6 7 8; do
+    eval "state=\${R${n}:-}"
+    case "${state}" in
+      *FAIL*) ;;
+      *) continue ;;
+    esac
+    eval "note=\${N${n}:-}"
+    echo "[verify] FAILED_CHECK=${n} name=${CHECK_NAME[${n}]:-unknown}"
+    printf '%s\n' "${note}" | tail -n 3 | sed 's/^/[verify]   /'
+  done
+  echo "[verify] === 失败明细结束 ==="
+}
+# <<< emit-failure-summary:end >>>
 
 # ============================================================
 # 0. 前置：绿环境必须已起（up.sh 跑过）
@@ -573,6 +598,7 @@ if [[ ${OVERALL_PASS} -eq 1 ]]; then
   exit 0
 else
   echo "[verify] ❌ 失败"
+  _emit_failure_summary  # Issue #123：进 stdout，让 pipeline 日志尾部可读
   _write_report  # 显式调
   exit 1
 fi
