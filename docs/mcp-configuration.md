@@ -4,12 +4,17 @@ This guide explains how to configure Claude Code and other agents to connect to 
 
 ## Transports
 
+The CLI defaults to **stdio** (`python -m mcp_server` or `flask mcp`). TCP serving
+requires explicit `--transport http`; the shipped systemd unit passes that flag,
+`--host 0.0.0.0` and `--port 5100`. The CLI's HTTP bind defaults are
+`127.0.0.1:5100` when host/port are omitted. MCP code changes need a process restart.
+
 The MCP server supports two transport modes:
 
 | Transport | Use Case | Connection |
 |-----------|----------|------------|
 | `stdio` | Local Claude Code | Child process, stdin/stdout |
-| `http` | Remote agents on other machines | HTTP/SSE on TCP port |
+| `http` | Remote agents on other machines | Stateless JSON StreamableHTTP `/api/mcp/` (recommended); legacy SSE `/sse` + `/messages/` also mounted |
 
 ---
 
@@ -53,7 +58,7 @@ In Claude Code settings (`~/.claude/settings.json`), add the MCP server config w
       "command": "/Users/ericmr/Documents/GitHub/DailyCheck/mcp_server/.venv/bin/python",
       "args": ["-m", "mcp_server"],
       "env": {
-        "DAILYCHECK_MCP_TOKEN": "REDACTED_UNRESOLVED_MCP_TOKEN"
+        "DAILYCHECK_MCP_TOKEN": "your_token"
       }
     }
   }
@@ -115,59 +120,46 @@ Replace `YOUR_HOST_IP` with the IP or hostname of the machine running the HTTP s
 
 ### 3. Health Check
 
+`AuthMiddleware` protects **all HTTP routes, including `/health`**. Missing/invalid
+credentials return HTTP 401. Authenticated checks return HTTP 200 when all checks
+are `ok`, otherwise HTTP 503; the legacy top-level `status` stays `ok` even on
+503, so monitoring must inspect the HTTP status and `checks.db`. The DB check runs
+`SELECT 1` and does not prove migrations, warehouse integrity or a successful tool call.
+
+
 ```bash
 curl -H "Authorization: Bearer your_token" http://YOUR_HOST_IP:5100/health
-# Expected: {"status":"ok"}
+# Expected HTTP 200: {"status":"ok","checks":{"mcp_server":"ok","transport":"ok","db":"ok"}}
 ```
 
 ---
 
 ## Available Tools
 
-The DailyCheck MCP server provides 13 tools:
+The live server registers **29 tools**: 14 inventory/document/analysis tools,
+13 canonical tools and two store-order reads. The external integration
+[tools.json](integrations/dailycheck-mcp/tools.json) intentionally contains a
+**16-tool subset** (the 14 base tools plus two store-order reads); it is not the
+full live list and does not grant token permissions.
 
-### Inventory Tools
+The generated [complete contracts](integrations/dailycheck-mcp/registry.md) and
+[machine-readable ledger](integrations/dailycheck-mcp/registry.json) cover all 29
+names, handlers, input declarations, actual minimum output shapes, ACL enforcement,
+warehouse scope, compatibility and regression references. `get_tools()` and dispatch
+are derived from `mcp_server/protocol/registry.py`. Bot execution remains independently
+approved for 22 tools; seven canonical writes stay excluded.
 
-| Tool | Description |
-|------|-------------|
-| `items_list` | List all items in a warehouse, including quantity and safety stock |
-| `items_detail` | Get full details for a single inventory item by ID |
-| `movements_list` | List recent stock movements (outbound requests and stocktake adjustments) for a warehouse |
+After editing the authoritative registration, run from the repository root:
 
-### Inbound Tools
+```bash
+python -m scripts.mcp_contracts --write
+python -m scripts.mcp_contracts --check
+python -m pytest tests/test_mcp_registry.py
+```
 
-| Tool | Description |
-|------|-------------|
-| `restock_create` | Create a restock (inbound) record |
-| `restock_list` | List restock records for a warehouse |
-
-### Outbound Tools
-
-| Tool | Description |
-|------|-------------|
-| `outbound_create` | Create an outbound request: deduct stock + write movement (mirrors Flask `/outbound/submit`) |
-| `outbound_list` | List outbound requests for a warehouse |
-| `outbound_rollback` | Roll back an outbound request: return stock to warehouse |
-
-### Consumption Tools
-
-| Tool | Description |
-|------|-------------|
-| `warehouse_consumption` | Per-item consumption summary with rank, qty, daily avg, turnover rate, consume pct |
-| `item_consumption` | Single item: 7d/30d/monthly totals + weekly breakdown + daily avg |
-
-### Forecast Tools
-
-| Tool | Description |
-|------|-------------|
-| `item_forecast` | Get consumption forecast for an item |
-
-### Procurement Tools
-
-| Tool | Description |
-|------|-------------|
-| `procurement_store` | Get procurement recommendations for a specific store |
-| `procurement_hub` | Get procurement recommendations aggregated across all warehouses |
+`--check` is read-only and exits nonzero on artifact/implementation/Bot metadata drift;
+it is suitable for CI. Output contracts are internal verification metadata: responses
+remain JSON text inside MCP `TextContent`, without SDK `outputSchema` or a new wrapper.
 
 ## Troubleshooting
 
