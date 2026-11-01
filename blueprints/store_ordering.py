@@ -118,6 +118,27 @@ def _storefront_or_admin(view: Callable) -> Callable:
     return wrapped
 
 
+def _storefront_or_transfer_receiver(view: Callable) -> Callable:
+    """Bypass the legacy storefront gate only for a DC transfer route.
+
+    Ordinary orders (including unknown IDs) keep their existing redirects and
+    platform-admin behavior; the transfer handler enforces destination ownership.
+    """
+    storefront_view = _storefront_or_admin(view)
+
+    @functools.wraps(view)
+    def wrapped(order_id: int, *args, **kwargs):
+        if _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC:
+            row = get_master_db().execute(
+                "SELECT flow_type FROM store_orders WHERE id=?", (order_id,),
+            ).fetchone()
+            if row is not None and row["flow_type"] == sop.FLOW_DC_TRANSFER:
+                return view(order_id, *args, **kwargs)
+        return storefront_view(order_id, *args, **kwargs)
+
+    return wrapped
+
+
 def _order_viewable(master: sqlite3.Connection, order: dict[str, Any]) -> bool:
     """Order can be viewed by the current store, any participating DC, or admin.
 
@@ -140,19 +161,16 @@ def _order_viewable(master: sqlite3.Connection, order: dict[str, Any]) -> bool:
 
 
 def _is_receiving_warehouse(order: dict[str, Any]) -> bool:
-    """Receiving always acts in the destination session, including for admins.
+    """Transfers require the destination session, including for admins.
 
-    Only dc_transfer extends receiving to DCs; other storefront guards stay intact.
+    Ordinary storefront orders keep their existing visibility/admin bypass;
+    only dc_transfer extends receiving to DCs.
     """
+    if order.get("flow_type") != sop.FLOW_DC_TRANSFER:
+        return _current_warehouse_type() == "storefront"
     return (
         _current_warehouse_code() == order["store_warehouse_code"]
-        and (
-            _current_warehouse_type() == "storefront"
-            or (
-                order.get("flow_type") == sop.FLOW_DC_TRANSFER
-                and _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC
-            )
-        )
+        and _current_warehouse_type() in dtp.TRANSFER_RECEIVER_TYPES
     )
 
 
@@ -910,6 +928,15 @@ def order_detail(order_id: int) -> str:
             "rcv_state_label": dtp.RCV_STATE_LABELS[rcv_state],
         }
 
+    # Preserve ordinary-order UI rules; stricter destination/permission display
+    # applies only to the explicitly extended transfer flow.
+    can_deliver = wh_type == "storefront" and role in ("manager", "admin")
+    can_receive = (wh_type == "storefront" and role in ("manager", "admin")) or is_admin
+    if transfer_ctx is not None:
+        receiving_manager = is_receiving and (role in ("manager", "admin") or is_admin)
+        can_deliver = receiving_manager and has_permission("order.ship")
+        can_receive = receiving_manager and has_permission("order.receive")
+
     return render_template(
         "store_ordering/order_detail.html",
         order=order,
@@ -931,16 +958,8 @@ def order_detail(order_id: int) -> str:
         ),
         current_warehouse_code=current_wh_code,
         ship_progress=ship_progress,
-        can_deliver=(
-            is_receiving
-            and (role in ("manager", "admin") or is_admin)
-            and has_permission("order.ship")
-        ),
-        can_receive=(
-            is_receiving
-            and (role in ("manager", "admin") or is_admin)
-            and has_permission("order.receive")
-        ),
+        can_deliver=can_deliver,
+        can_receive=can_receive,
         can_cancel_transfer=(
             order.get("flow_type") == sop.FLOW_DC_TRANSFER
             and current_wh_code == order["dc_warehouse_code"]
@@ -1458,10 +1477,16 @@ def deliver_order_route(order_id: int) -> str:
     if not _order_viewable(master, order):
         abort(403)
     if not _is_receiving_warehouse(order):
-        abort(403)
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
+        flash("只有门店可确认收货")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     role = g.role["role"] if g.role else None
     if role not in ("manager", "admin") and not _is_admin():
-        abort(403)
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
+        flash("需要经理及以上权限")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
         # Use the same receipt protocol as the per-line form. On replay restore
         # the original quantities, including unapplied receipts after a crash.
@@ -1507,6 +1532,7 @@ def deliver_order_route(order_id: int) -> str:
 
 @bp.route("/orders/<int:order_id>/receive", methods=["POST"])
 @require_permission("order.receive")
+@_storefront_or_transfer_receiver
 def receive_order_route(order_id: int) -> str:
     """Receive a single order_item into its destination warehouse.
 
@@ -1527,10 +1553,16 @@ def receive_order_route(order_id: int) -> str:
     if not _order_viewable(master, order):
         abort(403)
     if not _is_receiving_warehouse(order):
-        abort(403)
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
+        flash("只有门店可以收货")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     role = g.role["role"] if g.role else None
     if role not in ("manager", "admin") and not _is_admin():
-        abort(403)
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
+        flash("需要经理及以上权限")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     order_item_id = request.form.get("order_item_id", type=int)
     quantity = parse_qty(request.form.get("quantity", "0"))

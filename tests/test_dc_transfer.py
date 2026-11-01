@@ -819,7 +819,7 @@ def test_dc_receiver_cannot_receive_normal_order(dc_receiver_env, transfer_clien
             },
         )
         .status_code
-        == 403
+        == 302
     )
     assert _stock(env["receiver_path"]) == 0
     assert sop.get_order_detail(env["master"], order["id"])["receipts"] == []
@@ -1063,3 +1063,72 @@ def test_receiving_dc_keeps_own_outgoing_transfers_separate(dc_receiver_env, tra
     detail = sop.get_order_detail(env["master"], outgoing["id"])
     assert detail["order_items"][0]["source_warehouse_code"] == "dc_receiver"
     assert _stock(env["receiver_path"]) == 4
+
+
+@pytest.mark.parametrize("route,expected", [("receive", 2), ("deliver", 10)])
+def test_normal_order_admin_cross_storefront_receipt_compatibility(
+    transfer_env, transfer_client, route, expected
+):
+    env = transfer_env
+    master = env["master"]
+    other = env["dc_path"].parent / "other_store.db"
+    init_warehouse_db(other)
+    master.execute(
+        "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, created_at) "
+        "VALUES (3, 'other_store', 'Other storefront', ?, 'storefront', ?)",
+        (str(other), sop.now()),
+    )
+    master.commit()
+    order = _create(env)
+    master.execute(
+        "UPDATE store_orders SET flow_type=? WHERE id=?", (sop.FLOW_STORE_ORDER, order["id"])
+    )
+    master.commit()
+    item = order["order_items"][0]["id"]
+    sop.ship_order(master, order["id"], {item: 10}, shipped_by=3)
+    client = transfer_client(1, 3)
+    response = client.post(
+        f"/store-ordering/orders/{order['id']}/{route}",
+        data={
+            "order_item_id": item,
+            "quantity": "2",
+            "op_no": "normal-admin-compat",
+        },
+    )
+    assert response.status_code == 302
+    assert _stock(env["store_path"]) == expected
+    assert _stock(other) == 0
+    detail = sop.get_order_detail(master, order["id"])
+    assert detail["order_items"][0]["fulfilled_quantity"] == expected
+    assert detail["status"] == ("delivered" if route == "deliver" else "shipped")
+
+
+@pytest.mark.parametrize("route", ["receive", "deliver"])
+@pytest.mark.parametrize("uid", [1, 2])
+def test_normal_order_dc_receipt_keeps_legacy_redirects(transfer_env, transfer_client, route, uid):
+    env = transfer_env
+    master = env["master"]
+    order = _create(env)
+    master.execute(
+        "UPDATE store_orders SET flow_type=? WHERE id=?", (sop.FLOW_STORE_ORDER, order["id"])
+    )
+    master.commit()
+    item = order["order_items"][0]["id"]
+    sop.ship_order(master, order["id"], {item: 10}, shipped_by=3)
+    response = transfer_client(uid, 1).post(
+        f"/store-ordering/orders/{order['id']}/{route}",
+        data={
+            "order_item_id": item,
+            "quantity": "2",
+            "op_no": "normal-dc-reject",
+        },
+    )
+    assert response.status_code == 302
+    expected = (
+        "/store-ordering/review"
+        if route == "receive" and uid == 2
+        else f"/store-ordering/orders/{order['id']}"
+    )
+    assert response.location.endswith(expected)
+    assert sop.get_order_detail(master, order["id"])["receipts"] == []
+    assert _stock(env["store_path"]) == 0 and _stock(env["dc_path"]) == 90
