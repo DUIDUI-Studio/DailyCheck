@@ -1621,48 +1621,94 @@ def get_dc_items_for_order_detail(
         (dc_code, order_id),
     ).fetchall()
 
+    class SourceUnavailable(Exception):
+        """An availability error raised specifically by a source DB read."""
+
+    def source_read(operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except sqlite3.DatabaseError as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            if code in {
+                sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CANTOPEN,
+                sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_IOERR,
+                sqlite3.SQLITE_PERM,
+            } or (code == sqlite3.SQLITE_ERROR and str(exc).startswith(
+                ("no such table:", "no such column:")
+            )):
+                raise SourceUnavailable from exc
+            # Syntax/binding defects and attempted writes are not missing stock.
+            raise
+
+    class SourceCursor(sqlite3.Cursor):
+        def execute(self, sql, *args, **kwargs):
+            if sql.strip().upper() != "BEGIN" and not sql.lstrip().upper().startswith("SELECT "):
+                return super().execute(sql, *args, **kwargs)
+            return source_read(super().execute, sql, *args, **kwargs)
+
+        def fetchone(self):
+            return source_read(super().fetchone)
+
+        def fetchall(self):
+            return source_read(super().fetchall)
+
+    class SourceConnection(sqlite3.Connection):
+        def cursor(self):
+            return super().cursor(factory=SourceCursor)
+
+        def execute(self, *args, **kwargs):
+            return self.cursor().execute(*args, **kwargs)
+
+    # Only source operations are tagged: the shared resolver also queries master,
+    # whose failures must propagate unchanged rather than look like zero stock.
     dc_conns: dict[str, sqlite3.Connection | None] = {}
     try:
         out: dict[int, dict[str, Any]] = {}
         for r in rows:
             source = r["source_warehouse_code"]
-            if source not in dc_conns:
-                path = config.WAREHOUSE_DB_DIR / f"{source}.db"
-                try:
-                    dc_conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-                except sqlite3.OperationalError:
-                    # A missing/unavailable source must not create an empty DB
-                    # or hide valid lines from other participating warehouses.
-                    dc_conn = None
-                if dc_conn is not None:
-                    dc_conn.row_factory = sqlite3.Row
-                    # Keep resolver and enrichment on the same read snapshot.
-                    dc_conn.execute("BEGIN")
-                dc_conns[source] = dc_conn
-            dc_conn = dc_conns[source]
             dc_available = 0.0
             unit_price = 0.0
             category_name = ""
             dc_row = None
-            if dc_conn is not None:
-                try:
-                    resolved = resolve_fulfillment_item(
-                        master_conn, dc_conn,
-                        canonical_id=int(r["canonical_id"]), warehouse_code=source,
+            try:
+                if source not in dc_conns:
+                    path = config.WAREHOUSE_DB_DIR / f"{source}.db"
+                    dc_conn = source_read(
+                        sqlite3.connect, f"{path.resolve().as_uri()}?mode=ro", uri=True,
+                        # Display enrichment may yield to a writer for 250ms,
+                        # but must not spend SQLite's default 5s per source/line.
+                        timeout=0.25, factory=SourceConnection,
                     )
-                except FulfillmentError:
-                    resolved = None
-                if resolved is not None and (
-                    r["dc_item_id"] is None or r["dc_item_id"] == resolved["item_id"]
-                ):
-                    dc_row = dc_conn.execute(
-                        """SELECT i.quantity, i.selling_price, i.unit_cost,
-                                  c.name AS category_name
-                           FROM items i
-                           LEFT JOIN categories c ON c.id = i.category_id
-                           WHERE i.id=? AND i.canonical_id=?""",
-                        (resolved["item_id"], int(r["canonical_id"])),
-                    ).fetchone()
+                    # Register before BEGIN so even snapshot setup failures close.
+                    dc_conns[source] = dc_conn
+                    dc_conn.row_factory = sqlite3.Row
+                    dc_conn.execute("BEGIN")
+                dc_conn = dc_conns[source]
+                if dc_conn is not None:
+                    try:
+                        resolved = resolve_fulfillment_item(
+                            master_conn, dc_conn,
+                            canonical_id=int(r["canonical_id"]), warehouse_code=source,
+                        )
+                    except FulfillmentError:
+                        resolved = None
+                    if resolved is not None and (
+                        r["dc_item_id"] is None or r["dc_item_id"] == resolved["item_id"]
+                    ):
+                        dc_row = dc_conn.execute(
+                            """SELECT i.quantity, i.selling_price, i.unit_cost,
+                                      c.name AS category_name
+                               FROM items i
+                               LEFT JOIN categories c ON c.id = i.category_id
+                               WHERE i.id=? AND i.canonical_id=?""",
+                            (resolved["item_id"], int(r["canonical_id"])),
+                        ).fetchone()
+            except SourceUnavailable:
+                # Latch the failed source for this render: no reopen/retry per row.
+                failed_conn = dc_conns.get(source)
+                dc_conns[source] = None
+                if failed_conn is not None:
+                    failed_conn.close()
             if dc_row is not None:
                 dc_available = parse_qty(dc_row["quantity"])
                 unit_price, _ = parse_price_and_multiple(dc_row)

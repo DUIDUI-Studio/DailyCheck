@@ -1499,6 +1499,8 @@ flowchart TB
 
 `fulfillment_pure.py` 按显式来源仓解析唯一有效履约行，别名/停用行不参与，缺失/多绑定/单位或阻断冲突失败关闭；返回原始成本与库存，独立价格/倍数 helper 沿用订货规则，且不回查当前路由（测试：`tests/test_fulfillment_pure.py`）。
 订单详情库存/价格/品类 enrichment 也复用该解析器，并核对已固化的仓内行 ID，避免跨仓同 ID 串读（Issue #109，详 §10.3）。
+Issue #111 仅在该详情 helper 内标记来源库读取可用性错误；坏库/缺 schema/锁竞争
+按来源隔离，master 与非预期异常继续上抛，不扩展到订货写事务。
 
 **UI 导航结构（2026-10-13 导航模块化起）**：面向用户的信息架构收敛为 **7 模块** —
 总览 / 库存管理 / 生产管理 / 门店订货 / 采购 / 通知 / 管理员，三个载体（桌面侧边栏 /
@@ -1566,6 +1568,8 @@ flowchart LR
   `store_quantity` 展示值。
 - `get_dc_items_for_order_detail()` 按订单行固化来源分别建立只读仓库连接，复用
   `resolve_fulfillment_item()` / `parse_price_and_multiple()`；详情查询不触发仓库迁移。
+  来源专用 connection/cursor 在执行和取行时标记读取可用性错误，避免把解析器内
+  master 查询错误误当来源缺货；每来源忙等待 250ms，失败后本次查询不再重试（Issue #111）。
 - `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
   `master.db.store_orders` 给订单发货流水补订单链接。
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
@@ -2135,8 +2139,17 @@ HTTP 层 `BEGIN IMMEDIATE` 后 `apply_batch()` 重读整批基线并校验所有
 只有历史 NULL 行 ID 才允许按 canonical 解析。缺行、解绑、停用、别名、歧义、单位/
 阻断冲突或固化 ID 不匹配时，沿用零库存/零单价和 canonical 品类兜底，不换仓、不换行。
 库存、售价优先/成本兜底和本地品类来自同一经验证的行；历史负库存仍保留。
-每个来源仓复用一条 `mode=ro` 连接和读事务，缺失/不可打开的仓库显示兜底且不影响
-其他来源行，不创建物理库、不迁移、不改订单快照。当前路由变更或跨仓创建开关不改变
+每个来源仓复用一条 `mode=ro` 连接和读事务，不创建物理库、不迁移、不改订单快照。
+**来源读取容错（Issue #111，2026-11-01）**：连接、BEGIN、解析和 enrichment 的来源库
+可用性错误（缺失/不可打开、损坏、缺表/列、busy/locked、读取 I/O/权限）沿用兜底，
+不影响健康来源的库存/单价/品类。来源专用 cursor 标记异常，master 查询、SQL 语法/
+绑定缺陷、非预期程序异常及写入错误仍上抛；不在其他业务事务增加捕获。
+显示查询设置 SQLite busy timeout=250ms，允许短暂让出写锁且避免默认 5s 等待；
+同来源首个可用性失败即关闭连接并缓存失败，不逐行开库或重试。成功来源继续在同一
+读快照中解析与取值，所有已打开连接（含 BEGIN 失败路径）均关闭。
+这里的零库存/零单价表示 enrichment 不可用，**不是实际物理库存为零的证明**，显示
+总金额也可能因兜底而下降；本次保留原返回结构及 UI，不新增不可用状态展示。
+当前路由变更或跨仓创建开关不改变
 存量单来源；`/inventory` 仍是当前会话仓库存，不作 DC 汇总。
 
 **订单审批与出库可见性（Issue #64，2026-10-27）**：审批只更新订单状态并授权后续
@@ -2489,6 +2502,13 @@ Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 mast
 停用/别名/歧义/单位/阻断冲突、无效重复绑定、缺库不创建、负库存/成本兜底、
 查询前后库文件不变和 `/inventory` 当前仓语义。临时变异验证头仓代替来源、
 忽略固化 ID、歧义取首行和允许建缺库均会被回归检出。
+
+Issue #111 的 `tests/test_order_detail_source_resilience.py` 复用 #109 的真实多仓夹具，
+覆盖坏库/空库/缺表列/独占锁/缺库/不可打开、历史 NULL 头仓兜底，以及生产式异常处理
+的 Flask HTTP 请求；断言健康行完整值、canonical 兜底与库文件字节不变。
+多行锁源以实际第二连接持有 BEGIN EXCLUSIVE，核验忙等待配置、每来源开库/解析次数，
+记录耗时；正常/异常关闭、BEGIN 与取行故障、master/程序/写错不吞和 WAL 并发快照均回归。
+关键变异检验来源隔离、失败缓存、短等待、连接关闭和读快照，保留 #109 原 30 例。
 
 **完整 MCP 门禁（Issue #103，2026-10-31 起）**：CI test job、`verify.sh` check 1 与
 `generate_reports.sh` 的本地 fallback 都收集 `tests/mcp_server/`，不再整目录排除。
