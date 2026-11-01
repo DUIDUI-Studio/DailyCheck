@@ -47,7 +47,7 @@ def test_registry_matches_every_implementation_and_dispatch():
     }
     for entry in registry.REGISTRY:
         Draft202012Validator.check_schema(entry.output_shape)
-        assert entry.tool.outputSchema is None
+        assert "outputSchema" not in entry.tool.model_dump(mode="json", exclude_none=True)
         assert entry.tests == (f"tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[{entry.name}]",)
 
 
@@ -127,6 +127,87 @@ def test_generated_artifacts_match_and_check_detects_drift(tmp_path, monkeypatch
         target.write_text(original)
     assert mcp_contracts.main(['--write']) == 0
     assert mcp_contracts.main(['--check']) == 0
+
+
+def test_json_serialization_is_independent_of_nested_object_insertion_order():
+    first = {
+        'tools': [{'name': '库存', 'metadata': {'z': 1, 'a': {'right': False, 'left': None}}}],
+        'counts': {'runtime': 1, 'external': 0},
+    }
+    reordered = {
+        'counts': {'external': 0, 'runtime': 1},
+        'tools': [{'metadata': {'a': {'left': None, 'right': False}, 'z': 1}, 'name': '库存'}],
+    }
+    assert first == reordered
+    serialized = mcp_contracts.json_text(first)
+    assert json.loads(serialized) == first
+    assert serialized == mcp_contracts.json_text(reordered)
+
+
+@pytest.fixture
+def generated_contract_tree(tmp_path, monkeypatch):
+    copy_maintenance_files(tmp_path)
+    for path, expected in mcp_contracts.generated_artifacts().items():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(expected)
+    monkeypatch.setattr(mcp_contracts, 'ROOT', tmp_path)
+    assert mcp_contracts.main(['--check']) == 0
+    return tmp_path
+
+
+@pytest.mark.parametrize('change', [
+    'metadata', 'description', 'input_schema', 'output_shape', 'added_field',
+    'array_value', 'array_order', 'array_count', 'declared_count',
+])
+def test_generated_contract_check_rejects_semantic_json_drift(generated_contract_tree, change):
+    target = generated_contract_tree / mcp_contracts.ARTIFACT_DIR / 'registry.json'
+    original = target.read_text()
+    changed = json.loads(original)
+    tool = changed['tools'][0]
+    if change == 'metadata':
+        tool['access']['path_enforcement'] = 'changed enforcement metadata'
+    elif change == 'description':
+        tool['description'] += ' changed description'
+    elif change == 'input_schema':
+        tool['inputSchema']['required'].append('unexpected_argument')
+    elif change == 'output_shape':
+        tool['output_contract']['schema'] = {'type': 'null'}
+    elif change == 'added_field':
+        tool['future_metadata'] = {'meaning': 'must not be silently dropped'}
+    elif change == 'array_value':
+        changed['notes'][0] += ' changed note'
+    elif change == 'array_order':
+        changed['tools'].reverse()
+    elif change == 'array_count':
+        changed['tools'].pop()
+    else:
+        changed['counts']['runtime'] += 1
+    assert changed != json.loads(original)
+    changed_text = mcp_contracts.json_text(changed)
+    assert json.loads(changed_text) == changed
+    target.write_text(changed_text)
+    assert mcp_contracts.main(['--check']) == 1
+    assert target.read_text() == changed_text
+    target.write_text(original)
+    assert mcp_contracts.main(['--check']) == 0
+
+
+@pytest.mark.parametrize('change', ['formatting_only', 'malformed', 'trailing_json'])
+def test_contract_check_rejects_noncanonical_json_text(generated_contract_tree, change):
+    target = generated_contract_tree / mcp_contracts.ARTIFACT_DIR / 'registry.json'
+    original = target.read_text()
+    if change == 'formatting_only':
+        changed = json.dumps(json.loads(original), ensure_ascii=False)
+        assert json.loads(changed) == json.loads(original)
+    elif change == 'malformed':
+        changed = original[:original.rfind('}')]
+    else:
+        changed = original + '{}\n'
+    assert changed != original
+    target.write_text(changed)
+    assert mcp_contracts.main(['--check']) == 1
+    assert target.read_text() == changed
 
 
 def test_contract_cli_runs_from_repository():

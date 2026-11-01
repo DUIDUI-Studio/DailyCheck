@@ -106,7 +106,7 @@ def validate_maintenance_references(root: Path = ROOT) -> None:
 
 
 def json_text(value: dict) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 def generated_artifacts() -> dict[Path, str]:
