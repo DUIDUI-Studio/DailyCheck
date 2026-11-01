@@ -1915,6 +1915,8 @@ flowchart LR
 完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
 及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留16项子集，不是完整注册表。
 `python -m scripts.mcp_contracts --write/--check` 确定性生成/只读校验三份产物，检查失败返回非零；
+JSON 对象键递归排序，保留全部元数据和值及数组次序，消除 SDK 字段声明顺序造成的文本漂移；
+`--check` 仍逐字校验，不放行真实内容变化、非规范格式或尾随文本。
 命令无需服务或数据库，可供CI接线。输出 shape **不**传给SDK `outputSchema`，不启用
 `structuredContent`，保留原description/input与TextContent中的JSON业务形状。
 其中 `items_detail` 仍列表包装、`procurement_hub` 仍数组、`canonical_fanout_event` 缺事件仍null、
@@ -2494,6 +2496,8 @@ Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时mast
 
 Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、
 原始29声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
+嵌套对象插入顺序不影响生成字节；元数据/输入输出字段/新增字段、数组值/次序/数量、计数变化
+及非规范/畸形/尾随JSON均须被检出。SDK输出禁用守卫检查实际序列化结果，不依赖新SDK对象属性。
 全部29项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
 call_tool派发/序列化验证最小输出shape；七canonical写只在临时库与临时备份目录实调，
 不用Bot扩权或生产库。新增登记需同步该参数矩阵；形状元数据不改变运行时返回。
