@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -85,16 +86,25 @@ def test_oversized_compact_summary_fails_instead_of_truncating_required_lines(he
 def test_writes_single_base64_github_output(helper, tmp_path):
     source = tmp_path / "pytest-output.txt"
     output = tmp_path / "github-output"
-    source.write_text(SAMPLE_OUTPUT, encoding="utf-8")
-
-    assert helper.main([str(source), "--output-file", str(output)]) == 0
+    text = "FAILED tests/unit/test_known.py::test_known - old baseline\n1 failed, 17 passed in 1.25s\n"
+    source.write_text(text, encoding="utf-8")
+    session = {"schema_version": 1, "pytest_exit": 1, "selected": 18, "selected_unique": 18,
+               "completed": 18, "uncompleted": [], "unexpected": [], "error_nodeids": [],
+               "failed_nodeids": ["tests/unit/test_known.py::test_known"],
+               "counts": {"passed": 17, "failed": 1, "skipped": 0, "xfailed": 0, "xpassed": 0, "error": 0}}
+    meta = tmp_path / "evidence.json"
+    meta.write_text(json.dumps(helper.make_evidence(text, 1, session)), encoding="utf-8")
+    assert helper.main([str(source), "--evidence-file", str(meta), "--output-file", str(output)]) == 0
 
     line = output.read_text(encoding="utf-8").rstrip("\n")
     prefix = f"{helper.OUTPUT_NAME}="
     assert line.startswith(prefix)
     encoded = line.removeprefix(prefix)
     assert "\n" not in encoded
-    assert base64.b64decode(encoded).decode("utf-8") == helper.extract_pytest_summary(SAMPLE_OUTPUT)
+    envelope = json.loads(base64.b64decode(encoded).decode("utf-8"))
+    text_out, evidence = helper.decode_result(envelope)
+    assert text_out == helper.extract_pytest_summary(text)
+    assert evidence["native_exit"] == 1
 
 
 def test_missing_input_returns_usage_error(helper, tmp_path):
