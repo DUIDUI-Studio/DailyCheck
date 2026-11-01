@@ -2,6 +2,9 @@
 
 > 2026-10-19 · 状态：已实现（`feat/dc-transfer-order`）
 > 相关代码：`blueprints/dc_transfer.py`、`blueprints/dc_transfer_pure.py`、`blueprints/store_ordering_pure.py`、`db/__init__.py`
+> 2026-11-01 扩展（Issue #107）：Owner eric 在 [comment966](http://hub01:3000/eric/dailycheck/issues/107#issuecomment-966)
+> 批准 [comment961](http://hub01:3000/eric/dailycheck/issues/107#issuecomment-961)，允许配送中心间调货。
+> 本文「收货仓/分仓」可为同租户的其他配送中心或门店；门店既有入口保持不变。
 
 ## 1. 需求与结论
 
@@ -46,13 +49,15 @@
 | 发起调货（建单） | 总仓 manager / admin；平台超管 | `require_warehouse_type("distribution_center")` + `require_permission("transfer.create")` |
 | 查看发送单列表 | 总仓 staff 及以上 | `require_warehouse_type(DC)`；建单按钮仅对持 `transfer.create` 者渲染 |
 | 安排发货 / 部分发货 | 总仓 staff 及以上 | 复用 `store_ordering.ship_order_route`（`require_role("staff")` + DC 类型 + `_assert_order_belongs_to_current_dc`） |
-| 查看待收货的调货单 | 分仓 staff 及以上 | 不设独立入口：进「本店订单」即可（`dc_transfer.transfer_list` 对门店 302 回订单列表） |
-| 确认接收 / 部分接收 | 分仓 manager / admin；平台超管 | 复用 `store_ordering.receive_order_route`（`order.receive` + storefront 类型 + 经理角色） |
-| 一次性收齐 | 分仓 manager / admin | 复用 `store_ordering.deliver_order_route`（`order.ship`） |
+| 查看待收货的调货单 | 收货仓用户 | 门店进「本店订单」（调货列表对门店 302 回订单列表）；DC 进调货列表的「收货单」 |
+| 确认接收 / 部分接收 | 收货仓 manager / admin；平台超管 | `receive_order_route`：order.receive + 经理角色；当前仓=收货仓，仅 dc_transfer 允许 DC 收货 |
+| 一次性收齐已到货物 | 收货仓 manager / admin；平台超管 | `deliver_order_route`：order.ship + 经理角色 + 同一收货仓归属校验；调货复用 receive_partial 幂等协议 |
 | 取消调货单 | 总仓 manager / admin，且**未发货** | 复用 `cancel_order_route` 的 `approved` 分支 + `cancel_order()` 新增「已有发货记录不可取消」守卫 |
 | 收到发起 / 发出通知 | 分仓 manager / admin | `notify_order_event(EVENT_TRANSFER_CREATED / SHIPPED / DELIVERED)` |
 
-> 分仓不能发起调货，也不能取消总仓发起的调货单——两条路径分别被仓库类型守卫和 `cancel_order_route` 的 approved 分支（要求当前仓为发货 DC）挡住。
+> 门店不能发起调货；配送中心可向其他配送中心或门店调货，禁止向自身、研发仓或跨租户仓调货。
+> 收货方不能取消来货，即使操作者另有发送仓角色；取消调货要求当前仓为发送仓，且未发货。
+> 平台管理员收货也必须切换到实际目标仓；现有角色包与权限点不变。
 
 ## 4. 状态流转
 
@@ -68,9 +73,10 @@
 | `completed` | 已完成 | 主状态 `delivered`（分仓全部收齐） |
 | `cancelled` | 已取消 | 主状态 `cancelled`（仅未发货时可进入） |
 
-### 4.2 收货视角（门店，由明细派生）
+### 4.2 收货视角（门店或接收 DC，由明细派生）
 
 > 门店侧**不引入「接收单」概念**：收到的调货单就是一张待收货的订单，列在「本店订单」里，状态按收货进度显示（2026-10-19 owner 明确）。
+> 接收 DC 在既有调货列表选择「收货单」；详情按目标仓显示收货进度及本仓入库流水，不显示出货表单。
 
 | 状态 key | 展示 | 判定 |
 |---|---|---|
@@ -131,18 +137,19 @@ stateDiagram-v2
 | 报表口径 | 计入订货报表 | **排除**（`compute_store_order_report` 只统计 `flow_type='store_order'`） |
 | 取消限制 | 已收货不可取消 | 在「已收货不可取消」之外，**已发货也不可取消**（在途货物不能凭空作废） |
 | 通知文案 | 订货单 | 总仓调货单；创建时额外通知分仓准备接收 |
-| 列表 | `/store-ordering/orders` 本店订单 | 总仓用 `/dc-transfer/` 发送单列表；门店仍在本店订单里看（多一列「类型」） |
+| 列表 | `/store-ordering/orders` 本店订单 | DC 用 `/dc-transfer/` 发送单、`?scope=incoming` 本仓收货单；门店仍在本店订单里看 |
 
 ## 7. 页面与接口
 
 | 方法与路径 | 作用 |
 |---|---|
-| `GET /dc-transfer/` | 总仓：发送单列表（含进度、待发量）；门店访问 302 回「本店订单」，不设独立页面 |
-| `GET /dc-transfer/new` | 建单页：选分仓 + 勾品项数量（仅列主数据启用且库存 > 0 的品项） |
+| `GET /dc-transfer/` | DC 默认仅本仓发送单；`?scope=incoming` 仅本仓收货单（含进度、待收量）；门店仍 302 回「本店订单」 |
+| `GET /dc-transfer/new` | 建单页：选同租户其他 DC / 门店 + 勾品项数量（仅列主数据启用且库存 > 0 的品项） |
 | `POST /dc-transfer/new` | 创建调货单，字段 `to_warehouse_code`、`items[<canonical_id>]`、`note` |
 | `GET /store-ordering/orders/<id>` | 调货单详情（复用），发送 / 接收 / 取消入口同页 |
 | `POST /store-ordering/orders/<id>/ship` | 总仓发货（复用） |
 | `POST /store-ordering/orders/<id>/receive` | 分仓收货（复用） |
+| `POST /store-ordering/orders/<id>/deliver` | 收货仓一次性收下已到货物；调货表单携带 op_no，同键只重放原批次，可恢复未应用 receipt |
 | `POST /store-ordering/orders/<id>/cancel` | 总仓取消（复用） |
 
 ## 8. 边界与已知限制
@@ -155,6 +162,12 @@ stateDiagram-v2
 6. **状态历史表仍显示英文状态码**：与订货单现状一致，未在本轮改造。
 
 ## 9. 测试
+
+Issue #107 扩展的真实临时 SQLite / Flask 回归覆盖 DC→DC 与 DC→门店、非法候选/建单、
+自调货、staff 建单/收货拒绝、错仓及无关仓可见性/收货/发货拒绝、普通订货单 DC 收货拒绝、
+双角色收货方取消拒绝、部分/最终收货、发送/接收库存与流水、通知及幂等重放。
+收货仓故障注入验证单行和整批收货可原键恢复，整批旧键重放不吸收后续到货。
+实现仍复用原库存协议，无独立库存写、schema 或权限包扩展。
 
 `tests/test_dc_transfer.py`（18 个用例）覆盖：
 

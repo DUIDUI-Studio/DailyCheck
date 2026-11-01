@@ -1,4 +1,4 @@
-"""Pure logic for 总仓调货（DC → 门店调拨）.
+"""Pure logic for 总仓调货（DC → 其他 DC / 门店调拨）.
 
 设计要点（详见 docs/2026-10-19-dc-transfer-design.md）：
 
@@ -6,7 +6,7 @@
   的订单，因此明细、批次发货（``store_order_deliveries``）、部分收货
   （``store_order_receipts``）、状态历史、库存流水全部复用订货流程的实现。
 - **方向复用现有列**：``dc_warehouse_code`` = 发货仓（总仓），
-  ``store_warehouse_code`` = 收货仓（分仓）。不新增方向列。
+  ``store_warehouse_code`` = 收货仓（其他 DC / 门店）。不新增方向列。
 - **跳过审批**：调货由总仓主动发起，不存在「总仓审批自己」的环节，因此
   建单即 ``approved``（待发货），不经过 ``pending``。
 - **发送单 / 接收单** 是同一张单的两个视角：
@@ -24,6 +24,7 @@ from blueprints import store_ordering_pure as sop
 from blueprints._helpers import now, parse_qty
 
 WAREHOUSE_TYPE_STOREFRONT: str = "storefront"
+TRANSFER_RECEIVER_TYPES = (sop.WAREHOUSE_TYPE_DC, WAREHOUSE_TYPE_STOREFRONT)
 
 # 发送单状态（总仓视角）
 DOC_AWAITING_SHIP: str = "awaiting_ship"
@@ -92,18 +93,19 @@ def list_transferable_items(
 def _assert_warehouse(
     master_conn: sqlite3.Connection,
     code: str,
-    expected_type: str,
+    expected_type: str | tuple[str, ...],
     label: str,
 ) -> dict[str, Any]:
     master_conn.row_factory = sqlite3.Row
     row = master_conn.execute(
-        "SELECT code, name, warehouse_type FROM warehouses WHERE code=?",
+        "SELECT code, name, warehouse_type, tenant_id FROM warehouses WHERE code=?",
         (code,),
     ).fetchone()
     if row is None:
         raise ValueError(f"{label}不存在：{code}")
-    if row["warehouse_type"] != expected_type:
-        raise ValueError(f"{label} {code} 不是{expected_type}类型仓库")
+    types = (expected_type,) if isinstance(expected_type, str) else expected_type
+    if row["warehouse_type"] not in types:
+        raise ValueError(f"{label} {code} 不是{' / '.join(types)}类型仓库")
     return dict(row)
 
 
@@ -123,7 +125,7 @@ def create_transfer_order(
     canonical 出现多行时先合并，避免明细重复导致发货/收货对不上。
 
     校验（任一条不满足 → ValueError，调用方 flash）：
-      1. 发货仓必须是配送中心（总仓），收货仓必须是门店（分仓），两者不同；
+      1. 发货仓必须是配送中心，收货仓为同租户的其他配送中心或门店；
       2. 明细非空、数量 > 0；
       3. 每个 canonical 在发货仓有对应 items 行（否则发不出货）。
 
@@ -135,12 +137,14 @@ def create_transfer_order(
         raise ValueError("调货明细不能为空")
     if from_warehouse_code == to_warehouse_code:
         raise ValueError("发货仓与收货仓不能相同")
-    _assert_warehouse(
+    source = _assert_warehouse(
         master_conn, from_warehouse_code, sop.WAREHOUSE_TYPE_DC, "发货仓"
     )
-    _assert_warehouse(
-        master_conn, to_warehouse_code, WAREHOUSE_TYPE_STOREFRONT, "收货仓"
+    receiver = _assert_warehouse(
+        master_conn, to_warehouse_code, TRANSFER_RECEIVER_TYPES, "收货仓"
     )
+    if receiver["tenant_id"] != source["tenant_id"]:
+        raise ValueError("发货仓与收货仓必须属于同一租户")
 
     # 合并同 canonical 多行（保持首次出现顺序，UI 顺序可预期）。
     merged: dict[int, float] = {}

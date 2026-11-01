@@ -492,3 +492,574 @@ def test_transfer_detail_renders_for_both_sides(transfer_env, transfer_client):
     # 内部调拨不展示结算金额
     assert "订单总计" not in store_body
     assert "内部调拨，不产生金额" in store_body
+
+# Issue #107: receiving warehouse type must not determine document direction.
+@pytest.fixture
+def dc_receiver_env(transfer_env):
+    env = transfer_env
+    master = env["master"]
+    ts = sop.now()
+    master.execute(
+        "INSERT INTO tenants (id, name, created_at) VALUES (2, 'other tenant', ?)", (ts,)
+    )
+    for wid, code, kind, tenant in (
+        (3, "dc_receiver", "distribution_center", 1),
+        (4, "dc_foreign", "distribution_center", 1),
+        (5, "rd_receiver", "rd", 1),
+        (6, "dc_other_tenant", "distribution_center", 2),
+    ):
+        path = env["dc_path"].parent / f"{code}.db"
+        init_warehouse_db(path)
+        master.execute(
+            "INSERT INTO warehouses (id, code, name, db_path, warehouse_type, tenant_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (wid, code, code, str(path), kind, tenant, ts),
+        )
+    for uid, name, wid, role in (
+        (5, "receiver_manager", 3, "manager"),
+        (6, "receiver_staff", 3, "staff"),
+        (7, "foreign_manager", 4, "manager"),
+    ):
+        master.execute(
+            "INSERT INTO users (id, username, password_hash, is_admin, created_at) VALUES (?, ?, 'x', 0, ?)",
+            (uid, name, ts),
+        )
+        master.execute(
+            "INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (?, ?, ?)",
+            (uid, wid, role),
+        )
+    master.commit()
+    env["receiver_path"] = env["dc_path"].parent / "dc_receiver.db"
+    return env
+
+
+def _to_dc(env, quantity=10):
+    return dtp.create_transfer_order(
+        env["master"],
+        from_warehouse_code="dc_test",
+        to_warehouse_code="dc_receiver",
+        items=[{"canonical_id": 101, "quantity": quantity}],
+        actor_id=2,
+    )
+
+
+def _stock(path):
+    with sqlite3.connect(path) as conn:
+        return conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM items WHERE canonical_id=101"
+        ).fetchone()[0]
+
+
+def _receive(client, order, item_id, qty, key):
+    return client.post(
+        f"/store-ordering/orders/{order['id']}/receive",
+        data={
+            "order_item_id": item_id,
+            "quantity": str(qty),
+            "op_no": key,
+        },
+    )
+
+
+def _ship(client, order, item_id, qty, key):
+    return client.post(
+        f"/store-ordering/orders/{order['id']}/ship",
+        data={
+            f"shipped_items[{item_id}]": str(qty),
+            "op_no": key,
+        },
+    )
+
+
+def test_dc_receiver_candidates_and_creation(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    client = transfer_client(2, 1)
+    body = client.get("/dc-transfer/new").get_data(as_text=True)
+    assert 'value="dc_receiver"' in body
+    assert 'value="store_test"' in body
+    for code in ("dc_test", "rd_receiver", "dc_other_tenant"):
+        assert f'value="{code}"' not in body
+    response = client.post(
+        "/dc-transfer/new",
+        data={
+            "to_warehouse_code": "dc_receiver",
+            "items[101]": "10",
+        },
+    )
+    assert response.status_code == 302
+    order = sop.list_orders(env["master"], store_warehouse_code="dc_receiver")[0]
+    detail = sop.get_order_detail(env["master"], order["id"])
+    assert detail["status"] == "approved"
+    assert detail["flow_type"] == sop.FLOW_DC_TRANSFER
+    assert detail["order_items"][0]["source_warehouse_code"] == "dc_test"
+    notifications = (
+        env["master"]
+        .execute(
+            "SELECT user_id, target_url FROM notifications WHERE event_type=?",
+            (sop.EVENT_TRANSFER_CREATED,),
+        )
+        .fetchall()
+    )
+    # Fan-out keeps the existing effective order.receive recipient policy.
+    # Staff may receive notifications but the manager role gate still blocks receipt.
+    assert {r["user_id"] for r in notifications} == {5, 6}
+    assert {r["target_url"] for r in notifications} == {f"/store-ordering/orders/{order['id']}"}
+    assert _stock(env["dc_path"]) == 100 and _stock(env["receiver_path"]) == 0
+
+
+@pytest.mark.parametrize("target", ["dc_test", "rd_receiver", "dc_other_tenant", "missing"])
+def test_dc_transfer_invalid_receiver_is_atomic(dc_receiver_env, transfer_client, target):
+    env = dc_receiver_env
+    response = transfer_client(2, 1).post(
+        "/dc-transfer/new",
+        data={
+            "to_warehouse_code": target,
+            "items[101]": "10",
+        },
+    )
+    assert response.status_code == 302
+    assert env["master"].execute("SELECT COUNT(*) FROM store_orders").fetchone()[0] == 0
+    assert _stock(env["dc_path"]) == 100
+
+
+def test_dc_transfer_staff_cannot_create_for_dc(dc_receiver_env, transfer_client):
+    client = transfer_client(3, 1)
+    assert client.get("/dc-transfer/new").status_code == 403
+    assert (
+        client.post(
+            "/dc-transfer/new",
+            data={
+                "to_warehouse_code": "dc_receiver",
+                "items[101]": "1",
+            },
+        ).status_code
+        == 403
+    )
+    assert dc_receiver_env["master"].execute("SELECT COUNT(*) FROM store_orders").fetchone()[0] == 0
+
+
+def test_dc_receiver_incoming_list_and_detail_are_directional(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    incoming = _to_dc(env)
+    outgoing = _create(env)
+    # Another sender's transfer must not be discoverable by receiving DC.
+    env["master"].execute(
+        "UPDATE store_orders SET dc_warehouse_code='dc_foreign' WHERE id=?", (outgoing["id"],)
+    )
+    env["master"].execute(
+        "UPDATE store_order_items SET source_warehouse_code='dc_foreign' WHERE order_id=?",
+        (outgoing["id"],),
+    )
+    env["master"].commit()
+    item = incoming["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), incoming, item, 4, "list-ship")
+    receiver = transfer_client(5, 3)
+    outgoing_body = receiver.get("/dc-transfer/").get_data(as_text=True)
+    assert incoming["order_no"] not in outgoing_body
+    incoming_body = receiver.get(
+        "/dc-transfer/?scope=incoming&from_warehouse_code=dc_foreign&to_warehouse_code=store_test"
+    ).get_data(as_text=True)
+    assert incoming["order_no"] in incoming_body and "待收货" in incoming_body
+    assert outgoing["order_no"] not in incoming_body
+    detail = receiver.get(f"/store-ordering/orders/{incoming['id']}").get_data(as_text=True)
+    assert "待收货" in detail and f"/orders/{incoming['id']}/receive" in detail
+    assert f"/orders/{incoming['id']}/deliver" in detail
+    assert "shipped_items[" not in detail
+    assert f"/orders/{incoming['id']}/cancel" not in detail
+    assert "/dc-transfer/?scope=incoming" in detail
+    sender_body = (
+        transfer_client(2, 1).get(f"/store-ordering/orders/{incoming['id']}").get_data(as_text=True)
+    )
+    assert "部分发出" in sender_body and "shipped_items[" in sender_body
+    assert f"/orders/{incoming['id']}/receive" not in sender_body
+    # A DC incoming list must not open unrelated storefront catalogue/order routes.
+    assert receiver.get("/store-ordering/orders").status_code == 302
+    assert receiver.get("/store-ordering/cart").status_code == 302
+
+
+@pytest.mark.parametrize(
+    "target,user_id,warehouse_id,path_key",
+    [
+        ("dc_receiver", 5, 3, "receiver_path"),
+        ("store_test", 4, 2, "store_path"),
+    ],
+)
+def test_transfer_route_partial_final_receipt_and_retries(
+    dc_receiver_env, transfer_client, target, user_id, warehouse_id, path_key
+):
+    env = dc_receiver_env
+    order = dtp.create_transfer_order(
+        env["master"],
+        from_warehouse_code="dc_test",
+        to_warehouse_code=target,
+        items=[{"canonical_id": 101, "quantity": 10}],
+        actor_id=2,
+    )
+    item = order["order_items"][0]["id"]
+    sender = transfer_client(2, 1)
+    assert _ship(sender, order, item, 6, "s1").status_code == 302
+    assert _ship(sender, order, item, 6, "s1").status_code == 302
+    assert _stock(env["dc_path"]) == 94
+    receiver = transfer_client(user_id, warehouse_id)
+    assert _receive(receiver, order, item, 4, "r1").status_code == 302
+    assert _receive(receiver, order, item, 4, "r1").status_code == 302
+    detail = sop.get_order_detail(env["master"], order["id"])
+    assert detail["status"] == "approved"
+    assert detail["order_items"][0]["fulfilled_quantity"] == 4
+    assert _stock(env[path_key]) == 4
+    # Overreceipt and reused key with altered quantity must leave all data unchanged.
+    assert _receive(receiver, order, item, 3, "over").status_code == 302
+    assert _receive(receiver, order, item, 1, "r1").status_code == 302
+    assert _stock(env[path_key]) == 4
+    assert len(sop.get_order_detail(env["master"], order["id"])["receipts"]) == 1
+    sender = transfer_client(2, 1)
+    assert (
+        sender.post(
+            f"/store-ordering/orders/{order['id']}/cancel", data={"reason": "too late"}
+        ).status_code
+        == 302
+    )
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "approved"
+    assert _ship(sender, order, item, 4, "s2").status_code == 302
+    assert _stock(env["dc_path"]) == 90
+    receiver = transfer_client(user_id, warehouse_id)
+    assert _receive(receiver, order, item, 6, "r2").status_code == 302
+    final = sop.get_order_detail(env["master"], order["id"])
+    assert final["status"] == "delivered"
+    assert final["order_items"][0]["fulfilled_quantity"] == 10
+    assert final["order_items"][0]["shipped_quantity"] == 10
+    before = env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+    assert _receive(receiver, order, item, 6, "r2").status_code == 302
+    assert env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == before
+    assert _stock(env[path_key]) == 10
+    assert len(sop.get_order_detail(env["master"], order["id"])["receipts"]) == 2
+    with sqlite3.connect(env[path_key]) as conn:
+        assert conn.execute(
+            "SELECT delta FROM stock_movements WHERE action=? ORDER BY id",
+            (sop.TRANSFER_RECEIPT_ACTION,),
+        ).fetchall() == [(4,), (6,)]
+    with sqlite3.connect(env["dc_path"]) as conn:
+        assert conn.execute(
+            "SELECT delta FROM stock_movements WHERE action=? ORDER BY id",
+            (sop.TRANSFER_SHIPMENT_ACTION,),
+        ).fetchall() == [(-6,), (-4,)]
+    assert [h["to_status"] for h in final["status_history"]].count("delivered") == 1
+    assert (
+        env["master"]
+        .execute(
+            "SELECT COUNT(*) FROM notifications WHERE event_type=?", (sop.EVENT_ORDER_SHIPPED,)
+        )
+        .fetchone()[0]
+        > 0
+    )
+    partial = (
+        env["master"]
+        .execute(
+            "SELECT user_id FROM notifications WHERE event_type=?", (sop.EVENT_ORDER_RECEIVED,)
+        )
+        .fetchall()
+    )
+    assert {r[0] for r in partial} == {1, 2}
+
+
+@pytest.mark.parametrize("route", ["receive", "deliver"])
+@pytest.mark.parametrize("uid,wid", [(6, 3), (2, 1), (7, 4), (4, 2), (1, 1)])
+def test_transfer_receipt_rejects_unauthorized_or_wrong_warehouse(
+    dc_receiver_env, transfer_client, route, uid, wid
+):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "auth-ship")
+    client = transfer_client(uid, wid)
+    assert (
+        client.post(
+            f"/store-ordering/orders/{order['id']}/{route}",
+            data={
+                "order_item_id": item,
+                "quantity": "4",
+                "op_no": "unauthorized",
+            },
+        ).status_code
+        == 403
+    )
+    assert _stock(env["receiver_path"]) == 0
+    assert sop.get_order_detail(env["master"], order["id"])["receipts"] == []
+
+
+def test_foreign_dc_cannot_discover_view_or_ship_transfer(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    client = transfer_client(7, 4)
+    for url in ("/dc-transfer/", "/dc-transfer/?scope=incoming", "/store-ordering/review"):
+        assert order["order_no"] not in client.get(url).get_data(as_text=True)
+    assert client.get(f"/store-ordering/orders/{order['id']}").status_code == 403
+    assert _ship(client, order, order["order_items"][0]["id"], 1, "foreign").status_code == 403
+    assert _stock(env["dc_path"]) == 100
+
+
+@pytest.mark.parametrize("route", ["receive", "deliver"])
+def test_dc_receiver_cannot_receive_normal_order(dc_receiver_env, transfer_client, route):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "normal-ship")
+    env["master"].execute(
+        "UPDATE store_orders SET flow_type=? WHERE id=?", (sop.FLOW_STORE_ORDER, order["id"])
+    )
+    env["master"].commit()
+    assert (
+        transfer_client(5, 3)
+        .post(
+            f"/store-ordering/orders/{order['id']}/{route}",
+            data={
+                "order_item_id": item,
+                "quantity": "4",
+                "op_no": "normal-receipt",
+            },
+        )
+        .status_code
+        == 403
+    )
+    assert _stock(env["receiver_path"]) == 0
+    assert sop.get_order_detail(env["master"], order["id"])["receipts"] == []
+
+
+def test_receiver_cannot_cancel_even_with_sender_role(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    # Having sender privileges in another warehouse must not make this an outgoing order.
+    env["master"].execute(
+        "INSERT INTO warehouse_users (user_id, warehouse_id, role) VALUES (5, 1, 'manager')"
+    )
+    env["master"].commit()
+    assert (
+        transfer_client(5, 3)
+        .post(f"/store-ordering/orders/{order['id']}/cancel", data={"reason": "receiver"})
+        .status_code
+        == 403
+    )
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "approved"
+    assert (
+        transfer_client(2, 1)
+        .post(f"/store-ordering/orders/{order['id']}/cancel", data={"reason": "sender"})
+        .status_code
+        == 302
+    )
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "cancelled"
+    assert _stock(env["dc_path"]) == 100 and _stock(env["receiver_path"]) == 0
+
+
+def test_dc_receiving_shortcut_handles_partial_full_and_repeat(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "quick-s1")
+    receiver = transfer_client(5, 3)
+    url = f"/store-ordering/orders/{order['id']}/deliver"
+    assert receiver.post(url).status_code == 302
+    assert _stock(env["receiver_path"]) == 4
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "approved"
+    assert (
+        env["master"]
+        .execute(
+            "SELECT COUNT(*) FROM notifications WHERE event_type=?", (sop.EVENT_ORDER_DELIVERED,)
+        )
+        .fetchone()[0]
+        == 0
+    )
+    before = env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+    assert receiver.post(url).status_code == 302
+    assert env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == before
+    _ship(transfer_client(2, 1), order, item, 6, "quick-s2")
+    receiver = transfer_client(5, 3)
+    assert receiver.post(url).status_code == 302
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "delivered"
+    before = env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+    assert receiver.post(url).status_code == 302
+    assert env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == before
+    assert _stock(env["dc_path"]) == 90 and _stock(env["receiver_path"]) == 10
+
+
+def test_dc_receipt_storage_failure_retries_without_duplicate_stock(
+    dc_receiver_env, transfer_client, monkeypatch
+):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "failure-ship")
+    client = transfer_client(5, 3)
+    apply = sop._apply_store_receipts
+
+    def fail_storage(*args, **kwargs):
+        raise sqlite3.OperationalError("injected receiving warehouse unavailable")
+
+    monkeypatch.setattr(sop, "_apply_store_receipts", fail_storage)
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        _receive(client, order, item, 4, "repair")
+    pending = sop.get_order_detail(env["master"], order["id"])
+    assert pending["receipts"][0]["applied"] == 0
+    assert pending["order_items"][0]["fulfilled_quantity"] == 4
+    assert _stock(env["receiver_path"]) == 0
+    monkeypatch.setattr(sop, "_apply_store_receipts", apply)
+    assert _receive(client, order, item, 4, "repair").status_code == 302
+    assert _receive(client, order, item, 4, "repair").status_code == 302
+    repaired = sop.get_order_detail(env["master"], order["id"])
+    assert len(repaired["receipts"]) == 1 and repaired["receipts"][0]["applied"] == 1
+    assert repaired["order_items"][0]["fulfilled_quantity"] == 4
+    assert _stock(env["receiver_path"]) == 4 and _stock(env["dc_path"]) == 96
+
+
+def test_dc_receipt_foreign_line_and_cancelled_order_are_rejected(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    other = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    foreign_item = other["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "line-ship")
+    receiver = transfer_client(5, 3)
+    assert _receive(receiver, order, foreign_item, 1, "foreign-line").status_code == 302
+    assert sop.get_order_detail(env["master"], order["id"])["receipts"] == []
+    sop.cancel_order(env["master"], other["id"], 2, "cancel")
+    assert _receive(receiver, other, foreign_item, 1, "cancelled").status_code == 302
+    assert sop.get_order_detail(env["master"], other["id"])["receipts"] == []
+    assert _stock(env["receiver_path"]) == 0
+
+
+def test_dc_receiver_manager_still_requires_receive_permission(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "permission-ship")
+    env["master"].execute(
+        "DELETE FROM role_permissions WHERE permission_code='order.receive' AND role_id IN (SELECT id FROM roles WHERE code='manager')"
+    )
+    env["master"].commit()
+    client = transfer_client(5, 3)
+    assert _receive(client, order, item, 4, "no-permission").status_code == 403
+    body = client.get(f"/store-ordering/orders/{order['id']}").get_data(as_text=True)
+    assert f"/orders/{order['id']}/receive" not in body
+    assert _stock(env["receiver_path"]) == 0
+
+
+def test_dc_transfer_small_batch_replay_is_idempotent(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    sender = transfer_client(2, 1)
+    assert _ship(sender, order, item, 6, "small-ship").status_code == 302
+    receiver = transfer_client(5, 3)
+    assert _receive(receiver, order, item, 2, "small-receipt").status_code == 302
+    before = env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+    assert _receive(receiver, order, item, 2, "small-receipt").status_code == 302
+    assert _stock(env["receiver_path"]) == 2
+    assert env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == before
+    assert len(sop.get_order_detail(env["master"], order["id"])["receipts"]) == 1
+
+
+def test_dc_transfer_shortcut_replay_does_not_receive_later_arrivals(
+    dc_receiver_env, transfer_client
+):
+    env = dc_receiver_env
+    order = dtp.create_transfer_order(
+        env["master"],
+        from_warehouse_code="dc_test",
+        to_warehouse_code="dc_receiver",
+        items=[{"canonical_id": 101, "quantity": 10}, {"canonical_id": 102, "quantity": 3}],
+        actor_id=2,
+    )
+    first, second = [it["id"] for it in order["order_items"]]
+    _ship(transfer_client(2, 1), order, first, 4, "arrivals-1")
+    receiver = transfer_client(5, 3)
+    url = f"/store-ordering/orders/{order['id']}/deliver"
+    assert receiver.post(url, data={"op_no": "arrival-receipt"}).status_code == 302
+    _ship(transfer_client(2, 1), order, second, 3, "arrivals-2")
+    receiver = transfer_client(5, 3)
+    before = env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+    assert receiver.post(url, data={"op_no": "arrival-receipt"}).status_code == 302
+    detail = sop.get_order_detail(env["master"], order["id"])
+    assert len(detail["receipts"]) == 1
+    assert [it["fulfilled_quantity"] for it in detail["order_items"]] == [4, 0]
+    assert env["master"].execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == before
+    assert receiver.post(url, data={"op_no": "new-arrival-receipt"}).status_code == 302
+    assert [
+        it["fulfilled_quantity"]
+        for it in sop.get_order_detail(env["master"], order["id"])["order_items"]
+    ] == [4, 3]
+
+
+def test_dc_transfer_shortcut_recovers_interrupted_receipt(
+    dc_receiver_env, transfer_client, monkeypatch
+):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), order, item, 4, "shortcut-failure")
+    receiver = transfer_client(5, 3)
+    url = f"/store-ordering/orders/{order['id']}/deliver"
+    apply = sop._apply_store_receipts
+
+    def fail_storage(*args, **kwargs):
+        raise sqlite3.OperationalError("injected shortcut warehouse unavailable")
+
+    monkeypatch.setattr(sop, "_apply_store_receipts", fail_storage)
+    with pytest.raises(sqlite3.OperationalError, match="injected shortcut"):
+        receiver.post(url, data={"op_no": "shortcut-repair"})
+    assert _stock(env["receiver_path"]) == 0
+    monkeypatch.setattr(sop, "_apply_store_receipts", apply)
+    assert receiver.post(url, data={"op_no": "shortcut-repair"}).status_code == 302
+    assert receiver.post(url, data={"op_no": "shortcut-repair"}).status_code == 302
+    detail = sop.get_order_detail(env["master"], order["id"])
+    assert len(detail["receipts"]) == 1 and detail["receipts"][0]["applied"] == 1
+    assert _stock(env["receiver_path"]) == 4 and _stock(env["dc_path"]) == 96
+
+
+def test_dc_transfer_receipt_and_shipping_status_constraints(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    order = _to_dc(env)
+    item = order["order_items"][0]["id"]
+    receiver = transfer_client(5, 3)
+    assert _receive(receiver, order, item, 1, "not-shipped").status_code == 302
+    assert sop.get_order_detail(env["master"], order["id"])["receipts"] == []
+    assert _stock(env["receiver_path"]) == 0
+    cancelled = _to_dc(env)
+    cancelled_item = cancelled["order_items"][0]["id"]
+    sender = transfer_client(2, 1)
+    sender.post(f"/store-ordering/orders/{cancelled['id']}/cancel", data={"reason": "before ship"})
+    assert _ship(sender, cancelled, cancelled_item, 1, "cancelled-ship").status_code == 302
+    assert _stock(env["dc_path"]) == 100
+    assert sop.get_order_detail(env["master"], cancelled["id"])["status"] == "cancelled"
+    assert _ship(sender, order, item, 10, "full-ship").status_code == 302
+    sender.post(f"/store-ordering/orders/{order['id']}/cancel", data={"reason": "after ship"})
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "shipped"
+    assert _receive(transfer_client(5, 3), order, item, 10, "full-receipt").status_code == 302
+    sender = transfer_client(2, 1)
+    sender.post(f"/store-ordering/orders/{order['id']}/cancel", data={"reason": "after receipt"})
+    assert _ship(sender, order, item, 1, "after-receipt").status_code == 302
+    assert sop.get_order_detail(env["master"], order["id"])["status"] == "delivered"
+    assert _stock(env["dc_path"]) == 90 and _stock(env["receiver_path"]) == 10
+
+
+def test_receiving_dc_keeps_own_outgoing_transfers_separate(dc_receiver_env, transfer_client):
+    env = dc_receiver_env
+    incoming = _to_dc(env)
+    item = incoming["order_items"][0]["id"]
+    _ship(transfer_client(2, 1), incoming, item, 4, "dual-direction")
+    receiver = transfer_client(5, 3)
+    _receive(receiver, incoming, item, 4, "dual-direction-receipt")
+    response = receiver.post(
+        "/dc-transfer/new",
+        data={
+            "to_warehouse_code": "store_test",
+            "items[101]": "2",
+        },
+    )
+    assert response.status_code == 302
+    outgoing = sop.list_orders(env["master"], dc_warehouse_code="dc_receiver")[0]
+    out_body = receiver.get("/dc-transfer/").get_data(as_text=True)
+    in_body = receiver.get("/dc-transfer/?scope=incoming").get_data(as_text=True)
+    assert outgoing["order_no"] in out_body and incoming["order_no"] not in out_body
+    assert incoming["order_no"] in in_body and outgoing["order_no"] not in in_body
+    detail = sop.get_order_detail(env["master"], outgoing["id"])
+    assert detail["order_items"][0]["source_warehouse_code"] == "dc_receiver"
+    assert _stock(env["receiver_path"]) == 4

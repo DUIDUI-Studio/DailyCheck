@@ -1497,6 +1497,9 @@ flowchart TB
 
 **约定**：`xxx.py`（蓝图，含 Flask 视图）和 `xxx_pure.py`（纯函数/类，便于测试和复用）成对出现。改业务规则时**优先改 pure**，再让蓝图调它。
 
+Issue #107 的 DC 调货接收沿用现有蓝图与模板：`dc_transfer` 提供本仓发送/收货列表，
+`store_ordering` 按单据目标仓决定收货视角及收货动作；不新增库存写入口。
+
 `fulfillment_pure.py` 按显式来源仓解析唯一有效履约行，别名/停用行不参与，缺失/多绑定/单位或阻断冲突失败关闭；返回原始成本与库存，独立价格/倍数 helper 沿用订货规则，且不回查当前路由（测试：`tests/test_fulfillment_pure.py`）。
 订单详情库存/价格/品类 enrichment 也复用该解析器，并核对已固化的仓内行 ID，避免跨仓同 ID 串读（Issue #109，详 §10.3）。
 
@@ -1566,6 +1569,8 @@ flowchart LR
   `store_quantity` 展示值。
 - `get_dc_items_for_order_detail()` 按订单行固化来源分别建立只读仓库连接，复用
   `resolve_fulfillment_item()` / `parse_price_and_multiple()`；详情查询不触发仓库迁移。
+- 调货的 DC 收货方复用 `dc_transfer_pure` 的收货进度与 `store_ordering_pure.receive_partial()`；
+  单行收货和调货的整批收货快捷入口共用既有幂等协议，来源解析仍按冻结的订单行。
 - `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
   `master.db.store_orders` 给订单发货流水补订单链接。
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
@@ -2258,6 +2263,18 @@ stateDiagram-v2
 
 **权限**：新增 `transfer.create`（manager/admin 包，26 点 / `manager 18`、`admin 19`）。建单要求 DC 类型 + 该权限；列表对 DC / 门店分别开放，发货与收货复用 `store_ordering` 的既有路由与角色守卫。
 
+**配送中心间调货（Issue #107，2026-11-01 Owner comment966 批准 comment961）**：
+发货方仍为持 `transfer.create` 的 DC；收货方可为同租户的其他 DC 或门店，禁止自调货、
+研发仓与跨租户目标，候选列表和 pure 建单校验一致。DC 的 `/dc-transfer/` 默认仅本仓发送单，
+`?scope=incoming` 仅本仓收货单，查询中的发/收仓由会话固定，不接收客户端仓码覆盖；
+门店仍走「本店订单」。DC 收货详情按目标仓识别，显示收货进度、收货表单和本仓入库流水，
+不会当作本仓出货。`receive`（order.receive）与 `deliver`（order.ship）仍须经理/管理员角色，
+且会话仓必须是目标仓（平台管理员也须选对仓）；仅 `dc_transfer` 放开 DC 收货，普通门店订货不放开。
+收货仓不能取消来货，即使同一用户另有发货仓权限；发货/取消仍受来源与已发货约束。
+调货的整批收货表单也携带 op_no，复用 receive_partial：重放只处理原批次，不吞入后续到货，
+未应用的跨库 receipt 可原键恢复；无新增收货不发通知，部分收货发 RECEIVED、收齐才发 DELIVERED。
+既有通知权限收件人、发货协议、冻结行来源及门店订货流程保持原口径，无 schema/权限包变更。
+
 **列表口径（2026-10-19 修正）**：门店侧**不设独立调货入口**——调货单对门店就是一张待收货的订单，直接列在「本店订单」（`store_orders_list`）里；模板按 `flow_type` 显示「类型」列，状态用**收货进度**（待发货 / 待收货 / 部分收货 / 已收货）而非主状态——分批发货期间主状态停在 `approved`，直接展示会变成门店看不懂的「已审批」。`dc_transfer.transfer_list` 对门店 302 回订单列表；只有总仓／平台管理员有「总仓调货」入口。管理员订单板（`admin_orders`）同源处理。
 
 **订单板合并（2026-10-24，Issue #19）**：`admin_orders`（`/admin/orders`，平台视角）与 `review_list`（`/review`，配送中心视角）原是两个模块、两张模板（`orders.html` / `review.html`）两套筛选，导航里并列出现，用户反馈「功能重复」。现合并为**一份实现 + 一张模板**：视图 `_render_order_board()`（`blueprints/store_ordering.py`）同时服务两个端点，模板 `templates/store_ordering/order_board.html`（状态页签 = 全部 / 待审批 / 待出库 / 已发货 / 已送达 / 已拒绝 / 已取消，计数来自 `store_ordering_pure.count_orders_by_status()` 的 SQL `GROUP BY status`——不在应用层捞全表再数）；原 `review.html` 已删除。
@@ -2455,6 +2472,10 @@ flowchart LR
 列和订单回链，沿用现有裸 `<table>` + 自动 `.table-scroll` 契约；移动端不新增固定层
 或特殊交互。页面隐藏「新建出库」，因为 DC 的人工出库入口不存在，发货由订单详情驱动。
 
+**DC 调货收货视角（Issue #107）**：既有调货列表增加发送/收货链接，表格沿用自动
+`.table-scroll`；收货详情复用原单行及整批收货表单（CSRF + data-ajax reload-stay），
+返回本仓收货列表。无新 JS、样式或导航模块，门店仍使用本店订单入口。
+
 **订货目录库存展示（Issue #67，2026-10-27）**：门店 catalog 的每张卡片复用既有
 `.inv-card-body` 指标区显示 `门店库存`，弹窗顶部也以同一 `data-stock` 显示本店库存与单价；
 数据在既有目录查询内一次解析，不新增异步请求，也不改变移动端提交链路。
@@ -2482,6 +2503,12 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #107 在 `tests/test_dc_transfer.py` 使用真实临时 master、发送 DC、接收 DC、门店及
+无关/跨租户仓库，覆盖候选/创建一致性、双向列表隔离、接收详情、角色/权限/仓库归属、
+普通门店订货 DC 收货拒绝、取消与已发约束、部分/最终收货和库存流水、通知去重、
+原键重放及跨库故障恢复。整批收货另覆盖旧请求重放不接收后续批次的到货。
+关键类型、方向、归属与幂等条件需用临时变异证明测试会失败；全量原生测试仍包含 MCP。
 
 Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 master/两 DC/门店库，
 先提交跨仓单再改路由，以跨库同 local item ID 的不同 canonical/库存/价格/品类复现串读；

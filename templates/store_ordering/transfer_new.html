@@ -7,13 +7,13 @@
 </div>
 
 <p class="muted">
-  调货单由总仓直接发起，<b>创建即进入待发货状态，无需分仓申请、也无需审批</b>；
-  提交后可在单据详情页安排发货，分仓收货后单据自动完成。
+  调货单由配送中心直接发起，<b>创建即进入待发货状态，无需收货仓申请、也无需审批</b>；
+  收货仓可为同租户的其他配送中心或门店。提交后在详情页安排发货，收齐后单据自动完成。
   仅列出<b>主数据启用且有库存</b>的品项；实际发货时仍会按当时库存二次校验。
 </p>
 
 {% if not stores %}
-<p class="empty">还没有可分仓的目标门店，请先在「账号 / 仓库管理」中创建门店仓库。</p>
+<p class="empty">暂无可调货的收货仓，请先在「账号 / 仓库管理」中创建其他配送中心或门店仓库。</p>
 {% elif item_count == 0 %}
 <p class="empty">总仓当前没有可调拨的品项（需已绑定主数据、主数据启用、库存 &gt; 0）。</p>
 {% else %}
@@ -22,9 +22,9 @@
 
   <div class="grid cols-2" style="margin-bottom:14px">
     <label>
-      <span>收货分仓</span>
+      <span>收货仓</span>
       <select name="to_warehouse_code" required>
-        <option value="">请选择分仓</option>
+        <option value="">请选择收货仓</option>
         {% for s in stores %}
         <option value="{{ s.code }}">{{ s.name }} ({{ s.code }})</option>
         {% endfor %}
