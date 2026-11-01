@@ -57,20 +57,27 @@ jobs:
 
       - name: Pytest (full suite, including MCP)
         run: |
+          set -euo pipefail
+          TEST_DB_DIR="$(mktemp -d)"
+          python3 -c 'from pathlib import Path; [Path(p).unlink(missing_ok=True) for p in ["/tmp/pytest-session.json", "/tmp/pytest-native.exit", "/tmp/pytest-evidence.json"]]'
           set +e
-          DAILYCHECK_DB_DIR="$(mktemp -d)" \
-            /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE \
+          DAILYCHECK_DB_DIR="${TEST_DB_DIR}" \
+            /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE --color=no \
+            -p scripts.ci.pytest_evidence --dc-evidence=/tmp/pytest-session.json \
             > /tmp/pytest-output.txt 2>&1
+          PYTEST_EXIT=$?
+          set -e
+          printf '%s\n' "${PYTEST_EXIT}" > /tmp/pytest-native.exit
           tail -3 /tmp/pytest-output.txt
 
       - name: Zero-new-failure gate
-        run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt
+        run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt --pytest-exit-file /tmp/pytest-native.exit --session-file /tmp/pytest-session.json --write-evidence /tmp/pytest-evidence.json
 
       # Gitea 不支持 artifact v4。只传递下游报告和零新增门禁所需的小型摘要：
-      # 全部 FAILED/ERROR、collection/interrupted 标记，以及最后 5 行汇总。
+      # 全部 FAILED/ERROR、终态摘要与真实 native/session/hash 证据，不能重建假退出码。
       - name: Create compact pytest summary output
         id: pytest_summary
-        run: python3 scripts/ci/pytest_summary.py /tmp/pytest-output.txt
+        run: python3 scripts/ci/pytest_summary.py /tmp/pytest-output.txt --evidence-file /tmp/pytest-evidence.json
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
@@ -98,7 +105,9 @@ jobs:
           set -euo pipefail
           test -n "${PYTEST_SUMMARY_B64}"
           mkdir -p /tmp/ci-pytest
-          printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > /tmp/ci-pytest/pytest-output.txt
+          printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > /tmp/ci-pytest/pytest-result.json
+          python3 scripts/ci/pytest_summary.py --decode /tmp/ci-pytest/pytest-result.json \
+            --text-output /tmp/ci-pytest/pytest-output.txt --evidence-output /tmp/ci-pytest/pytest-evidence.json
           test -s /tmp/ci-pytest/pytest-output.txt
 
       - name: Python（镜像自带 3.12 + pip）
@@ -116,6 +125,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUM: ${{ github.event.pull_request.number }}
           PYTEST_REUSE_FILE: /tmp/ci-pytest/pytest-output.txt
+          PYTEST_REUSE_EVIDENCE: /tmp/ci-pytest/pytest-evidence.json
         run: |
           # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
           export PATH=/opt/venv/bin:$PATH

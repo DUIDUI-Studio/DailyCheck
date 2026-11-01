@@ -2521,6 +2521,30 @@ CI 继续把原生 pytest 摘要交给 reports job 复用，不重复全量执�
 `generate_reports.sh` 保留 known-failure checker 的真实退出码，即使失败仍生成报告，
 `ci-summary.json` 的 `gate_exit` 与最终退出码不得被恒真后缀覆盖；已知失败清单只许收缩。
 
+**完整 pytest 结果证据（Issue #114）**：`scripts/ci/pytest_evidence.py` 是显式启用的
+只读观察插件，sessionfinish 写出 selected/completed、真实 outcome 统计及失败 nodeid。
+`scripts/check_known_failures.py` 必须接真实 native exit（仅0/1）与会话记录，验证每个已选
+用例完成、唯一终态摘要/统计/原始 FAILED 枚举一致，再核对 known 清单。收集/setup/teardown
+异常、中断/internal error、提前停止、零用例、缺失/损坏/不匹配证据均拒绝；参数化 nodeid 保留旧授权范围：实际参数 nodeid 及其基础别名均须在 known 清单，基础ID不是
+新增参数变体的通配许可；实际失败数与别名集合独立，不重复计算测试数。没有硬编码全仓测试总量。
+
+CI test、verify check1 与 reports fallback 均启用插件并保留真实子进程退出码；不会把重定向、
+tail 或摘要复用的退出码当作 pytest 成功。strict checker 可产出绑定输出 SHA256/native/session
+的 portable evidence。compact helper 的 CLI 必须先验证证据，再将文本和证据放入 base64 JSON
+信封；下游 decode 再验证并还原文本/证据。保留的纯提取工具只是诊断 API，不能直接放行门禁。
+
+reports 仅显式请求才复用真实证据；未请求时即使默认文件/证据都存在也必须 fresh pytest，
+显式空/缺失/损坏请求失败且不回退重跑；原生失败/无效证据仍
+生成02/03和ci-summary，缺失退出码记null，complete=false。有效证据/文本一同落reports，
+`check_reports.py` 重新校验hash/native/session/计数与known，而非仅相信gate_exit=0。
+显式调用者负责路径来自本次候选/同一次流程；哈希和会话一致性绑定数据，不证明当前GitHEAD
+或操作/进程身份。同一必需 test/reports check 名称、完整MCP收集和临时数据库隔离保持不变。
+
+`tests/test_pytest_gate_completeness.py` 用真实 pytest 子进程覆盖完整成功/known-only/新失败、
+参数化含空格ID、收集/运行异常、KeyboardInterrupt、退出码1提前停止、零用例、截断/重复/
+不一致摘要及元数据；实际CI步骤在临时repo执行，确认native0/1/2捕获。报告与verify沙箱另锁
+缺失/损坏复用不重跑、失败仍产报告、摘要不能伪造native0或complete。关键guard须变异打红。
+
 `tests/mcp_server/conftest.py` 的 autouse fixture 为每例初始化临时 master，覆盖 root/db/
 MCP config/UoW 的导入期路径绑定并隔离 access.log 与认证 ContextVar；SQLite 连接守卫
 拒绝打开该例目录以外的文件（含 URI/软链解析），防止遗漏新别名后触及默认或真实库。
@@ -2590,7 +2614,7 @@ flowchart TB
         KeyHygiene["test_deploy_key_hygiene.py<br/>部署凭据卫生：私钥不进打包目录 /<br/>不进生产应用目录 / 不进索引<br/>6 用例（Issue #9）"]
         Redline["test_redline_gate.py<br/>红线机验：路径命中 / known_failures 净增 /<br/>自述需拍板但无授权<br/>19 用例（Issue #24）"]
         PrHygiene["test_pr_hygiene.py<br/>开工规范：分支前缀白名单 / issue 号与<br/>Closes·Part-Of 一致 / 无号须声明 No-Issue<br/>32 用例（Issue #26）"]
-        CIHandoff["test_ci_artifact_handoff.py (9)<br/>+ test_ci_pytest_summary.py (6)<br/>artifact v4 零引用 / base64 job output /<br/>摘要保留 FAILED·ERROR·collection·末 5 行<br/>（Issue #59）"]
+        CIHandoff["test_ci_artifact_handoff.py (9)<br/>+ test_ci_pytest_summary.py (6)<br/>artifact v4 零引用 / base64 job output /<br/>摘要+真实 native/session/hash 证据<br/>（Issue #59）"]
         ModelRouting["test_orca_model_routing.py<br/>主模型/fallback 顺序 / 基础设施失败分类 /<br/>同 Task retry 命令 / Release 禁止 LLM<br/>16 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
         BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]

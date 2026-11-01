@@ -96,3 +96,38 @@ macOS Docker Desktop 下 bind mount 文件变更触发 Flask reloader。
 
 旧的 standalone 部署方案已删除(2026-07)。如果新机器需要从零部署,直接装 Python + systemd 即可,或
 把 wdg-systemd 起来后跑 install 脚本。
+
+## 完整本地 pytest 门禁（Issue #114）
+
+门禁需要真实退出码和独立会话结果；只有 FAILED 行或看似完整的摘要不能证明执行完整。
+`check_known_failures.py` 的默认 CLI 缺少证据会失败，不再接受历史片段作为成功结果。
+使用 requirements.txt 范围内的依赖（MCP1.x）和隔离的临时 DB，示例：
+
+```bash
+test_run_dir="$(mktemp -d)"
+if DAILYCHECK_DB_DIR="${test_run_dir}/db" python -m pytest tests/ \
+    --basetemp="${test_run_dir}/pytest" -q --tb=no -rfE --color=no \
+    -p scripts.ci.pytest_evidence --dc-evidence="${test_run_dir}/session.json" \
+    > "${test_run_dir}/pytest.txt" 2>&1; then
+  pytest_exit=0
+else
+  pytest_exit=$?
+fi
+printf '%s\n' "${pytest_exit}" > "${test_run_dir}/native.exit"
+python scripts/check_known_failures.py "${test_run_dir}/pytest.txt" \
+  --pytest-exit-file "${test_run_dir}/native.exit" --session-file "${test_run_dir}/session.json" \
+  --write-evidence "${test_run_dir}/evidence.json"
+```
+
+完整 native1 且只有已知失败仍允许通过；中断/internal/collection/setup错误、提前停止、
+缺失或不一致终态/计数/证据不能通过。没有固定全仓用例数；参数化失败保留旧授权条件，实际参数 nodeid 和基础别名都须在清单，
+基础ID不能通配新增参数变体。失败数只按实际用例计算，不按别名集合膨胀。
+保留原生日志、native.exit、session.json 和 evidence.json 作为同一次运行的证据。
+
+CI compact handoff 使用带真实 native/session/hash 的 JSON 信封；报告复用必须同时提供
+`PYTEST_REUSE_FILE` 和 `PYTEST_REUSE_EVIDENCE`（strict checker生成的portable evidence），
+建议显式提供两条路径；仅给出文件时按其 `.evidence.json` sidecar 查找证据。
+未设置复用变量时一律 fresh pytest，即使默认路径有旧的有效文件/证据；显式空/缺失/损坏请求
+失败且不重跑掩盖。调用者负责证据来自本次候选/同一流程；哈希/会话只证明数据一致，
+不证明当前GitHEAD或操作/进程身份。
+失败仍产02/03/ci-summary；原生退出码未知记null。报告门禁会重新核对证据，不只看gate_exit。
