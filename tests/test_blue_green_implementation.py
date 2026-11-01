@@ -1010,10 +1010,11 @@ def test_verify_check2_ensures_account_in_green_db_statically():
     # 绑定命令行形状，不绑裸字符串：函数体注释/提示里也出现 "admin" 字样，
     # 裸 `assert "--admin" in fn` 会被文案命中而成恒真断言（轮 2 审核实测）。
     assert re.search(
-        r"create-user\s+\"\$\{SIM_USER_USER\}\"\s+\"\$\{SIM_USER_PASSWORD\}\"\s+--admin",
+        r"create-user\s+--admin\s+--\s+\"\$\{SIM_USER_USER\}\"\s+\"\$\{SIM_USER_PASSWORD\}\"",
         fn,
     ), (
-        "create-user 未带 --admin——非 admin 选仓页为空 → sim_user 路径 3 必失败"
+        "create-user 必须带 --admin 且使用 '--' 选项终止符（Issue #123）——"
+        "非 admin 选仓页为空；以 '-' 开头的密码会被 click 当选项"
     )
     # 写库前必须自证不是蓝库（路径形态 + inode），否则 GREEN_DB 误配会先把
     # 已知口令的 admin 写进 production 真库（check 7 排在 check 2 之后）

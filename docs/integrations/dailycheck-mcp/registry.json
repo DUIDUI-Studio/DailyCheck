@@ -1,0 +1,2394 @@
+{
+  "counts": {
+    "bot_approved": 22,
+    "canonical": 13,
+    "external_subset": 16,
+    "runtime": 29,
+    "writes": 10
+  },
+  "generated_from": "mcp_server/protocol/registry.py",
+  "notes": [
+    "Maintenance metadata only; does not grant external token or Bot permissions.",
+    "Output contracts validate existing serialized JSON; no SDK outputSchema/structuredContent.",
+    "Read describes business intent; legacy HTTP/stdio reads can initialize schema or populate procurement caches.",
+    "Bot read contexts use read_only=True; approval and runtime identity/scope guards remain independent."
+  ],
+  "schema_version": 1,
+  "tools": [
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/warehouses",
+        "path_enforcement": "none; Bot adapter checks the documented path",
+        "warehouse_scope": "filter warehouses by token"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List all warehouses accessible to this token, returning code and display name. Returns: array of {code, name}.",
+      "domain": "inventory",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.inventory:warehouse_list_impl",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "warehouse_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "name"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[warehouse_list]"
+      ],
+      "title": "List Warehouses"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/items",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List all items in a warehouse. Returns: array of {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
+      "domain": "inventory",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.inventory:items_list_impl",
+      "inputSchema": {
+        "properties": {
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "items_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "current_stock": {
+                "type": "number"
+              },
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "current_stock"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[items_list]"
+      ],
+      "title": "List Warehouse Items"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/items/<id>",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get full details for a single inventory item by ID. Returns: {id, sku, name, category_id, category_name, current_stock, safety_stock, unit, unit_cost, gram_per_unit, updated_at}.",
+      "domain": "inventory",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.inventory:items_detail_impl",
+      "inputSchema": {
+        "properties": {
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "items_detail",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "current_stock": {
+                "type": "number"
+              },
+              "id": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "current_stock"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[items_detail]"
+      ],
+      "title": "Get Item Detail"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/movements",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List recent stock movements (outbound requests and stocktake adjustments) for a warehouse. Returns: array of {id, type, item_id, item_name, qty, reason, created_at}.",
+      "domain": "inventory",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.inventory:movements_list_impl",
+      "inputSchema": {
+        "properties": {
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "movements_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "item_id": {
+                "type": "integer"
+              },
+              "qty": {
+                "type": "number"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "type",
+              "item_id",
+              "qty"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[movements_list]"
+      ],
+      "title": "List Stock Movements"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/restock",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Create a restock (inbound) record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
+      "domain": "inbound",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.inbound:restock_create_impl",
+      "inputSchema": {
+        "dependentRequired": {
+          "doc_no": [
+            "line_no"
+          ],
+          "line_no": [
+            "doc_no"
+          ]
+        },
+        "properties": {
+          "doc_no": {
+            "description": "Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "factor": {
+            "default": 1,
+            "description": "Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.",
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "line_no": {
+            "description": "Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Quantity to restock",
+            "type": "number"
+          },
+          "reason": {
+            "description": "Reason for restock (optional)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "quantity",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "restock_create",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "applied": {
+              "type": "boolean"
+            },
+            "doc_no": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "factor": {
+              "type": "number"
+            },
+            "id": {
+              "type": "integer"
+            },
+            "input_quantity": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "item_id": {
+              "type": "integer"
+            },
+            "line_no": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "quantity": {
+              "type": "number"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "rolled_back": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "item_id",
+            "quantity",
+            "warehouse_code",
+            "doc_no",
+            "line_no",
+            "input_quantity",
+            "factor",
+            "status",
+            "rolled_back",
+            "replayed",
+            "applied"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[restock_create]"
+      ],
+      "title": "Create Restock"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/restock",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List inbound restock requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, status, reason, created_at, doc_no, line_no, input_quantity, factor}], total, limit, offset, truncated}.",
+      "domain": "inbound",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.inbound:restock_list_impl",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 100,
+            "description": "Page size (1-500, default 100).",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Page offset (default 0; negative values are treated as 0).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "restock_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "items": {
+              "items": {
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "item_id": {
+                    "type": "integer"
+                  },
+                  "quantity": {
+                    "type": "number"
+                  },
+                  "status": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "item_id",
+                  "quantity",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "limit": {
+              "type": "integer"
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "total": {
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "items",
+            "total",
+            "limit",
+            "offset",
+            "truncated"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[restock_list]"
+      ],
+      "title": "List Restocks"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/forecast/item/<id>",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get consumption forecast for an item. Returns: {item_id, warehouse_code, horizon_days, daily_avg, forecast_total, confidence, computed_at, data_status}.",
+      "domain": "forecast",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.forecast:item_forecast_impl",
+      "inputSchema": {
+        "properties": {
+          "horizon_days": {
+            "description": "Forecast horizon in days (1-90, default 14)",
+            "type": "integer"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "item_forecast",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "computed_at": {
+              "type": "string"
+            },
+            "confidence": {
+              "type": "string"
+            },
+            "daily_avg": {
+              "type": "number"
+            },
+            "data_status": {
+              "type": "string"
+            },
+            "forecast_total": {
+              "type": "number"
+            },
+            "horizon_days": {
+              "type": "integer"
+            },
+            "item_id": {
+              "type": "integer"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "item_id",
+            "warehouse_code",
+            "horizon_days",
+            "daily_avg",
+            "forecast_total",
+            "confidence",
+            "computed_at",
+            "data_status"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[item_forecast]"
+      ],
+      "title": "Get Item Forecast"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/procurement/store",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in handler/service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get procurement recommendations for a store. Returns: {warehouse_code, computed_at, items: [{item_id, item_name, current_qty, in_transit_qty, daily_avg, forecast_total_horizon, safety_stock, suggested_qty}]}.",
+      "domain": "procurement",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.procurement:procurement_store_impl",
+      "inputSchema": {
+        "properties": {
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "procurement_store",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "computed_at": {
+              "type": "string"
+            },
+            "items": {
+              "items": {
+                "properties": {
+                  "item_id": {
+                    "type": "integer"
+                  },
+                  "suggested_qty": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "item_id",
+                  "suggested_qty"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "warehouse_code",
+            "computed_at",
+            "items"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[procurement_store]"
+      ],
+      "title": "Get Store Procurement"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/procurement/hub",
+        "path_enforcement": "handler",
+        "warehouse_scope": "filter authorized warehouses before aggregation"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get procurement recommendations aggregated across all warehouses. Returns: {computed_at, items: [{item_id, item_name, total_suggested_qty, stores_needing, stores_detail}]}.",
+      "domain": "procurement",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.procurement:procurement_hub_impl",
+      "inputSchema": {
+        "properties": {
+          "warehouse_code": {
+            "description": "Warehouse code (optional, for specific warehouse)",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "procurement_hub",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "item_id": {
+                "type": "integer"
+              },
+              "stores_detail": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "stores_needing": {
+                "type": "integer"
+              },
+              "total_suggested_qty": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "item_id",
+              "total_suggested_qty",
+              "stores_needing",
+              "stores_detail"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[procurement_hub]"
+      ],
+      "title": "Get Hub Procurement"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/outbound",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Create an outbound record. Returns: {id, item_id, quantity, warehouse_code, doc_no, line_no, input_quantity, factor, status, rolled_back, replayed, applied}. quantity is effective base units; replay does not apply stock again; deleted keys remain consumed.",
+      "domain": "outbound",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.outbound:outbound_create_impl",
+      "inputSchema": {
+        "dependentRequired": {
+          "doc_no": [
+            "line_no"
+          ],
+          "line_no": [
+            "doc_no"
+          ]
+        },
+        "properties": {
+          "doc_no": {
+            "description": "Opaque, case-sensitive identity; caller convention <source>:<external_doc_no> (e.g. juleng:JL-001); UTF-8 <=512 bytes, no controls or edge whitespace. Supply together with line_no; explicit null invalid.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "factor": {
+            "default": 1,
+            "description": "Finite positive source-to-base multiplier, applied once before 2dp HALF_EVEN rounding; may be used without a document key.",
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "line_no": {
+            "description": "Opaque line identity; preserves leading zeros; UTF-8 <=256 bytes, no controls or edge whitespace. Supply together with doc_no; explicit null invalid.",
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Quantity to outbound (must be <= current stock)",
+            "type": "number"
+          },
+          "reason": {
+            "description": "Reason for outbound (optional)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "quantity",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "outbound_create",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "applied": {
+              "type": "boolean"
+            },
+            "doc_no": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "factor": {
+              "type": "number"
+            },
+            "id": {
+              "type": "integer"
+            },
+            "input_quantity": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "item_id": {
+              "type": "integer"
+            },
+            "line_no": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "quantity": {
+              "type": "number"
+            },
+            "replayed": {
+              "type": "boolean"
+            },
+            "rolled_back": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "item_id",
+            "quantity",
+            "warehouse_code",
+            "doc_no",
+            "line_no",
+            "input_quantity",
+            "factor",
+            "status",
+            "rolled_back",
+            "replayed",
+            "applied"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[outbound_create]"
+      ],
+      "title": "Create Outbound"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/outbound",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List outbound requests for a warehouse with pagination. Returns: {items: [{id, item_id, item_name, quantity, reason, status, rolled_back, created_at}], total, limit, offset, truncated}.",
+      "domain": "outbound",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.outbound:outbound_list_impl",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 100,
+            "description": "Page size (1-500, default 100).",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Page offset (default 0; negative values are treated as 0).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "outbound_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "items": {
+              "items": {
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "item_id": {
+                    "type": "integer"
+                  },
+                  "quantity": {
+                    "type": "number"
+                  },
+                  "rolled_back": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "item_id",
+                  "quantity",
+                  "rolled_back"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "limit": {
+              "type": "integer"
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "total": {
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "items",
+            "total",
+            "limit",
+            "offset",
+            "truncated"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[outbound_list]"
+      ],
+      "title": "List Outbounds"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/outbound/rollback",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Roll back an outbound request: return stock to warehouse. Returns: {id, item_id, quantity}.",
+      "domain": "outbound",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.outbound:outbound_rollback_impl",
+      "inputSchema": {
+        "properties": {
+          "request_id": {
+            "description": "Outbound request ID to roll back",
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "outbound_rollback",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "id": {
+              "type": "integer"
+            },
+            "item_id": {
+              "type": "integer"
+            },
+            "quantity": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "id",
+            "item_id",
+            "quantity"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[outbound_rollback]"
+      ],
+      "title": "Rollback Outbound"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/consumption/warehouse",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Return per-item consumption summary for a warehouse with rank, qty, daily avg, turnover rate, and percentage. Returns: {items: [{rank, item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_qty, active_days, daily_avg, turnover_rate, consume_pct, first_date, last_date}], warehouse_turnover: {window_days, warehouse_cogs_value, warehouse_avg_inventory_value, turnover_value, items_with_turnover, items_total, data_quality, method}}.",
+      "domain": "consumption",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.consumption:warehouse_consumption_impl",
+      "inputSchema": {
+        "properties": {
+          "days": {
+            "description": "Time window: 7, 14, or 30 days (default 7)",
+            "enum": [
+              7,
+              14,
+              30
+            ],
+            "type": "integer"
+          },
+          "limit": {
+            "description": "Max items to return (default 100, max 200)",
+            "type": "integer"
+          },
+          "sort_by": {
+            "description": "Sort by: qty (default), value, turnover, name",
+            "enum": [
+              "qty",
+              "value",
+              "turnover",
+              "name"
+            ],
+            "type": "string"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "warehouse_consumption",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "items": {
+              "items": {
+                "properties": {
+                  "consume_qty": {
+                    "type": "number"
+                  },
+                  "item_id": {
+                    "type": "integer"
+                  },
+                  "rank": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "item_id",
+                  "consume_qty",
+                  "rank"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "warehouse_turnover": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "items",
+            "warehouse_turnover"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[warehouse_consumption]"
+      ],
+      "title": "Warehouse Consumption Summary"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/consumption/item/<id>",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Return consumption stats for a single item: 7d / 14d / 30d / monthly totals, weekly breakdown. Opt-in include_turnover adds a stocktake-anchored inventory turnover estimate. Returns: {item_id, sku, name, category_name, unit, current_stock, safety_stock, consume_7d{qty,window_days,daily_avg}, consume_14d{...}, consume_30d{...}, consume_monthly{...}, weekly[{...}], [opt-in when include_turnover=true: inventory_turnover]}.",
+      "domain": "consumption",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.consumption:item_consumption_impl",
+      "inputSchema": {
+        "properties": {
+          "include_turnover": {
+            "default": false,
+            "description": "If true, also return inventory_turnover (stocktake-anchored average-inventory estimate). Default false.",
+            "type": "boolean"
+          },
+          "item_id": {
+            "description": "Item ID",
+            "type": "integer"
+          },
+          "turnover_days": {
+            "default": 30,
+            "description": "Window for the inventory_turnover calculation (default 30).",
+            "enum": [
+              7,
+              14,
+              30
+            ],
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "warehouse_code"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "item_consumption",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "consume_14d": {
+              "type": "object"
+            },
+            "consume_30d": {
+              "type": "object"
+            },
+            "consume_7d": {
+              "properties": {
+                "daily_avg": {
+                  "type": "number"
+                },
+                "qty": {
+                  "type": "number"
+                },
+                "window_days": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "qty",
+                "window_days",
+                "daily_avg"
+              ],
+              "type": "object"
+            },
+            "consume_monthly": {
+              "type": "object"
+            },
+            "item_id": {
+              "type": "integer"
+            },
+            "weekly": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "item_id",
+            "consume_7d",
+            "consume_14d",
+            "consume_30d",
+            "consume_monthly",
+            "weekly"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[item_consumption]"
+      ],
+      "title": "Item Consumption Detail"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/canonical",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List canonical master items with optional status/category/q filters. Returns: {items: [{id, canonical_sku, name, category_code, unit, gram_per_unit, aux_unit, aux_rate, selling_price, unit_cost, barcode, status, created_from, created_at, updated_at}], total, limit, offset, truncated, categories: [{code, name, item_count}]}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_list_impl",
+      "inputSchema": {
+        "properties": {
+          "category_code": {
+            "description": "Optional canonical category code filter (e.g. PRODUCE_CONSUMABLE).",
+            "type": "string"
+          },
+          "limit": {
+            "default": 200,
+            "description": "Max items to return (default 200, max 500).",
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Offset for pagination (default 0).",
+            "type": "integer"
+          },
+          "q": {
+            "description": "Optional keyword search across name / canonical_sku / barcode.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Optional status filter.",
+            "enum": [
+              "active",
+              "disabled"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "canonical_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "categories": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "items": {
+              "items": {
+                "properties": {
+                  "canonical_sku": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "canonical_sku",
+                  "name",
+                  "unit",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "limit": {
+              "type": "integer"
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "total": {
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "items",
+            "total",
+            "limit",
+            "offset",
+            "truncated",
+            "categories"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_list]"
+      ],
+      "title": "List Canonical Items"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/canonical/<id>",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global bindings; no token warehouse filtering"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get one canonical item with aliases and per-warehouse bindings. Returns: {canonical: {id, canonical_sku, name, ...}, bindings: [{warehouse_code, warehouse_type, id, sku, name, unit, canonical_id, is_alias, canonical_status, is_store_exclusive, is_active}], bound_warehouse_count}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_detail_impl",
+      "inputSchema": {
+        "properties": {
+          "canonical_id": {
+            "description": "Canonical master item id.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "canonical_id"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "canonical_detail",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "bindings": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "bound_warehouse_count": {
+              "type": "integer"
+            },
+            "canonical": {
+              "properties": {
+                "canonical_sku": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "canonical_sku",
+                "name",
+                "unit",
+                "status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "canonical",
+            "bindings",
+            "bound_warehouse_count"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_detail]"
+      ],
+      "title": "Get Canonical Item"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/canonical/categories",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List canonical categories with per-category item counts (for filter dropdowns). Returns: array of {code, name, item_count}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_categories_impl",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "canonical_categories",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "item_count": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "name",
+              "item_count"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_categories]"
+      ],
+      "title": "List Canonical Categories"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/canonical/fanout-targets",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List warehouses eligible as fanout targets: storefront + rd + distribution_center. Returns: array of {code, name, warehouse_type}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_fanout_targets_impl",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "canonical_fanout_targets",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "warehouse_type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "name",
+              "warehouse_type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_fanout_targets]"
+      ],
+      "title": "List Fanout Target Warehouses"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/canonical/conflicts",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List status='open' canonical_conflicts optionally filtered by canonical_id. Returns: array of {id, canonical_id, warehouse_code, local_item_id, field, conflict_type, canonical_value, local_value, last_synced_value, status, canonical_sku, canonical_name, created_at}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_conflicts_impl",
+      "inputSchema": {
+        "properties": {
+          "canonical_id": {
+            "description": "Optional canonical_id filter.",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "canonical_conflicts",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "canonical_id": {
+                "type": "integer"
+              },
+              "id": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string"
+              },
+              "warehouse_code": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "canonical_id",
+              "warehouse_code",
+              "status"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_conflicts]"
+      ],
+      "title": "List Open Canonical Conflicts"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/canonical/fanout/event/<id>",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get one fanout/publish event with per-warehouse and per-item results. Returns: {event: {id, summary, status, started_by, started_at, completed_at, item_count, ...}, warehouses: [...], items: [...]}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_fanout_event_impl",
+      "inputSchema": {
+        "properties": {
+          "event_id": {
+            "description": "Fanout event id.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_id"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "canonical_fanout_event",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "anyOf": [
+            {
+              "properties": {
+                "event": {
+                  "type": "object"
+                },
+                "items": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "warehouses": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "event",
+                "warehouses",
+                "items"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_fanout_event]"
+      ],
+      "title": "Get Fanout Event"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Create one canonical master item. Two-phase insert returns {id, canonical_sku, ...}. Requires the token's allowed_write_paths includes POST /api/v1/canonical.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_create_impl",
+      "inputSchema": {
+        "properties": {
+          "aux_rate": {
+            "description": "Aux unit conversion rate (default 0).",
+            "type": "number"
+          },
+          "aux_unit": {
+            "description": "Optional auxiliary unit (e.g. 克).",
+            "type": "string"
+          },
+          "barcode": {
+            "description": "Optional barcode.",
+            "type": "string"
+          },
+          "category_code": {
+            "description": "Optional category code.",
+            "type": "string"
+          },
+          "gram_per_unit": {
+            "description": "Grams per unit (default 0).",
+            "type": "number"
+          },
+          "name": {
+            "description": "Standard name (required).",
+            "type": "string"
+          },
+          "selling_price": {
+            "description": "Optional selling price (only when Q6=canonical_managed; negative rejected).",
+            "type": "number"
+          },
+          "status": {
+            "description": "Status (default 'active'). Q3=deactivate_only — 'deleted' is rejected.",
+            "enum": [
+              "active",
+              "disabled"
+            ],
+            "type": "string"
+          },
+          "unit": {
+            "description": "Unit (required).",
+            "type": "string"
+          },
+          "unit_cost": {
+            "description": "Optional unit cost (only when Q6=canonical_managed).",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "unit"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_create",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "canonical_sku": {
+              "type": "string"
+            },
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "canonical_sku",
+            "name",
+            "unit",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_create]"
+      ],
+      "title": "Create Canonical Item"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical/<id>/update",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Update editable fields on a canonical item. Only the listed properties are accepted; status='deleted' is rejected by Q3=deactivate_only. Returns the updated canonical row.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_update_impl",
+      "inputSchema": {
+        "properties": {
+          "aux_rate": {
+            "type": "number"
+          },
+          "aux_unit": {
+            "type": "string"
+          },
+          "barcode": {
+            "type": "string"
+          },
+          "canonical_id": {
+            "description": "Canonical master item id.",
+            "type": "integer"
+          },
+          "category_code": {
+            "type": "string"
+          },
+          "gram_per_unit": {
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          },
+          "selling_price": {
+            "type": "number"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "disabled"
+            ],
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "unit_cost": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "canonical_id"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_update",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "canonical_sku": {
+              "type": "string"
+            },
+            "id": {
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "canonical_sku",
+            "name",
+            "unit",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_update]"
+      ],
+      "title": "Update Canonical Item"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical/claim",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Claim one items row to a canonical_items row. Strict 4-column write (canonical_id / is_alias / canonical_status / updated_at); inventory / business fields untouched (Q7 §7.7.2). Returns the claim receipt.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_claim_impl",
+      "inputSchema": {
+        "properties": {
+          "canonical_id": {
+            "description": "canonical_items.id.",
+            "type": "integer"
+          },
+          "is_alias": {
+            "default": false,
+            "description": "If true, keep the local name as an alias on the canonical item.",
+            "type": "boolean"
+          },
+          "local_item_id": {
+            "description": "items.id in the warehouse db.",
+            "type": "integer"
+          },
+          "local_keep_name": {
+            "description": "Optional alias name to record.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Optional reason / audit note.",
+            "type": "string"
+          },
+          "warehouse_code": {
+            "description": "Warehouse code (e.g. WH001).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code",
+          "local_item_id",
+          "canonical_id"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_claim",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "canonical_id": {
+              "type": "integer"
+            },
+            "local_item_id": {
+              "type": "integer"
+            },
+            "request_id": {
+              "type": "integer"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "warehouse_code",
+            "local_item_id",
+            "canonical_id",
+            "request_id"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_claim]"
+      ],
+      "title": "Claim Item to Canonical"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical/unclaim",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Unbind one items row from its canonical item. Symmetric to claim_item. Returns the unclaim receipt.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_unclaim_impl",
+      "inputSchema": {
+        "properties": {
+          "local_item_id": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "warehouse_code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code",
+          "local_item_id"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_unclaim",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "canonical_id": {
+              "type": "integer"
+            },
+            "local_item_id": {
+              "type": "integer"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "warehouse_code",
+            "local_item_id",
+            "canonical_id",
+            "action"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_unclaim]"
+      ],
+      "title": "Unclaim Item from Canonical"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical/fanout",
+        "path_enforcement": "handler",
+        "warehouse_scope": "explicit warehouse_codes; no token warehouse filtering; distribution center required"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Fanout canonical item fields to target warehouses (M2 关键路径). Q4=freeze: if local field diverges from last_synced and not force, the field is frozen. Returns {event_id, status, total_written, total_frozen, warehouses: [{code, status, error_message}], items: [...]}. warehouse_codes MUST include at least one distribution_center, otherwise new items cannot be ordered (P0-10).",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_fanout_impl",
+      "inputSchema": {
+        "properties": {
+          "action": {
+            "default": "overwrite",
+            "enum": [
+              "overwrite",
+              "skip"
+            ],
+            "type": "string"
+          },
+          "canonical_ids": {
+            "description": "Canonical item ids to publish.",
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "force": {
+            "default": false,
+            "description": "Force override frozen fields (Q4=freeze bypass).",
+            "type": "boolean"
+          },
+          "summary": {
+            "description": "Optional event summary.",
+            "type": "string"
+          },
+          "warehouse_codes": {
+            "description": "Target warehouse codes. Must include at least one distribution_center.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "canonical_ids",
+          "warehouse_codes"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_fanout",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "event_id": {
+              "type": "integer"
+            },
+            "per_canonical": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "status": {
+              "type": "string"
+            },
+            "total_frozen": {
+              "type": "integer"
+            },
+            "total_written": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event_id",
+            "per_canonical",
+            "total_written",
+            "total_frozen",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_fanout]"
+      ],
+      "title": "Fanout Canonical Items"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical/conflicts/<id>/resolve",
+        "path_enforcement": "handler",
+        "warehouse_scope": "global; no token warehouse filtering"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Resolve one open canonical_conflict. decision ∈ {'keep_local', 'accept_canonical', 'waive'}. Returns {conflict_id, status}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_resolve_conflict_impl",
+      "inputSchema": {
+        "properties": {
+          "conflict_id": {
+            "type": "integer"
+          },
+          "decision": {
+            "enum": [
+              "keep_local",
+              "accept_canonical",
+              "waive"
+            ],
+            "type": "string"
+          },
+          "note": {
+            "description": "Optional resolution note.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "conflict_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_resolve_conflict",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "conflict_id": {
+              "type": "integer"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "conflict_id",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_resolve_conflict]"
+      ],
+      "title": "Resolve Canonical Conflict"
+    },
+    {
+      "access": {
+        "method": "POST",
+        "path": "/api/v1/canonical/binding-active",
+        "path_enforcement": "handler",
+        "warehouse_scope": "warehouse_code checked in service"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "P0-10 — Toggle a per-warehouse binding row's is_active flag. Only writes items.is_active + updated_at; inventory, history and master data fields are untouched. Returns {item_id, warehouse_code, canonical_id, active, quantity}.",
+      "domain": "canonical",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.canonical:canonical_set_binding_active_impl",
+      "inputSchema": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "canonical_id": {
+            "type": "integer"
+          },
+          "warehouse_code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "warehouse_code",
+          "canonical_id",
+          "active"
+        ],
+        "type": "object"
+      },
+      "mode": "write",
+      "name": "canonical_set_binding_active",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "canonical_id": {
+              "type": "integer"
+            },
+            "item_id": {
+              "type": "integer"
+            },
+            "quantity": {
+              "type": "number"
+            },
+            "warehouse_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "item_id",
+            "warehouse_code",
+            "canonical_id",
+            "active",
+            "quantity"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[canonical_set_binding_active]"
+      ],
+      "title": "Set Warehouse Binding Active"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/store-orders",
+        "path_enforcement": "handler; exact path or path plus slash",
+        "warehouse_scope": "any participating warehouse grants full order visibility, including other warehouses; optional warehouse filter"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "List store orders (store ordering / DC transfer documents) visible to this token. Read-only. Visibility is by participating warehouse: an order is visible when the token is allowed on its store warehouse or on ANY participating warehouse (a line's source warehouse, with the header DC as legacy fallback). ACL expansion (explicit): a token allowed on any participating warehouse can read the full order, including line items fulfilled by other warehouses and their amounts. Optional filters: warehouse_code (matches the store side or any participating warehouse of an order), status, limit, offset. Returns: {orders: [{id, order_no, store_warehouse_code, dc_warehouse_code, flow_type, status, requested_by, expected_delivery_date, created_at, updated_at, ...}], total, limit, offset, truncated}.",
+      "domain": "store_order",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.store_order:store_order_list_impl",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 200,
+            "description": "Page size (1-500, default 200).",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Page offset (default 0).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "description": "Optional order status filter.",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "shipped",
+              "delivered",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "warehouse_code": {
+            "description": "Optional warehouse code filter; matches an order whose store warehouse or any participating warehouse is this warehouse (e.g. wh_000).",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "store_order_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "limit": {
+              "type": "integer"
+            },
+            "offset": {
+              "type": "integer"
+            },
+            "orders": {
+              "items": {
+                "properties": {
+                  "dc_warehouse_code": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "integer"
+                  },
+                  "order_no": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "store_warehouse_code": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "order_no",
+                  "store_warehouse_code",
+                  "dc_warehouse_code",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "total": {
+              "type": "integer"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "orders",
+            "total",
+            "limit",
+            "offset",
+            "truncated"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[store_order_list]"
+      ],
+      "title": "List Store Orders"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/store-orders/<id>",
+        "path_enforcement": "handler; exact path or path plus slash",
+        "warehouse_scope": "any participating warehouse grants full order visibility, including other warehouses"
+      },
+      "bot_approved": true,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Get one store order with its header, line items, deliveries, receipts and status history. Read-only. Visible when the token is allowed on the store warehouse or on ANY participating warehouse; ACL expansion (explicit): such a token can read the full order, including line items fulfilled by other warehouses, their amounts and the receipt history. Returns: {order: {id, order_no, store_warehouse_code, dc_warehouse_code, flow_type, status, ...}, items: [{id, canonical_id, canonical_name, dc_item_id, dc_item_bound, source_warehouse_code, quantity, fulfilled_quantity, shipped_quantity, unit, status}], deliveries: [{..., warehouse_code}], receipts: [...], status_history: [...]}.",
+      "domain": "store_order",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.store_order:store_order_detail_impl",
+      "inputSchema": {
+        "properties": {
+          "order_id": {
+            "description": "Store order id (store_orders.id).",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "order_id"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "store_order_detail",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "deliveries": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "items": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "order": {
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "order_no": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "order_no",
+                "status"
+              ],
+              "type": "object"
+            },
+            "receipts": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "status_history": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "order",
+            "items",
+            "deliveries",
+            "receipts",
+            "status_history"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[store_order_detail]"
+      ],
+      "title": "Get Store Order Detail"
+    }
+  ]
+}
