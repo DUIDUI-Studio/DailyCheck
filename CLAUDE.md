@@ -60,7 +60,7 @@ docker exec wdg-systemd bash -c 'journalctl -u dailycheck-app -f'
 flask --app app run --host 0.0.0.0 --port 5001 --debug
 RUNAPP=1 python3 app.py                                                # 等价
 flask mcp                                                              # MCP stdio 模式
-python3 -m mcp_server                                                  # MCP HTTP 模式
+python3 -m mcp_server --transport http                                 # MCP HTTP 模式
 ```
 
 ## 目录结构
@@ -136,9 +136,14 @@ docs/
 
 ## MCP 服务器（29 个工具）
 
+权威登记：`mcp_server/protocol/registry.py`；完整生成台账与实调输出契约见
+[`registry.md`](docs/integrations/dailycheck-mcp/registry.md) / `registry.json`。
+`python -m scripts.mcp_contracts --check` 校验29项与实现/生成文档，外部 `tools.json`
+明确仅16项；Bot批准池仍22项，七项canonical写禁止Bot执行。
+
 通过 Model Context Protocol 提供 AI Agent 数据访问能力。支持两种传输模式：
 - **stdio**: 本地 Claude Code 使用（`flask mcp`）
-- **HTTP/SSE**: 远程 Agent 通过 TCP 端口（`python3 -m mcp_server`）
+- **HTTP/SSE**: 远程 Agent 通过 TCP 端口（`python3 -m mcp_server --transport http`）
 
 | 工具 | 功能 |
 |------|------|

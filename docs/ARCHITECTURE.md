@@ -177,6 +177,7 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
 - **check 1 禁止兜底** —— 真跑 pytest（`-rf` 产出 FAILED 行）+ 复用 `scripts/check_known_failures.py` 判「失败集 ⊆ known_failures.txt」，不允许把失败兜成 PASS。
 - **check 2 禁止静默跳过** —— `scripts/playwright/sim_user.py`（纯 stdlib）真走 登录→选仓→总览→库存→健康报表 5 路径（含 CSRF 回填）；凭据走 `SIM_USER_USER` / `SIM_USER_PASSWORD` 环境变量，缺失直接 FAIL。末条 `/report/health`（Issue #38 补）需 **manager+ 账号**（平台 admin 放行），403 按失败处理不降级；同时校验落点须停在 `/report/health`——会话丢失会 302 到 `/login` 再返回 200，只看 status 会假绿。
 - **check 2 凭据必须 provision 进「绿」库（Issue #34）** —— sim_user 的 HTTP 凭据校验发生在**绿进程持有的库**上，而 verify.sh 跑的 wrapper shell 不在绿 unit 环境里。因此 `_ensure_sim_user_in_green_db()` 必须用**显式 `DAILYCHECK_DB_DIR=${GREEN_DB}` 覆盖**（子 shell 内赋值，禁止继承调用者环境）幂等 ensure 账号，且必须带 **`--admin`**（非 admin 用户在选仓页只看到 `warehouse_users` 绑定的仓，而 create-user 不写绑定 → 空选仓页 → 探针路径 3 必失败）；探针前再复核「绿库有该账号 + 密码匹配 + 未停用（`is_active`）+ 有可见仓」（覆盖 up.sh 快照里同名不同密码 / 已停用 / 非 admin 账号的情形），并在**写库之前**先用「路径形态 + inode 相异」双闸自证 `${GREEN_DB}` 不是蓝库（check 7 排在 check 2 之后，误配时否则会先把一个已知口令的 admin 写进 production 真库）。**裸跑 `flask create-user` 会写蓝库（production 真库）** —— 绿库查无此人导致路径 2 恒 401，实测见 Issue #34；任何新增的「verify 里要碰 DB 的步骤」都必须照此 pin env 到目标侧库。
+- **verify 探针凭据可移植 + 失败明细可读（Issue #123）** —— `deploy_pipeline.sh` 自动生成的探针密码必须带固定字母前缀：`secrets.token_urlsafe(18)` 约 1.5% 以 `-` 开头，会被 click 当成选项（`Error: No such option '-i'`）→ check 2 假红 → 整次部署 rc=21 并被回退（#119 实证）；`verify.sh` 的 `create-user` 一律使用 `--` 选项终止符，运营显式传入 `--sim-pass -xxx` 同样安全。verify 失败时 `_emit_failure_summary` 向 stdout 输出 `FAILED_CHECK=<n>` + 检查名 + 该 check 日志尾 3 行，使 pipeline 日志与 `deploy_report.py` 的 40 行 tail 能指出具体失败 check，而不是只有 `rc=21 / undetermined`。由 `tests/test_verify_probe_portability.py`（6 用例：生成器 300 次首字符断言、真实 Flask CLI 带/不带 `--` 的正反证、失败明细抽取真跑）钉住，两处变异（去掉字母前缀 / 去掉 `--` 终止符）各自打红。
 - **DB 隔离（Issue #28）** —— 蓝绿不许共享物理库：`config.py` 在 import 期读 `DAILYCHECK_DB_DIR` env（Flask 与 MCP 同源覆盖）；`up.sh` 从真库 `${APP_DIR}/db` 用 `cp -aL` 解软链拷独立副本，且守卫绿 unit 必须声明 `DAILYCHECK_DB_DIR` 与拷贝目标一致，否则拒启；`verify.sh` check 7 取三重证据（绿进程 environ 声明 + master.db 非软链 + 蓝/绿 inode 相异）。**改部署布局（软链/数据目录迁移）必须保持这三个语义**。**语义边界（勿与「绿转正」冲突）**：本条约束的是**验证期**（绿以 `DRY_RUN=true` 承接 0 流量）；一旦按下方 DRY_RUN 铁律走「绿转正」承接生产流量，绿必须把 `DAILYCHECK_DB_DIR` 改指生产真库 `${APP_DIR}/db` —— 转正后蓝绿同库是**设计预期**（单写者：蓝 standby 不写），此时 check 7 的「inode 相异」不再适用，写安全改由 DRY_RUN 守卫保证；转正后重跑 `verify.sh` 若 check 7 报红，属预期而非回归。**同源影响 check 2**：`_ensure_sim_user_in_green_db()` 之所以能靠「路径形态 + inode 相异」双闸拒绝写蓝库，前提同样是验证期的库隔离；转正后该前提消失（`GREEN_DB` 变量值仍在、实际库已是真库，双闸退化为假保证）。因此**转正后如需复跑 `verify.sh`，应先在蓝绿框架下回蓝（`switch.sh blue 100`）并恢复验证期布局**，或在明确「已知同库」的前提下判读 check 2 / check 7 的红。
 - **nginx 单 upstream 蓝绿同池（Issue #32）** —— `location` 的 `proxy_pass` 永远指向合并的 `dailycheck` / `dailycheck-mcp` upstream，蓝绿是同 upstream 内的两个 `server` 节点；切流量只改 server 行的 `weight=N` / `down` —— **switch.sh 不动 location 也不新增 `dailycheck-blue/green` upstream**（旧布局下 location 硬编码，upstream 切了真实流量不动 → 502 必现，Issue #32 实测）。三道防线：① `switch.sh` 头部布局守卫 grep `proxy_pass http://dailycheck-(blue|green)` 命中旧布局直接拒跑（exit 2），强制 Prod Agent 先按 `scripts/blue_green/nginx-site.conf` 模板重构；② `switch.sh` 尾部 post-switch 探活，过 nginx 入口（默认 `http://127.0.0.1:8080`，可用 `NGINX_ENTRY` 环境变量覆盖，dry-run 路径也透传）取 `http_code`，5xx/000 自动 cp 备份回滚 + reload；③ `verify.sh` check 8 终态保险，再过一遍入口探活捕获 reload → observe window 期间的状态漂移。**改 nginx 布局必须保持单 upstream 模型**，新增独立 upstream 必须同时承担布局守卫与探活的改造。
 - **DRY_RUN 实例绝不承接流量（Issue #41，2026-10-15 P0 事故）** —— 绿实例的 `DRY_RUN=true` 写隔离只允许存在于验证期：窗口期曾发生「绿实例接管生产流量 44 分钟、全部写操作被吞」（HTTP 200 / 审计照记 / DB 不落盘）。`switch.sh` 四道防线：① **DRY_RUN 守卫** —— 切换后凡承接流量（weight>0）的实例检测到 `DRY_RUN=true`（取证次序：进程 `/proc/<pid>/environ` → unit `systemctl show Environment`；无法判定仅告警）即拒跑（exit 3），必须先按 README「绿转正」（关 DRY_RUN + DB 指回真库 + restart）再切；② **conf 应用核验** —— sed 后逐行核对 4 条 server 行与期望一致（sed 未命中时 `nginx -t` 仍过、reload 仍「成功」而权重根本没变，静默失败）；③ **reload 失败显式回滚**（旧版 `set -e` 直退会留下 conf/运行态分歧）；④ **落点核验** —— 100%/0% 边界用带 nonce 的探针核对流量真实落到目标实例 access log（**全部尝试**均未命中目标且至少一次落对侧=回滚；日志不可读=仅告警）；**探针必须重发（Issue #55）**：nginx worker 在 `reload` 后需 1-3 秒才刷新 in-memory upstream，只发一次探针必然落在旧配置（对侧），「反复 grep 同一个 nonce」等不来路由改变 → 必然误判「reload 未生效」并自动回滚（2026-10-16 生产实测：`switch.sh green 100` 被误判失败，部署只能人工 `sleep 3` 绕过）。现为「每次尝试用**新 nonce** 重发探针 + 轮询日志」，命中目标 access log 即成功（默认最多 `LAND_TRY_MAX=5` 次、每次轮询 4×0.25s、尝试间等 1 秒 ≈ 常态等待预算 10 秒；探针自身 `--max-time 5`，入口持续无响应的最坏耗时可到约 35 秒）；对侧命中不再一票判死（那是 race 的正常表现），只有「所有尝试均未命中目标且至少一次落对侧」才认定 reload 真的没生效 → 回滚；若最终命中而此前有探针落过对侧，成功信息会额外回显一行说明，避免运维把刷新窗口当故障。`LAND_TRY_MAX < 2` 会打 WARNING（等于退回 #55 的只发一次，仅供调试）。节奏参数 `LAND_TRY_MAX` / `LAND_POLL_MAX` / `LAND_POLL_STEP` / `LAND_RETRY_SLEEP` 可 env 覆盖（测试用 0 秒只跑行为断言）。**「绿转正」标准步骤见 `scripts/blue_green/README.md`**。
@@ -1911,37 +1912,29 @@ flowchart LR
 
 **Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
-| 工具 | 服务模块 | 路径 ACL | 仓库范围 |
-|------|----------|----------|----------|
-| `warehouse_list` | inventory | read | per-token |
-| `items_list` | inventory | read | per-token |
-| `items_detail` | inventory | read | per-token |
-| `movements_list` | inventory | read | per-token |
-| `restock_create` | inbound | write | per-token |
-| `restock_list` | inbound | read | per-token |
-| `outbound_create` | outbound | write | per-token |
-| `outbound_list` | outbound | read | per-token |
-| `outbound_rollback` | outbound | write | per-token |
-| `warehouse_consumption` | consumption | read | per-token |
-| `item_consumption` | consumption | read | per-token |
-| `item_forecast` | forecast | read | per-token |
-| `procurement_store` | procurement | read | per-token |
-| `procurement_hub` | procurement | read | per-token |
-| `canonical_list` | canonical | read | 全局（跨仓） |
-| `canonical_detail` | canonical | read | 全局（跨仓） |
-| `canonical_categories` | canonical | read | 全局（跨仓） |
-| `canonical_fanout_targets` | canonical | read | 全局（跨仓） |
-| `canonical_conflicts` | canonical | read | 全局（跨仓） |
-| `canonical_fanout_event` | canonical | read | 全局（跨仓） |
-| `canonical_create` | canonical | write | 全局（跨仓） |
-| `canonical_update` | canonical | write | 全局（跨仓） |
-| `canonical_claim` | canonical | write | per-token |
-| `canonical_unclaim` | canonical | write | per-token |
-| `canonical_fanout` | canonical | write | 显式传 warehouse_codes |
-| `canonical_resolve_conflict` | canonical | write | 全局（跨仓） |
-| `canonical_set_binding_active` | canonical | write | per-token |
-| `store_order_list` | store_order | read | per-token |
-| `store_order_detail` | store_order | read | per-token |
+**统一登记（Issue #104）**：`mcp_server/protocol/registry.py::REGISTRY` 是唯一工具登记，
+每项包含原始 `Tool` 声明、真实 callable handler、业务域、读写意图、路径/范围的**实际执行位置**、
+内部可验证输出 JSON shape、外部子集/Bot批准状态及回归引用。`tools.get_tools()` 深复制声明，
+`server._tool_map` 从登记派生；启动时拒绝重名/无效handler，检查命令另扫描全部工具模块，
+拒绝漏注册实现、漏实现和错误绑定。Bot 的显式批准白名单仍由 `bot/tool_contract.py` 独立持有，
+仅做一致性核对，不从动态发现授予权限；29运行项、16外部集成子集、22 Bot批准项、七canonical写禁用不变。
+
+完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
+及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留16项子集，不是完整注册表。
+`python -m scripts.mcp_contracts --write/--check` 确定性生成/只读校验三份产物，检查失败返回非零；
+JSON 对象键递归排序，保留全部元数据和值及数组次序，消除 SDK 字段声明顺序造成的文本漂移；
+`--check` 仍逐字校验，不放行真实内容变化、非规范格式或尾随文本。
+命令无需服务或数据库，可供CI接线。输出 shape **不**传给SDK `outputSchema`，不启用
+`structuredContent`，保留原description/input与TextContent中的JSON业务形状。
+其中 `items_detail` 仍列表包装、`procurement_hub` 仍数组、`canonical_fanout_event` 缺事件仍null、
+`canonical_fanout` 实返 `per_canonical`；台账如实记录旧description差异，不借本次改包装。
+仓清单仍无MCP路径检查，Bot adapter另做检查；两个消费handler已由#103补齐GET路径检查，
+登记元数据随已审查依赖同步，仓库范围仍在service校验。全局canonical读、
+fanout目标无token仓过滤等现状均显式注明，不把元数据当成新增守卫或授权。
+
+**独立Bot部署接缝**：Bot也import `get_tools()`，新增registry模块树需要随Bot独立部署同步；
+主站蓝绿成功不证明Bot已加载新版本。Prod按标准流程核实Bot实际加载版本/依赖及代表性授权读，
+七canonical写排除和三写护栏保持原样；writer不接触生产。
 
 **门店订单只读域（Issue #73）**：`store_order_list` / `store_order_detail` 只读 `master.db` 的门店订单五张表（`store_orders` / `store_order_items` / `store_order_deliveries` / `store_order_receipts` / `store_order_status_history`），无迁移、无写语义、无删除语义。策略来源复用 `blueprints/store_ordering_pure.list_orders` / `.get_order_detail`（与 `service/canonical.py` 复用 `canonical_pure` 同一先例），`mcp_server/service/store_order.py` 只负责 ACL 翻译与返回形状整理。
 
@@ -2012,13 +2005,18 @@ retry_safe（有键true）；带键重试修缓存不补库存，无键不得自
 | 模式 | 入口 | 鉴权 | 用途 |
 |------|------|------|------|
 | **stdio** | `flask mcp` | 进程 env `DAILYCHECK_MCP_TOKEN` | 本地 Claude Code |
-| **HTTP/SSE + StreamableHTTP** | `python -m mcp_server` (HTTP 模式) | Bearer → agent_tokens 表（per-token 仓库/路径 ACL） | 远程 Agent |
+| **HTTP/SSE + StreamableHTTP** | `python -m mcp_server --transport http` | Bearer → agent_tokens 表（per-token 仓库/路径 ACL） | 远程 Agent |
 
 **HTTP 入口路径**：
 - `/sse`（legacy SSE）
 - `/messages/`（SSE POST）
 - `/api/mcp/`（StreamableHTTP，**推荐**）
-- `/health`（不需鉴权）
+- `/health`（同样需Bearer鉴权；HTTP 200/503，顶层status仍为ok，监控须看HTTP和checks）
+
+CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确传入
+`--transport http --host 0.0.0.0 --port 5100`。StreamableHTTP manager配置
+`json_response=True, stateless=True`；legacy SSE端点仍挂载。health的DB检查仅`SELECT 1`，
+不证明schema完整或工具成功；所有HTTP路由都经过AuthMiddleware。MCP代码变动须重启进程。
 
 ### 9.4 鉴权回退链
 
@@ -2131,6 +2129,14 @@ HTTP 层 `BEGIN IMMEDIATE` 后 `apply_batch()` 重读整批基线并校验所有
 不得把成功路由写入说成回滚，不在 master 提交前发出成功审计。
 路由 GET 与 batch JSON 标记 no-store；沿用全局 CSRF / 平台管理员 / 租户 1，不放宽认证。
 
+
+**canonical 解绑 SQL 可移植性（Issue #108）**：`canonical_pure.unclaim_item` 的主库取消
+认领改为 `UPDATE ... WHERE id=(SELECT id ... ORDER BY id DESC LIMIT 1)`，保留原
+warehouse/local_item/status=approved 过滤与最新ID语义，避免依赖SQLite可选的
+`ENABLE_UPDATE_DELETE_LIMIT`。标准CPython3.12/3.13的SQLite3.50.4未启用该选项时，
+旧SQL会在仓库解绑已提交后抛语法错；本修复不改跨库提交顺序、不承诺额外跨库原子性，
+只消除确定性语法失败。备份、原回执及库存/价格/业务字段保持不变；无匹配approved记录
+仍正常解绑且不改主库其他记录。MCP handler权限与Bot七canonical写禁用保持原样。
 
 ### 10.3 Store Ordering 状态机
 
@@ -2515,6 +2521,25 @@ Issue #107 在 `tests/test_dc_transfer.py` 使用真实临时 master、发送 DC
 普通门店订单另锁定平台管理员跨 storefront 会话的收货兼容性及 DC 会话的旧拒绝跳转，
 防止为调货新增的目标仓检查误收紧既有管理员行为；原门店 staff 拒绝路径继续由验收 B11 覆盖。
 关键类型、方向、归属与幂等条件需用临时变异证明测试会失败；全量原生测试仍包含 MCP。
+
+Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时master/warehouse
+数据库经实际MCP dispatch和TextContent序列化验证解绑回执、仅取消最新匹配approved记录、
+旧approved/新pending与rejected/其他仓及品项隔离、无匹配或空历史、默认note及重复解绑拒绝；
+逐字段核对库存/价格/非绑定字段不变，备份落临时目录。旧SQL在标准3.12/3.13先跑红；
+变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
+
+Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、
+原始29声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
+嵌套对象插入顺序不影响生成字节；元数据/输入输出字段/新增字段、数组值/次序/数量、计数变化
+及非规范/畸形/尾随JSON均须被检出。SDK输出禁用守卫检查实际序列化结果，不依赖新SDK对象属性。
+全部29项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
+call_tool派发/序列化验证最小输出shape；七canonical写只在临时库与临时备份目录实调，
+不用Bot扩权或生产库。新增登记需同步该参数矩阵；形状元数据不改变运行时返回。
+生成校验命令`python -m scripts.mcp_contracts --check`还核对AGENT/CLAUDE工具集合与测试引用，
+以及维护中的`calculation-logic.md`入口29/16口径、订单只读范围和权威台账链接；
+旧27项入口、缺订单说明或缺台账链接均由回归/变异证明不能通过校验；其历史公式段落不重写。
+真实Starlette health与CLI回归锁住Bearer覆盖health、200/503及默认stdio/HTTP参数，
+使文档口径可验证。命令适用于CI，本Issue不改workflow接线。
 
 Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 master/两 DC/门店库，
 先提交跨仓单再改路由，以跨库同 local item ID 的不同 canonical/库存/价格/品类复现串读；
@@ -2950,6 +2975,8 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/runbook-dr.md`](runbook-dr.md) — 灾难恢复手册（备份/还原/整机重建）
 
 ### 集成
+
+- [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md) / `registry.json` — MCP完整29项生成契约；`tools.json`仅16项外部集成子集，校验入口`scripts.mcp_contracts`。
 
 - `docs/integrations/dailycheck-mcp/` — MCP 接入文档 + examples
 - [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md) — Bot 工具运行契约（#78 批准口径：D1–D7、三写限定例外、PR1 / #80 / #81 阶段）

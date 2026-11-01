@@ -426,7 +426,10 @@ if [[ "${SKIP_VERIFY}" -eq 1 ]]; then
 else
   [[ -n "${SIM_USER}" ]] || SIM_USER="sim_user"
   if [[ -z "${SIM_PASS}" ]]; then
-    SIM_PASS="$("${PY}" -c 'import secrets; print(secrets.token_urlsafe(18))')"
+    # Issue #123：token_urlsafe 约 1.5% 以 '-' 开头，会被 click 当成选项
+    # （verify.sh create-user 报 "No such option '-i'" → check 2 假红）。
+    # 固定字母前缀保证首字符安全，熵不变（常量前缀 + 18 字节随机）。
+    SIM_PASS="$("${PY}" -c 'import secrets; print("dc" + secrets.token_urlsafe(18))')"
     log "verify 探针凭据：自动生成（每次部署一次性，不落盘）"
   fi
   export SIM_USER_USER="${SIM_USER}"
