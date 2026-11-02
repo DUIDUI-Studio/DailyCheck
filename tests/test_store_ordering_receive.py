@@ -1,7 +1,9 @@
 """Route tests for storefront receive (partial + full) flow."""
 from __future__ import annotations
 
+import logging
 import sqlite3
+import uuid
 from datetime import datetime
 
 import pytest
@@ -436,4 +438,129 @@ def test_receive_unbound_auto_creates_item(receive_env):
     ).fetchone()
     assert row is not None
     assert row["quantity"] == 3.0
+    store.close()
+
+
+def _build_direct_shipped_order(receive_env, canonical_id, qty=3.0):
+    """Insert a shipped one-line order without going through cart validation.
+
+    Used for canonicals that have no storefront binding (submit would block).
+    Returns ``(order_id, order_item_id)``.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    m = sqlite3.connect(str(receive_env["master_path"]))
+    m.row_factory = sqlite3.Row
+    cur = m.execute(
+        """INSERT INTO store_orders
+           (order_no, store_warehouse_code, dc_warehouse_code, status,
+            requested_by, expected_delivery_date, note, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, NULL, '', ?, ?)""",
+        (f"SO-PRICE-{uuid.uuid4().hex[:8]}", "store_test", "dc_test",
+         sop.ORDER_STATUS_SHIPPED, 1, ts, ts),
+    )
+    order_id = int(cur.lastrowid)
+    dc = sqlite3.connect(str(receive_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    dc_item_id = int(dc.execute(
+        "SELECT id FROM items WHERE canonical_id=?", (canonical_id,)
+    ).fetchone()["id"])
+    dc.close()
+    cur = m.execute(
+        """INSERT INTO store_order_items
+           (order_id, canonical_id, dc_item_id, quantity, unit,
+            fulfilled_quantity, status, created_at)
+           VALUES (?, ?, ?, ?, '件', 0, 'pending', ?)""",
+        (order_id, canonical_id, dc_item_id, qty, ts),
+    )
+    order_item_id = int(cur.lastrowid)
+    m.commit()
+    m.close()
+    return order_id, order_item_id
+
+
+def _set_dc_item_price(receive_env, canonical_id, selling_price, unit_cost):
+    dc = sqlite3.connect(str(receive_env["dc_path"]))
+    dc.execute(
+        "UPDATE items SET selling_price=?, unit_cost=? WHERE canonical_id=?",
+        (selling_price, unit_cost, canonical_id),
+    )
+    dc.commit()
+    dc.close()
+
+
+def _receive(receive_env, order_id, order_item_id, qty):
+    client = receive_env["client"]
+    _login_as(client, 2, 2)
+    return client.post(
+        f"/store-ordering/orders/{order_id}/receive",
+        data={"order_item_id": order_item_id, "quantity": str(qty), "note": ""},
+        follow_redirects=True,
+    )
+
+
+def test_receive_unbound_copies_source_warehouse_price(receive_env):
+    """Auto-created storefront row copies the source warehouse price/cost."""
+    _set_dc_item_price(receive_env, 102, 12.5, 8.25)
+    order_id, order_item_id = _build_direct_shipped_order(receive_env, 102)
+    resp = _receive(receive_env, order_id, order_item_id, 3)
+    assert resp.status_code == 200
+
+    store = sqlite3.connect(str(receive_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    row = store.execute(
+        "SELECT selling_price, unit_cost FROM items WHERE canonical_id=102"
+    ).fetchone()
+    assert row is not None
+    assert row["selling_price"] == 12.5
+    assert row["unit_cost"] == 8.25
+    store.close()
+
+
+def test_receive_unbound_zero_source_price_warns(receive_env, caplog):
+    """Zero source price stays zero, does not raise, and emits a WARN."""
+    _set_dc_item_price(receive_env, 102, 0, 0)
+    order_id, order_item_id = _build_direct_shipped_order(receive_env, 102)
+    with caplog.at_level(
+        logging.WARNING, logger="blueprints.store_ordering_pure"
+    ):
+        resp = _receive(receive_env, order_id, order_item_id, 3)
+    assert resp.status_code == 200
+
+    store = sqlite3.connect(str(receive_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    row = store.execute(
+        "SELECT selling_price, unit_cost FROM items WHERE canonical_id=102"
+    ).fetchone()
+    assert row is not None
+    assert row["selling_price"] == 0
+    assert row["unit_cost"] == 0
+    store.close()
+
+    assert (
+        "[receiving] auto-created item without price canonical_id=102"
+        in caplog.text
+    )
+
+
+def test_receive_existing_binding_keeps_its_prices(receive_env):
+    """An already-bound storefront row is never repriced by receiving."""
+    _set_dc_item_price(receive_env, 101, 5.0, 3.0)
+    store = sqlite3.connect(str(receive_env["store_path"]))
+    store.execute(
+        "UPDATE items SET selling_price=99.0, unit_cost=77.0 WHERE canonical_id=101"
+    )
+    store.commit()
+    store.close()
+
+    order_id, order_item_id = _build_direct_shipped_order(receive_env, 101)
+    resp = _receive(receive_env, order_id, order_item_id, 3)
+    assert resp.status_code == 200
+
+    store = sqlite3.connect(str(receive_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    row = store.execute(
+        "SELECT selling_price, unit_cost FROM items WHERE canonical_id=101"
+    ).fetchone()
+    assert row["selling_price"] == 99.0
+    assert row["unit_cost"] == 77.0
     store.close()

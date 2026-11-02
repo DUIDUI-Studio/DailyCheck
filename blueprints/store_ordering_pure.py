@@ -11,6 +11,7 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §6.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from datetime import datetime
@@ -30,6 +31,9 @@ from blueprints.procurement_pure import (
     compute_safety_stock,
     compute_suggested_qty,
 )
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2868,11 +2872,39 @@ def _find_existing_receipts(
     return found
 
 
+def _source_item_prices(
+    source_code: str | None,
+    canonical_id: int,
+) -> tuple[float, float]:
+    """Return ``(selling_price, unit_cost)`` from the source warehouse row.
+
+    Falling back to 0/0 keeps receiving unblocked when the source row is
+    missing; the auto-create path logs a warning in that case.
+    """
+    if not source_code:
+        return 0.0, 0.0
+    conn = open_warehouse_db(str(source_code))
+    try:
+        row = conn.execute(
+            """SELECT selling_price, unit_cost FROM items
+                WHERE canonical_id=? ORDER BY id LIMIT 1""",
+            (canonical_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return 0.0, 0.0
+    return float(row["selling_price"] or 0), float(row["unit_cost"] or 0)
+
+
 def _ensure_store_item(
     store_conn: sqlite3.Connection,
     master_conn: sqlite3.Connection,
     canonical_id: int,
     ts: str,
+    *,
+    selling_price: float,
+    unit_cost: float,
 ) -> sqlite3.Row:
     """Return the storefront ``items`` row, auto-creating it when unbound (§3.1)."""
     store_item = store_conn.execute(
@@ -2918,17 +2950,26 @@ def _ensure_store_item(
                 f"门店仓尚未初始化品类，无法为 canonical_id={canonical_id} 自动创建 items"
             )
         cat_id = int(row["id"])
+    price = float(selling_price or 0)
+    cost = float(unit_cost or 0)
+    if price == 0:
+        logger.warning(
+            "[receiving] auto-created item without price canonical_id=%s",
+            canonical_id,
+        )
     cur = store_conn.execute(
         """INSERT INTO items
            (sku, name, category_id, quantity, safety_stock,
             unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
-            canonical_id, updated_at)
-           VALUES (?, ?, ?, 0, 0, ?, 0, 0, NULL, 0, ?, ?)""",
+            selling_price, canonical_id, updated_at)
+           VALUES (?, ?, ?, 0, 0, ?, ?, 0, NULL, 0, ?, ?, ?)""",
         (
             f"AUTO-RECEIVE-{canonical_id}",
             str(canon["name"]),
             cat_id,
             str(canon["unit"] or "件"),
+            cost,
+            price,
             canonical_id,
             ts,
         ),
@@ -2959,6 +3000,10 @@ def _apply_store_receipts(
         store_conn.row_factory = sqlite3.Row
         store_conn.execute("BEGIN IMMEDIATE")
         recv_action = receipt_action_for(order)
+        order_items_by_id = {
+            int(item["id"]): item
+            for item in order.get("order_items") or []
+        }
         for entry in pending:
             order_item_id = int(entry["order_item_id"])
             canonical_id = int(entry["canonical_id"])
@@ -2971,8 +3016,16 @@ def _apply_store_receipts(
             if existing is not None:
                 item_ids[order_item_id] = int(existing["item_id"])
                 continue
+            source_code = _line_source_warehouse(
+                order, order_items_by_id.get(order_item_id, {})
+            )
+            selling_price, unit_cost = _source_item_prices(
+                source_code, canonical_id
+            )
             store_item = _ensure_store_item(
-                store_conn, master_conn, canonical_id, ts
+                store_conn, master_conn, canonical_id, ts,
+                selling_price=selling_price,
+                unit_cost=unit_cost,
             )
             item_id = int(store_item["id"])
             store_conn.execute(
@@ -3334,6 +3387,8 @@ def reconcile_orphan_receipts(
     rows = master_conn.execute(
         """SELECT r.id, r.op_no, r.quantity, r.order_item_id,
                   so.order_no, so.flow_type, so.store_warehouse_code,
+                  COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)
+                      AS source_warehouse_code,
                   soi.canonical_id
              FROM store_order_receipts r
              JOIN store_orders so ON so.id = r.order_id
@@ -3358,8 +3413,14 @@ def reconcile_orphan_receipts(
             if existing is not None:
                 item_id = int(existing["item_id"])
             else:
+                canonical_id = int(row["canonical_id"])
+                selling_price, unit_cost = _source_item_prices(
+                    row["source_warehouse_code"], canonical_id
+                )
                 store_item = _ensure_store_item(
-                    store_conn, master_conn, int(row["canonical_id"]), ts
+                    store_conn, master_conn, canonical_id, ts,
+                    selling_price=selling_price,
+                    unit_cost=unit_cost,
                 )
                 item_id = int(store_item["id"])
                 store_conn.execute(
