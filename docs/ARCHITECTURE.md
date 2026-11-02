@@ -163,7 +163,8 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
   **保持关闭** → 目录/提交/发货与存量逐字节恒等（单仓路径）；master v4/v5/v6 与每仓 schema v6 迁移在
   T1 发布时执行，播种 pending 清单交人工配置。
 - **T2 开跨仓**：确认**蓝绿双实例均 ≥ T1**（都能识别行级来源）、且灰度期没有旧写者承流后，
-  才开启 `MULTI_WAREHOUSE_FULFILLMENT`。**首张跨仓单产生后，回滚目标版本必须仍是 T1+**，
+  才开启 `MULTI_WAREHOUSE_FULFILLMENT`（2026-11-02 起由 env `DAILYCHECK_MULTI_WAREHOUSE=1`
+  驱动，见 §13.15，切换不重新发版）。**首张跨仓单产生后，回滚目标版本必须仍是 T1+**，
   严禁回滚到不识别 `source_warehouse_code` 的版本（否则按头仓扣所有行）。
 - **T3 收敛**：`dc_warehouse_code` 降级为纯展示，报表/MCP/健康报表的参与仓谓词已切换完成。
 - 灰度期蓝绿同池（`switch.sh` 5%/50%）时**绝不开启跨仓创建**——旧实例按头仓扣行的风险由此关闭；
@@ -1319,7 +1320,7 @@ erDiagram
 生产侧事项：本次属于 master 与全部仓库的 schema 兼容变更，Prod Agent 按标准迁移流程
 完成主库及仓库备份、执行版本迁移并审查异常报告；异常行需人工处置，不静默修数。
 版本迁移本身不启用跨仓业务；跨仓创建由 `MULTI_WAREHOUSE_FULFILLMENT` 开关控制
-（默认关，即 T1 兼容发布），发布节奏见 §3.4「多仓履约发布节奏」。
+（env `DAILYCHECK_MULTI_WAREHOUSE`，未设置即关闭，即 T1 兼容发布），发布节奏见 §3.4「多仓履约发布节奏」。
 
 **默认租户前置**：`init_master_db()` 与 master v5 路由播种迁移均先幂等插入
 `tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`
@@ -2207,7 +2208,7 @@ stateDiagram-v2
 
 **通知（多仓履约 Task 10，spec §11）**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out，**收件人按有效权限解析，不硬编码角色名**：参与仓侧 = 在任一参与仓持有 `order.approve` 的在职用户 + 在职平台管理员；门店侧 = 下单人 + 在门店仓持有 `order.receive` 的在职用户。逐事件方向：提交 → 各参与仓审批人；批准/拒绝 → 门店侧；部分收货 → 门店 + **该批**来源仓（按最近一批 receipt 的 `order_item_id` 回溯来源仓，无收货行时回落全部参与仓）；全发齐 `shipped` → 门店（由 §8 条件迁移保证恰一条）；取消 → 参与仓审批人 + 门店；调货事件方向维持现状（发起/批准/发货 → 收货门店，收货 → 发货仓侧）。所有方向均排除操作者自己。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
 
-**建单/目录/购物车去 DC 化（2026-10-29，多仓履约 Task 7）**：由 `config.MULTI_WAREHOUSE_FULFILLMENT`（默认 `False`）控制，**关闭时行为与存量完全一致**，新逻辑只在开启后生效。
+**建单/目录/购物车去 DC 化（2026-10-29，多仓履约 Task 7）**：由 `config.MULTI_WAREHOUSE_FULFILLMENT` 控制（env `DAILYCHECK_MULTI_WAREHOUSE`，未设置时 `False`，见 §13.15），**关闭时行为与存量完全一致**，新逻辑只在开启后生效。
 
 - **目录**：不再出现 DC 选择器，也不再读 session `store_ordering_dc`（开启路径直接 `session.pop`）。品项范围 = 既有四道门禁（canonical 有效 / 来源行 `is_orderable` / 门店启停 / 起订倍数）**∩ `item_routing` 配置**，再排除 `is_store_exclusive` 的门店行——`list_available_routed_items()` 按路由到各 DC 分别复用 `list_available_dc_items()` 再取交集，未配置路由与门店专属品项**不出现在目录**。
 - **购物车**：`store_order_carts.dc_warehouse_code` 写 `NULL`，一用户一门店仍只有一行（`UNIQUE(user_id, store_warehouse_code)`）；行上展示的来源仓由当前路由派生，属显示态。
@@ -2331,6 +2332,21 @@ summary 全局一次，仓维度各计一次（同单多行不翻倍、跨仓单
 新增 `routing` 注入参数（纯层不碰 DB），按路由去重 DC 行——双 DC 镜像同 canonical、路由=B
 时采购单只出现 B 一次；`build_digest` / `collect_digest` 透传。测试：
 `tests/test_report_multi_dc.py`、`tests/test_replenishment_routing.py`。
+
+### 10.3.4 DC 发货入口与路由同判定（2026-11-02）
+
+订单详情页的 `can_ship` 必须与 `POST /orders/<id>/ship` 的鉴权**同一口径**：
+`is_dc_view and (is_admin or role in ("staff", "manager", "admin"))`。
+
+原因是两个事实源不同步：`g.role` 按 `(user_id, warehouse_id)` 从 `warehouse_users` 解析，
+而平台管理员跨仓**免绑定**（`auth._warehouse_visible_to` 直接放行），于是能进仓但 `g.role` 为 None；
+`permissions.require_role` 对 `is_admin` 一律放行，路由本身是可写的。模板若只按 `g.role`
+判角色，就会出现「路由允许写、界面不给按钮」。2026-11-02 的实例：蓝天大厦 `wh_005` 的
+`warehouse_users` 一条绑定都没有，从该仓视角打开已审批订单时整块发货区不渲染。
+
+同源排查口径：凡是「模板里按 `role in (...)` 控制动作按钮」的地方，都要对照对应路由装饰器
+是否对 `is_admin` 直通；不一致就是这一类缺陷。回归：
+`tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`。
 
 ### 10.4 Canonical 扇出流程
 
@@ -2547,6 +2563,10 @@ Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 mast
 停用/别名/歧义/单位/阻断冲突、无效重复绑定、缺库不创建、负库存/成本兜底、
 查询前后库文件不变和 `/inventory` 当前仓语义。临时变异验证头仓代替来源、
 忽略固化 ID、歧义取首行和允许建缺库均会被回归检出。
+
+2026-11-02 的 `tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`
+锁定「平台管理员 + 无 `warehouse_users` 绑定的 DC 会话」下详情页仍渲染发货表单；
+去掉 `is_admin` 直通后实测打红（缺 `shipped_items[`），防止再出现「路由可写、界面无入口」（§10.3.4）。
 
 **完整 MCP 门禁（Issue #103，2026-10-31 起）**：CI test job、`verify.sh` check 1 与
 `generate_reports.sh` 的本地 fallback 都收集 `tests/mcp_server/`，不再整目录排除。
@@ -2913,6 +2933,14 @@ with app.test_client() as c, c.session_transaction() as s:
 
 **与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，PR1 阶段不可执行；#80 PR2 实现三写护栏，生产未核实真实 userid 或未配置写范围时仍拒写。D2 八读、三写护栏与 D7 显式启用由 #80 实现，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
+### 13.15 多仓履约开关是 env，不是代码常量（2026-11-02 起）
+
+- ✅ 开关取值 = `os.environ['DAILYCHECK_MULTI_WAREHOUSE']`（`1/true/yes/on` 为开），**未设置即关闭**；`config.py` 里不再写死布尔值
+- ✅ 生产开启/回滚 = 改 `/etc/dailycheck/app.env` + `systemctl restart dailycheck dailycheck-green`，不重新发版
+- ❌ **不要**把默认值直接改成 `True`：85 个按单仓假设写的测试会红（2026-11-02 对照实测：`250 passed` → `85 failed + 12 errors`）
+- ⚠️ 蓝绿共用一份代码与同一个 db 目录，两个 unit 必须同时生效；只重启一个会写出混着两种口径的订单
+- ⚠️ 开启前的数据前置：每条 `item_routing` 的**目标仓**必须有 `is_active=1 AND is_alias=0` 的绑定行，否则该品项既进不了目录也发不了货（2026-11-02 由扇出事件 `#41` 给 `wh_005` 补了 75 项）
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
@@ -2936,6 +2964,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
 | 出品配方的多态行 `bom_item_id[]` / `bom_ic_recipe_id[]` 与 `bom_row_id[]` **不按位对齐** | **高** | pre-existing（Issue #47 复核时发现，**本次未修**，已另立 issue） | 模板每行只渲染「当前类型」的那一个 select（`bom_item_id` 或 `bom_ic_recipe_id`），浏览器提交时两个数组各自按类型计数、与 `bom_row_id[]` 长度不等；后端按 `item_ids[i]` / `ic_ids[i]` 取值 → **混合来源**的出品配方保存时，部分行的原料/用量被静默跳过，甚至写错行（行序为 [ic_recipe, item, item] 时，第 2 行可能被写成第 3 行的原料）。与 §13.13 同属「平行数组按位配对」家族，但根因在**模板渲染 ≠ 表单契约**，与 Issue #47 的两条缺陷不同源 → 按 workflow.md D2 另立 issue，不在本 PR 修。**修法**：每行同时渲染另一类型的 hidden 占位（`value=""`），或后端改为按行解析。存量风险：混合来源的出品配方保存后行数/用量可能与预期不符，**改配方前先核对行数** |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
+| DC 发货入口与路由权限不一致（管理员无绑定→无入口） | 中 | **已修复（2026-11-02）** | `can_ship` 原为显式角色判断（`role in staff/manager/admin`），不含 `is_admin`；而 `@require_role("staff")` 对平台管理员直通 → 蓝天大厦 `wh_005` 无任何 `warehouse_users` 绑定时，管理员从该仓视角看不到发货表单。已改为 `is_admin or role in (...)`（§10.3.4），并给 `admin` 补 wh_005 绑定。**同类待查**：模板里其他按 `g.role` 控制动作按钮的位置（如门店侧 `can_deliver`）尚未逐个对齐 |
 
 ---
 

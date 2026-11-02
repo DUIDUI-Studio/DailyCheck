@@ -952,9 +952,13 @@ def order_detail(order_id: int) -> str:
         transfer=transfer_ctx,
         can_review=(is_dc_view and review_allowed),
         review_missing_warehouses=review_missing,
+        # 平台管理员直通：与 POST /orders/<id>/ship 的 @require_role("staff")
+        # 保持同一判定（permissions.py:212 — is_admin 一律放行）。缺这个分支
+        # 会出现「路由允许写、界面不给按钮」：管理员进了未绑 warehouse_users 的
+        # 配送中心仓时 g.role 为 None，发货区整块不渲染（2026-11-02 蓝天大厦）。
         can_ship=(
             is_dc_view
-            and role in ("staff", "manager", "admin")
+            and (is_admin or role in ("staff", "manager", "admin"))
         ),
         current_warehouse_code=current_wh_code,
         ship_progress=ship_progress,
