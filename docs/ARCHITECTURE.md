@@ -2512,15 +2512,16 @@ Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时mast
 逐字段核对库存/价格/非绑定字段不变，备份落临时目录。旧SQL在标准3.12/3.13先跑红；
 变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
 
-Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、
-原始29声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
+Issue #104 的 `tests/test_mcp_registry.py` 验证32声明/全部实现/dispatch集合、重名与漏实现拒绝、
+原始32声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
 嵌套对象插入顺序不影响生成字节；元数据/输入输出字段/新增字段、数组值/次序/数量、计数变化
 及非规范/畸形/尾随JSON均须被检出。SDK输出禁用守卫检查实际序列化结果，不依赖新SDK对象属性。
-全部29项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
-call_tool派发/序列化验证最小输出shape；七canonical写只在临时库与临时备份目录实调，
+全部32项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
+call_tool派发/序列化验证最小输出shape；三项外部WMS只读工具在该用例中桩化service层
+（`_WMS_ROWS` / `stub_wms`），CI不连第三方SQL Server，只验派发与序列化形状；七canonical写只在临时库与临时备份目录实调，
 不用Bot扩权或生产库。新增登记需同步该参数矩阵；形状元数据不改变运行时返回。
 生成校验命令`python -m scripts.mcp_contracts --check`还核对AGENT/CLAUDE工具集合与测试引用，
-以及维护中的`calculation-logic.md`入口29/16口径、订单只读范围和权威台账链接；
+以及维护中的`calculation-logic.md`入口32/19口径、订单只读范围和权威台账链接；
 旧27项入口、缺订单说明或缺台账链接均由回归/变异证明不能通过校验；其历史公式段落不重写。
 真实Starlette health与CLI回归锁住Bearer覆盖health、200/503及默认stdio/HTTP参数，
 使文档口径可验证。命令适用于CI，本Issue不改workflow接线。
@@ -2909,6 +2910,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:80,100` / `blueprints/procurement.py:185` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:91` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 的 4 个调用点 / 3 个代码站点（`replay_item_layers`、`compute_stocktake_quality`、`compute_fulfillment`）；行号按 2026-10-15 `52516a8` 校准，改动这些模块时按符号名而非行号定位。后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | 事故已止血；**根治已交付待 merge**（Issue #41 → PR #42） | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。**处置**：生产侧已 `switch.sh blue 100` 止血（运行态 blue 100 / green down）；**根治**= §3.4 铁律新增的 `switch.sh` DRY_RUN 守卫（承接流量且 `DRY_RUN=true` → 拒跑 exit 3），已随 Issue #41 修复交付（PR #42）。⚠️ **下一次切流量前必须先按 `scripts/blue_green/README.md`「绿转正」关闭绿的写隔离**，否则会被守卫拒跑（预期行为） |
 | MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27；参与仓口径更新 2026-10-29） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的门店仓或**任一参与仓**（明细行来源仓，历史 NULL 回落头仓）命中才可见；命中任一参与仓即可读**全单**（含他仓行/金额/收货历史）。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
+| **外部 WMS 只读工具需另配上游凭据与读路径** | 中 | 新增（2026-11-02） | `wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 要生效需两件事：① 注入 `DAILYCHECK_WMS_HOST` / `PORT` / `USER` / `PASSWORD` / `DATABASE` / `CUSTOMER_ID`；② token 的 `allowed_read_paths` 覆盖 `/api/v1/wms`（或 `*`）。缺①返回 `wms_not_configured`，缺②返回 `forbidden_path`，两者都不影响其余工具。上游是第三方生产库且带来源白名单，CI 只跑桩化用例，真实连通性须在部署环境单独确认 |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |

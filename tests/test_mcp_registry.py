@@ -385,7 +385,7 @@ def test_documented_health_auth_and_db_status_use_actual_app(registry_db, monkey
 
 
 @pytest.mark.parametrize('old,new', [
-    ('实时 29 项', '合计 27 项'),
+    ('实时 32 项', '合计 27 项'),
     ('`store_order_list` / `store_order_detail`', '未说明订单范围'),
     ('[完整工具台账](./registry.md)', '没有权威台账链接'),
 ])
