@@ -542,6 +542,51 @@ def test_receive_unbound_zero_source_price_warns(receive_env, caplog):
     )
 
 
+def test_receive_unbound_ignores_inactive_source_duplicate(receive_env):
+    """Auto-create copies the active non-alias source row, not an earlier
+    inactive/alias duplicate with the same canonical_id and a wrong price."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    dc = sqlite3.connect(str(receive_env["dc_path"]))
+    dc.row_factory = sqlite3.Row
+    duplicate = dc.execute(
+        "SELECT id, category_id FROM items WHERE canonical_id=102"
+    ).fetchone()
+    # Demote the fixture row: same canonical_id, wrong price, not fulfillable.
+    dc.execute(
+        """UPDATE items
+              SET is_active=0, is_alias=1, selling_price=1.0, unit_cost=0.5
+            WHERE id=?""",
+        (duplicate["id"],),
+    )
+    # The active non-alias row is the one the resolver must pick.
+    dc.execute(
+        """INSERT INTO items
+           (sku, name, category_id, quantity, unit, canonical_id,
+            selling_price, unit_cost, is_active, is_alias, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)""",
+        (
+            "DC-B-ACTIVE", "测试包材B", duplicate["category_id"], 50.0,
+            "件", 102, 21.5, 13.75, ts,
+        ),
+    )
+    dc.commit()
+    dc.close()
+
+    order_id, order_item_id = _build_direct_shipped_order(receive_env, 102)
+    resp = _receive(receive_env, order_id, order_item_id, 3)
+    assert resp.status_code == 200
+
+    store = sqlite3.connect(str(receive_env["store_path"]))
+    store.row_factory = sqlite3.Row
+    row = store.execute(
+        "SELECT selling_price, unit_cost FROM items WHERE canonical_id=102"
+    ).fetchone()
+    assert row is not None
+    assert row["selling_price"] == 21.5
+    assert row["unit_cost"] == 13.75
+    store.close()
+
+
 def test_receive_existing_binding_keeps_its_prices(receive_env):
     """An already-bound storefront row is never repriced by receiving."""
     _set_dc_item_price(receive_env, 101, 5.0, 3.0)

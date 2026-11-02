@@ -2873,28 +2873,49 @@ def _find_existing_receipts(
 
 
 def _source_item_prices(
+    master_conn: sqlite3.Connection,
     source_code: str | None,
     canonical_id: int,
 ) -> tuple[float, float]:
-    """Return ``(selling_price, unit_cost)`` from the source warehouse row.
+    """Return ``(selling_price, unit_cost)`` from the resolved source row.
 
-    Falling back to 0/0 keeps receiving unblocked when the source row is
-    missing; the auto-create path logs a warning in that case.
+    The row comes from the authoritative fulfillment resolver (unique active
+    non-alias row with a matching unit), never an arbitrary ``canonical_id``
+    match. An unresolvable binding logs a distinct warning and falls back to
+    0/0 so receiving stays unblocked; ``_ensure_store_item`` then warns about
+    the zero price. The source db is opened read-only and never migrated, so a
+    missing file cannot be created by this lookup.
     """
     if not source_code:
         return 0.0, 0.0
-    conn = open_warehouse_db(str(source_code))
+    path = config.WAREHOUSE_DB_DIR / f"{source_code}.db"
+    conn: sqlite3.Connection | None = None
     try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        resolved = resolve_fulfillment_item(
+            master_conn,
+            conn,
+            canonical_id=canonical_id,
+            warehouse_code=str(source_code),
+        )
         row = conn.execute(
-            """SELECT selling_price, unit_cost FROM items
-                WHERE canonical_id=? ORDER BY id LIMIT 1""",
-            (canonical_id,),
+            "SELECT selling_price FROM items WHERE id=?",
+            (resolved["item_id"],),
         ).fetchone()
-    finally:
-        conn.close()
-    if row is None:
+    except (FulfillmentError, sqlite3.Error) as exc:
+        logger.warning(
+            "[receiving] source binding unresolved canonical_id=%s warehouse=%s error=%s",
+            canonical_id,
+            source_code,
+            type(exc).__name__,
+        )
         return 0.0, 0.0
-    return float(row["selling_price"] or 0), float(row["unit_cost"] or 0)
+    finally:
+        if conn is not None:
+            conn.close()
+    selling_price = float(row["selling_price"] or 0) if row is not None else 0.0
+    return selling_price, float(resolved["unit_cost"] or 0)
 
 
 def _ensure_store_item(
@@ -3020,7 +3041,7 @@ def _apply_store_receipts(
                 order, order_items_by_id.get(order_item_id, {})
             )
             selling_price, unit_cost = _source_item_prices(
-                source_code, canonical_id
+                master_conn, source_code, canonical_id
             )
             store_item = _ensure_store_item(
                 store_conn, master_conn, canonical_id, ts,
@@ -3415,7 +3436,7 @@ def reconcile_orphan_receipts(
             else:
                 canonical_id = int(row["canonical_id"])
                 selling_price, unit_cost = _source_item_prices(
-                    row["source_warehouse_code"], canonical_id
+                    master_conn, row["source_warehouse_code"], canonical_id
                 )
                 store_item = _ensure_store_item(
                     store_conn, master_conn, canonical_id, ts,
