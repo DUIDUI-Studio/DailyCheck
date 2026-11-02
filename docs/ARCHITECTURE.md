@@ -2333,6 +2333,21 @@ summary 全局一次，仓维度各计一次（同单多行不翻倍、跨仓单
 时采购单只出现 B 一次；`build_digest` / `collect_digest` 透传。测试：
 `tests/test_report_multi_dc.py`、`tests/test_replenishment_routing.py`。
 
+### 10.3.4 DC 发货入口与路由同判定（2026-11-02）
+
+订单详情页的 `can_ship` 必须与 `POST /orders/<id>/ship` 的鉴权**同一口径**：
+`is_dc_view and (is_admin or role in ("staff", "manager", "admin"))`。
+
+原因是两个事实源不同步：`g.role` 按 `(user_id, warehouse_id)` 从 `warehouse_users` 解析，
+而平台管理员跨仓**免绑定**（`auth._warehouse_visible_to` 直接放行），于是能进仓但 `g.role` 为 None；
+`permissions.require_role` 对 `is_admin` 一律放行，路由本身是可写的。模板若只按 `g.role`
+判角色，就会出现「路由允许写、界面不给按钮」。2026-11-02 的实例：蓝天大厦 `wh_005` 的
+`warehouse_users` 一条绑定都没有，从该仓视角打开已审批订单时整块发货区不渲染。
+
+同源排查口径：凡是「模板里按 `role in (...)` 控制动作按钮」的地方，都要对照对应路由装饰器
+是否对 `is_admin` 直通；不一致就是这一类缺陷。回归：
+`tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`。
+
 ### 10.4 Canonical 扇出流程
 
 ```mermaid
@@ -2548,6 +2563,10 @@ Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 mast
 停用/别名/歧义/单位/阻断冲突、无效重复绑定、缺库不创建、负库存/成本兜底、
 查询前后库文件不变和 `/inventory` 当前仓语义。临时变异验证头仓代替来源、
 忽略固化 ID、歧义取首行和允许建缺库均会被回归检出。
+
+2026-11-02 的 `tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`
+锁定「平台管理员 + 无 `warehouse_users` 绑定的 DC 会话」下详情页仍渲染发货表单；
+去掉 `is_admin` 直通后实测打红（缺 `shipped_items[`），防止再出现「路由可写、界面无入口」（§10.3.4）。
 
 **完整 MCP 门禁（Issue #103，2026-10-31 起）**：CI test job、`verify.sh` check 1 与
 `generate_reports.sh` 的本地 fallback 都收集 `tests/mcp_server/`，不再整目录排除。
@@ -2945,6 +2964,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
 | 出品配方的多态行 `bom_item_id[]` / `bom_ic_recipe_id[]` 与 `bom_row_id[]` **不按位对齐** | **高** | pre-existing（Issue #47 复核时发现，**本次未修**，已另立 issue） | 模板每行只渲染「当前类型」的那一个 select（`bom_item_id` 或 `bom_ic_recipe_id`），浏览器提交时两个数组各自按类型计数、与 `bom_row_id[]` 长度不等；后端按 `item_ids[i]` / `ic_ids[i]` 取值 → **混合来源**的出品配方保存时，部分行的原料/用量被静默跳过，甚至写错行（行序为 [ic_recipe, item, item] 时，第 2 行可能被写成第 3 行的原料）。与 §13.13 同属「平行数组按位配对」家族，但根因在**模板渲染 ≠ 表单契约**，与 Issue #47 的两条缺陷不同源 → 按 workflow.md D2 另立 issue，不在本 PR 修。**修法**：每行同时渲染另一类型的 hidden 占位（`value=""`），或后端改为按行解析。存量风险：混合来源的出品配方保存后行数/用量可能与预期不符，**改配方前先核对行数** |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
+| DC 发货入口与路由权限不一致（管理员无绑定→无入口） | 中 | **已修复（2026-11-02）** | `can_ship` 原为显式角色判断（`role in staff/manager/admin`），不含 `is_admin`；而 `@require_role("staff")` 对平台管理员直通 → 蓝天大厦 `wh_005` 无任何 `warehouse_users` 绑定时，管理员从该仓视角看不到发货表单。已改为 `is_admin or role in (...)`（§10.3.4），并给 `admin` 补 wh_005 绑定。**同类待查**：模板里其他按 `g.role` 控制动作按钮的位置（如门店侧 `can_deliver`）尚未逐个对齐 |
 
 ---
 
