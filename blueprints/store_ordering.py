@@ -1452,25 +1452,25 @@ def ship_order_route(order_id: int) -> str:
         flash("请至少填写一项发货数量")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 2. 兼容 v2 全量字段 'qty'：仅作用本仓未发齐明细。
+    # Preserve legacy qty before adapting against the current remaining quantity.
+    legacy_quantity = None
     if not shipped_items_map:
-        raw_qty = request.form.get("qty")
-        if raw_qty is not None and raw_qty != "":
+        raw_qty = request.form.get('qty')
+        if raw_qty is not None and raw_qty != '':
             qty_value = parse_qty(raw_qty)
             if qty_value > 0:
-                for it in detail["order_items"]:
-                    source = it.get("source_warehouse_code") or detail["dc_warehouse_code"]
-                    if source != operator_dc_code:
-                        continue
-                    if it.get('ship_blocked_reason'):
-                        continue
-                    already = parse_qty(it.get("shipped_quantity") or 0)
-                    remaining = parse_qty(it["quantity"]) - already
-                    if remaining > 0:
-                        shipped_items_map[int(it["id"])] = min(qty_value, remaining)
+                legacy_quantity = qty_value
 
     # 3. 都没填（且不含 shipped_items 字段）→ 本仓 legacy full-ship（旧客户端兼容）。
-    if not shipped_items_map:
+    if legacy_quantity is not None:
+        try:
+            order = sop.ship_legacy_quantity(master, order_id=order_id,
+                operator_dc_code=operator_dc_code, op_no=op_no, quantity=legacy_quantity,
+                shipped_by=g.user['id'], tracking_note=tracking_note)
+        except ValueError as e:
+            flash(f"出库失败：{e}", "error")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+    elif not shipped_items_map:
         try:
             order = sop.ship_order_full(
                 master,

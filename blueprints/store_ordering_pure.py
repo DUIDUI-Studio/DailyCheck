@@ -2423,6 +2423,7 @@ def ship_partial(
     line_qty: dict[int, float],
     shipped_by: int,
     tracking_note: str | None = None,
+    legacy_quantity: float | None = None,
 ) -> dict[str, Any]:
     """Ship one source warehouse's lines under a caller-supplied idempotency key.
 
@@ -2440,16 +2441,17 @@ def ship_partial(
     if not op_no:
         raise ValueError("op_no is required")
     master_conn.row_factory = sqlite3.Row
-    payload = ocp.ship_payload(order_id, operator_dc_code, line_qty)
+    payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no, order_id=order_id,
+        source=operator_dc_code, line_qty=line_qty, legacy_quantity=legacy_quantity)
     normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
+    effective_line_qty = normalized if legacy_quantity is not None else line_qty
     # Binding resolution has no master write lock and does not touch stock.
-    claim = ocp.get_claim(master_conn, op_no, payload)
     frozen = {}
     if claim is None:
         order = get_order_detail(master_conn, order_id)
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
-        selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
+        selected = _select_ship_lines(order, effective_line_qty, operator_dc_code, op_no)
         wh = wh_conn_factory(operator_dc_code)
         try:
             prefix = op_no + ':'
@@ -2469,7 +2471,10 @@ def ship_partial(
             wh.close()
     owns_tx = _begin_immediate(master_conn)
     try:
-        claim = ocp.get_claim(master_conn, op_no, payload)
+        payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no, order_id=order_id,
+            source=operator_dc_code, line_qty=line_qty, legacy_quantity=legacy_quantity)
+        normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
+        effective_line_qty = normalized if legacy_quantity is not None else line_qty
         order = get_order_detail(master_conn, order_id)
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
@@ -2480,7 +2485,7 @@ def ship_partial(
                 op_no=op_no, warehouse_code=operator_dc_code, selected_ids=list(normalized), idempotent=True)
         if claim is not None and claim['state'] != 'active':
             raise ValueError('发货占用已恢复或终结，不可复用op_no')
-        selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
+        selected = _select_ship_lines(order, effective_line_qty, operator_dc_code, op_no)
         if claim is None:
             ocp.register_claim(master_conn, op_no=op_no, order=order, payload=payload,
                                selected=selected, frozen=frozen, actor_id=shipped_by)
@@ -2689,6 +2694,28 @@ def ship_order(
         f"int (legacy shipped_by), got {type(third).__name__}"
     )
 
+
+
+def ship_legacy_quantity(master_conn: sqlite3.Connection, *, order_id: int,
+                         operator_dc_code: str, op_no: str, quantity: float,
+                         shipped_by: int, tracking_note: str | None = None) -> dict[str, Any]:
+    """Adapt the old per-line qty cap while keeping its original request identity."""
+    requested = parse_qty(quantity)
+    if requested <= 0:
+        raise ValueError('发货数量必须大于 0')
+    order = get_order_detail(master_conn, order_id)
+    if order is None:
+        raise ValueError(f'order_id={order_id} not found')
+    line_qty = {}
+    for item in order['order_items']:
+        if _line_source_warehouse(order, item) != operator_dc_code or item.get('ship_blocked_reason'):
+            continue
+        remaining = parse_qty(item['quantity']) - parse_qty(item.get('shipped_quantity') or 0)
+        if remaining > 0:
+            line_qty[int(item['id'])] = min(requested, remaining)
+    return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+        operator_dc_code=operator_dc_code, op_no=op_no, line_qty=line_qty,
+        shipped_by=shipped_by, tracking_note=tracking_note, legacy_quantity=requested)
 
 def ship_order_full(
     master_conn: sqlite3.Connection,

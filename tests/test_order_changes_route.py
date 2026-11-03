@@ -139,3 +139,49 @@ def test_notification_and_audit_rollback_after_enqueue(ship_env, monkeypatch):
     assert changes.proposal_detail(e['master'], oid, pid)['status'] == 'pending'
     assert e['master'].execute('SELECT count(*) FROM store_order_change_events').fetchone()[0] == 0
     assert e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('requested', [3, 4, 10])
+def test_legacy_qty_retry_keeps_original_delivery_and_notification_count(ship_env, requested):
+    e = ship_env
+    oid, ids = e['create_order']([(101, 4, 'A')])
+    login(e, user=2)
+    url = f'/store-ordering/orders/{oid}/ship'
+    data = {'op_no': 'legacy-qty-retry', 'qty': str(requested)}
+    first = e['client'].post(url, data=data, headers={'X-Requested-With': 'fetch'})
+    assert first.status_code == 200 and first.json['ok']
+    deliveries = [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_deliveries')]
+    delivery_lines = [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_delivery_items')]
+    notifications = e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0]
+    repeat = e['client'].post(url, data=data, headers={'X-Requested-With': 'fetch'})
+    assert repeat.status_code == 200 and repeat.json['ok'], repeat.get_data(as_text=True)
+    assert e['stock']('A', 101) == 10 - min(requested, 4)
+    assert [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_deliveries')] == deliveries
+    assert [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_delivery_items')] == delivery_lines
+    assert e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0] == notifications
+    assert e['master'].execute('SELECT shipped_quantity FROM store_order_items WHERE id=?', (ids[0],)).fetchone()[0] == min(requested, 4)
+
+
+@pytest.mark.parametrize('mismatch', ['quantity', 'clipped_quantity', 'order', 'source', 'explicit_lines'])
+def test_legacy_qty_key_still_rejects_changed_request(ship_env, mismatch):
+    e = ship_env
+    oid, ids = e['create_order']([(101, 4, 'A'), (102, 4, 'B')])
+    login(e, user=2)
+    requested = '10' if mismatch == 'clipped_quantity' else '3'
+    data = {'op_no': 'legacy-qty-bound', 'qty': requested}
+    url = f'/store-ordering/orders/{oid}/ship'
+    assert e['client'].post(url, data=data, headers={'X-Requested-With': 'fetch'}).status_code == 200
+    initial_a = e['stock']('A', 101)
+    if mismatch in ('quantity', 'clipped_quantity'):
+        data['qty'] = '11' if mismatch == 'clipped_quantity' else '2'
+    elif mismatch == 'order':
+        other, _ = e['create_order']([(101, 4, 'A')])
+        url = f'/store-ordering/orders/{other}/ship'
+    elif mismatch == 'source':
+        login(e, user=3, warehouse=2)
+    else:
+        data = {'op_no': data['op_no'], f'shipped_items[{ids[0]}]': requested}
+    rejected = e['client'].post(url, data=data, headers={'X-Requested-With': 'fetch'})
+    assert rejected.status_code == 409 and rejected.json['ok'] is False
+    assert e['stock']('A', 101) == initial_a and e['stock']('B', 102) == 10
+    assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 1

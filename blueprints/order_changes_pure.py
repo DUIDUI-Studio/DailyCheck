@@ -92,7 +92,8 @@ def assert_ship_permission(conn: sqlite3.Connection, order: dict, actor_id: int,
         raise ValueError('订单目标仓不在当前租户')
 
 
-def ship_payload(order_id: int, source: str, line_qty: dict[int, float]) -> dict:
+def ship_payload(order_id: int, source: str, line_qty: dict[int, float], *,
+                 legacy_quantity: float | str | None = None) -> dict:
     normalized: dict[int, str] = {}
     for key, raw in line_qty.items():
         try:
@@ -106,7 +107,30 @@ def ship_payload(order_id: int, source: str, line_qty: dict[int, float]) -> dict
             normalized[item_id] = value
     if not normalized:
         raise ValueError('本批发货数量全部为空，请至少填写一项')
-    return {'order_id': int(order_id), 'source': source, 'lines': sorted(normalized.items())}
+    payload = {'order_id': int(order_id), 'source': source, 'lines': sorted(normalized.items())}
+    if legacy_quantity is not None:
+        payload['legacy_quantity'] = quantity(legacy_quantity)
+    return payload
+
+
+def resolve_ship_payload(conn: sqlite3.Connection, *, op_no: str, order_id: int,
+                         source: str, line_qty: dict[int, float],
+                         legacy_quantity: float | None = None) -> tuple[dict, dict | None]:
+    """Bind legacy scalar input before adapting it against mutable remaining stock.
+
+    Re-run under the claim lock: a concurrent first request may have frozen its
+    batch since the optimistic binding read. Explicit line requests always use
+    their complete caller-supplied payload and never take this replay branch.
+    """
+    claim = get_claim(conn, op_no)
+    if claim is not None and legacy_quantity is not None:
+        saved = json.loads(claim['payload_json'])
+        if (saved['order_id'] != order_id or saved['source'] != source or
+                saved.get('legacy_quantity') != quantity(legacy_quantity)):
+            raise ValueError('op_no 已用于不同原始发货请求，拒绝复用')
+        return saved, get_claim(conn, op_no, saved)
+    payload = ship_payload(order_id, source, line_qty, legacy_quantity=legacy_quantity)
+    return payload, get_claim(conn, op_no, payload)
 
 
 def get_claim(conn: sqlite3.Connection, op_no: str, payload: dict | None = None) -> dict | None:
@@ -150,10 +174,13 @@ def register_claim(conn: sqlite3.Connection, *, op_no: str, order: dict, payload
 
 def assert_active_claim(conn: sqlite3.Connection, op_no: str, *, order_id: int,
                         source: str, selected: list) -> list[dict]:
-    payload = ship_payload(order_id, source, {oid: qty for oid, _, qty in selected})
-    claim = get_claim(conn, op_no, payload)
+    claim = get_claim(conn, op_no)
     if claim is None or claim['state'] != 'active':
         raise ValueError('发货占用已恢复或终结，迟到请求不可执行')
+    saved = json.loads(claim['payload_json'])
+    payload = ship_payload(order_id, source, {oid: qty for oid, _, qty in selected},
+                           legacy_quantity=saved.get('legacy_quantity'))
+    get_claim(conn, op_no, payload)
     rows = claim_lines(conn, op_no)
     items = {oid: item for oid, item, _ in selected}
     for line in rows:
