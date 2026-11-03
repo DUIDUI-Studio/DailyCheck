@@ -2029,6 +2029,19 @@ retry_safe（有键true）；带键重试修缓存不补库存，无键不得自
 
 #### 9.2.1 外部 WMS 只读桥接（3 项）
 
+**Issue #140 Web 独立范围**：新增 `mcp_server/service/wms_web.py`，只复用 WMS
+连接、环境配置与安全错误包装，不改变下述 MCP 单货主函数、注册、schema 或 Bot 池。
+Owner 2026-11-03 确认 Web 多货主仅含 `sy_warehouse` ID 1（朴宇冷库）及 3（朴宇仓）；
+默认同时查两仓，空仓仍保留选择。其他原可见外仓仍限配置货主，不接受调用方扩张白名单。
+`WebScope` 不可变，库存/货主选项/单据头及明细均在 SQL 绑定仓库范围；货主筛选只收窄。
+`Page` 用 SQL Server 2008 R2 的 ROW_NUMBER + 唯一 goodsBalanceID（单据为日期+唯一头 ID）
+分页，计数/品项数与当前筛选一致，不合计不同单位数量；分页反映实时查询，不承诺跨请求快照。
+`DocumentKey` 为方向枚举+唯一头 ID；`DocumentDetail` 区分完整/空明细/截断，库位分配独立
+查询并归属明细，禁止一对多 JOIN 重复行数量。查询异常不伪装空结果。
+结构依据 Coordinator 经授权的真实 SELECT/schema/PK/FK 取证（2026-11-03），
+CI 仅以合成数据运行 SQL 方言适配及 Flask 桩化测试，不连第三方 WMS；真实候选及生产验证归 Prod。
+
+
 `wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 读的不是 DailyCheck 自己的
 SQLite，而是租仓方 WMS（SQL Server）中**本货主**的数据。边界如下，改动前必须逐条确认：
 
