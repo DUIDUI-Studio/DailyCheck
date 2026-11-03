@@ -2518,16 +2518,16 @@ def ship_partial(
         order = get_order_detail(master_conn, order_id)
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
-        if mode == 'explicit':
-            members = {int(item['id']) for item in order['order_items']}
-            if any(int(oid) not in members for oid in line_qty):
-                raise ValueError('发货明细不属于当前订单')
         if claim is not None:
             source = operator_dc_code or claim['source_warehouse_code']
             ocp.assert_ship_permission(master_conn, order, shipped_by, source)
             payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no,
                 order_id=order_id, source=source, line_qty=line_qty,
                 legacy_quantity=legacy_quantity, request_mode=mode)
+            if mode == 'explicit':
+                members = {int(item['id']) for item in order['order_items']}
+                if any(int(oid) not in members for oid in line_qty):
+                    raise ValueError('发货明细不属于当前订单')
             normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
             if claim['state'] == 'committed':
                 master_conn.commit()
