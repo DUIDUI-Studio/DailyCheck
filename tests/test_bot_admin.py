@@ -70,7 +70,7 @@ def test_page_renders_live_registry_plus_own_tools(logged_client):
     assert resp.status_code == 200
     html = resp.get_data(as_text=True)
     main = _main_rows(html)
-    assert len(main) == 34, f"应 34 主行（29 MCP + 5 自有），实际 {len(main)}"
+    assert len(main) == 37, f"应 37 主行（32 MCP + 5 自有），实际 {len(main)}"
     assert set(main) == {t.name for t in get_tools()} | {
         "search_items",
         "list_low_stock",
@@ -85,7 +85,7 @@ def test_page_renders_live_registry_plus_own_tools(logged_client):
         "get_item_consumption",
     }
     assert "get_price" in html, "D6：get_price 应单列诊断"
-    assert "待确认" not in html, "当前 29 项都应有明确登记"
+    assert "待确认" not in html, "当前 32 项都应有明确登记"
 
 
 def test_injected_registry_tool_appears_without_static_list_change(
@@ -110,7 +110,7 @@ def test_injected_registry_tool_appears_without_static_list_change(
 
     html = client.get("/admin/bot-agent").get_data(as_text=True)
 
-    assert len(_main_rows(html)) == 35
+    assert len(_main_rows(html)) == 38
     assert 'data-tool-row="probe_new_tool"' in html
     assert 'data-status-code="pending"' in _row_block(html, "probe_new_tool")
 
