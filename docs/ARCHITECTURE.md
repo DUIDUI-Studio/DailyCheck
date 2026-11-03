@@ -2315,6 +2315,20 @@ stateDiagram-v2
 
 `is_multiple_of` 用**相对容差**（`abs(qty − round(qty/step)·step) ≤ max(1e-9, step·1e-9)`）判定，不用 `%`——浮点二进制误差会让 `0.3 / 0.1` 判成 False。`normalize_order_multiple` 把脏值（None/非数字/≤0）一律回落成 1，避免配置错误把某个品项永久锁死。
 
+**持久发货占用（Issue #144）**：所有 full/partial/legacy 包装最终进入同一
+ship_partial：解析冻结履约行后，在 master 短事务重新校验 approved、DC staff
+原能力、来源/有效量和 pending 受影响行，完整请求 hash 绑定订单、操作仓和全部
+正数量行；整批登记后才扣库存。active/recovering 每行独占，无 TTL。
+仓库写锁内检查 active、冻结 item/unit/line revision 与 REV；master finalize
+同锁检查后写配送并将整批 committed。恢复先在 master active→recovering fence，
+再取仓库锁按原流水 REV 幂等冲销，最后 master→aborted；失败保持占用，重复
+恢复可继续，终态不复活。committed 先赢则恢复不冲销，fence 先赢则迟到 finalize
+不可落配送。旧 cancel 也检查活动占用；人工孤儿核对对有 claim 的请求先走 fence，
+旧无 claim 请求仍按原人工核对边界处理，不能在旧执行者未排空时运行此核对。
+自动全发跳过暂停/占用行，显式批次含任一暂停正数量行整批拒绝。
+部署前所有 Web 写实例必须具备此协议且旧执行者排空；提议入口持续关闭，
+兼容回退不可删除 active/recovering claim。
+
 ### 10.3.1 总仓调货（2026-10-19）
 
 **不新建单据体系**：调货单是 `store_orders` 里 `flow_type='dc_transfer'` 的一行，方向列复用 —— `dc_warehouse_code` = 发货总仓、`store_warehouse_code` = 收货分仓。明细、批次发货、部分收货、状态历史、库存流水全部复用订货实现（`blueprints/store_ordering_pure.py`），新增代码只在 `blueprints/dc_transfer{,_pure}.py`（列表 + 建单 + 状态派生）。

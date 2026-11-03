@@ -94,9 +94,10 @@ DDL = (
        BEGIN UPDATE store_order_items SET original_quantity=NEW.quantity WHERE id=NEW.id; END""",
     """CREATE TRIGGER IF NOT EXISTS order_item_identity_immutable BEFORE UPDATE ON store_order_items
        WHEN NEW.original_quantity IS NOT OLD.original_quantity AND OLD.original_quantity IS NOT NULL
-         OR NEW.canonical_id IS NOT OLD.canonical_id OR NEW.order_id IS NOT OLD.order_id
-         OR NEW.source_warehouse_code IS NOT OLD.source_warehouse_code OR NEW.unit IS NOT OLD.unit
-         OR (OLD.dc_item_id IS NOT NULL AND NEW.dc_item_id IS NOT OLD.dc_item_id)
+         OR (OLD.product_snapshot IS NOT NULL AND (
+             NEW.canonical_id IS NOT OLD.canonical_id OR NEW.order_id IS NOT OLD.order_id
+             OR NEW.source_warehouse_code IS NOT OLD.source_warehouse_code OR NEW.unit IS NOT OLD.unit
+             OR (OLD.dc_item_id IS NOT NULL AND NEW.dc_item_id IS NOT OLD.dc_item_id)))
          OR (OLD.product_snapshot IS NOT NULL AND NEW.product_snapshot IS NOT OLD.product_snapshot)
          OR (OLD.unit_price_snapshot IS NOT NULL AND NEW.unit_price_snapshot IS NOT OLD.unit_price_snapshot)
        BEGIN SELECT RAISE(ABORT, 'immutable order line snapshot'); END""",

@@ -179,7 +179,7 @@ def ship_env(tmp_path, monkeypatch):
     m.close()
 
 
-def _ship(env, order_id, operator, op_no, line_qty, shipped_by=2):
+def _ship(env, order_id, operator, op_no, line_qty, shipped_by=None):
     return sop.ship_partial(
         env["master"],
         sop.open_warehouse_db,
@@ -187,7 +187,7 @@ def _ship(env, order_id, operator, op_no, line_qty, shipped_by=2):
         operator_dc_code=operator,
         op_no=op_no,
         line_qty=line_qty,
-        shipped_by=shipped_by,
+        shipped_by=shipped_by if shipped_by is not None else (3 if operator == "B" else 2),
     )
 
 

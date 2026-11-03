@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 import config
+from blueprints import order_changes_pure as ocp
 from blueprints._helpers import now, parse_qty
 from blueprints.fulfillment_pure import (
     FulfillmentError,
@@ -2198,6 +2199,10 @@ def _apply_warehouse_shipment(
     try:
         wh_conn.row_factory = sqlite3.Row
         wh_conn.execute("BEGIN IMMEDIATE")
+        op_no = next(iter(line_keys.values())).rsplit(':', 1)[0]
+        claim_rows = ocp.assert_active_claim(master_conn, op_no, order_id=order['id'],
+                                            source=operator_dc_code, selected=selected)
+        frozen_ids = {r['order_item_id']: r['dc_item_id'] for r in claim_rows}
         for order_item_id, item, qty in selected:
             resolved = resolve_fulfillment_item(
                 master_conn,
@@ -2206,6 +2211,11 @@ def _apply_warehouse_shipment(
                 warehouse_code=operator_dc_code,
             )
             item_id = int(resolved["item_id"])
+            if item_id != frozen_ids[order_item_id] or resolved['unit'] != item['unit']:
+                raise ValueError('冻结履约行/单位已变更，拒绝换行扣库')
+            if wh_conn.execute('SELECT 1 FROM stock_movements WHERE op_no=?',
+                               ('REV:' + line_keys[order_item_id],)).fetchone():
+                raise ValueError('发货请求已有REV，不可复活')
             item_ids[order_item_id] = item_id
             applied = wh_conn.execute(
                 "SELECT 1 FROM stock_movements WHERE op_no=? LIMIT 1",
@@ -2401,110 +2411,91 @@ def ship_partial(
     if not op_no:
         raise ValueError("op_no is required")
     master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
-    selected_ids = [order_item_id for order_item_id, _, _ in selected]
-    line_keys = {oid: _line_op_no(op_no, oid) for oid in selected_ids}
-
-    existing = _find_existing_batch(master_conn, order_id, line_keys)
-    if existing is not None:
-        return _ship_result(
-            master_conn,
-            order_id,
-            delivery_id=existing,
-            op_no=op_no,
-            warehouse_code=operator_dc_code,
-            selected_ids=selected_ids,
-            idempotent=True,
-        )
-
-    if order["status"] != ORDER_STATUS_APPROVED:
-        raise ValueError(
-            f"order must be approved to ship, got {order['status']!r}"
-        )
-
-    ts = now()
-    item_ids = _apply_warehouse_shipment(
-        master_conn,
-        wh_conn_factory,
-        operator_dc_code,
-        order,
-        selected,
-        line_keys,
-        shipment_action_for(order),
-        ts,
-    )
-
-    try:
-        master_conn.execute("BEGIN IMMEDIATE")
-        current = master_conn.execute(
-            "SELECT status FROM store_orders WHERE id=?", (order_id,)
-        ).fetchone()
-        if current is None:
+    payload = ocp.ship_payload(order_id, operator_dc_code, line_qty)
+    normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
+    # Binding resolution has no master write lock and does not touch stock.
+    claim = ocp.get_claim(master_conn, op_no, payload)
+    frozen = {}
+    if claim is None:
+        order = get_order_detail(master_conn, order_id)
+        if order is None:
             raise ValueError(f"order_id={order_id} not found")
-        existing = _find_existing_batch(master_conn, order_id, line_keys)
-        if existing is not None:
-            master_conn.rollback()
-            return _ship_result(
-                master_conn,
-                order_id,
-                delivery_id=existing,
-                op_no=op_no,
-                warehouse_code=operator_dc_code,
-                selected_ids=selected_ids,
-                idempotent=True,
-            )
-        if current["status"] != ORDER_STATUS_APPROVED:
-            raise ValueError(
-                f"order must be approved to ship, got {current['status']!r}"
-            )
+        selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
+        wh = wh_conn_factory(operator_dc_code)
         try:
-            delivery_id = _insert_master_batch(
-                master_conn,
-                order_id,
-                operator_dc_code,
-                selected,
-                line_keys,
-                item_ids,
-                op_no,
-                shipped_by,
-                tracking_note,
-                ts,
-            )
-        except sqlite3.IntegrityError:
+            for oid, item, _ in selected:
+                resolved = resolve_fulfillment_item(master_conn, wh,
+                    canonical_id=item['canonical_id'], warehouse_code=operator_dc_code)
+                if (item.get('dc_item_id') is not None and item['dc_item_id'] != resolved['item_id']) or item['unit'] != resolved['unit']:
+                    raise ValueError('冻结履约行/单位已变更，拒绝换行扣库')
+                frozen[oid] = int(resolved['item_id'])
+        finally:
+            wh.close()
+    owns_tx = _begin_immediate(master_conn)
+    try:
+        claim = ocp.get_claim(master_conn, op_no, payload)
+        order = get_order_detail(master_conn, order_id)
+        if order is None:
+            raise ValueError(f"order_id={order_id} not found")
+        ocp.assert_ship_permission(master_conn, order, shipped_by, operator_dc_code)
+        if claim is not None and claim['state'] == 'committed':
+            master_conn.commit()
+            return _ship_result(master_conn, order_id, delivery_id=claim['delivery_id'],
+                op_no=op_no, warehouse_code=operator_dc_code, selected_ids=list(normalized), idempotent=True)
+        if claim is not None and claim['state'] != 'active':
+            raise ValueError('发货占用已恢复或终结，不可复用op_no')
+        selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
+        if claim is None:
+            ocp.register_claim(master_conn, op_no=op_no, order=order, payload=payload,
+                               selected=selected, frozen=frozen, actor_id=shipped_by)
+        else:
+            ocp.assert_active_claim(master_conn, op_no, order_id=order_id,
+                                    source=operator_dc_code, selected=selected)
+        master_conn.commit()
+    except Exception:
+        if owns_tx and master_conn.in_transaction:
             master_conn.rollback()
-            existing = _find_existing_batch(master_conn, order_id, line_keys)
-            if existing is not None:
-                return _ship_result(
-                    master_conn,
-                    order_id,
-                    delivery_id=existing,
-                    op_no=op_no,
-                    warehouse_code=operator_dc_code,
-                    selected_ids=selected_ids,
-                    idempotent=True,
-                )
-            raise
-        transitioned = _finalise_order_state(
-            master_conn, order_id, shipped_by, tracking_note, selected, ts
-        )
+        raise
+    selected_ids = list(normalized)
+    line_keys = {oid: _line_op_no(op_no, oid) for oid in selected_ids}
+    ts = now()
+    item_ids = _apply_warehouse_shipment(master_conn, wh_conn_factory,
+        operator_dc_code, order, selected, line_keys, shipment_action_for(order), ts)
+    try:
+        master_conn.execute('BEGIN IMMEDIATE')
+        claim = ocp.get_claim(master_conn, op_no, payload)
+        if claim['state'] == 'committed':
+            master_conn.commit()
+            return _ship_result(master_conn, order_id, delivery_id=claim['delivery_id'],
+                op_no=op_no, warehouse_code=operator_dc_code, selected_ids=selected_ids, idempotent=True)
+        current = get_order_detail(master_conn, order_id)
+        if current['status'] != ORDER_STATUS_APPROVED:
+            raise ValueError('订单不再是approved，保留发货占用待恢复')
+        ocp.assert_active_claim(master_conn, op_no, order_id=order_id,
+                                source=operator_dc_code, selected=selected)
+        # REV is permanent: a fenced/reversed request can never resurrect a delivery.
+        wh = wh_conn_factory(operator_dc_code)
+        try:
+            if any(wh.execute('SELECT 1 FROM stock_movements WHERE op_no=?',
+                              ('REV:' + key,)).fetchone() for key in line_keys.values()):
+                raise ValueError('发货请求已冲销，不可补写配送')
+        finally:
+            wh.close()
+        delivery_id = _insert_master_batch(master_conn, order_id, operator_dc_code,
+            selected, line_keys, item_ids, op_no, shipped_by, tracking_note, ts)
+        transitioned = _finalise_order_state(master_conn, order_id, shipped_by, tracking_note, selected, ts)
+        moved = master_conn.execute("UPDATE store_order_ship_claims SET state='committed',delivery_id=?,completed_at=? WHERE op_no=? AND state='active'",
+                                    (delivery_id, ts, op_no))
+        if moved.rowcount != 1:
+            raise ValueError('发货已被恢复隔离')
         master_conn.commit()
     except Exception:
         if master_conn.in_transaction:
             master_conn.rollback()
         raise
-
-    return _ship_result(
-        master_conn,
-        order_id,
-        delivery_id=delivery_id,
-        op_no=op_no,
-        warehouse_code=operator_dc_code,
-        selected_ids=selected_ids,
-        transitioned_to_shipped=transitioned,
-    )
+    return _ship_result(master_conn, order_id, delivery_id=delivery_id,
+        op_no=op_no, warehouse_code=operator_dc_code, selected_ids=selected_ids,
+        transitioned_to_shipped=transitioned)
 
 
 REVERSAL_OP_NO_PREFIX: str = "REV:"
@@ -2528,6 +2519,8 @@ def reconcile_orphan_shipments(
         (WAREHOUSE_TYPE_DC,),
     ).fetchall()
     reconciled: list[dict[str, Any]] = []
+    for row in master_conn.execute("SELECT op_no FROM store_order_ship_claims WHERE state IN ('active','recovering') ORDER BY op_no").fetchall():
+        reconciled.extend(ocp.recover_shipment(master_conn, wh_conn_factory, row['op_no']))
     for warehouse in warehouses:
         code = warehouse["code"]
         wh_conn = wh_conn_factory(code)
@@ -2548,6 +2541,8 @@ def reconcile_orphan_shipments(
             for row in rows:
                 op_no = str(row["op_no"])
                 if op_no.startswith(REVERSAL_OP_NO_PREFIX):
+                    continue
+                if ocp.get_claim(master_conn, op_no.rsplit(':', 1)[0]) is not None:
                     continue
                 delivered = master_conn.execute(
                     "SELECT 1 FROM store_order_delivery_items WHERE op_no=? LIMIT 1",
@@ -2695,6 +2690,8 @@ def _ship_order_full_impl(
     for item in order["order_items"]:
         source = _line_source_warehouse(order, item)
         if operator_dc_code is not None and source != operator_dc_code:
+            continue
+        if int(item['id']) in ocp.blocked_lines(master_conn, order_id):
             continue
         already = parse_qty(item.get("shipped_quantity") or 0)
         remaining = parse_qty(item["quantity"]) - already
@@ -3563,6 +3560,7 @@ def cancel_order(
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
         _assert_transition(order["status"], ORDER_STATUS_CANCELLED)
+        ocp.assert_unoccupied(master_conn, order_id)
         # 已有收货记录则拒绝取消：货已实际入库，作废订单会造成账实不符。
         # （2026-10-10：approved 状态开放「部分发货即可收货」后新增的防护路径；
         #  此前 approved 不可收货，故不存在该状态。）
