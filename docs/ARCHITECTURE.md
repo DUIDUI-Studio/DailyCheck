@@ -2615,6 +2615,11 @@ flowchart LR
 
 ## 12. 测试架构
 
+Issue #146 的 `tests/test_shipping_ownership.py` 用 DC staff 会话、强制开启的 CSRF
+及详情页生成的新 `op_no` 驱动发货 HTTP 入口，覆盖新请求、原样重放、同单零数量行、
+外单零/正/空数量行及同单他仓行；拒绝前后比较两订单、配送头/行、状态历史和各仓
+库存/流水，另以领域完整 map 调用对照外单零 ID。显式空批次不得回落全发。
+
 Issue #140 的 `tests/test_wms_dashboard.py` 覆盖真实 Cookie/DC/viewer 权限、导航双载体、
 多货主分页、详情/原筛选返回、ID/范围攻击、故障与部分结果丢弃、空/截断、转义和只读方法。
 `test_wms_web_service.py` 用真实已核验 schema 的合成 SQLite 数据与 SQL 方言适配执行查询，
