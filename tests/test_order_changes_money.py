@@ -125,3 +125,16 @@ def test_unapplied_receipt_cannot_complete_even_after_effective_reduction(ship_e
     assert sop.refresh_effective_order_state(e['master'], order, 4) == 'shipped'
     assert sop._finalise_receipt_state(e['master'], order, 1, None, '2026-11-03') is False
     e['master'].rollback()
+
+
+@pytest.mark.parametrize('multi', [True, False])
+def test_submit_cannot_freeze_price_under_a_forged_unit(money_env, monkeypatch, multi):
+    import config
+    env = money_env
+    monkeypatch.setattr(config, 'MULTI_WAREHOUSE_FULFILLMENT', multi)
+    with closing(builder.connect(env['master_path'])) as master:
+        cart = sop.get_or_create_cart(master, 1, 'store_one', None if multi else 'dc_alpha')
+        sop.add_cart_item(master, cart['id'], 201, 3, '箱')
+        with pytest.raises(ValueError, match='基础单位不一致'):
+            sop.submit_order(master, cart['id'], 1, None, None)
+        assert master.execute('SELECT count(*) FROM store_orders').fetchone()[0] == 0

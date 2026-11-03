@@ -1379,6 +1379,8 @@ def _resolve_routed_cart_lines(
             resolved = resolve_fulfillment_item(
                 master_conn, wh_conn, canonical_id=canonical_id, warehouse_code=dc_code,
             )
+            if ci.get('cart_unit') and ci['cart_unit'] != resolved['unit']:
+                raise ValueError('下单单位与履约基础单位不一致')
             row = wh_conn.execute("SELECT * FROM items WHERE id=?", (resolved["item_id"],)).fetchone()
             unit_price, _ = parse_price_and_multiple(row)
             snapshot = ocp.snapshot_product(master_conn, wh_conn, canonical_id, resolved['item_id'])

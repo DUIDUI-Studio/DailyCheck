@@ -245,3 +245,63 @@ def test_unclaimed_legacy_movement_and_reversal_cannot_be_adopted(ship_env):
         _ship(e, order, 'A', 'old-request', {ids[0]: 3})
     assert changes.get_claim(e['master'], 'old-request') is None
     assert e['stock']('A', 101) == 10
+
+
+def test_effective_quantity_update_cannot_cross_active_claim(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    worker, release, result = start_ship(e, order, ids[0], 'before_warehouse')
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match='occupied'):
+            e['master'].execute('UPDATE store_order_items SET quantity=2,line_revision=line_revision+1 WHERE id=?', (ids[0],))
+        e['master'].rollback()
+        release.set()
+        worker.join(15)
+        assert worker.exitcode == 0 and result.get(timeout=2) == 'committed'
+        assert e['master'].execute('SELECT quantity FROM store_order_items WHERE id=?', (ids[0],)).fetchone()[0] == 4
+        assert e['stock']('A', 101) == 8
+    finally:
+        e['master'].rollback()
+        release.set()
+        worker.join(15)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join()
+
+
+def test_rev_tombstone_checked_before_warehouse_deduction(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    worker, release, result = start_ship(e, order, ids[0], 'before_warehouse')
+    try:
+        with sop.open_warehouse_db('A') as wh:
+            item_id = wh.execute('SELECT id FROM items WHERE canonical_id=101').fetchone()[0]
+            wh.execute("INSERT INTO stock_movements(item_id,action,delta,note,created_at,op_no) VALUES(?,'门店订货出库',2,'permanent reversal','now',?)", (item_id, f'REV:process-request:{ids[0]}'))
+        release.set()
+        worker.join(15)
+        assert worker.exitcode == 0
+        message = result.get(timeout=2)
+        assert e['stock']('A', 101) == 10
+        assert 'REV' in message
+        assert changes.get_claim(e['master'], 'process-request')['state'] == 'aborted'
+    finally:
+        release.set()
+        worker.join(15)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join()
+
+
+def test_ship_permission_reloaded_after_binding_resolution(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+
+    def factory(code):
+        with sqlite3.connect(e['master_path']) as other:
+            other.execute("UPDATE warehouse_users SET role='viewer' WHERE user_id=2")
+        return sop.open_warehouse_db(code)
+    with pytest.raises(ValueError, match='无本仓发货权限'):
+        sop.ship_partial(e['master'], factory, order_id=order, operator_dc_code='A',
+                         op_no='revoked-ship', line_qty={ids[0]: 2}, shipped_by=2)
+    assert changes.get_claim(e['master'], 'revoked-ship') is None
+    assert e['stock']('A', 101) == 10
