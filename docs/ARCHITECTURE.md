@@ -1705,7 +1705,14 @@ sequenceDiagram
    `fulfilled + order_item_receivable_qty()`，即**受已发数封顶**（旧 v2 数据
    status=shipped 且 shipped=0 时回落订货量）。审批中（approved）也可按行收货。
 2. **仓库库** `BEGIN IMMEDIATE` → 按派生键跳过已存在流水；缺 items 行时按 canonical
-   自动建行 → 原子加库存 + 写 `stock_movements(op_no)` → COMMIT。
+   自动建行（Issue #130：`selling_price` / `unit_cost` 取自该行来源仓
+   `COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)` 经
+   `resolve_fulfillment_item()` 解析出的**唯一 active 非 alias 绑定行**，不按
+   `canonical_id` 任意匹配；绑定无法解析时记 0/0 并输出 WARN
+   `[receiving] source binding unresolved canonical_id=<id> warehouse=<code> error=<class>`；
+   源价为 0 时保持 0 并输出 WARN
+   `[receiving] auto-created item without price canonical_id=<id>`，均不阻塞收货）→
+   原子加库存 + 写 `stock_movements(op_no)` → COMMIT。已存在的绑定行不重新定价。
 3. **master** `BEGIN IMMEDIATE` → `applied=1` + 回写 `store_item_id` → 锁内重读全部行，
    全行收齐时 `UPDATE store_orders SET status='delivered' … WHERE id=? AND
    status='shipped'`；`changes()==1` 才写 SHIPPED→DELIVERED 历史并置收货时间。
@@ -2141,6 +2148,19 @@ warehouse/local_item/status=approved 过滤与最新ID语义，避免依赖SQLit
 
 ### 10.3 Store Ordering 状态机
 
+**收货自动建行复制来源仓价格（Issue #130，2026-11-02）**：`receive_partial` /
+`reconcile_orphan_receipts` 在目标仓没有 canonical 绑定时创建 `AUTO-RECEIVE-<id>`
+行，必须把该行来源仓（`COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)`）
+经 `resolve_fulfillment_item()` 解析出的唯一 active 非 alias 绑定行的
+`selling_price` / `unit_cost` 一并写入，禁止沿用列默认 0，否则新行会以
+¥0 参与门店订单计价。绑定缺失、歧义、单位不符或存在阻断冲突时不阻塞收货：
+记 0/0 并输出 WARN
+`[receiving] source binding unresolved canonical_id=<id> warehouse=<code> error=<class>`。
+来源价/成本为 0 时保持 0、不阻塞收货，并由
+`blueprints.store_ordering_pure` 输出 WARN
+`[receiving] auto-created item without price canonical_id=<id>`。已有绑定行只加库存，
+不重新定价。
+
 **订单详情来源库存（Issue #109，2026-10-31）**：订单板自身没有库存列；
 `/store-ordering/orders/<id>` 才显示履约仓库存并为门店/DC/平台视角提供单价。
 `get_dc_items_for_order_detail()` 按行取 `COALESCE(source_warehouse_code, 头仓)`，
@@ -2529,6 +2549,11 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
+`selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时
+仍取 active 非 alias 行、源价与成本同为 0 时保持 0 且输出 WARN、已有绑定行
+价格不被收货改写；临时变异把 INSERT 的售价/成本改回 0 后两条新用例必红。
 
 Issue #107 在 `tests/test_dc_transfer.py` 使用真实临时 master、发送 DC、接收 DC、门店及
 无关/跨租户仓库，覆盖候选/创建一致性、双向列表隔离、接收详情、角色/权限/仓库归属、
