@@ -53,6 +53,9 @@
 
 ## 2. 系统拓扑（容器视角）
 
+Issue #136 的外仓页由 Flask 直接调用同一 WMS SELECT 服务连接外部 SQL Server；
+不依赖 MCP HTTP 进程在线，也不通过本地 SQLite 镜像外仓库存。
+
 ```mermaid
 flowchart TB
     subgraph Browser["浏览器 / PWA"]
@@ -98,6 +101,10 @@ flowchart TB
 ---
 
 ## 3. 部署拓扑
+
+外仓 Web 上线需在 Flask 运行环境具备 WMS 环境变量、`pymssql` 驱动与来源
+网络白名单；不引入 schema 迁移或新守护进程。真实外仓连接仅由部署环境验证，
+本地/CI 使用桩数据；凭据缺失只使该页显示明确未配置状态。
 
 ### 3.1 Dev 环境
 
@@ -1432,6 +1439,10 @@ master_connection不迁移warehouse。软链共享真实路径锁，绿副本独
 
 ## 5. 应用层模块图
 
+**外仓 Web 查询（Issue #136）**：`app.py` 注册 `blueprints/wms.py`，配送中心的
+「库存管理 → 外仓信息」在桌面侧栏与移动「更多」页同步出现。`templates/wms.html`
+提供仓库选择、库存明细及入/出库单据；仅 GET 查询，无同步、配置或库存写入入口。
+
 **Bot PR2 复用接线**：`bot.agent` → `bot.mcp_tools` → 22 个批准 MCP handler/service；`bot.tools` 保留旧查询接口。采购计算新增显式配置/只读参数供无缓存只读调用，canonical bindings 新增只读收集模式；没有新增蓝图、路由、表或预测算法。
 
 ```mermaid
@@ -1514,6 +1525,10 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 
 ## 6. 蓝图依赖关系
 
+`wms.py` Web 蓝图直接复用 `mcp_server.service.wms` 的 SELECT 服务，不经过 MCP
+票据或 Bot；不会引入本地库存写路径。服务新增 keyword-only `warehouse` 参数，
+既有 MCP 位置参数、输出与工具声明保持不变。
+
 **Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
 
 ```mermaid
@@ -1581,6 +1596,10 @@ request物理删除只撤销库存/流水，不删除永久journal，避免后�
 ## 7. 请求生命周期
 
 ### 7.1 Web（Cookie 会话）
+
+外仓页沿用会话与选仓初始化，再经 DC 守卫、筛选校验、货主范围外仓列表与
+SELECT 查询进入 Jinja 渲染。Web 只提交 GET，响应标记 no-store；上游失败
+只回固定安全状态，不让半次结果被误认为完整库存。
 
 ```mermaid
 sequenceDiagram
@@ -1730,6 +1749,11 @@ receipt 补库并回填，已存在流水则只标记 applied。收货表单隐�
 ---
 
 ## 8. 鉴权架构
+
+外仓 Web 使用 `@require_login` + `@distribution_center_only`，并登记
+`permissions_manifest.ROUTE_MATRIX`。DC viewer 可读，普通门店/R&D 返回 403；
+平台管理员保留既有仓库类型绕过。外部仓库筛选仍限定服务端配置的同一货主，
+不接收调用方 customer/owner，不改变 MCP 路径 ACL 或 Bot 批准池。
 
 ### 8.1 三种身份
 
@@ -2019,6 +2043,13 @@ SQLite，而是租仓方 WMS（SQL Server）中**本货主**的数据。边界�
   `/api/v1/wms/*` 路径 ACL 与 `agent_tokens` 票据。
 - **CI 不连上游**：上游是第三方生产库，契约测试用桩数据跑 dispatch/serialization，
   真实连通性只在部署环境验证。
+
+**Web 复用边界（Issue #136）**：仓库名筛选通过 SQL 参数绑定，在 WHERE 中先于
+TOP 截断生效；`list_warehouses()` 使用本货主库存及入/出库历史 EXISTS 条件，
+保留已无库存但有单据的仓库。页面概览仅展示各仓 SKU 数，不累加跨仓 SKU，
+不展示服务旧汇总中的混合单位总量；编码筛选只影响明细，页面明确标注范围。
+未配置、缺驱动、连接或查询失败均转为固定安全提示（页面 200），不显示半次结果、
+SQL、主机或异常详情；无效筛选 400。成功空结果与达到条数上限分别提示。
 
 ### 9.3 双传输模式
 
@@ -2468,6 +2499,11 @@ canonical 时，非来源仓用自己的出库史算水位、不承接门店需�
 
 ## 11. PWA / 移动端
 
+外仓页使用限定 `.wms-*` 的 `static/wms.css`，复用主题与裸表格的全局
+`.table-scroll` 包装；窄屏筛选单列，平板双列，桌面横排。`base.html` 新增
+`extra_css` 槽，资源查询版本与 SW cache 名同步更新。外仓页响应均为
+`Cache-Control: no-store`，且不加入 APP_SHELL；既有 SW 仅缓存静态资源的边界不变。
+
 ```mermaid
 flowchart LR
     subgraph Client["浏览器 / 手机"]
@@ -2561,6 +2597,11 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #136 的 `tests/test_wms_dashboard.py` 覆盖 Cookie/仓库类型与 viewer 权限、
+导航双载体、筛选保持、SQL 参数绑定与固定货主、历史仓选项、无写方法、
+故障安全/部分结果丢弃、空/截断状态、转义与不混合汇总。复用 `test_mcp_wms.py`
+与 MCP 契约门禁验证旧调用；所有上游查询桩化，CI 禁止连接第三方生产库。
 
 Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
 `selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时
@@ -2991,7 +3032,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:80,100` / `blueprints/procurement.py:185` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:91` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 的 4 个调用点 / 3 个代码站点（`replay_item_layers`、`compute_stocktake_quality`、`compute_fulfillment`）；行号按 2026-10-15 `52516a8` 校准，改动这些模块时按符号名而非行号定位。后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | 事故已止血；**根治已交付待 merge**（Issue #41 → PR #42） | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。**处置**：生产侧已 `switch.sh blue 100` 止血（运行态 blue 100 / green down）；**根治**= §3.4 铁律新增的 `switch.sh` DRY_RUN 守卫（承接流量且 `DRY_RUN=true` → 拒跑 exit 3），已随 Issue #41 修复交付（PR #42）。⚠️ **下一次切流量前必须先按 `scripts/blue_green/README.md`「绿转正」关闭绿的写隔离**，否则会被守卫拒跑（预期行为） |
 | MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27；参与仓口径更新 2026-10-29） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的门店仓或**任一参与仓**（明细行来源仓，历史 NULL 回落头仓）命中才可见；命中任一参与仓即可读**全单**（含他仓行/金额/收货历史）。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
-| **外部 WMS 只读工具需另配上游凭据与读路径** | 中 | 新增（2026-11-02） | `wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 要生效需两件事：① 注入 `DAILYCHECK_WMS_HOST` / `PORT` / `USER` / `PASSWORD` / `DATABASE` / `CUSTOMER_ID`；② token 的 `allowed_read_paths` 覆盖 `/api/v1/wms`（或 `*`）。缺①返回 `wms_not_configured`，缺②返回 `forbidden_path`，两者都不影响其余工具。上游是第三方生产库且带来源白名单，CI 只跑桩化用例，真实连通性须在部署环境单独确认 |
+| **外部 WMS 只读工具需另配上游凭据与读路径** | 中 | 新增（2026-11-02） | `wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 要生效需两件事：① 注入 `DAILYCHECK_WMS_HOST` / `PORT` / `USER` / `PASSWORD` / `DATABASE` / `CUSTOMER_ID`；② token 的 `allowed_read_paths` 覆盖 `/api/v1/wms`（或 `*`）。缺①返回 `wms_not_configured`，缺②返回 `forbidden_path`，两者都不影响其余工具。上游是第三方生产库且带来源白名单，CI 只跑桩化用例，真实连通性须在部署环境单独确认；Issue #136 Web 页同样需要 Flask 进程的环境配置、可选驱动与网络白名单，使用 Cookie 权限而非 MCP token |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |
