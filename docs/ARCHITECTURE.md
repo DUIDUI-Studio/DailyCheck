@@ -2684,6 +2684,9 @@ Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时
 扣库后 fence 交错、冲销后主库未回写、同键并发重放、Decimal 半分及原能力回归。
 并发/撤权探针先核对实际库存、配送和 claim 状态，再核对异常类型；权限变更只在
 绑定解析的第一次调用发生，不能让错误文案或非预期锁异常冒充安全不变量证据。
+请求身份回归用真实 loopback HTTP/CSRF 和 Event 控制初读缺失、仓库已提交及
+master 锁前窗口，断言同键结果、库存/流水/配送和完整 hash；另覆盖绑定变化、
+后续批次与 full/explicit/scalar 六方向模式互换，先提交失败复现再修复裁决顺序。
 
 HTTP 用例开启真实 CSRF，覆盖 AJAX/PRG、撤权后拒绝和通知 enqueue 后故障回滚。
 scripts/dev_smoke_order_changes.py 必须显式指定空的 /tmp/dailycheck-order-change-*

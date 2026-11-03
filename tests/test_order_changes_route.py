@@ -1,6 +1,13 @@
 """Real Flask HTTP adapters, temp SQLite and the existing permission model."""
 import hashlib
+import http.cookiejar
+import json
 import re
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
 
 import pytest
 
@@ -11,6 +18,183 @@ from tests import test_ship_op_protocol as protocol
 from tests.test_order_changes_claims import seed_proposal
 
 ship_env = protocol.ship_env
+
+
+@contextmanager
+def identity_http(e, order_id):
+    """Real loopback HTTP, signed DC session and a freshly rendered CSRF token."""
+    from werkzeug.serving import make_server
+
+    app = e['client'].application
+    app.config['WTF_CSRF_FORCE_ENABLED'] = True
+    cookie = app.session_interface.get_signing_serializer(app).dumps(
+        {'user_id': 2, 'warehouse_id': 1})
+    server = make_server('127.0.0.1', 0, app, threaded=True)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f'http://127.0.0.1:{server.server_port}/store-ordering/orders/{order_id}'
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    try:
+        with opener.open(urllib.request.Request(url, headers={'Cookie': 'session=' + cookie})) as response:
+            csrf = re.search('name="csrf_token" value="([^"]+)"', response.read().decode()).group(1)
+        session = '; '.join(c.name + '=' + c.value for c in jar)
+
+        def post(data):
+            request = urllib.request.Request(url + '/ship',
+                data=urllib.parse.urlencode({**data, 'csrf_token': csrf}).encode(),
+                headers={'Cookie': session, 'X-Requested-With': 'fetch'})
+            try:
+                response = urllib.request.urlopen(request, timeout=20)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                return response.status, json.loads(response.read())
+
+        yield post
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(5)
+        assert not worker.is_alive()
+
+
+def identity_form(mode, item_id, quantity=3, key='identity-request'):
+    data = {'op_no': key}
+    if mode == 'qty':
+        data['qty'] = str(quantity)
+    elif mode == 'explicit':
+        data[f'shipped_items[{item_id}]'] = str(quantity)
+    return data
+
+
+@pytest.mark.parametrize('mode', ['qty', 'explicit', 'full'])
+@pytest.mark.parametrize('phase', ['initial', 'warehouse', 'pre-lock'])
+def test_original_identity_survives_concurrent_first_request(ship_env, monkeypatch, mode, phase):
+    _identity_window(ship_env, monkeypatch, mode, phase)
+
+
+@pytest.mark.parametrize('mode,phase', [('full', 'early-full'),
+    ('explicit', 'binding'), ('explicit', 'later-batch')])
+def test_replay_ignores_mutable_preparation(ship_env, monkeypatch, mode, phase):
+    _identity_window(ship_env, monkeypatch, mode, phase)
+
+
+def _identity_window(e, monkeypatch, mode, phase):
+    order, ids = e['create_order']([(101, 4, 'A')])
+    reached, release = threading.Event(), threading.Event()
+    wh_reached, wh_release = threading.Event(), threading.Event()
+    armed, guard, responses, failures = [True], threading.Lock(), {}, []
+    original_get, original_begin = changes.get_claim, sop._begin_immediate
+    original_apply, original_binding = sop._apply_warehouse_shipment, sop.resolve_fulfillment_item
+
+    def pause():
+        with guard:
+            first = armed[0]
+            armed[0] = False
+        if first:
+            reached.set()
+            assert release.wait(15), 'identity barrier timeout'
+
+    def get(*args, **kwargs):
+        result = original_get(*args, **kwargs)
+        if result is None and phase not in ('pre-lock', 'binding'):
+            pause()
+        return result
+
+    def begin(*args):
+        if phase == 'pre-lock':
+            pause()
+        return original_begin(*args)
+
+    def binding(*args, **kwargs):
+        if phase == 'binding':
+            pause()
+        return original_binding(*args, **kwargs)
+
+    def apply(*args, **kwargs):
+        result = original_apply(*args, **kwargs)
+        if phase in ('warehouse', 'early-full'):
+            wh_reached.set()
+            assert wh_release.wait(15), 'warehouse barrier timeout'
+        return result
+
+    monkeypatch.setattr(changes, 'get_claim', get)
+    monkeypatch.setattr(sop, '_begin_immediate', begin)
+    monkeypatch.setattr(sop, 'resolve_fulfillment_item', binding)
+    monkeypatch.setattr(sop, '_apply_warehouse_shipment', apply)
+    with identity_http(e, order) as post:
+        data = identity_form(mode, ids[0])
+
+        def request(name):
+            try:
+                responses[name] = post(data)
+            except Exception as exc:
+                failures.append(repr(exc))
+
+        delayed = threading.Thread(target=request, args=('delayed',))
+        winner = None
+        try:
+            delayed.start()
+            assert reached.wait(15)
+            assert original_get(e['master'], data['op_no']) is None
+            if phase in ('warehouse', 'early-full'):
+                winner = threading.Thread(target=request, args=('winner',))
+                winner.start()
+                assert wh_reached.wait(15)
+                assert original_get(e['master'], data['op_no'])['state'] == 'active'
+                release.set()
+                delayed.join(15)
+                wh_release.set()
+                winner.join(15)
+            else:
+                request('winner')
+                if phase == 'binding':
+                    with sop.open_warehouse_db('A') as wh:
+                        wh.execute("UPDATE items SET unit='箱' WHERE canonical_id=101")
+                if phase == 'later-batch':
+                    responses['later'] = post(identity_form('explicit', ids[0], 1, 'later-request'))
+                release.set()
+                delayed.join(15)
+            assert not delayed.is_alive() and (winner is None or not winner.is_alive())
+            claim = original_get(e['master'], data['op_no'])
+            with sop.open_warehouse_db('A') as wh:
+                movements = wh.execute('SELECT count(*) FROM stock_movements WHERE op_no LIKE ?',
+                    (data['op_no'] + ':%',)).fetchone()[0]
+            observed = {'mode': mode, 'phase': phase, 'responses': responses,
+                'stock': e['stock']('A', 101), 'movements': movements,
+                'deliveries': e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0],
+                'claim': claim, 'failures': failures}
+            print(json.dumps(observed, ensure_ascii=False))
+            assert not failures
+            assert observed['stock'] == (6 if mode == 'full' or phase == 'later-batch' else 7)
+            assert observed['deliveries'] == (2 if phase == 'later-batch' else 1)
+            assert movements == 1 and claim['state'] == 'committed'
+            assert claim['payload_hash'] == changes.payload_hash(json.loads(claim['payload_json']))
+            assert all(status == 200 and body['ok'] for status, body in responses.values()), responses
+        finally:
+            release.set()
+            wh_release.set()
+            delayed.join(20)
+            if winner is not None:
+                winner.join(20)
+
+
+@pytest.mark.parametrize('first,retry', [(a, b) for a in ('qty', 'explicit', 'full')
+    for b in ('qty', 'explicit', 'full') if a != b])
+def test_original_modes_cannot_exchange_identical_frozen_batch(ship_env, first, retry):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    with identity_http(e, order) as post:
+        assert post(identity_form(first, ids[0], 4))[0] == 200
+        before = changes.get_claim(e['master'], 'identity-request')
+        notifications = e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0]
+        status, body = post(identity_form(retry, ids[0], 4))
+        assert e['stock']('A', 101) == 6
+        assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 1
+        assert changes.get_claim(e['master'], 'identity-request') == before
+        assert e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0] == notifications
+        assert status == 409 and not body['ok']
 
 
 def login(e, user=4, warehouse=1):
