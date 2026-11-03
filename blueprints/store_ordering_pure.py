@@ -2482,8 +2482,7 @@ def ship_partial(
     elif legacy_quantity is not None:
         raise ValueError('原始数量与请求模式不符')
     if mode == 'explicit':
-        raw = ocp.ship_payload(order_id, operator_dc_code or '', line_qty)
-        line_qty = {int(oid): float(qty) for oid, qty in raw['lines']}
+        ocp.ship_payload(order_id, operator_dc_code or '', line_qty)
     master_conn.row_factory = sqlite3.Row
     prepared, prepared_source, frozen, preparation_error, legacy_warehouse = [], None, {}, None, False
     # A missing optimistic read is only a hint. Capture every mutable preparation

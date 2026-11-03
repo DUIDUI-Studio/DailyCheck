@@ -2360,6 +2360,8 @@ committed 直接返回原配送，不依赖最新 remaining/blocked/绑定；act
 `in_transaction` 当作已取得写入序列化能力。执行/恢复的锁顺序及 finalize 的 REV 检查保留。
 旧无 mode 且有 legacy_quantity 的 scalar 只在原量可证及原完整 JSON/hash 严格匹配时重放；
 无 mode 且无 scalar 的歧义键失败关闭待核对，不猜 explicit/full，不回写历史 hash。
+explicit 的原始 map 同时保留给新批次的成员校验；hash 虽仅含正数量行，外来行 ID
+即使数量为零仍沿用原能力明确拒绝，不能先滤除零项而绕过此校验。
 
 部署前所有 Web 写实例必须具备此协议且旧执行者排空；提议入口持续关闭，
 兼容回退不可删除 active/recovering claim。
