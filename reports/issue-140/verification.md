@@ -2,7 +2,7 @@
 
 ## 结论
 
-实现和本地验证完成，等待独立评审与 PR/CI 后续；生产交付尚未完成。业务源固定在 `1f995e2f0c6b962e27551c309e752ce8149ad9df`，之后只添加标准报告。最终 PR URL/head/CI 以 Orca settlement 及阶段回帖为准。
+实现和本地验证完成，草稿 PR #141 已开（http://hub01:3000/eric/dailycheck/pulls/141），等待独立评审与 CI 后续；生产交付尚未完成。业务源固定在 `1f995e2f0c6b962e27551c309e752ce8149ad9df`，之后只添加标准报告。最终 PR URL/head/CI 以 Orca settlement 及阶段回帖为准。
 
 ## 证据
 
@@ -32,7 +32,8 @@
 - [x] 桌面/手机真实浏览器证据明确合成数据；schema 与 SELECT 有独立真实证据。
 - [x] Ruff 0.16.10/0.17.3、契约、权限、架构、红线门禁及四项变异。
 - [x] origin/main 起分支且 merge origin/main（最新 ccc0a76，Already up to date）。
-- [ ] Fresh Reviewer 最终结论及 PR/CI 状态由 Coordinator 跟进。
+- [x] 普通显式 push，创建 Closes #140 的草稿 PR #141；本地四报告门禁通过，阶段回帖见 Issue。
+- [ ] Fresh Reviewer 最终结论及 CI 状态由 Coordinator 跟进。
 - [ ] Prod 独立生产审查、候选部署、至少 30 分钟观察窗、merge、Issue 关闭和部署成功终态。
 
 ## 限制与责任
