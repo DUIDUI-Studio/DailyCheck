@@ -78,3 +78,7 @@ Browser QA used Orca embedded browser against a temporary Flask harness with syn
 ## Full-suite navigation regression and repair
 
 The first complete post-change suite found 19 failures: 14 baseline plus five native navigation-contract failures because an unconfigured WMS list now returned 503. Preserve the established list-page 200 error rendering (with explicit safe error code and no result/empty-success content); details retain 502/503. The nav contract is legitimate during optional upstream outages, so this is an implementation fix, not a test or known-failures relaxation. That failing complete run is preserved as navigation-regression-pytest.txt/native exit 1. A new complete final suite follows the repair.
+
+## Evidence archive
+
+After verification, raw stdout/XML, mutation and local preview scripts, HTML, screenshots and browser JSON are moved without renaming into `/Users/ericmr/.cache/dailycheck-coordination/run_0cbbf33a0d93/writer-evidence-task_c1ad7027772a/`. Earlier commands above show their original generation paths; the archive preserves original output, including the interrupted attempt and the rejected navigation-regression run. Only design and standard reports are committed. Current complete final output is checked before archival and is the only output accepted for final counts/known-failures comparison. The code candidate remains frozen for independent review; report-only descendants do not change application source.
