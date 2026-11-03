@@ -116,6 +116,9 @@ def index():
         status = 400
     except McpError as exc:
         error_code, error, status = _safe_error(exc)
+        # The dashboard remains a reachable navigation page during upstream outages.
+        if status >= 500:
+            status = 200
 
     return make_response(render_template(
         "wms.html", title="外仓信息", filters=filters, warehouses=warehouses, owners=owners,

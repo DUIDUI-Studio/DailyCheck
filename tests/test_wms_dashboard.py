@@ -134,7 +134,7 @@ def test_failure_is_distinct_safe_and_uncached(nav_client_factory, web_sql, monk
     client, _ = nav_client_factory("distribution_center")
     response = client.get(path)
     html = response.get_data(as_text=True)
-    assert response.status_code in (502, 503)
+    assert response.status_code == (200 if path == "/wms" else 502 if code == "wms_query_failed" else 503)
     assert code in html and response.headers["Cache-Control"] == "no-store"
     assert "SELECT password" not in html and "secret-host" not in html
     assert "暂无库存" not in html and "单据无明细行" not in html
@@ -150,7 +150,7 @@ def test_partial_failure_hides_header_and_inventory(nav_client_factory, web_sql,
     client, _ = nav_client_factory("distribution_center")
     for path in ("/wms", "/wms/documents/in/7"):
         response = client.get(path)
-        assert response.status_code == 502
+        assert response.status_code == (200 if path == "/wms" else 502)
         html = response.get_data(as_text=True)
         for private in ("private raw error", "SAME-DISPLAY-NUMBER", "匹配在库品项", "本次显示"):
             assert private not in html
