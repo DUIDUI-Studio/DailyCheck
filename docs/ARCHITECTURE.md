@@ -1094,28 +1094,23 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 ---
 
-### 3.15 Orca 角色模型 fallback（2026-10-26 起）
+### 3.15 Orca 角色模型路由（2026-11-03 项目表作废）
 
-**问题**：DailyCheck 的 Orca 角色原先每个角色只绑定一个模型。模型 API 的认证、配额、端点或代理热切换出现基础设施故障时，Coordinator 只能停住整条波次；如果临时人工换模型，又没有项目内的顺序、停止条件和审计口径。
+**现状**：DailyCheck 不再维护项目级模型路由表。模型、effort、quota pool 和
+fallback 由用户全局策略 `~/.agents/skills/orca-model-routing/` 决定；本项目
+采纳记录见 [`agent-framework/orca-overlay.md`](agent-framework/orca-overlay.md) §5。
 
-**单一事实来源**：
+**历史资产与 fail-closed**：
 
-- 人读规则：[`agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md)
-- 机器配置：[`agent-framework/orca-model-routing.json`](agent-framework/orca-model-routing.json)
-- 校验/分类/命令生成：[`../scripts/agent_framework/model_routing.py`](../scripts/agent_framework/model_routing.py)
-
-**路由结构**：每个可调用 LLM 的角色声明一个主模型和有序 `fallbacks`；Release 不调用 LLM。CC Switch 聚合模式负责 provider 层热切换，项目路由只处理 Orca 角色的显式模型切换。
-
-**安全边界**：
-
-| 条件 | 动作 |
+| 资产 | 状态 |
 |---|---|
-| 认证失败、429、配额、超时、连接失败、5xx、provider unavailable | 可切换下一模型 |
-| `launch.effective` 与声明的目标模型不一致 | 可切换下一模型 |
-| Reviewer BLOCKER、CI/测试失败、输出质量不达标 | **不切换**，按原失败处理 |
-| `outcome_unknown`、残留 writer/terminal、失败阶段未知 | **不自动切换**，先结算和取证 |
+| `agent-framework/orca-model-routing.json` | `deprecated: true`，仅供审计，不参与派活 |
+| `scripts/agent_framework/model_routing.py` | 读取到 deprecated 文档时退出码 2，不生成 `worker-start` 命令 |
+| `tests/test_orca_model_routing.py` | 通用解析/校验用例保留；真实文件用例断言 deprecation |
 
-切换必须复用同一 Task，并记录失败 Dispatch：Coordinator 先运行 `model_routing.py classify`，只有 `fallback_allowed=true` 才运行 `model_routing.py next` 生成带 `--retry-of` 的命令。直接调用 `orca orchestration worker-start` 会绕过该项目级机制；同一 worktree 仍遵守单写者铁律。
+**安全边界**：基础设施失败可切换、语义失败不切换等规则由全局策略定义；
+项目侧不再维护独立 fallback 顺序。模型选择以全局 `routing.json` 为准；同一
+worktree 仍遵守单写者铁律。
 
 ---
 
@@ -2688,7 +2683,7 @@ flowchart TB
         Redline["test_redline_gate.py<br/>红线机验：路径命中 / known_failures 净增 /<br/>自述需拍板但无授权<br/>19 用例（Issue #24）"]
         PrHygiene["test_pr_hygiene.py<br/>开工规范：分支前缀白名单 / issue 号与<br/>Closes·Part-Of 一致 / 无号须声明 No-Issue<br/>32 用例（Issue #26）"]
         CIHandoff["test_ci_artifact_handoff.py (9)<br/>+ test_ci_pytest_summary.py (6)<br/>artifact v4 零引用 / base64 job output /<br/>摘要保留 FAILED·ERROR·collection·末 5 行<br/>（Issue #59）"]
-        ModelRouting["test_orca_model_routing.py<br/>主模型/fallback 顺序 / 基础设施失败分类 /<br/>同 Task retry 命令 / Release 禁止 LLM<br/>16 用例"]
+        ModelRouting["test_orca_model_routing.py<br/>通用解析/校验保留 / 真实表 deprecated<br/>fail-closed 退出码 2 / 16 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
         BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
     end

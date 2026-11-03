@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Resolve DailyCheck Orca role models and emit safe fallback retry commands.
+"""Deprecated project-level Orca routing resolver.
 
-The routing file is the project-level contract for role -> model assignment.
-Orca's ``worker-start`` accepts one model at a time, so this module exposes the
-declared fallback order and builds a ``--retry-of`` command for the coordinator
-after an infrastructure failure has settled.
+This module used to resolve the DailyCheck project routing table. That table is
+retired; the user-global policy at
+``~/.agents/skills/orca-model-routing/routing.json`` is authoritative. The
+loader fails closed on a deprecated routing document so this script cannot
+generate new launches.
+
+Historical note: Orca's ``worker-start`` accepts one model at a time, so this
+module used to expose a declared fallback order and build ``--retry-of``
+commands after an infrastructure failure settled.
 """
 
 from __future__ import annotations
@@ -63,6 +68,12 @@ def load_routing(path: Path = DEFAULT_ROUTING_PATH) -> dict[str, Any]:
         raise RoutingError(f"invalid JSON in routing file {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise RoutingError("routing document must be a JSON object")
+    if data.get("deprecated") is True:
+        superseded = data.get("superseded_by") or "the user-global routing policy"
+        raise RoutingError(
+            f"routing file {path} is deprecated; use {superseded}. "
+            "This project-level table must not generate launches."
+        )
     return data
 
 
