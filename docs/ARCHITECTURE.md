@@ -1685,6 +1685,12 @@ sequenceDiagram
 该仓有来源行（`order_participants`）才可操作；表单行 ID 的来源不是操作仓即整批拒绝，
 不扣任何库存（场景 c）。
 
+**显式提交行归属（Issue #146）**：HTTP 适配保留 `shipped_items[N]` 中的零/空数量
+ID，把完整 map 交给领域层；`_select_ship_lines()` 先校验每行属于目标订单且来源为
+操作仓，再跳过零数量行。混合批次的本单本仓零行仍不发货，显式全零/全空批次拒绝，
+不会回落旧版全发；归属校验在幂等批次查询前执行，新请求及同键重放均适用。
+失败沿用 PRG 并标记 `flash(..., "error")`，AJAX 对应 HTTP 409 / `ok:false`。
+
 提交分两段短事务，由 `store_ordering_pure.ship_partial()` 串起：
 
 1. **仓库库** `BEGIN IMMEDIATE` → `fulfillment_pure.resolve_fulfillment_item()` 解析本仓
