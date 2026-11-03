@@ -2682,6 +2682,9 @@ flowchart LR
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/
 扣库后 fence 交错、冲销后主库未回写、同键并发重放、Decimal 半分及原能力回归。
+并发/撤权探针先核对实际库存、配送和 claim 状态，再核对异常类型；权限变更只在
+绑定解析的第一次调用发生，不能让错误文案或非预期锁异常冒充安全不变量证据。
+
 HTTP 用例开启真实 CSRF，覆盖 AJAX/PRG、撤权后拒绝和通知 enqueue 后故障回滚。
 scripts/dev_smoke_order_changes.py 必须显式指定空的 /tmp/dailycheck-order-change-*
 根，启动独占随机 loopback 端口，拒绝外部 HTTP；用于实际浏览器 375/320 宽验证，

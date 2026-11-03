@@ -86,9 +86,9 @@ def _paused_ship(master_path, wh_dir, order, item, phase, reached, release, resu
     try:
         sop.ship_partial(master, factory, order_id=order, operator_dc_code='A',
                          op_no='process-request', line_qty={item: 2}, shipped_by=2)
-        result.put('committed')
+        result.put({'outcome': 'committed'})
     except Exception as exc:
-        result.put(str(exc))
+        result.put({'outcome': 'error', 'type': type(exc).__name__, 'message': str(exc)})
     finally:
         master.close()
 
@@ -126,11 +126,17 @@ def test_recovery_fence_blocks_late_executor_and_cancel(ship_env, phase):
         assert len(reversed_rows) == (0 if phase == 'before_warehouse' else 1)
         release.set()
         worker.join(15)
-        assert worker.exitcode == 0
-        assert '终结' in result.get(timeout=2)
-        assert e['stock']('A', 101) == 10
-        assert changes.get_claim(e['master'], 'process-request')['state'] == 'aborted'
-        assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 0
+        execution = result.get(timeout=2)
+        observed = {'phase': phase, 'stock': e['stock']('A', 101),
+                    'claim': changes.get_claim(e['master'], 'process-request')['state'],
+                    'deliveries': e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0],
+                    'executor': execution, 'process_exit': worker.exitcode}
+        print(observed)
+        assert observed['stock'] == 10
+        assert observed['deliveries'] == 0
+        assert observed['claim'] == 'aborted'
+        assert observed['process_exit'] == 0
+        assert execution['outcome'] == 'error' and execution['type'] == 'ValueError'
         assert changes.recover_shipment(e['master'], recovery_factory, 'process-request') == []
         with pytest.raises(ValueError, match='不可复用'):
             _ship(e, order, 'A', 'process-request', {ids[0]: 2})
@@ -186,7 +192,7 @@ def test_concurrent_same_payload_retry_settles_once(ship_env):
         settled = _ship(e, order, 'A', 'process-request', {ids[0]: 2})
         release.set()
         worker.join(15)
-        assert worker.exitcode == 0 and result.get(timeout=2) == 'committed'
+        assert worker.exitcode == 0 and result.get(timeout=2)['outcome'] == 'committed'
         assert e['stock']('A', 101) == 8
         assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 1
         assert e['master'].execute('SELECT shipped_quantity FROM store_order_items WHERE id=?', (ids[0],)).fetchone()[0] == 2
@@ -257,7 +263,7 @@ def test_effective_quantity_update_cannot_cross_active_claim(ship_env):
         e['master'].rollback()
         release.set()
         worker.join(15)
-        assert worker.exitcode == 0 and result.get(timeout=2) == 'committed'
+        assert worker.exitcode == 0 and result.get(timeout=2)['outcome'] == 'committed'
         assert e['master'].execute('SELECT quantity FROM store_order_items WHERE id=?', (ids[0],)).fetchone()[0] == 4
         assert e['stock']('A', 101) == 8
     finally:
@@ -280,10 +286,10 @@ def test_rev_tombstone_checked_before_warehouse_deduction(ship_env):
         release.set()
         worker.join(15)
         assert worker.exitcode == 0
-        message = result.get(timeout=2)
+        execution = result.get(timeout=2)
         assert e['stock']('A', 101) == 10
-        assert 'REV' in message
         assert changes.get_claim(e['master'], 'process-request')['state'] == 'aborted'
+        assert execution['outcome'] == 'error' and execution['type'] == 'ValueError'
     finally:
         release.set()
         worker.join(15)
@@ -295,13 +301,30 @@ def test_rev_tombstone_checked_before_warehouse_deduction(ship_env):
 def test_ship_permission_reloaded_after_binding_resolution(ship_env):
     e = ship_env
     order, ids = e['create_order']([(101, 4, 'A')])
+    factory_calls = 0
 
     def factory(code):
-        with sqlite3.connect(e['master_path']) as other:
-            other.execute("UPDATE warehouse_users SET role='viewer' WHERE user_id=2")
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            with sqlite3.connect(e['master_path']) as other:
+                other.execute("UPDATE warehouse_users SET role='viewer' WHERE user_id=2")
         return sop.open_warehouse_db(code)
-    with pytest.raises(ValueError, match='无本仓发货权限'):
+
+    before_changes = e['master'].total_changes
+    failure = None
+    try:
         sop.ship_partial(e['master'], factory, order_id=order, operator_dc_code='A',
                          op_no='revoked-ship', line_qty={ids[0]: 2}, shipped_by=2)
-    assert changes.get_claim(e['master'], 'revoked-ship') is None
-    assert e['stock']('A', 101) == 10
+    except Exception as exc:
+        failure = exc
+    observed = {'stock': e['stock']('A', 101),
+                'claim': changes.get_claim(e['master'], 'revoked-ship'),
+                'deliveries': e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0],
+                'master_writes': e['master'].total_changes - before_changes,
+                'exception_type': type(failure).__name__ if failure is not None else None}
+    print(observed)
+    assert observed['stock'] == 10
+    assert observed['deliveries'] == 0 and observed['claim'] is None
+    assert observed['master_writes'] == 0
+    assert isinstance(failure, ValueError)
