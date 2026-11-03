@@ -1328,6 +1328,14 @@ erDiagram
 `tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`
 外键可用；已有租户配置不覆盖，路由 pure 层不代建租户。
 
+**订单变更兼容底座（Issue #144，master v7）**：init 与 runner 共用
+`migrations.order_changes.registered_up`，savepoint 内追加行原始量、行/商业 revision、
+可空的服务端商品/单价/运费规则快照，以及独立 proposal/line/command/event 和
+发货 claim 请求/行表。历史 original_quantity 仅按 quantity 回填，包括异常旧行；
+历史价与规则保持 NULL，不猜成交额或已付额。pending 每单唯一，active/recovering
+每行唯一占用；终态不复活。迁移不触及仓库，兼容 floor 不可破坏性 down，代码回退
+必须保留这些表、快照与活动占用。第一阶段没有 create/accept/reject 业务入口。
+
 ### 4.3 warehouse.db 核心表（ER 简图）
 
 ```mermaid
@@ -1422,7 +1430,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v6**（含多仓履约/路由播种/收货协议；本次不改）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v7**（订单变更兼容底座；仓库仍为 v7，互不混用）。
 
 ---
 
