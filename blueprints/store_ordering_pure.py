@@ -2073,18 +2073,18 @@ def _select_ship_lines(
             raise ValueError(
                 f"order_item_id={order_item_id} 不属于 order_id={order['id']}"
             )
-        try:
-            qty = parse_qty(raw_qty)
-        except (TypeError, ValueError):
-            continue
-        if qty <= 0:
-            continue
         source = _line_source_warehouse(order, item)
         if source != operator_dc_code:
             raise ValueError(
                 f"order_item_id={order_item_id} 不属于操作仓 {operator_dc_code}"
                 f"（行来源 {source}）"
             )
+        try:
+            qty = parse_qty(raw_qty)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
         already = parse_qty(item.get("shipped_quantity") or 0)
         target = parse_qty(item["quantity"])
         # A retry of this very operation already carried the quantity into

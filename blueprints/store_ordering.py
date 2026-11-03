@@ -1396,14 +1396,14 @@ def ship_order_route(order_id: int) -> str:
             try:
                 oid = int(key[len("shipped_items["):-1])
                 qty = parse_qty(value)
-                if qty > 0:
-                    shipped_items_map[oid] = qty
+                # Keep zero/blank lines for domain ownership validation.
+                shipped_items_map[oid] = qty
             except (ValueError, TypeError):
                 continue
 
-    # 1b. 新 UI 提交了 shipped_items[] 字段但全部为空 → 拒绝，不猜、不全发。
+    # 1b. v3 字段没有可解析 ID → 拒绝，不猜、不全发；全零 map 由领域层拒绝。
     if not shipped_items_map and has_multival_fields:
-        flash("请至少填写一项发货数量")
+        flash("请至少填写一项发货数量", "error")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     # 2. 兼容 v2 全量字段 'qty'：仅作用本仓未发齐明细。
@@ -1448,7 +1448,7 @@ def ship_order_route(order_id: int) -> str:
                 tracking_note=tracking_note,
             )
         except ValueError as e:
-            flash(f"出库失败：{e}")
+            flash(f"出库失败：{e}", "error")
             return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     # 4. 通知：仅本次调用真正完成 approved→shipped 迁移才触发（幂等重试不发）。
