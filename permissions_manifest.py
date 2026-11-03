@@ -238,6 +238,7 @@ ROUTE_MATRIX: dict[str, str] = {
     "items.toggle_item_active": PLATFORM,
     "items.recompute_safety_stock": PLATFORM,
     "items.inventory_view": LOGIN,              # 终裁④：不脱敏
+    "wms.detail": f"{DC_PREFIX}{LOGIN}",          # 同列表范围的外仓单据详情
     "wms.index": f"{DC_PREFIX}{LOGIN}",           # 外仓只读：配送中心 / 平台管理员
     "items.items_publish": PLATFORM,
     "items.items_publish_history": LOGIN,

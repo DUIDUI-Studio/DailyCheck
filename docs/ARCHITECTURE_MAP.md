@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 25 个（已装配 24 / 未装配 1）
-- 路由 **191** 条（按鉴权强度：平台超管 65 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 9 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **192** 条（按鉴权强度：平台超管 65 · 登录 47 · 权限点 31 · 角色 29 · 配送中心 10 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **65** 张，`WAREHOUSE_SCHEMA_VERSION = 7`
 - MCP 工具域 9 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -45,8 +45,8 @@
 | `notifications` | `notifications.py` | 3 | 在役 |
 | `bot_admin` | `bot_admin.py` | 2 | 在役 |
 | `dc_transfer` | `dc_transfer.py` | 2 | 在役 |
+| `wms` | `wms.py` | 2 | 在役 |
 | `ops` | `ops.py` | 1 | 在役 |
-| `wms` | `wms.py` | 1 | 在役 |
 
 ## 2. 路由 × 鉴权（唯一事实来源：`permissions_manifest.ROUTE_MATRIX`）
 
@@ -374,6 +374,7 @@
 
 | endpoint | 方法 | 规则 | 鉴权 | 明细 |
 |---|---|---|---|---|
+| `wms.detail` | GET | `/wms/documents/<direction>/<document_id>` | 配送中心 | login |
 | `wms.index` | GET | `/wms` | 配送中心 | login |
 
 ## 3. 数据层

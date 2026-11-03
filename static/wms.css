@@ -50,3 +50,14 @@
   .wms-summary-heading, .wms-results-heading { align-items: start; flex-direction: column; }
   .wms-tabs a { padding-inline: 12px; }
 }
+.wms-identity { display: block; margin-top: 5px; font-size: 11px; color: var(--muted); font-weight: 400; }
+.wms-doc-link { display: inline-block; min-height: 44px; color: var(--brand-ink); padding-block: 4px; text-underline-offset: 3px; }
+.wms-pagination { display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap; margin-top: 20px; }
+.wms-pagination a { display: inline-flex; align-items: center; min-height: 44px; padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; color: var(--brand-ink); background: var(--panel); }
+.wms-pagination span { font-size: 12px; color: var(--muted); }
+.wms-back { display: inline-flex; align-items: center; min-height: 44px; margin-bottom: 12px; color: var(--brand-ink); }
+.wms-detail-header { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); }
+.wms-detail-header dt { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.wms-detail-header dd { margin: 0; overflow-wrap: anywhere; font-weight: 600; }
+@media (min-width: 1100px) { .wms-filters { grid-template-columns: repeat(3, minmax(140px, 1fr)); } }
+@media (max-width: 480px) { .wms-detail-header { grid-template-columns: minmax(0, 1fr); padding: 16px; } .wms-pagination { justify-content: flex-start; } }

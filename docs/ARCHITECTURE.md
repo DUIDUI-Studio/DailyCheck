@@ -53,7 +53,7 @@
 
 ## 2. 系统拓扑（容器视角）
 
-Issue #136 的外仓页由 Flask 直接调用同一 WMS SELECT 服务连接外部 SQL Server；
+Issue #140 的外仓页由 Flask 调用独立 Web 范围 WMS SELECT 服务连接外部 SQL Server；
 不依赖 MCP HTTP 进程在线，也不通过本地 SQLite 镜像外仓库存。
 
 ```mermaid
@@ -1441,7 +1441,9 @@ master_connection不迁移warehouse。软链共享真实路径锁，绿副本独
 
 **外仓 Web 查询（Issue #136）**：`app.py` 注册 `blueprints/wms.py`，配送中心的
 「库存管理 → 外仓信息」在桌面侧栏与移动「更多」页同步出现。`templates/wms.html`
-提供仓库选择、库存明细及入/出库单据；仅 GET 查询，无同步、配置或库存写入入口。
+提供仓库/货主选择、库存及入/出库单据的服务端分页；`wms_detail.html` 展示按方向+唯一 ID
+查询的头、货主、货物和独立库位分配。列表与详情共用登录/DC/viewer 权限和 no-store；仅 GET，
+无同步、配置或库存写入入口。详情返回链接以 url_for 保留原筛选与页码，不接受外部跳转 URL。
 
 **Bot PR2 复用接线**：`bot.agent` → `bot.mcp_tools` → 22 个批准 MCP handler/service；`bot.tools` 保留旧查询接口。采购计算新增显式配置/只读参数供无缓存只读调用，canonical bindings 新增只读收集模式；没有新增蓝图、路由、表或预测算法。
 
@@ -1525,9 +1527,10 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 
 ## 6. 蓝图依赖关系
 
-`wms.py` Web 蓝图直接复用 `mcp_server.service.wms` 的 SELECT 服务，不经过 MCP
-票据或 Bot；不会引入本地库存写路径。服务新增 keyword-only `warehouse` 参数，
-既有 MCP 位置参数、输出与工具声明保持不变。
+`wms.py` Web 蓝图调用 `mcp_server.service.wms_web`，只复用旧 `wms` 的连接/配置/安全错误
+包装；Web 多货主权限不进入 MCP 票据或 Bot，旧 MCP 单货主函数/参数/输出/工具声明保持不变。
+`Filters` 在边界解析页码、ID、日期和每页条数；白名单 (1,3) 服务端固定，其他原可见仓仍限配置货主。
+无本地或外部库存写路径。`permissions_manifest` 登记列表及 `wms.detail` 两个 DC 登录只读端点。
 
 **Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
 
@@ -2057,12 +2060,12 @@ SQLite，而是租仓方 WMS（SQL Server）中**本货主**的数据。边界�
 - **CI 不连上游**：上游是第三方生产库，契约测试用桩数据跑 dispatch/serialization，
   真实连通性只在部署环境验证。
 
-**Web 复用边界（Issue #136）**：仓库名筛选通过 SQL 参数绑定，在 WHERE 中先于
-TOP 截断生效；`list_warehouses()` 使用本货主库存及入/出库历史 EXISTS 条件，
-保留已无库存但有单据的仓库。页面概览仅展示各仓 SKU 数，不累加跨仓 SKU，
-不展示服务旧汇总中的混合单位总量；编码筛选只影响明细，页面明确标注范围。
-未配置、缺驱动、连接或查询失败均转为固定安全提示（页面 200），不显示半次结果、
-SQL、主机或异常详情；无效筛选 400。成功空结果与达到条数上限分别提示。
+**Web 查询边界（Issue #140）**：默认两朴宇仓全部货主；仓库 ID 经可见选项校验，货主选项
+来自该仓范围库存/历史单据。库存按 goodsBalanceID 唯一排序、单据按 bizDate+头 ID 唯一排序；
+ROW_NUMBER 分页及 CTE 同范围计数支持超过 500 条，编码/货主筛选也影响概览。
+库位分配单独查询，保留明细单位/数量/批次；明细上限 2000、库位分配上限 10000，超限明确
+标为不完整。有效头无明细单独提示；缺失或越界单据 404；无效条件 400；未配置/缺驱动/
+连接或范围不可用 503、查询失败 502，全部固定安全提示/no-store，不展示半次结果或上游错误。
 
 ### 9.3 双传输模式
 
@@ -2611,10 +2614,11 @@ flowchart LR
 
 ## 12. 测试架构
 
-Issue #136 的 `tests/test_wms_dashboard.py` 覆盖 Cookie/仓库类型与 viewer 权限、
-导航双载体、筛选保持、SQL 参数绑定与固定货主、历史仓选项、无写方法、
-故障安全/部分结果丢弃、空/截断状态、转义与不混合汇总。复用 `test_mcp_wms.py`
-与 MCP 契约门禁验证旧调用；所有上游查询桩化，CI 禁止连接第三方生产库。
+Issue #140 的 `tests/test_wms_dashboard.py` 覆盖真实 Cookie/DC/viewer 权限、导航双载体、
+多货主分页、详情/原筛选返回、ID/范围攻击、故障与部分结果丢弃、空/截断、转义和只读方法。
+`test_wms_web_service.py` 用真实已核验 schema 的合成 SQLite 数据与 SQL 方言适配执行查询，
+验证 >500 行唯一分页、跨货主同编码、空仓历史、双方向同编号、库位一对多及其他仓单货主边界。
+`test_mcp_wms.py` 与 MCP 契约门禁验证旧调用；CI 禁止连接第三方生产库，真实验证归 Prod。
 
 Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
 `selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时

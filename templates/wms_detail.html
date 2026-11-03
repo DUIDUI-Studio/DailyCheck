@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block extra_css %}<link rel="stylesheet" href="{{ url_for('static', filename='wms.css') }}?v=2" />{% endblock %}
+{% block content %}
+<section class="wms-board" aria-labelledby="wms-title">
+  <a class="wms-back" href="{{ back_url }}">← 返回原筛选列表</a>
+  <header class="wms-heading"><div><p class="wms-eyebrow">外仓信息 / 单据详情</p><h2 id="wms-title">{{ '入库' if direction == 'in' else '出库' }}单据 <span class="wms-badge">只读</span></h2></div><p class="muted">{{ scope_label }}</p></header>
+  {% if error %}
+  <div class="wms-state wms-error" role="alert"{% if error_code %} data-error-code="{{ error_code }}"{% endif %}><h3>无法查看单据</h3><p>{{ error }}</p><p class="muted">未展示单据结果，请返回列表或稍后重试。</p></div>
+  {% else %}
+  {% set header = detail.header %}
+  <dl class="wms-detail-header">
+    {% for label, value in [('单据编号', header.doc_no), ('唯一标识', '#' ~ header.doc_id), ('货主', (header.owner_name or '未命名货主') ~ ' · ' ~ (header.owner_code or '—') ~ ' (#' ~ header.owner_id ~ ')'), ('业务日期', header.biz_date), ('仓库', header.warehouse), ('供应方' if direction == 'in' else '收货方', header.party), ('经办人', header.issued_by)] %}<div><dt>{{ label }}</dt><dd>{{ value or '—' }}</dd></div>{% endfor %}
+  </dl>
+  <p class="muted">单据数量 {{ header.qty | fmt_qty }}（上游原值，未提供统一单位）。明细按各自单位展示，不跨单位合计。</p>
+  <div class="wms-results-heading"><h3>货物明细</h3><span class="muted">本次显示 {{ detail.lines | length }} 行</span></div>
+  {% if detail.state == 'truncated' %}<p class="wms-limit-notice" role="status">明细或库位分配超过显示上限，本次结果不完整，请联系管理员核对完整单据。</p>{% endif %}
+  {% if detail.lines %}
+  <p class="muted wms-scroll-hint">表格可左右滑动。库位分配数量单独展示，不重复累加到货物明细数量。</p>
+  <table class="wms-table"><caption class="wms-visually-hidden">单据货物及库位分配明细</caption><thead><tr><th scope="col">行标识</th><th scope="col">货品编码</th><th scope="col">货品名称</th><th scope="col">单位</th><th scope="col">数量</th><th scope="col">批次</th><th scope="col">库存批次</th><th scope="col">库位分配</th></tr></thead><tbody>
+    {% for line in detail.lines %}<tr><td>#{{ line.line_id }}</td><td>{{ line.goods_code or '—' }}</td><td>{{ line.goods_name or '—' }}</td><td>{{ line.unit or '—' }}</td><td class="wms-qty">{{ line.qty | fmt_qty }}</td><td>{{ line.lot_no or '—' }}</td><td>{{ line.store_lot_no or '—' }}</td><td>{% for location in line.locations %}<div>{{ location.zone or '—' }} / {{ location.position or '—' }} · {{ location.qty | fmt_qty }} {{ line.unit or '' }} · {{ location.lot_no or '—' }}</div>{% else %}上游未返回库位分配{% endfor %}</td></tr>{% endfor %}
+  </tbody></table>
+  {% else %}<div class="wms-state"><h3>单据无明细行</h3><p>上游返回了单据头，但没有货物明细；此状态不代表库存为零。</p></div>{% endif %}
+  {% endif %}
+</section>
+{% endblock %}

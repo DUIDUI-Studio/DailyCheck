@@ -43,6 +43,9 @@ def web_sql(monkeypatch):
             (70,7,2,10,'LOT-A','STORE-A'),(80,8,3,500,'SECRET','SECRET');
         INSERT INTO biz_store{direction}Position VALUES (1,70,1,4,'LOT-A'),(2,70,2,6,'LOT-A');
         """)
+    conn.execute("UPDATE biz_storeOut SET qty=20 WHERE storeOutID=7")
+    conn.execute("UPDATE biz_storeOutDetail SET qty=20 WHERE storeOutID=7")
+    conn.execute("UPDATE biz_storeOutPosition SET qty=qty*2 WHERE storeOutDetailID=70")
     conn.executemany("INSERT INTO biz_goodsBalance VALUES (?,1,1,?,1,?,0)",
                      [(i, 1 if i % 2 else 2, f"LOT-{i}") for i in range(1, 608)])
     conn.executemany("INSERT INTO biz_goodsBalance VALUES (?,4,1,?,1,'OTHER',0)", [(608, 3), (609, 1)])
@@ -129,8 +132,8 @@ def test_document_identity_scope_and_allocations_do_not_multiply_qty(web_sql, di
     assert page.rows[0]["doc_id"] == 9
     detail = web.document_detail(scope, cfg, web.DocumentKey(direction, 7))
     assert detail.header["owner_id"] == 200 and detail.header["doc_no"] == "SAME-DISPLAY-NUMBER"
-    assert len(detail.lines) == 1 and detail.lines[0]["qty"] == 10
-    assert [p["qty"] for p in detail.lines[0]["locations"]] == [4, 6]
+    assert len(detail.lines) == 1 and detail.lines[0]["qty"] == (10 if direction == web.Direction.IN else 20)
+    assert [p["qty"] for p in detail.lines[0]["locations"]] == ([4, 6] if direction == web.Direction.IN else [8, 12])
     assert detail.lines[0]["store_lot_no"] == "STORE-A"
     assert detail.state == web.DetailState.COMPLETE
     assert web.document_detail(scope, cfg, web.DocumentKey(direction, 8)) is None
@@ -163,3 +166,23 @@ def test_literals_are_bound_and_truncation_is_explicit(web_sql, monkeypatch):
 def test_invalid_document_identity(direction, identity):
     with pytest.raises(ValueError):
         web.DocumentKey(direction, identity)
+
+
+def test_mcp_queries_still_execute_with_configured_owner_only(web_sql):
+    _, _, calls = web_sql
+    rows = wms.list_stock(limit=500)
+    assert len(rows) == 305
+    assert {row["goods_name"] for row in rows} == {"甲的商品"}
+    assert all(params[0] == 155 for _, params in calls)
+
+
+def test_line_truncation_and_missing_authorized_warehouse(web_sql, monkeypatch):
+    cfg, conn, _ = web_sql
+    scope = default_scope(cfg)
+    conn.execute("INSERT INTO biz_storeInDetail VALUES (71,7,2,3,'LOT-B','STORE-B')")
+    monkeypatch.setattr(web, "MAX_DETAIL_ROWS", 1)
+    detail = web.document_detail(scope, cfg, web.DocumentKey(web.Direction.IN, 7))
+    assert detail.state == web.DetailState.TRUNCATED and len(detail.lines) == 1
+    conn.execute("DELETE FROM sy_warehouse WHERE warehouseID=3")
+    with pytest.raises(Exception, match="Authorized warehouse missing"):
+        default_scope(cfg)
