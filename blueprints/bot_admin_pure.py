@@ -45,6 +45,9 @@ MCP_TOOL_META: dict[str, tuple[str, bool]] = {
     "canonical_set_binding_active": ("启停仓内品项绑定行。", True),
     "store_order_list": ("列门店订单（只读；门店仓或总仓任一命中可见）。", False),
     "store_order_detail": ("单张门店订单五段详情（只读）。", False),
+    "wms_stock_list": ("外部 WMS（租仓方）本货主库存明细，只读。", False),
+    "wms_stock_summary": ("外部 WMS 本货主分仓汇总，只读。", False),
+    "wms_documents_list": ("外部 WMS 本货主出入库单据，只读。", False),
 }
 
 OWN_TOOLS: tuple[tuple[str, str], ...] = (
@@ -132,7 +135,7 @@ def build_tool_rows(
     effective: BotAgentConfig,
     counts: dict[str, int],
 ) -> list[ToolRow]:
-    """34 主行：实时 MCP 注册项 + bot 五自有；旧名只作为子条目。"""
+    """37 主行：实时 MCP 注册项 + bot 五自有；旧名只作为子条目。"""
     rows: list[ToolRow] = []
 
     for tool in mcp_tools:

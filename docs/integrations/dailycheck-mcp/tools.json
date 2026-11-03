@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "DailyCheck external integration subset: 16 tools; runtime registry: 29 tools including 13 canonical tools. Subset membership is documentation, not authorization. Full maintenance ledger: registry.json.",
+  "description": "DailyCheck external integration subset: 19 tools; runtime registry: 32 tools including 13 canonical tools. Subset membership is documentation, not authorization. Full maintenance ledger: registry.json.",
   "server": null,
   "tools": [
     {
@@ -446,6 +446,61 @@
         "type": "object"
       },
       "name": "store_order_detail"
+    },
+    {
+      "description": "Read-only: current stock of this tenant in the external WMS (Puyu cold store, SQL Server). Returns: array of {goods_code, goods_name, unit, qty, warehouse, zone, position, lot_no}.",
+      "inputSchema": {
+        "properties": {
+          "goods_code": {
+            "description": "Optional goods code filter, e.g. SC0001",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max rows (default 100, max 500)",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "wms_stock_list"
+    },
+    {
+      "description": "Read-only: stock totals per warehouse for this tenant in the external WMS. Returns: array of {warehouse, sku_count, total_qty}.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "wms_stock_summary"
+    },
+    {
+      "description": "Read-only: inbound/outbound documents of this tenant in the external WMS. Returns: array of {doc_no, biz_date, warehouse, qty, supplier|receiver, issued_by}.",
+      "inputSchema": {
+        "properties": {
+          "date_from": {
+            "description": "Optional lower bound, YYYY-MM-DD",
+            "type": "string"
+          },
+          "direction": {
+            "description": "in = inbound (biz_storeIn), out = outbound (biz_storeOut)",
+            "enum": [
+              "in",
+              "out"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max rows (default 100, max 500)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "direction"
+        ],
+        "type": "object"
+      },
+      "name": "wms_documents_list"
     }
   ]
 }

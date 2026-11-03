@@ -8,6 +8,11 @@ uvicorn>=0.30
 anyio>=4.0
 click>=8.1
 
+# --- MCP: 外部 WMS 只读桥接（mcp_server/service/wms.py）---
+# 部署时用 manylinux wheel；未安装时该组工具返回 wms_driver_missing，
+# 其余 MCP 工具不受影响。凭据走环境变量，不写进本文件。
+pymssql>=2.3
+
 # --- 企业微信库存助手（bot/）---
 # 运行时用独立 venv（见 bot/requirements.txt），但这里必须登记：
 # CI 只装本文件，而 tests/bot/test_agent.py 要 import bot.agent（依赖 aiohttp），
