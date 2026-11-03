@@ -11,6 +11,7 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §6.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import uuid
@@ -1380,6 +1381,7 @@ def _resolve_routed_cart_lines(
             )
             row = wh_conn.execute("SELECT * FROM items WHERE id=?", (resolved["item_id"],)).fetchone()
             unit_price, _ = parse_price_and_multiple(row)
+            snapshot = ocp.snapshot_product(master_conn, wh_conn, canonical_id, resolved['item_id'])
         except ValueError as exc:
             raise ValueError(f"{name} 无法解析履约行：{exc}") from exc
         finally:
@@ -1394,6 +1396,7 @@ def _resolve_routed_cart_lines(
             "source_warehouse_code": dc_code,
             "unit_price": unit_price,
             "order_multiple": resolved["order_multiple"],
+            **snapshot,
         })
     if missing:
         raise ValueError("以下品项未配置履约仓，整单退回：" + "、".join(missing))
@@ -1412,8 +1415,8 @@ def _snapshot_changes(
     for line in lines:
         canonical_id = line["canonical_id"]
         if price_snapshot is not None and canonical_id in price_snapshot:
-            old = parse_qty(price_snapshot[canonical_id])
-            new = parse_qty(line["unit_price"])
+            old = float(price_snapshot[canonical_id])
+            new = float(line["unit_price"])
             if abs(old - new) > 1e-9:
                 changes.append({
                     "canonical_id": canonical_id, "name": line["name"],
@@ -1485,29 +1488,47 @@ def submit_order(
             "quantity": parse_qty(ci["quantity"]),
             "unit": ci["cart_unit"],
             "store_item_id": ci.get("store_item_id"),
-            "dc_item_id": None,
+            "dc_item_id": ci.get('dc_item_id'),
             "source_warehouse_code": cart_dict["dc_warehouse_code"],
             "unit_price": ci.get("unit_price"),
             "order_multiple": ci.get("order_multiple"),
         } for ci in cart_items]
-        subtotal = sum(parse_qty(ci.get("line_subtotal") or 0) for ci in cart_items)
         header_dc = cart_dict["dc_warehouse_code"]
+        wh = open_warehouse_db(header_dc)
+        try:
+            for line in lines:
+                resolved = resolve_fulfillment_item(master_conn, wh,
+                    canonical_id=line['canonical_id'], warehouse_code=header_dc)
+                if line['unit'] != resolved['unit']:
+                    raise ValueError('下单单位与履约基础单位不一致')
+                line['dc_item_id'] = resolved['item_id']
+                line.update(ocp.snapshot_product(master_conn, wh, line['canonical_id'], resolved['item_id']))
+        finally:
+            wh.close()
+        changes = _snapshot_changes(lines, price_snapshot, multiple_snapshot)
+        if changes and not confirm_price_change:
+            return {"order": None, "price_changed": changes}
 
     order_no = generate_order_no(master_conn)
     # v3.1: 算订单金额合计 + 运费
     rule = get_active_shipping_rule(master_conn)
+    subtotal = sum((ocp.money(Decimal(line['unit_price_snapshot']) * Decimal(str(line['quantity']))) for line in lines), Decimal(0))
     shipping_fee = compute_shipping_fee(subtotal, rule)
+    rule_snapshot = ocp.canonical_json({'rule_id': rule['id'] if rule else None,
+        'base_fee': str(rule['base_fee']) if rule else '0',
+        'pct_fee': str(rule['pct_fee']) if rule else '0', 'rounding': 'ROUND_HALF_UP',
+        'basis': 'effective_goods_amount', 'version': 1})
 
     cur = master_conn.execute(
         """INSERT INTO store_orders
            (order_no, store_warehouse_code, dc_warehouse_code, status,
             requested_by, expected_delivery_date, note, created_at, updated_at,
-            shipping_fee)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            shipping_fee, shipping_rule_snapshot)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             order_no, cart_dict["store_warehouse_code"], header_dc,
             ORDER_STATUS_PENDING, requested_by, expected_delivery_date,
-            note, ts, ts, shipping_fee,
+            note, ts, ts, shipping_fee, rule_snapshot,
         ),
     )
     order_id = int(cur.lastrowid)
@@ -1515,16 +1536,19 @@ def submit_order(
         master_conn.execute(
             """INSERT INTO store_order_items
                (order_id, canonical_id, dc_item_id, store_item_id, source_warehouse_code,
-                quantity, unit, fulfilled_quantity, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quantity, original_quantity, unit, fulfilled_quantity, status, created_at,
+                unit_price_snapshot, price_snapshot_origin, product_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order_id, line["canonical_id"], line["dc_item_id"], line["store_item_id"],
-                line["source_warehouse_code"], line["quantity"], line["unit"], 0.0,
-                ORDER_ITEM_STATUS_PENDING, ts,
+                line["source_warehouse_code"], line["quantity"], line["quantity"], line["unit"], 0.0,
+                ORDER_ITEM_STATUS_PENDING, ts, line['unit_price_snapshot'],
+                line['price_snapshot_origin'], line['product_snapshot'],
             ),
         )
     # Clear cart items but keep the cart row so user can build next order.
-    clear_cart(master_conn, cart_id)
+    master_conn.execute('DELETE FROM store_order_cart_items WHERE cart_id=?', (cart_id,))
+    _touch_cart(master_conn, cart_id)
     _insert_status_history(master_conn, order_id, None, ORDER_STATUS_PENDING, requested_by, note)
     master_conn.commit()
     return get_order_detail(master_conn, order_id)
@@ -1541,11 +1565,9 @@ def compute_shipping_fee(subtotal: float, rule: dict | None) -> float:
     """
     if rule is None:
         return 0.0
-    base = float(rule.get("base_fee") or 0)
-    pct = float(rule.get("pct_fee") or 0)
-    raw = base + parse_qty(subtotal) * pct
-    # 2dp 量化，与货币一致
-    return float(Decimal(str(raw)).quantize(Decimal("0.01")))
+    base = Decimal(str(rule.get('base_fee') or 0))
+    pct = Decimal(str(rule.get('pct_fee') or 0))
+    return float(ocp.money(base + ocp.money(subtotal) * pct))
 
 
 def get_active_shipping_rule(master_conn: sqlite3.Connection) -> dict | None:
@@ -1964,6 +1986,14 @@ def get_order_detail(
         source = item.get("source_warehouse_code") or order["dc_warehouse_code"]
         item["effective_source_warehouse_code"] = source
         item["source_warehouse_name"] = names.get(str(source), source) if source else None
+    ocp.project_order(order)
+    display_names = {item['id']: item['canonical_name'] for item in order['order_items']}
+    for receipt in order['receipts']:
+        receipt['canonical_name'] = display_names.get(receipt['order_item_id'], receipt['canonical_name'])
+    order['change_history'] = ocp.change_history(master_conn, order_id)
+    blocked = ocp.blocked_lines(master_conn, order_id)
+    for item in order['order_items']:
+        item['ship_blocked_reason'] = blocked.get(item['id'])
     return order
 
 
@@ -1994,10 +2024,15 @@ def review_order(
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
         _assert_transition(order["status"], decision)
+        if decision == ORDER_STATUS_APPROVED and any(p['status'] == 'pending' for p in order['change_history']):
+            raise ValueError('订单存在待确认变更方案，不能审批通过')
+        if decision == ORDER_STATUS_REJECTED:
+            ocp.assert_unoccupied(master_conn, order_id)
+            ocp.invalidate_pending(master_conn, order, actor_id, '订单审核拒绝')
         ts = now()
         moved = master_conn.execute(
             """UPDATE store_orders
-               SET status=?, approved_by=?, approved_at=?, approved_note=?, updated_at=?
+               SET status=?, approved_by=?, approved_at=?, approved_note=?, updated_at=?, change_revision=change_revision+1
                WHERE id=? AND status=?""",
             (decision, actor_id, ts, note, ts, order_id, order["status"]),
         )
@@ -2346,15 +2381,7 @@ def _finalise_order_state(
     route emits exactly one ``store_order_shipped`` notification even when two
     warehouses ship their last lines back to back.
     """
-    rows = master_conn.execute(
-        """SELECT id, quantity, shipped_quantity
-             FROM store_order_items WHERE order_id=?""",
-        (order_id,),
-    ).fetchall()
-    is_fully_shipped = bool(rows) and all(
-        parse_qty(row["shipped_quantity"]) >= parse_qty(row["quantity"]) - 1e-9
-        for row in rows
-    )
+    is_fully_shipped = ocp.effective_progress(master_conn, order_id)['all_shipped']
     if not is_fully_shipped:
         _insert_status_history(
             master_conn,
@@ -2423,6 +2450,13 @@ def ship_partial(
         selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
         wh = wh_conn_factory(operator_dc_code)
         try:
+            prefix = op_no + ':'
+            if master_conn.execute('SELECT 1 FROM store_order_delivery_items WHERE substr(op_no,1,?)=? LIMIT 1',
+                                   (len(prefix), prefix)).fetchone():
+                raise ValueError('旧发货请求无claim，须人工核对，不可复用op_no')
+            if wh.execute('SELECT 1 FROM stock_movements WHERE substr(op_no,1,?)=? OR substr(op_no,1,?)=? LIMIT 1',
+                          (len(prefix), prefix, len('REV:' + prefix), 'REV:' + prefix)).fetchone():
+                raise ValueError('旧仓库请求或REV已存在且无claim，须人工核对，不可复用op_no')
             for oid, item, _ in selected:
                 resolved = resolve_fulfillment_item(master_conn, wh,
                     canonical_id=item['canonical_id'], warehouse_code=operator_dc_code)
@@ -2459,8 +2493,19 @@ def ship_partial(
     selected_ids = list(normalized)
     line_keys = {oid: _line_op_no(op_no, oid) for oid in selected_ids}
     ts = now()
-    item_ids = _apply_warehouse_shipment(master_conn, wh_conn_factory,
-        operator_dc_code, order, selected, line_keys, shipment_action_for(order), ts)
+    try:
+        item_ids = _apply_warehouse_shipment(master_conn, wh_conn_factory,
+            operator_dc_code, order, selected, line_keys, shipment_action_for(order), ts)
+    except ValueError:
+        settled = ocp.get_claim(master_conn, op_no, payload)
+        if settled is not None and settled['state'] == 'committed':
+            return _ship_result(master_conn, order_id, delivery_id=settled['delivery_id'],
+                op_no=op_no, warehouse_code=operator_dc_code, selected_ids=selected_ids, idempotent=True)
+        if settled is not None and settled['state'] == 'active':
+            # Even a known warehouse rollback uses the fence: another executor of
+            # this same request may still be running. Never simply delete a claim.
+            ocp.recover_shipment(master_conn, wh_conn_factory, op_no)
+        raise
     try:
         master_conn.execute('BEGIN IMMEDIATE')
         claim = ocp.get_claim(master_conn, op_no, payload)
@@ -2681,6 +2726,16 @@ def _ship_order_full_impl(
     order = get_order_detail(master_conn, order_id)
     if order is None:
         raise ValueError(f"order_id={order_id} not found")
+    if op_no:
+        claim = ocp.get_claim(master_conn, op_no)
+        if claim is not None:
+            if claim['order_id'] != order_id or (operator_dc_code is not None and claim['source_warehouse_code'] != operator_dc_code):
+                raise ValueError('op_no 已属于其他订单或操作仓')
+            payload = json.loads(claim['payload_json'])
+            return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+                operator_dc_code=claim['source_warehouse_code'], op_no=op_no,
+                line_qty={int(oid): float(qty) for oid, qty in payload['lines']},
+                shipped_by=shipped_by, tracking_note=tracking_note)
     if order["status"] != ORDER_STATUS_APPROVED:
         raise ValueError(
             f"order must be approved to ship, got {order['status']!r}"
@@ -2798,6 +2853,8 @@ def order_item_receivable_qty(
 
     Returns a non-negative float; ``0`` means "nothing to receive here".
     """
+    if item.get('status') == ORDER_ITEM_STATUS_CANCELLED:
+        return 0.0
     ordered = parse_qty(item["quantity"])
     fulfilled = parse_qty(item.get("fulfilled_quantity") or 0)
     shipped = parse_qty(item.get("shipped_quantity") or 0)
@@ -3089,15 +3146,7 @@ def _finalise_receipt_state(
     ``UPDATE … WHERE status='shipped'`` actually moved the order, so the route
     emits exactly one ``store_order_delivered`` notification.
     """
-    rows = master_conn.execute(
-        """SELECT id, quantity, fulfilled_quantity
-             FROM store_order_items WHERE order_id=?""",
-        (order_id,),
-    ).fetchall()
-    all_done = bool(rows) and all(
-        parse_qty(row["fulfilled_quantity"]) >= parse_qty(row["quantity"]) - 1e-9
-        for row in rows
-    )
+    all_done = ocp.effective_progress(master_conn, order_id)['all_received']
     if not all_done:
         return False
     moved = master_conn.execute(
@@ -3128,6 +3177,28 @@ def _finalise_receipt_state(
     )
     return True
 
+
+
+def refresh_effective_order_state(master_conn: sqlite3.Connection, order_id: int,
+                                  actor_id: int, note: str = '有效订量履约完成') -> str:
+    """Caller owns the master write transaction; never invents delivery/receipt rows."""
+    if not master_conn.in_transaction:
+        raise ValueError('有效量聚合需要外层master事务')
+    order = master_conn.execute('SELECT status FROM store_orders WHERE id=?', (order_id,)).fetchone()
+    if order is None:
+        raise ValueError('订单不存在')
+    state = order['status']
+    progress = ocp.effective_progress(master_conn, order_id)
+    target = state
+    if state in ('approved', 'shipped') and progress['all_received']:
+        target = ORDER_STATUS_DELIVERED
+    elif state == ORDER_STATUS_APPROVED and progress['all_shipped']:
+        target = ORDER_STATUS_SHIPPED
+    if target != state:
+        master_conn.execute("UPDATE store_orders SET status=?,updated_at=?,delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END WHERE id=? AND status=?",
+                            (target, now(), target, now(), order_id, state))
+        _insert_status_history(master_conn, order_id, state, target, actor_id, note)
+    return target
 
 def receive_partial(
     master_conn: sqlite3.Connection,
@@ -3561,6 +3632,7 @@ def cancel_order(
             raise ValueError(f"order_id={order_id} not found")
         _assert_transition(order["status"], ORDER_STATUS_CANCELLED)
         ocp.assert_unoccupied(master_conn, order_id)
+        ocp.invalidate_pending(master_conn, order, cancelled_by, '订单取消')
         # 已有收货记录则拒绝取消：货已实际入库，作废订单会造成账实不符。
         # （2026-10-10：approved 状态开放「部分发货即可收货」后新增的防护路径；
         #  此前 approved 不可收货，故不存在该状态。）
@@ -3583,7 +3655,7 @@ def cancel_order(
         moved = master_conn.execute(
             """UPDATE store_orders
                   SET status=?, cancelled_by=?, cancelled_at=?,
-                      cancel_reason=?, updated_at=?
+                      cancel_reason=?, updated_at=?, change_revision=change_revision+1
                 WHERE id=? AND status IN (?, ?)""",
             (
                 ORDER_STATUS_CANCELLED,

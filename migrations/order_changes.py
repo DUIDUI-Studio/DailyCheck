@@ -8,6 +8,9 @@ ORDER_COLUMNS = {
     "shipping_rule_snapshot": "TEXT CHECK(shipping_rule_snapshot IS NULL OR json_valid(shipping_rule_snapshot))",
 }
 ITEM_COLUMNS = {
+    # init can encounter pre-v4 masters before the explicit routing migration.
+    "source_warehouse_code": "TEXT",
+    "ship_op_no": "TEXT",
     "original_quantity": "REAL",
     "line_revision": "INTEGER NOT NULL DEFAULT 0 CHECK(line_revision >= 0)",
     "unit_price_snapshot": "TEXT",
@@ -89,6 +92,26 @@ DDL = (
        BEGIN SELECT RAISE(ABORT, 'invalid ship claim transition'); END""",
     """CREATE TRIGGER IF NOT EXISTS order_ship_claim_line_state AFTER UPDATE OF state ON store_order_ship_claims
        BEGIN UPDATE store_order_ship_claim_lines SET state=NEW.state WHERE op_no=NEW.op_no; END""",
+    """CREATE TRIGGER IF NOT EXISTS order_change_status_transition BEFORE UPDATE OF status ON store_order_change_proposals
+       WHEN NEW.status IS NOT OLD.status AND OLD.status <> 'pending'
+       BEGIN SELECT RAISE(ABORT, 'terminal proposal cannot reopen'); END""",
+    """CREATE TRIGGER IF NOT EXISTS order_change_snapshot_immutable BEFORE UPDATE ON store_order_change_proposals
+       WHEN NEW.order_id IS NOT OLD.order_id OR NEW.sequence IS NOT OLD.sequence
+         OR NEW.base_order_change_revision IS NOT OLD.base_order_change_revision
+         OR NEW.proposed_by IS NOT OLD.proposed_by OR NEW.reason IS NOT OLD.reason
+         OR NEW.snapshot_json IS NOT OLD.snapshot_json OR NEW.required_warehouses_json IS NOT OLD.required_warehouses_json
+       BEGIN SELECT RAISE(ABORT, 'immutable proposal snapshot'); END""",
+    """CREATE TRIGGER IF NOT EXISTS order_change_line_immutable BEFORE UPDATE ON store_order_change_lines
+       BEGIN SELECT RAISE(ABORT, 'immutable proposal line'); END""",
+    """CREATE TRIGGER IF NOT EXISTS order_ship_request_immutable BEFORE UPDATE ON store_order_ship_claims
+       WHEN NEW.op_no IS NOT OLD.op_no OR NEW.order_id IS NOT OLD.order_id
+         OR NEW.source_warehouse_code IS NOT OLD.source_warehouse_code OR NEW.payload_hash IS NOT OLD.payload_hash
+         OR NEW.payload_json IS NOT OLD.payload_json OR NEW.actor_id IS NOT OLD.actor_id
+       BEGIN SELECT RAISE(ABORT, 'immutable ship request'); END""",
+    """CREATE TRIGGER IF NOT EXISTS order_shipping_rule_immutable BEFORE UPDATE OF shipping_rule_snapshot ON store_orders
+       WHEN OLD.shipping_rule_snapshot IS NOT NULL AND NEW.shipping_rule_snapshot IS NOT OLD.shipping_rule_snapshot
+            AND NEW.change_revision <= OLD.change_revision
+       BEGIN SELECT RAISE(ABORT, 'shipping rule change requires commercial revision'); END""",
     """CREATE TRIGGER IF NOT EXISTS order_item_original_insert AFTER INSERT ON store_order_items
        WHEN NEW.original_quantity IS NULL
        BEGIN UPDATE store_order_items SET original_quantity=NEW.quantity WHERE id=NEW.id; END""",
@@ -99,7 +122,10 @@ DDL = (
              OR NEW.source_warehouse_code IS NOT OLD.source_warehouse_code OR NEW.unit IS NOT OLD.unit
              OR (OLD.dc_item_id IS NOT NULL AND NEW.dc_item_id IS NOT OLD.dc_item_id)))
          OR (OLD.product_snapshot IS NOT NULL AND NEW.product_snapshot IS NOT OLD.product_snapshot)
-         OR (OLD.unit_price_snapshot IS NOT NULL AND NEW.unit_price_snapshot IS NOT OLD.unit_price_snapshot)
+         OR (OLD.unit_price_snapshot IS NOT NULL AND (NEW.unit_price_snapshot IS NOT OLD.unit_price_snapshot
+             OR NEW.price_snapshot_origin IS NOT OLD.price_snapshot_origin))
+         OR NEW.replaces_order_item_id IS NOT OLD.replaces_order_item_id
+         OR NEW.introduced_by_proposal_line_id IS NOT OLD.introduced_by_proposal_line_id
        BEGIN SELECT RAISE(ABORT, 'immutable order line snapshot'); END""",
     """CREATE TRIGGER IF NOT EXISTS order_item_quantity_claim_guard BEFORE UPDATE OF quantity, line_revision ON store_order_items
        WHEN EXISTS(SELECT 1 FROM store_order_ship_claim_lines WHERE order_item_id=OLD.id AND state IN ('active','recovering'))

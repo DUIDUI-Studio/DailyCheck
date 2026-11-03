@@ -321,3 +321,6 @@ DIGEST_MAIL_FROM = (os.environ.get("DIGEST_MAIL_FROM") or "").strip() or DIGEST_
 DIGEST_MAIL_TO = (os.environ.get("DIGEST_MAIL_TO") or "").strip()
 DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 1)
 DIGEST_HOUR = _env_int("DIGEST_HOUR", 8)
+
+# Compatibility floor stays active regardless of future proposal rollout.
+ORDER_CHANGES_ENABLED = os.environ.get("DAILYCHECK_ORDER_CHANGES", "").lower() in ("1", "true", "yes")

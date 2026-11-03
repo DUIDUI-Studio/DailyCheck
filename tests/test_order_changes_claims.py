@@ -176,3 +176,72 @@ def test_crash_after_reversal_before_master_settlement_can_resume(ship_env, monk
     assert changes.recover_shipment(e['master'], sop.open_warehouse_db, 'gap') == []
     assert changes.get_claim(e['master'], 'gap')['state'] == 'aborted'
     assert e['stock']('A', 101) == 10
+
+
+def test_concurrent_same_payload_retry_settles_once(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    worker, release, result = start_ship(e, order, ids[0], 'after_warehouse')
+    try:
+        settled = _ship(e, order, 'A', 'process-request', {ids[0]: 2})
+        release.set()
+        worker.join(15)
+        assert worker.exitcode == 0 and result.get(timeout=2) == 'committed'
+        assert e['stock']('A', 101) == 8
+        assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 1
+        assert e['master'].execute('SELECT shipped_quantity FROM store_order_items WHERE id=?', (ids[0],)).fetchone()[0] == 2
+        assert changes.get_claim(e['master'], 'process-request')['delivery_id'] == settled['delivery_id']
+    finally:
+        release.set()
+        worker.join(15)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join()
+
+
+def test_schema_pending_unique_foreign_key_and_terminal_guards(ship_env):
+    e = ship_env
+    master = e['master']
+    master.execute('PRAGMA foreign_keys=ON')
+    order, ids = e['create_order']([(101, 4, 'A')])
+    pid = seed_proposal(master, order, ids)
+    with pytest.raises(sqlite3.IntegrityError, match='UNIQUE'):
+        master.execute("INSERT INTO store_order_change_proposals(order_id,sequence,status,base_order_change_revision,proposed_by,reason,snapshot_json,required_warehouses_json,created_at) VALUES(?,2,'pending',0,4,'x','{}','[]','now')", (order,))
+    master.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+        master.execute("UPDATE store_order_change_proposals SET snapshot_json='[]' WHERE id=?", (pid,))
+    master.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match='CHECK'):
+        master.execute("INSERT INTO store_order_change_lines(proposal_id,order_id,order_item_id,operation,base_line_revision,baseline_quantity,baseline_shipped,remove_quantity) VALUES(?,?,?,'cancel',0,4,0,5)", (pid, order, ids[0]))
+    master.rollback()
+    with pytest.raises(sqlite3.IntegrityError, match='FOREIGN KEY'):
+        master.execute("INSERT INTO store_order_change_events(proposal_id,actor_id,to_status,note,created_at) VALUES(999,4,'stale','bad','now')")
+    master.rollback()
+    master.execute("UPDATE store_order_change_proposals SET status='withdrawn' WHERE id=?", (pid,))
+    master.commit()
+    with pytest.raises(sqlite3.IntegrityError, match='cannot reopen'):
+        master.execute("UPDATE store_order_change_proposals SET status='pending' WHERE id=?", (pid,))
+    master.rollback()
+
+
+def test_automatic_full_retry_uses_original_request_not_new_remaining(ship_env):
+    e = ship_env
+    order, _ = e['create_order']([(101, 4, 'A')])
+    first = sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no='auto-original')
+    second = sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no='auto-original')
+    assert first['delivery_id'] == second['delivery_id'] and second['idempotent']
+    assert e['stock']('A', 101) == 6
+
+
+def test_unclaimed_legacy_movement_and_reversal_cannot_be_adopted(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    key = f'old-request:{ids[0]}'
+    with sop.open_warehouse_db('A') as wh:
+        item_id = wh.execute('SELECT id FROM items WHERE canonical_id=101').fetchone()[0]
+        for op, delta in ((key, -2), ('REV:' + key, 2)):
+            wh.execute("INSERT INTO stock_movements(item_id,action,delta,note,created_at,op_no) VALUES(?,'门店订货出库',?,'legacy','now',?)", (item_id, delta, op))
+    with pytest.raises(ValueError, match='旧仓库请求或REV'):
+        _ship(e, order, 'A', 'old-request', {ids[0]: 3})
+    assert changes.get_claim(e['master'], 'old-request') is None
+    assert e['stock']('A', 101) == 10
