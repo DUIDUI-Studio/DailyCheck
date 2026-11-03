@@ -2362,7 +2362,8 @@ committed 直接返回原配送，不依赖最新 remaining/blocked/绑定；act
 无 mode 且无 scalar 的歧义键失败关闭待核对，不猜 explicit/full，不回写历史 hash。
 explicit 的原始 map 同时保留给新批次的成员校验；hash 虽仅含正数量行，外来行 ID
 即使数量为零仍沿用原能力明确拒绝，不能先滤除零项而绕过此校验。
-归属校验也覆盖已有 claim 的 explicit 重放；该校验只读订单成员集合，不重算当前
+最终短 master 事务读完订单后，归属校验也覆盖已有 claim 的 explicit 重放；
+该校验只读订单成员集合，不重算当前
 remaining、不重新解析单位/绑定，避免把合法 committed 重放重新绑定到可变准备状态。
 
 部署前所有 Web 写实例必须具备此协议且旧执行者排空；提议入口持续关闭，
