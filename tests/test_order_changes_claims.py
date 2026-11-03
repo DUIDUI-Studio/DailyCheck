@@ -433,6 +433,22 @@ def test_caller_owned_transaction_is_rejected_before_warehouse_access(ship_env):
     assert changes.get_claim(e['master'], 'deferred-caller') is None
 
 
+@pytest.mark.parametrize('replay', [False, True])
+def test_raw_explicit_foreign_zero_id_never_bypasses_membership(ship_env, replay):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    if replay:
+        _ship(e, order, 'A', 'raw-membership', {ids[0]: 3})
+    before = changes.get_claim(e['master'], 'raw-membership')
+    stock = e['stock']('A', 101)
+    deliveries = [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_deliveries')]
+    with pytest.raises(ValueError):
+        _ship(e, order, 'A', 'raw-membership', {999999: 0, ids[0]: 3})
+    assert changes.get_claim(e['master'], 'raw-membership') == before
+    assert e['stock']('A', 101) == stock
+    assert [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_deliveries')] == deliveries
+
+
 @pytest.mark.parametrize('change', ['unit', 'binding'])
 def test_active_executor_keeps_frozen_binding_after_preparation(ship_env, change):
     e = ship_env
