@@ -3,6 +3,7 @@ import hashlib
 import http.cookiejar
 import json
 import re
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -49,7 +50,9 @@ def identity_http(e, order_id):
             except urllib.error.HTTPError as exc:
                 response = exc
             with response:
-                return response.status, json.loads(response.read())
+                body = response.read().decode()
+                return response.status, (json.loads(body) if response.headers.get_content_type() ==
+                    'application/json' else {'ok': False, 'html': body})
 
         yield post
     finally:
@@ -75,7 +78,7 @@ def test_original_identity_survives_concurrent_first_request(ship_env, monkeypat
 
 
 @pytest.mark.parametrize('mode,phase', [('full', 'early-full'),
-    ('explicit', 'binding'), ('explicit', 'later-batch')])
+    ('explicit', 'binding'), ('explicit', 'later-batch'), ('explicit', 'prepare-error-active')])
 def test_replay_ignores_mutable_preparation(ship_env, monkeypatch, mode, phase):
     _identity_window(ship_env, monkeypatch, mode, phase)
 
@@ -84,9 +87,11 @@ def _identity_window(e, monkeypatch, mode, phase):
     order, ids = e['create_order']([(101, 4, 'A')])
     reached, release = threading.Event(), threading.Event()
     wh_reached, wh_release = threading.Event(), threading.Event()
-    armed, guard, responses, failures = [True], threading.Lock(), {}, []
+    armed, wh_armed, guard, responses, failures = [True], [True], threading.Lock(), {}, []
     original_get, original_begin = changes.get_claim, sop._begin_immediate
     original_apply, original_binding = sop._apply_warehouse_shipment, sop.resolve_fulfillment_item
+    original_result, original_notify = sop._ship_result, sop.notify_order_event
+    deliveries, notices = [], []
 
     def pause():
         with guard:
@@ -95,10 +100,18 @@ def _identity_window(e, monkeypatch, mode, phase):
         if first:
             reached.set()
             assert release.wait(15), 'identity barrier timeout'
+        return first
 
     def get(*args, **kwargs):
         result = original_get(*args, **kwargs)
-        if result is None and phase not in ('pre-lock', 'binding'):
+        caller = sys._getframe(1).f_code.co_name
+        # Delay the completed optimistic read, rather than the first SELECT of
+        # the old resolver (which performed two reads). Both source versions
+        # pause before any authoritative write lock is acquired.
+        optimistic = (caller == 'ship_partial' or
+            (caller == 'resolve_ship_payload' and len(args) == 3) or
+            (phase == 'early-full' and caller == '_ship_order_full_impl'))
+        if result is None and optimistic and phase not in ('pre-lock', 'binding', 'prepare-error-active'):
             pause()
         return result
 
@@ -108,21 +121,39 @@ def _identity_window(e, monkeypatch, mode, phase):
         return original_begin(*args)
 
     def binding(*args, **kwargs):
-        if phase == 'binding':
-            pause()
+        if phase in ('binding', 'prepare-error-active') and sys._getframe(1).f_code.co_name == 'ship_partial':
+            if pause() and phase == 'prepare-error-active':
+                # Actual SQLite preparation error, with the valid active batch
+                # still executable through its frozen claim on another connection.
+                args[1].execute('SELECT * FROM missing_preparation_table')
         return original_binding(*args, **kwargs)
 
     def apply(*args, **kwargs):
         result = original_apply(*args, **kwargs)
-        if phase in ('warehouse', 'early-full'):
+        with guard:
+            first = wh_armed[0]
+            wh_armed[0] = False
+        if first and phase in ('warehouse', 'early-full', 'prepare-error-active'):
             wh_reached.set()
             assert wh_release.wait(15), 'warehouse barrier timeout'
         return result
+
+    def result(*args, **kwargs):
+        value = original_result(*args, **kwargs)
+        if kwargs['op_no'] == 'identity-request':
+            deliveries.append(value['delivery_id'])
+        return value
+
+    def notify(*args, **kwargs):
+        notices.append(args[1])
+        return original_notify(*args, **kwargs)
 
     monkeypatch.setattr(changes, 'get_claim', get)
     monkeypatch.setattr(sop, '_begin_immediate', begin)
     monkeypatch.setattr(sop, 'resolve_fulfillment_item', binding)
     monkeypatch.setattr(sop, '_apply_warehouse_shipment', apply)
+    monkeypatch.setattr(sop, '_ship_result', result)
+    monkeypatch.setattr(sop, 'notify_order_event', notify)
     with identity_http(e, order) as post:
         data = identity_form(mode, ids[0])
 
@@ -138,7 +169,7 @@ def _identity_window(e, monkeypatch, mode, phase):
             delayed.start()
             assert reached.wait(15)
             assert original_get(e['master'], data['op_no']) is None
-            if phase in ('warehouse', 'early-full'):
+            if phase in ('warehouse', 'early-full', 'prepare-error-active'):
                 winner = threading.Thread(target=request, args=('winner',))
                 winner.start()
                 assert wh_reached.wait(15)
@@ -164,12 +195,16 @@ def _identity_window(e, monkeypatch, mode, phase):
             observed = {'mode': mode, 'phase': phase, 'responses': responses,
                 'stock': e['stock']('A', 101), 'movements': movements,
                 'deliveries': e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0],
-                'claim': claim, 'failures': failures}
+                'claim': claim, 'result_delivery_ids': deliveries, 'notices': notices,
+                'notifications': e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0],
+                'failures': failures}
             print(json.dumps(observed, ensure_ascii=False))
             assert not failures
             assert observed['stock'] == (6 if mode == 'full' or phase == 'later-batch' else 7)
             assert observed['deliveries'] == (2 if phase == 'later-batch' else 1)
             assert movements == 1 and claim['state'] == 'committed'
+            assert deliveries == [claim['delivery_id'], claim['delivery_id']]
+            assert len(notices) == (1 if mode == 'full' or phase == 'later-batch' else 0)
             assert claim['payload_hash'] == changes.payload_hash(json.loads(claim['payload_json']))
             assert all(status == 200 and body['ok'] for status, body in responses.values()), responses
         finally:
@@ -188,6 +223,7 @@ def test_original_modes_cannot_exchange_identical_frozen_batch(ship_env, first, 
     with identity_http(e, order) as post:
         assert post(identity_form(first, ids[0], 4))[0] == 200
         before = changes.get_claim(e['master'], 'identity-request')
+        assert json.loads(before['payload_json'])['request_mode'] == {'qty': 'legacy_qty'}.get(first, first)
         notifications = e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0]
         status, body = post(identity_form(retry, ids[0], 4))
         assert e['stock']('A', 101) == 6
@@ -195,6 +231,86 @@ def test_original_modes_cannot_exchange_identical_frozen_batch(ship_env, first, 
         assert changes.get_claim(e['master'], 'identity-request') == before
         assert e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0] == notifications
         assert status == 409 and not body['ok']
+
+
+@pytest.mark.parametrize('legacy_scalar,tamper', [(True, False), (True, True), (False, False)])
+def test_unmarked_claim_requires_provable_scalar_and_original_hash(ship_env, legacy_scalar, tamper):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    detail = sop.get_order_detail(e['master'], order)
+    # Seed the pre-mode shape without rewriting any immutable persisted hash.
+    payload = {'order_id': order, 'source': 'A', 'lines': [[ids[0], '3.00']]}
+    if legacy_scalar:
+        payload['legacy_quantity'] = '3.00'
+    digest = changes.payload_hash(payload) if not tamper else '0' * 64
+    e['master'].execute("""INSERT INTO store_order_ship_claims
+        (op_no,order_id,source_warehouse_code,payload_hash,payload_json,state,actor_id,created_at)
+        VALUES ('unmarked',?,'A',?,?,'active',2,'now')""",
+        (order, digest, changes.canonical_json(payload)))
+    with sop.open_warehouse_db('A') as wh:
+        item_id = wh.execute('SELECT id FROM items WHERE canonical_id=101').fetchone()[0]
+    item = detail['order_items'][0]
+    e['master'].execute("""INSERT INTO store_order_ship_claim_lines
+        (op_no,order_id,order_item_id,quantity,base_line_revision,baseline_quantity,
+         baseline_shipped,canonical_id,dc_item_id,unit,state)
+        VALUES ('unmarked',?,?,3,?,4,0,101,?,'件','active')""",
+        (order, ids[0], item['line_revision'], item_id))
+    e['master'].commit()
+    with identity_http(e, order) as post:
+        status, _ = post(identity_form('qty' if legacy_scalar else 'explicit', ids[0], key='unmarked'))
+        after = changes.get_claim(e['master'], 'unmarked')
+        assert after['payload_json'] == changes.canonical_json(payload)
+        assert after['payload_hash'] == digest
+        if legacy_scalar and not tamper:
+            assert status == 200 and after['state'] == 'committed'
+            assert post(identity_form('qty', ids[0], key='unmarked'))[0] == 200
+            assert post(identity_form('qty', ids[0], 2, 'unmarked'))[0] == 409
+            assert e['stock']('A', 101) == 7
+        else:
+            assert status == 409 and after['state'] == 'active'
+            assert e['stock']('A', 101) == 10
+            assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('change', ['unit', 'binding', 'permission'])
+def test_committed_identity_ignores_binding_but_rechecks_permission(ship_env, change):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    with identity_http(e, order) as post:
+        form = identity_form('explicit', ids[0])
+        assert post(form)[0] == 200
+        before = changes.get_claim(e['master'], 'identity-request')
+        if change == 'permission':
+            e['master'].execute("UPDATE warehouse_users SET role='viewer' WHERE user_id=2")
+            e['master'].commit()
+            with pytest.raises(ValueError):
+                protocol._ship(e, order, 'A', 'identity-request', {ids[0]: 3})
+        else:
+            with sop.open_warehouse_db('A') as wh:
+                if change == 'unit':
+                    wh.execute("UPDATE items SET unit='箱' WHERE canonical_id=101")
+                else:
+                    wh.execute('UPDATE items SET is_active=0 WHERE canonical_id=101')
+        status, _ = post(form)
+        assert e['stock']('A', 101) == 7
+        assert changes.get_claim(e['master'], 'identity-request') == before
+        assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 1
+        assert status == (403 if change == 'permission' else 200)
+
+
+def test_full_replays_only_original_source_batch_after_unpause(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A'), (102, 3, 'A'), (101, 2, 'B')])
+    pid = seed_proposal(e['master'], order, [ids[1]])
+    first = sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no='full-paused')
+    e['master'].execute("UPDATE store_order_change_proposals SET status='withdrawn' WHERE id=?", (pid,))
+    e['master'].commit()
+    second = sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no='full-paused')
+    assert first['delivery_id'] == second['delivery_id']
+    assert second['status'] == 'approved'
+    assert e['stock']('A', 101) == 6 and e['stock']('A', 102) == e['stock']('B', 101) == 10
+    payload = json.loads(changes.get_claim(e['master'], 'full-paused')['payload_json'])
+    assert payload == {'order_id': order, 'source': 'A', 'request_mode': 'full', 'lines': [[ids[0], '4.00']]}
 
 
 def login(e, user=4, warehouse=1):

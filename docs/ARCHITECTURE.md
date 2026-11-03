@@ -2348,9 +2348,18 @@ ship_partial：解析冻结履约行后，在 master 短事务重新校验 appro
 不可落配送。旧 cancel 也检查活动占用；人工孤儿核对对有 claim 的请求先走 fence，
 旧无 claim 请求仍按原人工核对边界处理，不能在旧执行者未排空时运行此核对。
 自动全发跳过暂停/占用行，显式批次含任一暂停正数量行整批拒绝。
-legacy HTTP qty 先作为原始标量写入完整 payload，再适配当时本仓剩余量；
-同键同原始 qty 重放持久批次，不按新 remaining 再裁剪，避免部分发货后误报 409。
-锁内再次解析请求身份以覆盖并发首请求；异 qty/订单/来源/显式行仍拒绝，hash 检查不放宽。
+三入口保留原始 `request_mode=explicit|legacy_qty|full`，模式与 scalar 原始归一量
+进入完整 payload hash；explicit 始终比较调用者完整 map，full/scalar 仅重放首次冻结批次。
+锁外读取只是提示：选行、旧流水观察、仓库连接/绑定解析及真实异常均为准备结果。
+唯一最终 `BEGIN IMMEDIATE` 先读当前 claim、比原始意图/完整 hash 并重查权限，
+committed 直接返回原配送，不依赖最新 remaining/blocked/绑定；active 恢复冻结行继续既有
+执行协议，不能因迟到者准备失败触发 fence；recovering/aborted 拒绝，只有仍无 claim
+才核对旧记录、当前 approved/有效量/pending、准备计划和冻结绑定后注册。
+准备与锁内新选批不一致时明确拒绝重试，不持 master 写锁重新连接/迁移仓库。
+发货要求独立 master 事务；调用者自有事务会在访问仓库前明确拒绝，不能把
+`in_transaction` 当作已取得写入序列化能力。执行/恢复的锁顺序及 finalize 的 REV 检查保留。
+旧无 mode 且有 legacy_quantity 的 scalar 只在原量可证及原完整 JSON/hash 严格匹配时重放；
+无 mode 且无 scalar 的歧义键失败关闭待核对，不猜 explicit/full，不回写历史 hash。
 
 部署前所有 Web 写实例必须具备此协议且旧执行者排空；提议入口持续关闭，
 兼容回退不可删除 active/recovering claim。

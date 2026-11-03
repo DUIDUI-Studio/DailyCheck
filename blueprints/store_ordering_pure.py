@@ -11,7 +11,6 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §6.
 """
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import uuid
@@ -2413,85 +2412,152 @@ def _finalise_order_state(
     return True
 
 
+def _new_ship_plan(master_conn, order, source, op_no, line_qty, mode, legacy_quantity):
+    """Select a genuinely new batch; never use this to classify an existing key."""
+    if order['status'] != ORDER_STATUS_APPROVED:
+        raise ValueError(f"order must be approved to ship, got {order['status']!r}")
+    if mode != 'explicit':
+        blocked = ocp.blocked_lines(master_conn, order['id'])
+        line_qty = {}
+        for item in order['order_items']:
+            if source is not None and _line_source_warehouse(order, item) != source:
+                continue
+            if int(item['id']) in blocked:
+                continue
+            remaining = parse_qty(item['quantity']) - parse_qty(item.get('shipped_quantity') or 0)
+            if remaining > 0:
+                line_qty[int(item['id'])] = (min(legacy_quantity, remaining)
+                    if mode == 'legacy_qty' else remaining)
+    if source is None:
+        sources = {_line_source_warehouse(order, item) for item in order['order_items']
+                   if int(item['id']) in line_qty}
+        if len(sources) > 1:
+            raise ValueError('订单跨仓，必须显式指定操作仓')
+        source = next(iter(sources), order['dc_warehouse_code'])
+    return source, _select_ship_lines(order, line_qty, source, op_no)
+
+
+def _ship_plan_signature(selected):
+    """Bind lock-free item resolution to exactly the plan adjudicated in master."""
+    return sorted((oid, qty, item['canonical_id'], item['unit'], item.get('dc_item_id'),
+        item['line_revision'], item['quantity'], item['shipped_quantity'])
+        for oid, item, qty in selected)
+
+
 def ship_partial(
     master_conn: sqlite3.Connection,
     wh_conn_factory,
     *,
     order_id: int,
-    operator_dc_code: str,
+    operator_dc_code: str | None,
     op_no: str,
     line_qty: dict[int, float],
     shipped_by: int,
     tracking_note: str | None = None,
     legacy_quantity: float | None = None,
+    request_mode: str | None = None,
 ) -> dict[str, Any]:
     """Ship one source warehouse's lines under a caller-supplied idempotency key.
 
-    Protocol (spec v2 §7/§8):
-      1. Validate every line's frozen source equals ``operator_dc_code``.
-      2. Warehouse db ``BEGIN IMMEDIATE``: conditional atomic decrement
-         (``WHERE quantity >= ?``) + ``stock_movements(op_no)``; a line already
-         carrying this request's derived key is skipped (retry-safe).
-      3. Master db ``BEGIN IMMEDIATE``: insert batch header + line rows
-         (``store_order_delivery_items.op_no`` UNIQUE → same request returns
-         the existing batch), accumulate ``shipped_quantity`` with a guard,
-         re-read **all** lines inside the lock and conditionally migrate
-         ``approved → shipped`` exactly once.
+    Prepare bindings without a master write lock, then adjudicate original
+    intent and register the frozen batch in one short master transaction.
+    Warehouse execution and master finalization retain their active/fence/REV
+    checks and conditional stock/quantity updates; committed replay skips them.
     """
     if not op_no:
         raise ValueError("op_no is required")
+    if operator_dc_code is not None and not operator_dc_code:
+        raise ValueError('操作仓不能为空')
+    # An arbitrary caller transaction may already hold a master write lock.
+    # Do not open/migrate a warehouse beneath that unknown lock ordering.
+    if master_conn.in_transaction:
+        raise ValueError('发货必须在独立master事务中执行，请先结束调用者事务')
+    mode = request_mode or ('legacy_qty' if legacy_quantity is not None else 'explicit')
+    if mode not in ('explicit', 'legacy_qty', 'full'):
+        raise ValueError('无效发货请求模式')
+    if mode == 'legacy_qty':
+        legacy_quantity = float(ocp.quantity(legacy_quantity))
+        if legacy_quantity <= 0:
+            raise ValueError('发货数量必须大于 0')
+    elif legacy_quantity is not None:
+        raise ValueError('原始数量与请求模式不符')
+    if mode == 'explicit':
+        raw = ocp.ship_payload(order_id, operator_dc_code or '', line_qty)
+        line_qty = {int(oid): float(qty) for oid, qty in raw['lines']}
     master_conn.row_factory = sqlite3.Row
-    payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no, order_id=order_id,
-        source=operator_dc_code, line_qty=line_qty, legacy_quantity=legacy_quantity)
-    normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
-    effective_line_qty = normalized if legacy_quantity is not None else line_qty
-    # Binding resolution has no master write lock and does not touch stock.
-    frozen = {}
-    if claim is None:
-        order = get_order_detail(master_conn, order_id)
-        if order is None:
-            raise ValueError(f"order_id={order_id} not found")
-        selected = _select_ship_lines(order, effective_line_qty, operator_dc_code, op_no)
-        wh = wh_conn_factory(operator_dc_code)
-        try:
-            prefix = op_no + ':'
-            if master_conn.execute('SELECT 1 FROM store_order_delivery_items WHERE substr(op_no,1,?)=? LIMIT 1',
-                                   (len(prefix), prefix)).fetchone():
-                raise ValueError('旧发货请求无claim，须人工核对，不可复用op_no')
-            if wh.execute('SELECT 1 FROM stock_movements WHERE substr(op_no,1,?)=? OR substr(op_no,1,?)=? LIMIT 1',
-                          (len(prefix), prefix, len('REV:' + prefix), 'REV:' + prefix)).fetchone():
-                raise ValueError('旧仓库请求或REV已存在且无claim，须人工核对，不可复用op_no')
-            for oid, item, _ in selected:
-                resolved = resolve_fulfillment_item(master_conn, wh,
-                    canonical_id=item['canonical_id'], warehouse_code=operator_dc_code)
-                if (item.get('dc_item_id') is not None and item['dc_item_id'] != resolved['item_id']) or item['unit'] != resolved['unit']:
-                    raise ValueError('冻结履约行/单位已变更，拒绝换行扣库')
-                frozen[oid] = int(resolved['item_id'])
-        finally:
-            wh.close()
+    prepared, prepared_source, frozen, preparation_error, legacy_warehouse = [], None, {}, None, False
+    # A missing optimistic read is only a hint. Capture every mutable preparation
+    # result, including real exceptions, until the authoritative short write lock.
+    try:
+        hint = ocp.get_claim(master_conn, op_no)
+        if hint is None:
+            order = get_order_detail(master_conn, order_id)
+            if order is None:
+                raise ValueError(f"order_id={order_id} not found")
+            prepared_source, prepared = _new_ship_plan(master_conn, order,
+                operator_dc_code, op_no, line_qty, mode, legacy_quantity)
+            wh = wh_conn_factory(prepared_source)
+            try:
+                prefix = op_no + ':'
+                legacy_warehouse = wh.execute(
+                    'SELECT 1 FROM stock_movements WHERE substr(op_no,1,?)=? OR substr(op_no,1,?)=? LIMIT 1',
+                    (len(prefix), prefix, len('REV:' + prefix), 'REV:' + prefix)).fetchone() is not None
+                for oid, item, _ in prepared:
+                    resolved = resolve_fulfillment_item(master_conn, wh,
+                        canonical_id=item['canonical_id'], warehouse_code=prepared_source)
+                    if ((item.get('dc_item_id') is not None and item['dc_item_id'] != resolved['item_id'])
+                            or item['unit'] != resolved['unit']):
+                        raise ValueError('冻结履约行/单位已变更，拒绝换行扣库')
+                    frozen[oid] = int(resolved['item_id'])
+            finally:
+                wh.close()
+    except Exception as exc:
+        preparation_error = exc
     owns_tx = _begin_immediate(master_conn)
     try:
-        payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no, order_id=order_id,
-            source=operator_dc_code, line_qty=line_qty, legacy_quantity=legacy_quantity)
-        normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
-        effective_line_qty = normalized if legacy_quantity is not None else line_qty
+        claim = ocp.get_claim(master_conn, op_no)
         order = get_order_detail(master_conn, order_id)
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
-        ocp.assert_ship_permission(master_conn, order, shipped_by, operator_dc_code)
-        if claim is not None and claim['state'] == 'committed':
-            master_conn.commit()
-            return _ship_result(master_conn, order_id, delivery_id=claim['delivery_id'],
-                op_no=op_no, warehouse_code=operator_dc_code, selected_ids=list(normalized), idempotent=True)
-        if claim is not None and claim['state'] != 'active':
-            raise ValueError('发货占用已恢复或终结，不可复用op_no')
-        selected = _select_ship_lines(order, effective_line_qty, operator_dc_code, op_no)
-        if claim is None:
+        if claim is not None:
+            source = operator_dc_code or claim['source_warehouse_code']
+            ocp.assert_ship_permission(master_conn, order, shipped_by, source)
+            payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no,
+                order_id=order_id, source=source, line_qty=line_qty,
+                legacy_quantity=legacy_quantity, request_mode=mode)
+            normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
+            if claim['state'] == 'committed':
+                master_conn.commit()
+                return _ship_result(master_conn, order_id, delivery_id=claim['delivery_id'],
+                    op_no=op_no, warehouse_code=source, selected_ids=list(normalized), idempotent=True)
+            if claim['state'] != 'active':
+                raise ValueError('发货占用已恢复或终结，不可复用op_no')
+            items = {int(item['id']): item for item in order['order_items']}
+            selected = [(oid, items[oid], qty) for oid, qty in normalized.items()]
+            ocp.assert_active_claim(master_conn, op_no, order_id=order_id,
+                                    source=source, selected=selected)
+        else:
+            prefix = op_no + ':'
+            if master_conn.execute(
+                    'SELECT 1 FROM store_order_delivery_items WHERE substr(op_no,1,?)=? LIMIT 1',
+                    (len(prefix), prefix)).fetchone():
+                raise ValueError('旧发货请求无claim，须人工核对，不可复用op_no')
+            if legacy_warehouse:
+                raise ValueError('旧仓库请求或REV已存在且无claim，须人工核对，不可复用op_no')
+            source, selected = _new_ship_plan(master_conn, order, operator_dc_code,
+                op_no, line_qty, mode, legacy_quantity)
+            ocp.assert_ship_permission(master_conn, order, shipped_by, source)
+            if preparation_error is not None:
+                raise preparation_error
+            if (_ship_plan_signature(selected) != _ship_plan_signature(prepared)
+                    or source != prepared_source or set(frozen) != {oid for oid, _, _ in selected}):
+                raise ValueError('发货准备期间订单已变化，请重新发起请求')
+            payload = ocp.ship_payload(order_id, source, {oid: qty for oid, _, qty in selected},
+                legacy_quantity=legacy_quantity, request_mode=mode)
+            normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
             ocp.register_claim(master_conn, op_no=op_no, order=order, payload=payload,
                                selected=selected, frozen=frozen, actor_id=shipped_by)
-        else:
-            ocp.assert_active_claim(master_conn, op_no, order_id=order_id,
-                                    source=operator_dc_code, selected=selected)
+        operator_dc_code = source
         master_conn.commit()
     except Exception:
         if owns_tx and master_conn.in_transaction:
@@ -2703,19 +2769,11 @@ def ship_legacy_quantity(master_conn: sqlite3.Connection, *, order_id: int,
     requested = parse_qty(quantity)
     if requested <= 0:
         raise ValueError('发货数量必须大于 0')
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f'order_id={order_id} not found')
-    line_qty = {}
-    for item in order['order_items']:
-        if _line_source_warehouse(order, item) != operator_dc_code or item.get('ship_blocked_reason'):
-            continue
-        remaining = parse_qty(item['quantity']) - parse_qty(item.get('shipped_quantity') or 0)
-        if remaining > 0:
-            line_qty[int(item['id'])] = min(requested, remaining)
     return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
-        operator_dc_code=operator_dc_code, op_no=op_no, line_qty=line_qty,
-        shipped_by=shipped_by, tracking_note=tracking_note, legacy_quantity=requested)
+        operator_dc_code=operator_dc_code, op_no=op_no, line_qty={},
+        shipped_by=shipped_by, tracking_note=tracking_note, legacy_quantity=requested,
+        request_mode='legacy_qty')
+
 
 def ship_order_full(
     master_conn: sqlite3.Connection,
@@ -2750,56 +2808,10 @@ def _ship_order_full_impl(
     operator_dc_code: str | None = None,
     op_no: str | None = None,
 ) -> dict[str, Any]:
-    """Legacy one-shot: build a full-batch map and run partial-ship on it."""
-    master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    if op_no:
-        claim = ocp.get_claim(master_conn, op_no)
-        if claim is not None:
-            if claim['order_id'] != order_id or (operator_dc_code is not None and claim['source_warehouse_code'] != operator_dc_code):
-                raise ValueError('op_no 已属于其他订单或操作仓')
-            payload = json.loads(claim['payload_json'])
-            return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
-                operator_dc_code=claim['source_warehouse_code'], op_no=op_no,
-                line_qty={int(oid): float(qty) for oid, qty in payload['lines']},
-                shipped_by=shipped_by, tracking_note=tracking_note)
-    if order["status"] != ORDER_STATUS_APPROVED:
-        raise ValueError(
-            f"order must be approved to ship, got {order['status']!r}"
-        )
-    items_map: dict[int, float] = {}
-    sources: set[str] = set()
-    for item in order["order_items"]:
-        source = _line_source_warehouse(order, item)
-        if operator_dc_code is not None and source != operator_dc_code:
-            continue
-        if int(item['id']) in ocp.blocked_lines(master_conn, order_id):
-            continue
-        already = parse_qty(item.get("shipped_quantity") or 0)
-        remaining = parse_qty(item["quantity"]) - already
-        if remaining > 0:
-            items_map[int(item["id"])] = remaining
-            sources.add(source)
-    if not items_map:
-        if operator_dc_code is not None:
-            raise ValueError(f"操作仓 {operator_dc_code} 无可发货明细")
-        raise ValueError("订单已全部发齐，无需再次发货")
-    if operator_dc_code is None:
-        if len(sources) != 1:
-            raise ValueError("订单跨仓，必须显式指定操作仓")
-        operator_dc_code = next(iter(sources))
-    return ship_partial(
-        master_conn,
-        open_warehouse_db,
-        order_id=order_id,
-        operator_dc_code=operator_dc_code,
-        op_no=op_no or generate_op_no(),
-        line_qty=items_map,
-        shipped_by=shipped_by,
-        tracking_note=tracking_note,
-    )
+    """Keep full intent intact until the common master identity adjudication."""
+    return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+        operator_dc_code=operator_dc_code, op_no=op_no or generate_op_no(),
+        line_qty={}, shipped_by=shipped_by, tracking_note=tracking_note, request_mode='full')
 
 
 def _ship_order_partial_impl(
@@ -2811,45 +2823,10 @@ def _ship_order_partial_impl(
     *,
     op_no: str | None = None,
 ) -> dict[str, Any]:
-    """Backwards-compatible wrapper around the cross-warehouse protocol.
-
-    Resolves the operation warehouse from the selected lines' frozen sources;
-    HTTP callers pass an explicit session warehouse to ``ship_partial``.
-    """
-    master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    items_by_id = {int(it["id"]): it for it in order["order_items"]}
-    sources: set[str] = set()
-    for raw_id, raw_qty in shipped_items_map.items():
-        try:
-            qty = parse_qty(raw_qty)
-        except (TypeError, ValueError):
-            continue
-        try:
-            item = items_by_id.get(int(raw_id))
-        except (TypeError, ValueError):
-            item = None
-        if item is None or qty <= 0:
-            continue
-        sources.add(_line_source_warehouse(order, item))
-    if not sources:
-        operator_dc_code = order["dc_warehouse_code"]
-    elif len(sources) == 1:
-        operator_dc_code = next(iter(sources))
-    else:
-        raise ValueError("订单跨仓，必须显式指定操作仓")
-    return ship_partial(
-        master_conn,
-        open_warehouse_db,
-        order_id=order_id,
-        operator_dc_code=operator_dc_code,
-        op_no=op_no or generate_op_no(),
-        line_qty=shipped_items_map,
-        shipped_by=shipped_by,
-        tracking_note=tracking_note,
-    )
+    """Infer the single frozen source inside the common identity adjudication."""
+    return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+        operator_dc_code=None, op_no=op_no or generate_op_no(), line_qty=shipped_items_map,
+        shipped_by=shipped_by, tracking_note=tracking_note, request_mode='explicit')
 
 
 # Order statuses in which the storefront is allowed to receive goods.

@@ -93,7 +93,8 @@ def assert_ship_permission(conn: sqlite3.Connection, order: dict, actor_id: int,
 
 
 def ship_payload(order_id: int, source: str, line_qty: dict[int, float], *,
-                 legacy_quantity: float | str | None = None) -> dict:
+                 legacy_quantity: float | str | None = None,
+                 request_mode: str | None = 'explicit') -> dict:
     normalized: dict[int, str] = {}
     for key, raw in line_qty.items():
         try:
@@ -108,6 +109,8 @@ def ship_payload(order_id: int, source: str, line_qty: dict[int, float], *,
     if not normalized:
         raise ValueError('本批发货数量全部为空，请至少填写一项')
     payload = {'order_id': int(order_id), 'source': source, 'lines': sorted(normalized.items())}
+    if request_mode is not None:
+        payload['request_mode'] = request_mode
     if legacy_quantity is not None:
         payload['legacy_quantity'] = quantity(legacy_quantity)
     return payload
@@ -115,21 +118,34 @@ def ship_payload(order_id: int, source: str, line_qty: dict[int, float], *,
 
 def resolve_ship_payload(conn: sqlite3.Connection, *, op_no: str, order_id: int,
                          source: str, line_qty: dict[int, float],
-                         legacy_quantity: float | None = None) -> tuple[dict, dict | None]:
-    """Bind legacy scalar input before adapting it against mutable remaining stock.
+                         legacy_quantity: float | None = None,
+                         request_mode: str = 'explicit') -> tuple[dict, dict | None]:
+    """Adjudicate raw intent against the current claim under the master write lock.
 
-    Re-run under the claim lock: a concurrent first request may have frozen its
-    batch since the optimistic binding read. Explicit line requests always use
-    their complete caller-supplied payload and never take this replay branch.
+    Full/scalar replay the original batch; explicit input must supply its entire
+    original map. Unmarked non-scalar claims cannot prove their wire mode.
     """
     claim = get_claim(conn, op_no)
-    if claim is not None and legacy_quantity is not None:
+    stored_mode = request_mode
+    if claim is not None:
         saved = json.loads(claim['payload_json'])
-        if (saved['order_id'] != order_id or saved['source'] != source or
-                saved.get('legacy_quantity') != quantity(legacy_quantity)):
-            raise ValueError('op_no 已用于不同原始发货请求，拒绝复用')
-        return saved, get_claim(conn, op_no, saved)
-    payload = ship_payload(order_id, source, line_qty, legacy_quantity=legacy_quantity)
+        if claim['payload_hash'] != payload_hash(saved):
+            raise ValueError('持久发货请求与原hash不一致，须人工核对')
+        stored_mode = saved.get('request_mode')
+        if stored_mode is None:
+            if 'legacy_quantity' not in saved:
+                raise ValueError('旧发货请求缺少原始模式，须人工核对，不可猜测重放')
+            matches_mode = request_mode == 'legacy_qty'
+        else:
+            matches_mode = stored_mode == request_mode
+        if (not matches_mode or saved['order_id'] != order_id or saved['source'] != source or
+                (request_mode == 'legacy_qty' and
+                 saved.get('legacy_quantity') != quantity(legacy_quantity))):
+            raise ValueError('op_no 已用于不同完整发货请求或原始模式，拒绝复用')
+        if request_mode in ('full', 'legacy_qty'):
+            line_qty = {int(oid): qty for oid, qty in saved['lines']}
+    payload = ship_payload(order_id, source, line_qty, legacy_quantity=legacy_quantity,
+                           request_mode=stored_mode)
     return payload, get_claim(conn, op_no, payload)
 
 
@@ -179,7 +195,8 @@ def assert_active_claim(conn: sqlite3.Connection, op_no: str, *, order_id: int,
         raise ValueError('发货占用已恢复或终结，迟到请求不可执行')
     saved = json.loads(claim['payload_json'])
     payload = ship_payload(order_id, source, {oid: qty for oid, _, qty in selected},
-                           legacy_quantity=saved.get('legacy_quantity'))
+                           legacy_quantity=saved.get('legacy_quantity'),
+                           request_mode=saved.get('request_mode'))
     get_claim(conn, op_no, payload)
     rows = claim_lines(conn, op_no)
     items = {oid: item for oid, item, _ in selected}

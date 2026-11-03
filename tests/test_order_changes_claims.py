@@ -328,3 +328,165 @@ def test_ship_permission_reloaded_after_binding_resolution(ship_env):
     assert observed['deliveries'] == 0 and observed['claim'] is None
     assert observed['master_writes'] == 0
     assert isinstance(failure, ValueError)
+
+
+@pytest.mark.parametrize('record', ['delivery', 'negative', 'rev', 'negative-rev'])
+@pytest.mark.parametrize('already', [1, 4])
+def test_genuine_unclaimed_keys_stay_manual_even_when_full_selection_empty(ship_env, record, already):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    key = 'genuine-old'
+    with sop.open_warehouse_db('A') as wh:
+        local = wh.execute('SELECT id FROM items WHERE canonical_id=101').fetchone()[0]
+        for op, delta in ((key + ':' + str(ids[0]), -already),
+                          ('REV:' + key + ':' + str(ids[0]), already)):
+            if (delta < 0 and record in ('negative', 'negative-rev') or
+                    delta > 0 and record in ('rev', 'negative-rev')):
+                wh.execute("""INSERT INTO stock_movements
+                    (item_id,action,delta,note,created_at,op_no)
+                    VALUES (?,'门店订货出库',?,'legacy','now',?)""", (local, delta, op))
+    if record == 'delivery':
+        item = sop.get_order_detail(e['master'], order)['order_items'][0]
+        sop._insert_master_batch(e['master'], order, 'A', [(ids[0], item, already)],
+            {ids[0]: key + ':' + str(ids[0])}, {ids[0]: local}, key, 2, None, 'now')
+    else:
+        e['master'].execute('UPDATE store_order_items SET shipped_quantity=? WHERE id=?', (already, ids[0]))
+    e['master'].commit()
+    before = [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_deliveries')]
+    with pytest.raises(ValueError):
+        sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no=key)
+    assert e['stock']('A', 101) == 10
+    assert changes.get_claim(e['master'], key) is None
+    assert [tuple(r) for r in e['master'].execute('SELECT * FROM store_order_deliveries')] == before
+
+
+@pytest.mark.parametrize('change', ['missing', 'unit'])
+def test_new_batch_binding_preparation_failure_never_registers(ship_env, change):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    with sop.open_warehouse_db('A') as wh:
+        if change == 'missing':
+            wh.execute('UPDATE items SET is_active=0 WHERE canonical_id=101')
+        else:
+            wh.execute("UPDATE items SET unit='箱' WHERE canonical_id=101")
+    with pytest.raises(ValueError):
+        _ship(e, order, 'A', 'bad-binding', {ids[0]: 3})
+    assert e['stock']('A', 101) == 10
+    assert changes.get_claim(e['master'], 'bad-binding') is None
+    assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 0
+
+
+def test_preparation_factory_does_not_hold_master_write_lock(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    calls = []
+
+    def factory(code):
+        if not calls:
+            assert not e['master'].in_transaction
+            with sqlite3.connect(e['master_path'], timeout=0) as other:
+                other.execute('BEGIN IMMEDIATE')
+                other.rollback()
+        calls.append(code)
+        return sop.open_warehouse_db(code)
+
+    sop.ship_partial(e['master'], factory, order_id=order, operator_dc_code='A',
+        op_no='outside-master', line_qty={ids[0]: 3}, shipped_by=2)
+    assert calls and e['stock']('A', 101) == 7
+
+
+def test_new_full_plan_changed_after_preparation_requires_clean_retry(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A'), (102, 3, 'A')])
+    pid = seed_proposal(e['master'], order, [ids[1]])
+    calls = []
+
+    def factory(code):
+        if not calls:
+            with sqlite3.connect(e['master_path']) as other:
+                other.execute("UPDATE store_order_change_proposals SET status='withdrawn' WHERE id=?", (pid,))
+        calls.append(code)
+        return sop.open_warehouse_db(code)
+
+    with pytest.raises(ValueError):
+        sop.ship_partial(e['master'], factory, order_id=order, operator_dc_code='A',
+            op_no='changed-plan', line_qty={}, shipped_by=2, request_mode='full')
+    assert e['stock']('A', 101) == e['stock']('A', 102) == 10
+    assert changes.get_claim(e['master'], 'changed-plan') is None
+    assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 0
+    sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no='changed-plan')
+    assert e['stock']('A', 101) == 6 and e['stock']('A', 102) == 7
+
+
+def test_caller_owned_transaction_is_rejected_before_warehouse_access(ship_env):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    e['master'].execute('BEGIN')
+    e['master'].execute('SELECT * FROM store_orders').fetchall()
+    factories = []
+    with pytest.raises(ValueError):
+        sop.ship_partial(e['master'], lambda code: factories.append(code), order_id=order,
+            operator_dc_code='A', op_no='deferred-caller', line_qty={ids[0]: 3}, shipped_by=2)
+    assert e['master'].in_transaction and not factories
+    e['master'].rollback()
+    assert e['stock']('A', 101) == 10
+    assert changes.get_claim(e['master'], 'deferred-caller') is None
+
+
+@pytest.mark.parametrize('change', ['unit', 'binding'])
+def test_active_executor_keeps_frozen_binding_after_preparation(ship_env, change):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    worker, release, result = start_ship(e, order, ids[0], 'before_warehouse')
+    try:
+        with sop.open_warehouse_db('A') as wh:
+            if change == 'unit':
+                wh.execute("UPDATE items SET unit='箱' WHERE canonical_id=101")
+            else:
+                wh.execute('UPDATE items SET is_active=0 WHERE canonical_id=101')
+        release.set()
+        worker.join(15)
+        execution = result.get(timeout=2)
+        assert worker.exitcode == 0
+        assert e['stock']('A', 101) == 10
+        assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 0
+        assert changes.get_claim(e['master'], 'process-request')['state'] == 'aborted'
+        assert execution['outcome'] == 'error'
+        assert execution['type'] == ('FulfillmentConflictError' if change == 'unit' else 'FulfillmentMissingError')
+    finally:
+        release.set()
+        worker.join(15)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join()
+
+
+@pytest.mark.parametrize('mode', ['full', 'legacy_qty'])
+@pytest.mark.parametrize('state', ['recovering', 'aborted'])
+def test_raw_wrappers_cannot_revive_fenced_key(ship_env, monkeypatch, mode, state):
+    e = ship_env
+    order, _ = e['create_order']([(101, 4, 'A')])
+
+    def ship():
+        if mode == 'full':
+            return sop.ship_order_full(e['master'], order, 2, operator_dc_code='A', op_no='fenced-raw')
+        return sop.ship_legacy_quantity(e['master'], order_id=order, operator_dc_code='A',
+            op_no='fenced-raw', quantity=3, shipped_by=2)
+
+    def crash(*args, **kwargs):
+        raise RuntimeError('simulated crash before warehouse')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sop, '_apply_warehouse_shipment', crash)
+        with pytest.raises(RuntimeError):
+            ship()
+    with pytest.raises(RuntimeError):
+        changes.recover_shipment(e['master'], crash, 'fenced-raw')
+    if state == 'aborted':
+        changes.recover_shipment(e['master'], sop.open_warehouse_db, 'fenced-raw')
+    before = changes.get_claim(e['master'], 'fenced-raw')
+    with pytest.raises(ValueError):
+        ship()
+    assert before['state'] == state and changes.get_claim(e['master'], 'fenced-raw') == before
+    assert e['stock']('A', 101) == 10
+    assert e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0] == 0
