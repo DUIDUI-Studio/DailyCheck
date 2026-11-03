@@ -1,0 +1,10 @@
+[Unit]
+Description=DailyCheck inbox backpressure watch (self-heal + alert)
+After=dc-inbox-rotate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dc-inbox-backpressure-alert
+
+[Install]
+WantedBy=multi-user.target
