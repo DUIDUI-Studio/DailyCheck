@@ -212,7 +212,8 @@ ORDER BY s.bizDate DESC, s.storeOutID DESC
 """
 
 
-def list_stock(limit: int | None = None, goods_code: str | None = None) -> list[dict]:
+def list_stock(limit: int | None = None, goods_code: str | None = None,
+               *, warehouse: str | None = None) -> list[dict]:
     """当前在库明细（含货位与批次）。"""
     cfg = load_config()
     n = _clamp_limit(limit)
@@ -222,19 +223,27 @@ def list_stock(limit: int | None = None, goods_code: str | None = None) -> list[
     if code:
         sql = sql.replace("ORDER BY b.qty DESC", "AND g.goodsCode = %s\nORDER BY b.qty DESC")
         params.append(code)
+    if warehouse:
+        sql = sql.replace("ORDER BY b.qty DESC", "AND w.warehouse = %s\nORDER BY b.qty DESC")
+        params.append(warehouse)
     # TOP 由 SQL Server 语法承担，避免在 Python 侧截断后丢失 total 语义
     sql = sql.replace("SELECT g.goodsCode", f"SELECT TOP {n} g.goodsCode", 1)
     return _run(sql, tuple(params), cfg)
 
 
-def summarize_stock() -> list[dict]:
+def summarize_stock(*, warehouse: str | None = None) -> list[dict]:
     """按仓库汇总：SKU 数与总件数。"""
     cfg = load_config()
-    return _run(_SUMMARY_SQL, (cfg.customer_id,), cfg)
+    sql = _SUMMARY_SQL
+    params: tuple = (cfg.customer_id,)
+    if warehouse:
+        sql = sql.replace("GROUP BY w.warehouse", "AND w.warehouse = %s\nGROUP BY w.warehouse")
+        params += (warehouse,)
+    return _run(sql, params, cfg)
 
 
 def list_documents(direction: str = "in", date_from: str | None = None,
-                   limit: int | None = None) -> list[dict]:
+                   limit: int | None = None, *, warehouse: str | None = None) -> list[dict]:
     """出入库单据列表。direction 只接受 in / out。"""
     cfg = load_config()
     n = _clamp_limit(limit)
@@ -245,4 +254,28 @@ def list_documents(direction: str = "in", date_from: str | None = None,
     sql = sql.replace("SELECT s.storeInNo", f"SELECT TOP {n} s.storeInNo", 1)
     sql = sql.replace("SELECT s.storeOutNo", f"SELECT TOP {n} s.storeOutNo", 1)
     since = (date_from or "").strip() or None
-    return _run(sql, (cfg.customer_id, since, since), cfg)
+    params: tuple = (cfg.customer_id, since, since)
+    if warehouse:
+        sql = sql.replace("ORDER BY s.bizDate", "AND w.warehouse = %s\nORDER BY s.bizDate")
+        params += (warehouse,)
+    return _run(sql, params, cfg)
+
+
+def list_warehouses() -> list[dict]:
+    """本货主涉及的外仓；含已清空库存但仍有历史单据的仓库。"""
+    cfg = load_config()
+    return _run("""
+SELECT DISTINCT w.warehouse AS warehouse
+FROM sy_warehouse w
+WHERE w.warehouse IS NOT NULL AND w.warehouse <> ''
+  AND (
+    EXISTS (SELECT 1 FROM biz_goodsBalance b
+            JOIN sy_goods g ON g.goodsID = b.goodsID
+            WHERE b.warehouseID = w.warehouseID AND g.customerID = %s)
+    OR EXISTS (SELECT 1 FROM biz_storeIn s
+               WHERE s.warehouseID = w.warehouseID AND s.customerID = %s)
+    OR EXISTS (SELECT 1 FROM biz_storeOut s
+               WHERE s.warehouseID = w.warehouseID AND s.customerID = %s)
+  )
+ORDER BY w.warehouse
+""", (cfg.customer_id, cfg.customer_id, cfg.customer_id), cfg)

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block extra_css %}<link rel="stylesheet" href="{{ url_for('static', filename='wms.css') }}?v=1" />{% endblock %}
+{% block content %}
+<section class="wms-board" aria-labelledby="wms-title">
+  <header class="wms-heading">
+    <div><p class="wms-eyebrow">库存管理 / 外部仓储</p><h2 id="wms-title">外仓信息 <span class="wms-badge">只读</span></h2></div>
+    <p class="muted">查看外仓库存与单据<br>查询不会改变本地或外仓库存</p>
+  </header>
+  <nav class="wms-tabs" aria-label="外仓查询视图">
+    {% for key, label in [('stock', '库存'), ('in', '入库单据'), ('out', '出库单据')] %}
+    <a href="{{ url_for('wms.index', view=key, warehouse=warehouse, goods_code=goods_code, date_from=date_from, limit=limit) }}"{% if view == key %} class="is-active" aria-current="page"{% endif %}>{{ label }}</a>
+    {% endfor %}
+  </nav>
+  <form method="get" class="wms-filters">
+    <input type="hidden" name="view" value="{{ view if view in ['stock', 'in', 'out'] else 'stock' }}">
+    <label for="wms-warehouse"><span>外部仓库</span>
+      <select id="wms-warehouse" name="warehouse">
+        <option value="">全部外仓</option>
+        {% if warehouse and warehouse not in warehouses | map(attribute="warehouse") | list %}<option value="{{ warehouse }}" selected>{{ warehouse }}（待确认）</option>{% endif %}
+        {% for option in warehouses %}<option value="{{ option.warehouse }}"{% if warehouse == option.warehouse %} selected{% endif %}>{{ option.warehouse }}</option>{% endfor %}
+      </select>
+    </label>
+    {% if view == 'stock' %}
+    <label for="wms-goods"><span>货品编码（精确匹配）</span><input id="wms-goods" name="goods_code" value="{{ goods_code }}" placeholder="输入货品编码"></label>
+    <input type="hidden" name="date_from" value="{{ date_from }}">
+    {% else %}
+    <label for="wms-date"><span>业务日期起</span><input id="wms-date" type="date" name="date_from" value="{{ date_from }}"></label>
+    <input type="hidden" name="goods_code" value="{{ goods_code }}">
+    {% endif %}
+    <label for="wms-limit"><span>最多显示条数</span><input id="wms-limit" type="number" name="limit" min="1" max="500" step="1" value="{{ limit }}" required></label>
+    <button type="submit">查询</button>
+    <a class="wms-reset" href="{{ url_for('wms.index', view=view if view in ['stock', 'in', 'out'] else 'stock') }}">重置筛选</a>
+  </form>
+  {% if error %}
+  <div class="wms-state wms-error" role="alert"{% if error_code %} data-error-code="{{ error_code }}"{% endif %}>
+    <h3>{{ '暂时无法查询' if error_code else '请检查查询条件' }}</h3>
+    <p>{{ error }}</p><p class="muted">本次未展示查询结果。调整条件或稍后重新查询。</p>
+  </div>
+  {% else %}
+  <p class="wms-query-note muted">查询范围：{{ warehouse or '全部外仓' }} · 查询完成于 {{ checked_at }}（北京时间）。外仓数据可能随业务变化。</p>
+  {% if view == 'stock' %}
+  <div class="wms-summary-heading"><h3>库存概览</h3><span class="muted">所选仓库全部在库货品，不受货品编码筛选影响</span></div>
+  <div class="wms-summary">
+    {% for item in summary %}
+    <article class="card"><p>{{ item.warehouse or '未标注仓库' }}</p><strong>{{ item.sku_count }} <small>个在库品项</small></strong></article>
+    {% else %}<p class="muted">所选仓库暂无在库品项。</p>{% endfor %}
+  </div>
+  <p class="muted wms-scope-note">各仓品项数分别统计，跨仓同品项可能重复；不同单位的数量不合计，请以明细中的单位和数量为准。</p>
+  {% endif %}
+  <div class="wms-results-heading"><h3>{{ '库存明细' if view == 'stock' else ('入库单据' if view == 'in' else '出库单据') }}</h3><span class="muted">本次显示 {{ rows | length }} 条 · 上限 {{ limit }} 条</span></div>
+  {% if rows %}
+  <p class="muted wms-scroll-hint">表格可左右滑动查看全部字段。</p>
+  {% if view == 'stock' %}
+  <table class="wms-table">
+    <caption class="wms-visually-hidden">外仓库存明细</caption>
+    <thead><tr><th scope="col">货品编码</th><th scope="col">货品名称</th><th scope="col">单位</th><th scope="col">数量</th><th scope="col">仓库</th><th scope="col">库区</th><th scope="col">货位</th><th scope="col">批次</th></tr></thead>
+    <tbody>{% for row in rows %}<tr><td>{{ row.goods_code or '—' }}</td><td>{{ row.goods_name or '—' }}</td><td>{{ row.unit or '—' }}</td><td class="wms-qty">{{ row.qty | fmt_qty }}</td><td>{{ row.warehouse or '—' }}</td><td>{{ row.zone or '—' }}</td><td>{{ row.position or '—' }}</td><td>{{ row.lot_no or '—' }}</td></tr>{% endfor %}</tbody>
+  </table>
+  {% else %}
+  <table class="wms-table">
+    <caption class="wms-visually-hidden">外仓{{ '入库' if view == 'in' else '出库' }}单据</caption>
+    <thead><tr><th scope="col">单据编号</th><th scope="col">业务日期</th><th scope="col">仓库</th><th scope="col">单据数量</th><th scope="col">{{ '供应方' if view == 'in' else '收货方' }}</th><th scope="col">经办人</th></tr></thead>
+    <tbody>{% for row in rows %}<tr><td>{{ row.doc_no or '—' }}</td><td>{{ row.biz_date or '—' }}</td><td>{{ row.warehouse or '—' }}</td><td class="wms-qty">{{ row.qty | fmt_qty }}</td><td>{{ (row.supplier if view == 'in' else row.receiver) or '—' }}</td><td>{{ row.issued_by or '—' }}</td></tr>{% endfor %}</tbody>
+  </table>
+  <p class="muted">数量为上游单据原值，未提供单位；不同单据不合计。</p>
+  {% endif %}
+  {% if rows | length >= limit %}<p class="wms-limit-notice" role="status">已达到 {{ limit }} 条显示上限，可能还有更多记录。请缩小筛选范围{% if limit < 500 %}或提高显示条数（最多 500 条）{% endif %}。</p>{% endif %}
+  {% else %}
+  <div class="wms-state"><h3>{{ '暂无库存' if view == 'stock' else '暂无单据' }}</h3><p>当前筛选范围没有匹配记录，可调整筛选条件后重新查询。</p></div>
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

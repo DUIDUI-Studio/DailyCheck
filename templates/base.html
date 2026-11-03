@@ -10,7 +10,8 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=23" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=24" />
+  {% block extra_css %}{% endblock %}
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
   {% block sidebar %}
@@ -30,13 +31,18 @@
       {% endif %}
     </nav>
 
-    {% if is_admin or is_storefront %}
+    {% if is_admin or is_storefront or is_distribution_center %}
     <nav class="nav-group">
       <p class="nav-group-title">库存管理</p>
+      {% if is_admin or is_storefront %}
       <a href="{{ url_for('items.inventory_view') }}">库存查阅</a>
       <a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a>
       <a href="{{ url_for('restock.restock_list') }}">入库记录</a>
       <a href="{{ url_for('outbound.outbound_list') }}">出库记录</a>
+      {% endif %}
+      {% if is_admin or is_distribution_center %}
+      <a href="{{ url_for('wms.index') }}">外仓信息</a>
+      {% endif %}
     </nav>
     {% endif %}
 
