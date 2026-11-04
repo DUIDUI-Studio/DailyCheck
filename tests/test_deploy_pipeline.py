@@ -542,24 +542,24 @@ def test_drift_guard_skipped_when_not_a_git_repo(sandbox):
 
 
 # ================================================================ F5 观察窗留痕
-# 机制要求观察窗 ≥30min，#111 实测压到 10min 却**无任何留痕**。压缩本身不该
+# 机制要求观察窗 ≥10min；历史上 #111 压到 10min（当时要求 30min）却**无任何留痕**。压缩本身不该
 # 阻断（人工应急确实需要），但必须从「没人知道」变成 Dashboard 可见。
 
 
 def test_observe_window_shortened_records_audit(sandbox):
     """压缩观察窗必须留痕。
 
-    ⚠️ 必须注入 fake curl/journalctl（_observe_tools）：--observe-min 10 会真进
+    ⚠️ 必须注入 fake curl/journalctl（_observe_tools）：--observe-min 5 会真进
     观察窗探测 127.0.0.1:8080，本机 dev 容器返回 302 能过、CI 上无监听得 000
     → 触发回滚 exit 24（2026-10-18 CI 实 hit：本地全绿、CI 判红）。测试要脱真流量。
     """
     extra, _ = _observe_tools(sandbox, blocked_lines=0, code="302")
-    proc = _pipe(sandbox, "42", SHA, "--observe-min", "10", **extra)
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "5", **extra)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     audit = _audit(sandbox)
     assert "kind=observe-window-shortened" in audit, audit
-    assert "observe=10min" in audit, audit
+    assert "observe=5min" in audit, audit
 
 
 def test_observe_window_skipped_entirely_records_audit(sandbox):
@@ -571,12 +571,12 @@ def test_observe_window_skipped_entirely_records_audit(sandbox):
 
 
 def test_observe_window_at_required_records_no_shortened_audit(sandbox):
-    """反向：达到机制要求 30min → 不记压缩事件（否则告警天天响＝没告警）。
+    """反向：达到机制要求 10min → 不记压缩事件（否则告警天天响＝没告警）。
 
-    沙盒里 TICK_SEC=1，30min 折算 6 轮 ×1s，可接受。
+    沙盒里 TICK_SEC=1，10min 折算 2 轮 ×1s，可接受。
     """
     extra, _ = _observe_tools(sandbox, blocked_lines=0, code="302")
-    proc = _pipe(sandbox, "42", SHA, "--observe-min", "30", **extra)
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "10", **extra)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "observe-window-shortened" not in _audit(sandbox)
