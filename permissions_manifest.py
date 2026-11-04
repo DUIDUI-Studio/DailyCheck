@@ -350,6 +350,10 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.submit_order_route": perm("order.create"),
     "store_ordering.store_orders_list": LOGIN,
     "store_ordering.order_detail": LOGIN,
+    "store_ordering.new_order_change": LOGIN,  # fresh union endorsement in domain
+    "store_ordering.create_order_change": LOGIN,
+    "store_ordering.accept_order_change": LOGIN,  # fresh target-store decision policy
+    "store_ordering.reject_order_change": LOGIN,
     "store_ordering.order_change_detail": LOGIN,
     "store_ordering.withdraw_order_change": LOGIN,  # fresh domain policy in master tx
 

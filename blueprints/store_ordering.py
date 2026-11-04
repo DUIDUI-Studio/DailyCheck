@@ -5,6 +5,7 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §4 / §6.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
@@ -763,22 +764,147 @@ def submit_order_route() -> str:
     )
 
 
+
+@bp.after_request
+def order_change_no_store(response):
+    if '/changes' in request.path:
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _change_order(order_id, proposal_id=None):
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    proposal = ocp.proposal_detail(master, order_id, proposal_id) if proposal_id is not None else None
+    if order is None or (proposal_id is not None and proposal is None):
+        abort(404)
+    if not _order_viewable(master, order):
+        abort(403)
+    return master, order, proposal
+
+
+def _change_intent(order):
+    lines, prices = [], {}
+    for item in order['order_items']:
+        key = str(item['id'])
+        operation = request.form.get('operation_' + key, '')
+        if operation:
+            lines.append({'order_item_id': item['id'], 'operation': operation,
+                'remove_quantity': request.form.get('remove_' + key),
+                'replacement_canonical_id': request.form.get('replacement_' + key),
+                'replacement_quantity': request.form.get('replacement_qty_' + key)})
+        price = request.form.get('historical_price_' + key, '').strip()
+        if price:
+            prices[key] = {'price': price, 'reference': request.form.get('reference_' + key, ''),
+                           'note': request.form.get('evidence_' + key, '')}
+    return {'base_change_revision': request.form.get('base_change_revision'),
+        'reason': request.form.get('reason', ''), 'lines': lines, 'historical_prices': prices,
+        'after_fee': request.form.get('after_fee'), 'fee_reference': request.form.get('fee_reference', ''),
+        'fee_note': request.form.get('fee_note', '')}
+
+
+def _change_form(master, order, *, preview=None, error=None, status=200):
+    for item in order['order_items']:
+        item['display_product'] = json.loads(item['product_snapshot']) if item['product_snapshot'] else {}
+    return render_template('store_ordering/order_change_form.html', order=order,
+        candidates=ocp.list_replacement_candidates(master, order), preview=preview, error=error,
+        values=request.form, request_key=request.form.get('request_key') or sop.generate_op_no()), status
+
+
+@bp.route('/orders/<int:order_id>/changes/new')
+@require_login
+def new_order_change(order_id: int):
+    master, order, _ = _change_order(order_id)
+    if not config_module.ORDER_CHANGES_ENABLED:
+        abort(409, description='订单变更入口尚未启用')
+    if not ocp.can_propose(master, order, int(g.user['id']), _current_warehouse_code()):
+        abort(403)
+    return _change_form(master, order)
+
+
+@bp.route('/orders/<int:order_id>/changes', methods=['POST'])
+@require_login
+def create_order_change(order_id: int):
+    master, order, _ = _change_order(order_id)
+    try:
+        ocp._enabled()
+        intent = _change_intent(order)
+        if request.form.get('action') == 'publish':
+            result = ocp.create_proposal(master, order_id=order_id, actor_id=int(g.user['id']),
+                current_warehouse_code=_current_warehouse_code(), request_key=request.form.get('request_key', ''),
+                intent=intent, seen_digest=request.form.get('seen_digest', ''))
+            flash('整份方案已发布，等待订货方明确决定')
+            return redirect(url_for('store_ordering.order_change_detail', order_id=order_id, proposal_id=result['proposal_id']))
+        preview = ocp.preview_proposal(master, order_id=order_id, actor_id=int(g.user['id']),
+            current_warehouse_code=_current_warehouse_code(), intent=intent)
+        return _change_form(master, order, preview=preview)
+    except PermissionError:
+        abort(403)
+    except LookupError:
+        abort(404)
+    except ValueError as exc:
+        if request.headers.get('X-Requested-With') == 'fetch' or request.accept_mimetypes.best == 'application/json':
+            flash(str(exc), 'error')
+            return redirect(url_for('store_ordering.new_order_change', order_id=order_id))
+        return _change_form(master, order, error=str(exc), status=409 if request.form.get('action') == 'publish' else 422)
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/accept', methods=['POST'])
+@require_login
+def accept_order_change(order_id: int, proposal_id: int):
+    return _decide_order_change(order_id, proposal_id, 'accept')
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/reject', methods=['POST'])
+@require_login
+def reject_order_change(order_id: int, proposal_id: int):
+    return _decide_order_change(order_id, proposal_id, 'reject')
+
+
+def _decide_order_change(order_id, proposal_id, action):
+    master, _, _ = _change_order(order_id, proposal_id)
+    try:
+        kwargs = dict(order_id=order_id, proposal_id=proposal_id, actor_id=int(g.user['id']),
+            current_warehouse_code=_current_warehouse_code(), request_key=request.form.get('request_key', ''),
+            seen_digest=request.form.get('seen_digest', ''), note=request.form.get('note', ''))
+        if action == 'accept':
+            if any(key.startswith(('line', 'subset', 'quantity', 'price')) for key in request.form):
+                raise ValueError('仅可同意整份方案，不能提交子集或改价')
+            result = ocp.accept_proposal(master, agree=request.form.get('agree') == '1', **kwargs)
+        else:
+            result = ocp.reject_proposal(master, **kwargs)
+        if result.get('conflict'):
+            raise ValueError(result['conflict'])
+    except PermissionError:
+        abort(403)
+    except LookupError:
+        abort(404)
+    except ValueError as exc:
+        if request.headers.get('X-Requested-With') == 'fetch' or request.accept_mimetypes.best == 'application/json':
+            flash(str(exc), 'error')
+        else:
+            abort(409, description=str(exc))
+    else:
+        flash('整份方案已同意' if action == 'accept' else '整份方案已拒绝并留言')
+    return redirect(url_for('store_ordering.order_change_detail', order_id=order_id, proposal_id=proposal_id))
+
+
 @bp.route('/orders/<int:order_id>/changes/<int:proposal_id>')
 @require_login
 def order_change_detail(order_id: int, proposal_id: int) -> str:
     """Compatibility read/withdraw surface is independent of rollout flags."""
-    master = get_master_db()
-    order = sop.get_order_detail(master, order_id)
-    if order is None:
-        abort(404)
-    if not _order_viewable(master, order):
-        abort(403)
-    proposal = ocp.proposal_detail(master, order_id, proposal_id)
-    if proposal is None:
-        abort(404)
+    master, order, proposal = _change_order(order_id, proposal_id)
+    enabled = config_module.ORDER_CHANGES_ENABLED
+    actor = int(g.user['id'])
+    current = _current_warehouse_code()
     return render_template('store_ordering/order_change_detail.html', order=order,
         proposal=proposal, withdraw_request_key=sop.generate_op_no(),
-        can_withdraw=ocp.can_withdraw(master, order, proposal, int(g.user['id']), _current_warehouse_code()))
+        accept_request_key=sop.generate_op_no(), reject_request_key=sop.generate_op_no(),
+        snapshot_digest=ocp.payload_hash(proposal['snapshot']),
+        can_decide=enabled and proposal['status']=='pending' and ocp.can_decide(master, order, proposal, actor, current),
+        can_repropose=enabled and proposal['status']!='pending' and order['status'] in ('pending','approved') and ocp.can_propose(master, order, actor, current),
+        stale_hint='商业版本已变化，请重新提议' if proposal['status']=='pending' and proposal['base_order_change_revision']!=order['change_revision'] else None,
+        can_withdraw=ocp.can_withdraw(master, order, proposal, actor, current))
 
 
 @bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/withdraw', methods=['POST'])
@@ -1006,6 +1132,7 @@ def order_detail(order_id: int) -> str:
             is_dc_view
             and (is_admin or role in ("staff", "manager", "admin"))
         ),
+        can_propose_change=(config_module.ORDER_CHANGES_ENABLED and order['status'] in ('pending','approved') and not any(p['status']=='pending' for p in order['change_history']) and ocp.can_propose(master, order, int(g.user['id']), current_wh_code)),
         current_warehouse_code=current_wh_code,
         ship_progress=ship_progress,
         can_deliver=can_deliver,
