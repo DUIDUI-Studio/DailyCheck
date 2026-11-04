@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}提议订单变更{% endblock %}
+{% block content %}
+<div class="order-change">
+<h2>提议订单变更</h2>
+<p><a href="{{ url_for('store_ordering.order_detail', order_id=order.id) }}">返回 {{ order.order_no }}</a></p>
+<p>仅调整未发部分，保留订单号与已发历史。发布后仅受影响行暂停发货，订货方须明确决定整份方案。</p>
+{% if error %}<p role="alert" class="flash error">{{ error }}</p>{% endif %}
+<form method="post" action="{{ url_for('store_ordering.create_order_change', order_id=order.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="request_key" value="{{ request_key }}">
+<input type="hidden" name="base_change_revision" value="{{ values.get('base_change_revision', order.change_revision) }}">
+{% if preview %}<input type="hidden" name="seen_digest" value="{{ preview.digest }}">{% endif %}
+{% for item in order.order_items %}{% set key=item.id|string %}
+<fieldset class="info-card">
+<legend>{{ item.canonical_name }} · #{{ item.id }}</legend>
+<p>{{ item.unit }} · 来源 {{ item.effective_source_warehouse_code }} · {{ item.display_product.canonical_sku or "历史SKU未记录" }}</p>
+<p>原始 {{ item.original_quantity|fmt_qty }} · 有效 {{ item.quantity|fmt_qty }} · 已发 {{ item.shipped_quantity|fmt_qty }} · 可调 {{ (item.quantity-item.shipped_quantity)|fmt_qty }}</p>
+{% if item.quantity > item.shipped_quantity %}
+<label for="operation_{{ key }}">本行方案</label>
+<select id="operation_{{ key }}" name="operation_{{ key }}">
+{% for value,label in [('', '保持不变'), ('cancel','取消全部未发量'),('reduce','减少部分未发量'),('replace','替换全部未发量')] %}<option value="{{ value }}" {% if values.get('operation_'~key,'')==value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+</select>
+<label>减量：移除基础数量 <input type="number" name="remove_{{ key }}" min="0.01" step="0.01" value="{{ values.get('remove_'~key,'') }}"></label>
+<label>替换品项 <select name="replacement_{{ key }}"><option value="">请选择</option>
+{% for candidate in candidates %}<option value="{{ candidate.canonical_id }}" {% if values.get('replacement_'~key,'')==candidate.canonical_id|string %}selected{% endif %}>{{ candidate.product.name }} · {{ candidate.product.canonical_sku }} · {{ candidate.source_warehouse_code }} · {{ candidate.unit }} · ¥{{ candidate.unit_price_snapshot }} · 倍数{{ candidate.order_multiple }}</option>{% endfor %}
+</select></label>
+<label>替换后的基础数量 <input type="number" name="replacement_qty_{{ key }}" min="0.01" step="0.01" value="{{ values.get('replacement_qty_'~key,'') }}"></label>
+{% endif %}
+{% if item.quantity > 0 and item.unit_price_snapshot is none %}
+<p>历史单价未知；本行即使不变或取消也须核对。此处仅为本次补录待整份核对，不以当前价格代替。</p>
+<label>经凭据核对的历史基础单价 <input type="number" name="historical_price_{{ key }}" min="0" step="any" value="{{ values.get('historical_price_'~key,'') }}"></label>
+<label>本单凭证ID（proof:编号）或线下编号 <input name="reference_{{ key }}" value="{{ values.get('reference_'~key,'') }}"></label>
+<label>证据核对说明 <textarea name="evidence_{{ key }}">{{ values.get('evidence_'~key,'') }}</textarea></label>
+{% endif %}
+</fieldset>
+{% endfor %}
+<label>变更原因 <textarea name="reason" required>{{ values.get('reason','') }}</textarea></label>
+{% if order.shipping_rule_state == 'unknown' %}
+<p>原运费规则未记录，默认沿用已记录运费 ¥{{ order.shipping_fee|fmt_money }}。调整时须填写依据；全未发全取消则运费归零。</p>
+<label>调整后运费（留空沿用） <input type="number" name="after_fee" min="0" step="0.01" value="{{ values.get('after_fee','') }}"></label>
+<label>费用凭证或线下编号 <input name="fee_reference" value="{{ values.get('fee_reference','') }}"></label>
+<label>费用核对说明 <textarea name="fee_note">{{ values.get('fee_note','') }}</textarea></label>
+{% endif %}
+<button type="submit" name="action" value="preview">预览整份方案</button>
+{% if preview %}
+<h3>整份方案预览</h3>
+{% set snapshot=preview.snapshot %}
+{% for side,label in [('before','变更前'),('after','变更后')] %}
+<section class="info-card"><h4>{{ label }}</h4>
+{% for line in snapshot[side].lines %}<p>{{ line.product.name }} · {{ line.product.canonical_sku or '历史SKU未记录' }} · {{ line.source_warehouse_code }}<br>{{ line.quantity }} {{ line.unit }} × ¥{{ line.unit_price_snapshot if line.unit_price_snapshot is not none else '未知' }} = ¥{{ line.line_amount }}{% if line.verification_pending %}<br>本次补录待整份核对{% endif %}{% if line.product_basis=='current_identification_only' %}<br>当前识别描述，非历史规格{% endif %}</p>{% endfor %}
+<p>货品 ¥{{ snapshot[side].goods_amount }} · 运费 ¥{{ snapshot[side].shipping_fee }} · 总计 ¥{{ snapshot[side].total_amount }}</p></section>
+{% endfor %}
+<p>订单计价差额 ¥{{ snapshot.delta }}（正数待核对增补，负数待核对减退）</p>
+<p>订单计价差额，待线下核对，不代表已付款或已退款。</p>
+<p>发布代表对全部原来源仓和新来源仓背书；修改内容后请重新预览。</p>
+<button type="submit" name="action" value="publish">发布整份方案，等待订货方确认</button>
+{% endif %}
+</form></div>
+{% endblock %}

@@ -2407,13 +2407,66 @@ GET/旧 MCP 仅投影摘要、历史和暂停原因。撤回不依赖 ORDER_CHAN
 旧 cancel / review reject 原子令 pending stale，approve 遇 pending 明确拒绝；
 原 DC staff 发货、仓范围与平台管理员明确操作仓能力保留。
 
-**第二阶段 #145 接线契约**：本阶段没有 create/accept/reject HTTP 或 MCP 写入口，
-DAILYCHECK_ORDER_CHANGES 默认关，仅测试种子可产生 pending。后续接受在同一
-master 事务中先 assert_unoccupied、校验商业/受影响行 revision，再减有效量、
-追加带快照替换行、递增 revision 并调用有效量聚合；proposal/command/event schema
-和只读/撤回界面是 A 支持 B 代码回退的最低版本。B 回退到 A 保留有效 quantity、
-快照、追加行和 active/recovering 占用，不能回到不识别 claim 的 pre-A 写者。
-开放提议前所有 Web 写者必须支持 claim、旧执行者排空；当前不改 CI/部署脚本。
+**整份订单变更入口（Issue #145 / 父 #142 第二阶段）**：
+`order_changes_pure.preview_proposal/create_proposal/accept_proposal/reject_proposal`
+集中管理整份方案；`/store-ordering/orders/<id>/changes/new` 的原生表单先服务端预览，
+再显式发布；成对 order/proposal 详情提供“同意整份方案”或必填留言拒绝。
+新建/同意/拒绝由 `DAILYCHECK_ORDER_CHANGES` 默认关闭的开关控制，读取、撤回和
+原 claim/fence/恢复协议持续有效，不增加 schema、MCP 工具或外部消息。
+
+服务器按 version=1 生成不可变完整 before/after 行、货品/运费/总计/差额、
+历史核对引用/说明/人/时间、联合仓与替换报价指纹；不信任客户端价格与金额。
+原单正量的全部 NULL 单价须逐行核对（包括未改与将取消行），发布不填原价，
+整份接受才锁为 verified；无历史商品快照时明确标当前识别描述，不能补造历史规格。
+原已记录运费为 before_fee；新单按原规则快照重算，旧规则 NULL 默认沿用旧费，
+调整须明确非负新费及凭据说明。行额 HALF_UP 到分后求和、整单费用再量化，
+差额仅表示订单计价、待线下核对，不代表已付款/退款，不增加支付结算状态。
+
+每条命令拒绝 caller 事务；仓库候选只读准备在 master 写锁外完成，短
+BEGIN IMMEDIATE 内重读同租户活跃身份/角色包、全部原来源与新来源审批权、
+目标店原下单人或经理/管理员的决定权、商业/受影响行基线与占用及 master 准备指纹。
+平台管理员仍须明确目标店并记录代确认，提议人不能自确认；按钮共用 fresh 策略。
+当前候选同时验证租户路由、canonical active、门店停用/专属、唯一 active 非 alias
+履约行、单位/冲突、可订、倍数及服务端报价。跨库配置无法原子锁定，仅记录观测
+指纹/时间及边界；接受后库存仍只在实际发货时扣减、冻结 item/unit 仍由原协议复核。
+
+pending 仅冻结方案并暂停 affected 行，其他已审批行发货、已发收货照常。
+接受原子条件更新有效量/行 revision、锁 NULL 历史价、追加唯一关联替换行、
+递增商业 revision/锁定费用、决定/event/command/站内通知；原订单号、原行身份/
+original_quantity、已发已收及配送/收货历史行不变。小数有效量先按 Decimal
+计算，再条件写最终数值，避免 REAL 减法越过已发下限；proposal line 的 REAL
+移除量兼容既有 baseline 差值约束，展示/计价仍用冻结 Decimal 文本。
+全未发归零且无履约记录/占用时取消且费零；pending 接受仍待原整单审批。
+其余接受在无活动/恢复 claim 或未决方案时调用既有有效量聚合，applied=0 不完成，
+不伪造配送/收货。拒绝只记整份决定，不改变有效内容；终态重提必须新 pid/sequence。
+
+全局 request_key 的 canonical hash 绑定 actor/action/order/proposal/标准意图/
+所见 digest/证据/留言，先匹配身份/hash 与 fresh 权限再返回持久结果，已完成重放
+不依赖最新候选。新 key 同方向终态只回原决定，相反方向冲突；合法接受发现
+版本/基线、背书或报价变化，独立提交 stale/event/通知/command 并返回409，
+无权请求只403且不使他人方案失效。enqueue 不自行提交，失败全回滚。
+通知收件按目标租户重新过滤活跃/权限、去重排操作者；新仓在接受成为实际参与仓后
+才收到可打开的订单深链。所有变更 GET no-store，GET/MCP 不落业务写入。
+
+移动页面保留原导航与SSR，320/375/390px 单列，禁用JS亦可预览/发布/整份决定。
+订单详情表格直接输出 table-scroll 包装，含变更深链的通知表格有本功能限定的
+CSS滚动容器，避免依赖全局JS包装。浏览器离线点击不会排队同意，联网后须显式重试。
+`test_order_changes_{pure,http,concurrency}` 覆盖真实SQLite/独立连接barrier与loopback
+HTTP/CSRF；`dev_smoke_order_changes.py --browser --root <新空根>` 通过真实create
+产生方案，保留三尺寸无JS通知→比较→决定→发收截图和每步主/仓库SQL dump。
+关键断言在独占源码副本逐项变异并恢复验证。
+B1 数量回归通过原生单批、分批、顺序变化与收货累加对照，断言整份决定、金额及原始
+REAL 历史保持；真实 loopback HTTP 覆盖无关行和受影响行的分批发货。固定 d10 候选
+在合法分批后会误失效或无法接受，这些回归先以失败提交，再修复 B 数量消费边界。
+B 的 `_contract_quantity` 将持久数量导出为既有 HALF_UP 两位 Decimal，并仅容许
+距该精度不超过原生 1e-9 的尾差；非有限、负数和更大偏差仍拒绝。历史四量校验、
+未发量算术和冻结基线检查共用此边界。接受在同一 master 写锁内以实际原始 REAL
+数量/已发值作精确 CAS，已发下限用两位 ROUND 与已校验语义一致；只改有效数量，
+不改 original/shipped/fulfilled 原值、配送/收货/库存流水或 A 发收及 claim 协议。
+
+B 回退到 A 保留有效 quantity、快照、追加行和 active/recovering 占用，不能回到
+不识别 claim 的 pre-A 写者。开放提议前所有 Web 写者必须支持 claim、旧执行者
+排空；生产何时启用由 Prod 标准流程决定，当前不改 CI/部署脚本。
 
 ### 10.3.1 总仓调货（2026-10-19）
 
