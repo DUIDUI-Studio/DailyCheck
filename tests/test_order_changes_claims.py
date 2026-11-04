@@ -90,6 +90,19 @@ def test_execution_projection_retains_rejection_boundaries(ship_env, kind):
     assert _shipment_effects(e) == before
 
 
+@pytest.mark.parametrize('replay', [False, True])
+def test_explicit_source_rejects_other_source_zero_before_and_after_commit(ship_env, replay):
+    """An explicit warehouse keeps main's full-input source ownership contract."""
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A'), (102, 3, 'B')])
+    if replay:
+        _ship(e, order, 'A', 'explicit-ownership', {ids[0]: 3})
+    before = _shipment_effects(e)
+    with pytest.raises(ValueError):
+        _ship(e, order, 'A', 'explicit-ownership', {ids[0]: 3, ids[1]: 0})
+    assert _shipment_effects(e) == before
+
+
 def seed_proposal(master, order_id, ids):
     proposal_id = master.execute("""INSERT INTO store_order_change_proposals
         (order_id,sequence,status,base_order_change_revision,proposed_by,reason,snapshot_json,required_warehouses_json,created_at)
