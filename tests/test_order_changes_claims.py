@@ -1,6 +1,7 @@
 """Durable ship requests: real files, independent processes and deterministic gates."""
 import multiprocessing
 import sqlite3
+from itertools import combinations, permutations
 
 import pytest
 
@@ -10,6 +11,83 @@ from tests import test_ship_op_protocol as protocol
 
 ship_env = protocol.ship_env
 _ship = protocol._ship
+
+
+def _shipment_effects(e):
+    master = {table: [tuple(row) for row in e['master'].execute(f'SELECT * FROM {table} ORDER BY rowid')]
+        for table in ('store_order_items', 'store_order_deliveries', 'store_order_delivery_items',
+                      'store_order_status_history', 'notifications', 'store_order_ship_claims',
+                      'store_order_ship_claim_lines')}
+    warehouses = {}
+    for code in ('A', 'B'):
+        with sqlite3.connect(e['wh_dir'] / f'{code}.db') as warehouse:
+            warehouses[code] = {table: warehouse.execute(f'SELECT * FROM {table} ORDER BY rowid').fetchall()
+                for table in ('items', 'stock_movements')}
+    return master, warehouses
+
+
+@pytest.mark.parametrize('source,actor,quantity', [('A', 2, 3), ('B', 3, 2)])
+@pytest.mark.parametrize('initial', ['zeros-first', 'zeros-last', 'positive-only'])
+def test_zero_line_transformations_preserve_inferred_shipment(ship_env, source, actor, quantity, initial):
+    """Adding/removing/reordering same-order zero lines is a shipment no-op."""
+    e = ship_env
+    other = 'B' if source == 'A' else 'A'
+    order, ids = e['create_order']([(101, 4, source), (101, 3, other), (102, 5, other)])
+    positive = (ids[0], quantity)
+    zeros = [(oid, 0) for oid in ids[1:]]
+    submitted = (zeros + [positive] if initial == 'zeros-first' else
+                 [positive] + zeros if initial == 'zeros-last' else [positive])
+    result = sop.ship_order(e['master'], order, dict(submitted), shipped_by=actor, op_no='zero-transform')
+    delivery = result['delivery_id']
+    assert e['stock'](source, 101) == 10 - quantity
+    assert e['stock'](other, 101) == e['stock'](other, 102) == 10
+    assert [tuple(r) for r in e['master'].execute(
+        'SELECT id,warehouse_code FROM store_order_deliveries')] == [(delivery, source)]
+    assert [tuple(r) for r in e['master'].execute(
+        'SELECT order_item_id,quantity,warehouse_code FROM store_order_delivery_items')] == [(ids[0], quantity, source)]
+    assert e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0] == 0
+    before = _shipment_effects(e)
+    variants = 0
+    for size in range(len(zeros) + 1):
+        for subset in combinations(ids[1:], size):
+            for ordering in permutations([ids[0], *subset]):
+                zero = (0, 0.0, '0', '0.00')[variants % 4]
+                raw = {oid: quantity if oid == ids[0] else zero for oid in ordering}
+                replay = sop.ship_order(e['master'], order, raw, shipped_by=actor, op_no='zero-transform')
+                assert replay['delivery_id'] == delivery and replay['idempotent']
+                assert _shipment_effects(e) == before
+                variants += 1
+    print({'source': source, 'initial': initial, 'variants': variants, 'delivery_id': delivery,
+        'source_stock': e['stock'](source, 101), 'other_stock': e['stock'](other, 101),
+        'deliveries': e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0],
+        'notifications': e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0]})
+
+
+@pytest.mark.parametrize('replay', [False, True])
+def test_inferred_shipment_rejects_foreign_zero_id(ship_env, replay):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A')])
+    _, foreign = e['create_order']([(102, 3, 'B')])
+    if replay:
+        sop.ship_order(e['master'], order, {ids[0]: 3}, shipped_by=2, op_no='foreign-zero')
+    before = _shipment_effects(e)
+    with pytest.raises(ValueError):
+        sop.ship_order(e['master'], order, {ids[0]: 3, foreign[0]: 0}, shipped_by=2, op_no='foreign-zero')
+    assert _shipment_effects(e) == before
+
+
+@pytest.mark.parametrize('kind', ['two-positive', 'all-zero', 'explicit-other-positive'])
+def test_execution_projection_retains_rejection_boundaries(ship_env, kind):
+    e = ship_env
+    order, ids = e['create_order']([(101, 4, 'A'), (102, 3, 'B')])
+    raw = {ids[0]: 3, ids[1]: 2} if kind == 'two-positive' else {ids[0]: 0, ids[1]: 0}
+    before = _shipment_effects(e)
+    with pytest.raises(ValueError):
+        if kind == 'explicit-other-positive':
+            _ship(e, order, 'A', 'bad-execution', {ids[0]: 0, ids[1]: 2})
+        else:
+            sop.ship_order(e['master'], order, raw, shipped_by=2, op_no='bad-execution')
+    assert _shipment_effects(e) == before
 
 
 def seed_proposal(master, order_id, ids):

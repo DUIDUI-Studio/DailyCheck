@@ -2707,6 +2707,8 @@ Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时
 请求身份回归用真实 loopback HTTP/CSRF 和 Event 控制初读缺失、仓库已提交及
 master 锁前窗口，断言同键结果、库存/流水/配送和完整 hash；另覆盖绑定变化、
 后续批次与 full/explicit/scalar 六方向模式互换，先提交失败复现再修复裁决顺序。
+R3 的 dict 包装回归以零数量行的增删/重排性质约束来源推导：同单其他仓零项不改变
+实际发仓、库存、配送或重放结果；外单零 ID、两仓正量、全零与显式仓越权仍拒绝。
 
 HTTP 用例开启真实 CSRF，覆盖 AJAX/PRG、撤权后拒绝和通知 enqueue 后故障回滚。
 scripts/dev_smoke_order_changes.py 必须显式指定空的 /tmp/dailycheck-order-change-*
