@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}变更方案 #{{ proposal.sequence }}{% endblock %}
+{% block content %}
+<div class="page-header"><h2>变更方案 #{{ proposal.sequence }}</h2></div>
+<p><a href="{{ url_for('store_ordering.order_detail', order_id=order.id) }}">返回订单 {{ order.order_no }}</a></p>
+<div class="info-card">
+<p><strong>状态：</strong>{{ {'pending':'待确认','accepted':'已同意','rejected':'已拒绝','withdrawn':'已撤回','stale':'已失效'}[proposal.status] }}</p>
+<p><strong>原因：</strong>{{ proposal.reason }}</p>
+<p><strong>提议时间：</strong>{{ proposal.created_at }}</p>
+{% if proposal.status == 'pending' %}<p class="calc-hint">受影响行暂停发货，其他已审批行可继续发货，已发货物照常收货。未回复不会自动同意。</p>{% endif %}
+{% if proposal.stale_reason %}<p>{{ proposal.stale_reason }}</p>{% endif %}
+{% if proposal.decided_at %}<p>处理时间：{{ proposal.decided_at }} · {{ proposal.decision_note or '—' }}</p>{% endif %}
+</div>
+<h3>受影响明细</h3>
+{% for line in proposal.lines %}
+{% set item = (order.order_items | selectattr('id', 'equalto', line.order_item_id) | list | first) %}
+<div class="info-card">
+<p><strong>{{ item.canonical_name if item else ('明细 #' ~ line.order_item_id) }}</strong> · {{ {'cancel':'取消未发量','reduce':'减量','replace':'替换未发量'}[line.operation] }}</p>
+<p>原有效数量 {{ line.baseline_quantity | fmt_qty }} · 已发 {{ line.baseline_shipped | fmt_qty }} · 建议移除 {{ line.remove_quantity | fmt_qty }}</p>
+{% if line.operation == 'replace' %}<p class="muted">替换商品及金额以已保存的整份方案为准。</p>{% endif %}
+</div>
+{% endfor %}
+{% if can_withdraw %}
+<form method="post" action="{{ url_for('store_ordering.withdraw_order_change', order_id=order.id, proposal_id=proposal.id) }}" data-ajax data-ajax-mode="reload-stay">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="request_key" value="{{ withdraw_request_key }}">
+<label>撤回备注 <input name="note" maxlength="500" placeholder="可选"></label>
+<button type="submit" class="btn-action danger">撤回整份方案</button>
+</form>
+{% endif %}
+{% if proposal.events %}<h3>处理记录</h3>{% for event in proposal.events %}<p>{{ event.created_at }} · {{ event.note }}</p>{% endfor %}{% endif %}
+{% endblock %}

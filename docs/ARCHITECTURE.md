@@ -1328,6 +1328,14 @@ erDiagram
 `tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`
 外键可用；已有租户配置不覆盖，路由 pure 层不代建租户。
 
+**订单变更兼容底座（Issue #144，master v7）**：init 与 runner 共用
+`migrations.order_changes.registered_up`，savepoint 内追加行原始量、行/商业 revision、
+可空的服务端商品/单价/运费规则快照，以及独立 proposal/line/command/event 和
+发货 claim 请求/行表。历史 original_quantity 仅按 quantity 回填，包括异常旧行；
+历史价与规则保持 NULL，不猜成交额或已付额。pending 每单唯一，active/recovering
+每行唯一占用；终态不复活。迁移不触及仓库，兼容 floor 不可破坏性 down，代码回退
+必须保留这些表、快照与活动占用。第一阶段没有 create/accept/reject 业务入口。
+
 ### 4.3 warehouse.db 核心表（ER 简图）
 
 ```mermaid
@@ -1422,7 +1430,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v6**（含多仓履约/路由播种/收货协议；本次不改）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v7**（订单变更兼容底座；仓库仍为 v7，互不混用）。
 
 ---
 
@@ -2135,6 +2143,11 @@ flowchart TB
 
 ---
 
+Issue #144 扩充 store_order_detail 的内部 output_shape 和生成台账：有效量/原始量、
+价格来源/未知状态、锁定金额、商业 revision 和安全变更摘要。工具数量与原 wire
+声明/路径 ACL 保持兼容；服务层对头/明细使用显式字段白名单，不暴露内部 command、
+claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 或写 stale。
+
 ## 10. 业务领域模型
 
 ### 10.1 仓库类型
@@ -2329,6 +2342,78 @@ stateDiagram-v2
 - 测试：`tests/test_jinja_helpers.py::TestFmtWarehouse`（5 个 case 覆盖 None / 空串 / name==code / code 缺失）；`tests/test_store_ordering_pure.py::TestIssue122WarehouseNames`（3 个 case 验证 list_orders / get_order_detail 返回 name + LEFT JOIN 守门员）；`tests/test_issue_122_nav.py::TestNavHasReviewEntry`（6 个 parametrized case 验证侧栏 + /land 链接集对 DC / admin / storefront 各角色正确显隐「订货审批」）。
 
 `is_multiple_of` 用**相对容差**（`abs(qty − round(qty/step)·step) ≤ max(1e-9, step·1e-9)`）判定，不用 `%`——浮点二进制误差会让 `0.3 / 0.1` 判成 False。`normalize_order_multiple` 把脏值（None/非数字/≤0）一律回落成 1，避免配置错误把某个品项永久锁死。
+
+**持久发货占用（Issue #144）**：所有 full/partial/legacy 包装最终进入同一
+ship_partial：解析冻结履约行后，在 master 短事务重新校验 approved、DC staff
+原能力、来源/有效量和 pending 受影响行，完整请求 hash 绑定订单、操作仓和全部
+正数量行；整批登记后才扣库存。active/recovering 每行独占，无 TTL。
+仓库写锁内检查 active、冻结 item/unit/line revision 与 REV；master finalize
+同锁检查后写配送并将整批 committed。恢复先在 master active→recovering fence，
+再取仓库锁按原流水 REV 幂等冲销，最后 master→aborted；失败保持占用，重复
+恢复可继续，终态不复活。committed 先赢则恢复不冲销，fence 先赢则迟到 finalize
+不可落配送。旧 cancel 也检查活动占用；人工孤儿核对对有 claim 的请求先走 fence，
+旧无 claim 请求仍按原人工核对边界处理，不能在旧执行者未排空时运行此核对。
+自动全发跳过暂停/占用行，显式批次含任一暂停正数量行整批拒绝。
+三入口保留原始 `request_mode=explicit|legacy_qty|full`，模式与 scalar 原始归一量
+进入完整 payload hash；explicit 始终比较调用者完整 map，full/scalar 仅重放首次冻结批次。
+锁外读取只是提示：选行、旧流水观察、仓库连接/绑定解析及真实异常均为准备结果。
+唯一最终 `BEGIN IMMEDIATE` 先读当前 claim、比原始意图/完整 hash 并重查权限，
+committed 直接返回原配送，不依赖最新 remaining/blocked/绑定；active 恢复冻结行继续既有
+执行协议，不能因迟到者准备失败触发 fence；recovering/aborted 拒绝，只有仍无 claim
+才核对旧记录、当前 approved/有效量/pending、准备计划和冻结绑定后注册。
+准备与锁内新选批不一致时明确拒绝重试，不持 master 写锁重新连接/迁移仓库。
+发货要求独立 master 事务；调用者自有事务会在访问仓库前明确拒绝，不能把
+`in_transaction` 当作已取得写入序列化能力。执行/恢复的锁顺序及 finalize 的 REV 检查保留。
+旧无 mode 且有 legacy_quantity 的 scalar 只在原量可证及原完整 JSON/hash 严格匹配时重放；
+无 mode 且无 scalar 的歧义键失败关闭待核对，不猜 explicit/full，不回写历史 hash。
+explicit 的原始 map 同时保留给新批次的成员校验；hash 虽仅含正数量行，外来行 ID
+即使数量为零仍沿用原能力明确拒绝，不能先滤除零项而绕过此校验。
+最终短 master 事务匹配原始身份/hash 后，归属校验也覆盖已有 claim 的 explicit 重放；
+新批次沿用选行器的归属校验。两者只读订单成员集合，不重算重放请求当前的
+remaining、不重新解析单位/绑定，避免把合法 committed 重放重新绑定到可变准备状态。
+dict 兼容包装省略操作仓时，selector 先校验完整 raw map 的全部 ID、沿用数量解析，
+返回仅正数量的实际执行行；来源集合从该执行行集合推导，再复用同一集合登记/扣库。
+同单其他仓零项不参与推导；指定操作仓时仍对完整输入执行主线来源归属限制。
+已有 claim 的外单 ID 拒绝沿用主线含明细/订单 ID 的错误格式，身份与状态裁决不变。
+显式指定操作仓的 matched-claim 路径亦保留 main 的完整 raw 来源归属限制；仅检查
+master 中冻结的订单成员/来源，不连接仓库或重算 remaining/单位。省略操作仓的
+dict 包装允许同单他仓零项，正量来源与权限仍由原冻结批次及 fresh 权限裁决。
+
+部署前所有 Web 写实例必须具备此协议且旧执行者排空；提议入口持续关闭，
+兼容回退不可删除 active/recovering claim。
+
+**价格与有效量的兼容底座（Issue #144 / 父 #142 阶段一）**：普通新单在服务端
+解析冻结来源行时同时保存商品名称/SKU/基础与辅单位、Decimal 文本单价及来源
+（selling_price 优先，否则 unit_cost），legacy 与多仓提交均如此。每行扩展金额
+按 quantity × 原精度单价 ROUND_HALF_UP 到分，再求和；运费按该合计与保存的
+规则参数计算，同样 HALF_UP 到分。来源改价/改成本/换 active 规则不再改变旧单
+金额；库存仍读来源仓当前值。两种提交路径均拒绝与履约基础单位不一致的购物车，
+不推定隐式单位换算。历史未知价格、商品/运费规则快照保持 NULL，
+金额显示待核对，当前价仅标参考；已记录的 shipping_fee 不伪称原规则或已付。
+调货仍无金额语义。新商品/价格/原始量快照由 schema 触发器保护，历史 NULL
+可在后续凭据核对后填入；不能反向猜测过去成交价格。
+
+quantity 是包含已发部分的有效合同量，original_quantity 只用于审计；替换行
+追加并通过 replaces_order_item_id / introduced_by_proposal_line_id 关联原行。
+ship/receive 共用有效量聚合（取消行不进分母，applied=0 收货不能完成）；
+未来接受事务调用 refresh_effective_order_state，取消最后未发量后可直接完成，
+不伪造配送/收货，也不修写旧 shipped/fulfilled 历史。
+
+**回退时的变更读取/撤回**：proposal 是独立整份实体，只有 pending 暂停受影响行；
+GET/旧 MCP 仅投影摘要、历史和暂停原因。撤回不依赖 ORDER_CHANGES_ENABLED，
+原提议人或全部联合仓审批者可执行，活跃/租户/权限在 POST master 锁内重查。
+请求键绑定 actor/order/proposal/action/note；状态、command、审计及站内通知
+同事务落盘。notifications_pure.enqueue_event 不提交，旧 emit_event 仍提交。
+旧 cancel / review reject 原子令 pending stale，approve 遇 pending 明确拒绝；
+原 DC staff 发货、仓范围与平台管理员明确操作仓能力保留。
+
+**第二阶段 #145 接线契约**：本阶段没有 create/accept/reject HTTP 或 MCP 写入口，
+DAILYCHECK_ORDER_CHANGES 默认关，仅测试种子可产生 pending。后续接受在同一
+master 事务中先 assert_unoccupied、校验商业/受影响行 revision，再减有效量、
+追加带快照替换行、递增 revision 并调用有效量聚合；proposal/command/event schema
+和只读/撤回界面是 A 支持 B 代码回退的最低版本。B 回退到 A 保留有效 quantity、
+快照、追加行和 active/recovering 占用，不能回到不识别 claim 的 pre-A 写者。
+开放提议前所有 Web 写者必须支持 claim、旧执行者排空；当前不改 CI/部署脚本。
 
 ### 10.3.1 总仓调货（2026-10-19）
 
@@ -2620,6 +2705,25 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
+覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/
+扣库后 fence 交错、冲销后主库未回写、同键并发重放、Decimal 半分及原能力回归。
+并发/撤权探针先核对实际库存、配送和 claim 状态，再核对异常类型；权限变更只在
+绑定解析的第一次调用发生，不能让错误文案或非预期锁异常冒充安全不变量证据。
+请求身份回归用真实 loopback HTTP/CSRF 和 Event 控制初读缺失、仓库已提交及
+master 锁前窗口，断言同键结果、库存/流水/配送和完整 hash；另覆盖绑定变化、
+后续批次与 full/explicit/scalar 六方向模式互换，先提交失败复现再修复裁决顺序。
+R3 的 dict 包装回归以零数量行的增删/重排性质约束来源推导：同单其他仓零项不改变
+实际发仓、库存、配送或重放结果；外单零 ID、两仓正量、全零与显式仓越权仍拒绝。
+同时对照本轮 main 的显式仓合同：他仓零项在新请求及已有 claim 重放均拒绝，
+比较完整库存/流水/配送/通知/claim 前后状态，不以异常文案代替行为断言。
+
+HTTP 用例开启真实 CSRF，覆盖 AJAX/PRG、撤权后拒绝和通知 enqueue 后故障回滚。
+scripts/dev_smoke_order_changes.py 必须显式指定空的 /tmp/dailycheck-order-change-*
+根，启动独占随机 loopback 端口，拒绝外部 HTTP；用于实际浏览器 375/320 宽验证，
+不连接共享 localhost:8080。master v7 与 warehouse v7 的编号相同但注册表与迁移
+目标仍严格分离，仓库 CLI 必须拒绝 master 文件。
 
 Issue #146 的 `tests/test_shipping_ownership.py` 用 DC staff 会话、强制开启的 CSRF
 及详情页生成的新 `op_no` 驱动发货 HTTP 入口，覆盖新请求、原样重放、同单零数量行、

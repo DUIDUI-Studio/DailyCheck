@@ -9,6 +9,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from flask import (
@@ -26,6 +27,7 @@ from flask import (
 
 import config as config_module
 from blueprints import dc_transfer_pure as dtp
+from blueprints import order_changes_pure as ocp
 from blueprints import payment_proofs_pure as ppp
 from blueprints import store_ordering_pure as sop
 from blueprints import wecom_notify_pure as wecom_notify
@@ -761,6 +763,47 @@ def submit_order_route() -> str:
     )
 
 
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>')
+@require_login
+def order_change_detail(order_id: int, proposal_id: int) -> str:
+    """Compatibility read/withdraw surface is independent of rollout flags."""
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    if order is None:
+        abort(404)
+    if not _order_viewable(master, order):
+        abort(403)
+    proposal = ocp.proposal_detail(master, order_id, proposal_id)
+    if proposal is None:
+        abort(404)
+    return render_template('store_ordering/order_change_detail.html', order=order,
+        proposal=proposal, withdraw_request_key=sop.generate_op_no(),
+        can_withdraw=ocp.can_withdraw(master, order, proposal, int(g.user['id']), _current_warehouse_code()))
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/withdraw', methods=['POST'])
+@require_login
+def withdraw_order_change(order_id: int, proposal_id: int) -> str:
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    if order is None:
+        abort(404)
+    if not _order_viewable(master, order):
+        abort(403)
+    try:
+        ocp.withdraw_proposal(master, order_id=order_id, proposal_id=proposal_id,
+            actor_id=int(g.user['id']), current_warehouse_code=_current_warehouse_code(),
+            request_key=(request.form.get('request_key') or '').strip(),
+            note=(request.form.get('note') or '').strip())
+    except PermissionError:
+        abort(403)
+    except ValueError as exc:
+        flash(str(exc), 'error')
+    else:
+        flash('变更方案已撤回，受影响行恢复按订单状态发货')
+    return redirect(url_for('store_ordering.order_change_detail', order_id=order_id, proposal_id=proposal_id))
+
+
 # ---------------------------------------------------------------------------
 # Storefront orders
 # ---------------------------------------------------------------------------
@@ -825,14 +868,11 @@ def order_detail(order_id: int) -> str:
     dc_items_info = sop.get_dc_items_for_order_detail(master, order_id)
     for item in order["order_items"]:
         info = dc_items_info.get(int(item["id"]), {})
-        item["unit_price"] = info.get("unit_price", 0.0)
+        item['reference_unit_price'] = info.get('unit_price') if item.get('price_state') == 'unknown' else None
         item["dc_available"] = info.get("dc_available", 0.0)
 
     # v3 A4: 订单总金额 = Σ(item.quantity × item.unit_price)，2dp 量化。
-    total_amount = sum(
-        parse_qty(item["quantity"]) * parse_qty(item.get("unit_price") or 0)
-        for item in order["order_items"]
-    )
+    total_amount = Decimal(order['goods_amount']) if order.get('goods_amount') is not None else None
     # v3.1: 订单含 shipping_fee（submit 时锁定）。order dict 已含 shipping_fee 字段。
     if "shipping_fee" not in order:
         order["shipping_fee"] = 0.0
@@ -897,6 +937,12 @@ def order_detail(order_id: int) -> str:
                 # not found.
                 cid = d.pop("canonical_id")
                 local_name = d.pop("local_name")
+                frozen_name = next((item['canonical_name'] for item in order['order_items']
+                                    if item['canonical_id'] == cid and item.get('product_snapshot')), None)
+                if frozen_name:
+                    d['canonical_name'] = frozen_name
+                    store_inflows.append(d)
+                    continue
                 if cid is not None:
                     cn = master.execute(
                         "SELECT name FROM canonical_items WHERE id=?",
@@ -1180,7 +1226,7 @@ def review_order_route(order_id: int) -> str:
     try:
         order = sop.review_order(master, order_id, decision, g.user["id"], note or None)
     except ValueError as e:
-        flash(str(e))
+        flash(str(e), "error")
         return redirect(url_for("store_ordering.review_list"))
 
     event = (
@@ -1341,7 +1387,7 @@ def cancel_order_route(order_id: int) -> str:
     try:
         order = sop.cancel_order(master, order_id, actor_id, reason)
     except ValueError as e:
-        flash(str(e))
+        flash(str(e), "error")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     sop.notify_order_event(master, sop.EVENT_ORDER_CANCELLED, order, actor_id)
@@ -1406,23 +1452,25 @@ def ship_order_route(order_id: int) -> str:
         flash("请至少填写一项发货数量", "error")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 2. 兼容 v2 全量字段 'qty'：仅作用本仓未发齐明细。
+    # Preserve legacy qty before adapting against the current remaining quantity.
+    legacy_quantity = None
     if not shipped_items_map:
-        raw_qty = request.form.get("qty")
-        if raw_qty is not None and raw_qty != "":
+        raw_qty = request.form.get('qty')
+        if raw_qty is not None and raw_qty != '':
             qty_value = parse_qty(raw_qty)
             if qty_value > 0:
-                for it in detail["order_items"]:
-                    source = it.get("source_warehouse_code") or detail["dc_warehouse_code"]
-                    if source != operator_dc_code:
-                        continue
-                    already = parse_qty(it.get("shipped_quantity") or 0)
-                    remaining = parse_qty(it["quantity"]) - already
-                    if remaining > 0:
-                        shipped_items_map[int(it["id"])] = min(qty_value, remaining)
+                legacy_quantity = qty_value
 
     # 3. 都没填（且不含 shipped_items 字段）→ 本仓 legacy full-ship（旧客户端兼容）。
-    if not shipped_items_map:
+    if legacy_quantity is not None:
+        try:
+            order = sop.ship_legacy_quantity(master, order_id=order_id,
+                operator_dc_code=operator_dc_code, op_no=op_no, quantity=legacy_quantity,
+                shipped_by=g.user['id'], tracking_note=tracking_note)
+        except ValueError as e:
+            flash(f"出库失败：{e}", "error")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+    elif not shipped_items_map:
         try:
             order = sop.ship_order_full(
                 master,
@@ -1433,7 +1481,7 @@ def ship_order_route(order_id: int) -> str:
                 op_no=op_no,
             )
         except ValueError as e:
-            flash(f"出库失败：{e}")
+            flash(f"出库失败：{e}", "error")
             return redirect(url_for("store_ordering.shipment_list"))
     else:
         try:

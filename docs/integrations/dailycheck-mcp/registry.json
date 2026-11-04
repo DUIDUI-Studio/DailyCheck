@@ -2339,26 +2339,104 @@
             },
             "items": {
               "items": {
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "line_amount": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "line_revision": {
+                    "type": "integer"
+                  },
+                  "original_quantity": {
+                    "type": "number"
+                  },
+                  "price_state": {
+                    "type": "string"
+                  },
+                  "quantity": {
+                    "type": "number"
+                  },
+                  "ship_blocked_reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "unit_price_snapshot": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "quantity",
+                  "original_quantity",
+                  "line_revision",
+                  "unit_price_snapshot",
+                  "price_state",
+                  "line_amount",
+                  "ship_blocked_reason"
+                ],
                 "type": "object"
               },
               "type": "array"
             },
             "order": {
               "properties": {
+                "amount_state": {
+                  "type": "string"
+                },
+                "change_history": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "change_revision": {
+                  "type": "integer"
+                },
+                "goods_amount": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "id": {
                   "type": "integer"
                 },
                 "order_no": {
                   "type": "string"
                 },
+                "shipping_rule_state": {
+                  "type": "string"
+                },
                 "status": {
                   "type": "string"
+                },
+                "total_amount": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
                 "id",
                 "order_no",
-                "status"
+                "status",
+                "change_revision",
+                "amount_state",
+                "goods_amount",
+                "total_amount",
+                "shipping_rule_state",
+                "change_history"
               ],
               "type": "object"
             },

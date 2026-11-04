@@ -101,19 +101,30 @@
     {% else %}
     <div class="info-card-fee">
       <span class="info-card-fee-label">货品金额</span>
-      <span class="info-card-fee-value">¥ {{ (total_amount or 0) | fmt_money }}</span>
+      <span class="info-card-fee-value">{% if total_amount is not none %}¥ {{ total_amount | fmt_money }}{% else %}待核对（历史单价未知）{% endif %}</span>
     </div>
     <div class="info-card-fee">
-      <span class="info-card-fee-label">运费</span>
+      <span class="info-card-fee-label">运费{% if order.shipping_rule_state == 'unknown' %}（已记录，规则待核对）{% endif %}</span>
       <span class="info-card-fee-value">¥ {{ (order.shipping_fee or 0) | fmt_money }}</span>
     </div>
     <div class="info-card-total">
       <span class="info-card-total-label">订单总计</span>
-      <span class="info-card-total-value">¥ {{ ((total_amount or 0) + (order.shipping_fee or 0)) | fmt_money }}</span>
+      <span class="info-card-total-value">{% if order.total_amount is not none %}¥ {{ order.total_amount | fmt_money }}{% else %}待核对{% endif %}</span>
     </div>
     {% endif %}
   </div>
 </div>
+
+{% if order.change_history %}
+<h3>订单变更记录</h3>
+<div class="info-card">
+{% for proposal in order.change_history %}
+<p><a href="{{ url_for('store_ordering.order_change_detail', order_id=order.id, proposal_id=proposal.id) }}">方案 #{{ proposal.sequence }}</a>
+ · {{ {'pending':'待确认','accepted':'已同意','rejected':'已拒绝','withdrawn':'已撤回','stale':'已失效'}[proposal.status] }}
+ · {{ proposal.reason }}{% if proposal.status == 'pending' %}<br><small class="muted">仅受影响行暂停发货，已发货物可照常收货。可打开方案撤回。</small>{% endif %}</p>
+{% endfor %}
+</div>
+{% endif %}
 
 {# —— 付款凭证（Issue #135）：门店提交订单时上传，审批时在此核对 —— #}
 <h3>付款凭证</h3>
@@ -182,12 +193,12 @@
            他仓行只读展示由谁发货。单仓单不受影响（row_own 恒真）。 #}
         {% set row_own = (not ship_progress.is_multi) or (item.effective_source_warehouse_code == current_warehouse_code) %}
         <tr>
-          <td>{{ item.canonical_name }}</td>
+          <td>{{ item.canonical_name }}{% if item.ship_blocked_reason %}<br><small class="muted">{{ item.ship_blocked_reason }}</small>{% endif %}{% if item.original_quantity != item.quantity %}<br><small class="muted">原始 {{ item.original_quantity | fmt_qty }} · 有效 {{ item.quantity | fmt_qty }}</small>{% endif %}</td>
           {% if ship_progress.is_multi %}
           <td>{{ fmt_warehouse(item.source_warehouse_name, item.effective_source_warehouse_code) }}</td>
           {% endif %}
           <td>{{ item.unit }}</td>
-          {% if not is_transfer %}<td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>{% endif %}
+          {% if not is_transfer %}<td>{% if item.unit_price is not none %}¥ {{ item.unit_price | fmt_money }}{% else %}<span class="muted">待核对</span>{% if item.reference_unit_price is not none %}<br><small class="muted">当前参考价 ¥ {{ item.reference_unit_price | fmt_money }}</small>{% endif %}{% endif %}</td>{% endif %}
           <td>{{ item.quantity | fmt_qty }}</td>
           <td>{{ shipped | fmt_qty }}</td>
           <td>
@@ -200,6 +211,8 @@
           <td>
             {% if not row_own %}
             <span class="muted">由 {{ fmt_warehouse(item.source_warehouse_name, item.effective_source_warehouse_code) }} 发货</span>
+            {% elif item.ship_blocked_reason %}
+            <span class="muted">{{ item.ship_blocked_reason }}</span>
             {% elif shippable > 0 %}
             {# 上限 = min(剩余订单量, DC 库存)：禁止超库存发货（2026-10-10）。
                name 直接写死为 shipped_items[N] —— 本 form 的原生字段，无需 JS
@@ -263,9 +276,9 @@
         {% set effective_shipped = shipped_qty if shipped_qty > 0 else (item.quantity if order.status == 'shipped' else 0) %}
         {% set pending = ([effective_shipped, item.quantity] | min) - fulfilled %}
         <tr>
-          <td>{{ item.canonical_name }}</td>
+          <td>{{ item.canonical_name }}{% if item.ship_blocked_reason %}<br><small class="muted">{{ item.ship_blocked_reason }}</small>{% endif %}{% if item.original_quantity != item.quantity %}<br><small class="muted">原始 {{ item.original_quantity | fmt_qty }} · 有效 {{ item.quantity | fmt_qty }}</small>{% endif %}</td>
           <td>{{ item.unit }}</td>
-          {% if not is_transfer %}<td>¥ {{ (item.unit_price or 0) | fmt_money }}</td>{% endif %}
+          {% if not is_transfer %}<td>{% if item.unit_price is not none %}¥ {{ item.unit_price | fmt_money }}{% else %}<span class="muted">待核对</span>{% if item.reference_unit_price is not none %}<br><small class="muted">当前参考价 ¥ {{ item.reference_unit_price | fmt_money }}</small>{% endif %}{% endif %}</td>{% endif %}
           <td>{{ item.quantity | fmt_qty }}</td>
           <td>{{ shipped_qty | fmt_qty }}</td>
           <td>{{ fulfilled | fmt_qty }}</td>

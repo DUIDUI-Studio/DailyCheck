@@ -350,6 +350,9 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.submit_order_route": perm("order.create"),
     "store_ordering.store_orders_list": LOGIN,
     "store_ordering.order_detail": LOGIN,
+    "store_ordering.order_change_detail": LOGIN,
+    "store_ordering.withdraw_order_change": LOGIN,  # fresh domain policy in master tx
+
     # 付款凭证：可见性与订单详情一致，视图内部再走 _order_viewable 校验。
     "store_ordering.payment_proof_download": LOGIN,
     # Issue #19（2026-10-24）：订单管理（admin_orders）与订货审批（review_list）
