@@ -61,7 +61,7 @@ bash scripts/blue_green/deploy_pipeline.sh <pr-num> <merge-sha>
 
 | 选项 | 说明 |
 |------|------|
-| `--observe-min N` | 观察窗分钟数（默认 30；`0` 跳过）。窗口内每 5 分钟探 `:8080/` + `grep BLOCKED`，异常自动回滚蓝 |
+| `--observe-min N` | 观察窗分钟数（默认 10；`0` 跳过）。窗口内每 5 分钟探 `:8080/` + `grep BLOCKED`，异常自动回滚蓝 |
 | `--skip-verify` | 跳过八项验证（仅限人工应急，会打 WARN） |
 | `--dry-run` | 只透传子脚本的 `--dry-run`，不 acquire / 不 release / 不碰流量 |
 | `--session NAME` | 锁归属标签（默认 `pipeline-<pr>`），审计可追溯 |
@@ -319,7 +319,7 @@ read -rsp 'SIM_USER_PASSWORD: ' SIM_USER_PASSWORD; export SIM_USER_PASSWORD  # �
 ./scripts/blue_green/switch.sh green 50
 ./scripts/blue_green/switch.sh green 100
 
-# 6. 观察窗 30 分钟无异常 → 合 PR
+# 6. 观察窗 10 分钟无异常 → 合 PR
 # 7. 蓝环境 standby 7 天后清理
 ./scripts/blue_green/down.sh --keep-blue
 ```
