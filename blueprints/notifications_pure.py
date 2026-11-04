@@ -30,6 +30,9 @@ ALLOWED_EVENT_TYPES = frozenset({
     "store_order_no_approver_alert",
     # 用户反馈提单（2026-10-17）：扇出给所有平台超管，见 blueprints/feedback.py
     "feedback_submitted",
+    "store_order_change_proposed",
+    "store_order_change_accepted",
+    "store_order_change_rejected",
     "store_order_change_withdrawn",
     "store_order_change_stale",
 })

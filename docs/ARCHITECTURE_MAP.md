@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 25 个（已装配 24 / 未装配 1）
-- 路由 **194** 条（按鉴权强度：平台超管 65 · 登录 49 · 权限点 31 · 角色 29 · 配送中心 10 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **198** 条（按鉴权强度：平台超管 65 · 登录 53 · 权限点 31 · 角色 29 · 配送中心 10 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **65** 张，`WAREHOUSE_SCHEMA_VERSION = 7`
 - MCP 工具域 9 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -22,8 +22,8 @@
 
 | 蓝图 | 文件 | 路由数 | 装配 |
 |---|---|---|---|
+| `store_ordering` | `store_ordering.py` | 29 | 在役 |
 | `recipe_cost` | `recipe_cost.py` | 25 | 在役 |
-| `store_ordering` | `store_ordering.py` | 25 | 在役 |
 | `canonical` | `canonical.py` | 20 | 在役 |
 | `production` | `production.py` | 12 | 在役 |
 | `stocktake` | `stocktake.py` | 12 | 在役 |
@@ -329,6 +329,7 @@
 
 | endpoint | 方法 | 规则 | 鉴权 | 明细 |
 |---|---|---|---|---|
+| `store_ordering.accept_order_change` | POST | `/orders/<int:order_id>/changes/<int:proposal_id>/accept` | 登录 |  |
 | `store_ordering.add_to_cart` | POST | `/cart/add` | 权限点 | order.create |
 | `store_ordering.admin_orders` | GET | `/admin/orders` | 配送中心 | role:staff |
 | `store_ordering.admin_report` | GET | `/admin/report` | 角色 | admin |
@@ -337,13 +338,16 @@
 | `store_ordering.cart_view` | GET | `/cart` | 登录 |  |
 | `store_ordering.catalog` | GET | `/catalog` | 登录 |  |
 | `store_ordering.clear_cart_route` | POST | `/cart/clear` | 权限点 | order.create |
+| `store_ordering.create_order_change` | POST | `/orders/<int:order_id>/changes` | 登录 |  |
 | `store_ordering.deliver_order_route` | POST | `/orders/<int:order_id>/deliver` | 权限点 | order.ship |
 | `store_ordering.manage_dc_items` | GET,POST | `/dc/items` | 配送中心 | role:manager |
 | `store_ordering.manage_shipping_rule` | GET,POST | `/admin/shipping` | 角色 | admin |
+| `store_ordering.new_order_change` | GET | `/orders/<int:order_id>/changes/new` | 登录 |  |
 | `store_ordering.order_change_detail` | GET | `/orders/<int:order_id>/changes/<int:proposal_id>` | 登录 |  |
 | `store_ordering.order_detail` | GET | `/orders/<int:order_id>` | 登录 |  |
 | `store_ordering.payment_proof_download` | GET | `/orders/<int:order_id>/payment-proofs/<int:proof_id>` | 登录 |  |
 | `store_ordering.receive_order_route` | POST | `/orders/<int:order_id>/receive` | 权限点 | order.receive |
+| `store_ordering.reject_order_change` | POST | `/orders/<int:order_id>/changes/<int:proposal_id>/reject` | 登录 |  |
 | `store_ordering.remove_cart_item_route` | POST | `/cart/remove/<int:cart_item_id>` | 权限点 | order.create |
 | `store_ordering.review_list` | GET | `/review` | 配送中心 | role:staff |
 | `store_ordering.review_order_route` | POST | `/orders/<int:order_id>/review` | 配送中心 | perm:order.approve |

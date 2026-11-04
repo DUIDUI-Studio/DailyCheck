@@ -2177,3 +2177,21 @@ button.btn-table:focus-visible {
 .proof-thumb { width: 100%; height: 120px; object-fit: cover; border-radius: 6px; background: #f1f5f9; }
 .proof-pdf { display: flex; align-items: center; justify-content: center; height: 120px; border-radius: 6px; background: #fef2f2; color: #b91c1c; font-weight: 700; letter-spacing: 1px; }
 .proof-name { font-size: 12px; color: #64748b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Whole-order changes: single-column forms and comparisons on narrow phones. */
+.order-change { max-width: 46rem; margin-inline: auto; overflow-wrap: anywhere; }
+.order-change form { display: grid; gap: .85rem; margin-block: 1.25rem; min-width: 0; }
+.order-change fieldset { min-width: 0; margin: 0; }
+.order-change label { display: grid; gap: .35rem; min-width: 0; }
+.order-change input, .order-change select, .order-change textarea,
+.order-change button { box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; }
+.order-change select { white-space: normal; }
+.order-change textarea { min-height: 5rem; }
+.order-change legend { max-width: 100%; white-space: normal; }
+/* Proposal inbox links stay inside a scroll container even with JS disabled. */
+main > table:has(a[href^="/store-ordering/orders/"][href*="/changes/"]) {
+  display: block; max-width: 100%; overflow-x: auto;
+}
+@media (max-width: 600px) {
+  .order-change button.danger { color: #b91c1c; background: #fff; border: 1px solid #fca5a5; }
+}

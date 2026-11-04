@@ -115,6 +115,7 @@
   </div>
 </div>
 
+{% if can_propose_change %}<p><a class="btn-action" href="{{ url_for('store_ordering.new_order_change', order_id=order.id) }}">提议订单变更</a></p>{% endif %}
 {% if order.change_history %}
 <h3>订单变更记录</h3>
 <div class="info-card">
@@ -169,7 +170,7 @@
         {# 发货幂等键（多仓履约 Task 5）：服务端下发、提交回传；重复提交不重复扣减。 #}
         <input type="hidden" name="op_no" value="{{ ship_op_no }}">
   {% endif %}
-  <table class="data-table">
+  <div class="table-scroll"><table class="data-table">
     <thead>
       <tr>
         <th>品项</th>
@@ -238,7 +239,7 @@
         </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% if show_ship_form %}
   <div class="inline-form" style="margin-top:8px;gap:10px">
     <input name="tracking_note" placeholder="物流备注" />
@@ -254,7 +255,7 @@
      在门店端永远看不到收货入口（2026-10-10 缺陷）。故放宽到
      approved + shipped，再逐行按「已发未收」量决定是否给输入框。 #}
   {% set show_receive_form = can_receive and order.status in ('approved', 'shipped') %}
-  <table class="data-table">
+  <div class="table-scroll"><table class="data-table">
     <thead>
       <tr>
         <th>品项</th>
@@ -303,13 +304,13 @@
         </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
 {% endif %}
 
 {# —— 收货历史（如有）—— 显眼位置放顶部，按时间倒序 —— #}
 {% if order.receipts %}
 <h3>收货历史</h3>
-<table class="data-table">
+<div class="table-scroll"><table class="data-table">
   <thead>
     <tr><th>时间</th><th>品项</th><th>数量</th><th>收货人</th><th>备注</th></tr>
   </thead>
@@ -324,14 +325,14 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% endif %}
 
 {# —— 门店入库流水（storefront 视角）：直接读门店仓 stock_movements —— #}
 {% if not is_dc_view %}
 <h3>{{ '收货入库流水' if is_dc_receiver else '门店入库流水' }}</h3>
 {% if store_inflows %}
-<table class="data-table">
+<div class="table-scroll"><table class="data-table">
   <thead>
     <tr><th>时间</th><th>品项</th><th>入库数量</th><th>动作</th><th>备注</th></tr>
   </thead>
@@ -346,7 +347,7 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% else %}
 <p class="empty">暂无{{ '收货入库流水' if is_dc_receiver else '门店入库流水' }}（收货后会自动写入）</p>{% endif %}
 {% endif %}
@@ -354,7 +355,7 @@
 {# —— 发货历史（如有）—— #}
 {% if order.deliveries %}
 <h3>发货历史</h3>
-<table class="data-table">
+<div class="table-scroll"><table class="data-table">
   <thead>
     <tr><th>配送单号</th><th>出库人</th><th>出库时间</th><th>物流备注</th></tr>
   </thead>
@@ -368,11 +369,11 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 {% endif %}
 
 <h3>状态历史</h3>
-<table class="data-table">
+<div class="table-scroll"><table class="data-table">
   <thead>
     <tr><th>时间</th><th>从</th><th>到</th><th>操作人</th><th>备注</th></tr>
   </thead>
@@ -387,7 +388,7 @@
     </tr>
     {% endfor %}
   </tbody>
-</table>
+</table></div>
 
 <div class="order-actions">
   {# —— 审批操作：主操作「通过」实心，危险操作「拒绝」描边红，同高同宽 —— #}
