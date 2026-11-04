@@ -1693,6 +1693,12 @@ sequenceDiagram
 该仓有来源行（`order_participants`）才可操作；表单行 ID 的来源不是操作仓即整批拒绝，
 不扣任何库存（场景 c）。
 
+**显式提交行归属（Issue #146）**：HTTP 适配保留 `shipped_items[N]` 中的零/空数量
+ID，把完整 map 交给领域层；`_select_ship_lines()` 先校验每行属于目标订单且来源为
+操作仓，再跳过零数量行。混合批次的本单本仓零行仍不发货，显式全零/全空批次拒绝，
+不会回落旧版全发；归属校验在幂等批次查询前执行，新请求及同键重放均适用。
+失败沿用 PRG 并标记 `flash(..., "error")`，AJAX 对应 HTTP 409 / `ok:false`。
+
 提交分两段短事务，由 `store_ordering_pure.ship_partial()` 串起：
 
 1. **仓库库** `BEGIN IMMEDIATE` → `fulfillment_pure.resolve_fulfillment_item()` 解析本仓
@@ -2707,6 +2713,11 @@ scripts/dev_smoke_order_changes.py 必须显式指定空的 /tmp/dailycheck-orde
 根，启动独占随机 loopback 端口，拒绝外部 HTTP；用于实际浏览器 375/320 宽验证，
 不连接共享 localhost:8080。master v7 与 warehouse v7 的编号相同但注册表与迁移
 目标仍严格分离，仓库 CLI 必须拒绝 master 文件。
+
+Issue #146 的 `tests/test_shipping_ownership.py` 用 DC staff 会话、强制开启的 CSRF
+及详情页生成的新 `op_no` 驱动发货 HTTP 入口，覆盖新请求、原样重放、同单零数量行、
+外单零/正/空数量行及同单他仓行；拒绝前后比较两订单、配送头/行、状态历史和各仓
+库存/流水，另以领域完整 map 调用对照外单零 ID。显式空批次不得回落全发。
 
 Issue #140 的 `tests/test_wms_dashboard.py` 覆盖真实 Cookie/DC/viewer 权限、导航双载体、
 多货主分页、详情/原筛选返回、ID/范围攻击、故障与部分结果丢弃、空/截断、转义和只读方法。
