@@ -37,8 +37,16 @@ def test_zero_line_transformations_preserve_inferred_shipment(ship_env, source, 
     zeros = [(oid, 0) for oid in ids[1:]]
     submitted = (zeros + [positive] if initial == 'zeros-first' else
                  [positive] + zeros if initial == 'zeros-last' else [positive])
-    result = sop.ship_order(e['master'], order, dict(submitted), shipped_by=actor, op_no='zero-transform')
-    delivery = result['delivery_id']
+    result = error = None
+    try:
+        result = sop.ship_order(e['master'], order, dict(submitted), shipped_by=actor, op_no='zero-transform')
+    except ValueError as exc:
+        error = str(exc)
+    delivery = result['delivery_id'] if result is not None else None
+    print({'source': source, 'initial': initial, 'raw': submitted, 'error': error,
+        'delivery_id': delivery, 'source_stock': e['stock'](source, 101),
+        'other_stock': e['stock'](other, 101),
+        'deliveries': e['master'].execute('SELECT count(*) FROM store_order_deliveries').fetchone()[0]})
     assert e['stock'](source, 101) == 10 - quantity
     assert e['stock'](other, 101) == e['stock'](other, 102) == 10
     assert [tuple(r) for r in e['master'].execute(
@@ -46,6 +54,7 @@ def test_zero_line_transformations_preserve_inferred_shipment(ship_env, source, 
     assert [tuple(r) for r in e['master'].execute(
         'SELECT order_item_id,quantity,warehouse_code FROM store_order_delivery_items')] == [(ids[0], quantity, source)]
     assert e['master'].execute('SELECT count(*) FROM notifications').fetchone()[0] == 0
+    assert result is not None
     before = _shipment_effects(e)
     variants = 0
     for size in range(len(zeros) + 1):

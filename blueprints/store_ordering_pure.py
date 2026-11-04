@@ -2087,14 +2087,14 @@ def _line_source_warehouse(order: dict[str, Any], item: dict[str, Any]) -> str:
 def _select_ship_lines(
     order: dict[str, Any],
     line_qty: dict[int, float],
-    operator_dc_code: str,
+    operator_dc_code: str | None,
     op_no: str,
 ) -> list[tuple[int, dict[str, Any], float]]:
     """Validate every requested line before any stock is touched.
 
-    Zero/blank quantities are no-ops (UI blank rows). Unknown line IDs and
-    lines whose frozen source is not the operation warehouse are hard errors,
-    so a forged foreign row can never deduct stock.
+    Validate every ID, then return positive-quantity execution lines. An explicit
+    operation warehouse constrains all submitted lines, including zeros. Without
+    one, the caller infers the source from these validated execution lines.
     """
     items_by_id: dict[int, dict[str, Any]] = {
         int(it["id"]): it for it in order["order_items"]
@@ -2111,7 +2111,7 @@ def _select_ship_lines(
                 f"order_item_id={order_item_id} 不属于 order_id={order['id']}"
             )
         source = _line_source_warehouse(order, item)
-        if source != operator_dc_code:
+        if operator_dc_code is not None and source != operator_dc_code:
             raise ValueError(
                 f"order_item_id={order_item_id} 不属于操作仓 {operator_dc_code}"
                 f"（行来源 {source}）"
@@ -2428,13 +2428,13 @@ def _new_ship_plan(master_conn, order, source, op_no, line_qty, mode, legacy_qua
             if remaining > 0:
                 line_qty[int(item['id'])] = (min(legacy_quantity, remaining)
                     if mode == 'legacy_qty' else remaining)
+    selected = _select_ship_lines(order, line_qty, source, op_no)
     if source is None:
-        sources = {_line_source_warehouse(order, item) for item in order['order_items']
-                   if int(item['id']) in line_qty}
+        sources = {_line_source_warehouse(order, item) for _, item, _ in selected}
         if len(sources) > 1:
             raise ValueError('订单跨仓，必须显式指定操作仓')
-        source = next(iter(sources), order['dc_warehouse_code'])
-    return source, _select_ship_lines(order, line_qty, source, op_no)
+        source = next(iter(sources))
+    return source, selected
 
 
 def _ship_plan_signature(selected):
@@ -2525,9 +2525,14 @@ def ship_partial(
                 order_id=order_id, source=source, line_qty=line_qty,
                 legacy_quantity=legacy_quantity, request_mode=mode)
             if mode == 'explicit':
-                members = {int(item['id']) for item in order['order_items']}
-                if any(int(oid) not in members for oid in line_qty):
-                    raise ValueError('发货明细不属于当前订单')
+                members = {int(item['id']): item for item in order['order_items']}
+                for oid in line_qty:
+                    item = members.get(int(oid))
+                    if item is None:
+                        raise ValueError(f"order_item_id={int(oid)} 不属于 order_id={order_id}")
+                    item_source = _line_source_warehouse(order, item)
+                    if operator_dc_code is not None and item_source != operator_dc_code:
+                        raise ValueError(f"order_item_id={int(oid)} 不属于操作仓 {operator_dc_code}（行来源 {item_source}）")
             normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
             if claim['state'] == 'committed':
                 master_conn.commit()
