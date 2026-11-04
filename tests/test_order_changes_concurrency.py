@@ -250,3 +250,116 @@ def test_ship_warehouse_commit_before_finalize_keeps_affected_occupied(change_en
             release.set()
         future.result(timeout=15)
     assert ocp.get_claim(e["master"], "occupied")["state"] == "committed"
+
+
+def test_b1_affected_quantity_changed_after_preparation_stales_under_lock(change_env, monkeypatch):
+    e = change_env
+    order = domain.fractional_order(e, 0.5)
+    domain.ship_fraction_batches(e, order, (0.1, 0.2))
+    order = sop.get_order_detail(e["master"], order["id"])
+    p, _ = publish(e, order, replacement_intent(order))
+    reached, committed = threading.Barrier(2), threading.Event()
+    original = ocp._candidate
+
+    def pause(*args):
+        quote = original(*args)
+        reached.wait(10)
+        assert committed.wait(10)
+        return quote
+
+    monkeypatch.setattr(ocp, "_candidate", pause)
+
+    def accept():
+        with closing(builder.connect(e["master_path"])) as m:
+            return ocp.accept_proposal(
+                m,
+                order_id=order["id"],
+                proposal_id=p["id"],
+                actor_id=1,
+                current_warehouse_code="store_one",
+                request_key="changed-after-read",
+                seen_digest=ocp.payload_hash(p["snapshot"]),
+                agree=True,
+            )
+
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(accept)
+        reached.wait(10)
+        with closing(builder.connect(e["master_path"])) as m:
+            m.execute(
+                "UPDATE store_order_items SET quantity=.49,line_revision=line_revision+1 WHERE id=?",
+                (order["order_items"][0]["id"],),
+            )
+            m.commit()
+        before = commercial(e["master"], order["id"])
+        committed.set()
+        assert future.result(15)["status"] == "stale"
+    assert commercial(e["master"], order["id"]) == before
+    assert (
+        not e["master"]
+        .execute("SELECT 1 FROM store_order_items WHERE replaces_order_item_id IS NOT NULL")
+        .fetchone()
+    )
+    domain.dump_fraction_state(e, "changed-under-lock")
+
+
+@pytest.mark.parametrize("different_actor", [False, True])
+def test_b1_tail_accept_same_key_rechecks_identity_and_hash_under_lock(
+    change_env, monkeypatch, different_actor
+):
+    e = change_env
+    order = domain.fractional_order(e, 0.5)
+    domain.ship_fraction_batches(e, order, (0.1, 0.2))
+    order = sop.get_order_detail(e["master"], order["id"])
+    p, _ = publish(e, order)
+    initial = threading.Barrier(2)
+    local = threading.local()
+    original = ocp._prior
+
+    def prior(*args):
+        result = original(*args)
+        if not getattr(local, "observed", False):
+            local.observed = True
+            assert result is None
+            initial.wait(10)
+        return result
+
+    monkeypatch.setattr(ocp, "_prior", prior)
+
+    def accept(actor):
+        return lambda m: ocp.accept_proposal(
+            m,
+            order_id=order["id"],
+            proposal_id=p["id"],
+            actor_id=actor,
+            current_warehouse_code="store_one",
+            request_key="shared-tail",
+            seen_digest=ocp.payload_hash(p["snapshot"]),
+            agree=True,
+        )
+
+    before = domain.fraction_history(e, order)
+    results = race(e, [accept(1), accept(5 if different_actor else 1)])
+    assert sum(result[0] == "ok" for result in results) == (1 if different_actor else 2)
+    assert domain.fraction_history(e, order) == before
+    assert (
+        e["master"]
+        .execute(
+            "SELECT quantity FROM store_order_items WHERE id=?", (order["order_items"][0]["id"],)
+        )
+        .fetchone()[0]
+        == 0.3
+    )
+    assert (
+        e["master"]
+        .execute("SELECT COUNT(*) FROM store_order_change_commands WHERE action='accept'")
+        .fetchone()[0]
+        == 1
+    )
+    assert (
+        e["master"]
+        .execute("SELECT COUNT(*) FROM store_order_change_events WHERE to_status='accepted'")
+        .fetchone()[0]
+        == 1
+    )
+    domain.dump_fraction_state(e, "identity-race")

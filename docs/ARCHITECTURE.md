@@ -2458,6 +2458,11 @@ HTTP/CSRF；`dev_smoke_order_changes.py --browser --root <新空根>` 通过真�
 B1 数量回归通过原生单批、分批、顺序变化与收货累加对照，断言整份决定、金额及原始
 REAL 历史保持；真实 loopback HTTP 覆盖无关行和受影响行的分批发货。固定 d10 候选
 在合法分批后会误失效或无法接受，这些回归先以失败提交，再修复 B 数量消费边界。
+B 的 `_contract_quantity` 将持久数量导出为既有 HALF_UP 两位 Decimal，并仅容许
+距该精度不超过原生 1e-9 的尾差；非有限、负数和更大偏差仍拒绝。历史四量校验、
+未发量算术和冻结基线检查共用此边界。接受在同一 master 写锁内以实际原始 REAL
+数量/已发值作精确 CAS，已发下限用两位 ROUND 与已校验语义一致；只改有效数量，
+不改 original/shipped/fulfilled 原值、配送/收货/库存流水或 A 发收及 claim 协议。
 
 B 回退到 A 保留有效 quantity、快照、追加行和 active/recovering 占用，不能回到
 不识别 claim 的 pre-A 写者。开放提议前所有 Web 写者必须支持 claim、旧执行者

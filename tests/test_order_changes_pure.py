@@ -989,3 +989,159 @@ def test_b1_native_fraction_receipts_preserve_history_and_complete_at_effective_
         assert final["order_items"][0]["fulfilled_quantity"] == sum(batches)
     finally:
         dump_fraction_state(e, "after-decision")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("shipped_quantity", -0.01),
+        ("fulfilled_quantity", -0.01),
+        ("quantity", -0.01),
+        ("original_quantity", -0.01),
+        ("shipped_quantity", float("inf")),
+        ("fulfilled_quantity", "NaN"),
+        ("quantity", float("inf")),
+        ("original_quantity", float("inf")),
+        ("fulfilled_quantity", 0.31),
+        ("shipped_quantity", 1.01),
+        ("quantity", 1.01),
+        ("shipped_quantity", 0.30000001),
+        ("fulfilled_quantity", 0.20000001),
+        ("quantity", 1.00000001),
+        ("original_quantity", 1.00000001),
+    ],
+)
+def test_b1_abnormal_real_history_is_rejected_without_rounding_it_away(change_env, field, value):
+    e, m = change_env, change_env["master"]
+    oid = m.execute(
+        "INSERT INTO store_orders(order_no,store_warehouse_code,dc_warehouse_code,status,requested_by,created_at,updated_at) VALUES('B1-ABNORMAL','store_one','dc_alpha','approved',1,?,?)",
+        (builder.TS, builder.TS),
+    ).lastrowid
+    quantities = {
+        "quantity": 1,
+        "original_quantity": 1,
+        "shipped_quantity": 0.3,
+        "fulfilled_quantity": 0.2,
+        field: value,
+    }
+    m.execute(
+        "INSERT INTO store_order_items(order_id,canonical_id,source_warehouse_code,quantity,original_quantity,shipped_quantity,fulfilled_quantity,unit,created_at) VALUES(?,201,'dc_alpha',?,?,?,?, '件',?)",
+        (
+            oid,
+            quantities["quantity"],
+            quantities["original_quantity"],
+            quantities["shipped_quantity"],
+            quantities["fulfilled_quantity"],
+            builder.TS,
+        ),
+    )
+    m.commit()
+    before = "\n".join(m.iterdump())
+    order = sop.get_order_detail(m, oid)
+    with pytest.raises(ValueError):
+        publish(
+            e,
+            order,
+            intent_for(
+                order,
+                historical_prices={
+                    str(order["order_items"][0]["id"]): {
+                        "price": "1",
+                        "reference": "B1-OFFLINE",
+                        "note": "核对原价，排除缺价造成假拒绝",
+                    }
+                },
+            ),
+        )
+    assert "\n".join(m.iterdump()) == before
+    assert not ocp.blocked_lines(m, oid) and not rows(m, "store_order_change_commands")
+
+
+@pytest.mark.parametrize(
+    "mutation", ["effective", "shipped", "revision", "off_precision", "below_shipped"]
+)
+def test_b1_real_affected_baseline_change_still_stales_atomically(change_env, mutation):
+    e, m = change_env, change_env["master"]
+    order = fractional_order(e, 0.5)
+    ship_fraction_batches(e, order, (0.1, 0.2))
+    order = sop.get_order_detail(m, order["id"])
+    p, _ = publish(e, order)
+    item = order["order_items"][0]["id"]
+    sql = {
+        "effective": "quantity=.49",
+        "shipped": "shipped_quantity=.31",
+        "revision": "line_revision=line_revision+1",
+        "off_precision": "quantity=.50000001",
+        "below_shipped": "quantity=.29",
+    }[mutation]
+    m.execute("UPDATE store_order_items SET " + sql + " WHERE id=?", (item,))
+    m.commit()
+    before = commercial(m, order["id"])
+    histories = fraction_history(e, order)
+    result = decide(e, order, p)
+    assert result["status"] == "stale"
+    assert commercial(m, order["id"]) == before and fraction_history(e, order) == histories
+    assert (
+        m.execute(
+            "SELECT COUNT(*) FROM store_order_change_events WHERE to_status='accepted'"
+        ).fetchone()[0]
+        == 0
+    )
+    dump_fraction_state(e, "stale-baseline")
+
+
+@pytest.mark.parametrize("state", ["active", "recovering"])
+def test_b1_fraction_tail_does_not_bypass_affected_claim(change_env, state):
+    e, m = change_env, change_env["master"]
+    order = fractional_order(e, 0.5)
+    ship_fraction_batches(e, order, (0.1, 0.2))
+    order = sop.get_order_detail(m, order["id"])
+    p, _ = publish(e, order)
+    line = order["order_items"][0]
+    payload = ocp.ship_payload(order["id"], "dc_alpha", {line["id"]: 0.1})
+    m.execute(
+        "INSERT INTO store_order_ship_claims(op_no,order_id,source_warehouse_code,payload_hash,payload_json,state,actor_id,created_at) VALUES('held-b1',?,'dc_alpha',?,?,'active',2,?)",
+        (order["id"], ocp.payload_hash(payload), ocp.canonical_json(payload), builder.TS),
+    )
+    m.execute(
+        "INSERT INTO store_order_ship_claim_lines(op_no,order_id,order_item_id,quantity,base_line_revision,baseline_quantity,baseline_shipped,canonical_id,dc_item_id,unit,state) VALUES('held-b1',?,?,.1,?,?,?,?,?,'件','active')",
+        (
+            order["id"],
+            line["id"],
+            line["line_revision"],
+            line["quantity"],
+            line["shipped_quantity"],
+            line["canonical_id"],
+            line["dc_item_id"],
+        ),
+    )
+    if state == "recovering":
+        m.execute("UPDATE store_order_ship_claims SET state='recovering' WHERE op_no='held-b1'")
+    m.commit()
+    before = commercial(m, order["id"])
+    histories = fraction_history(e, order)
+    assert decide(e, order, p)["status"] == "stale"
+    assert commercial(m, order["id"]) == before and fraction_history(e, order) == histories
+    assert ocp.get_claim(m, "held-b1")["state"] == state
+    dump_fraction_state(e, "held-claim")
+
+
+def test_b1_remove_beyond_normalized_unshipped_quantity_is_rejected(change_env):
+    e, m = change_env, change_env["master"]
+    order = fractional_order(e, 0.5)
+    ship_fraction_batches(e, order, (0.1, 0.2))
+    order = sop.get_order_detail(m, order["id"])
+    before = "\n".join(m.iterdump())
+    intent = intent_for(
+        order,
+        [
+            {
+                "order_item_id": order["order_items"][0]["id"],
+                "operation": "reduce",
+                "remove_quantity": ".21",
+            }
+        ],
+    )
+    with pytest.raises(ValueError):
+        publish(e, order, intent)
+    assert "\n".join(m.iterdump()) == before

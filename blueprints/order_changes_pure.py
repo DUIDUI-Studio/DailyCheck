@@ -458,6 +458,8 @@ def withdraw_proposal(conn: sqlite3.Connection, *, order_id: int, proposal_id: i
 
 # Whole-order commercial proposals. Snapshot v1 is private persistence, not an MCP contract.
 SNAPSHOT_VERSION = 1
+# Match native shipment/receipt arithmetic without admitting off-precision history.
+CONTRACT_QUANTITY_TOLERANCE = Decimal('0.000000001')
 
 
 def _number(value, label: str) -> Decimal:
@@ -470,6 +472,15 @@ def _number(value, label: str) -> Decimal:
         return result
     except (InvalidOperation, TypeError):
         raise ValueError(label + '无效') from None
+
+
+def _contract_quantity(value) -> Decimal:
+    """Derive commercial 2dp quantity; raw SQLite shipment/receipt history stays intact."""
+    raw = _number(value, '订单数量')
+    normalized = Decimal(quantity(raw))
+    if abs(raw - normalized) > CONTRACT_QUANTITY_TOLERANCE:
+        raise ValueError('历史数量超出正常精度容差，须人工核对后再变更')
+    return normalized
 
 
 def _id(value) -> int:
@@ -664,7 +675,7 @@ def _assert_order_changeable(order):
     if order.get('flow_type') not in (None, 'store_order') or order['status'] not in ('pending', 'approved'):
         raise ValueError('仅待审批或已审批的普通订货单可提变更')
     for row in order['order_items']:
-        received, shipped, effective, original = (_number(row[key], '订单数量') for key in ('fulfilled_quantity', 'shipped_quantity', 'quantity', 'original_quantity'))
+        received, shipped, effective, original = (_contract_quantity(row[key]) for key in ('fulfilled_quantity', 'shipped_quantity', 'quantity', 'original_quantity'))
         if not 0 <= received <= shipped <= effective <= original:
             raise ValueError('历史数量异常，须人工核对后再变更')
 
@@ -690,6 +701,8 @@ def _build_snapshot(conn, order, intent, actor_id, quotes):
     if not set(intent['historical_prices']) <= {str(key) for key in by_id}:
         raise ValueError('历史价格明细不属于本订单')
     for row in order['order_items']:
+        effective = _contract_quantity(row['quantity'])
+        shipped = _contract_quantity(row['shipped_quantity'])
         raw_price = row['unit_price_snapshot']
         if raw_price is None and _number(row['quantity'], '有效量') > 0:
             evidence = intent['historical_prices'].get(str(row['id']))
@@ -711,18 +724,18 @@ def _build_snapshot(conn, order, intent, actor_id, quotes):
             'product': product, 'product_basis': 'historical_snapshot' if row['product_snapshot'] else 'current_identification_only',
             'unit_price_snapshot': str(price) if price is not None else None,
             'price_snapshot_origin': row['price_snapshot_origin'] if row['unit_price_snapshot'] is not None else ('verified' if price is not None else None),
-            'line_amount': str(money(price * Decimal(str(row['quantity'])))) if price is not None else '0.00',
+            'line_amount': str(money(price * effective)) if price is not None else '0.00',
             'verification_pending': str(row['id']) in verification}
         before.append(display)
         changed = dict(display)
         if row['id'] in affected:
             line = affected[row['id']]
-            remaining = Decimal(str(row['quantity'])) - Decimal(str(row['shipped_quantity']))
+            remaining = effective - shipped
             remove = _number(line['remove_quantity'], '移除量') if line['operation'] == 'reduce' else remaining
             if remaining <= 0 or remove <= 0 or remove > remaining or (line['operation'] == 'reduce' and remove >= remaining):
                 raise ValueError('减量须严格小于未发量；取消或替换移除全部未发量')
-            new_qty = Decimal(str(row['quantity'])) - remove
-            if not new_qty.is_finite() or new_qty < Decimal(str(row['shipped_quantity'])):
+            new_qty = effective - remove
+            if not new_qty.is_finite() or new_qty < shipped:
                 raise ValueError('有效量不得低于已发量')
             changed['quantity'] = quantity(new_qty)
             changed['line_amount'] = str(money(price * new_qty))
@@ -926,7 +939,8 @@ def _assert_pending_valid(conn, order, proposal, quotes, preparation_error):
     for line in snapshot['operations']:
         row = by_id.get(line['order_item_id'])
         if (row is None or row['line_revision'] != line['base_line_revision'] or
-                quantity(row['quantity']) != line['baseline_quantity'] or quantity(row['shipped_quantity']) != line['baseline_shipped']):
+                _contract_quantity(row['quantity']) != Decimal(line['baseline_quantity']) or
+                _contract_quantity(row['shipped_quantity']) != Decimal(line['baseline_shipped'])):
             raise ValueError('受影响行基线已变化')
         if line['replacement'] != quotes.get(line['order_item_id']):
             raise ValueError('替换品项、路由、单位、倍数或报价已变化')
@@ -1000,12 +1014,14 @@ def _decision(conn, *, action, order_id, proposal_id, actor_id, current_warehous
                     if conn.execute("UPDATE store_order_items SET unit_price_snapshot=?,price_snapshot_origin='verified' WHERE id=? AND order_id=? AND unit_price_snapshot IS NULL", (evidence['price'], int(key), order_id)).rowcount != 1:
                         raise ValueError('历史核对价格基线已变化')
                 line_ids = {line['order_item_id']: line['id'] for line in proposal['lines']}
+                current_lines = {row['id']: row for row in order['order_items']}
                 for line in snapshot['operations']:
+                    current = current_lines[line['order_item_id']]
                     new_quantity = float(Decimal(line['baseline_quantity']) - Decimal(line['remove_quantity']))
                     if conn.execute('''UPDATE store_order_items SET quantity=?,line_revision=line_revision+1
                         WHERE id=? AND order_id=? AND line_revision=? AND quantity=? AND shipped_quantity=?
-                        AND ? >= shipped_quantity''', (new_quantity, line['order_item_id'], order_id, line['base_line_revision'],
-                        float(line['baseline_quantity']), float(line['baseline_shipped']), new_quantity)).rowcount != 1:
+                        AND ? >= ROUND(shipped_quantity,2)''', (new_quantity, line['order_item_id'], order_id, line['base_line_revision'],
+                        current['quantity'], current['shipped_quantity'], new_quantity)).rowcount != 1:
                         raise ValueError('受影响行已变更，整份接受回滚')
                     replacement = line['replacement']
                     if replacement:
