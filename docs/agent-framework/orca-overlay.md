@@ -72,7 +72,10 @@ a PR comment. Use `~/.local/state/dailycheck/automation/bin/dc_delivery.py`.
 
 Flow:
 
-1. Lock `~/.local/state/dailycheck/automation/drain.lock`; keep it across wakes.
+1. Acquire a per-issue claim under
+   `~/.local/state/dailycheck/automation/claims/issue-<N>/`; there is no global
+   drain lock. A fresh claim is not dispatchable; a stale claim is reclaimed only
+   after confirming the owner worker is not live.
 2. First run at/after 20:00 with no `triage.md`: skip the empty-queue NO_ACTION
    and continue to triage.
 3. Refresh Gitea: open issues, PRs, branches, claims.
@@ -85,7 +88,13 @@ Flow:
    - `SOLO`: independent.
    - `DEFER`: blocked, owner-decision, claimed, red-line, or high-risk.
 7. Dispatch in triage order (BATCH → SOLO → SPLIT), not raw `queue-next` order.
-8. End the turn; process Orca wakes; summarize.
+8. End the turn; process Orca wakes; release claims only after the worker is
+   settled and the item reaches a round-terminal state; summarize.
+
+Dispatch logging: after every `worker-start` — drain or manual coordinator —
+append one `dc_state.py log --type dispatch` entry with `role`, `agent`,
+`model_requested`, `model_effective`, `effort`, `complexity_score`, `playbook`
+and `worktree_path`.
 
 Hard limits: never merge, deploy, close issues, self-authorize owner decisions,
 or combine multiple issues into one PR.
@@ -125,6 +134,10 @@ Project-specific additions:
   to the Prod Agent.
 - Every issue still gets its own branch and PR; batching changes sequencing and
   shared context, not PR scope.
+- Read-only native subagents are allowed inside a worker. Orca worker creation
+  and Dispatch remain forbidden.
+- Host skills and CLI tools remain available: code-review agents, `codex review`,
+  ruff, semgrep, browser testing. pstack-orca does not disable them.
 
 ---
 
