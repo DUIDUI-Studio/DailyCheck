@@ -291,3 +291,72 @@ def test_http_reject_requires_note_and_escapes_reason(loopback):
     status, html, _ = store.request(url)
     assert status == 200 and "&lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert "<script>alert(1)</script>" not in html
+
+
+@pytest.mark.parametrize("affected", [False, True])
+@pytest.mark.parametrize("batches", [(0.3,), (0.1, 0.2)])
+def test_b1_real_http_native_split_shipments_accept_and_preserve_real_history(
+    loopback, affected, batches
+):
+    e = loopback
+    order = domain.fractional_order(e, 0.5 if affected else 0.3)
+    a, b = [line["id"] for line in order["order_items"]]
+    base = f"/store-ordering/orders/{order['id']}"
+    dc, store, shipper = e["http"](), e["http"](1, 3), e["http"](2, 1)
+
+    def ship():
+        for index, amount in enumerate(batches):
+            assert shipper.request(base)[0] == 200
+            status, body, _ = shipper.request(
+                base + "/ship",
+                {"op_no": f"http-fraction-{index}", f"shipped_items[{a}]": str(amount)},
+                ajax=True,
+            )
+            assert status == 200 and json.loads(body)["ok"]
+
+    if affected:
+        ship()
+    status, html, _ = dc.request(base + "/changes/new")
+    assert status == 200
+    fields = Inputs(html).values
+    data = {
+        "request_key": fields["request_key"],
+        "base_change_revision": fields["base_change_revision"],
+        "reason": "B1 原生小数分批回归",
+        f"operation_{a if affected else b}": "cancel",
+    }
+    status, html, _ = dc.request(base + "/changes", {**data, "action": "preview"})
+    assert status == 200
+    status, _, headers = dc.request(
+        base + "/changes",
+        {**data, "action": "publish", "seen_digest": Inputs(html).values["seen_digest"]},
+    )
+    assert status == 302
+    url = headers["Location"]
+    if not affected:
+        ship()
+    before = domain.fraction_history(e, order)
+    domain.dump_fraction_state(e, "before-http-decision")
+    try:
+        status, html, _ = store.request(url)
+        assert status == 200
+        status, body, _ = store.request(
+            url + "/accept",
+            {
+                "request_key": "http-accept-fraction",
+                "seen_digest": Inputs(html).values["seen_digest"],
+                "agree": "1",
+            },
+            ajax=True,
+        )
+        assert status == 200 and json.loads(body)["ok"]
+        assert domain.fraction_history(e, order) == before
+        final = sop.get_order_detail(e["master"], order["id"])
+        assert final["order_items"][0]["shipped_quantity"] == sum(batches)
+        assert final["order_items"][0 if affected else 1]["quantity"] == (0.3 if affected else 0)
+        assert (
+            e["master"].execute("SELECT status FROM store_order_change_proposals").fetchone()[0]
+            == "accepted"
+        )
+    finally:
+        domain.dump_fraction_state(e, "after-http-decision")

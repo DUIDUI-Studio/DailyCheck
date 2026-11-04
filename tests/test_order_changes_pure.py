@@ -838,3 +838,154 @@ def test_accepted_effective_projection_mcp_is_read_only_without_double_count(
     assert response["items"][0]["original_quantity"] == 10 and response["items"][0]["quantity"] == 0
     assert "snapshot_json" not in str(response) and "payload_hash" not in str(response)
     assert {table: rows(m, table) for table in tables} == before
+
+
+def fractional_order(e, amount):
+    with closing(builder.connect(e["paths"]["dc_alpha"])) as wh:
+        wh.execute("UPDATE items SET order_multiple=.1 WHERE canonical_id=201")
+        wh.commit()
+    return new_order(e, ((201, amount), (203, 4)))
+
+
+def ship_fraction_batches(e, order, batches):
+    item = order["order_items"][0]["id"]
+    for index, amount in enumerate(batches):
+        sop.ship_partial(
+            e["master"],
+            sop.open_warehouse_db,
+            order_id=order["id"],
+            operator_dc_code="dc_alpha",
+            op_no=f"fraction-batch-{index}",
+            line_qty={item: amount},
+            shipped_by=2,
+        )
+
+
+def fraction_history(e, order):
+    m = e["master"]
+    return {
+        "lines": [
+            tuple(row)
+            for row in m.execute(
+                "SELECT id,original_quantity,shipped_quantity,fulfilled_quantity,canonical_id,source_warehouse_code,unit FROM store_order_items WHERE order_id=? ORDER BY id",
+                (order["id"],),
+            )
+        ],
+        **{
+            table: rows(m, table)
+            for table in (
+                "store_order_deliveries",
+                "store_order_delivery_items",
+                "store_order_receipts",
+            )
+        },
+    }
+
+
+def dump_fraction_state(e, label):
+    import json
+
+    m = e["master"]
+    tables = (
+        "store_order_items",
+        "store_order_change_proposals",
+        "store_order_change_commands",
+        "store_order_change_events",
+        "store_order_ship_claims",
+        "store_order_ship_claim_lines",
+        "notifications",
+    )
+    (e["root"] / (label + ".sql")).write_text("\n".join(m.iterdump()))
+    (e["root"] / (label + ".json")).write_text(
+        json.dumps(
+            {
+                table: [
+                    dict(row) for row in m.execute("SELECT * FROM " + table + " ORDER BY rowid")
+                ]
+                for table in tables
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+FRACTION_BATCHES = [(0.3,), (0.1, 0.2), (0.2, 0.1), (0.1, 0.1, 0.1)]
+
+
+@pytest.mark.parametrize("batches", FRACTION_BATCHES)
+def test_b1_unrelated_native_fraction_batches_accept_without_stale(change_env, batches):
+    e = change_env
+    order = fractional_order(e, 0.3)
+    b = order["order_items"][1]["id"]
+    p, _ = publish(e, order, intent_for(order, [{"order_item_id": b, "operation": "cancel"}]))
+    ship_fraction_batches(e, order, batches)
+    before = fraction_history(e, order)
+    dump_fraction_state(e, "before-decision")
+    try:
+        assert decide(e, order, p)["status"] == "accepted"
+        assert fraction_history(e, order) == before
+        final = sop.get_order_detail(e["master"], order["id"])
+        assert final["order_items"][1]["quantity"] == 0 and final["status"] == "shipped"
+        assert final["goods_amount"] == "2.97"
+    finally:
+        dump_fraction_state(e, "after-decision")
+
+
+@pytest.mark.parametrize("batches", FRACTION_BATCHES)
+def test_b1_affected_native_fraction_batches_cancel_remaining_without_history_rewrite(
+    change_env, batches
+):
+    e = change_env
+    order = fractional_order(e, 0.5)
+    ship_fraction_batches(e, order, batches)
+    order = sop.get_order_detail(e["master"], order["id"])
+    before = fraction_history(e, order)
+    p, _ = publish(e, order)
+    dump_fraction_state(e, "before-decision")
+    try:
+        assert p["snapshot"]["operations"][0]["remove_quantity"] == "0.20"
+        assert decide(e, order, p)["status"] == "accepted"
+        assert fraction_history(e, order) == before
+        final = sop.get_order_detail(e["master"], order["id"])
+        assert final["order_items"][0]["quantity"] == 0.3
+        assert final["order_items"][0]["shipped_quantity"] == sum(batches)
+        assert final["order_items"][0]["original_quantity"] == 0.5
+        assert final["order_items"][0]["line_amount"] == "2.97"
+    finally:
+        dump_fraction_state(e, "after-decision")
+
+
+@pytest.mark.parametrize("batches", FRACTION_BATCHES)
+@pytest.mark.parametrize("affected", [False, True])
+def test_b1_native_fraction_receipts_preserve_history_and_complete_at_effective_quantity(
+    change_env, batches, affected
+):
+    e = change_env
+    order = fractional_order(e, 0.5 if affected else 0.3)
+    a, b = [line["id"] for line in order["order_items"]]
+    ship_fraction_batches(e, order, (0.3,))
+    order = sop.get_order_detail(e["master"], order["id"])
+    operations = [{"order_item_id": b, "operation": "cancel"}]
+    if affected:
+        operations.append({"order_item_id": a, "operation": "cancel"})
+    p, _ = publish(e, order, intent_for(order, operations))
+    for index, amount in enumerate(batches):
+        sop.receive_partial(
+            e["master"],
+            sop.open_warehouse_db,
+            order_id=order["id"],
+            op_no=f"fraction-receive-{index}",
+            item_qty={a: amount},
+            received_by=1,
+        )
+    before = fraction_history(e, order)
+    dump_fraction_state(e, "before-decision")
+    try:
+        assert decide(e, order, p)["status"] == "accepted"
+        assert fraction_history(e, order) == before
+        final = sop.get_order_detail(e["master"], order["id"])
+        assert final["status"] == "delivered" and final["goods_amount"] == "2.97"
+        assert final["order_items"][0]["fulfilled_quantity"] == sum(batches)
+    finally:
+        dump_fraction_state(e, "after-decision")

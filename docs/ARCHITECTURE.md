@@ -2455,6 +2455,9 @@ CSS滚动容器，避免依赖全局JS包装。浏览器离线点击不会排队
 HTTP/CSRF；`dev_smoke_order_changes.py --browser --root <新空根>` 通过真实create
 产生方案，保留三尺寸无JS通知→比较→决定→发收截图和每步主/仓库SQL dump。
 关键断言在独占源码副本逐项变异并恢复验证。
+B1 数量回归通过原生单批、分批、顺序变化与收货累加对照，断言整份决定、金额及原始
+REAL 历史保持；真实 loopback HTTP 覆盖无关行和受影响行的分批发货。固定 d10 候选
+在合法分批后会误失效或无法接受，这些回归先以失败提交，再修复 B 数量消费边界。
 
 B 回退到 A 保留有效 quantity、快照、追加行和 active/recovering 占用，不能回到
 不识别 claim 的 pre-A 写者。开放提议前所有 Web 写者必须支持 claim、旧执行者
