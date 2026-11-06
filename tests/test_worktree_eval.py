@@ -929,7 +929,7 @@ def test_history_event_ownership_across_fresh_archived_and_fallback_rows(
         else:
             previous.append(item)
             fresh.append({**item, "usage_events": [], "tokens": None, "cost": None,
-                          "collected_at": SNAPSHOT})
+                          "collected_at": SNAPSHOT, "warnings": ["no_transcripts"]})
     output = preserve_history(deepcopy(fresh), deepcopy(previous))
     events = [e for r in output for e in r.get("usage_events") or []]
     assert len(events) == len({e["event_id"] for e in events}) == 4

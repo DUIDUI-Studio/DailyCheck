@@ -422,6 +422,8 @@ PR webhook → dc-webhook-receiver → inbox.jsonl (append)
 缺时间的存储哨兵查询后恢复 null，不能成为业务时间。源失败退回历史并显示陈旧/未知，
 新鲜度取源 collected_at，非 DB updated_at。各源独立降级。内存回退也恢复 fact_ts，
 存储哨兵不能重现为业务日期；日桶最近活动排序使用 last_at，不使用日首。
+fresh、历史回退与归档记录合并后，按 event_id 统一分配用量：执行优先于未归属会话，
+同类优先当前记录，再按稳定身份决定唯一持有者；不因输入行顺序重复分配。
 
 **数量和 Token**：repo+host+worktree instance 优先，历史路径归组标近似；Worker 认
 process incarnation，缺身份执行与未归属会话单列，Dispatch 不冒充人数，retry_of 才算重试。
@@ -1140,6 +1142,10 @@ Token = input + output + cache_read + cache_write；reasoning 已在 output 内�
 
 **输出**：`python -m scripts.model_eval collect` 原子写本机 ledger，保留已归档身份及
 源消失的历史用量（保持原采集时间，不能假装新鲜）；`--dry-run` 只输出 JSONL。
+事件去重覆盖完整合并结果；未归属会话被执行全部接管后移除，执行身份仍保留。
+部分接管的记录重算剩余事件的 Token / 模型，未知分项保持 null；无法重定价的成本
+置 null，不能沿用接管前总价；无剩余事件的执行用量保持未知，不伪造覆盖。
+历史回退保留原用量警告并补回缺失的 agent 来源，重复对账不丢失这些元数据。
 不写 automation state，不修改 Orca，不碰生产。
 
 **传输入口**：`python -m scripts.model_eval.publish --destination <approved-host>`
