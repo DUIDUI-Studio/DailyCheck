@@ -1461,6 +1461,9 @@ master_connection不迁移warehouse。软链共享真实路径锁，绿副本独
 查询的头、货主、货物和独立库位分配。列表与详情共用登录/DC/viewer 权限和 no-store；仅 GET，
 无同步、配置或库存写入入口。详情返回链接以 url_for 保留原筛选与页码，不接受外部跳转 URL。
 
+**订单详情来源读取容错（Issue #111）**：仅在既有 `get_dc_items_for_order_detail()` 内
+按来源隔离读取失败，不新增模块、路由、表或蓝图边界；行为详见 §10.3。
+
 **Bot PR2 复用接线**：`bot.agent` → `bot.mcp_tools` → 22 个批准 MCP handler/service；`bot.tools` 保留旧查询接口。采购计算新增显式配置/只读参数供无缓存只读调用，canonical bindings 新增只读收集模式；没有新增蓝图、路由、表或预测算法。
 
 ```mermaid
@@ -1529,6 +1532,8 @@ Issue #107 的 DC 调货接收沿用现有蓝图与模板：`dc_transfer` 提供
 
 `fulfillment_pure.py` 按显式来源仓解析唯一有效履约行，别名/停用行不参与，缺失/多绑定/单位或阻断冲突失败关闭；返回原始成本与库存，独立价格/倍数 helper 沿用订货规则，且不回查当前路由（测试：`tests/test_fulfillment_pure.py`）。
 订单详情库存/价格/品类 enrichment 也复用该解析器，并核对已固化的仓内行 ID，避免跨仓同 ID 串读（Issue #109，详 §10.3）。
+Issue #111 仅在该详情 helper 内标记来源库读取可用性错误；坏库/缺 schema/锁竞争
+按来源隔离，master 与非预期异常继续上抛，不扩展到订货写事务；兼容 Python 3.10+ 的 SQLite 驱动。
 
 **UI 导航结构（2026-10-13 导航模块化起）**：面向用户的信息架构收敛为 **7 模块** —
 总览 / 库存管理 / 生产管理 / 门店订货 / 采购 / 通知 / 管理员，三个载体（桌面侧边栏 /
@@ -1547,6 +1552,9 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 包装；Web 多货主权限不进入 MCP 票据或 Bot，旧 MCP 单货主函数/参数/输出/工具声明保持不变。
 `Filters` 在边界解析页码、ID、日期和每页条数；白名单 (1,3) 服务端固定，其他原可见仓仍限配置货主。
 无本地或外部库存写路径。`permissions_manifest` 登记列表及 `wms.detail` 两个 DC 登录只读端点。
+
+Issue #111 的来源读取容错留在 `store_ordering_pure.get_dc_items_for_order_detail()`
+内部，未新增蓝图间依赖。
 
 **Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
 
@@ -1601,6 +1609,9 @@ flowchart LR
   `store_quantity` 展示值。
 - `get_dc_items_for_order_detail()` 按订单行固化来源分别建立只读仓库连接，复用
   `resolve_fulfillment_item()` / `parse_price_and_multiple()`；详情查询不触发仓库迁移。
+  来源专用 connection/cursor 在执行和取行时标记读取可用性错误，避免把解析器内
+  master 查询错误误当来源缺货；驱动有错误码时按稳定 primary code 分类，Python 3.10
+  无元数据时只匹配已知 SQLite 读取可用性消息，每来源忙等待 250ms，失败后不重试（Issue #111）。
 - 调货的 DC 收货方复用 `dc_transfer_pure` 的收货进度与 `store_ordering_pure.receive_partial()`；
   单行收货和调货的整批收货快捷入口共用既有幂等协议，来源解析仍按冻结的订单行。
 - `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
@@ -2255,8 +2266,20 @@ warehouse/local_item/status=approved 过滤与最新ID语义，避免依赖SQLit
 只有历史 NULL 行 ID 才允许按 canonical 解析。缺行、解绑、停用、别名、歧义、单位/
 阻断冲突或固化 ID 不匹配时，沿用零库存/零单价和 canonical 品类兜底，不换仓、不换行。
 库存、售价优先/成本兜底和本地品类来自同一经验证的行；历史负库存仍保留。
-每个来源仓复用一条 `mode=ro` 连接和读事务，缺失/不可打开的仓库显示兜底且不影响
-其他来源行，不创建物理库、不迁移、不改订单快照。当前路由变更或跨仓创建开关不改变
+每个来源仓复用一条 `mode=ro` 连接和读事务，不创建物理库、不迁移、不改订单快照。
+**来源读取容错（Issue #111，2026-11-01）**：连接、BEGIN、解析和 enrichment 的来源库
+可用性错误（缺失/不可打开、损坏、缺表/列、busy/locked、读取 I/O/权限）沿用兜底，
+不影响健康来源的库存/单价/品类。来源专用 cursor 标记异常，master 查询、SQL 语法/
+绑定缺陷、非预期程序异常及写入错误仍上抛；不在其他业务事务增加捕获。
+遵守 Python 3.10+：不引用 3.11 才提供的 sqlite3 错误常量；有错误码时按稳定 SQLite
+primary code 判断，无错误元数据时仅对 DatabaseError/OperationalError 的已知读取
+可用性/缺 schema 消息兜底，ProgrammingError/IntegrityError/InternalError 类型始终上抛。
+显示查询设置 SQLite busy timeout=250ms，允许短暂让出写锁且避免默认 5s 等待；
+同来源首个可用性失败即关闭连接并缓存失败，不逐行开库或重试。成功来源继续在同一
+读快照中解析与取值，所有已打开连接（含 BEGIN 失败路径）均关闭。
+这里的零库存/零单价表示 enrichment 不可用，**不是实际物理库存为零的证明**，显示
+总金额也可能因兜底而下降；本次保留原返回结构及 UI，不新增不可用状态展示。
+当前路由变更或跨仓创建开关不改变
 存量单来源；`/inventory` 仍是当前会话仓库存，不作 DC 汇总。
 
 **订单审批与出库可见性（Issue #64，2026-10-27）**：审批只更新订单状态并授权后续
@@ -2830,12 +2853,25 @@ call_tool派发/序列化验证最小输出shape；三项外部WMS只读工具�
 真实Starlette health与CLI回归锁住Bearer覆盖health、200/503及默认stdio/HTTP参数，
 使文档口径可验证。命令适用于CI，本Issue不改workflow接线。
 
+Issue #111 的回归用真实的不完整/无后缀/语法/重复列/标点变形 schema 坏库文件，经 helper
+与生产式 HTTP 验证；断言健康行值、库文件字节不变、来源隔离与连接关闭、异常身份与错误码
+优先级、master 来源错误，以及健康/坏库上的真实写入错误均不被吞。
+
 Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 master/两 DC/门店库，
 先提交跨仓单再改路由，以跨库同 local item ID 的不同 canonical/库存/价格/品类复现串读；
 覆盖门店/DC/平台订单板到详情渲染、历史 NULL 来源/行 ID、固化 ID 缺失/错绑/替换、
 停用/别名/歧义/单位/阻断冲突、无效重复绑定、缺库不创建、负库存/成本兜底、
 查询前后库文件不变和 `/inventory` 当前仓语义。临时变异验证头仓代替来源、
 忽略固化 ID、歧义取首行和允许建缺库均会被回归检出。
+
+Issue #111 的 `tests/test_order_detail_source_resilience.py` 复用 #109 的真实多仓夹具，
+覆盖坏库/空库/缺表列/独占锁/缺库/不可打开、历史 NULL 头仓兜底，以及生产式异常处理
+的 Flask HTTP 请求；断言健康行完整值、canonical 兜底与库文件字节不变。
+多行锁源以实际第二连接持有 BEGIN EXCLUSIVE，核验忙等待配置、每来源开库/解析次数，
+记录耗时；正常/异常关闭、BEGIN 与取行故障、master/程序/写错不吞和 WAL 并发快照均回归。
+关键变异检验来源隔离、失败缓存、短等待、连接关闭和读快照，保留 #109 原 30 例。
+兼容回归在真实 Python 3.10 与主验证 Python 3.12 执行 helper/HTTP；取行故障不注入
+驱动版本专属元数据，并覆盖无元数据且消息相似的程序/约束/内部错误不被误归类。
 
 2026-11-02 的 `tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`
 锁定「平台管理员 + 无 `warehouse_users` 绑定的 DC 会话」下详情页仍渲染发货表单；
