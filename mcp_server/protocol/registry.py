@@ -21,6 +21,7 @@ from mcp_server.protocol.tools import (
     outbound,
     procurement,
     store_order,
+    wms,
 )
 
 
@@ -998,9 +999,89 @@ REGISTRY = (
         ),
         domain='store_order', handler=store_order.store_order_detail_impl,
         access=AccessContract('GET', '/api/v1/store-orders/<id>', 'handler; exact path or path plus slash', 'any participating warehouse grants full order visibility, including other warehouses'),
-        output_shape=obj(order=obj(id=INTEGER, order_no=STRING, status=STRING), items=array(ROW), deliveries=array(ROW), receipts=array(ROW), status_history=array(ROW)),
+        output_shape=obj(order=obj(id=INTEGER, order_no=STRING, status=STRING,
+            change_revision=INTEGER, amount_state=STRING, goods_amount=NULLABLE_STRING,
+            total_amount=NULLABLE_STRING, shipping_rule_state=STRING, change_history=array(ROW)),
+            items=array(obj(id=INTEGER, quantity=NUMBER, original_quantity=NUMBER,
+                line_revision=INTEGER, unit_price_snapshot=NULLABLE_STRING, price_state=STRING,
+                line_amount=NULLABLE_STRING, ship_blocked_reason=NULLABLE_STRING)),
+            deliveries=array(ROW), receipts=array(ROW), status_history=array(ROW)),
         external_subset=True, bot_approved=True,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[store_order_detail]",),
+    ),
+    ToolRegistration(
+        tool=Tool(
+            name="wms_stock_list",
+            title="List WMS Stock (external)",
+            description="Read-only: current stock of this tenant in the external WMS (Puyu cold store, SQL Server). Returns: array of {goods_code, goods_name, unit, qty, warehouse, zone, position, lot_no}.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "goods_code": {
+                        "type": "string",
+                        "description": "Optional goods code filter, e.g. SC0001",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows (default 100, max 500)",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        domain='wms', handler=wms.wms_stock_list_impl,
+        access=AccessContract('GET', '/api/v1/wms/stock', 'handler', 'tenant fixed by server config; caller cannot widen it'),
+        output_shape=array(obj(goods_code=STRING, goods_name=STRING, unit=STRING, qty=NUMBER)),
+        external_subset=True, bot_approved=False,
+        tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_stock_list]",),
+    ),
+    ToolRegistration(
+        tool=Tool(
+            name="wms_stock_summary",
+            title="Summarize WMS Stock (external)",
+            description="Read-only: stock totals per warehouse for this tenant in the external WMS. Returns: array of {warehouse, sku_count, total_qty}.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        domain='wms', handler=wms.wms_stock_summary_impl,
+        access=AccessContract('GET', '/api/v1/wms/stock/summary', 'handler', 'tenant fixed by server config; caller cannot widen it'),
+        output_shape=array(obj(warehouse=STRING, sku_count=INTEGER, total_qty=NUMBER)),
+        external_subset=True, bot_approved=False,
+        tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_stock_summary]",),
+    ),
+    ToolRegistration(
+        tool=Tool(
+            name="wms_documents_list",
+            title="List WMS Documents (external)",
+            description="Read-only: inbound/outbound documents of this tenant in the external WMS. Returns: array of {doc_no, biz_date, warehouse, qty, supplier|receiver, issued_by}.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": ["in", "out"],
+                        "description": "in = inbound (biz_storeIn), out = outbound (biz_storeOut)",
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Optional lower bound, YYYY-MM-DD",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows (default 100, max 500)",
+                    },
+                },
+                "required": ["direction"],
+            },
+        ),
+        domain='wms', handler=wms.wms_documents_list_impl,
+        access=AccessContract('GET', '/api/v1/wms/documents', 'handler', 'tenant fixed by server config; caller cannot widen it'),
+        output_shape=array(obj(doc_no=STRING, biz_date=STRING, qty=NUMBER)),
+        external_subset=True, bot_approved=False,
+        tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_documents_list]",),
     ),
 )
 

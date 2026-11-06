@@ -238,6 +238,8 @@ ROUTE_MATRIX: dict[str, str] = {
     "items.toggle_item_active": PLATFORM,
     "items.recompute_safety_stock": PLATFORM,
     "items.inventory_view": LOGIN,              # 终裁④：不脱敏
+    "wms.detail": f"{DC_PREFIX}{LOGIN}",          # 同列表范围的外仓单据详情
+    "wms.index": f"{DC_PREFIX}{LOGIN}",           # 外仓只读：配送中心 / 平台管理员
     "items.items_publish": PLATFORM,
     "items.items_publish_history": LOGIN,
     "items.new_item_redirect": perm("item.create"),
@@ -348,6 +350,13 @@ ROUTE_MATRIX: dict[str, str] = {
     "store_ordering.submit_order_route": perm("order.create"),
     "store_ordering.store_orders_list": LOGIN,
     "store_ordering.order_detail": LOGIN,
+    "store_ordering.new_order_change": LOGIN,  # fresh union endorsement in domain
+    "store_ordering.create_order_change": LOGIN,
+    "store_ordering.accept_order_change": LOGIN,  # fresh target-store decision policy
+    "store_ordering.reject_order_change": LOGIN,
+    "store_ordering.order_change_detail": LOGIN,
+    "store_ordering.withdraw_order_change": LOGIN,  # fresh domain policy in master tx
+
     # 付款凭证：可见性与订单详情一致，视图内部再走 _order_viewable 校验。
     "store_ordering.payment_proof_download": LOGIN,
     # Issue #19（2026-10-24）：订单管理（admin_orders）与订货审批（review_list）

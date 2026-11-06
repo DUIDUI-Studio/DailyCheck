@@ -2,8 +2,8 @@
   "counts": {
     "bot_approved": 22,
     "canonical": 13,
-    "external_subset": 16,
-    "runtime": 29,
+    "external_subset": 19,
+    "runtime": 32,
     "writes": 10
   },
   "generated_from": "mcp_server/protocol/registry.py",
@@ -2339,26 +2339,104 @@
             },
             "items": {
               "items": {
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "line_amount": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "line_revision": {
+                    "type": "integer"
+                  },
+                  "original_quantity": {
+                    "type": "number"
+                  },
+                  "price_state": {
+                    "type": "string"
+                  },
+                  "quantity": {
+                    "type": "number"
+                  },
+                  "ship_blocked_reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "unit_price_snapshot": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "quantity",
+                  "original_quantity",
+                  "line_revision",
+                  "unit_price_snapshot",
+                  "price_state",
+                  "line_amount",
+                  "ship_blocked_reason"
+                ],
                 "type": "object"
               },
               "type": "array"
             },
             "order": {
               "properties": {
+                "amount_state": {
+                  "type": "string"
+                },
+                "change_history": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "change_revision": {
+                  "type": "integer"
+                },
+                "goods_amount": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "id": {
                   "type": "integer"
                 },
                 "order_no": {
                   "type": "string"
                 },
+                "shipping_rule_state": {
+                  "type": "string"
+                },
                 "status": {
                   "type": "string"
+                },
+                "total_amount": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
                 "id",
                 "order_no",
-                "status"
+                "status",
+                "change_revision",
+                "amount_state",
+                "goods_amount",
+                "total_amount",
+                "shipping_rule_state",
+                "change_history"
               ],
               "type": "object"
             },
@@ -2389,6 +2467,188 @@
         "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[store_order_detail]"
       ],
       "title": "Get Store Order Detail"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/wms/stock",
+        "path_enforcement": "handler",
+        "warehouse_scope": "tenant fixed by server config; caller cannot widen it"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Read-only: current stock of this tenant in the external WMS (Puyu cold store, SQL Server). Returns: array of {goods_code, goods_name, unit, qty, warehouse, zone, position, lot_no}.",
+      "domain": "wms",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.wms:wms_stock_list_impl",
+      "inputSchema": {
+        "properties": {
+          "goods_code": {
+            "description": "Optional goods code filter, e.g. SC0001",
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max rows (default 100, max 500)",
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "wms_stock_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "goods_code": {
+                "type": "string"
+              },
+              "goods_name": {
+                "type": "string"
+              },
+              "qty": {
+                "type": "number"
+              },
+              "unit": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "goods_code",
+              "goods_name",
+              "unit",
+              "qty"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_stock_list]"
+      ],
+      "title": "List WMS Stock (external)"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/wms/stock/summary",
+        "path_enforcement": "handler",
+        "warehouse_scope": "tenant fixed by server config; caller cannot widen it"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Read-only: stock totals per warehouse for this tenant in the external WMS. Returns: array of {warehouse, sku_count, total_qty}.",
+      "domain": "wms",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.wms:wms_stock_summary_impl",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "wms_stock_summary",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "sku_count": {
+                "type": "integer"
+              },
+              "total_qty": {
+                "type": "number"
+              },
+              "warehouse": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "warehouse",
+              "sku_count",
+              "total_qty"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_stock_summary]"
+      ],
+      "title": "Summarize WMS Stock (external)"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/wms/documents",
+        "path_enforcement": "handler",
+        "warehouse_scope": "tenant fixed by server config; caller cannot widen it"
+      },
+      "bot_approved": false,
+      "compatibility": "preserved-input-description-and-TextContent-JSON",
+      "description": "Read-only: inbound/outbound documents of this tenant in the external WMS. Returns: array of {doc_no, biz_date, warehouse, qty, supplier|receiver, issued_by}.",
+      "domain": "wms",
+      "external_subset": true,
+      "handler": "mcp_server.protocol.tools.wms:wms_documents_list_impl",
+      "inputSchema": {
+        "properties": {
+          "date_from": {
+            "description": "Optional lower bound, YYYY-MM-DD",
+            "type": "string"
+          },
+          "direction": {
+            "description": "in = inbound (biz_storeIn), out = outbound (biz_storeOut)",
+            "enum": [
+              "in",
+              "out"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "description": "Max rows (default 100, max 500)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "direction"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "wms_documents_list",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "items": {
+            "properties": {
+              "biz_date": {
+                "type": "string"
+              },
+              "doc_no": {
+                "type": "string"
+              },
+              "qty": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "doc_no",
+              "biz_date",
+              "qty"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "tests": [
+        "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_documents_list]"
+      ],
+      "title": "List WMS Documents (external)"
     }
   ]
 }

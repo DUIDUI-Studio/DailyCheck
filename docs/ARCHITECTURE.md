@@ -42,7 +42,7 @@
 
 ## 1. 项目一句话
 
-**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 29 个工具。**
+**单租户、多仓、带主数据治理的轻量库存管理系统，对 AI Agent 通过 MCP 协议开放 32 个工具。**
 
 - **目标用户**：连锁餐饮/零售的小企业（5–50 仓规模），现场用手机做日常操作。
 - **核心问题**：让一家公司能管 N 个门店/DCN/R&D 的库存，并让 AI Agent 读得到。
@@ -52,6 +52,9 @@
 ---
 
 ## 2. 系统拓扑（容器视角）
+
+Issue #140 的外仓页由 Flask 调用独立 Web 范围 WMS SELECT 服务连接外部 SQL Server；
+不依赖 MCP HTTP 进程在线，也不通过本地 SQLite 镜像外仓库存。
 
 ```mermaid
 flowchart TB
@@ -71,7 +74,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["29 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail)"]
+        Tools["32 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail / wms_stock_list)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -98,6 +101,10 @@ flowchart TB
 ---
 
 ## 3. 部署拓扑
+
+外仓 Web 上线需在 Flask 运行环境具备 WMS 环境变量、`pymssql` 驱动与来源
+网络白名单；不引入 schema 迁移或新守护进程。真实外仓连接仅由部署环境验证，
+本地/CI 使用桩数据；凭据缺失只使该页显示明确未配置状态。
 
 ### 3.1 Dev 环境
 
@@ -163,7 +170,8 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
   **保持关闭** → 目录/提交/发货与存量逐字节恒等（单仓路径）；master v4/v5/v6 与每仓 schema v6 迁移在
   T1 发布时执行，播种 pending 清单交人工配置。
 - **T2 开跨仓**：确认**蓝绿双实例均 ≥ T1**（都能识别行级来源）、且灰度期没有旧写者承流后，
-  才开启 `MULTI_WAREHOUSE_FULFILLMENT`。**首张跨仓单产生后，回滚目标版本必须仍是 T1+**，
+  才开启 `MULTI_WAREHOUSE_FULFILLMENT`（2026-11-02 起由 env `DAILYCHECK_MULTI_WAREHOUSE=1`
+  驱动，见 §13.15，切换不重新发版）。**首张跨仓单产生后，回滚目标版本必须仍是 T1+**，
   严禁回滚到不识别 `source_warehouse_code` 的版本（否则按头仓扣所有行）。
 - **T3 收敛**：`dc_warehouse_code` 降级为纯展示，报表/MCP/健康报表的参与仓谓词已切换完成。
 - 灰度期蓝绿同池（`switch.sh` 5%/50%）时**绝不开启跨仓创建**——旧实例按头仓扣行的风险由此关闭；
@@ -516,8 +524,8 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 - **幂等**：`deployed.sha` 已等于目标 sha → 直接 rc 0 退出，不动任何子脚本。
 - **`--dry-run`**：只透传子脚本的 `--dry-run`，**不** acquire / 不 release / 不进观察窗（不碰部署状态）。
 - **⚠️ 工作树漂移守卫（F1，2026-10-18）**：verify 前后各取一次 `git -C ${REPO_ROOT} rev-parse HEAD`，**不一致即 rc 21 中止，绝不 promote/switch**。根因是 #110 首轮 verify 判红（195 failed + `BuildError: feedback.submit_feedback_api`）的真因不是代码——verify 跑的 10 分钟里另一会话合了 #111 并 `git pull`，**工作树被换**：check1 的 pytest 进程已 import 旧模块、Jinja 模板却读新文件；check2 的绿实例同理（`WorkingDirectory` 固定 `/root/DailyCheck`）。结构性漏洞是**部署锁只护脚本、护不住 `git pull`**。守卫把「神秘 195 failed」变成「工作树在 verify 中被改动」这条明确归因。⚠️ **不能用 `run_stage` 包 verify**：它在子命令失败时直接 exit，而 #110 正是 verify 因漂移而失败 → 检测永远跑不到、恰好错过要诊断的场景，故手动捕获 rc 后先判漂移再判失败。两侧 HEAD 取不到（非 git 目录）时守卫跳过（dev 沙盒 / 离线不误伤）。**残余缺口**：让绿实例也跑 pinned 代码需改生产 systemd unit（`WorkingDirectory` 指向 `git worktree` 出的固定树），属 owner 决策 + 运维执行，脚本层做不到。
-- **观察窗**：默认 30 分钟，每 5 分钟探 `:8080/` 与 `journalctl -u dailycheck-green | grep BLOCKED`；任一异常即 `switch.sh blue 100` 回滚并 rc 24。**BLOCKED 的统计起点是观察窗开始时刻，不是「回溯总观察时长」**——promote 之前绿实例还在 DRY_RUN 下承接 verify 探针，那批 `[dry_run] BLOCKED` 会被按总时长回溯的窗口捞进来，使首次检查（+5min）必然误判「写隔离没关」并回滚蓝（2026-10-17 PR #101 首次完整跑观察窗即命中：脚本判定 rc 24、回滚蓝成功，新代码白转正没上线，靠人工 `switch.sh green 100` 恢复）。回滚输出写 `${LOG}.rollback` 独立文件——与主日志同文件双写时，父进程 stdout 缓冲会按旧 offset 覆盖子进程刚写的行，把「观察 +Nmin / 观察窗异常」两行诊断吃掉，事后只剩「已回滚」而无缘由。观察窗的三个外部依赖（`curl` / `journalctl` / unit 名）都可经 `DAILYCHECK_PIPELINE_CURL` / `_JOURNALCTL` / `_GREEN_UNIT` 注入，测试才能脱离 Linux 与真流量同构跑。
-- **压缩观察窗必须留痕（F5，2026-10-18）**：`--observe-min < OBSERVE_MIN_REQUIRED(30)` **不阻断**（人工应急确实需要能压缩），但落一条 `observe-window-shortened` audit 事件。#111 实测压到 10min 却无任何留痕——「压了却没人知道」正是要消灭的静默降级。`--skip-verify` 同理留痕。
+- **观察窗**：默认 10 分钟，每 5 分钟探 `:8080/` 与 `journalctl -u dailycheck-green | grep BLOCKED`；任一异常即 `switch.sh blue 100` 回滚并 rc 24。**BLOCKED 的统计起点是观察窗开始时刻，不是「回溯总观察时长」**——promote 之前绿实例还在 DRY_RUN 下承接 verify 探针，那批 `[dry_run] BLOCKED` 会被按总时长回溯的窗口捞进来，使首次检查（+5min）必然误判「写隔离没关」并回滚蓝（2026-10-17 PR #101 首次完整跑观察窗即命中：脚本判定 rc 24、回滚蓝成功，新代码白转正没上线，靠人工 `switch.sh green 100` 恢复）。回滚输出写 `${LOG}.rollback` 独立文件——与主日志同文件双写时，父进程 stdout 缓冲会按旧 offset 覆盖子进程刚写的行，把「观察 +Nmin / 观察窗异常」两行诊断吃掉，事后只剩「已回滚」而无缘由。观察窗的三个外部依赖（`curl` / `journalctl` / unit 名）都可经 `DAILYCHECK_PIPELINE_CURL` / `_JOURNALCTL` / `_GREEN_UNIT` 注入，测试才能脱离 Linux 与真流量同构跑。
+- **压缩观察窗必须留痕（F5，2026-10-18）**：`--observe-min < OBSERVE_MIN_REQUIRED(10)` **不阻断**（人工应急确实需要能压缩），但落一条 `observe-window-shortened` audit 事件。#111 实测压到 10min 却无任何留痕——「压了却没人知道」正是要消灭的静默降级。`--skip-verify` 同理留痕。
 - **结构化事件通道 `_audit_event`**：以上非常规动作（漂移 / 压缩观察窗 / skip-verify / 仪表盘钩子失败）统一写一行 `pipeline-event kind=<k> pr= sha= session= <detail>` 到 `${STATE_DIR}/audit.log`，供运维仪表盘消费（让 owner 不必 review 对话就能发现降级）。best-effort：状态目录不存在或写失败只 WARN，绝不阻塞部署主链。
 - 退出码：0 成功 / 10 锁被占 / 11 acquire 失败 / 20 up / **21 verify（含工作树漂移）** / 22 promote / 23 switch / 24 观察窗异常 / 64 参数错。
 - **⚠️ `PY` 必须 venv 优先（F4，2026-10-18）**：`PY="${PYTHON:-${REPO_ROOT}/.venv/bin/python}"` → 回退 `python3`。旧版直接用裸 `python3`，撞上 VPS `/usr/local/lib/python3.12/dist-packages/scripts/` 这个**常规包**——它 import 优先级高于仓库的 namespace 包 `scripts/`（PEP 420 namespace 仅在全路径都找不到常规包时生效）→ 尾部 `render_dashboard` 的 `-m scripts.dailycheck_dashboard` **必报 No module**，钩子长期静默失败、只 WARN 靠 15min timer 兜底掩盖。`verify.sh` 早已 venv 优先（`DC_PYTHON_BIN`），此处对齐同口径；钩子失败现在也落 `dashboard-hook-failed` audit 事件。
@@ -568,7 +576,7 @@ webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人�
 - **静默语义不变**（skill `no-agent-cron-script-pattern`）：全部无事 → 零 stdout（cron 收空 → 不投递）；有 PR / 有部署欠账 → 输出块。**失败一律出声**：token 读不到、HTTP 非 200、返回非数组、单个 PR 的 status 查不到，都必须落成可见告警 —— 尤其「返回对象而不是数组」不能当成「没有 PR」静默放过。
 - **状态码不能跟着响应体一起丢**：响应体不是 JSON（nginx 502 页、Gitea 明文报错）时仍要报出真实 HTTP code —— 告警里 `HTTP 502` 和 `HTTP 0` 的排查方向完全不同。
 
-**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（49 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（10min / 0min → `observe-window-shortened`、30min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
+**测试**：`tests/test_deploy_state.py`（43 用例：CLI 黑盒 —— 锁全生命周期 / TTL 过期抢占 / PR 交叉校验 / release 双结果 / catchup 四态 + 同 sha 失败防重试 / 损坏 state 治愈留证 / init 幂等 / check 只读无副作用 / **token 文件交接（0600、抢占换 token、收官删文件、缺文件 fail-closed）**；时间推进用改 `heartbeat_at` 而非 sleep）+ `tests/test_blue_green_deploy_lock.py`（17 用例：五脚本守卫的拒绝 / 放行 / 豁免 / 逃生舱 / dry-run 跳过路径 + fake systemctl 自检）+ `tests/test_deploy_pipeline.py`（49 用例：编排沙盒 —— 把真 `deploy_pipeline.sh` + 真 `deploy_state.py` 复制进 tmp，用「记录调用顺序」的假四阶段脚本替换 systemd/nginx 依赖，因此可在 macOS dev 与 Linux CI 同构运行。断言覆盖 **up→verify→promote→switch 的固定顺序**、失败/中断必收锁且 `deployed` 不前进、锁被他人持有时 rc 10 且不碰子脚本、已部署幂等跳过、`--dry-run` 不写状态，`heartbeat --loop` 的常驻续约 / 锁丢失退出 rc 11 / SIGTERM 优雅退出 / phase 不被循环盖回，以及**观察窗四态**（绿无 BLOCKED → 放行；BLOCKED>0 → rc 24 + 回滚蓝且锚点不前进；探针 502 → 回滚；回滚输出落独立文件不污染主日志，且 `--since` 不得是 `N min ago`）。**2026-10-18 复盘新增 13 用例**：F1 漂移守卫（用 `repo_sandbox` 把 `REPO_ROOT` 造成真 git 仓库 —— 普通 sandbox 的 REPO_ROOT 落在 pytest basetemp 根、非仓库且多测试共享，故必须把脚本放 `<repo>/scripts/blue_green/` 才对齐 `${SCRIPT_DIR}/../..`；覆盖 漂移→rc21+audit+阻断promote/switch+仍收锁、HEAD不动→放行、verify真失败但无漂移→归因不得是漂移、非git目录→跳过）；F5 压缩留痕（5min / 0min → `observe-window-shortened`、10min → 不记、skip-verify → 记）；F4（venv 优先命中、PYTHON 覆盖优先于 venv、钩子失败落 `dashboard-hook-failed`）。关键断言做过变异验证：对调 promote 与 switch、摘掉失败路径的 release、让循环每拍覆写 phase、把 BLOCKED 窗口退回总时长、把回滚输出写回主日志、**漂移守卫令 head_after 恒等 before、观察窗留痕条件短路、venv 分支短路**，八处变异分别打红对应用例）。全部状态目录 tmp_path 覆盖，**绝不碰 `/var`**；live 用例只走到「第一真动作」（up 停 APP_DIR 检查、switch 停布局守卫），不触 systemctl / nginx —— 这条契约由模块级 autouse fixture 装配 fake `systemctl` 与 tmp `NGINX_DAILYCHECK_CONF` **强制兑现**（Issue #81：此前只写在注释里，prod 上被证伪）。
  `tests/test_deploy_report.py`（69 用例：归因十态（含 `verify-drift` 优先于 rc、DRY_RUN BLOCKED 判 out-of-scope）/ 需求解析（加粗 `**R-001**` 与下划线标识符 `DRY_RUN` 不得被误洗）/ 对齐四态（含「无需求条目即挡住自动化」）/ **动作授权表逐格覆盖 + autofix 上界 + 「不存在面向人的动作」的穷举守卫** / 脱敏两形态 / 渲染含标记与 `下一步` 行且不漏明文凭据 / CLI write 的 POST 新建·同 sha PATCH 幂等·Gitea 500 仍 rc 0·`DAILYCHECK_DEPLOY_REPORT=0` 关闭·**失败时除 Gitea 外不得打任何外部端点**（守着「不再推企微」）/ **事件流四例**（自包含字段、Gitea 挂了仍投递、半行 JSON 不废熔断计数、开关关闭不投）/ **唤醒队列七例**（字段自包含且平铺、**必须过 watcher 的 repo 与 action 两道静默过滤**、成功也投、inbox 写失败不影响 rc 与事件流、路由脚本必须有 `deploy_result` 分支且保留默认分支）/ **aligned 端到端给 autofix**（真 git 仓库 + 日志命中改动文件，防映射表对而 write 传错参）/ assess 退出码 / **pipeline 集成六例**（verify 失败后 rc 仍为 21 且真发出评论与隔离 inbox、`deploy_report.py` 缺失只 WARN、开关生效、**Issue #38：临时状态目录在收件箱缺失或为生产默认值时改投 tmp，自定义路径保持原值**））。
  `tests/test_deploy_merge.py`（14 用例：FF-only 合并助手 —— open/closed/draft/sha 不符/base 非 main 前置、FF 成功 payload 必须是 `{"do":"fast-forward-only"}`、405 → rc 30、500/非 JSON/未标记 merged → rc 32、token 缺失 → rc 32、dry-run 不 POST、输出不含 token；fake curl 响应队列，不触网）。
  **2026-10-25 deploy-first 新增**：`test_deploy_pipeline.py` 9 例（候选前置 rc 25 不触蓝绿 / checkout 先于 up / dry-run 不 checkout / 失败恢复 `origin/main` / merge 在 switch 后 release 前 / merge 失败切蓝 rc 26 / `--merge-pr` 缺 `--candidate` 用法错）；`test_deploy_report.py` 4 例（rc 25/26 归因、`changed_files` 候选感知）。
@@ -1093,28 +1101,23 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 ---
 
-### 3.15 Orca 角色模型 fallback（2026-10-26 起）
+### 3.15 Orca 角色模型路由（2026-11-03 项目表作废）
 
-**问题**：DailyCheck 的 Orca 角色原先每个角色只绑定一个模型。模型 API 的认证、配额、端点或代理热切换出现基础设施故障时，Coordinator 只能停住整条波次；如果临时人工换模型，又没有项目内的顺序、停止条件和审计口径。
+**现状**：DailyCheck 不再维护项目级模型路由表。模型、effort、quota pool 和
+fallback 由用户全局策略 `~/.agents/skills/orca-model-routing/` 决定；本项目
+采纳记录见 [`agent-framework/orca-overlay.md`](agent-framework/orca-overlay.md) §5。
 
-**单一事实来源**：
+**历史资产与 fail-closed**：
 
-- 人读规则：[`agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md)
-- 机器配置：[`agent-framework/orca-model-routing.json`](agent-framework/orca-model-routing.json)
-- 校验/分类/命令生成：[`../scripts/agent_framework/model_routing.py`](../scripts/agent_framework/model_routing.py)
-
-**路由结构**：每个可调用 LLM 的角色声明一个主模型和有序 `fallbacks`；Release 不调用 LLM。CC Switch 聚合模式负责 provider 层热切换，项目路由只处理 Orca 角色的显式模型切换。
-
-**安全边界**：
-
-| 条件 | 动作 |
+| 资产 | 状态 |
 |---|---|
-| 认证失败、429、配额、超时、连接失败、5xx、provider unavailable | 可切换下一模型 |
-| `launch.effective` 与声明的目标模型不一致 | 可切换下一模型 |
-| Reviewer BLOCKER、CI/测试失败、输出质量不达标 | **不切换**，按原失败处理 |
-| `outcome_unknown`、残留 writer/terminal、失败阶段未知 | **不自动切换**，先结算和取证 |
+| `agent-framework/orca-model-routing.json` | `deprecated: true`，仅供审计，不参与派活 |
+| `scripts/agent_framework/model_routing.py` | 读取到 deprecated 文档时退出码 2，不生成 `worker-start` 命令 |
+| `tests/test_orca_model_routing.py` | 通用解析/校验用例保留；真实文件用例断言 deprecation |
 
-切换必须复用同一 Task，并记录失败 Dispatch：Coordinator 先运行 `model_routing.py classify`，只有 `fallback_allowed=true` 才运行 `model_routing.py next` 生成带 `--retry-of` 的命令。直接调用 `orca orchestration worker-start` 会绕过该项目级机制；同一 worktree 仍遵守单写者铁律。
+**安全边界**：基础设施失败可切换、语义失败不切换等规则由全局策略定义；
+项目侧不再维护独立 fallback 顺序。模型选择以全局 `routing.json` 为准；同一
+worktree 仍遵守单写者铁律。
 
 ---
 
@@ -1319,11 +1322,19 @@ erDiagram
 生产侧事项：本次属于 master 与全部仓库的 schema 兼容变更，Prod Agent 按标准迁移流程
 完成主库及仓库备份、执行版本迁移并审查异常报告；异常行需人工处置，不静默修数。
 版本迁移本身不启用跨仓业务；跨仓创建由 `MULTI_WAREHOUSE_FULFILLMENT` 开关控制
-（默认关，即 T1 兼容发布），发布节奏见 §3.4「多仓履约发布节奏」。
+（env `DAILYCHECK_MULTI_WAREHOUSE`，未设置即关闭，即 T1 兼容发布），发布节奏见 §3.4「多仓履约发布节奏」。
 
 **默认租户前置**：`init_master_db()` 与 master v5 路由播种迁移均先幂等插入
 `tenants(id=1, name='默认租户')`，保证新安装及存量单租户库的 `item_routing.tenant_id`
 外键可用；已有租户配置不覆盖，路由 pure 层不代建租户。
+
+**订单变更兼容底座（Issue #144，master v7）**：init 与 runner 共用
+`migrations.order_changes.registered_up`，savepoint 内追加行原始量、行/商业 revision、
+可空的服务端商品/单价/运费规则快照，以及独立 proposal/line/command/event 和
+发货 claim 请求/行表。历史 original_quantity 仅按 quantity 回填，包括异常旧行；
+历史价与规则保持 NULL，不猜成交额或已付额。pending 每单唯一，active/recovering
+每行唯一占用；终态不复活。迁移不触及仓库，兼容 floor 不可破坏性 down，代码回退
+必须保留这些表、快照与活动占用。第一阶段没有 create/accept/reject 业务入口。
 
 ### 4.3 warehouse.db 核心表（ER 简图）
 
@@ -1419,7 +1430,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v6**（含多仓履约/路由播种/收货协议；本次不改）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v7**（订单变更兼容底座；仓库仍为 v7，互不混用）。
 
 ---
 
@@ -1435,6 +1446,12 @@ MCP warehouse_connection非只读路径在connect/yield前调wrapper，无需Web
 master_connection不迁移warehouse。软链共享真实路径锁，绿副本独立迁移；已v7不重复备份/ALTER。
 
 ## 5. 应用层模块图
+
+**外仓 Web 查询（Issue #136）**：`app.py` 注册 `blueprints/wms.py`，配送中心的
+「库存管理 → 外仓信息」在桌面侧栏与移动「更多」页同步出现。`templates/wms.html`
+提供仓库/货主选择、库存及入/出库单据的服务端分页；`wms_detail.html` 展示按方向+唯一 ID
+查询的头、货主、货物和独立库位分配。列表与详情共用登录/DC/viewer 权限和 no-store；仅 GET，
+无同步、配置或库存写入入口。详情返回链接以 url_for 保留原筛选与页码，不接受外部跳转 URL。
 
 **Bot PR2 复用接线**：`bot.agent` → `bot.mcp_tools` → 22 个批准 MCP handler/service；`bot.tools` 保留旧查询接口。采购计算新增显式配置/只读参数供无缓存只读调用，canonical bindings 新增只读收集模式；没有新增蓝图、路由、表或预测算法。
 
@@ -1498,6 +1515,10 @@ flowchart TB
 
 **约定**：`xxx.py`（蓝图，含 Flask 视图）和 `xxx_pure.py`（纯函数/类，便于测试和复用）成对出现。改业务规则时**优先改 pure**，再让蓝图调它。
 
+Issue #107 的 DC 调货接收沿用现有蓝图与模板：`dc_transfer` 提供本仓发送/收货列表，
+`store_ordering` 按单据目标仓决定收货视角及收货动作；不新增库存写入口。
+普通门店订货沿用原 storefront/admin 守卫；严格目标仓检查只作用于调货，不收紧平台管理员既有代收能力。
+
 `fulfillment_pure.py` 按显式来源仓解析唯一有效履约行，别名/停用行不参与，缺失/多绑定/单位或阻断冲突失败关闭；返回原始成本与库存，独立价格/倍数 helper 沿用订货规则，且不回查当前路由（测试：`tests/test_fulfillment_pure.py`）。
 订单详情库存/价格/品类 enrichment 也复用该解析器，并核对已固化的仓内行 ID，避免跨仓同 ID 串读（Issue #109，详 §10.3）。
 
@@ -1513,6 +1534,11 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 新增MCP身份不进入Web表单，Web新行仍保留NULL身份/input和factor默认1。
 
 ## 6. 蓝图依赖关系
+
+`wms.py` Web 蓝图调用 `mcp_server.service.wms_web`，只复用旧 `wms` 的连接/配置/安全错误
+包装；Web 多货主权限不进入 MCP 票据或 Bot，旧 MCP 单货主函数/参数/输出/工具声明保持不变。
+`Filters` 在边界解析页码、ID、日期和每页条数；白名单 (1,3) 服务端固定，其他原可见仓仍限配置货主。
+无本地或外部库存写路径。`permissions_manifest` 登记列表及 `wms.detail` 两个 DC 登录只读端点。
 
 **Issue #80**：bot 只读采购 adapter 复用 `blueprints.procurement.compute_store_procurement` 和 `procurement_pure.aggregate_hub`，以显式配置值跳过 Flask 生命周期初始化与缓存写入；canonical 详情复用 `canonical_pure.collect_bindings(read_only=True)`。这些路径只依赖已初始化的数据库，无 Flask request/app context。
 
@@ -1567,6 +1593,8 @@ flowchart LR
   `store_quantity` 展示值。
 - `get_dc_items_for_order_detail()` 按订单行固化来源分别建立只读仓库连接，复用
   `resolve_fulfillment_item()` / `parse_price_and_multiple()`；详情查询不触发仓库迁移。
+- 调货的 DC 收货方复用 `dc_transfer_pure` 的收货进度与 `store_ordering_pure.receive_partial()`；
+  单行收货和调货的整批收货快捷入口共用既有幂等协议，来源解析仍按冻结的订单行。
 - `outbound.py` 复用 `store_ordering_pure` 的发货动作常量，并在 DC 视角只读
   `master.db.store_orders` 给订单发货流水补订单链接。
 - `wecom_notify_pure` 是**唯一对外通道**：只读 `config` + 标准库 `urllib`，不碰 DB、不碰 Flask 上下文；蓝图把订单字典传进去，它负责渲染 + POST。任何新事件接入都走 `WEBHOOK_EVENT_MAP`（§3.9），不要在蓝图里自己拼 HTTP 请求。
@@ -1579,6 +1607,10 @@ request物理删除只撤销库存/流水，不删除永久journal，避免后�
 ## 7. 请求生命周期
 
 ### 7.1 Web（Cookie 会话）
+
+外仓页沿用会话与选仓初始化，再经 DC 守卫、筛选校验、货主范围外仓列表与
+SELECT 查询进入 Jinja 渲染。Web 只提交 GET，响应标记 no-store；上游失败
+只回固定安全状态，不让半次结果被误认为完整库存。
 
 ```mermaid
 sequenceDiagram
@@ -1661,6 +1693,12 @@ sequenceDiagram
 该仓有来源行（`order_participants`）才可操作；表单行 ID 的来源不是操作仓即整批拒绝，
 不扣任何库存（场景 c）。
 
+**显式提交行归属（Issue #146）**：HTTP 适配保留 `shipped_items[N]` 中的零/空数量
+ID，把完整 map 交给领域层；`_select_ship_lines()` 先校验每行属于目标订单且来源为
+操作仓，再跳过零数量行。混合批次的本单本仓零行仍不发货，显式全零/全空批次拒绝，
+不会回落旧版全发；归属校验在幂等批次查询前执行，新请求及同键重放均适用。
+失败沿用 PRG 并标记 `flash(..., "error")`，AJAX 对应 HTTP 409 / `ok:false`。
+
 提交分两段短事务，由 `store_ordering_pure.ship_partial()` 串起：
 
 1. **仓库库** `BEGIN IMMEDIATE` → `fulfillment_pure.resolve_fulfillment_item()` 解析本仓
@@ -1698,7 +1736,14 @@ sequenceDiagram
    `fulfilled + order_item_receivable_qty()`，即**受已发数封顶**（旧 v2 数据
    status=shipped 且 shipped=0 时回落订货量）。审批中（approved）也可按行收货。
 2. **仓库库** `BEGIN IMMEDIATE` → 按派生键跳过已存在流水；缺 items 行时按 canonical
-   自动建行 → 原子加库存 + 写 `stock_movements(op_no)` → COMMIT。
+   自动建行（Issue #130：`selling_price` / `unit_cost` 取自该行来源仓
+   `COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)` 经
+   `resolve_fulfillment_item()` 解析出的**唯一 active 非 alias 绑定行**，不按
+   `canonical_id` 任意匹配；绑定无法解析时记 0/0 并输出 WARN
+   `[receiving] source binding unresolved canonical_id=<id> warehouse=<code> error=<class>`；
+   源价为 0 时保持 0 并输出 WARN
+   `[receiving] auto-created item without price canonical_id=<id>`，均不阻塞收货）→
+   原子加库存 + 写 `stock_movements(op_no)` → COMMIT。已存在的绑定行不重新定价。
 3. **master** `BEGIN IMMEDIATE` → `applied=1` + 回写 `store_item_id` → 锁内重读全部行，
    全行收齐时 `UPDATE store_orders SET status='delivered' … WHERE id=? AND
    status='shipped'`；`changes()==1` 才写 SHIPPED→DELIVERED 历史并置收货时间。
@@ -1721,6 +1766,11 @@ receipt 补库并回填，已存在流水则只标记 applied。收货表单隐�
 ---
 
 ## 8. 鉴权架构
+
+外仓 Web 使用 `@require_login` + `@distribution_center_only`，并登记
+`permissions_manifest.ROUTE_MATRIX`。DC viewer 可读，普通门店/R&D 返回 403；
+平台管理员保留既有仓库类型绕过。外部仓库筛选仍限定服务端配置的同一货主，
+不接收调用方 customer/owner，不改变 MCP 路径 ACL 或 Bot 批准池。
 
 ### 8.1 三种身份
 
@@ -1881,7 +1931,7 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 
 ## 9. MCP 架构
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（29 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（32 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -1890,7 +1940,7 @@ flowchart LR
     subgraph MCP["mcp_server/ 进程 (uvicorn :5100)"]
         Main["main.py<br/>lifespan + AuthMiddleware + 健康检查"]
         Protocol["protocol/<br/>server.py + tools/"]
-        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical / store_order"]
+        Service["service/<br/>auth / inventory / inbound /<br/>outbound / consumption /<br/>forecast / procurement /<br/>canonical / store_order / wms"]
         Data["data/<br/>master.py / warehouse.py / unit_of_work.py"]
         Infra["infra/<br/>errors.py / access_log.py"]
     end
@@ -1902,19 +1952,19 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 29 个 MCP 工具
+### 9.2 32 个 MCP 工具
 
-**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 29 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
+**Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 32 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
 **统一登记（Issue #104）**：`mcp_server/protocol/registry.py::REGISTRY` 是唯一工具登记，
 每项包含原始 `Tool` 声明、真实 callable handler、业务域、读写意图、路径/范围的**实际执行位置**、
 内部可验证输出 JSON shape、外部子集/Bot批准状态及回归引用。`tools.get_tools()` 深复制声明，
 `server._tool_map` 从登记派生；启动时拒绝重名/无效handler，检查命令另扫描全部工具模块，
 拒绝漏注册实现、漏实现和错误绑定。Bot 的显式批准白名单仍由 `bot/tool_contract.py` 独立持有，
-仅做一致性核对，不从动态发现授予权限；29运行项、16外部集成子集、22 Bot批准项、七canonical写禁用不变。
+仅做一致性核对，不从动态发现授予权限；32运行项、19外部集成子集、22 Bot批准项、七canonical写禁用不变。
 
 完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
-及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留16项子集，不是完整注册表。
+及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留19项子集，不是完整注册表。
 `python -m scripts.mcp_contracts --write/--check` 确定性生成/只读校验三份产物，检查失败返回非零；
 JSON 对象键递归排序，保留全部元数据和值及数组次序，消除 SDK 字段声明顺序造成的文本漂移；
 `--check` 仍逐字校验，不放行真实内容变化、非规范格式或尾随文本。
@@ -1994,6 +2044,44 @@ MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁�
 warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
 retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
 
+#### 9.2.1 外部 WMS 只读桥接（3 项）
+
+**Issue #140 Web 独立范围**：新增 `mcp_server/service/wms_web.py`，只复用 WMS
+连接、环境配置与安全错误包装，不改变下述 MCP 单货主函数、注册、schema 或 Bot 池。
+Owner 2026-11-03 确认 Web 多货主仅含 `sy_warehouse` ID 1（朴宇冷库）及 3（朴宇仓）；
+默认同时查两仓，空仓仍保留选择。其他原可见外仓仍限配置货主，不接受调用方扩张白名单。
+`WebScope` 不可变，库存/货主选项/单据头及明细均在 SQL 绑定仓库范围；货主筛选只收窄。
+`Page` 用 SQL Server 2008 R2 的 ROW_NUMBER + 唯一 goodsBalanceID（单据为日期+唯一头 ID）
+分页，计数/品项数与当前筛选一致，不合计不同单位数量；分页反映实时查询，不承诺跨请求快照。
+`DocumentKey` 为方向枚举+唯一头 ID；`DocumentDetail` 区分完整/空明细/截断，库位分配独立
+查询并归属明细，禁止一对多 JOIN 重复行数量。查询异常不伪装空结果。
+结构依据 Coordinator 经授权的真实 SELECT/schema/PK/FK 取证（2026-11-03），
+CI 仅以合成数据运行 SQL 方言适配及 Flask 桩化测试，不连第三方 WMS；真实候选及生产验证归 Prod。
+
+
+`wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 读的不是 DailyCheck 自己的
+SQLite，而是租仓方 WMS（SQL Server）中**本货主**的数据。边界如下，改动前必须逐条确认：
+
+- **只读**：`mcp_server/service/wms.py` 只拼 SELECT，不提供任何写入路径。
+- **单货主固定**：货主 ID 来自 `DAILYCHECK_WMS_CUSTOMER_ID`（默认 155），**不接受调用方
+  传入**。上游同库还挂着其他数十家货主，放开传参等于横向越权。
+- **凭据只走环境变量**（`DAILYCHECK_WMS_HOST` / `PORT` / `USER` / `PASSWORD` /
+  `DATABASE` / `TDS_VERSION`），不落库、不入日志；`WmsConfig.__repr__` 不回显口令。
+- **驱动与配置都可选**：未装 `pymssql` 返回 `wms_driver_missing`，未配置返回
+  `wms_not_configured`；两种情况都不会影响其余工具注册与启动。
+- **不进 Bot 池**：`bot_approved=False`，企微侧读不到外部系统；外部调用方仍走既有
+  `/api/v1/wms/*` 路径 ACL 与 `agent_tokens` 票据。
+- **CI 不连上游**：上游是第三方生产库，契约测试用桩数据跑 dispatch/serialization，
+  真实连通性只在部署环境验证。
+
+**Web 查询边界（Issue #140）**：默认两朴宇仓全部货主；仓库 ID 经可见选项校验，货主选项
+来自该仓范围库存/历史单据。库存按 goodsBalanceID 唯一排序、单据按 bizDate+头 ID 唯一排序；
+ROW_NUMBER 分页及 CTE 同范围计数支持超过 500 条，编码/货主筛选也影响概览。
+库位分配单独查询，保留明细单位/数量/批次；明细上限 2000、库位分配上限 10000，超限明确
+标为不完整。有效头无明细单独提示；缺失或越界单据 404；无效条件 400；未配置/缺驱动/
+连接或范围不可用详情 503、查询失败详情 502。列表页在上游故障时仍 200 展示错误状态以保持
+导航可达，全部固定安全提示/no-store，不展示半次结果或上游错误。
+
 ### 9.3 双传输模式
 
 | 模式 | 入口 | 鉴权 | 用途 |
@@ -2054,6 +2142,11 @@ flowchart TB
 - 回归：`tests/test_mcp_access_log.py`（根目录，CI 可收集）。真实生产文件路径不在测试中写入，测试用临时路径替换 `_ACCESS_LOG_PATH`。
 
 ---
+
+Issue #144 扩充 store_order_detail 的内部 output_shape 和生成台账：有效量/原始量、
+价格来源/未知状态、锁定金额、商业 revision 和安全变更摘要。工具数量与原 wire
+声明/路径 ACL 保持兼容；服务层对头/明细使用显式字段白名单，不暴露内部 command、
+claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 或写 stale。
 
 ## 10. 业务领域模型
 
@@ -2134,6 +2227,19 @@ warehouse/local_item/status=approved 过滤与最新ID语义，避免依赖SQLit
 
 ### 10.3 Store Ordering 状态机
 
+**收货自动建行复制来源仓价格（Issue #130，2026-11-02）**：`receive_partial` /
+`reconcile_orphan_receipts` 在目标仓没有 canonical 绑定时创建 `AUTO-RECEIVE-<id>`
+行，必须把该行来源仓（`COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)`）
+经 `resolve_fulfillment_item()` 解析出的唯一 active 非 alias 绑定行的
+`selling_price` / `unit_cost` 一并写入，禁止沿用列默认 0，否则新行会以
+¥0 参与门店订单计价。绑定缺失、歧义、单位不符或存在阻断冲突时不阻塞收货：
+记 0/0 并输出 WARN
+`[receiving] source binding unresolved canonical_id=<id> warehouse=<code> error=<class>`。
+来源价/成本为 0 时保持 0、不阻塞收货，并由
+`blueprints.store_ordering_pure` 输出 WARN
+`[receiving] auto-created item without price canonical_id=<id>`。已有绑定行只加库存，
+不重新定价。
+
 **订单详情来源库存（Issue #109，2026-10-31）**：订单板自身没有库存列；
 `/store-ordering/orders/<id>` 才显示履约仓库存并为门店/DC/平台视角提供单价。
 `get_dc_items_for_order_detail()` 按行取 `COALESCE(source_warehouse_code, 头仓)`，
@@ -2201,7 +2307,7 @@ stateDiagram-v2
 
 **通知（多仓履约 Task 10，spec §11）**：每次状态迁移走 `store_ordering_pure.notify_order_event()` 向站内用户 fan-out，**收件人按有效权限解析，不硬编码角色名**：参与仓侧 = 在任一参与仓持有 `order.approve` 的在职用户 + 在职平台管理员；门店侧 = 下单人 + 在门店仓持有 `order.receive` 的在职用户。逐事件方向：提交 → 各参与仓审批人；批准/拒绝 → 门店侧；部分收货 → 门店 + **该批**来源仓（按最近一批 receipt 的 `order_item_id` 回溯来源仓，无收货行时回落全部参与仓）；全发齐 `shipped` → 门店（由 §8 条件迁移保证恰一条）；取消 → 参与仓审批人 + 门店；调货事件方向维持现状（发起/批准/发货 → 收货门店，收货 → 发货仓侧）。所有方向均排除操作者自己。**只有 `pending` 那一跳（`cart.submit`）额外推一条企微群消息**——见 §3.9；审批 / 发货 / 取消事件在 `WEBHOOK_EVENT_MAP` 里未登记，不对外推送。
 
-**建单/目录/购物车去 DC 化（2026-10-29，多仓履约 Task 7）**：由 `config.MULTI_WAREHOUSE_FULFILLMENT`（默认 `False`）控制，**关闭时行为与存量完全一致**，新逻辑只在开启后生效。
+**建单/目录/购物车去 DC 化（2026-10-29，多仓履约 Task 7）**：由 `config.MULTI_WAREHOUSE_FULFILLMENT` 控制（env `DAILYCHECK_MULTI_WAREHOUSE`，未设置时 `False`，见 §13.15），**关闭时行为与存量完全一致**，新逻辑只在开启后生效。
 
 - **目录**：不再出现 DC 选择器，也不再读 session `store_ordering_dc`（开启路径直接 `session.pop`）。品项范围 = 既有四道门禁（canonical 有效 / 来源行 `is_orderable` / 门店启停 / 起订倍数）**∩ `item_routing` 配置**，再排除 `is_store_exclusive` 的门店行——`list_available_routed_items()` 按路由到各 DC 分别复用 `list_available_dc_items()` 再取交集，未配置路由与门店专属品项**不出现在目录**。
 - **购物车**：`store_order_carts.dc_warehouse_code` 写 `NULL`，一用户一门店仍只有一行（`UNIQUE(user_id, store_warehouse_code)`）；行上展示的来源仓由当前路由派生，属显示态。
@@ -2237,6 +2343,131 @@ stateDiagram-v2
 
 `is_multiple_of` 用**相对容差**（`abs(qty − round(qty/step)·step) ≤ max(1e-9, step·1e-9)`）判定，不用 `%`——浮点二进制误差会让 `0.3 / 0.1` 判成 False。`normalize_order_multiple` 把脏值（None/非数字/≤0）一律回落成 1，避免配置错误把某个品项永久锁死。
 
+**持久发货占用（Issue #144）**：所有 full/partial/legacy 包装最终进入同一
+ship_partial：解析冻结履约行后，在 master 短事务重新校验 approved、DC staff
+原能力、来源/有效量和 pending 受影响行，完整请求 hash 绑定订单、操作仓和全部
+正数量行；整批登记后才扣库存。active/recovering 每行独占，无 TTL。
+仓库写锁内检查 active、冻结 item/unit/line revision 与 REV；master finalize
+同锁检查后写配送并将整批 committed。恢复先在 master active→recovering fence，
+再取仓库锁按原流水 REV 幂等冲销，最后 master→aborted；失败保持占用，重复
+恢复可继续，终态不复活。committed 先赢则恢复不冲销，fence 先赢则迟到 finalize
+不可落配送。旧 cancel 也检查活动占用；人工孤儿核对对有 claim 的请求先走 fence，
+旧无 claim 请求仍按原人工核对边界处理，不能在旧执行者未排空时运行此核对。
+自动全发跳过暂停/占用行，显式批次含任一暂停正数量行整批拒绝。
+三入口保留原始 `request_mode=explicit|legacy_qty|full`，模式与 scalar 原始归一量
+进入完整 payload hash；explicit 始终比较调用者完整 map，full/scalar 仅重放首次冻结批次。
+锁外读取只是提示：选行、旧流水观察、仓库连接/绑定解析及真实异常均为准备结果。
+唯一最终 `BEGIN IMMEDIATE` 先读当前 claim、比原始意图/完整 hash 并重查权限，
+committed 直接返回原配送，不依赖最新 remaining/blocked/绑定；active 恢复冻结行继续既有
+执行协议，不能因迟到者准备失败触发 fence；recovering/aborted 拒绝，只有仍无 claim
+才核对旧记录、当前 approved/有效量/pending、准备计划和冻结绑定后注册。
+准备与锁内新选批不一致时明确拒绝重试，不持 master 写锁重新连接/迁移仓库。
+发货要求独立 master 事务；调用者自有事务会在访问仓库前明确拒绝，不能把
+`in_transaction` 当作已取得写入序列化能力。执行/恢复的锁顺序及 finalize 的 REV 检查保留。
+旧无 mode 且有 legacy_quantity 的 scalar 只在原量可证及原完整 JSON/hash 严格匹配时重放；
+无 mode 且无 scalar 的歧义键失败关闭待核对，不猜 explicit/full，不回写历史 hash。
+explicit 的原始 map 同时保留给新批次的成员校验；hash 虽仅含正数量行，外来行 ID
+即使数量为零仍沿用原能力明确拒绝，不能先滤除零项而绕过此校验。
+最终短 master 事务匹配原始身份/hash 后，归属校验也覆盖已有 claim 的 explicit 重放；
+新批次沿用选行器的归属校验。两者只读订单成员集合，不重算重放请求当前的
+remaining、不重新解析单位/绑定，避免把合法 committed 重放重新绑定到可变准备状态。
+dict 兼容包装省略操作仓时，selector 先校验完整 raw map 的全部 ID、沿用数量解析，
+返回仅正数量的实际执行行；来源集合从该执行行集合推导，再复用同一集合登记/扣库。
+同单其他仓零项不参与推导；指定操作仓时仍对完整输入执行主线来源归属限制。
+已有 claim 的外单 ID 拒绝沿用主线含明细/订单 ID 的错误格式，身份与状态裁决不变。
+显式指定操作仓的 matched-claim 路径亦保留 main 的完整 raw 来源归属限制；仅检查
+master 中冻结的订单成员/来源，不连接仓库或重算 remaining/单位。省略操作仓的
+dict 包装允许同单他仓零项，正量来源与权限仍由原冻结批次及 fresh 权限裁决。
+
+部署前所有 Web 写实例必须具备此协议且旧执行者排空；提议入口持续关闭，
+兼容回退不可删除 active/recovering claim。
+
+**价格与有效量的兼容底座（Issue #144 / 父 #142 阶段一）**：普通新单在服务端
+解析冻结来源行时同时保存商品名称/SKU/基础与辅单位、Decimal 文本单价及来源
+（selling_price 优先，否则 unit_cost），legacy 与多仓提交均如此。每行扩展金额
+按 quantity × 原精度单价 ROUND_HALF_UP 到分，再求和；运费按该合计与保存的
+规则参数计算，同样 HALF_UP 到分。来源改价/改成本/换 active 规则不再改变旧单
+金额；库存仍读来源仓当前值。两种提交路径均拒绝与履约基础单位不一致的购物车，
+不推定隐式单位换算。历史未知价格、商品/运费规则快照保持 NULL，
+金额显示待核对，当前价仅标参考；已记录的 shipping_fee 不伪称原规则或已付。
+调货仍无金额语义。新商品/价格/原始量快照由 schema 触发器保护，历史 NULL
+可在后续凭据核对后填入；不能反向猜测过去成交价格。
+
+quantity 是包含已发部分的有效合同量，original_quantity 只用于审计；替换行
+追加并通过 replaces_order_item_id / introduced_by_proposal_line_id 关联原行。
+ship/receive 共用有效量聚合（取消行不进分母，applied=0 收货不能完成）；
+未来接受事务调用 refresh_effective_order_state，取消最后未发量后可直接完成，
+不伪造配送/收货，也不修写旧 shipped/fulfilled 历史。
+
+**回退时的变更读取/撤回**：proposal 是独立整份实体，只有 pending 暂停受影响行；
+GET/旧 MCP 仅投影摘要、历史和暂停原因。撤回不依赖 ORDER_CHANGES_ENABLED，
+原提议人或全部联合仓审批者可执行，活跃/租户/权限在 POST master 锁内重查。
+请求键绑定 actor/order/proposal/action/note；状态、command、审计及站内通知
+同事务落盘。notifications_pure.enqueue_event 不提交，旧 emit_event 仍提交。
+旧 cancel / review reject 原子令 pending stale，approve 遇 pending 明确拒绝；
+原 DC staff 发货、仓范围与平台管理员明确操作仓能力保留。
+
+**整份订单变更入口（Issue #145 / 父 #142 第二阶段）**：
+`order_changes_pure.preview_proposal/create_proposal/accept_proposal/reject_proposal`
+集中管理整份方案；`/store-ordering/orders/<id>/changes/new` 的原生表单先服务端预览，
+再显式发布；成对 order/proposal 详情提供“同意整份方案”或必填留言拒绝。
+新建/同意/拒绝由 `DAILYCHECK_ORDER_CHANGES` 默认关闭的开关控制，读取、撤回和
+原 claim/fence/恢复协议持续有效，不增加 schema、MCP 工具或外部消息。
+
+服务器按 version=1 生成不可变完整 before/after 行、货品/运费/总计/差额、
+历史核对引用/说明/人/时间、联合仓与替换报价指纹；不信任客户端价格与金额。
+原单正量的全部 NULL 单价须逐行核对（包括未改与将取消行），发布不填原价，
+整份接受才锁为 verified；无历史商品快照时明确标当前识别描述，不能补造历史规格。
+原已记录运费为 before_fee；新单按原规则快照重算，旧规则 NULL 默认沿用旧费，
+调整须明确非负新费及凭据说明。行额 HALF_UP 到分后求和、整单费用再量化，
+差额仅表示订单计价、待线下核对，不代表已付款/退款，不增加支付结算状态。
+
+每条命令拒绝 caller 事务；仓库候选只读准备在 master 写锁外完成，短
+BEGIN IMMEDIATE 内重读同租户活跃身份/角色包、全部原来源与新来源审批权、
+目标店原下单人或经理/管理员的决定权、商业/受影响行基线与占用及 master 准备指纹。
+平台管理员仍须明确目标店并记录代确认，提议人不能自确认；按钮共用 fresh 策略。
+当前候选同时验证租户路由、canonical active、门店停用/专属、唯一 active 非 alias
+履约行、单位/冲突、可订、倍数及服务端报价。跨库配置无法原子锁定，仅记录观测
+指纹/时间及边界；接受后库存仍只在实际发货时扣减、冻结 item/unit 仍由原协议复核。
+
+pending 仅冻结方案并暂停 affected 行，其他已审批行发货、已发收货照常。
+接受原子条件更新有效量/行 revision、锁 NULL 历史价、追加唯一关联替换行、
+递增商业 revision/锁定费用、决定/event/command/站内通知；原订单号、原行身份/
+original_quantity、已发已收及配送/收货历史行不变。小数有效量先按 Decimal
+计算，再条件写最终数值，避免 REAL 减法越过已发下限；proposal line 的 REAL
+移除量兼容既有 baseline 差值约束，展示/计价仍用冻结 Decimal 文本。
+全未发归零且无履约记录/占用时取消且费零；pending 接受仍待原整单审批。
+其余接受在无活动/恢复 claim 或未决方案时调用既有有效量聚合，applied=0 不完成，
+不伪造配送/收货。拒绝只记整份决定，不改变有效内容；终态重提必须新 pid/sequence。
+
+全局 request_key 的 canonical hash 绑定 actor/action/order/proposal/标准意图/
+所见 digest/证据/留言，先匹配身份/hash 与 fresh 权限再返回持久结果，已完成重放
+不依赖最新候选。新 key 同方向终态只回原决定，相反方向冲突；合法接受发现
+版本/基线、背书或报价变化，独立提交 stale/event/通知/command 并返回409，
+无权请求只403且不使他人方案失效。enqueue 不自行提交，失败全回滚。
+通知收件按目标租户重新过滤活跃/权限、去重排操作者；新仓在接受成为实际参与仓后
+才收到可打开的订单深链。所有变更 GET no-store，GET/MCP 不落业务写入。
+
+移动页面保留原导航与SSR，320/375/390px 单列，禁用JS亦可预览/发布/整份决定。
+订单详情表格直接输出 table-scroll 包装，含变更深链的通知表格有本功能限定的
+CSS滚动容器，避免依赖全局JS包装。浏览器离线点击不会排队同意，联网后须显式重试。
+`test_order_changes_{pure,http,concurrency}` 覆盖真实SQLite/独立连接barrier与loopback
+HTTP/CSRF；`dev_smoke_order_changes.py --browser --root <新空根>` 通过真实create
+产生方案，保留三尺寸无JS通知→比较→决定→发收截图和每步主/仓库SQL dump。
+关键断言在独占源码副本逐项变异并恢复验证。
+B1 数量回归通过原生单批、分批、顺序变化与收货累加对照，断言整份决定、金额及原始
+REAL 历史保持；真实 loopback HTTP 覆盖无关行和受影响行的分批发货。固定 d10 候选
+在合法分批后会误失效或无法接受，这些回归先以失败提交，再修复 B 数量消费边界。
+B 的 `_contract_quantity` 将持久数量导出为既有 HALF_UP 两位 Decimal，并仅容许
+距该精度不超过原生 1e-9 的尾差；非有限、负数和更大偏差仍拒绝。历史四量校验、
+未发量算术和冻结基线检查共用此边界。接受在同一 master 写锁内以实际原始 REAL
+数量/已发值作精确 CAS，已发下限用两位 ROUND 与已校验语义一致；只改有效数量，
+不改 original/shipped/fulfilled 原值、配送/收货/库存流水或 A 发收及 claim 协议。
+
+B 回退到 A 保留有效 quantity、快照、追加行和 active/recovering 占用，不能回到
+不识别 claim 的 pre-A 写者。开放提议前所有 Web 写者必须支持 claim、旧执行者
+排空；生产何时启用由 Prod 标准流程决定，当前不改 CI/部署脚本。
+
 ### 10.3.1 总仓调货（2026-10-19）
 
 **不新建单据体系**：调货单是 `store_orders` 里 `flow_type='dc_transfer'` 的一行，方向列复用 —— `dc_warehouse_code` = 发货总仓、`store_warehouse_code` = 收货分仓。明细、批次发货、部分收货、状态历史、库存流水全部复用订货实现（`blueprints/store_ordering_pure.py`），新增代码只在 `blueprints/dc_transfer{,_pure}.py`（列表 + 建单 + 状态派生）。
@@ -2263,6 +2494,21 @@ stateDiagram-v2
 **与订货流程的差异**：① 无 `pending` 审批（创建即 `approved`，`approved_by` 记发起人）；② 单号 `DT-`；③ 运费恒 0、详情页不显示金额；④ 库存流水用 `总仓调货出库/入库`（已同步 `reports_health_pure` 的 `INBOUND_ACTIONS`/`CONSUME_ACTIONS` 与 `restock` 入库历史，漏改会静默漏算）；⑤ `compute_store_order_report` 排除调货单；⑥ `cancel_order` 新增「已发货不可取消」守卫（对订货单同样生效，修掉「部分发货后作废导致在途货悬空」的旧缺口）。
 
 **权限**：新增 `transfer.create`（manager/admin 包，26 点 / `manager 18`、`admin 19`）。建单要求 DC 类型 + 该权限；列表对 DC / 门店分别开放，发货与收货复用 `store_ordering` 的既有路由与角色守卫。
+
+**配送中心间调货（Issue #107，2026-11-01 Owner comment966 批准 comment961）**：
+发货方仍为持 `transfer.create` 的 DC；收货方可为同租户的其他 DC 或门店，禁止自调货、
+研发仓与跨租户目标，候选列表和 pure 建单校验一致。DC 的 `/dc-transfer/` 默认仅本仓发送单，
+`?scope=incoming` 仅本仓收货单，查询中的发/收仓由会话固定，不接收客户端仓码覆盖；
+门店仍走「本店订单」。DC 收货详情按目标仓识别，显示收货进度、收货表单和本仓入库流水，
+不会当作本仓出货。`receive`（order.receive）与 `deliver`（order.ship）仍须经理/管理员角色，
+且会话仓必须是目标仓（平台管理员也须选对仓）；仅 `dc_transfer` 放开 DC 收货，普通门店订货不放开。
+收货仓不能取消来货，即使同一用户另有发货仓权限；发货/取消仍受来源与已发货约束。
+调货的整批收货表单也携带 op_no，复用 receive_partial：重放只处理原批次，不吞入后续到货，
+未应用的跨库 receipt 可原键恢复；无新增收货不发通知，部分收货发 RECEIVED、收齐才发 DELIVERED。
+既有通知权限收件人、发货协议、冻结行来源及门店订货流程保持原口径，无 schema/权限包变更。
+上述目标仓约束仅针对 `dc_transfer`；普通门店订单保留平台管理员跨门店会话代收、
+门店 staff 拒绝后的原跳转语义，以及 DC 普通订货收货入口的旧类型守卫与跳转。
+收货路由的局部适配器只为 DC 调货绕过原 storefront 守卫，未找到订单仍走原入口规则。
 
 **列表口径（2026-10-19 修正）**：门店侧**不设独立调货入口**——调货单对门店就是一张待收货的订单，直接列在「本店订单」（`store_orders_list`）里；模板按 `flow_type` 显示「类型」列，状态用**收货进度**（待发货 / 待收货 / 部分收货 / 已收货）而非主状态——分批发货期间主状态停在 `approved`，直接展示会变成门店看不懂的「已审批」。`dc_transfer.transfer_list` 对门店 302 回订单列表；只有总仓／平台管理员有「总仓调货」入口。管理员订单板（`admin_orders`）同源处理。
 
@@ -2310,6 +2556,21 @@ summary 全局一次，仓维度各计一次（同单多行不翻倍、跨仓单
 新增 `routing` 注入参数（纯层不碰 DB），按路由去重 DC 行——双 DC 镜像同 canonical、路由=B
 时采购单只出现 B 一次；`build_digest` / `collect_digest` 透传。测试：
 `tests/test_report_multi_dc.py`、`tests/test_replenishment_routing.py`。
+
+### 10.3.4 DC 发货入口与路由同判定（2026-11-02）
+
+订单详情页的 `can_ship` 必须与 `POST /orders/<id>/ship` 的鉴权**同一口径**：
+`is_dc_view and (is_admin or role in ("staff", "manager", "admin"))`。
+
+原因是两个事实源不同步：`g.role` 按 `(user_id, warehouse_id)` 从 `warehouse_users` 解析，
+而平台管理员跨仓**免绑定**（`auth._warehouse_visible_to` 直接放行），于是能进仓但 `g.role` 为 None；
+`permissions.require_role` 对 `is_admin` 一律放行，路由本身是可写的。模板若只按 `g.role`
+判角色，就会出现「路由允许写、界面不给按钮」。2026-11-02 的实例：蓝天大厦 `wh_005` 的
+`warehouse_users` 一条绑定都没有，从该仓视角打开已审批订单时整块发货区不渲染。
+
+同源排查口径：凡是「模板里按 `role in (...)` 控制动作按钮」的地方，都要对照对应路由装饰器
+是否对 `is_admin` 直通；不一致就是这一类缺陷。回归：
+`tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`。
 
 ### 10.4 Canonical 扇出流程
 
@@ -2399,6 +2660,11 @@ canonical 时，非来源仓用自己的出库史算水位、不承接门店需�
 
 ## 11. PWA / 移动端
 
+外仓页使用限定 `.wms-*` 的 `static/wms.css`，复用主题与裸表格的全局
+`.table-scroll` 包装；窄屏筛选单列，平板双列，桌面横排。`base.html` 新增
+`extra_css` 槽，资源查询版本与 SW cache 名同步更新。外仓页响应均为
+`Cache-Control: no-store`，且不加入 APP_SHELL；既有 SW 仅缓存静态资源的边界不变。
+
 ```mermaid
 flowchart LR
     subgraph Client["浏览器 / 手机"]
@@ -2461,6 +2727,10 @@ flowchart LR
 列和订单回链，沿用现有裸 `<table>` + 自动 `.table-scroll` 契约；移动端不新增固定层
 或特殊交互。页面隐藏「新建出库」，因为 DC 的人工出库入口不存在，发货由订单详情驱动。
 
+**DC 调货收货视角（Issue #107）**：既有调货列表增加发送/收货链接，表格沿用自动
+`.table-scroll`；收货详情复用原单行及整批收货表单（CSRF + data-ajax reload-stay），
+返回本仓收货列表。无新 JS、样式或导航模块，门店仍使用本店订单入口。
+
 **订货目录库存展示（Issue #67，2026-10-27）**：门店 catalog 的每张卡片复用既有
 `.inv-card-body` 指标区显示 `门店库存`，弹窗顶部也以同一 `data-stock` 显示本店库存与单价；
 数据在既有目录查询内一次解析，不新增异步请求，也不改变移动端提交链路。
@@ -2489,21 +2759,65 @@ flowchart LR
 
 ## 12. 测试架构
 
+Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
+覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/
+扣库后 fence 交错、冲销后主库未回写、同键并发重放、Decimal 半分及原能力回归。
+并发/撤权探针先核对实际库存、配送和 claim 状态，再核对异常类型；权限变更只在
+绑定解析的第一次调用发生，不能让错误文案或非预期锁异常冒充安全不变量证据。
+请求身份回归用真实 loopback HTTP/CSRF 和 Event 控制初读缺失、仓库已提交及
+master 锁前窗口，断言同键结果、库存/流水/配送和完整 hash；另覆盖绑定变化、
+后续批次与 full/explicit/scalar 六方向模式互换，先提交失败复现再修复裁决顺序。
+R3 的 dict 包装回归以零数量行的增删/重排性质约束来源推导：同单其他仓零项不改变
+实际发仓、库存、配送或重放结果；外单零 ID、两仓正量、全零与显式仓越权仍拒绝。
+同时对照本轮 main 的显式仓合同：他仓零项在新请求及已有 claim 重放均拒绝，
+比较完整库存/流水/配送/通知/claim 前后状态，不以异常文案代替行为断言。
+
+HTTP 用例开启真实 CSRF，覆盖 AJAX/PRG、撤权后拒绝和通知 enqueue 后故障回滚。
+scripts/dev_smoke_order_changes.py 必须显式指定空的 /tmp/dailycheck-order-change-*
+根，启动独占随机 loopback 端口，拒绝外部 HTTP；用于实际浏览器 375/320 宽验证，
+不连接共享 localhost:8080。master v7 与 warehouse v7 的编号相同但注册表与迁移
+目标仍严格分离，仓库 CLI 必须拒绝 master 文件。
+
+Issue #146 的 `tests/test_shipping_ownership.py` 用 DC staff 会话、强制开启的 CSRF
+及详情页生成的新 `op_no` 驱动发货 HTTP 入口，覆盖新请求、原样重放、同单零数量行、
+外单零/正/空数量行及同单他仓行；拒绝前后比较两订单、配送头/行、状态历史和各仓
+库存/流水，另以领域完整 map 调用对照外单零 ID。显式空批次不得回落全发。
+
+Issue #140 的 `tests/test_wms_dashboard.py` 覆盖真实 Cookie/DC/viewer 权限、导航双载体、
+多货主分页、详情/原筛选返回、ID/范围攻击、故障与部分结果丢弃、空/截断、转义和只读方法。
+`test_wms_web_service.py` 用真实已核验 schema 的合成 SQLite 数据与 SQL 方言适配执行查询，
+验证 >500 行唯一分页、跨货主同编码、空仓历史、双方向同编号、库位一对多及其他仓单货主边界。
+`test_mcp_wms.py` 与 MCP 契约门禁验证旧调用；CI 禁止连接第三方生产库，真实验证归 Prod。
+
+Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
+`selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时
+仍取 active 非 alias 行、源价与成本同为 0 时保持 0 且输出 WARN、已有绑定行
+价格不被收货改写；临时变异把 INSERT 的售价/成本改回 0 后两条新用例必红。
+
+Issue #107 在 `tests/test_dc_transfer.py` 使用真实临时 master、发送 DC、接收 DC、门店及
+无关/跨租户仓库，覆盖候选/创建一致性、双向列表隔离、接收详情、角色/权限/仓库归属、
+普通门店订货 DC 收货拒绝、取消与已发约束、部分/最终收货和库存流水、通知去重、
+原键重放及跨库故障恢复。整批收货另覆盖旧请求重放不接收后续批次的到货。
+普通门店订单另锁定平台管理员跨 storefront 会话的收货兼容性及 DC 会话的旧拒绝跳转，
+防止为调货新增的目标仓检查误收紧既有管理员行为；原门店 staff 拒绝路径继续由验收 B11 覆盖。
+关键类型、方向、归属与幂等条件需用临时变异证明测试会失败；全量原生测试仍包含 MCP。
+
 Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时master/warehouse
 数据库经实际MCP dispatch和TextContent序列化验证解绑回执、仅取消最新匹配approved记录、
 旧approved/新pending与rejected/其他仓及品项隔离、无匹配或空历史、默认note及重复解绑拒绝；
 逐字段核对库存/价格/非绑定字段不变，备份落临时目录。旧SQL在标准3.12/3.13先跑红；
 变异分别还原可选UPDATE语法、反转ID顺序或去掉仓/品项/approved筛选，须被回归打红。
 
-Issue #104 的 `tests/test_mcp_registry.py` 验证29声明/全部实现/dispatch集合、重名与漏实现拒绝、
-原始29声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
+Issue #104 的 `tests/test_mcp_registry.py` 验证32声明/全部实现/dispatch集合、重名与漏实现拒绝、
+原始32声明SHA256快照、显式Bot22与canonical七写排除、生成文档逐字一致及`--check`漂移拒绝。
 嵌套对象插入顺序不影响生成字节；元数据/输入输出字段/新增字段、数组值/次序/数量、计数变化
 及非规范/畸形/尾随JSON均须被检出。SDK输出禁用守卫检查实际序列化结果，不依赖新SDK对象属性。
-全部29项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
-call_tool派发/序列化验证最小输出shape；七canonical写只在临时库与临时备份目录实调，
+全部32项复用`tests/bot/test_mcp_integration.py::setup_db`的真实临时SQLite场景，通过真实
+call_tool派发/序列化验证最小输出shape；三项外部WMS只读工具在该用例中桩化service层
+（`_WMS_ROWS` / `stub_wms`），CI不连第三方SQL Server，只验派发与序列化形状；七canonical写只在临时库与临时备份目录实调，
 不用Bot扩权或生产库。新增登记需同步该参数矩阵；形状元数据不改变运行时返回。
 生成校验命令`python -m scripts.mcp_contracts --check`还核对AGENT/CLAUDE工具集合与测试引用，
-以及维护中的`calculation-logic.md`入口29/16口径、订单只读范围和权威台账链接；
+以及维护中的`calculation-logic.md`入口32/19口径、订单只读范围和权威台账链接；
 旧27项入口、缺订单说明或缺台账链接均由回归/变异证明不能通过校验；其历史公式段落不重写。
 真实Starlette health与CLI回归锁住Bearer覆盖health、200/503及默认stdio/HTTP参数，
 使文档口径可验证。命令适用于CI，本Issue不改workflow接线。
@@ -2514,6 +2828,10 @@ Issue #109 的 `tests/test_order_detail_source_stock.py` 使用真实临时 mast
 停用/别名/歧义/单位/阻断冲突、无效重复绑定、缺库不创建、负库存/成本兜底、
 查询前后库文件不变和 `/inventory` 当前仓语义。临时变异验证头仓代替来源、
 忽略固化 ID、歧义取首行和允许建缺库均会被回归检出。
+
+2026-11-02 的 `tests/test_store_ordering_dc_route.py::test_admin_without_warehouse_binding_sees_ship_form`
+锁定「平台管理员 + 无 `warehouse_users` 绑定的 DC 会话」下详情页仍渲染发货表单；
+去掉 `is_admin` 直通后实测打红（缺 `shipped_items[`），防止再出现「路由可写、界面无入口」（§10.3.4）。
 
 **完整 MCP 门禁（Issue #103，2026-10-31 起）**：CI test job、`verify.sh` check 1 与
 `generate_reports.sh` 的本地 fallback 都收集 `tests/mcp_server/`，不再整目录排除。
@@ -2616,7 +2934,7 @@ flowchart TB
         Redline["test_redline_gate.py<br/>红线机验：路径命中 / known_failures 净增 /<br/>自述需拍板但无授权<br/>19 用例（Issue #24）"]
         PrHygiene["test_pr_hygiene.py<br/>开工规范：分支前缀白名单 / issue 号与<br/>Closes·Part-Of 一致 / 无号须声明 No-Issue<br/>32 用例（Issue #26）"]
         CIHandoff["test_ci_artifact_handoff.py (9)<br/>+ test_ci_pytest_summary.py (6)<br/>artifact v4 零引用 / base64 job output /<br/>摘要+真实 native/session/hash 证据<br/>（Issue #59）"]
-        ModelRouting["test_orca_model_routing.py<br/>主模型/fallback 顺序 / 基础设施失败分类 /<br/>同 Task retry 命令 / Release 禁止 LLM<br/>16 用例"]
+        ModelRouting["test_orca_model_routing.py<br/>通用解析/校验保留 / 真实表 deprecated<br/>fail-closed 退出码 2 / 16 用例"]
         Perm["test_route_permission_matrix.py<br/>路由×角色权限矩阵<br/>49 用例（A 覆盖 / B deny-allow / C 不变式）"]
         BlueGreen["test_blue_green_implementation.py (80)<br/>+ test_blue_green_dryrun_guard.py (13)<br/>+ test_blue_green_promote_guard.py (18)<br/>蓝绿 6 脚本：bash -n / dry-run / DRY_RUN 守卫 / 落点核验（重发重试，Issue #55）<br/>/ 绿转正幂等 + 活流量先切蓝（Issue #81）<br/>宿主 systemd 由 fake 钉死（§12 环境无关性）"]
     end
@@ -2904,6 +3222,14 @@ with app.test_client() as c, c.session_transaction() as s:
 
 **与 #78 运行契约的关系（2026-10-30 起）**：§3.12 的展示/执行集合拆分是 #78 D1 的实现；历史「19 行」只是原 14 MCP + 五自有的展示基线，PR1 起 `D(t)` 动态计算，不写死 19 或 34。旧「所有 bot 一律只读」在查询连接 `mode=ro` 与七项 canonical 写禁止上不变；D4 仅对 `restock_create` / `outbound_create` / `outbound_rollback` 批准有条件例外，PR1 阶段不可执行；#80 PR2 实现三写护栏，生产未核实真实 userid 或未配置写范围时仍拒写。D2 八读、三写护栏与 D7 显式启用由 #80 实现，`replenishment_board` 归 #81。契约全文见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
+### 13.15 多仓履约开关是 env，不是代码常量（2026-11-02 起）
+
+- ✅ 开关取值 = `os.environ['DAILYCHECK_MULTI_WAREHOUSE']`（`1/true/yes/on` 为开），**未设置即关闭**；`config.py` 里不再写死布尔值
+- ✅ 生产开启/回滚 = 改 `/etc/dailycheck/app.env` + `systemctl restart dailycheck dailycheck-green`，不重新发版
+- ❌ **不要**把默认值直接改成 `True`：85 个按单仓假设写的测试会红（2026-11-02 对照实测：`250 passed` → `85 failed + 12 errors`）
+- ⚠️ 蓝绿共用一份代码与同一个 db 目录，两个 unit 必须同时生效；只重启一个会写出混着两种口径的订单
+- ⚠️ 开启前的数据前置：每条 `item_routing` 的**目标仓**必须有 `is_active=1 AND is_alias=0` 的绑定行，否则该品项既进不了目录也发不了货（2026-11-02 由扇出事件 `#41` 给 `wh_005` 补了 75 项）
+
 ## 14. pre-existing 风险清单
 
 | 风险 | 严重度 | 状态 | 处理 |
@@ -2916,6 +3242,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | 全仓 11 处 `strptime(..., "%Y-%m-%d %H:%M:%S")` 严格匹配 | 中 | pre-existing（2026-10-15 登记，Issue #38 同源） | `app.py:171` / `blueprints/consumption.py:27,67` / `blueprints/forecast.py:80,100` / `blueprints/procurement.py:185` / `rate_limit_pure.py:89,109` / `mcp_server/data/warehouse.py:265,316,676`（另有 `blueprints/store_ordering.py:91` 是 `%Y-%m-%d` 纯日期形态，同类不同款）。**当前无生产数据触发**（2026-10-15 普查显示它们读的 `outbound_requests` / `production_runs` / `rate_limit` 等列全为 19 字符），故 Issue #38 只收敛了 `reports_health_pure` 的 4 个调用点 / 3 个代码站点（`replay_item_layers`、`compute_stocktake_quality`、`compute_fulfillment`）；行号按 2026-10-15 `52516a8` 校准，改动这些模块时按符号名而非行号定位。后续改动这些模块的时间解析时按 §13.8 同一 helper 语义处理 |
 | **绿环境以 `DRY_RUN=true` 承载真实流量 → 写操作被静默丢弃** | **高（已实际发生）** | 事故已止血；**根治已交付待 merge**（Issue #41 → PR #42） | prod nginx 已 `blue down / green weight=100`（自 ~16:53 起），而 `dailycheck-green.service` 声明 `Environment=DRY_RUN=true` → `DryRunConnection` 把 INSERT/UPDATE/DELETE 全部拦截 + 不 commit，用户侧仍收到 302 成功。**已确认丢失**：2026-10-15 18:11:35/37/43 三次 `POST /production/submit`（product_id=15）全部 302 但真库零落库。**结构性成因**：§3.4 的切流量流程没有任何一步清掉绿环境的 `DRY_RUN`。**处置**：生产侧已 `switch.sh blue 100` 止血（运行态 blue 100 / green down）；**根治**= §3.4 铁律新增的 `switch.sh` DRY_RUN 守卫（承接流量且 `DRY_RUN=true` → 拒跑 exit 3），已随 Issue #41 修复交付（PR #42）。⚠️ **下一次切流量前必须先按 `scripts/blue_green/README.md`「绿转正」关闭绿的写隔离**，否则会被守卫拒跑（预期行为） |
 | MCP 门店订单只读工具需 token 显式授权路径 | 中 | 新增（Issue #73，2026-10-27；参与仓口径更新 2026-10-29） | `store_order_list` / `store_order_detail` 走路径级 ACL：token 的 `allowed_read_paths` 必须覆盖 `/api/v1/store-orders`（或 `*`），否则报 `forbidden_path`。仓库范围另走 `allowed_warehouses`：单的门店仓或**任一参与仓**（明细行来源仓，历史 NULL 回落头仓）命中才可见；命中任一参与仓即可读**全单**（含他仓行/金额/收货历史）。**部署后 Prod Agent 的同步 token 需补这条读路径**，否则读不到门店订单 |
+| **外部 WMS 只读工具需另配上游凭据与读路径** | 中 | 新增（2026-11-02） | `wms_stock_list` / `wms_stock_summary` / `wms_documents_list` 要生效需两件事：① 注入 `DAILYCHECK_WMS_HOST` / `PORT` / `USER` / `PASSWORD` / `DATABASE` / `CUSTOMER_ID`；② token 的 `allowed_read_paths` 覆盖 `/api/v1/wms`（或 `*`）。缺①返回 `wms_not_configured`，缺②返回 `forbidden_path`，两者都不影响其余工具。上游是第三方生产库且带来源白名单，CI 只跑桩化用例，真实连通性须在部署环境单独确认；Issue #136 Web 页同样需要 Flask 进程的环境配置、可选驱动与网络白名单，使用 Cookie 权限而非 MCP token |
 | `adjustment.py` 未注册 | 低 | pre-existing | 路由 404，前向兼容保留 |
 | `fix/mcp-streamable-http` 落后主分支 | **高** | pre-existing | prod 不含本轮任何 P0 收敛 |
 | `mcp-server` 进程 prod 未部署 | 中 | pre-existing | 仅 dev 有 |
@@ -2927,6 +3254,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
 | 出品配方的多态行 `bom_item_id[]` / `bom_ic_recipe_id[]` 与 `bom_row_id[]` **不按位对齐** | **高** | pre-existing（Issue #47 复核时发现，**本次未修**，已另立 issue） | 模板每行只渲染「当前类型」的那一个 select（`bom_item_id` 或 `bom_ic_recipe_id`），浏览器提交时两个数组各自按类型计数、与 `bom_row_id[]` 长度不等；后端按 `item_ids[i]` / `ic_ids[i]` 取值 → **混合来源**的出品配方保存时，部分行的原料/用量被静默跳过，甚至写错行（行序为 [ic_recipe, item, item] 时，第 2 行可能被写成第 3 行的原料）。与 §13.13 同属「平行数组按位配对」家族，但根因在**模板渲染 ≠ 表单契约**，与 Issue #47 的两条缺陷不同源 → 按 workflow.md D2 另立 issue，不在本 PR 修。**修法**：每行同时渲染另一类型的 hidden 占位（`value=""`），或后端改为按行解析。存量风险：混合来源的出品配方保存后行数/用量可能与预期不符，**改配方前先核对行数** |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
+| DC 发货入口与路由权限不一致（管理员无绑定→无入口） | 中 | **已修复（2026-11-02）** | `can_ship` 原为显式角色判断（`role in staff/manager/admin`），不含 `is_admin`；而 `@require_role("staff")` 对平台管理员直通 → 蓝天大厦 `wh_005` 无任何 `warehouse_users` 绑定时，管理员从该仓视角看不到发货表单。已改为 `is_admin or role in (...)`（§10.3.4），并给 `admin` 补 wh_005 绑定。**同类待查**：模板里其他按 `g.role` 控制动作按钮的位置（如门店侧 `can_deliver`）尚未逐个对齐 |
 
 ---
 

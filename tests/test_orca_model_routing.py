@@ -67,18 +67,11 @@ def _config() -> dict:
     }
 
 
-def test_production_routing_is_valid_and_every_llm_role_has_a_backup():
-    routing = model_routing.load_routing(
-        ROOT / "docs" / "agent-framework" / "orca-model-routing.json"
-    )
-
-    model_routing.validate_routing(routing)
-
-    for role, route in routing["roles"].items():
-        if role == "release":
-            assert route["fallbacks"] == []
-        else:
-            assert route["fallbacks"], role
+def test_production_routing_is_deprecated():
+    with pytest.raises(model_routing.RoutingError, match="deprecated"):
+        model_routing.load_routing(
+            ROOT / "docs" / "agent-framework" / "orca-model-routing.json"
+        )
 
 
 def test_resolve_role_route_returns_primary_then_ordered_fallbacks():

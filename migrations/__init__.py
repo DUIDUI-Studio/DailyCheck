@@ -19,6 +19,8 @@ from migrations.multi_warehouse_fulfillment import (
     registered_down,
     registered_up,
 )
+from migrations.order_changes import registered_down as order_changes_down
+from migrations.order_changes import registered_up as order_changes_up
 from migrations.receipt_op_protocol import registered_down as receipt_op_down
 from migrations.receipt_op_protocol import registered_up as receipt_op_up
 from migrations.seed_item_routing import registered_down as seed_routing_down
@@ -112,4 +114,6 @@ MIGRATIONS: list[Migration] = [
      seed_routing_up, seed_routing_down),
     (6, "receipt protocol: store_order_receipts.op_no UNIQUE + applied 标记",
      receipt_op_up, receipt_op_down),
+    (7, "order changes: durable compatibility floor, snapshots and ship claims",
+     order_changes_up, order_changes_down),
 ]

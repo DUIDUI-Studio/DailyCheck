@@ -26,15 +26,20 @@
     </ul>
   </section>
 
-  {% if is_admin or is_storefront %}
+  {% if is_admin or is_storefront or is_distribution_center %}
   <section class="land-card">
     <h3>库存管理</h3>
-    <p>库存查阅 / 盘点 / 入库 / 出库</p>
+    <p>{% if is_distribution_center and not is_admin %}外仓库存 / 出入库查询{% else %}库存查阅 / 盘点 / 入库 / 出库{% endif %}</p>
     <ul class="land-links">
+      {% if is_admin or is_storefront %}
       <li><a href="{{ url_for('items.inventory_view') }}">库存查阅</a></li>
       <li><a href="{{ url_for('stocktake.stocktake_list') }}">库存盘点</a></li>
       <li><a href="{{ url_for('restock.restock_list') }}">入库记录</a></li>
       <li><a href="{{ url_for('outbound.outbound_list') }}">出库记录</a></li>
+      {% endif %}
+      {% if is_admin or is_distribution_center %}
+      <li><a href="{{ url_for('wms.index') }}">外仓信息</a></li>
+      {% endif %}
     </ul>
   </section>
   {% endif %}

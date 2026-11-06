@@ -60,7 +60,14 @@ def _info(env):
 
 def _update_line(env, sql, params=()):
     with closing(env_builder.connect(env["master_path"])) as master:
+        # These mutations construct legacy/damaged fixtures. Production code cannot
+        # erase a snapshot identity; keep the trigger enabled outside this seed step.
+        from migrations.order_changes import DDL
+        if sql.startswith('UPDATE store_order_items'):
+            master.execute('DROP TRIGGER order_item_identity_immutable')
         master.execute(sql, params)
+        if sql.startswith('UPDATE store_order_items'):
+            master.execute(next(ddl for ddl in DDL if 'CREATE TRIGGER IF NOT EXISTS order_item_identity_immutable ' in ddl))
         master.commit()
 
 

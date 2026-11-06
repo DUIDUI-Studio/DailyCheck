@@ -117,6 +117,7 @@ def create_app() -> Flask:
     from blueprints.stocktake import bp as stocktake_bp
     from blueprints.store_ordering import bp as store_ordering_bp
     from blueprints.users import bp as users_bp
+    from blueprints.wms import bp as wms_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(core_bp)
@@ -129,6 +130,7 @@ def create_app() -> Flask:
     app.register_blueprint(production_bp)
     app.register_blueprint(recipe_cost_bp)
     app.register_blueprint(users_bp)
+    app.register_blueprint(wms_bp)
     app.register_blueprint(import_items_bp)
     app.register_blueprint(forecast_bp)
     app.register_blueprint(procurement_bp)

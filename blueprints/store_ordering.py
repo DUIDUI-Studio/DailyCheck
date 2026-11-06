@@ -5,10 +5,12 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §4 / §6.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from flask import (
@@ -26,12 +28,14 @@ from flask import (
 
 import config as config_module
 from blueprints import dc_transfer_pure as dtp
+from blueprints import order_changes_pure as ocp
 from blueprints import payment_proofs_pure as ppp
 from blueprints import store_ordering_pure as sop
 from blueprints import wecom_notify_pure as wecom_notify
 from blueprints._helpers import parse_qty
 from db import get_master_db
 from permissions import (
+    has_permission,
     require_any_permission,
     require_login,
     require_permission,
@@ -117,6 +121,27 @@ def _storefront_or_admin(view: Callable) -> Callable:
     return wrapped
 
 
+def _storefront_or_transfer_receiver(view: Callable) -> Callable:
+    """Bypass the legacy storefront gate only for a DC transfer route.
+
+    Ordinary orders (including unknown IDs) keep their existing redirects and
+    platform-admin behavior; the transfer handler enforces destination ownership.
+    """
+    storefront_view = _storefront_or_admin(view)
+
+    @functools.wraps(view)
+    def wrapped(order_id: int, *args, **kwargs):
+        if _current_warehouse_type() == sop.WAREHOUSE_TYPE_DC:
+            row = get_master_db().execute(
+                "SELECT flow_type FROM store_orders WHERE id=?", (order_id,),
+            ).fetchone()
+            if row is not None and row["flow_type"] == sop.FLOW_DC_TRANSFER:
+                return view(order_id, *args, **kwargs)
+        return storefront_view(order_id, *args, **kwargs)
+
+    return wrapped
+
+
 def _order_viewable(master: sqlite3.Connection, order: dict[str, Any]) -> bool:
     """Order can be viewed by the current store, any participating DC, or admin.
 
@@ -136,6 +161,20 @@ def _order_viewable(master: sqlite3.Connection, order: dict[str, Any]) -> bool:
     if participants:
         return code in participants
     return order["dc_warehouse_code"] == code
+
+
+def _is_receiving_warehouse(order: dict[str, Any]) -> bool:
+    """Transfers require the destination session, including for admins.
+
+    Ordinary storefront orders keep their existing visibility/admin bypass;
+    only dc_transfer extends receiving to DCs.
+    """
+    if order.get("flow_type") != sop.FLOW_DC_TRANSFER:
+        return _current_warehouse_type() == "storefront"
+    return (
+        _current_warehouse_code() == order["store_warehouse_code"]
+        and _current_warehouse_type() in dtp.TRANSFER_RECEIVER_TYPES
+    )
 
 
 def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: int) -> None:
@@ -725,6 +764,172 @@ def submit_order_route() -> str:
     )
 
 
+
+@bp.after_request
+def order_change_no_store(response):
+    if '/changes' in request.path:
+        response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+def _change_order(order_id, proposal_id=None):
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    proposal = ocp.proposal_detail(master, order_id, proposal_id) if proposal_id is not None else None
+    if order is None or (proposal_id is not None and proposal is None):
+        abort(404)
+    if not _order_viewable(master, order):
+        abort(403)
+    return master, order, proposal
+
+
+def _change_intent(order):
+    lines, prices = [], {}
+    for item in order['order_items']:
+        key = str(item['id'])
+        operation = request.form.get('operation_' + key, '')
+        if operation:
+            lines.append({'order_item_id': item['id'], 'operation': operation,
+                'remove_quantity': request.form.get('remove_' + key),
+                'replacement_canonical_id': request.form.get('replacement_' + key),
+                'replacement_quantity': request.form.get('replacement_qty_' + key)})
+        price = request.form.get('historical_price_' + key, '').strip()
+        if price:
+            prices[key] = {'price': price, 'reference': request.form.get('reference_' + key, ''),
+                           'note': request.form.get('evidence_' + key, '')}
+    return {'base_change_revision': request.form.get('base_change_revision'),
+        'reason': request.form.get('reason', ''), 'lines': lines, 'historical_prices': prices,
+        'after_fee': request.form.get('after_fee'), 'fee_reference': request.form.get('fee_reference', ''),
+        'fee_note': request.form.get('fee_note', '')}
+
+
+def _change_form(master, order, *, preview=None, error=None, status=200):
+    for item in order['order_items']:
+        item['display_product'] = json.loads(item['product_snapshot']) if item['product_snapshot'] else {}
+    return render_template('store_ordering/order_change_form.html', order=order,
+        candidates=ocp.list_replacement_candidates(master, order), preview=preview, error=error,
+        values=request.form, request_key=request.form.get('request_key') or sop.generate_op_no()), status
+
+
+@bp.route('/orders/<int:order_id>/changes/new')
+@require_login
+def new_order_change(order_id: int):
+    master, order, _ = _change_order(order_id)
+    if not config_module.ORDER_CHANGES_ENABLED:
+        abort(409, description='订单变更入口尚未启用')
+    if not ocp.can_propose(master, order, int(g.user['id']), _current_warehouse_code()):
+        abort(403)
+    return _change_form(master, order)
+
+
+@bp.route('/orders/<int:order_id>/changes', methods=['POST'])
+@require_login
+def create_order_change(order_id: int):
+    master, order, _ = _change_order(order_id)
+    try:
+        ocp._enabled()
+        intent = _change_intent(order)
+        if request.form.get('action') == 'publish':
+            result = ocp.create_proposal(master, order_id=order_id, actor_id=int(g.user['id']),
+                current_warehouse_code=_current_warehouse_code(), request_key=request.form.get('request_key', ''),
+                intent=intent, seen_digest=request.form.get('seen_digest', ''))
+            flash('整份方案已发布，等待订货方明确决定')
+            return redirect(url_for('store_ordering.order_change_detail', order_id=order_id, proposal_id=result['proposal_id']))
+        preview = ocp.preview_proposal(master, order_id=order_id, actor_id=int(g.user['id']),
+            current_warehouse_code=_current_warehouse_code(), intent=intent)
+        return _change_form(master, order, preview=preview)
+    except PermissionError:
+        abort(403)
+    except LookupError:
+        abort(404)
+    except ValueError as exc:
+        if request.headers.get('X-Requested-With') == 'fetch' or request.accept_mimetypes.best == 'application/json':
+            flash(str(exc), 'error')
+            return redirect(url_for('store_ordering.new_order_change', order_id=order_id))
+        return _change_form(master, order, error=str(exc), status=409 if request.form.get('action') == 'publish' else 422)
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/accept', methods=['POST'])
+@require_login
+def accept_order_change(order_id: int, proposal_id: int):
+    return _decide_order_change(order_id, proposal_id, 'accept')
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/reject', methods=['POST'])
+@require_login
+def reject_order_change(order_id: int, proposal_id: int):
+    return _decide_order_change(order_id, proposal_id, 'reject')
+
+
+def _decide_order_change(order_id, proposal_id, action):
+    master, _, _ = _change_order(order_id, proposal_id)
+    try:
+        kwargs = dict(order_id=order_id, proposal_id=proposal_id, actor_id=int(g.user['id']),
+            current_warehouse_code=_current_warehouse_code(), request_key=request.form.get('request_key', ''),
+            seen_digest=request.form.get('seen_digest', ''), note=request.form.get('note', ''))
+        if action == 'accept':
+            if any(key.startswith(('line', 'subset', 'quantity', 'price')) for key in request.form):
+                raise ValueError('仅可同意整份方案，不能提交子集或改价')
+            result = ocp.accept_proposal(master, agree=request.form.get('agree') == '1', **kwargs)
+        else:
+            result = ocp.reject_proposal(master, **kwargs)
+        if result.get('conflict'):
+            raise ValueError(result['conflict'])
+    except PermissionError:
+        abort(403)
+    except LookupError:
+        abort(404)
+    except ValueError as exc:
+        if request.headers.get('X-Requested-With') == 'fetch' or request.accept_mimetypes.best == 'application/json':
+            flash(str(exc), 'error')
+        else:
+            abort(409, description=str(exc))
+    else:
+        flash('整份方案已同意' if action == 'accept' else '整份方案已拒绝并留言')
+    return redirect(url_for('store_ordering.order_change_detail', order_id=order_id, proposal_id=proposal_id))
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>')
+@require_login
+def order_change_detail(order_id: int, proposal_id: int) -> str:
+    """Compatibility read/withdraw surface is independent of rollout flags."""
+    master, order, proposal = _change_order(order_id, proposal_id)
+    enabled = config_module.ORDER_CHANGES_ENABLED
+    actor = int(g.user['id'])
+    current = _current_warehouse_code()
+    return render_template('store_ordering/order_change_detail.html', order=order,
+        proposal=proposal, withdraw_request_key=sop.generate_op_no(),
+        accept_request_key=sop.generate_op_no(), reject_request_key=sop.generate_op_no(),
+        snapshot_digest=ocp.payload_hash(proposal['snapshot']),
+        can_decide=enabled and proposal['status']=='pending' and ocp.can_decide(master, order, proposal, actor, current),
+        can_repropose=enabled and proposal['status']!='pending' and order['status'] in ('pending','approved') and ocp.can_propose(master, order, actor, current),
+        stale_hint='商业版本已变化，请重新提议' if proposal['status']=='pending' and proposal['base_order_change_revision']!=order['change_revision'] else None,
+        can_withdraw=ocp.can_withdraw(master, order, proposal, actor, current))
+
+
+@bp.route('/orders/<int:order_id>/changes/<int:proposal_id>/withdraw', methods=['POST'])
+@require_login
+def withdraw_order_change(order_id: int, proposal_id: int) -> str:
+    master = get_master_db()
+    order = sop.get_order_detail(master, order_id)
+    if order is None:
+        abort(404)
+    if not _order_viewable(master, order):
+        abort(403)
+    try:
+        ocp.withdraw_proposal(master, order_id=order_id, proposal_id=proposal_id,
+            actor_id=int(g.user['id']), current_warehouse_code=_current_warehouse_code(),
+            request_key=(request.form.get('request_key') or '').strip(),
+            note=(request.form.get('note') or '').strip())
+    except PermissionError:
+        abort(403)
+    except ValueError as exc:
+        flash(str(exc), 'error')
+    else:
+        flash('变更方案已撤回，受影响行恢复按订单状态发货')
+    return redirect(url_for('store_ordering.order_change_detail', order_id=order_id, proposal_id=proposal_id))
+
+
 # ---------------------------------------------------------------------------
 # Storefront orders
 # ---------------------------------------------------------------------------
@@ -789,19 +994,18 @@ def order_detail(order_id: int) -> str:
     dc_items_info = sop.get_dc_items_for_order_detail(master, order_id)
     for item in order["order_items"]:
         info = dc_items_info.get(int(item["id"]), {})
-        item["unit_price"] = info.get("unit_price", 0.0)
+        item['reference_unit_price'] = info.get('unit_price') if item.get('price_state') == 'unknown' else None
         item["dc_available"] = info.get("dc_available", 0.0)
 
     # v3 A4: 订单总金额 = Σ(item.quantity × item.unit_price)，2dp 量化。
-    total_amount = sum(
-        parse_qty(item["quantity"]) * parse_qty(item.get("unit_price") or 0)
-        for item in order["order_items"]
-    )
+    total_amount = Decimal(order['goods_amount']) if order.get('goods_amount') is not None else None
     # v3.1: 订单含 shipping_fee（submit 时锁定）。order dict 已含 shipping_fee 字段。
     if "shipping_fee" not in order:
         order["shipping_fee"] = 0.0
 
-    is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC
+    is_receiving = _is_receiving_warehouse(order)
+    is_dc_receiver = wh_type == sop.WAREHOUSE_TYPE_DC and is_receiving
+    is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC and not is_dc_receiver
     current_wh_code = _current_warehouse_code()
 
     # 多仓履约（Task 8 / D4）：审批按钮按「全部参与仓 order.approve」展示；
@@ -834,8 +1038,8 @@ def order_detail(order_id: int) -> str:
 
     # Store-side inflow log: stock_movements with action='门店订货入库' for the
     # order's store warehouse, joined to canonical_items for the name.
-    # Surfaced only on the storefront view so store users can see the inbound
-    # inventory moves triggered by their receiving.
+    # Receiving views include the destination DC of a transfer, with the same
+    # inbound inventory log as storefront receivers.
     store_inflows: list[dict[str, Any]] = []
     receipt_action = sop.receipt_action_for(order)
     if not is_dc_view:
@@ -859,6 +1063,12 @@ def order_detail(order_id: int) -> str:
                 # not found.
                 cid = d.pop("canonical_id")
                 local_name = d.pop("local_name")
+                frozen_name = next((item['canonical_name'] for item in order['order_items']
+                                    if item['canonical_id'] == cid and item.get('product_snapshot')), None)
+                if frozen_name:
+                    d['canonical_name'] = frozen_name
+                    store_inflows.append(d)
+                    continue
                 if cid is not None:
                     cn = master.execute(
                         "SELECT name FROM canonical_items WHERE id=?",
@@ -890,12 +1100,22 @@ def order_detail(order_id: int) -> str:
             "rcv_state_label": dtp.RCV_STATE_LABELS[rcv_state],
         }
 
+    # Preserve ordinary-order UI rules; stricter destination/permission display
+    # applies only to the explicitly extended transfer flow.
+    can_deliver = wh_type == "storefront" and role in ("manager", "admin")
+    can_receive = (wh_type == "storefront" and role in ("manager", "admin")) or is_admin
+    if transfer_ctx is not None:
+        receiving_manager = is_receiving and (role in ("manager", "admin") or is_admin)
+        can_deliver = receiving_manager and has_permission("order.ship")
+        can_receive = receiving_manager and has_permission("order.receive")
+
     return render_template(
         "store_ordering/order_detail.html",
         order=order,
         total_amount=total_amount,
         dc_items_info=dc_items_info,
         is_dc_view=is_dc_view,
+        is_dc_receiver=is_dc_receiver,
         # 发货幂等键：页面下发、随表单回传；同一页面重复提交只扣一次。
         ship_op_no=sop.generate_op_no(),
         # 收货幂等键（多仓履约 Task 6）：与发货同模式，门店侧重复提交只入库一次。
@@ -904,19 +1124,24 @@ def order_detail(order_id: int) -> str:
         transfer=transfer_ctx,
         can_review=(is_dc_view and review_allowed),
         review_missing_warehouses=review_missing,
+        # 平台管理员直通：与 POST /orders/<id>/ship 的 @require_role("staff")
+        # 保持同一判定（permissions.py:212 — is_admin 一律放行）。缺这个分支
+        # 会出现「路由允许写、界面不给按钮」：管理员进了未绑 warehouse_users 的
+        # 配送中心仓时 g.role 为 None，发货区整块不渲染（2026-11-02 蓝天大厦）。
         can_ship=(
-            wh_type == sop.WAREHOUSE_TYPE_DC
-            and role in ("staff", "manager", "admin")
+            is_dc_view
+            and (is_admin or role in ("staff", "manager", "admin"))
         ),
+        can_propose_change=(config_module.ORDER_CHANGES_ENABLED and order['status'] in ('pending','approved') and not any(p['status']=='pending' for p in order['change_history']) and ocp.can_propose(master, order, int(g.user['id']), current_wh_code)),
         current_warehouse_code=current_wh_code,
         ship_progress=ship_progress,
-        can_deliver=(
-            wh_type == "storefront"
-            and role in ("manager", "admin")
-        ),
-        can_receive=(
-            (wh_type == "storefront" and role in ("manager", "admin"))
-            or is_admin
+        can_deliver=can_deliver,
+        can_receive=can_receive,
+        can_cancel_transfer=(
+            order.get("flow_type") == sop.FLOW_DC_TRANSFER
+            and current_wh_code == order["dc_warehouse_code"]
+            and review_allowed
+            and all(parse_qty(it.get("shipped_quantity") or 0) == 0 for it in order["order_items"])
         ),
         # 付款凭证（Issue #135）：门店提交时上传，DC/财务审批时在详情页查看。
         payment_proofs=ppp.list_proofs(master, order_id),
@@ -1128,7 +1353,7 @@ def review_order_route(order_id: int) -> str:
     try:
         order = sop.review_order(master, order_id, decision, g.user["id"], note or None)
     except ValueError as e:
-        flash(str(e))
+        flash(str(e), "error")
         return redirect(url_for("store_ordering.review_list"))
 
     event = (
@@ -1251,6 +1476,11 @@ def cancel_order_route(order_id: int) -> str:
         abort(404)
     if not _order_viewable(master, order):
         abort(403)
+    if (
+        order.get("flow_type") == sop.FLOW_DC_TRANSFER
+        and _current_warehouse_code() != order["dc_warehouse_code"]
+    ):
+        abort(403)
 
     reason = (request.form.get("reason") or "").strip()
     if not reason:
@@ -1284,7 +1514,7 @@ def cancel_order_route(order_id: int) -> str:
     try:
         order = sop.cancel_order(master, order_id, actor_id, reason)
     except ValueError as e:
-        flash(str(e))
+        flash(str(e), "error")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     sop.notify_order_event(master, sop.EVENT_ORDER_CANCELLED, order, actor_id)
@@ -1339,33 +1569,35 @@ def ship_order_route(order_id: int) -> str:
             try:
                 oid = int(key[len("shipped_items["):-1])
                 qty = parse_qty(value)
-                if qty > 0:
-                    shipped_items_map[oid] = qty
+                # Keep zero/blank lines for domain ownership validation.
+                shipped_items_map[oid] = qty
             except (ValueError, TypeError):
                 continue
 
-    # 1b. 新 UI 提交了 shipped_items[] 字段但全部为空 → 拒绝，不猜、不全发。
+    # 1b. v3 字段没有可解析 ID → 拒绝，不猜、不全发；全零 map 由领域层拒绝。
     if not shipped_items_map and has_multival_fields:
-        flash("请至少填写一项发货数量")
+        flash("请至少填写一项发货数量", "error")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
-    # 2. 兼容 v2 全量字段 'qty'：仅作用本仓未发齐明细。
+    # Preserve legacy qty before adapting against the current remaining quantity.
+    legacy_quantity = None
     if not shipped_items_map:
-        raw_qty = request.form.get("qty")
-        if raw_qty is not None and raw_qty != "":
+        raw_qty = request.form.get('qty')
+        if raw_qty is not None and raw_qty != '':
             qty_value = parse_qty(raw_qty)
             if qty_value > 0:
-                for it in detail["order_items"]:
-                    source = it.get("source_warehouse_code") or detail["dc_warehouse_code"]
-                    if source != operator_dc_code:
-                        continue
-                    already = parse_qty(it.get("shipped_quantity") or 0)
-                    remaining = parse_qty(it["quantity"]) - already
-                    if remaining > 0:
-                        shipped_items_map[int(it["id"])] = min(qty_value, remaining)
+                legacy_quantity = qty_value
 
     # 3. 都没填（且不含 shipped_items 字段）→ 本仓 legacy full-ship（旧客户端兼容）。
-    if not shipped_items_map:
+    if legacy_quantity is not None:
+        try:
+            order = sop.ship_legacy_quantity(master, order_id=order_id,
+                operator_dc_code=operator_dc_code, op_no=op_no, quantity=legacy_quantity,
+                shipped_by=g.user['id'], tracking_note=tracking_note)
+        except ValueError as e:
+            flash(f"出库失败：{e}", "error")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+    elif not shipped_items_map:
         try:
             order = sop.ship_order_full(
                 master,
@@ -1376,7 +1608,7 @@ def ship_order_route(order_id: int) -> str:
                 op_no=op_no,
             )
         except ValueError as e:
-            flash(f"出库失败：{e}")
+            flash(f"出库失败：{e}", "error")
             return redirect(url_for("store_ordering.shipment_list"))
     else:
         try:
@@ -1391,7 +1623,7 @@ def ship_order_route(order_id: int) -> str:
                 tracking_note=tracking_note,
             )
         except ValueError as e:
-            flash(f"出库失败：{e}")
+            flash(f"出库失败：{e}", "error")
             return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 
     # 4. 通知：仅本次调用真正完成 approved→shipped 迁移才触发（幂等重试不发）。
@@ -1423,12 +1655,49 @@ def deliver_order_route(order_id: int) -> str:
         abort(404)
     if not _order_viewable(master, order):
         abort(403)
-    if _current_warehouse_type() != "storefront":
+    if not _is_receiving_warehouse(order):
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
         flash("只有门店可确认收货")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     role = g.role["role"] if g.role else None
     if role not in ("manager", "admin") and not _is_admin():
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
         flash("需要经理及以上权限")
+        return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+    if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+        # Use the same receipt protocol as the per-line form. On replay restore
+        # the original quantities, including unapplied receipts after a crash.
+        op_no = (request.form.get("op_no") or "").strip() or sop.generate_op_no()
+        previous = {
+            int(r["order_item_id"]): parse_qty(r["quantity"])
+            for r in order["receipts"]
+            if r.get("op_no") == f"{op_no}:{r['order_item_id']}"
+        }
+        item_qty = previous or {
+            int(item["id"]): qty
+            for item in order["order_items"]
+            if (qty := sop.order_item_receivable_qty(order["status"], item)) > 0
+        }
+        if not item_qty:
+            flash("暂无可收货物")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+        try:
+            result = sop.receive_partial(
+                master, sop.open_warehouse_db, order_id=order_id, op_no=op_no,
+                item_qty=item_qty, received_by=g.user["id"], note="一次性收货已到货物",
+            )
+        except ValueError as e:
+            flash(str(e), "error")
+            return redirect(url_for("store_ordering.order_detail", order_id=order_id))
+        if not result["idempotent"]:
+            event = (
+                sop.EVENT_ORDER_DELIVERED if result["transitioned_to_delivered"]
+                else sop.EVENT_ORDER_RECEIVED
+            )
+            sop.notify_order_event(master, event, sop.get_order_detail(master, order_id), g.user["id"])
+        flash("已确认收货")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     try:
         order = sop.mark_order_delivered(master, order_id, g.user["id"])
@@ -1442,9 +1711,9 @@ def deliver_order_route(order_id: int) -> str:
 
 @bp.route("/orders/<int:order_id>/receive", methods=["POST"])
 @require_permission("order.receive")
-@_storefront_or_admin
+@_storefront_or_transfer_receiver
 def receive_order_route(order_id: int) -> str:
-    """Receive (partial or full) a single order_item into the storefront warehouse.
+    """Receive a single order_item into its destination warehouse.
 
     Form fields:
       order_item_id: the store_order_items.id being received
@@ -1453,8 +1722,8 @@ def receive_order_route(order_id: int) -> str:
       op_no:         idempotency key issued by the detail page (Task 6); the
                      line-level key is ``op_no:order_item_id``
 
-    Permission: storefront manager/admin (or platform admin). DC users are
-    redirected to review list by `_storefront_or_admin`.
+    Permission: destination manager/admin (or platform admin); a DC destination
+    is allowed only for dc_transfer, never for a normal storefront order.
     """
     master = get_master_db()
     order = sop.get_order_detail(master, order_id)
@@ -1462,11 +1731,15 @@ def receive_order_route(order_id: int) -> str:
         abort(404)
     if not _order_viewable(master, order):
         abort(403)
-    if _current_warehouse_type() != "storefront":
+    if not _is_receiving_warehouse(order):
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
         flash("只有门店可以收货")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
     role = g.role["role"] if g.role else None
     if role not in ("manager", "admin") and not _is_admin():
+        if order.get("flow_type") == sop.FLOW_DC_TRANSFER:
+            abort(403)
         flash("需要经理及以上权限")
         return redirect(url_for("store_ordering.order_detail", order_id=order_id))
 

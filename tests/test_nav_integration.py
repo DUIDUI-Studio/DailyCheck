@@ -161,7 +161,7 @@ def test_sidebar_module_groups_for_staff(staff_client):
 _M_OVERVIEW = {"总览", "库存管理", "生产管理", "门店订货", "通知"}
 _M_ADMIN_EXTRA = _M_OVERVIEW | {"管理员"}
 _M_ALL = _M_ADMIN_EXTRA | {"采购"}
-_M_DC = {"总览", "门店订货", "通知"}
+_M_DC = {"总览", "库存管理", "门店订货", "通知"}
 _M_RD = {"总览", "生产管理", "通知", "管理员"}
 
 # (warehouse_type, role, is_admin, 期望模块集)

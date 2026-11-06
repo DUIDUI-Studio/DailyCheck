@@ -27,5 +27,8 @@
   "canonical_resolve_conflict": "bcad5746d63ad8628c7ba6027427bd912ca1eeaa445a99bce531497adaf92e9c",
   "canonical_set_binding_active": "150652d42ca61d285c9dbf0d3428b260e225c22aea4714e3f8fb8c25e18b1b19",
   "store_order_list": "a0bf11ee8a94ff561a8768bfcdd2606671ee40065e04cb1c3e8ce4205bb80db2",
-  "store_order_detail": "3f00b2eacddd752f2783211a17ac4ed43a11385e649764500cfe5f1a3148b818"
+  "store_order_detail": "3f00b2eacddd752f2783211a17ac4ed43a11385e649764500cfe5f1a3148b818",
+  "wms_stock_list": "d0b7324a06faf1cca533b01f28642b9d7f4ae60287168c474c1fea62e0b46ea2",
+  "wms_stock_summary": "05262614116b8a44d38c7e265d80c9ad54a0f7be6c0e4ceba2dbedeba0e119b0",
+  "wms_documents_list": "5fb79f8c0228000ee91e7816a8114ac4ad55bc79dac398ea3bb1edc8f867110d"
 }

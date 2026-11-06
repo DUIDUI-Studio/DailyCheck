@@ -42,7 +42,24 @@ DEFAULT_LIMIT = 200
 MAX_LIMIT = 500
 
 #: 订单头之外的四个子段（纯函数返回 dict 里的键）。
-_COLLECTION_KEYS = ("order_items", "deliveries", "receipts", "status_history")
+_COLLECTION_KEYS = ("order_items", "deliveries", "receipts", "status_history", "change_history")
+_HEADER_FIELDS = frozenset(('id order_no store_warehouse_code dc_warehouse_code flow_type status '
+    'requested_by requested_by_username expected_delivery_date note created_at updated_at '
+    'approved_by approved_by_username approved_at approved_note shipped_by shipped_by_username shipped_at '
+    'delivered_at cancelled_by cancelled_by_username cancelled_at cancel_reason shipping_fee '
+    'store_warehouse_name dc_warehouse_name participant_warehouses is_multi_warehouse '
+    'change_revision amount_state goods_amount total_amount shipping_rule_state').split())
+_ITEM_FIELDS = frozenset(('id order_id canonical_id canonical_name category_code dc_item_id store_item_id '
+    'source_warehouse_code effective_source_warehouse_code source_warehouse_name quantity original_quantity '
+    'unit fulfilled_quantity shipped_quantity status created_at line_revision unit_price_snapshot '
+    'price_snapshot_origin unit_price price_state line_amount replaces_order_item_id ship_blocked_reason').split())
+_CHANGE_FIELDS = frozenset(('id sequence status reason proposed_by created_at decided_by decided_at '
+    'decision_note stale_reason').split())
+
+
+def _public_header(row: dict) -> dict:
+    return {k: v for k, v in row.items() if k in _HEADER_FIELDS}
+
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -218,7 +235,7 @@ def _shape_item(row: dict) -> dict:
     ``source_warehouse_code`` 是行级来源仓（迁移前历史行可能为 NULL，
     由头仓兜底），契约上始终存在该键。
     """
-    item = dict(row)
+    item = {k: v for k, v in row.items() if k in _ITEM_FIELDS}
     item.setdefault("source_warehouse_code", None)
     dc_item_id = item.get("dc_item_id")
     item["dc_item_id"] = dc_item_id
@@ -276,7 +293,7 @@ def list_store_orders(
         total = _count_orders(conn, codes, warehouse_code, status or None)
 
     return {
-        "orders": orders,
+        "orders": [_public_header(order) for order in orders],
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -306,7 +323,9 @@ def get_store_order_detail(ctx: AuthContext, order_id: int) -> dict:
         # 范围外的订单「不可见」—— 与不存在同义，不泄露其存在性。
         raise NotFoundError("not_found")
 
-    header = {k: v for k, v in detail.items() if k not in _COLLECTION_KEYS}
+    header = _public_header(detail)
+    header['change_history'] = [{k: v for k, v in proposal.items() if k in _CHANGE_FIELDS}
+                                for proposal in detail.get('change_history', [])]
     return {
         "order": header,
         "items": [_shape_item(r) for r in detail.get("order_items", [])],
