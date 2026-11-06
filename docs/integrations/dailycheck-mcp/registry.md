@@ -2,7 +2,7 @@
 
 Source: `mcp_server/protocol/registry.py`. Regenerate with `python -m scripts.mcp_contracts --write`; verify in CI with `python -m scripts.mcp_contracts --check`.
 
-Runtime: **29** tools; external integration subset: **16**; Bot approved: **22**; business writes: **10**.
+Runtime: **32** tools; external integration subset: **19**; Bot approved: **22**; business writes: **10**.
 
 `registry.json` contains every input declaration, handler, minimum output JSON shape, ACL enforcement/scope, test reference and compatibility status. `tools.json` intentionally publishes only the external integration subset. Neither file grants permissions.
 
@@ -39,3 +39,6 @@ Read/write classifies business intent; legacy HTTP/stdio reads may run migration
 | `canonical_set_binding_active` | canonical | write | `POST /api/v1/canonical/binding-active` | handler | warehouse_code checked in service | no | no |
 | `store_order_list` | store_order | read | `GET /api/v1/store-orders` | handler; exact path or path plus slash | any participating warehouse grants full order visibility, including other warehouses; optional warehouse filter | yes | yes |
 | `store_order_detail` | store_order | read | `GET /api/v1/store-orders/<id>` | handler; exact path or path plus slash | any participating warehouse grants full order visibility, including other warehouses | yes | yes |
+| `wms_stock_list` | wms | read | `GET /api/v1/wms/stock` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
+| `wms_stock_summary` | wms | read | `GET /api/v1/wms/stock/summary` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
+| `wms_documents_list` | wms | read | `GET /api/v1/wms/documents` | handler | tenant fixed by server config; caller cannot widen it | yes | no |

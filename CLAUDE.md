@@ -134,12 +134,12 @@ docs/
   superpowers/             # 开发计划文档
 ```
 
-## MCP 服务器（29 个工具）
+## MCP 服务器（32 个工具）
 
 权威登记：`mcp_server/protocol/registry.py`；完整生成台账与实调输出契约见
 [`registry.md`](docs/integrations/dailycheck-mcp/registry.md) / `registry.json`。
-`python -m scripts.mcp_contracts --check` 校验29项与实现/生成文档，外部 `tools.json`
-明确仅16项；Bot批准池仍22项，七项canonical写禁止Bot执行。
+`python -m scripts.mcp_contracts --check` 校验32项与实现/生成文档，外部 `tools.json`
+明确仅19项；Bot批准池仍22项，七项canonical写禁止Bot执行。
 
 通过 Model Context Protocol 提供 AI Agent 数据访问能力。支持两种传输模式：
 - **stdio**: 本地 Claude Code 使用（`flask mcp`）
@@ -176,6 +176,9 @@ docs/
 | `canonical_set_binding_active` | 按仓启停 items 绑定行 |
 | `store_order_list` | 列门店订单（只读；可按仓库/状态/分页过滤） |
 | `store_order_detail` | 单张门店订单详情（只读；头 + 明细 + 发货 + 收货 + 状态历史） |
+| `wms_stock_list` | 外部 WMS（朴宇冷库）本货主当前库存明细（只读） |
+| `wms_stock_summary` | 外部 WMS 本货主分仓汇总（只读） |
+| `wms_documents_list` | 外部 WMS 本货主出入库单据（只读） |
 
 门店订单只读域（Issue #73）：`store_order_list` / `store_order_detail` 走路径级 ACL
 （`GET /api/v1/store-orders`、`GET /api/v1/store-orders/<id>`），token 的

@@ -11,6 +11,7 @@ Spec: docs/2026-10-04-store-ordering-design.md §3.3 / §6.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from datetime import datetime
@@ -18,6 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 import config
+from blueprints import order_changes_pure as ocp
 from blueprints._helpers import now, parse_qty
 from blueprints.fulfillment_pure import (
     FulfillmentError,
@@ -30,6 +32,9 @@ from blueprints.procurement_pure import (
     compute_safety_stock,
     compute_suggested_qty,
 )
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1373,8 +1378,11 @@ def _resolve_routed_cart_lines(
             resolved = resolve_fulfillment_item(
                 master_conn, wh_conn, canonical_id=canonical_id, warehouse_code=dc_code,
             )
+            if ci.get('cart_unit') and ci['cart_unit'] != resolved['unit']:
+                raise ValueError('下单单位与履约基础单位不一致')
             row = wh_conn.execute("SELECT * FROM items WHERE id=?", (resolved["item_id"],)).fetchone()
             unit_price, _ = parse_price_and_multiple(row)
+            snapshot = ocp.snapshot_product(master_conn, wh_conn, canonical_id, resolved['item_id'])
         except ValueError as exc:
             raise ValueError(f"{name} 无法解析履约行：{exc}") from exc
         finally:
@@ -1389,6 +1397,7 @@ def _resolve_routed_cart_lines(
             "source_warehouse_code": dc_code,
             "unit_price": unit_price,
             "order_multiple": resolved["order_multiple"],
+            **snapshot,
         })
     if missing:
         raise ValueError("以下品项未配置履约仓，整单退回：" + "、".join(missing))
@@ -1407,8 +1416,8 @@ def _snapshot_changes(
     for line in lines:
         canonical_id = line["canonical_id"]
         if price_snapshot is not None and canonical_id in price_snapshot:
-            old = parse_qty(price_snapshot[canonical_id])
-            new = parse_qty(line["unit_price"])
+            old = float(price_snapshot[canonical_id])
+            new = float(line["unit_price"])
             if abs(old - new) > 1e-9:
                 changes.append({
                     "canonical_id": canonical_id, "name": line["name"],
@@ -1480,29 +1489,47 @@ def submit_order(
             "quantity": parse_qty(ci["quantity"]),
             "unit": ci["cart_unit"],
             "store_item_id": ci.get("store_item_id"),
-            "dc_item_id": None,
+            "dc_item_id": ci.get('dc_item_id'),
             "source_warehouse_code": cart_dict["dc_warehouse_code"],
             "unit_price": ci.get("unit_price"),
             "order_multiple": ci.get("order_multiple"),
         } for ci in cart_items]
-        subtotal = sum(parse_qty(ci.get("line_subtotal") or 0) for ci in cart_items)
         header_dc = cart_dict["dc_warehouse_code"]
+        wh = open_warehouse_db(header_dc)
+        try:
+            for line in lines:
+                resolved = resolve_fulfillment_item(master_conn, wh,
+                    canonical_id=line['canonical_id'], warehouse_code=header_dc)
+                if line['unit'] != resolved['unit']:
+                    raise ValueError('下单单位与履约基础单位不一致')
+                line['dc_item_id'] = resolved['item_id']
+                line.update(ocp.snapshot_product(master_conn, wh, line['canonical_id'], resolved['item_id']))
+        finally:
+            wh.close()
+        changes = _snapshot_changes(lines, price_snapshot, multiple_snapshot)
+        if changes and not confirm_price_change:
+            return {"order": None, "price_changed": changes}
 
     order_no = generate_order_no(master_conn)
     # v3.1: 算订单金额合计 + 运费
     rule = get_active_shipping_rule(master_conn)
+    subtotal = sum((ocp.money(Decimal(line['unit_price_snapshot']) * Decimal(str(line['quantity']))) for line in lines), Decimal(0))
     shipping_fee = compute_shipping_fee(subtotal, rule)
+    rule_snapshot = ocp.canonical_json({'rule_id': rule['id'] if rule else None,
+        'base_fee': str(rule['base_fee']) if rule else '0',
+        'pct_fee': str(rule['pct_fee']) if rule else '0', 'rounding': 'ROUND_HALF_UP',
+        'basis': 'effective_goods_amount', 'version': 1})
 
     cur = master_conn.execute(
         """INSERT INTO store_orders
            (order_no, store_warehouse_code, dc_warehouse_code, status,
             requested_by, expected_delivery_date, note, created_at, updated_at,
-            shipping_fee)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            shipping_fee, shipping_rule_snapshot)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             order_no, cart_dict["store_warehouse_code"], header_dc,
             ORDER_STATUS_PENDING, requested_by, expected_delivery_date,
-            note, ts, ts, shipping_fee,
+            note, ts, ts, shipping_fee, rule_snapshot,
         ),
     )
     order_id = int(cur.lastrowid)
@@ -1510,16 +1537,19 @@ def submit_order(
         master_conn.execute(
             """INSERT INTO store_order_items
                (order_id, canonical_id, dc_item_id, store_item_id, source_warehouse_code,
-                quantity, unit, fulfilled_quantity, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quantity, original_quantity, unit, fulfilled_quantity, status, created_at,
+                unit_price_snapshot, price_snapshot_origin, product_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order_id, line["canonical_id"], line["dc_item_id"], line["store_item_id"],
-                line["source_warehouse_code"], line["quantity"], line["unit"], 0.0,
-                ORDER_ITEM_STATUS_PENDING, ts,
+                line["source_warehouse_code"], line["quantity"], line["quantity"], line["unit"], 0.0,
+                ORDER_ITEM_STATUS_PENDING, ts, line['unit_price_snapshot'],
+                line['price_snapshot_origin'], line['product_snapshot'],
             ),
         )
     # Clear cart items but keep the cart row so user can build next order.
-    clear_cart(master_conn, cart_id)
+    master_conn.execute('DELETE FROM store_order_cart_items WHERE cart_id=?', (cart_id,))
+    _touch_cart(master_conn, cart_id)
     _insert_status_history(master_conn, order_id, None, ORDER_STATUS_PENDING, requested_by, note)
     master_conn.commit()
     return get_order_detail(master_conn, order_id)
@@ -1536,11 +1566,9 @@ def compute_shipping_fee(subtotal: float, rule: dict | None) -> float:
     """
     if rule is None:
         return 0.0
-    base = float(rule.get("base_fee") or 0)
-    pct = float(rule.get("pct_fee") or 0)
-    raw = base + parse_qty(subtotal) * pct
-    # 2dp 量化，与货币一致
-    return float(Decimal(str(raw)).quantize(Decimal("0.01")))
+    base = Decimal(str(rule.get('base_fee') or 0))
+    pct = Decimal(str(rule.get('pct_fee') or 0))
+    return float(ocp.money(base + ocp.money(subtotal) * pct))
 
 
 def get_active_shipping_rule(master_conn: sqlite3.Connection) -> dict | None:
@@ -2024,6 +2052,14 @@ def get_order_detail(
         source = item.get("source_warehouse_code") or order["dc_warehouse_code"]
         item["effective_source_warehouse_code"] = source
         item["source_warehouse_name"] = names.get(str(source), source) if source else None
+    ocp.project_order(order)
+    display_names = {item['id']: item['canonical_name'] for item in order['order_items']}
+    for receipt in order['receipts']:
+        receipt['canonical_name'] = display_names.get(receipt['order_item_id'], receipt['canonical_name'])
+    order['change_history'] = ocp.change_history(master_conn, order_id)
+    blocked = ocp.blocked_lines(master_conn, order_id)
+    for item in order['order_items']:
+        item['ship_blocked_reason'] = blocked.get(item['id'])
     return order
 
 
@@ -2054,10 +2090,15 @@ def review_order(
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
         _assert_transition(order["status"], decision)
+        if decision == ORDER_STATUS_APPROVED and any(p['status'] == 'pending' for p in order['change_history']):
+            raise ValueError('订单存在待确认变更方案，不能审批通过')
+        if decision == ORDER_STATUS_REJECTED:
+            ocp.assert_unoccupied(master_conn, order_id)
+            ocp.invalidate_pending(master_conn, order, actor_id, '订单审核拒绝')
         ts = now()
         moved = master_conn.execute(
             """UPDATE store_orders
-               SET status=?, approved_by=?, approved_at=?, approved_note=?, updated_at=?
+               SET status=?, approved_by=?, approved_at=?, approved_note=?, updated_at=?, change_revision=change_revision+1
                WHERE id=? AND status=?""",
             (decision, actor_id, ts, note, ts, order_id, order["status"]),
         )
@@ -2111,14 +2152,14 @@ def _line_source_warehouse(order: dict[str, Any], item: dict[str, Any]) -> str:
 def _select_ship_lines(
     order: dict[str, Any],
     line_qty: dict[int, float],
-    operator_dc_code: str,
+    operator_dc_code: str | None,
     op_no: str,
 ) -> list[tuple[int, dict[str, Any], float]]:
     """Validate every requested line before any stock is touched.
 
-    Zero/blank quantities are no-ops (UI blank rows). Unknown line IDs and
-    lines whose frozen source is not the operation warehouse are hard errors,
-    so a forged foreign row can never deduct stock.
+    Validate every ID, then return positive-quantity execution lines. An explicit
+    operation warehouse constrains all submitted lines, including zeros. Without
+    one, the caller infers the source from these validated execution lines.
     """
     items_by_id: dict[int, dict[str, Any]] = {
         int(it["id"]): it for it in order["order_items"]
@@ -2134,18 +2175,18 @@ def _select_ship_lines(
             raise ValueError(
                 f"order_item_id={order_item_id} 不属于 order_id={order['id']}"
             )
+        source = _line_source_warehouse(order, item)
+        if operator_dc_code is not None and source != operator_dc_code:
+            raise ValueError(
+                f"order_item_id={order_item_id} 不属于操作仓 {operator_dc_code}"
+                f"（行来源 {source}）"
+            )
         try:
             qty = parse_qty(raw_qty)
         except (TypeError, ValueError):
             continue
         if qty <= 0:
             continue
-        source = _line_source_warehouse(order, item)
-        if source != operator_dc_code:
-            raise ValueError(
-                f"order_item_id={order_item_id} 不属于操作仓 {operator_dc_code}"
-                f"（行来源 {source}）"
-            )
         already = parse_qty(item.get("shipped_quantity") or 0)
         target = parse_qty(item["quantity"])
         # A retry of this very operation already carried the quantity into
@@ -2259,6 +2300,10 @@ def _apply_warehouse_shipment(
     try:
         wh_conn.row_factory = sqlite3.Row
         wh_conn.execute("BEGIN IMMEDIATE")
+        op_no = next(iter(line_keys.values())).rsplit(':', 1)[0]
+        claim_rows = ocp.assert_active_claim(master_conn, op_no, order_id=order['id'],
+                                            source=operator_dc_code, selected=selected)
+        frozen_ids = {r['order_item_id']: r['dc_item_id'] for r in claim_rows}
         for order_item_id, item, qty in selected:
             resolved = resolve_fulfillment_item(
                 master_conn,
@@ -2267,6 +2312,11 @@ def _apply_warehouse_shipment(
                 warehouse_code=operator_dc_code,
             )
             item_id = int(resolved["item_id"])
+            if item_id != frozen_ids[order_item_id] or resolved['unit'] != item['unit']:
+                raise ValueError('冻结履约行/单位已变更，拒绝换行扣库')
+            if wh_conn.execute('SELECT 1 FROM stock_movements WHERE op_no=?',
+                               ('REV:' + line_keys[order_item_id],)).fetchone():
+                raise ValueError('发货请求已有REV，不可复活')
             item_ids[order_item_id] = item_id
             applied = wh_conn.execute(
                 "SELECT 1 FROM stock_movements WHERE op_no=? LIMIT 1",
@@ -2397,15 +2447,7 @@ def _finalise_order_state(
     route emits exactly one ``store_order_shipped`` notification even when two
     warehouses ship their last lines back to back.
     """
-    rows = master_conn.execute(
-        """SELECT id, quantity, shipped_quantity
-             FROM store_order_items WHERE order_id=?""",
-        (order_id,),
-    ).fetchall()
-    is_fully_shipped = bool(rows) and all(
-        parse_qty(row["shipped_quantity"]) >= parse_qty(row["quantity"]) - 1e-9
-        for row in rows
-    )
+    is_fully_shipped = ocp.effective_progress(master_conn, order_id)['all_shipped']
     if not is_fully_shipped:
         _insert_status_history(
             master_conn,
@@ -2435,137 +2477,216 @@ def _finalise_order_state(
     return True
 
 
+def _new_ship_plan(master_conn, order, source, op_no, line_qty, mode, legacy_quantity):
+    """Select a genuinely new batch; never use this to classify an existing key."""
+    if order['status'] != ORDER_STATUS_APPROVED:
+        raise ValueError(f"order must be approved to ship, got {order['status']!r}")
+    if mode != 'explicit':
+        blocked = ocp.blocked_lines(master_conn, order['id'])
+        line_qty = {}
+        for item in order['order_items']:
+            if source is not None and _line_source_warehouse(order, item) != source:
+                continue
+            if int(item['id']) in blocked:
+                continue
+            remaining = parse_qty(item['quantity']) - parse_qty(item.get('shipped_quantity') or 0)
+            if remaining > 0:
+                line_qty[int(item['id'])] = (min(legacy_quantity, remaining)
+                    if mode == 'legacy_qty' else remaining)
+    selected = _select_ship_lines(order, line_qty, source, op_no)
+    if source is None:
+        sources = {_line_source_warehouse(order, item) for _, item, _ in selected}
+        if len(sources) > 1:
+            raise ValueError('订单跨仓，必须显式指定操作仓')
+        source = next(iter(sources))
+    return source, selected
+
+
+def _ship_plan_signature(selected):
+    """Bind lock-free item resolution to exactly the plan adjudicated in master."""
+    return sorted((oid, qty, item['canonical_id'], item['unit'], item.get('dc_item_id'),
+        item['line_revision'], item['quantity'], item['shipped_quantity'])
+        for oid, item, qty in selected)
+
+
 def ship_partial(
     master_conn: sqlite3.Connection,
     wh_conn_factory,
     *,
     order_id: int,
-    operator_dc_code: str,
+    operator_dc_code: str | None,
     op_no: str,
     line_qty: dict[int, float],
     shipped_by: int,
     tracking_note: str | None = None,
+    legacy_quantity: float | None = None,
+    request_mode: str | None = None,
 ) -> dict[str, Any]:
     """Ship one source warehouse's lines under a caller-supplied idempotency key.
 
-    Protocol (spec v2 §7/§8):
-      1. Validate every line's frozen source equals ``operator_dc_code``.
-      2. Warehouse db ``BEGIN IMMEDIATE``: conditional atomic decrement
-         (``WHERE quantity >= ?``) + ``stock_movements(op_no)``; a line already
-         carrying this request's derived key is skipped (retry-safe).
-      3. Master db ``BEGIN IMMEDIATE``: insert batch header + line rows
-         (``store_order_delivery_items.op_no`` UNIQUE → same request returns
-         the existing batch), accumulate ``shipped_quantity`` with a guard,
-         re-read **all** lines inside the lock and conditionally migrate
-         ``approved → shipped`` exactly once.
+    Prepare bindings without a master write lock, then adjudicate original
+    intent and register the frozen batch in one short master transaction.
+    Warehouse execution and master finalization retain their active/fence/REV
+    checks and conditional stock/quantity updates; committed replay skips them.
     """
     if not op_no:
         raise ValueError("op_no is required")
+    if operator_dc_code is not None and not operator_dc_code:
+        raise ValueError('操作仓不能为空')
+    # An arbitrary caller transaction may already hold a master write lock.
+    # Do not open/migrate a warehouse beneath that unknown lock ordering.
+    if master_conn.in_transaction:
+        raise ValueError('发货必须在独立master事务中执行，请先结束调用者事务')
+    mode = request_mode or ('legacy_qty' if legacy_quantity is not None else 'explicit')
+    if mode not in ('explicit', 'legacy_qty', 'full'):
+        raise ValueError('无效发货请求模式')
+    if mode == 'legacy_qty':
+        legacy_quantity = float(ocp.quantity(legacy_quantity))
+        if legacy_quantity <= 0:
+            raise ValueError('发货数量必须大于 0')
+    elif legacy_quantity is not None:
+        raise ValueError('原始数量与请求模式不符')
+    if mode == 'explicit':
+        ocp.ship_payload(order_id, operator_dc_code or '', line_qty)
     master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    selected = _select_ship_lines(order, line_qty, operator_dc_code, op_no)
-    selected_ids = [order_item_id for order_item_id, _, _ in selected]
-    line_keys = {oid: _line_op_no(op_no, oid) for oid in selected_ids}
-
-    existing = _find_existing_batch(master_conn, order_id, line_keys)
-    if existing is not None:
-        return _ship_result(
-            master_conn,
-            order_id,
-            delivery_id=existing,
-            op_no=op_no,
-            warehouse_code=operator_dc_code,
-            selected_ids=selected_ids,
-            idempotent=True,
-        )
-
-    if order["status"] != ORDER_STATUS_APPROVED:
-        raise ValueError(
-            f"order must be approved to ship, got {order['status']!r}"
-        )
-
-    ts = now()
-    item_ids = _apply_warehouse_shipment(
-        master_conn,
-        wh_conn_factory,
-        operator_dc_code,
-        order,
-        selected,
-        line_keys,
-        shipment_action_for(order),
-        ts,
-    )
-
+    prepared, prepared_source, frozen, preparation_error, legacy_warehouse = [], None, {}, None, False
+    # A missing optimistic read is only a hint. Capture every mutable preparation
+    # result, including real exceptions, until the authoritative short write lock.
     try:
-        master_conn.execute("BEGIN IMMEDIATE")
-        current = master_conn.execute(
-            "SELECT status FROM store_orders WHERE id=?", (order_id,)
-        ).fetchone()
-        if current is None:
+        hint = ocp.get_claim(master_conn, op_no)
+        if hint is None:
+            order = get_order_detail(master_conn, order_id)
+            if order is None:
+                raise ValueError(f"order_id={order_id} not found")
+            prepared_source, prepared = _new_ship_plan(master_conn, order,
+                operator_dc_code, op_no, line_qty, mode, legacy_quantity)
+            wh = wh_conn_factory(prepared_source)
+            try:
+                prefix = op_no + ':'
+                legacy_warehouse = wh.execute(
+                    'SELECT 1 FROM stock_movements WHERE substr(op_no,1,?)=? OR substr(op_no,1,?)=? LIMIT 1',
+                    (len(prefix), prefix, len('REV:' + prefix), 'REV:' + prefix)).fetchone() is not None
+                for oid, item, _ in prepared:
+                    resolved = resolve_fulfillment_item(master_conn, wh,
+                        canonical_id=item['canonical_id'], warehouse_code=prepared_source)
+                    if ((item.get('dc_item_id') is not None and item['dc_item_id'] != resolved['item_id'])
+                            or item['unit'] != resolved['unit']):
+                        raise ValueError('冻结履约行/单位已变更，拒绝换行扣库')
+                    frozen[oid] = int(resolved['item_id'])
+            finally:
+                wh.close()
+    except Exception as exc:
+        preparation_error = exc
+    owns_tx = _begin_immediate(master_conn)
+    try:
+        claim = ocp.get_claim(master_conn, op_no)
+        order = get_order_detail(master_conn, order_id)
+        if order is None:
             raise ValueError(f"order_id={order_id} not found")
-        existing = _find_existing_batch(master_conn, order_id, line_keys)
-        if existing is not None:
+        if claim is not None:
+            source = operator_dc_code or claim['source_warehouse_code']
+            ocp.assert_ship_permission(master_conn, order, shipped_by, source)
+            payload, claim = ocp.resolve_ship_payload(master_conn, op_no=op_no,
+                order_id=order_id, source=source, line_qty=line_qty,
+                legacy_quantity=legacy_quantity, request_mode=mode)
+            if mode == 'explicit':
+                members = {int(item['id']): item for item in order['order_items']}
+                for oid in line_qty:
+                    item = members.get(int(oid))
+                    if item is None:
+                        raise ValueError(f"order_item_id={int(oid)} 不属于 order_id={order_id}")
+                    item_source = _line_source_warehouse(order, item)
+                    if operator_dc_code is not None and item_source != operator_dc_code:
+                        raise ValueError(f"order_item_id={int(oid)} 不属于操作仓 {operator_dc_code}（行来源 {item_source}）")
+            normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
+            if claim['state'] == 'committed':
+                master_conn.commit()
+                return _ship_result(master_conn, order_id, delivery_id=claim['delivery_id'],
+                    op_no=op_no, warehouse_code=source, selected_ids=list(normalized), idempotent=True)
+            if claim['state'] != 'active':
+                raise ValueError('发货占用已恢复或终结，不可复用op_no')
+            items = {int(item['id']): item for item in order['order_items']}
+            selected = [(oid, items[oid], qty) for oid, qty in normalized.items()]
+            ocp.assert_active_claim(master_conn, op_no, order_id=order_id,
+                                    source=source, selected=selected)
+        else:
+            prefix = op_no + ':'
+            if master_conn.execute(
+                    'SELECT 1 FROM store_order_delivery_items WHERE substr(op_no,1,?)=? LIMIT 1',
+                    (len(prefix), prefix)).fetchone():
+                raise ValueError('旧发货请求无claim，须人工核对，不可复用op_no')
+            if legacy_warehouse:
+                raise ValueError('旧仓库请求或REV已存在且无claim，须人工核对，不可复用op_no')
+            source, selected = _new_ship_plan(master_conn, order, operator_dc_code,
+                op_no, line_qty, mode, legacy_quantity)
+            ocp.assert_ship_permission(master_conn, order, shipped_by, source)
+            if preparation_error is not None:
+                raise preparation_error
+            if (_ship_plan_signature(selected) != _ship_plan_signature(prepared)
+                    or source != prepared_source or set(frozen) != {oid for oid, _, _ in selected}):
+                raise ValueError('发货准备期间订单已变化，请重新发起请求')
+            payload = ocp.ship_payload(order_id, source, {oid: qty for oid, _, qty in selected},
+                legacy_quantity=legacy_quantity, request_mode=mode)
+            normalized = {int(oid): float(qty) for oid, qty in payload['lines']}
+            ocp.register_claim(master_conn, op_no=op_no, order=order, payload=payload,
+                               selected=selected, frozen=frozen, actor_id=shipped_by)
+        operator_dc_code = source
+        master_conn.commit()
+    except Exception:
+        if owns_tx and master_conn.in_transaction:
             master_conn.rollback()
-            return _ship_result(
-                master_conn,
-                order_id,
-                delivery_id=existing,
-                op_no=op_no,
-                warehouse_code=operator_dc_code,
-                selected_ids=selected_ids,
-                idempotent=True,
-            )
-        if current["status"] != ORDER_STATUS_APPROVED:
-            raise ValueError(
-                f"order must be approved to ship, got {current['status']!r}"
-            )
+        raise
+    selected_ids = list(normalized)
+    line_keys = {oid: _line_op_no(op_no, oid) for oid in selected_ids}
+    ts = now()
+    try:
+        item_ids = _apply_warehouse_shipment(master_conn, wh_conn_factory,
+            operator_dc_code, order, selected, line_keys, shipment_action_for(order), ts)
+    except ValueError:
+        settled = ocp.get_claim(master_conn, op_no, payload)
+        if settled is not None and settled['state'] == 'committed':
+            return _ship_result(master_conn, order_id, delivery_id=settled['delivery_id'],
+                op_no=op_no, warehouse_code=operator_dc_code, selected_ids=selected_ids, idempotent=True)
+        if settled is not None and settled['state'] == 'active':
+            # Even a known warehouse rollback uses the fence: another executor of
+            # this same request may still be running. Never simply delete a claim.
+            ocp.recover_shipment(master_conn, wh_conn_factory, op_no)
+        raise
+    try:
+        master_conn.execute('BEGIN IMMEDIATE')
+        claim = ocp.get_claim(master_conn, op_no, payload)
+        if claim['state'] == 'committed':
+            master_conn.commit()
+            return _ship_result(master_conn, order_id, delivery_id=claim['delivery_id'],
+                op_no=op_no, warehouse_code=operator_dc_code, selected_ids=selected_ids, idempotent=True)
+        current = get_order_detail(master_conn, order_id)
+        if current['status'] != ORDER_STATUS_APPROVED:
+            raise ValueError('订单不再是approved，保留发货占用待恢复')
+        ocp.assert_active_claim(master_conn, op_no, order_id=order_id,
+                                source=operator_dc_code, selected=selected)
+        # REV is permanent: a fenced/reversed request can never resurrect a delivery.
+        wh = wh_conn_factory(operator_dc_code)
         try:
-            delivery_id = _insert_master_batch(
-                master_conn,
-                order_id,
-                operator_dc_code,
-                selected,
-                line_keys,
-                item_ids,
-                op_no,
-                shipped_by,
-                tracking_note,
-                ts,
-            )
-        except sqlite3.IntegrityError:
-            master_conn.rollback()
-            existing = _find_existing_batch(master_conn, order_id, line_keys)
-            if existing is not None:
-                return _ship_result(
-                    master_conn,
-                    order_id,
-                    delivery_id=existing,
-                    op_no=op_no,
-                    warehouse_code=operator_dc_code,
-                    selected_ids=selected_ids,
-                    idempotent=True,
-                )
-            raise
-        transitioned = _finalise_order_state(
-            master_conn, order_id, shipped_by, tracking_note, selected, ts
-        )
+            if any(wh.execute('SELECT 1 FROM stock_movements WHERE op_no=?',
+                              ('REV:' + key,)).fetchone() for key in line_keys.values()):
+                raise ValueError('发货请求已冲销，不可补写配送')
+        finally:
+            wh.close()
+        delivery_id = _insert_master_batch(master_conn, order_id, operator_dc_code,
+            selected, line_keys, item_ids, op_no, shipped_by, tracking_note, ts)
+        transitioned = _finalise_order_state(master_conn, order_id, shipped_by, tracking_note, selected, ts)
+        moved = master_conn.execute("UPDATE store_order_ship_claims SET state='committed',delivery_id=?,completed_at=? WHERE op_no=? AND state='active'",
+                                    (delivery_id, ts, op_no))
+        if moved.rowcount != 1:
+            raise ValueError('发货已被恢复隔离')
         master_conn.commit()
     except Exception:
         if master_conn.in_transaction:
             master_conn.rollback()
         raise
-
-    return _ship_result(
-        master_conn,
-        order_id,
-        delivery_id=delivery_id,
-        op_no=op_no,
-        warehouse_code=operator_dc_code,
-        selected_ids=selected_ids,
-        transitioned_to_shipped=transitioned,
-    )
+    return _ship_result(master_conn, order_id, delivery_id=delivery_id,
+        op_no=op_no, warehouse_code=operator_dc_code, selected_ids=selected_ids,
+        transitioned_to_shipped=transitioned)
 
 
 REVERSAL_OP_NO_PREFIX: str = "REV:"
@@ -2589,6 +2710,8 @@ def reconcile_orphan_shipments(
         (WAREHOUSE_TYPE_DC,),
     ).fetchall()
     reconciled: list[dict[str, Any]] = []
+    for row in master_conn.execute("SELECT op_no FROM store_order_ship_claims WHERE state IN ('active','recovering') ORDER BY op_no").fetchall():
+        reconciled.extend(ocp.recover_shipment(master_conn, wh_conn_factory, row['op_no']))
     for warehouse in warehouses:
         code = warehouse["code"]
         wh_conn = wh_conn_factory(code)
@@ -2609,6 +2732,8 @@ def reconcile_orphan_shipments(
             for row in rows:
                 op_no = str(row["op_no"])
                 if op_no.startswith(REVERSAL_OP_NO_PREFIX):
+                    continue
+                if ocp.get_claim(master_conn, op_no.rsplit(':', 1)[0]) is not None:
                     continue
                 delivered = master_conn.execute(
                     "SELECT 1 FROM store_order_delivery_items WHERE op_no=? LIMIT 1",
@@ -2709,6 +2834,20 @@ def ship_order(
     )
 
 
+
+def ship_legacy_quantity(master_conn: sqlite3.Connection, *, order_id: int,
+                         operator_dc_code: str, op_no: str, quantity: float,
+                         shipped_by: int, tracking_note: str | None = None) -> dict[str, Any]:
+    """Adapt the old per-line qty cap while keeping its original request identity."""
+    requested = parse_qty(quantity)
+    if requested <= 0:
+        raise ValueError('发货数量必须大于 0')
+    return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+        operator_dc_code=operator_dc_code, op_no=op_no, line_qty={},
+        shipped_by=shipped_by, tracking_note=tracking_note, legacy_quantity=requested,
+        request_mode='legacy_qty')
+
+
 def ship_order_full(
     master_conn: sqlite3.Connection,
     order_id: int,
@@ -2742,44 +2881,10 @@ def _ship_order_full_impl(
     operator_dc_code: str | None = None,
     op_no: str | None = None,
 ) -> dict[str, Any]:
-    """Legacy one-shot: build a full-batch map and run partial-ship on it."""
-    master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    if order["status"] != ORDER_STATUS_APPROVED:
-        raise ValueError(
-            f"order must be approved to ship, got {order['status']!r}"
-        )
-    items_map: dict[int, float] = {}
-    sources: set[str] = set()
-    for item in order["order_items"]:
-        source = _line_source_warehouse(order, item)
-        if operator_dc_code is not None and source != operator_dc_code:
-            continue
-        already = parse_qty(item.get("shipped_quantity") or 0)
-        remaining = parse_qty(item["quantity"]) - already
-        if remaining > 0:
-            items_map[int(item["id"])] = remaining
-            sources.add(source)
-    if not items_map:
-        if operator_dc_code is not None:
-            raise ValueError(f"操作仓 {operator_dc_code} 无可发货明细")
-        raise ValueError("订单已全部发齐，无需再次发货")
-    if operator_dc_code is None:
-        if len(sources) != 1:
-            raise ValueError("订单跨仓，必须显式指定操作仓")
-        operator_dc_code = next(iter(sources))
-    return ship_partial(
-        master_conn,
-        open_warehouse_db,
-        order_id=order_id,
-        operator_dc_code=operator_dc_code,
-        op_no=op_no or generate_op_no(),
-        line_qty=items_map,
-        shipped_by=shipped_by,
-        tracking_note=tracking_note,
-    )
+    """Keep full intent intact until the common master identity adjudication."""
+    return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+        operator_dc_code=operator_dc_code, op_no=op_no or generate_op_no(),
+        line_qty={}, shipped_by=shipped_by, tracking_note=tracking_note, request_mode='full')
 
 
 def _ship_order_partial_impl(
@@ -2791,45 +2896,10 @@ def _ship_order_partial_impl(
     *,
     op_no: str | None = None,
 ) -> dict[str, Any]:
-    """Backwards-compatible wrapper around the cross-warehouse protocol.
-
-    Resolves the operation warehouse from the selected lines' frozen sources;
-    HTTP callers pass an explicit session warehouse to ``ship_partial``.
-    """
-    master_conn.row_factory = sqlite3.Row
-    order = get_order_detail(master_conn, order_id)
-    if order is None:
-        raise ValueError(f"order_id={order_id} not found")
-    items_by_id = {int(it["id"]): it for it in order["order_items"]}
-    sources: set[str] = set()
-    for raw_id, raw_qty in shipped_items_map.items():
-        try:
-            qty = parse_qty(raw_qty)
-        except (TypeError, ValueError):
-            continue
-        try:
-            item = items_by_id.get(int(raw_id))
-        except (TypeError, ValueError):
-            item = None
-        if item is None or qty <= 0:
-            continue
-        sources.add(_line_source_warehouse(order, item))
-    if not sources:
-        operator_dc_code = order["dc_warehouse_code"]
-    elif len(sources) == 1:
-        operator_dc_code = next(iter(sources))
-    else:
-        raise ValueError("订单跨仓，必须显式指定操作仓")
-    return ship_partial(
-        master_conn,
-        open_warehouse_db,
-        order_id=order_id,
-        operator_dc_code=operator_dc_code,
-        op_no=op_no or generate_op_no(),
-        line_qty=shipped_items_map,
-        shipped_by=shipped_by,
-        tracking_note=tracking_note,
-    )
+    """Infer the single frozen source inside the common identity adjudication."""
+    return ship_partial(master_conn, open_warehouse_db, order_id=order_id,
+        operator_dc_code=None, op_no=op_no or generate_op_no(), line_qty=shipped_items_map,
+        shipped_by=shipped_by, tracking_note=tracking_note, request_mode='explicit')
 
 
 # Order statuses in which the storefront is allowed to receive goods.
@@ -2862,6 +2932,8 @@ def order_item_receivable_qty(
 
     Returns a non-negative float; ``0`` means "nothing to receive here".
     """
+    if item.get('status') == ORDER_ITEM_STATUS_CANCELLED:
+        return 0.0
     ordered = parse_qty(item["quantity"])
     fulfilled = parse_qty(item.get("fulfilled_quantity") or 0)
     shipped = parse_qty(item.get("shipped_quantity") or 0)
@@ -2933,11 +3005,60 @@ def _find_existing_receipts(
     return found
 
 
+def _source_item_prices(
+    master_conn: sqlite3.Connection,
+    source_code: str | None,
+    canonical_id: int,
+) -> tuple[float, float]:
+    """Return ``(selling_price, unit_cost)`` from the resolved source row.
+
+    The row comes from the authoritative fulfillment resolver (unique active
+    non-alias row with a matching unit), never an arbitrary ``canonical_id``
+    match. An unresolvable binding logs a distinct warning and falls back to
+    0/0 so receiving stays unblocked; ``_ensure_store_item`` then warns about
+    the zero price. The source db is opened read-only and never migrated, so a
+    missing file cannot be created by this lookup.
+    """
+    if not source_code:
+        return 0.0, 0.0
+    path = config.WAREHOUSE_DB_DIR / f"{source_code}.db"
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        resolved = resolve_fulfillment_item(
+            master_conn,
+            conn,
+            canonical_id=canonical_id,
+            warehouse_code=str(source_code),
+        )
+        row = conn.execute(
+            "SELECT selling_price FROM items WHERE id=?",
+            (resolved["item_id"],),
+        ).fetchone()
+    except (FulfillmentError, sqlite3.Error) as exc:
+        logger.warning(
+            "[receiving] source binding unresolved canonical_id=%s warehouse=%s error=%s",
+            canonical_id,
+            source_code,
+            type(exc).__name__,
+        )
+        return 0.0, 0.0
+    finally:
+        if conn is not None:
+            conn.close()
+    selling_price = float(row["selling_price"] or 0) if row is not None else 0.0
+    return selling_price, float(resolved["unit_cost"] or 0)
+
+
 def _ensure_store_item(
     store_conn: sqlite3.Connection,
     master_conn: sqlite3.Connection,
     canonical_id: int,
     ts: str,
+    *,
+    selling_price: float,
+    unit_cost: float,
 ) -> sqlite3.Row:
     """Return the storefront ``items`` row, auto-creating it when unbound (§3.1)."""
     store_item = store_conn.execute(
@@ -2983,17 +3104,26 @@ def _ensure_store_item(
                 f"门店仓尚未初始化品类，无法为 canonical_id={canonical_id} 自动创建 items"
             )
         cat_id = int(row["id"])
+    price = float(selling_price or 0)
+    cost = float(unit_cost or 0)
+    if price == 0:
+        logger.warning(
+            "[receiving] auto-created item without price canonical_id=%s",
+            canonical_id,
+        )
     cur = store_conn.execute(
         """INSERT INTO items
            (sku, name, category_id, quantity, safety_stock,
             unit, unit_cost, gram_per_unit, aux_unit, aux_rate,
-            canonical_id, updated_at)
-           VALUES (?, ?, ?, 0, 0, ?, 0, 0, NULL, 0, ?, ?)""",
+            selling_price, canonical_id, updated_at)
+           VALUES (?, ?, ?, 0, 0, ?, ?, 0, NULL, 0, ?, ?, ?)""",
         (
             f"AUTO-RECEIVE-{canonical_id}",
             str(canon["name"]),
             cat_id,
             str(canon["unit"] or "件"),
+            cost,
+            price,
             canonical_id,
             ts,
         ),
@@ -3024,6 +3154,10 @@ def _apply_store_receipts(
         store_conn.row_factory = sqlite3.Row
         store_conn.execute("BEGIN IMMEDIATE")
         recv_action = receipt_action_for(order)
+        order_items_by_id = {
+            int(item["id"]): item
+            for item in order.get("order_items") or []
+        }
         for entry in pending:
             order_item_id = int(entry["order_item_id"])
             canonical_id = int(entry["canonical_id"])
@@ -3036,8 +3170,16 @@ def _apply_store_receipts(
             if existing is not None:
                 item_ids[order_item_id] = int(existing["item_id"])
                 continue
+            source_code = _line_source_warehouse(
+                order, order_items_by_id.get(order_item_id, {})
+            )
+            selling_price, unit_cost = _source_item_prices(
+                master_conn, source_code, canonical_id
+            )
             store_item = _ensure_store_item(
-                store_conn, master_conn, canonical_id, ts
+                store_conn, master_conn, canonical_id, ts,
+                selling_price=selling_price,
+                unit_cost=unit_cost,
             )
             item_id = int(store_item["id"])
             store_conn.execute(
@@ -3083,15 +3225,7 @@ def _finalise_receipt_state(
     ``UPDATE … WHERE status='shipped'`` actually moved the order, so the route
     emits exactly one ``store_order_delivered`` notification.
     """
-    rows = master_conn.execute(
-        """SELECT id, quantity, fulfilled_quantity
-             FROM store_order_items WHERE order_id=?""",
-        (order_id,),
-    ).fetchall()
-    all_done = bool(rows) and all(
-        parse_qty(row["fulfilled_quantity"]) >= parse_qty(row["quantity"]) - 1e-9
-        for row in rows
-    )
+    all_done = ocp.effective_progress(master_conn, order_id)['all_received']
     if not all_done:
         return False
     moved = master_conn.execute(
@@ -3122,6 +3256,28 @@ def _finalise_receipt_state(
     )
     return True
 
+
+
+def refresh_effective_order_state(master_conn: sqlite3.Connection, order_id: int,
+                                  actor_id: int, note: str = '有效订量履约完成') -> str:
+    """Caller owns the master write transaction; never invents delivery/receipt rows."""
+    if not master_conn.in_transaction:
+        raise ValueError('有效量聚合需要外层master事务')
+    order = master_conn.execute('SELECT status FROM store_orders WHERE id=?', (order_id,)).fetchone()
+    if order is None:
+        raise ValueError('订单不存在')
+    state = order['status']
+    progress = ocp.effective_progress(master_conn, order_id)
+    target = state
+    if state in ('approved', 'shipped') and progress['all_received']:
+        target = ORDER_STATUS_DELIVERED
+    elif state == ORDER_STATUS_APPROVED and progress['all_shipped']:
+        target = ORDER_STATUS_SHIPPED
+    if target != state:
+        master_conn.execute("UPDATE store_orders SET status=?,updated_at=?,delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END WHERE id=? AND status=?",
+                            (target, now(), target, now(), order_id, state))
+        _insert_status_history(master_conn, order_id, state, target, actor_id, note)
+    return target
 
 def receive_partial(
     master_conn: sqlite3.Connection,
@@ -3399,6 +3555,8 @@ def reconcile_orphan_receipts(
     rows = master_conn.execute(
         """SELECT r.id, r.op_no, r.quantity, r.order_item_id,
                   so.order_no, so.flow_type, so.store_warehouse_code,
+                  COALESCE(soi.source_warehouse_code, so.dc_warehouse_code)
+                      AS source_warehouse_code,
                   soi.canonical_id
              FROM store_order_receipts r
              JOIN store_orders so ON so.id = r.order_id
@@ -3423,8 +3581,14 @@ def reconcile_orphan_receipts(
             if existing is not None:
                 item_id = int(existing["item_id"])
             else:
+                canonical_id = int(row["canonical_id"])
+                selling_price, unit_cost = _source_item_prices(
+                    master_conn, row["source_warehouse_code"], canonical_id
+                )
                 store_item = _ensure_store_item(
-                    store_conn, master_conn, int(row["canonical_id"]), ts
+                    store_conn, master_conn, canonical_id, ts,
+                    selling_price=selling_price,
+                    unit_cost=unit_cost,
                 )
                 item_id = int(store_item["id"])
                 store_conn.execute(
@@ -3546,6 +3710,8 @@ def cancel_order(
         if order is None:
             raise ValueError(f"order_id={order_id} not found")
         _assert_transition(order["status"], ORDER_STATUS_CANCELLED)
+        ocp.assert_unoccupied(master_conn, order_id)
+        ocp.invalidate_pending(master_conn, order, cancelled_by, '订单取消')
         # 已有收货记录则拒绝取消：货已实际入库，作废订单会造成账实不符。
         # （2026-10-10：approved 状态开放「部分发货即可收货」后新增的防护路径；
         #  此前 approved 不可收货，故不存在该状态。）
@@ -3568,7 +3734,7 @@ def cancel_order(
         moved = master_conn.execute(
             """UPDATE store_orders
                   SET status=?, cancelled_by=?, cancelled_at=?,
-                      cancel_reason=?, updated_at=?
+                      cancel_reason=?, updated_at=?, change_revision=change_revision+1
                 WHERE id=? AND status IN (?, ?)""",
             (
                 ORDER_STATUS_CANCELLED,

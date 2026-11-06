@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}变更方案 #{{ proposal.sequence }}{% endblock %}
+{% block content %}
+<div class="order-change">
+<h2>变更方案 #{{ proposal.sequence }}</h2>
+<p><a href="{{ url_for('store_ordering.order_detail', order_id=order.id) }}">返回订单 {{ order.order_no }}</a></p>
+<div class="info-card">
+<p><strong>状态：</strong>{{ {'pending':'待确认','accepted':'已同意','rejected':'已拒绝','withdrawn':'已撤回','stale':'已失效'}[proposal.status] }}</p>
+<p><strong>原因：</strong>{{ proposal.reason }}</p>
+<p>提议人 #{{ proposal.proposed_by }} · {{ proposal.created_at }}</p>
+{% if proposal.status == 'pending' %}<p>受影响行暂停发货，其他已审批行可继续发货，已发货物照常收货。未回复不会自动同意。</p>{% endif %}
+{% if proposal.stale_reason %}<p>{{ proposal.stale_reason }}</p>{% endif %}
+{% if stale_hint %}<p role="status">{{ stale_hint }}</p>{% endif %}
+{% if proposal.decided_at %}<p>处理人 #{{ proposal.decided_by }} · {{ proposal.decided_at }}<br>{{ proposal.decision_note or '—' }}</p>{% endif %}
+</div>
+{% set snapshot=proposal.snapshot %}
+{% if snapshot.version == 1 and snapshot.before and snapshot.after %}
+<h3>整份方案比较</h3>
+{% for side,label in [('before','变更前'),('after','变更后')] %}
+<section class="info-card"><h4>{{ label }}</h4>
+{% for line in snapshot[side].lines|default([]) %}
+<p><strong>{{ line.product.name }}</strong> · {{ line.product.canonical_sku or '历史SKU未记录' }}<br>
+来源 {{ line.source_warehouse_code }} · 基础单位 {{ line.unit }}<br>
+原始 {{ line.original_quantity }} · 有效 {{ line.quantity }} · 已发 {{ line.shipped_quantity }} · 已收 {{ line.fulfilled_quantity }}<br>
+单价 ¥{{ line.unit_price_snapshot if line.unit_price_snapshot is not none else '未知' }} · 行额 ¥{{ line.line_amount }}
+{% if line.product.aux_unit and line.product.aux_rate %}<br>辅单位换算：1 {{ line.product.aux_unit }} = {{ line.product.aux_rate }} {{ line.unit }}；计价使用基础单位{% endif %}
+{% if line.product_basis == 'current_identification_only' %}<br>当前识别描述，非历史规格{% endif %}
+{% if line.verification_pending %}<br>{{ '本次补录已随整份方案核对' if proposal.status=='accepted' else '本次补录待整份核对' }}{% else %}<br>价格来源：{{ line.price_snapshot_origin or '历史未记录' }}{% endif %}
+</p>
+{% endfor %}
+<p>货品金额 ¥{{ snapshot[side].goods_amount }}<br>运费 ¥{{ snapshot[side].shipping_fee }}<br><strong>订单总计 ¥{{ snapshot[side].total_amount }}</strong></p>
+</section>
+{% endfor %}
+<p><strong>订单计价差额 ¥{{ snapshot.delta }}</strong>（正数待核对增补，负数待核对减退）</p>
+<p>订单计价差额，待线下核对，不代表已付款或已退款。</p>
+<p>费用依据：{{ {'original_rule_snapshot':'原运费规则快照','all_cancelled':'全部未发量取消，费用归零','recorded_fee_carried_forward_rule_unknown':'沿用已记录费用，原规则未记录','verified_adjustment_rule_unknown':'经凭据核对调整，原规则未记录'}.get(snapshot.fee_basis, snapshot.fee_basis) }}<br>{{ snapshot.fee_reference }} {{ snapshot.fee_note }}</p>
+{% for key,evidence in snapshot.historical_verification|default({})|dictsort %}<p>明细 #{{ key }} 历史单价 ¥{{ evidence.price }} · 核对人 #{{ evidence.checked_by }} · {{ evidence.checked_at }}<br>凭据 {{ evidence.reference }} · {{ evidence.note }}</p>{% endfor %}
+{% endif %}
+<h3>受影响明细</h3>
+{% for line in proposal.lines %}
+<div class="info-card"><p>明细 #{{ line.order_item_id }} · {{ {'cancel':'取消未发量','reduce':'减量','replace':'替换未发量'}[line.operation] }}</p>
+<p>原有效数量 {{ line.baseline_quantity|fmt_qty }} · 已发 {{ line.baseline_shipped|fmt_qty }} · 建议移除 {{ line.remove_quantity|fmt_qty }}</p></div>
+{% endfor %}
+{% if can_decide %}
+<form method="post" action="{{ url_for('store_ordering.accept_order_change', order_id=order.id, proposal_id=proposal.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="request_key" value="{{ accept_request_key }}"><input type="hidden" name="seen_digest" value="{{ snapshot_digest }}">
+<p>请核对整份商品、数量、计价和历史补录；同意后本方案整体生效。</p>
+<label>同意备注（可选） <textarea name="note"></textarea></label>
+<button type="submit" name="agree" value="1">同意整份方案</button>
+</form>
+<form method="post" action="{{ url_for('store_ordering.reject_order_change', order_id=order.id, proposal_id=proposal.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="request_key" value="{{ reject_request_key }}"><input type="hidden" name="seen_digest" value="{{ snapshot_digest }}">
+<label>不同意的留言 <textarea name="note" required></textarea></label><button type="submit" class="danger">不同意并留言</button>
+</form>
+{% endif %}
+{% if can_withdraw %}
+<form method="post" action="{{ url_for('store_ordering.withdraw_order_change', order_id=order.id, proposal_id=proposal.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="request_key" value="{{ withdraw_request_key }}">
+<label>撤回备注 <input name="note" maxlength="500" placeholder="可选"></label><button type="submit" class="danger">撤回整份方案</button>
+</form>
+{% endif %}
+{% if can_repropose %}<p><a href="{{ url_for('store_ordering.new_order_change', order_id=order.id) }}">重新提议一份新方案</a></p>{% endif %}
+{% if proposal.events %}<h3>处理记录</h3>{% for event in proposal.events %}<p>{{ event.created_at }} · {{ event.note }}</p>{% endfor %}{% endif %}
+</div>
+{% endblock %}

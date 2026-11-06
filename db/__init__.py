@@ -1336,6 +1336,9 @@ def init_master_db() -> None:
                 )
                 _seed_permissions_and_roles(conn)
 
+                from migrations.order_changes import registered_up as order_changes_up
+                order_changes_up(conn)
+
                 # 启动断言（防空包全站 403 的沉默失败）：告警而非 raise，
                 # 避免单点数据问题让 gunicorn 拒绝启动、放大故障面。
                 for w in _verify_builtin_packages(conn):

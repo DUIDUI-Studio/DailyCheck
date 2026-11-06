@@ -1,6 +1,10 @@
 {
   "schema_version": 2,
   "project": "DailyCheck",
+  "deprecated": true,
+  "deprecated_at": "2026-11-03",
+  "superseded_by": "docs/agent-framework/orca-overlay.md#5",
+  "deprecation_note": "Project-level model routing is retired. The user-global policy at ~/.agents/skills/orca-model-routing/routing.json is authoritative. This file is retained for audit only.",
   "updated_at": "2026-10-26",
   "authority": "docs/agent-framework/workflow.md",
   "model_id_policy": {

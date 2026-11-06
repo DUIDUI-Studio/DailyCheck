@@ -1,13 +1,15 @@
 # deploy/systemd/dc-inbox-rotate.timer
 #
-# DailyCheck inbox 归档定时器（Issue #47）：每日 00:30 触发一次 rotate。
-# Persistent=true：机器错过窗口（宕机/暂停）恢复后补跑一次。
+# DailyCheck inbox 归档定时器（Issue #47）：每小时触发一次 rotate。
+# 2026-11-03 改：原每日 00:30 一次，inbox 撞 MAX_INBOX_LINES=1000 反压闸门
+# → receiver 对新事件返 503 → webhook 唤醒链断在第一环（PR #141 CI 转绿事件被丢）。
+# 每小时 + 水位兜底 = 撞上限前即恢复。
 
 [Unit]
-Description=Daily inbox rotate timer (00:30, Issue #47)
+Description=Daily inbox rotate timer (hourly, Issue #47)
 
 [Timer]
-OnCalendar=*-*-* 00:30:00
+OnCalendar=hourly
 Persistent=true
 Unit=dc-inbox-rotate.service
 
