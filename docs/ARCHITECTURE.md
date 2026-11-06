@@ -1150,6 +1150,8 @@ Token = input + output + cache_read + cache_write；reasoning 已在 output 内�
 
 **回归**：`tests/test_model_eval_collect.py`、`tests/test_worktree_eval.py`，覆盖显式与
 并发归属、实际模型段、累计/重置、源失败、历史保留、原子同步顺序与失败隔离。
+Issue #155 的历史合并回归断言 fresh / archived / fallback 组合的事件唯一性、
+用量合计、部分覆盖、原采集时间及重复对账结果。
 
 ---
 

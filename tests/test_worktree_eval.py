@@ -892,3 +892,100 @@ def test_db_failure_memory_fallback_restores_unknown_business_time(tmp_path):
     assert ef.summarize(ef.select_facts(prepared))["total"] == 135
     actual_epoch = facts([ledger_db._normalise(row(ts="1970-01-01T00:00:00Z"))])
     assert actual_epoch[0]["at"] == 0
+
+
+@pytest.mark.parametrize("execution_source", ["fresh", "archived", "fallback"])
+@pytest.mark.parametrize("session_source", ["fresh", "archived", "fallback"])
+def test_history_event_ownership_across_fresh_archived_and_fallback_rows(
+    execution_source, session_source,
+):
+    from copy import deepcopy
+
+    from scripts.model_eval.collect_pure import preserve_history, record_key
+
+    old_time = "2026-10-30T00:00:00Z"
+    execution = row(
+        record_kind="execution", collected_at=old_time,
+        usage_events=[evt("shared", complete=True), evt("execution-only", complete=True)],
+        tokens=usage(200, output=40, cache_read=20, cache_write=10, reasoning=24),
+    )
+    session = row(
+        None, row_id="session", record_kind="unattributed_session", collected_at=old_time,
+        usage_events=[evt("shared", complete=True), evt("session-only", model="m2", complete=True)],
+        tokens=usage(200, output=40, cache_read=20, cache_write=10, reasoning=24),
+        actual_models=["m1", "m2"], model_effective=None, cost=10,
+        warnings=["multiple_models"],
+    )
+    archive = row(
+        "archive", record_kind="execution", usage_events=[evt("archive-only", complete=True)],
+        collected_at=old_time, worktree_deleted_at=SNAPSHOT,
+    )
+    fresh, previous = [], [archive]
+    for source, item in ((execution_source, execution), (session_source, session)):
+        if source == "archived":
+            previous.append(item)
+        elif source == "fresh":
+            fresh.append(item)
+        else:
+            previous.append(item)
+            fresh.append({**item, "usage_events": [], "tokens": None, "cost": None,
+                          "collected_at": SNAPSHOT})
+    output = preserve_history(deepcopy(fresh), deepcopy(previous))
+    events = [e for r in output for e in r.get("usage_events") or []]
+    assert len(events) == len({e["event_id"] for e in events}) == 4
+    assert sum(sum(r["tokens"][k] for k in ef.BASE_KEYS) for r in output) == 540
+    by_key = {record_key(r): r for r in output}
+    assert [e["event_id"] for e in by_key["dispatch:d1"]["usage_events"]] == [
+        "shared", "execution-only",
+    ]
+    remaining = by_key["session"]
+    assert remaining["tokens"] == usage()
+    assert remaining["actual_models"] == ["m2"] and remaining["model_effective"] == "m2"
+    assert remaining["cost"] is None  # the old two-event price cannot describe the remainder
+    assert "multiple_models" not in remaining["warnings"]
+    assert all(r["collected_at"] == old_time for r in output)
+    assert by_key["dispatch:archive"] == archive
+    summary = ef.summarize(facts(output))
+    assert summary["total"] == 540 and summary["token_coverage"] == summary["rows"] == 3
+    for current, history in ((fresh, previous), (fresh[::-1], previous[::-1]), (fresh, output)):
+        replayed = preserve_history(deepcopy(current), deepcopy(history))
+        assert sorted(replayed, key=record_key) == sorted(output, key=record_key)
+
+
+@pytest.mark.parametrize("kind", ["execution", "unattributed_session"])
+def test_history_event_is_counted_once_within_and_between_same_kind_rows(kind):
+    from copy import deepcopy
+
+    from scripts.model_eval.collect_pure import preserve_history, record_key
+
+    a = row("a" if kind == "execution" else None, row_id="a", record_kind=kind,
+            usage_events=[evt(complete=True), evt(complete=True)], tokens=usage(200))
+    b = row("b" if kind == "execution" else None, row_id="b", record_kind=kind,
+            usage_events=[evt(complete=True)])
+    output = preserve_history([], deepcopy([b, a]))
+    assert sum(len(r.get("usage_events") or []) for r in output) == 1
+    assert sum(sum((r.get("tokens") or {}).get(k) or 0 for k in ef.BASE_KEYS)
+               for r in output) == 135
+    summary = ef.summarize(facts(output))
+    assert summary["total"] == 135 and summary["token_coverage"] == 1
+    assert summary["rows"] == (2 if kind == "execution" else 1)
+    if kind == "execution":
+        empty = next(r for r in output if not r["usage_events"])
+        assert empty["dispatch_id"] == "b" and empty["tokens"] is None and empty["cost"] is None
+    reordered = preserve_history([], deepcopy([a, b]))
+    assert sorted(output, key=record_key) == sorted(reordered, key=record_key)
+
+
+def test_history_reassigned_partial_usage_keeps_unknown_fields_and_coverage():
+    from scripts.model_eval.collect_pure import preserve_history
+
+    execution = row(record_kind="execution", usage_events=[evt(complete=True)])
+    partial = evt("partial", tokens=usage(cache_read=None, cache_write=None), complete=False)
+    session = row(None, row_id="session", record_kind="unattributed_session",
+                  usage_events=[evt(complete=True), partial], cost=10)
+    output = preserve_history([session], [execution])
+    remaining = next(r for r in output if r.get("row_id") == "session")
+    assert remaining["tokens"] == usage(cache_read=None, cache_write=None)
+    assert remaining["cost"] is None
+    summary = ef.summarize(facts(output))
+    assert summary["total"] == 255 and summary["token_coverage"] == 1 and summary["rows"] == 2
