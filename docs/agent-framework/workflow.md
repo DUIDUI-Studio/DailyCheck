@@ -71,7 +71,7 @@
 | # | 规则 |
 |---|------|
 | C1 | push 显式写 `git push origin <branch>`，不依赖 upstream —— worktree 的 upstream 可能指错 |
-| C2 | 生命周期内至少 merge 一次 `origin/main`。落后越久，冲突与 diff 误判越容易撞上（Issue #24）；落后 >30 个提交时 CI 给提示 **[机验 H4，只提示不拦]** |
+| C2 | **Gitea 保持既有行为**：生命周期内至少 merge 一次 `origin/main`；落后 >30 个提交时 CI 提示 **[机验 H4，只提示不拦]**。**GitHub native MERGE**：H tip 必须一父；GitHub queue 集成最新 main。未发布分支可 rebase；已发布 merge-tip 可普通 fast-forward 添加一父 child，或另开经审查新分支。不要求 force 更新已发布分支；`--force` / `--force-with-lease` 仍须 Owner 单独批准，此处没有该授权。 |
 
 #### PR 颗粒度
 
@@ -164,6 +164,22 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 | `CI / deploy (pull_request)` | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：至少一次手动 workflow_dispatch 演练跑通） |
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
+
+### GitHub native-only CI 与 Prod gate（Issue164，本地 seam；未激活）
+
+GitHub 的 H 是当前公开 PR head；B 是 merge_group 原始事件创建基线；G 是实际 tested /
+deployed group；P 是实际 Git graph 直接前驱。保留有序成员、authenticated repo/queue/entry
+和原私有 composite/source-map digest，不能从分支拼写猜成员，也不能把所有 H 替换成 G。
+
+MERGE only：H 一父、G 至少二父且成员 H 都在 ancestry。`test` 与
+`agent-framework-reports` 两个原 check 在 H/G 各跑完整真实 coverage；reports always 运行并
+显式拒绝缺失/失败/跳过 upstream、binding、成员四报告/body/MCP/redline/hygiene 义务。
+Prod 验证 approved workflow/check/run/attempt/App/evidence identity，不只看同名 green。
+PR body 是数据。只取消同 PR 旧 CI；group 以 event/G/run 独立并发，不取消 production。
+
+原生队列可并行验证当前及一个 lookahead。G2 含尚未 merge 的 G1 可以先 CI；Prod 必须等
+front/main/deployed=P=G1 且前驱已 merge/anchored。相同 G2 的旧 B 不必等于新的 main；
+重建 G 必须新 proof。queue merge limit=1 不证明 singleton 内容；GitHub 独占集成顺序。
 
 ### ④′ 自动交付跟随契约（2026-10-27 Eric 拍板，全局适用）
 
@@ -347,6 +363,26 @@ fetch refs/pull/<N>/head → 校验 sha 包含 origin/main → checkout --detach
 - **任何异常 → `rollback.sh` 秒回蓝**（Issue #28 修复生效后为代码+数据双回；此前仅回代码）
 - 铁律四条 + DB 隔离铁律见 `docs/ARCHITECTURE.md` §3.4
 - 已知注意：蓝 standby 进程内存里是旧代码，**重新启用蓝前必须 restart**
+
+### GitHub native-only Prod 生命周期（Issue164，本地 seam；未激活）
+
+Prod 独立 review → 在既有 attempt fence 下 checkout G → 全部现有蓝绿 verification /
+切流量 / ≥10min 真实观察 → durable verified journal → 最终 live 重读 → durable grant_intent
+→ dedicated isolated Prod check transport → GitHub 异步 merge → exact-G 对账 → 原子锚点/outcome
+→ typed public v2 H/B/G 报告 → Prod 对账源 Issue。不能为拿 receipt 提前调用普通 release。
+
+Owner 已接受：完整独立验证后授权 exact immutable G；同 G 出队再入队可复用该许可，grant
+发出后不能保证撤回已接受的异步 merge。放行前 H/B/成员/binding/policy/review/CI attempt
+或出队变化均使旧 proof 无效。此决策不启用 App/保护/生产；没有 signing key、环境 boolean
+或 caller success JSON 激活入口，具体新增传输只接受 owned loopback fixture。
+
+HTTP child、异步 merge、main/runtime/anchor reconciliation 全程持有既有 OS fence；process
+死亡后仍有 durable unresolved-grant barrier。TTL、clear-lock、state 删除/损坏或 ordinary
+cleanup 不能放行下一生产。恢复取同一 fence，只读事实，不重复 deploy/grant、不 refresh
+绿色；未知/incident 保留 reconcile_required，交 Prod/operator。仅 exact merged G、main G、
+runtime G、完整 observation/checks 写一次成功 anchor/outcome；publication 不证明 merge。
+应急 rollback 仍可用，但不撤销已接受 grant。Gitea 继续原 FF helper 与现有部署/报告行为。
+Coordinator 继续按 delivered 契约跟踪，不 merge、不部署、不关闭 Issue。
 
 ## 六、应急
 

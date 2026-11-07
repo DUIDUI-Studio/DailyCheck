@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--text-output", type=Path)
     parser.add_argument("--evidence-output", type=Path)
     parser.add_argument("--binding-file", type=Path, help="expected tested H/base B/run identity")
+    parser.add_argument("--envelope-output", type=Path, help="retain bound envelope for authenticated job-log attestation")
     args = parser.parse_args(argv)
     try:
         binding = json.loads(args.binding_file.read_text(encoding="utf-8")) if args.binding_file else None
@@ -128,6 +129,10 @@ def main(argv: list[str] | None = None) -> int:
         if len(payload.encode("utf-8")) > MAX_SUMMARY_BYTES:
             raise ValueError("compact pytest envelope too large; refusing to truncate evidence")
         encoded = encode_summary(payload)
+        if args.envelope_output:
+            if binding is None:
+                raise ValueError("attestation requires a candidate binding")
+            args.envelope_output.write_text(payload, encoding="utf-8")
         with output_file.open("a", encoding="utf-8") as handle:
             handle.write(f"{OUTPUT_NAME}={encoded}\n")
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as exc:

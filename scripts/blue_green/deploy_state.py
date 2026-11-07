@@ -75,6 +75,7 @@ TOKEN_FILENAME = "lock.token"
 ATTEMPT_LOCK_FILENAME = ".attempt.lock"
 ATTEMPT_ENV = "DAILYCHECK_DEPLOY_ATTEMPT"
 ATTEMPT_FD_ENV = "DAILYCHECK_DEPLOY_ATTEMPT_FD"
+NATIVE_GUARD_FILENAME = "native-queue.guard"
 
 # Issue163: the public code sink is a fixed 162 identity, never a fact the
 # reporter may take from a PR body, context JSON or caller argument.
@@ -169,6 +170,8 @@ def cmd_run(args) -> int:
         return EXIT_USAGE
     try:
         with _attempt_lock(_state_dir()) as fd:
+            if native_blocked(_state_dir(), _load_state(_state_dir())):
+                return _fail("native grant requires reconciliation before another pipeline", EXIT_LOCK_BUSY)
             os.set_inheritable(fd, True)
             env = dict(os.environ, **{ATTEMPT_FD_ENV: str(fd)})
             os.execvpe(command[0], command, env)
@@ -269,7 +272,7 @@ def _load_state(directory: Path, heal: bool = False) -> dict:
         return data
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         print(f"[deploy_state] WARN: state 文件损坏（{exc}）—— 按空状态处理", file=sys.stderr)
-        if heal:
+        if heal and not (directory / NATIVE_GUARD_FILENAME).exists():
             bak = path.with_name(f"{STATE_FILENAME}.corrupt-{_now()}")
             try:
                 path.replace(bak)
@@ -284,7 +287,66 @@ def _save_state(directory: Path, state: dict) -> None:
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # state 里有锁 token，按密钥对待；umask 不可靠，显式收紧
     os.chmod(tmp, 0o600)
+    with tmp.open("rb") as fh:
+        os.fsync(fh.fileno())
     os.replace(tmp, directory / STATE_FILENAME)
+    _sync_directory(directory)
+
+
+def _sync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def native_guard(directory: Path, marker: dict) -> None:
+    """Fail-closed marker, never positive authority; same directory and locks."""
+    path = directory / NATIVE_GUARD_FILENAME
+    tmp = directory / (NATIVE_GUARD_FILENAME + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        os.chmod(tmp, 0o600)
+        json.dump(marker, fh, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _sync_directory(directory)
+
+
+def native_consistent(directory: Path, state: dict) -> bool:
+    """Once initialized, absent/partial state or marker must never look like first use."""
+    native = state.get("native_queue")
+    path = directory / NATIVE_GUARD_FILENAME
+    if native is None:
+        return not path.exists()
+    try:
+        marker = json.loads(path.read_text())
+        if (not isinstance(native, dict) or native.get("version") != 1
+                or not isinstance(native.get("initialization_id"), str)
+                or marker.get("initialization_id") != native["initialization_id"]
+                or marker.get("version") != 1 or "active" not in native):
+            return False
+        active = native["active"]
+        if active is None:
+            return marker == {"version": 1, "initialization_id": native["initialization_id"],
+                              "intent_id": None}
+        if (not isinstance(active, dict) or not isinstance(active.get("candidate"), dict)
+                or active.get("phase") not in {"deploy", "verified", "grant_intent", "grant_uncertain",
+                                               "grant_accepted", "incident"}
+                or not isinstance(active.get("origin_attempt_id"), str)
+                or type(active.get("origin_generation")) is not int):
+            return False
+        grant = active.get("release_grant")
+        return marker == {"version": 1, "initialization_id": native["initialization_id"],
+                          "intent_id": grant["intent_id"] if isinstance(grant, dict) else None}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def native_blocked(directory: Path, state: dict) -> bool:
+    return (not native_consistent(directory, state)
+            or bool((state.get("native_queue") or {}).get("active")))
 
 
 def _token_path(directory: Path) -> Path:
@@ -380,6 +442,8 @@ def publication_config_transaction(directory: Path):
         fcntl.flock(fh, fcntl.LOCK_EX)  # blocking: wait for an in-flight publication
         try:
             with _write_lock(directory) as boundary:
+                if native_blocked(directory, _load_state(directory)):
+                    raise RuntimeError("native unresolved barrier requires reconciliation before config writes")
                 yield boundary
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
@@ -488,6 +552,8 @@ def _acquire(args) -> int:
     directory = _state_dir()
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
+        if native_blocked(directory, state):
+            return _fail("native grant/admission requires reconciliation", EXIT_LOCK_BUSY)
         now = _now()
         lock = state.get("lock")
         if _lock_active(lock, now, _ttl()):
@@ -702,6 +768,8 @@ def cmd_release(args) -> int:
     token = _resolve_token(args, directory)
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
+        if native_blocked(directory, state):
+            return _fail("native candidate cannot use ordinary release", EXIT_LOCK_BUSY)
         lock = state.get("lock")
         if (not isinstance(lock, dict) or not token or lock.get("token") != token
                 or not _attempt_owns(lock)):
@@ -772,6 +840,9 @@ def cmd_catchup(args) -> int:
     """追平检测：main vs deployed（+ 失败防重试）。"""
     directory = _state_dir()
     state = _load_state(directory)
+    if native_blocked(directory, state):
+        _emit({"status": "reconcile_required"})
+        return EXIT_LOCK_BUSY
     main = _resolve_main_sha(args)
     if not main:
         _emit({"status": "no-main", "state_dir": str(directory)})
@@ -809,6 +880,8 @@ def cmd_init(args) -> int:
     directory = _state_dir()
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
+        if native_blocked(directory, state):
+            return _fail("native state cannot be initialized/healed", EXIT_LOCK_BUSY)
         now = _now()
         lock = state.get("lock")
         if _lock_active(lock, now, _ttl()):
@@ -835,6 +908,8 @@ def cmd_clear_lock(args) -> int:
     directory = _state_dir()
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
+        if native_blocked(directory, state):
+            return _fail("native unresolved barrier cannot be cleared", EXIT_LOCK_BUSY)
         old = state.get("lock")
         state["lock"] = None
         _save_state(directory, state)
@@ -892,9 +967,71 @@ def cmd_status(args) -> int:
     return EXIT_OK
 
 
+NATIVE_STAGES = ("candidate", "up", "verify", "promote", "switch", "observe")
+
+
+def _native_owned(state: dict) -> dict:
+    native = state.get("native_queue")
+    active = native.get("active") if isinstance(native, dict) else None
+    lock = state.get("lock")
+    if (not native_consistent(_state_dir(), state) or not isinstance(active, dict)
+            or not isinstance(lock, dict) or ATTEMPT_ENV not in os.environ
+            or not _attempt_owns(lock) or active["origin_attempt_id"] != lock.get("attempt_id")
+            or active["origin_generation"] != state.get("generation")
+            or lock.get("sha") != active["candidate"].get("manifest", {}).get("group_sha")):
+        raise ValueError("native attempt ownership lost")
+    return active
+
+
+def cmd_native_candidate(args) -> int:
+    try:
+        active = _native_owned(_load_state(_state_dir()))
+        if active["phase"] != "deploy":
+            raise ValueError("native candidate is not deploying")
+        _emit(active["candidate"]["manifest"])
+        return EXIT_OK
+    except (ValueError, KeyError, TypeError):
+        return EXIT_TOKEN_MISMATCH
+
+
+def cmd_native_stage(args) -> int:
+    try:
+        with _write_lock(_state_dir()):
+            state = _load_state(_state_dir())
+            active = _native_owned(state)
+            if active["phase"] != "deploy":
+                raise ValueError("native stage is already sealed")
+            journal = active["journal"]
+            completed = [row["stage"] for row in journal if row.get("completed") is True]
+            if args.action == "start":
+                if (completed != list(NATIVE_STAGES[:len(completed)])
+                        or len(journal) != len(completed)
+                        or len(completed) >= len(NATIVE_STAGES)
+                        or args.stage != NATIVE_STAGES[len(completed)]):
+                    raise ValueError("native stage out of order")
+                journal.append({"stage": args.stage, "started_monotonic": time.monotonic(),
+                                "started_at": _now(), "completed": False})
+            else:
+                if not journal or journal[-1]["stage"] != args.stage or journal[-1]["completed"]:
+                    raise ValueError("native stage missing or repeated")
+                journal[-1].update(completed=True, rc=0, completed_monotonic=time.monotonic(),
+                                   completed_at=_now())
+            _save_state(_state_dir(), state)
+        return EXIT_OK
+    except (ValueError, KeyError, TypeError):
+        return EXIT_TOKEN_MISMATCH
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="deploy_state.py", description="蓝绿部署单飞状态原语")
     sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("native-candidate", help="owned native candidate; never grants release")
+    p.set_defaults(func=cmd_native_candidate)
+    p = sub.add_parser("native-stage", help="record owned real pipeline stage boundaries")
+    p.add_argument("--stage", required=True, choices=NATIVE_STAGES)
+    p.add_argument("--action", required=True, choices=["start", "done"])
+    p.set_defaults(func=cmd_native_stage)
 
     p = sub.add_parser("run", help="hold the normal pipeline process lock through exec")
     p.add_argument("exec", nargs=argparse.REMAINDER)

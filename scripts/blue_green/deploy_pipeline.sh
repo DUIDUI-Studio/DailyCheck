@@ -78,6 +78,7 @@ HB_PID=""
 FAIL_STAGE=""
 CANDIDATE=0
 MERGE_PR=0
+NATIVE_CANDIDATE=0
 TREE_MOVED=0
 ORIG_REF=""
 
@@ -130,6 +131,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)            DRY_RUN=1; shift ;;
     --candidate)          CANDIDATE=1; shift ;;
     --merge-pr)           MERGE_PR=1; shift ;;
+    --native-candidate)   NATIVE_CANDIDATE=1; shift ;;
     -h|--help)            usage; exit 0 ;;
     -*)                   die 64 "未知选项: $1" ;;
     *)
@@ -157,7 +159,11 @@ fi
 
 # Re-exec once under Python's POSIX flock (also available on macOS without flock CLI).
 # A descriptor is inherited across stages; heartbeat age never proves process exit.
-if [[ "${DRY_RUN}" -eq 0 ]]; then
+if [[ "${NATIVE_CANDIDATE}" -eq 1 ]]; then
+  [[ "${DRY_RUN}" -eq 0 && "${SKIP_VERIFY}" -eq 0 && "${OBSERVE_MIN}" -ge 10 && "${MERGE_PR}" -eq 0 ]] || die 64 "native candidate requires full verification and observation"
+  "${PY}" "${DS}" process-owned || die 11 "native candidate needs inherited process fence"
+  "${PY}" "${DS}" native-candidate >/dev/null || die 11 "native authority not installed for this attempt"
+elif [[ "${DRY_RUN}" -eq 0 ]]; then
   [[ -z "${DAILYCHECK_DEPLOY_ATTEMPT:-}" ]] || die 11 "不能嵌套普通部署 attempt"
   if [[ -z "${DAILYCHECK_DEPLOY_ATTEMPT_FD:-}" ]]; then
     exec "${PY}" "${DS}" run -- bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
@@ -241,10 +247,10 @@ cleanup() {
     kill -TERM "${HB_PID}" 2>/dev/null || true
     wait "${HB_PID}" 2>/dev/null || true
   fi
-  if [[ "${TREE_MOVED}" -eq 1 && ${rc} -ne 0 ]] && _owns_attempt; then
+  if [[ "${NATIVE_CANDIDATE}" -eq 0 && "${TREE_MOVED}" -eq 1 && ${rc} -ne 0 ]] && _owns_attempt; then
     _restore_main || true
   fi
-  if [[ "${RELEASE_ATTEMPTED}" -eq 0 && "${DS_READY}" -eq 1 ]]; then
+  if [[ "${NATIVE_CANDIDATE}" -eq 0 && "${RELEASE_ATTEMPTED}" -eq 0 && "${DS_READY}" -eq 1 ]]; then
     if [[ ${rc} -eq 0 ]]; then
       _release success || rc=27
     else
@@ -254,7 +260,7 @@ cleanup() {
   fi
   # 放最后：release 会再写几行日志，先回写就漏掉它们。且 _writeback_pr 内部
   # 全程 best-effort —— 回写失败绝不能把一次成功部署变成红。
-  _writeback_pr "${rc}"
+  if [[ "${NATIVE_CANDIDATE}" -eq 0 ]]; then _writeback_pr "${rc}"; fi
   trap - EXIT
   exit "${rc}"
 }
@@ -263,7 +269,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ---------------------------------------------------------------- 幂等
-if [[ "${DRY_RUN}" -eq 0 ]]; then
+if [[ "${DRY_RUN}" -eq 0 && "${NATIVE_CANDIDATE}" -eq 0 ]]; then
   _dep="$("${PY}" "${DS}" status --json 2>/dev/null | "${PY}" -c \
     'import json,sys; print((json.load(sys.stdin).get("deployed") or {}).get("sha", ""))')"
   if [[ "${SHA}" =~ ^[0-9a-f]{40}$ && "${_dep}" == "${SHA}" ]]; then
@@ -273,7 +279,11 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------- 抢锁 + 心跳
-if [[ "${DRY_RUN}" -eq 1 ]]; then
+if [[ "${NATIVE_CANDIDATE}" -eq 1 ]]; then
+  ATTEMPT_TOKEN="$("${PY}" -c 'import os,json; print(json.loads(os.environ["DAILYCHECK_DEPLOY_ATTEMPT"])["token"])')"
+  readonly ATTEMPT_TOKEN
+  DS_READY=1
+elif [[ "${DRY_RUN}" -eq 1 ]]; then
   log "dry-run：跳过 acquire / 心跳 / release（不碰部署状态）"
 else
   # Capture provenance through the actual deploy/report target resolver. Do not
@@ -353,11 +363,18 @@ _hb() {
   fi
 }
 
+# Native stage boundaries are written by the fenced pipeline, never by a success JSON.
+_native_stage() {
+  [[ "${NATIVE_CANDIDATE}" -eq 1 ]] || return 0
+  "${PY}" "${DS}" native-stage --stage "$1" --action "$2" >>"${LOG}" 2>&1 || die 28 "native journal rejected stage"
+}
+
 # ---------------------------------------------------------------- 阶段执行
 run_stage() {
   local code=$1 name=$2; shift 2
   log "→ ${name}"
   _hb "${name}-start"
+  _native_stage "${name}" start
   local rc
   "$@" >>"${LOG}" 2>&1
   rc=$?
@@ -369,6 +386,7 @@ run_stage() {
     exit "${code}"
   fi
   _hb "${name}-done"
+  _native_stage "${name}" done
   log "✓ ${name}"
   return 0
 }
@@ -520,7 +538,13 @@ observe_window() {
 DRY_FLAG=""
 [[ "${DRY_RUN}" -eq 1 ]] && DRY_FLAG="--dry-run"
 
-if [[ "${CANDIDATE}" -eq 1 ]]; then
+if [[ "${NATIVE_CANDIDATE}" -eq 1 ]]; then
+  _native_stage candidate start
+  _native_sha="$("${PY}" "${DS}" native-candidate | "${PY}" -c 'import json,sys; print(json.load(sys.stdin)["group_sha"])')"
+  [[ "${_native_sha}" == "${SHA}" ]] || die 25 "native G mismatch"
+  _owned_checkout --candidate "${SHA}" || die 25 "native checkout rejected"
+  _native_stage candidate done
+elif [[ "${CANDIDATE}" -eq 1 ]]; then
   run_stage 25 candidate _prepare_candidate
 fi
 
@@ -556,6 +580,7 @@ else
   _head_before="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
   log "→ verify"
   _hb "verify-start"
+  _native_stage verify start
   bash "${SCRIPT_DIR}/verify.sh" "${PR}" ${DRY_FLAG} >>"${LOG}" 2>&1
   _verify_rc=$?
   _head_after="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -582,6 +607,7 @@ else
     exit 21
   fi
   _hb "verify-done"
+  _native_stage verify done
   log "✓ verify"
 fi
 
@@ -601,7 +627,14 @@ if [[ "${OBSERVE_MIN}" -lt "${OBSERVE_MIN_REQUIRED}" ]]; then
     "observe=${OBSERVE_MIN}min < required=${OBSERVE_MIN_REQUIRED}min"
 fi
 
+_native_stage observe start
 observe_window "${OBSERVE_MIN}"
+_native_stage observe done
+
+if [[ "${NATIVE_CANDIDATE}" -eq 1 ]]; then
+  log "native G verified; grant and exact-G reconciliation remain with fenced Prod owner"
+  exit 0
+fi
 
 if [[ "${MERGE_PR}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
   run_stage 26 merge _merge_candidate

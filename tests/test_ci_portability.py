@@ -23,9 +23,13 @@ def workflow():
 def test_both_servers_have_explicit_checkout_and_python_paths():
     value = workflow()
     assert set(value["jobs"]) == {"test", "agent-framework-reports"}
-    assert value["permissions"] == {"contents": "read"}
+    assert value["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert value["concurrency"]["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
-    assert "pull_request.number || github.run_id" in value["concurrency"]["group"]
+    assert "github.event_name" in value["concurrency"]["group"]
+    assert "github.event.merge_group.head_sha" in value["concurrency"]["group"]
+    assert "github.run_id" in value["concurrency"]["group"]
+    assert value["on"]["merge_group"]["types"] == ["checks_requested"]
+    assert value["jobs"]["agent-framework-reports"]["if"].startswith("always()")
     for job in value["jobs"].values():
         steps = job["steps"]
         by_name = {step["name"]: step for step in steps}
@@ -35,12 +39,17 @@ def test_both_servers_have_explicit_checkout_and_python_paths():
         assert gh["if"] == "github.server_url == 'https://github.com'"
         assert source["if"] == "github.server_url != 'https://github.com'"
         assert not any("://" in step.get("uses", "") for step in steps)
-        assert gh["with"]["ref"] == "${{ github.event.pull_request.head.sha || github.sha }}"
+        assert gh["with"]["ref"] == "${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}"
         assert gh["with"]["persist-credentials"] == "false"
         assert by_name["Setup Python on GitHub"]["uses"] == "actions/setup-python@v7"
         assert by_name["Python on Gitea (runner image)"]["if"] == source["if"]
         assert '"PyYAML==6.0.3"' in by_name["Install dependencies"]["run"]
-        assert "mktemp -d" in steps[0]["run"] and "$GITHUB_ENV" in steps[0]["run"]
+        prepare = by_name["Prepare isolated job paths"]["run"]
+        assert "mktemp -d" in prepare and "$GITHUB_ENV" in prepare
+        assert "Pytest (full suite, including MCP)" in by_name
+        assert "Zero-new-failure gate" in by_name
+        if job is value["jobs"]["agent-framework-reports"]:
+            assert by_name["Pytest (full suite, including MCP)"]["if"] == "github.server_url == 'https://github.com'"
         assert "candidate_binding.py" in by_name["Bind tested H and event H/B to this run"]["run"]
 
 

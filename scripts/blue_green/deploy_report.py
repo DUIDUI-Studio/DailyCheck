@@ -584,8 +584,17 @@ class PublicDeployFacts:
     scope: str
     verdict: str
     next: str
+    version: int = 1
+    deployment_sha: str | None = None
+    creation_base_sha: str | None = None
 
     def __post_init__(self):
+        if (type(self.version) is not int or self.version not in {1, 2}
+                or self.version == 1 and (self.deployment_sha is not None or self.creation_base_sha is not None)
+                or self.version == 2 and any(
+                    not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None
+                    for value in (self.deployment_sha, self.creation_base_sha))):
+            raise HostingError("invalid_public_native_identity")
         enums = {
             "stage": {"acquire", "candidate", "up", "verify", "promote", "switch",
                       "observe", "merge", "release", "complete"},
@@ -614,16 +623,19 @@ class PublicDeployFacts:
 
 
 def publication_marker(facts: PublicDeployFacts) -> str:
-    return (f"<!-- deploy-publication:v1 repo=1448986421 pr={facts.pr} "
+    return (f"<!-- deploy-publication:v{facts.version} repo=1448986421 pr={facts.pr} "
             f"head={facts.sha} receipt={facts.receipt} -->")
 
 
 def render_public(facts: PublicDeployFacts) -> str:
     """No requirement, explanation, log, path, planner or private identity parameter."""
     head = "部署结果 · 成功" if facts.rc == 0 else f"部署结果 · 失败（rc={facts.rc}）"
+    native = ([f"| Deployment | `{facts.deployment_sha}` |",
+               f"| Creation base | `{facts.creation_base_sha}` |"] if facts.version == 2 else [])
     return "\n".join([
         MARKER, publication_marker(facts), f"## {head}", "", "| 项 | 值 |", "|---|---|",
         f"| PR | #{facts.pr} |", f"| Commit | `{facts.sha[:12]}` |",
+        *native,
         f"| RC | {facts.rc} |", f"| 阶段 | `{facts.stage}` |",
         f"| 归因 | `{facts.kind}` / `{facts.scope}` |", f"| 对齐 | `{facts.verdict}` |",
         f"| 下一步 | {_NEXT_LABEL[facts.next]} |", f"| 时间 | {facts.outcome_at} |", "",
@@ -805,13 +817,13 @@ def _public_stage(tr: dict, rc: int) -> str:
 
 
 def _publication_context(outcome: dict, binding, payload_sha256: str) -> PublicationContext:
-    from publication_authority import SOURCE_KEYS
+    from publication_authority import SOURCE_KEYS, public_head
 
     hosting = outcome["hosting"]
     return PublicationContext.parse({
         "provider": hosting["provider"], "host": hosting["host"],
         "repository_id": hosting["repository_id"], "repository": hosting["repository"],
-        "pr": outcome["pr"], "sha": outcome["sha"],
+        "pr": outcome["pr"], "sha": public_head(outcome),
         "attempt_id": outcome["attempt_id"], "generation": outcome["generation"],
         "outcome_at": outcome["outcome_at"],
         "public_receipt": outcome["public_receipt"],
@@ -878,6 +890,14 @@ def _cmd_write_github(args, tail: str, authority):
                 args.pr, args.sha, outcome["public_receipt"], outcome["outcome_at"],
                 outcome["rc"], _public_stage(tr, outcome["rc"]), tr["kind"],
                 tr["scope"], align["verdict"], nxt)
+            if outcome.get("candidate") is not None:
+                manifest = outcome["candidate"]["manifest"]
+                facts = PublicDeployFacts(
+                    args.pr, publication_authority.public_head(outcome),
+                    outcome["public_receipt"], outcome["outcome_at"], outcome["rc"],
+                    _public_stage(tr, outcome["rc"]), tr["kind"], tr["scope"], align["verdict"], nxt,
+                    version=2, deployment_sha=outcome["sha"],
+                    creation_base_sha=manifest["creation_base_sha"])
             frozen, digest = publication_authority.freeze_public_facts(
                 deploy_state.state_dir(), attempt_id, generation,
                 asdict(facts), _payload_digest(render_public(facts)))

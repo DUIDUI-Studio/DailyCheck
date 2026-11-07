@@ -88,6 +88,7 @@ class SourceBinding:
     pr: int
     source: tuple[str, str, int, str, str, int]
     binding_sha256: str
+    source_revision: dict | None = None
 
 
 # ── durable outcome ───────────────────────────────────────────────────────
@@ -115,6 +116,21 @@ def _validate_outcome(attempt_id: str, outcome: object, generation: int) -> dict
         raise HostingError("durable_outcome_malformed")
     if not _valid_deployment(outcome.get("deployment"), outcome["pr"]):
         raise HostingError("deployment_provenance_missing")
+    native = outcome.get("candidate")
+    if native is not None:
+        try:
+            manifest = native["manifest"]
+            subject = manifest["members"][-1]
+            if (native["kind"] != "github_merge_group" or native["version"] != 1
+                    or manifest["subject_pr_number"] != outcome["pr"]
+                    or subject["number"] != outcome["pr"]
+                    or manifest["group_sha"] != outcome["sha"]
+                    or re.fullmatch(r"[0-9a-f]{40}", subject["head_sha"]) is None
+                    or re.fullmatch(r"[0-9a-f]{40}", manifest["creation_base_sha"]) is None
+                    or re.fullmatch(r"[0-9a-f]{64}", outcome["native_evidence_sha256"]) is None):
+                raise ValueError
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            raise HostingError("durable_native_outcome_malformed") from exc
     try:
         if str(uuid.UUID(outcome["public_receipt"])) != outcome["public_receipt"]:
             raise ValueError
@@ -148,7 +164,7 @@ def load_durable_outcome(directory: Path, pr: int, sha: str,
         for attempt_id, outcome in outcomes.items()
         if isinstance(outcome, dict)
         and outcome.get("pr") == pr
-        and outcome.get("sha") == sha
+        and public_head(outcome) == sha
         and outcome.get("generation") == generation
     ]
     if not matches:
@@ -160,6 +176,16 @@ def load_durable_outcome(directory: Path, pr: int, sha: str,
     if require_public_github:
         require_public_deployment(outcome, pr)
     return attempt_id, outcome, generation
+
+
+def public_head(outcome: dict) -> str:
+    native = outcome.get("candidate")
+    if native is None:
+        return outcome.get("sha")
+    try:
+        return native["manifest"]["members"][-1]["head_sha"]
+    except (KeyError, TypeError, IndexError) as exc:
+        raise HostingError("durable_native_outcome_malformed") from exc
 
 
 def freeze_public_facts(directory: Path, attempt_id: str, generation: int,
@@ -198,7 +224,8 @@ def _binding_path(directory: Path) -> Path:
 
 
 def _validate_binding_entry(entry: object) -> dict:
-    if not isinstance(entry, dict) or set(entry) != {"pr", "public", "source"}:
+    if (not isinstance(entry, dict)
+            or set(entry) not in ({"pr", "public", "source"}, {"pr", "public", "source", "source_revision"})):
         raise HostingError("private_source_binding_invalid")
     source = entry["source"]
     public = entry["public"]
@@ -218,6 +245,21 @@ def _validate_binding_entry(entry: object) -> dict:
         raise HostingError("private_source_binding_invalid")
     if provider == "github" and (host, rid, repo) != GITHUB_SOURCE_IDENTITY:
         raise HostingError("private_source_binding_invalid")
+    if "source_revision" in entry:
+        revision = entry["source_revision"]
+        if (not isinstance(revision, dict) or set(revision) != {
+                "provider", "host", "repository_id", "repository", "sha", "source_public_map_sha256"}
+                or revision["provider"] not in {"gitea", "github"}
+                or type(revision["repository_id"]) is not int or revision["repository_id"] <= 0
+                or not isinstance(revision["host"], str)
+                or re.fullmatch(r"[A-Za-z0-9.:_-]+", revision["host"]) is None
+                or not isinstance(revision["repository"], str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", revision["repository"]) is None
+                or not isinstance(revision["sha"], str)
+                or re.fullmatch(r"[0-9a-f]{40}", revision["sha"]) is None
+                or not isinstance(revision["source_public_map_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", revision["source_public_map_sha256"]) is None):
+            raise HostingError("private_revision_binding_invalid")
     return entry
 
 
@@ -249,7 +291,8 @@ def resolve_source_binding(directory: Path, pr: int) -> SourceBinding:
         _canonical({"version": document["version"], "binding": entry}).encode()
     ).hexdigest()
     source = tuple(entry["source"][key] for key in SOURCE_KEYS)
-    return SourceBinding(pr=pr, source=source, binding_sha256=digest)
+    return SourceBinding(pr=pr, source=source, binding_sha256=digest,
+                         source_revision=entry.get("source_revision"))
 
 
 # ── adapter ───────────────────────────────────────────────────────────────
@@ -296,12 +339,19 @@ class DurablePublicationClaim:
             self._attempt_id, outcomes[self._attempt_id], self._generation)
         require_public_deployment(outcome, self._context.pr)
         if (outcome.get("pr") != self._context.pr
-                or outcome.get("sha") != self._context.sha
+                or public_head(outcome) != self._context.sha
                 or outcome.get("public_receipt") != self._context.public_receipt
                 or outcome.get("outcome_at") != self._context.outcome_at
                 or outcome.get("payload_sha256") != self._payload_sha256
                 or outcome.get("facts") is None):
             raise HostingError("durable_outcome_mismatch")
+        if outcome.get("candidate") is not None:
+            facts = outcome["facts"]
+            manifest = outcome["candidate"]["manifest"]
+            if (facts.get("version") != 2 or facts.get("sha") != public_head(outcome)
+                    or facts.get("deployment_sha") != outcome["sha"]
+                    or facts.get("creation_base_sha") != manifest["creation_base_sha"]):
+                raise HostingError("durable_native_projection_mismatch")
 
         binding = resolve_source_binding(self._directory, self._context.pr)
         if binding.binding_sha256 != self._binding_sha256:

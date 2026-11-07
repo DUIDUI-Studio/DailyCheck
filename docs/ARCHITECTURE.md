@@ -495,6 +495,28 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 本地回归入口 `tests/test_deploy_attempt_fencing.py` 使用真实 pipeline/CLI 子进程、SIGSTOP/CONT/KILL 与 pipe 栅栏，验证过期活进程互斥、setup/观察/收锁/回写的覆盖、同 PR 替换身份、真实临时文件锚点 I/O 错误、成功本地合并后的失败结果、全 SHA 前缀碰撞、退出后恢复及应急豁免。全部状态/SQLite/nginx/命令夹具都在临时目录；不连接生产服务。
 
+**Issue164 native-G seam（本地实现，激活关闭）**：GitHub 原生 MERGE 的 H（公开 PR head）、
+B（原始事件创建基线）、G（实际测试/部署的 merge group）、P（Git parents 的直接前驱）
+分别保存。H tip 必须一父；G 至少二父且包含所有成员 H；两种 producer domain 不重叠。
+GitHub 自行排集成顺序，允许当前 + 一个 speculative CI；生产只接受 live front/main/
+deployed=P，已合并并锚定的前驱证据不可省。B 不要求等于 admission 时的 main。
+
+`native_queue.NativeQueue` 复用本节的 state.json/.state.lock/.attempt.lock；受保护的
+初始化和 signer 安装没有实现，具体传输仅支持明确 TEST ONLY 的 owned loopback scope。
+`--native-candidate` 仅接受已持有描述符/attempt/native state 的调用，checkout G 并运行
+原有 up→verify→promote→switch→观察窗。阶段 journal 由真实 shell 在同一 attempt 下记录，
+完整验证和 ≥600 **真实 monotonic 秒**后先 seal verified evidence，再写 durable intent，
+不能调用普通 release 来提前拿 receipt。HTTP 子进程显式继承 fence；保留到异步 merge 和
+exact-G reconciliation。intent 后超时、进程死亡、出队/同 G 再入队、TTL 不代表撤销或释放。
+普通 acquire/run/release/init/clear-lock 不能跨过 unresolved barrier。
+
+同 trusted state 目录的 `native-queue.guard` 只保存初始化/待对账标记，无正向授权；marker
+先于 external intent durable 写入，缺失、损坏、marker/state 不一致均阻断 healing/admission。
+不存在第二个 queue/DB/lock；不能删除/替换 trusted state 目录或锁文件。恢复先取同一 OS
+fence，只读 host/runtime，绝不重复部署或 grant；未知 main、wrong merge SHA、缺事实、incident
+保留 reconcile_required。仅 PR merge SHA=main=runtime=G、原完整检查和观察均确认时，同一
+原子 state 写锚点 + 一份 outcome，再退 pending marker。崩溃窗口宁可阻断，不能重发 green。
+
 **Issue163 发布接线（本地实现，未激活）**：`release` 在既有原子状态提交里，除
 `deployed`/`last_attempt` 外还写入不可变 outcome（generation/完整 H/PR/public sink/
 实际 deployment provenance/真实 result/rc/stage/UTC 时间/随机 UUID4 public_receipt +
@@ -1389,6 +1411,32 @@ GitHub 生产激活或 public source import。`dc_state.py`/`dc_delivery.py`、�
 Prod 安装仍属外部依赖；CI/policy/生产模式未变。返回的 comment ID 只证明 publication，
 不证明真实 Prod review/admission；现有 review、候选验证、观察窗、merge/Issue closure
 仍仅由 Prod 执行。
+
+**Issue164 CI/发布增量（本地未激活）**：`candidate_binding.py` 的 GitHub PR/group 使用
+v3 tagged H/G，Gitea 保留原 v2 compact identity。`merge_group.py` 通过固定只读 GraphQL
+query 分页读取 authenticated queue/entry/repository/members，不解析 queue branch 拼写。
+manifest 绑定完整 tree/ordered parents/成员 H/body digest；CI 不接触私有 Issue tuple。
+两个 literal required jobs 均在 H 和 G 全量跑真实 pytest/native/session/hash 门禁，reports
+用 always() 并显式拒绝 upstream failed/skipped/missing binding。Gitea reports 继续复用原 test
+的完整 compact evidence，不重复全量 pytest。每个成员 H 的 body/MCP/
+redline/hygiene 和 G 的四报告均须通过；不以 check 同名 green 或 caller JSON 代替 producer
+证据。只有同 PR 旧 run 可取消；group key 含 event/G/run，不能取消 production。
+
+固定 workflow 最后记录 compact job-log attestation；独立只读 `NativeGitHubFacts` 验证 approved
+workflow blob、repository/workflow/run/attempt/job/check/App IDs 和最新 producer/evidence。
+日志下载只接受 authenticated API 的限定 presigned HTTPS host，下载不转发 auth。真实 Prod
+runtime、independent review 和 signer identity 必须来自受保护 port；本源码不安装这些 port。
+默认 signer 缺失即拒绝，shadow reducer/HostingClient 写权限不扩张。
+
+私有 binding 的可选完整 source_revision={provider,host,repository_id,repository,sha,
+source_public_map_sha256} 独立于 source Issue composite identity；native 必须有该字段，
+legacy Gitea/163 publication 仍兼容。所有 cooperating binding writers 继续使用既有
+publication_config_transaction，没有 installer；native unresolved barrier 同样阻断 cooperating config transaction，防止
+进程退出后绕过对账改写绑定。native outcome 的 sha=G，公开 projection
+v2 的 sha=H、deployment_sha=G、creation_base_sha=B；private canary、tuple、attempt/token
+不进入 public renderer。public receipt/comment 不是 merge 或 production admission 证明。
+Owner 已明确接受 exact verified-G 放行规则；App/installation/保护/隔离 signer/Linux/真实
+Prod 安装与验收仍未执行。本地真实 Git/SQLite/shell/loopback 的证据不冒充生产交付。
 
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。

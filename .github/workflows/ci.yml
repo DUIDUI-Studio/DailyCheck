@@ -10,21 +10,25 @@ env:
   CI_RUN_ATTEMPT: ${{ github.run_attempt || '1' }}
   CI_EVENT: ${{ github.event_name }}
   CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-  CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  CI_BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+  CI_GROUP_SHA: ${{ github.event.merge_group.head_sha }}
   CI_EVENT_SHA: ${{ github.sha }}
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   PIP_TRUSTED_HOST: mirrors.aliyun.com
 
 permissions:
   contents: read
+  pull-requests: read
 
 # Only superseded CI for the same PR is canceled. No deployment serialization.
 concurrency:
-  group: ci-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+  group: ci-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.sha }}-${{ github.event_name != 'pull_request' && github.run_id || 'pr' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   workflow_dispatch:
@@ -34,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
+      member_manifest_b64: ${{ steps.member_manifest.outputs.member_manifest_b64 }}
     steps:
       - name: Prepare isolated job paths
         run: |
@@ -47,7 +52,7 @@ jobs:
         if: github.server_url == 'https://github.com'
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -96,6 +101,15 @@ jobs:
       - name: Python on Gitea (runner image)
         if: github.server_url != 'https://github.com'
         run: python3 --version && python3 -m pip --version
+
+      - name: Resolve authenticated merge-group members
+        id: member_manifest
+        if: github.event_name == 'merge_group'
+        env:
+          NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/merge_group.py manifest --manifest "${CI_ROOT}/members.json"
+          printf 'CI_MEMBER_MANIFEST=%s/members.json\n' "$CI_ROOT" >> "$GITHUB_ENV"
 
       - name: Bind tested H and event H/B to this run
         run: |
@@ -154,16 +168,24 @@ jobs:
       # 全部 FAILED/ERROR、终态摘要与真实 native/session/hash 证据，不能重建假退出码。
       - name: Create compact pytest summary output
         id: pytest_summary
-        run: python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json"
+        run: python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --envelope-output "${CI_ROOT}/envelope.json"
+
+      - name: Attest test evidence for independent Prod reader
+        if: github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        run: python3 scripts/ci/merge_group.py attest --context test --manifest "${CI_ROOT}/members.json"
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
     # 详见 docs/agent-framework/v0.1.md §三
-    # 上游 test 失败则跳过（test 失败即阻断，无需跑 reports）
+    # Always settle the required report context; missing/failed upstream is an explicit failure.
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     steps:
+      - name: Require successful complete upstream
+        env:
+          UPSTREAM_RESULT: ${{ needs.test.result }}
+        run: test "$UPSTREAM_RESULT" = success
       - name: Prepare isolated job paths
         run: |
           set -euo pipefail
@@ -176,7 +198,7 @@ jobs:
         if: github.server_url == 'https://github.com'
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.merge_group.head_sha || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 0
 
@@ -226,6 +248,17 @@ jobs:
         if: github.server_url != 'https://github.com'
         run: python3 --version && python3 -m pip --version
 
+      - name: Resolve authenticated merge-group members
+        id: member_manifest
+        if: github.event_name == 'merge_group'
+        env:
+          NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
+          UPSTREAM_MEMBER_MANIFEST_B64: ${{ needs.test.outputs.member_manifest_b64 }}
+        run: |
+          test -n "${UPSTREAM_MEMBER_MANIFEST_B64}"
+          python3 scripts/ci/merge_group.py manifest --manifest "${CI_ROOT}/members.json"
+          printf 'CI_MEMBER_MANIFEST=%s/members.json\n' "$CI_ROOT" >> "$GITHUB_ENV"
+
       - name: Bind tested H and event H/B to this run
         run: |
           set -euo pipefail
@@ -253,9 +286,47 @@ jobs:
           ${CI_ROOT}/venv/bin/pip install -r requirements.txt -q
           ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" "PyYAML==6.0.3" radon bandit -q
 
+      - name: Pytest (full suite, including MCP)
+        if: github.server_url == 'https://github.com'
+        run: |
+          set -euo pipefail
+          TEST_DB_DIR="$(mktemp -d)"
+          python3 -c 'import os; from pathlib import Path; [Path(os.environ["CI_ROOT"], p).unlink(missing_ok=True) for p in ["pytest-session.json", "pytest-native.exit", "pytest-evidence.json"]]'
+          set +e
+          DAILYCHECK_DB_DIR="${TEST_DB_DIR}" \
+            ${CI_ROOT}/venv/bin/python -m pytest --basetemp=${CI_ROOT}/pytest-dc -q --tb=no -rfE --color=no \
+            -p scripts.ci.pytest_evidence --dc-evidence=${CI_ROOT}/pytest-session.json \
+            > ${CI_ROOT}/pytest-output.txt 2>&1
+          PYTEST_EXIT=$?
+          set -e
+          printf '%s\n' "${PYTEST_EXIT}" > ${CI_ROOT}/pytest-native.exit
+          tail -3 ${CI_ROOT}/pytest-output.txt
+
+      - name: Zero-new-failure gate
+        if: github.server_url == 'https://github.com'
+        run: ${CI_ROOT}/venv/bin/python scripts/check_known_failures.py ${CI_ROOT}/pytest-output.txt --pytest-exit-file ${CI_ROOT}/pytest-native.exit --session-file ${CI_ROOT}/pytest-session.json --write-evidence ${CI_ROOT}/pytest-evidence.json
+
+      - name: Retain reports full-suite evidence at documented reuse path
+        if: github.server_url == 'https://github.com'
+        run: |
+          cp "${CI_ROOT}/pytest-output.txt" "${CI_ROOT}/ci-pytest/pytest-output.txt"
+          cp "${CI_ROOT}/pytest-evidence.json" "${CI_ROOT}/ci-pytest/pytest-evidence.json"
+
+      - name: Merge-group member obligations
+        if: github.event_name == 'merge_group'
+        env:
+          NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
+          UPSTREAM_MEMBER_MANIFEST_B64: ${{ needs.test.outputs.member_manifest_b64 }}
+          PYTEST_REUSE_FILE: ${{ env.CI_ROOT }}/ci-pytest/pytest-output.txt
+          PYTEST_REUSE_EVIDENCE: ${{ env.CI_ROOT }}/ci-pytest/pytest-evidence.json
+        run: |
+          export PATH="${CI_ROOT}/venv/bin:$PATH"
+          python3 scripts/ci/merge_group.py reports --manifest "${CI_ROOT}/members.json"
+
       # 同一既有必需 check：台账必须与全部实现/文档一致，再验证 PR 的影响声明。
       # BASE_SHA 只作 main 参考；检查器内部用 merge-base，避免计入他人 main 变更。
       - name: MCP contracts and PR impact gate
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -267,6 +338,7 @@ jobs:
           ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_mcp_impact.py --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md
 
       - name: Generate reports 02 + 03
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -274,18 +346,20 @@ jobs:
           PYTEST_REUSE_FILE: ${{ env.CI_ROOT }}/ci-pytest/pytest-output.txt
           PYTEST_REUSE_EVIDENCE: ${{ env.CI_ROOT }}/ci-pytest/pytest-evidence.json
         run: |
-          # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
+          # Required report generation must finish successfully before attestation.
           export PATH=${CI_ROOT}/venv/bin:$PATH
-          bash scripts/agent_framework/generate_reports.sh || echo "[warn] generate_reports exit non-zero"
+          bash scripts/agent_framework/generate_reports.sh
 
       - name: Generate report 04 (local deploy preview)
+        if: github.event_name == 'pull_request'
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
           export PATH="${CI_ROOT}/venv/bin:$PATH"
-          bash scripts/agent_framework/preview.sh "${PR_NUM}" || echo "[warn] preview exit non-zero"
+          bash scripts/agent_framework/preview.sh "${PR_NUM}"
 
       - name: Check four reports gate
+        if: github.event_name == 'pull_request'
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -298,6 +372,7 @@ jobs:
       # PR #13 改了 .github/workflows/ci.yml（红线 2）被自行合并，没人拦得住。
       # 这里把「改了什么」变成判据：命中红线且 PR body 无 owner 授权 → 本 job 红。
       - name: Redline check（命中红线须 owner 授权）
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -310,6 +385,7 @@ jobs:
       # 开工规范机验（2026-10-24 新增，Issue #26）：分支前缀 / issue 号一致性 /
       # 无号分支必须声明。此前这些规矩只活在 Dev Agent 的本地记忆里，换 session 就丢。
       - name: PR hygiene check（分支命名 + issue 关联）
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -319,3 +395,9 @@ jobs:
           echo "$PR_BODY" > ${CI_ROOT}/pr/body.md
           ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_pr_hygiene.py \
             --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md
+
+      - name: Attest reports evidence for independent Prod reader
+        if: github.server_url == 'https://github.com'
+        run: |
+          python3 scripts/ci/pytest_summary.py "${CI_ROOT}/pytest-output.txt" --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --output-file "${CI_ROOT}/reports-output" --envelope-output "${CI_ROOT}/envelope.json"
+          python3 scripts/ci/merge_group.py attest --context agent-framework-reports --manifest "${CI_ROOT}/members.json"
