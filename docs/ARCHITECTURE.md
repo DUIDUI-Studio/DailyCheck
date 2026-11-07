@@ -1438,6 +1438,16 @@ v2 的 sha=H、deployment_sha=G、creation_base_sha=B；private canary、tuple�
 Owner 已明确接受 exact verified-G 放行规则；App/installation/保护/隔离 signer/Linux/真实
 Prod 安装与验收仍未执行。本地真实 Git/SQLite/shell/loopback 的证据不冒充生产交付。
 
+本地验收入口为 `tests/test_native_queue_contract.py`：真实 Git H/G/parent graph、两条 literal
+CI 的完整 tiny-fixture pytest/native/session/hash、真实 pipeline/state/OS flock、SQLite、
+loopback HTTP 与 reporter CLI。一次实际 observation 为 600.1887 秒；短窗不 grant，reporter
+SIGKILL 后 HTTP child 持 fence，丢响应/TTL/clear-lock/corruption 保留 barrier，exact G 才写
+一次 anchor/outcome/public v2。新增 init/config guard 与 lookahead-manifest 回归单独跑过。
+这些证据中的 App/policy/review 是明确 synthetic fixture，up/verify/promote/switch 外部设施
+使用 owned stand-ins；没有真实 systemd/nginx/业务库、hosting 或 Linux/Prod 验收。Gitea /
+shadow / publication / fencing 兼容回归保留；全仓测试由 Coordinator 在独立 Review PASS 后
+另行决定，本次没有 full-suite lease，也没有把 6b 基线重标成新源码结果。
+
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。
 check payload 缺 PR 列表也不猜第一个；分页查当前 open PR，同 H 的多个 PR 分别归一化。
