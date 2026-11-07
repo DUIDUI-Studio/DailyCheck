@@ -473,8 +473,9 @@ def test_lost_response_reconciles_exactly_once_without_duplicate_post(sandbox):
     _, outcome_id, outcome = _drop_first_response(sandbox)
     frozen = json.dumps(outcome["facts"], sort_keys=True)
 
+    # A different CLI stage must not replace the durable outcome projection.
     retry = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
-                    "--stage", "", "--log", str(sandbox["tmp"] / "pipeline.log"),
+                    "--stage", "verify", "--log", str(sandbox["tmp"] / "pipeline.log"),
                     "--repo", str(sandbox["tmp"]))
     assert retry.returncode == 0, retry.stdout + retry.stderr
     state = _state(sandbox)
@@ -485,6 +486,7 @@ def test_lost_response_reconciles_exactly_once_without_duplicate_post(sandbox):
     assert state["outcomes"][outcome_id]["public_receipt"] == outcome["public_receipt"]
     assert state["outcomes"][outcome_id]["outcome_at"] == outcome["outcome_at"]
     assert json.dumps(state["outcomes"][outcome_id]["facts"], sort_keys=True) == frozen
+    assert "| 阶段 | `complete` |" in sandbox["api"].comments[0]["body"]
 
 
 @pytest.mark.parametrize("change", ["zero", "multiple", "body"])
@@ -570,6 +572,21 @@ def test_tampered_frozen_payload_hash_blocks_without_repost(sandbox):
                     "--stage", "", "--log", str(sandbox["tmp"] / "pipeline.log"),
                     "--repo", str(sandbox["tmp"]))
     assert retry.returncode == 1
+    assert len(sandbox["api"].posts) == 1
+
+
+def test_missing_receipt_outcome_cannot_publish(sandbox):
+    _success(sandbox)
+    state = _state(sandbox)
+    outcome_id = state["deployed"]["outcome_id"]
+    del state["outcomes"][outcome_id]["public_receipt"]
+    (sandbox["state"] / "state.json").write_text(json.dumps(state))
+
+    retry = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                    "--stage", "", "--log", str(sandbox["tmp"] / "pipeline.log"),
+                    "--repo", str(sandbox["tmp"]))
+    assert retry.returncode == 1
+    assert "publication blocked" in retry.stderr
     assert len(sandbox["api"].posts) == 1
 
 
