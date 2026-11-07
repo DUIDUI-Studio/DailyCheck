@@ -631,6 +631,7 @@ def preserve_history(rows: list[dict], previous: list[dict]) -> list[dict]:
             "repo_id",
             "host_id",
             "worker_instance_id",
+            "agent",
             "started_at",
             "ended_at",
         ):
@@ -649,23 +650,48 @@ def preserve_history(rows: list[dict], previous: list[dict]) -> list[dict]:
                     row[field] = old[field]
             if "usage_events" not in old:
                 row.pop("usage_events", None)
-            row.setdefault("warnings", []).append("usage_source_unavailable:retained_history")
+            row["warnings"] = list(
+                dict.fromkeys(
+                    (row.get("warnings") or [])
+                    + (old.get("warnings") or [])
+                    + ["usage_source_unavailable:retained_history"]
+                )
+            )
         out.append(row)
-    claimed = {
-        e["event_id"]
-        for r in out
-        if r.get("record_kind", "execution") == "execution"
-        for e in r.get("usage_events") or []
-    }
-    for old in prior.values():
-        if old.get("record_kind") == "unattributed_session" and old.get("usage_events"):
-            old = dict(old)
-            old["usage_events"] = [e for e in old["usage_events"] if e["event_id"] not in claimed]
-            if not old["usage_events"]:
+    out.extend(prior.values())
+    claimed, reconciled = set(), {}
+    # Allocate only after all archived/fallback usage is present. Executions own
+    # events before sessions; current executions precede archived ones, then stable identity.
+    for i in sorted(
+        range(len(out)),
+        key=lambda i: (
+            out[i].get("record_kind", "execution") != "execution",
+            i >= len(rows),
+            record_key(out[i]),
+        ),
+    ):
+        row = out[i]
+        events = row.get("usage_events") or []
+        kept = []
+        for event in events:
+            if event["event_id"] not in claimed:
+                claimed.add(event["event_id"])
+                kept.append(event)
+        if len(kept) != len(events):
+            if not kept and row.get("record_kind") == "unattributed_session":
                 continue
-            _finish_usage(old, {})
-        out.append(old)
-    return reconcile_legacy_overlap(out)
+            row = {
+                **row,
+                "usage_events": kept,
+                "tokens": None,
+                "cost": None,
+                "actual_models": [],
+                "model_effective": None,
+                "warnings": [w for w in row.get("warnings", []) if w != "multiple_models"],
+            }
+            _finish_usage(row, {})
+        reconciled[i] = row
+    return reconcile_legacy_overlap([reconciled[i] for i in sorted(reconciled)])
 
 
 def record_key(row: dict) -> str:
