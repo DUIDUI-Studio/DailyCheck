@@ -136,7 +136,8 @@ def _verify_signature(payload: bytes, signature: str) -> bool:
 def _read_inbox_delivery_ids() -> set[str]:
     """读 inbox 已存在的 delivery_id 集合（幂等用）。"""
     ids: set[str] = set()
-    for path in (INBOX_PATH, PROCESSED_PATH):
+    paths = (INBOX_PATH, PROCESSED_PATH) if provider() is Provider.GITHUB else (INBOX_PATH,)
+    for path in paths:
         if not path.exists():
             continue
         with path.open("r", encoding="utf-8") as f:
@@ -386,7 +387,9 @@ def _github_webhook(payload: bytes):
             for pr in matches:
                 did = f"{delivery}:pr:{pr['number']}"
                 if event == "pull_request":
-                    record = _build_pull_request_record(did, action, {**data, "pull_request": pr})
+                    canonical_action = "reopened" if action == "ready_for_review" else action
+                    record = _build_pull_request_record(did, canonical_action, {**data, "pull_request": pr})
+                    record["source_action"] = action
                 else:
                     hint = {**data, "state": source.get("conclusion") or source.get("status") or source.get("state") or "pending"}
                     record = _build_status_record(did, hint, pr)

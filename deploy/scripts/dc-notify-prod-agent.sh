@@ -43,6 +43,20 @@ HERMES_SENDER="${DAILYCHECK_HERMES_SENDER:-/root/DailyCheck/scripts/prod_agent/h
 HERMES_WEBHOOK_URL="${DAILYCHECK_HERMES_WEBHOOK_URL:-http://127.0.0.1:8644}"
 HERMES_SUBSCRIPTIONS="${DAILYCHECK_HERMES_SUBSCRIPTIONS:-/root/.hermes/webhook_subscriptions.json}"
 
+# Guard both ingress and the reducer's output, including old untagged queued rows.
+ensure_production_work() {
+    local guard_result guard_rc
+    guard_result=$(printf '%s' "${1:-}" | "$PYTHON_BIN" "$HERMES_SENDER" --production-guard)
+    guard_rc=$?
+    if [ "$guard_rc" -ne 0 ]; then
+        printf '%s\n' "$guard_result"
+        if [ "$guard_rc" -eq 5 ]; then
+            exit 0
+        fi
+        exit "$guard_rc"
+    fi
+}
+
 common_args=(
     --db "$REDUCER_DB"
     --debounce-ms "${DAILYCHECK_REDUCER_DEBOUNCE_MS:-2000}"
@@ -57,6 +71,7 @@ if [ "${1:-}" = "--drain" ]; then
         echo "dc-notify-prod-agent: --drain takes no additional arguments" >&2
         exit 64
     fi
+    ensure_production_work
     decision=$("$PYTHON_BIN" "$REDUCER" "${common_args[@]}" drain)
     reducer_rc=$?
 elif [ "$#" -eq 0 ]; then
@@ -65,6 +80,7 @@ elif [ "$#" -eq 0 ]; then
         echo "dc-notify-prod-agent: empty payload on stdin" >&2
         exit 2
     fi
+    ensure_production_work "$payload"
     decision=$(printf '%s' "$payload" | "$PYTHON_BIN" "$REDUCER" "${common_args[@]}" ingest)
     reducer_rc=$?
 else
@@ -104,6 +120,8 @@ case "$decision_kind" in
         exit 1
         ;;
 esac
+
+ensure_production_work "$decision"
 
 payload_file=$(mktemp)
 meta_file=$(mktemp)

@@ -1193,6 +1193,13 @@ Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置
 采样时间与 freshness 标签；这是可复核快照，不是部署租约，后续 admission/finalization 必须重验。
 `merge_readiness.py` 保留 Gitea 入口；现有 reducer 对 GitHub 证据强制 `ready=false`，
 `deploy_merge.py` 明确拒绝 GitHub finalization，不引入 merge queue / group delivery。
+Shadow 边界不依赖 readiness helper：reducer ingress 在规范化后拒绝 GitHub/已标记 shadow/目标仓库事件的
+provider work；任何 GitHub 配置的 drain 都静默，已有未标记队列行在 claim 前按 row repo 与 payload
+拒绝，不领取 lease。CLI 的 SQLite 路径在构造和每次连接前检查，DB 以及 `-wal/-shm/-journal`
+均必须在解析 symlink 后位于 shadow root；缺 root 或越界在任何 mkdir/SQLite 写入前失败。
+`dc-notify-prod-agent.sh` 在 ingress、drain 和 reducer trigger 输出后调用 sender 的纯
+`--production-guard`，先于状态/临时文件/secret/HTTP；sender 的实际 `send` 也独立阻断，不能绕过
+adapter 直接投递。未标记或延迟的目标仓库 `deploy_result` 同样受限，Gitea 正常路由/租约/输出不变。
 
 **调用方**：poller 的 GitHub 分支只输出 shadow readiness，不运行生产 catchup；dashboard 使用
 GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 label 传名字；报告 comment
@@ -1205,8 +1212,11 @@ GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 lab
 check payload 缺 PR 列表也不猜第一个；分页查当前 open PR，同 H 的多个 PR 分别归一化。
 记录保留 `source_delivery_id`，传输键为 `delivery:pr:N`，同进程多线程串行检查/append，部分
 写入失败的重投只补缺项；已有 processed ledger 也参与查重，不增加新队列或数据库。
-只有显式 `DAILYCHECK_GITHUB_SHADOW_DIR` 下的 inbox/processed 路径可用；报告 event log/inbox
-同样要求独立 shadow 路径。模板 `deploy/github-shadow.env.example` 和
+只有显式 `DAILYCHECK_GITHUB_SHADOW_DIR` 下的 inbox/processed 路径可用；`ready_for_review`
+在边界映射为既有 canonical `reopened`，保留 `source_action`，必须能进入 reducer 规范化。
+Gitea 继续只查既有 inbox 的 delivery IDs，不改变其 processed 文件语义。报告 event log/inbox
+同样要求独立 shadow 路径，实际 append 边界检查路径，并写入 `hosting_provider=github` /
+`intake_mode=shadow`（包括 report event log 和 inbox）。模板 `deploy/github-shadow.env.example` 和
 `deploy/systemd/dc-github-shadow.service` 仅供审查，独立 loopback `8444`，无 Install 段、
 无生产 watcher 依赖。本变更不安装服务、不配 live token、不投递生产 lane。
 `deploy/scripts/dailycheck_pr_poll.py` 的 Gitea 入口保留原 `GITEA_URL`（含 URL root）、
@@ -1231,6 +1241,8 @@ event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 
 测试：`tests/test_github_transport.py` 经 fake curl 子进程覆盖 credential roles、HTTP/auth、分页、
 malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/test_ci_portability.py`
 对本机认证 Git HTTP endpoint 真执行 source checkout，并验证 job 隔离；
+`tests/test_github_shadow_boundary.py` 真跑 receiver→CLI、adapter→sender、本机 HTTP 捕获器与
+预存未标记 SQLite row，断言零 shadow POST / 零越界写，且 Gitea 正控仍恰好投递一次；
 `tests/test_pytest_gate_completeness.py` 用真实 pytest 子进程验证候选/运行绑定的摘要转交。
 
 ## 4. 数据架构

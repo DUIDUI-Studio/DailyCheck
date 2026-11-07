@@ -17,6 +17,7 @@ import hmac
 import json
 import math
 import os
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -24,6 +25,10 @@ import urllib.request
 from datetime import timezone
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.hosting import HostingError, require_production_work  # noqa: E402
 
 ROUTES = frozenset({"wdg-ci", "dailycheck-deploy"})
 EVENTS = frozenset({"check_suite", "deploy_result"})
@@ -102,6 +107,14 @@ def send(
     body: bytes,
     timeout_s: float = 10.0,
 ) -> tuple[int, dict[str, Any]]:
+    try:
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeError):
+            payload = None
+        require_production_work(payload)
+    except HostingError:
+        return 5, {"accepted": False, "reason": "github_shadow_only"}
     if route not in ROUTES or event not in EVENTS:
         return 5, {"accepted": False, "reason": "invalid_route_or_event"}
     if not delivery_id or len(delivery_id) > 256:
@@ -171,6 +184,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--production-guard"]:
+        try:
+            raw = sys.stdin.buffer.read(MAX_BODY_BYTES + 1)
+            if len(raw) > MAX_BODY_BYTES:
+                raise HostingError("invalid_guard_payload")
+            try:
+                payload = json.loads(raw) if raw else None
+            except (ValueError, UnicodeError):
+                payload = None
+            require_production_work(payload)
+        except HostingError as exc:
+            shadow = str(exc) == "github_shadow_only"
+            _emit({"decision": "suppress" if shadow else "retry",
+                   "reason": "github_shadow_only" if shadow else "invalid_hosting_configuration"})
+            return 5 if shadow else 1
+        return 0
     args = build_parser().parse_args(argv)
     try:
         body = Path(args.body_file).read_bytes()

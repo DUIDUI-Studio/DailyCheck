@@ -372,6 +372,13 @@ def append_event(event: dict[str, Any]) -> bool:
     路径上是自找的阻塞源。
     """
     p = event_log_path()
+    if provider() is Provider.GITHUB:
+        try:
+            require_shadow_path(p)
+        except HostingError:
+            print("[deploy-report] GitHub event log requires shadow isolation", file=sys.stderr)
+            return False
+        event = {**event, "hosting_provider": "github", "intake_mode": "shadow", "repo_full_name": _repo()}
     line = json.dumps(event, ensure_ascii=False) + "\n"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -437,6 +444,7 @@ def push_inbox_event(
     }
     p = inbox_path()
     if provider() is Provider.GITHUB:
+        payload.update(hosting_provider="github", intake_mode="shadow")
         try:
             require_shadow_path(p)
         except HostingError:

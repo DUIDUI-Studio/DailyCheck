@@ -66,6 +66,30 @@ def _token(env: Mapping[str, str], names: tuple[str, ...], file_key: str) -> str
     return value
 
 
+def is_shadow_event(payload: object) -> bool:
+    """Identify delayed/untagged target events as well as explicit shadow provenance."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("hosting_provider") == "github" or payload.get("intake_mode") == "shadow":
+        return True
+    repository = payload.get("repository")
+    identities = [payload.get("repo_full_name"), payload.get("repo")]
+    if isinstance(repository, dict):
+        identities.append(repository.get("full_name"))
+    if any(
+        isinstance(repo, str) and repo.casefold() == "duidui-studio/dailycheck"
+        for repo in identities
+    ):
+        return True
+    nested = payload.get("payload")
+    return isinstance(nested, dict) and nested is not payload and is_shadow_event(nested)
+
+
+def require_production_work(payload: object = None) -> None:
+    if provider() is Provider.GITHUB or is_shadow_event(payload):
+        raise HostingError("github_shadow_only")
+
+
 def require_shadow_path(path: Path) -> Path:
     raw = os.environ.get("DAILYCHECK_GITHUB_SHADOW_DIR", "")
     root = Path(raw)

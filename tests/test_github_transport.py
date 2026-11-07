@@ -663,10 +663,11 @@ def test_invalid_json_evidence_is_rejected(api, raw):
         api.client().get(ROOT)
 
 
-def test_reducer_cannot_admit_even_ready_github_shadow_evidence(api, tmp_path):
+def test_reducer_cannot_admit_even_ready_github_shadow_evidence(api, tmp_path, monkeypatch):
     from scripts.prod_agent.event_reducer import EventReducer, ReducerConfig
 
     api.write(evidence())
+    monkeypatch.setenv("DAILYCHECK_GITHUB_SHADOW_DIR", str(tmp_path))
     reducer = EventReducer(ReducerConfig(db_path=tmp_path / "reducer.sqlite3"))
     result = reducer._readiness_checker(REPO, 160, SHA)
     assert result["ready"] is False and result["reason"] == "github_shadow_only"

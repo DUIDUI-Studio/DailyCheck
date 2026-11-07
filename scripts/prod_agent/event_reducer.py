@@ -22,6 +22,14 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.hosting import (  # noqa: E402
+    HostingError,
+    Provider,
+    is_shadow_event,
+    provider,
+    require_production_work,
+    require_shadow_path,
+)
 from scripts.prod_agent.merge_readiness import (  # noqa: E402
     DEFAULT_REQUIRED_CONTEXTS,
     DEFAULT_REQUIRED_CONTEXTS_ENV,
@@ -274,6 +282,7 @@ class EventReducer:
         readiness_checker: Any | None = None,
     ):
         self.config = config
+        self._validate_state_path()
         if readiness_checker is None:
             base = ReadinessConfig.from_environment()
             readiness_config = ReadinessConfig(
@@ -297,7 +306,13 @@ class EventReducer:
         else:
             self._readiness_checker = readiness_checker
 
+    def _validate_state_path(self) -> None:
+        if provider() is Provider.GITHUB:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                require_shadow_path(Path(str(self.config.db_path) + suffix))
+
     def _connect(self) -> sqlite3.Connection:
+        self._validate_state_path()
         self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(self.config.db_path), timeout=10, isolation_level=None)
         try:
@@ -562,6 +577,7 @@ class EventReducer:
         ).fetchone()
         if active is not None:
             return None
+        require_production_work({"repo": row["repo"], "payload": json.loads(row["payload_json"])})
         attempts = int(row["attempts"]) + 1
         lease = hashlib.sha256(f"{trigger_id}|{attempts}|{now_ms}|lease".encode()).hexdigest()[:40]
         conn.execute(
@@ -847,6 +863,8 @@ class EventReducer:
 
     def ingest(self, payload: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         event = self.normalize(payload)
+        if provider() is Provider.GITHUB or is_shadow_event(event):
+            return {"decision": "silent", "reason": "github_shadow_only", "delivery_id": event["delivery_id"]}
         if event["event"] == "pull_request":
             return self._ingest_pull_request(event, now_ms=now_ms)
         if event["event"] == "check_suite":
@@ -1597,6 +1615,8 @@ class EventReducer:
         )
 
     def drain(self, *, now_ms: int) -> dict[str, Any]:
+        if provider() is Provider.GITHUB:
+            return {"decision": "silent", "reason": "github_shadow_only"}
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1893,6 +1913,8 @@ class EventReducer:
 
 
 def _emit(decision: dict[str, Any]) -> None:
+    if decision.get("decision") in {"trigger", "defer"} and (provider() is Provider.GITHUB or is_shadow_event(decision)):
+        decision = {"decision": "suppress", "reason": "github_shadow_only"}
     print(
         json.dumps(
             decision,
@@ -2019,6 +2041,12 @@ def main(argv: list[str] | None = None) -> int:
             decision = reducer.inspect(pr=args.pr)
         else:
             decision = reducer.status(now_ms=now_ms)
+    except HostingError as exc:
+        if str(exc) == "github_shadow_only":
+            _emit({"decision": "suppress", "reason": "github_shadow_only"})
+            return 0
+        _emit({"decision": "retry", "reason": "invalid_shadow_configuration"})
+        return 1
     except ValueError:
         print(
             json.dumps(
