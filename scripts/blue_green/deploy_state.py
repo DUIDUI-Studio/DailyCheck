@@ -11,7 +11,9 @@
     - heartbeat --loop 为编排脚本提供常驻续约：一个进程持续打心跳，
       把「阶段耗时超过 TTL」从结构上消掉（up/verify/promote/switch 内部
       只 check 不 beat，靠调用方自觉打点是不可靠的）。
-    - 持有者崩溃 -> 心跳过期 -> 锁自动失效，后来者可抢占（无死锁）。
+    - 普通 pipeline 另持 .attempt.lock 的 OS flock，覆盖完整进程生命周期；
+      过期心跳不是退出证明，活着/暂停的 pipeline 不可被另一普通 attempt 抢占。
+      独立 CLI 的旧租约仍兼容 TTL 抢占，但 acquire 也须先通过该 OS 锁。
   组件二：事实锚点「已部署 sha」+ 追平检测（catchup）
     - release success 记录 deployed.sha；catchup 对比 origin/main：
         rc 0 = 已追平 / rc 1 = 有欠账（可部署）/ rc 2 = 同 sha 上次失败
@@ -38,7 +40,7 @@
     DAILYCHECK_PROD_REPO              catchup 默认取 main 的仓库（默认 /root/DailyCheck）
 
 输入/输出：
-    - 除 status 外均为单行 JSON（stdout）；错误信息走 stderr。
+    - 状态命令（除 status）输出单行 JSON；run exec pipeline，所有权断言只返回 rc。
     - **token 走文件，不走 stdout**：acquire 除 JSON 外还写 `<state_dir>/lock.token`
       （0600），heartbeat / release 缺省从该文件取 token。原因：会话层（Hermes /
       飞书）会把 stdout 里形似密钥的值脱敏成 `***`，token 一旦只走 stdout，
@@ -58,6 +60,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_STATE_DIR = "/var/lib/dailycheck-deploy"
@@ -67,6 +70,9 @@ DEFAULT_PROD_REPO = "/root/DailyCheck"
 STATE_FILENAME = "state.json"
 FLOCK_FILENAME = ".state.lock"
 TOKEN_FILENAME = "lock.token"
+ATTEMPT_LOCK_FILENAME = ".attempt.lock"
+ATTEMPT_ENV = "DAILYCHECK_DEPLOY_ATTEMPT"
+ATTEMPT_FD_ENV = "DAILYCHECK_DEPLOY_ATTEMPT_FD"
 
 EXIT_OK = 0
 EXIT_BEHIND = 1
@@ -77,6 +83,103 @@ EXIT_TOKEN_MISMATCH = 11
 EXIT_PR_MISMATCH = 12
 EXIT_USAGE = 64
 EXIT_NO_MAIN = 65
+
+
+@dataclass(frozen=True)
+class AttemptIdentity:
+    token: str
+    pr: int | None
+    sha: str
+    session: str
+
+    @classmethod
+    def from_env(cls):
+        raw = os.environ.get(ATTEMPT_ENV)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        identity = cls(*(data[key] for key in ("token", "pr", "sha", "session")))
+        if not identity.token or not identity.sha:
+            raise ValueError("incomplete attempt identity")
+        return identity
+
+    def owns(self, lock) -> bool:
+        return isinstance(lock, dict) and all(
+            lock.get(key) == getattr(self, key) for key in ("token", "pr", "sha", "session")
+        )
+
+
+def _process_lock_fd():
+    """The inherited descriptor, not an environment flag, proves process exclusion."""
+    try:
+        fd = int(os.environ.get(ATTEMPT_FD_ENV, ""))
+        if fd < 3:
+            return None
+        held = os.fstat(fd)
+        expected = (_state_dir() / ATTEMPT_LOCK_FILENAME).stat()
+        if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
+            return None
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (ValueError, OSError):
+        return None
+
+
+@contextmanager
+def _attempt_lock(directory):
+    inherited = _process_lock_fd()
+    if inherited is not None:
+        yield inherited
+        return
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(directory / ATTEMPT_LOCK_FILENAME, "a+") as fh:
+        os.chmod(fh.name, 0o600)
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Do not LOCK_UN explicitly: exec descendants may still own this descriptor.
+        yield fh.fileno()
+
+
+def cmd_run(args) -> int:
+    """Exec the normal pipeline with one OS lock held through EXIT finalization."""
+    if not args.exec or os.environ.get(ATTEMPT_ENV) is not None:
+        return _fail("run requires a command and a fresh attempt", EXIT_USAGE)
+    command = args.exec[1:] if args.exec[0] == "--" else args.exec
+    if not command:
+        return EXIT_USAGE
+    try:
+        with _attempt_lock(_state_dir()) as fd:
+            os.set_inheritable(fd, True)
+            env = dict(os.environ, **{ATTEMPT_FD_ENV: str(fd)})
+            os.execvpe(command[0], command, env)
+    except BlockingIOError:
+        return _fail("normal pipeline process still owns deployment", EXIT_LOCK_BUSY)
+
+
+def cmd_process_owned(args) -> int:
+    return EXIT_OK if _process_lock_fd() is not None else EXIT_TOKEN_MISMATCH
+
+
+def _attempt_owns(lock) -> bool:
+    try:
+        identity = AttemptIdentity.from_env()
+    except (ValueError, KeyError, TypeError):
+        return False
+    return identity is None or (_process_lock_fd() is not None and identity.owns(lock))
+
+
+def cmd_assert_owner(args) -> int:
+    try:
+        identity = AttemptIdentity.from_env()
+    except (ValueError, KeyError, TypeError):
+        return _fail("invalid attempt identity", EXIT_TOKEN_MISMATCH)
+    lock = _load_state(_state_dir()).get("lock")
+    if identity is None or not _attempt_owns(lock):
+        return _fail("attempt ownership lost", EXIT_TOKEN_MISMATCH)
+    if args.pr is not None and args.pr != identity.pr:
+        return EXIT_PR_MISMATCH
+    if args.sha and args.sha != identity.sha:
+        return EXIT_TOKEN_MISMATCH
+    return EXIT_OK
 
 
 def _state_dir() -> Path:
@@ -271,6 +374,17 @@ def cmd_check(args) -> int:
 
 
 def cmd_acquire(args) -> int:
+    if os.environ.get(ATTEMPT_ENV) is not None:
+        return _fail("cannot acquire another lease inside an attempt", EXIT_TOKEN_MISMATCH)
+    try:
+        with _attempt_lock(_state_dir()):
+            return _acquire(args)
+    except BlockingIOError:
+        _emit({"ok": False, "reason": "pipeline-process-busy"})
+        return EXIT_LOCK_BUSY
+
+
+def _acquire(args) -> int:
     """抢锁。无活跃锁（或过期可抢占）时成功；被占用 -> rc 10。"""
     directory = _state_dir()
     with _write_lock(directory):
@@ -305,20 +419,22 @@ def cmd_acquire(args) -> int:
             "token_file": str(token_file),
             "pr": args.pr,
             "sha": args.sha or "",
+            "session": args.session or "",
             "ttl": _ttl(),
             "state_dir": str(directory),
         })
         return EXIT_OK
 
 
-def _beat(args, apply_phase: bool) -> tuple[int, dict]:
+def _beat(args, apply_phase: bool, token=None) -> tuple[int, dict]:
     """一次续约。返回 (rc, payload)，不做 I/O 输出，供单发与循环共用。"""
     directory = _state_dir()
-    token = _resolve_token(args, directory)
+    token = _resolve_token(args, directory) if token is None else token
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
         lock = state.get("lock")
-        if not isinstance(lock, dict) or not token or lock.get("token") != token:
+        if (not isinstance(lock, dict) or not token or lock.get("token") != token
+                or not _attempt_owns(lock)):
             return EXIT_TOKEN_MISMATCH, {"ok": False, "reason": "token-mismatch-or-no-lock"}
         now = _now()
         expired = not _lock_active(lock, now, _ttl())
@@ -349,6 +465,8 @@ def _heartbeat_loop(args) -> int:
     if interval < 1:
         return _fail("--interval 必须 >= 1", EXIT_USAGE)
 
+    # Resolve the shared handoff file exactly once for this process lifetime.
+    token = _resolve_token(args, _state_dir())
     stop = {"flag": False}
 
     def _on_signal(_signum, _frame):
@@ -362,7 +480,7 @@ def _heartbeat_loop(args) -> int:
 
     beats = 0
     while not stop["flag"]:
-        rc, payload = _beat(args, apply_phase=(beats == 0))
+        rc, payload = _beat(args, apply_phase=(beats == 0), token=token)
         payload["beat"] = beats + 1
         _emit(payload)
         if rc != EXIT_OK:
@@ -397,11 +515,14 @@ def cmd_release(args) -> int:
     with _write_lock(directory):
         state = _load_state(directory, heal=True)
         lock = state.get("lock")
-        if not isinstance(lock, dict) or not token or lock.get("token") != token:
+        if (not isinstance(lock, dict) or not token or lock.get("token") != token
+                or not _attempt_owns(lock)):
             _emit({"ok": False, "reason": "token-mismatch-or-no-lock"})
             return EXIT_TOKEN_MISMATCH
 
         now = _now()
+        if os.environ.get(ATTEMPT_ENV) is not None and args.sha != lock.get("sha"):
+            return _fail("release sha differs from attempt", EXIT_TOKEN_MISMATCH)
         sha = (args.sha or lock.get("sha") or "").strip()
         pr = lock.get("pr")
 
@@ -567,6 +688,18 @@ def cmd_status(args) -> int:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="deploy_state.py", description="蓝绿部署单飞状态原语")
     sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("run", help="hold the normal pipeline process lock through exec")
+    p.add_argument("exec", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("process-owned", help="validate the inherited pipeline lock descriptor")
+    p.set_defaults(func=cmd_process_owned)
+
+    p = sub.add_parser("assert-owner", help="require the immutable pipeline attempt identity")
+    p.add_argument("--pr", type=int, default=None)
+    p.add_argument("--sha", default="")
+    p.set_defaults(func=cmd_assert_owner)
 
     p = sub.add_parser("check", help="锁活跃性检查（rc 0=无锁 / 10=活跃 / 12=PR 不匹配）")
     p.add_argument("--pr", type=int, default=None, help="交叉校验：锁须属于该 PR（或锁未绑定 PR）")

@@ -18,6 +18,7 @@
 #   10 锁被占用（另一部署在跑）           11 acquire 失败
 #   20 up 失败   21 verify 失败   22 promote 失败   23 switch 失败   24 观察窗异常（已回滚）
 #   25 candidate 前置不满足               26 FF 合并失败（已回滚蓝）
+#   27 release / deployed 锚点未确认       28 attempt 所有权丢失
 #
 # 为什么存在（2026-10-17 一天内四次同型故障）:
 #   在此之前编排由「Prod Agent 会话读 SKILL.md 现场拼命令」承担，漏洞是结构性的：
@@ -25,9 +26,10 @@
 #     ② verify 10 分钟 / promote 7.5 分钟内无人打心跳 → 锁过期被合法抢占（PR #96）
 #     ③ 会话空回复终止 → 绿已转正但流量还压在蓝，挂到人工接管（PR #97）
 #     ④ 漏 release → deployed 锚点不前进，catchup 永远 behind
-#   本脚本把顺序固化进代码、自管后台心跳、trap 保证收锁，四类故障在结构上消失。
+#   本脚本把顺序固化进代码；OS 锁覆盖完整 attempt，固定身份续约/收锁，失败不报成功。
 #   Hermes 侧只需一行调用，不再有「步骤记忆」这个变量。
 set -uo pipefail
+ORIGINAL_ARGS=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -70,7 +72,7 @@ HB_INTERVAL=120
 SIM_USER="${SIM_USER_USER:-}"
 SIM_PASS="${SIM_USER_PASSWORD:-}"
 
-RELEASED=0
+RELEASE_ATTEMPTED=0
 DS_READY=0
 HB_PID=""
 FAIL_STAGE=""
@@ -112,6 +114,7 @@ usage() {
 退出码: 0 成功 / 64 参数错 / 10 锁被占 / 11 acquire 失败
         20 up / 21 verify / 22 promote / 23 switch / 24 观察窗异常（已回滚）
         25 candidate 前置不满足 / 26 FF 合并失败（已回滚蓝）
+        27 release/锚点未确认 / 28 attempt 所有权丢失
 EOF
 }
 
@@ -152,17 +155,30 @@ fi
 [[ -n "${SESSION}" ]] || SESSION="pipeline-${PR}"
 [[ "${MERGE_PR}" -eq 1 && "${CANDIDATE}" -eq 0 ]] && die 64 "--merge-pr 需要同时给 --candidate"
 
+# Re-exec once under Python's POSIX flock (also available on macOS without flock CLI).
+# A descriptor is inherited across stages; heartbeat age never proves process exit.
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+  [[ -z "${DAILYCHECK_DEPLOY_ATTEMPT:-}" ]] || die 11 "不能嵌套普通部署 attempt"
+  if [[ -z "${DAILYCHECK_DEPLOY_ATTEMPT_FD:-}" ]]; then
+    exec "${PY}" "${DS}" run -- bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+  fi
+  "${PY}" "${DS}" process-owned || die 11 "部署进程锁描述符无效"
+fi
+
 log "PR #${PR} sha=${SHA:0:12} session=${SESSION} dry-run=${DRY_RUN} observe=${OBSERVE_MIN}min"
 log "log=${LOG}"
 
 # ---------------------------------------------------------------- 收锁
 _release() {
   local result=$1 note="${2:-}"
-  if "${PY}" "${DS}" release --result "${result}" --sha "${SHA}" --note "${note}" >>"${LOG}" 2>&1; then
-    RELEASED=1
+  RELEASE_ATTEMPTED=1
+  if "${PY}" "${DS}" release --token "${ATTEMPT_TOKEN}" --result "${result}" --sha "${SHA}" --note "${note}" >>"${LOG}" 2>&1; then
     log "release(${result}) 完成"
   else
-    log "WARN: release(${result}) 失败 —— 锁可能需人工 deploy_state.py status 确认"
+    FAIL_STAGE="${FAIL_STAGE:-release}"
+    log "ERROR: release(${result}) 失败 —— deployed 锚点未确认，须恢复核验（见 ${LOG}）"
+    _audit_event "release-failed" "result=${result}; deployed anchor unknown; merge facts remain in log"
+    return 27
   fi
 }
 
@@ -211,26 +227,32 @@ cleanup() {
     kill -TERM "${HB_PID}" 2>/dev/null || true
     wait "${HB_PID}" 2>/dev/null || true
   fi
-  if [[ "${TREE_MOVED}" -eq 1 && ${rc} -ne 0 ]]; then
+  if [[ "${TREE_MOVED}" -eq 1 && ${rc} -ne 0 ]] && _owns_attempt; then
     _restore_main || true
   fi
-  if [[ "${RELEASED}" -eq 0 && "${DS_READY}" -eq 1 ]]; then
+  if [[ "${RELEASE_ATTEMPTED}" -eq 0 && "${DS_READY}" -eq 1 ]]; then
     if [[ ${rc} -eq 0 ]]; then
-      _release success
+      _release success || rc=27
     else
-      _release failed "${FAIL_STAGE:-aborted} rc=${rc}"
+      _release failed "${FAIL_STAGE:-aborted} rc=${rc}" \
+        || log "收锁结果未确认；保留原失败码 rc=${rc}"
     fi
   fi
   # 放最后：release 会再写几行日志，先回写就漏掉它们。且 _writeback_pr 内部
   # 全程 best-effort —— 回写失败绝不能把一次成功部署变成红。
   _writeback_pr "${rc}"
+  trap - EXIT
+  exit "${rc}"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------- 幂等
 if [[ "${DRY_RUN}" -eq 0 ]]; then
-  _dep="$("${PY}" "${DS}" status 2>/dev/null | awk '/^deployed[[:space:]]*:/{print $3}')"
-  if [[ -n "${_dep}" && "${_dep}" == "${SHA:0:12}" ]]; then
+  _dep="$("${PY}" "${DS}" status --json 2>/dev/null | "${PY}" -c \
+    'import json,sys; print((json.load(sys.stdin).get("deployed") or {}).get("sha", ""))')"
+  if [[ "${SHA}" =~ ^[0-9a-f]{40}$ && "${_dep}" == "${SHA}" ]]; then
     log "已部署 ${SHA:0:12}（deployed 锚点一致），跳过"
     exit 0
   fi
@@ -242,23 +264,37 @@ if [[ "${DRY_RUN}" -eq 1 ]]; then
 else
   _acq_rc=0
   _acq_out="$("${PY}" "${DS}" acquire --pr "${PR}" --sha "${SHA}" \
-              --session "${SESSION}" --phase "pipeline-start" 2>&1)" || _acq_rc=$?
+              --session "${SESSION}" --phase "pipeline-start" 2>>"${LOG}")" || _acq_rc=$?
   case "${_acq_rc}" in
-    0)  DS_READY=1; log "已持锁" ;;
+    0)
+      ATTEMPT_TOKEN="$(printf '%s' "${_acq_out}" | "${PY}" -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+      DAILYCHECK_DEPLOY_ATTEMPT="${_acq_out}"
+      readonly ATTEMPT_TOKEN DAILYCHECK_DEPLOY_ATTEMPT
+      export DAILYCHECK_DEPLOY_ATTEMPT
+      DS_READY=1
+      log "已持锁" ;;
     10) die 10 "部署锁被占用：${_acq_out}" ;;
     *)  die 11 "acquire 失败 rc=${_acq_rc}：${_acq_out}" ;;
   esac
-  # 后台常驻续约：这是「阶段耗时 > TTL」的结构解，不依赖任何人在中途记得打点
-  "${PY}" "${DS}" heartbeat --loop --interval "${HB_INTERVAL}" --phase "pipeline-running" \
+  # 心跳只描述进度；完整 attempt 的互斥由继承的 OS 锁提供。
+  "${PY}" "${DS}" heartbeat --token "${ATTEMPT_TOKEN}" --loop --interval "${HB_INTERVAL}" --phase "pipeline-running" \
     >>"${LOG}" 2>&1 &
   HB_PID=$!
   log "后台心跳已启动 pid=${HB_PID} interval=${HB_INTERVAL}s"
 fi
 
+_owns_attempt() {
+  [[ "${DS_READY}" -eq 1 ]] || return 0
+  "${PY}" "${DS}" assert-owner >>"${LOG}" 2>&1
+}
+
 # 主流程阶段打点（后台循环只在第一拍写 phase，这里不会被盖回去）
 _hb() {
   [[ "${DS_READY}" -eq 1 ]] || return 0
-  "${PY}" "${DS}" heartbeat --phase "$1" >>"${LOG}" 2>&1 || true
+  if ! "${PY}" "${DS}" heartbeat --token "${ATTEMPT_TOKEN}" --phase "$1" >>"${LOG}" 2>&1; then
+    FAIL_STAGE="ownership"
+    die 28 "attempt 所有权丢失；停止后续部署动作（见 ${LOG}）"
+  fi
 }
 
 # ---------------------------------------------------------------- 阶段执行
@@ -501,7 +537,7 @@ if [[ "${MERGE_PR}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
   run_stage 26 merge _merge_candidate
 fi
 
-_release success
+_release success || exit 27
 
 # ---------------------------------------------------------------- 仪表盘钩子
 # 部署成功后立即刷新运维仪表盘（2026-10-17 owner 定：不装常驻 webhook 触发器，

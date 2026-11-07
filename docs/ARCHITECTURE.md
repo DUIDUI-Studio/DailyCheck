@@ -481,13 +481,19 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 ### 3.8 部署单飞（single-flight deploy，2026-10-16 起）
 
-Issue #161 本地回归入口：`tests/test_deploy_attempt_fencing.py`，以真实 pipeline/CLI 子进程和 pipe 栅栏复现暂停活进程的过期租约、同 PR token 替换、release 失败及完整 SHA 前缀碰撞；测试不连接生产设施，pipe 子进程在完成后显式回收。
+**Issue #161 attempt 所有权修复（本地实现，待独立审查）**：`deploy_pipeline.sh` 在幂等读取/抢租约之前，通过 `deploy_state.py run` exec 自身并继承 `${STATE_DIR}/.attempt.lock` 的 POSIX flock 描述符。锁覆盖 setup、阶段间隙、八项验证、观察窗、merge/finalization、release 和结果回写，直到进程及持有描述符的子进程退出；短事务 `.state.lock` 仍只保护状态读改写。**心跳过期不是退出证明**：暂停/存活的普通 pipeline 不可被 TTL 抢占，独立 `acquire` 也必须经过同一进程锁；不新增队列服务。锁文件不可在活跃 attempt 期间删除/替换；`clear-lock` 只清租约，不解除 OS 进程锁。
+
+`acquire` 返回的 token/PR/完整 SHA/session 固定为一个 `AttemptIdentity`，由 pipeline 只读保存并传给子进程；heartbeat/release 明确使用原 token，不再重读可变的 `lock.token`。后台 heartbeat CLI 即使使用旧的默认文件交接，也只在启动时读取一次。up/verify/promote/switch-green 的 pipeline 子调用在原守卫前验证描述符和完整身份，同 PR 的替代 attempt 也不能放行；原有人工逃生变量不能绕过该校验。阶段边界续约失败立即停止后续普通部署动作（rc 28），失去身份后不恢复共享工作树。release/锚点写入失败返回 rc 27，保留日志和 `release-failed` 审计、失败/unknown 恢复证据，不写成功结果、不重试为 success；已经完成的 merge 事实仍保存在原日志和仓库事实中。该失败可能发生在流量切绿或 merge 之后，必须核验实际状态，不可把失败结果解释为“未 merge”。
+
+`status --json` 中完整 40 位 SHA 的精确相等才允许幂等跳过；人读 status 的 12 位缩写不参与决策。旧状态文件/人工 token-file CLI 保持可读；独立旧租约只在进程锁空闲时按既有 TTL 恢复。应急 rollback/down/switch-blue **不获取 attempt 锁**，原有每阶段蓝绿 flock 和 DRY_RUN/DB 隔离不变，默认真实观察窗仍为 10 分钟，八项验证保持原样。
+
+本地回归入口 `tests/test_deploy_attempt_fencing.py` 使用真实 pipeline/CLI 子进程、SIGSTOP/CONT/KILL 与 pipe 栅栏，验证过期活进程互斥、setup/观察/收锁/回写的覆盖、同 PR 替换身份、真实临时文件锚点 I/O 错误、成功本地合并后的失败结果、全 SHA 前缀碰撞、退出后恢复及应急豁免。全部状态/SQLite/nginx/命令夹具都在临时目录；不连接生产服务。
 
 **问题**：Prod Agent 的一个「merge → 部署」会话是 40-60 分钟长流程（up → verify → 绿转正 → switch → 观察窗），而 webhook 事件天生并发（两个 PR 同时全绿 / 同一 PR 多个 check_suite / 兜底轮询补刀）——两个部署会话在同一套蓝绿设施上重叠 = up/switch/rollback 交错互踩。**单飞 = 同一时刻全系统至多一个部署会话在动蓝绿设施**，且「谁欠谁一次部署」由状态事实判定，不靠会话记忆。
 
 **① 状态原语** `scripts/blue_green/deploy_state.py`（stdlib only；状态目录 `DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy/`）：
 
-- **会话级部署锁**（心跳式，TTL 1800s，`DAILYCHECK_DEPLOY_HEARTBEAT_TTL` 可调）：`acquire --pr N --sha <sha>`（返回 token，并写 `<state_dir>/lock.token`）→ 长步骤间 `heartbeat [--phase <阶段>]` → 收官 `release --result success|failed`（token 缺省从 `lock.token` 读，也可 `--token` / `--token-file` 显式指定）。持有者崩溃 → 心跳过期 → 锁自动失效可被后来者抢占（`last_evicted` 留证据），**无死锁**；`clear-lock --yes` = break-glass 人工清锁。
+- **会话级部署锁**（心跳式，TTL 1800s，`DAILYCHECK_DEPLOY_HEARTBEAT_TTL` 可调）：`acquire --pr N --sha <sha>`（返回 token，并写 `<state_dir>/lock.token`）→ 长步骤间 `heartbeat [--phase <阶段>]` → 收官 `release --result success|failed`（token 缺省从 `lock.token` 读，也可 `--token` / `--token-file` 显式指定）。独立 CLI 的旧租约在进程锁空闲时可按 TTL 抢占（`last_evicted` 留证据），普通 pipeline 的完整生命周期由上述 OS 锁保护；`clear-lock --yes` = break-glass 人工清锁。
   - `heartbeat --loop --interval <秒>` = 常驻续约循环（供编排脚本后台跑）：一个进程存活期内持续打心跳，`SIGTERM`/`SIGINT` 优雅退出 rc 0；token 失效（锁被抢占或已 release）→ 立即退出 rc 11，不空转。`--phase` 只在**第一拍**写入，主流程后续可用单发 heartbeat 推进阶段而不被盖回去。
   - ⚠️ **TTL 必须明显长于单步最长耗时**：verify 实测 12-14 分钟，原 900s 会在 verify 中途过期 —— 2026-10-17 PR #96 实测 `last_evicted`（心跳 20:17:10，20:37:19 被抢占），等于「合法抢占」把单飞保证打穿。取 1800s（≈2 倍余量）。
 - **token 交接走文件（0600），不走 stdout**：会话层（Hermes / 飞书）会把 stdout 里形似密钥的值脱敏成 `***`，`acquire` 返回的 token 在会话侧拿不到 —— 若只走 stdout，调用方只能去 `state.json` 手抠，而 `cat … | python3` 会撞上「管道进解释器」审批门禁（2026-10-17 PR #96 实测卡 5 分钟、PR #95 同遇脱敏）。故 acquire 同时落 `lock.token`、release / clear-lock 删除；`state.json` 与状态目录一并收紧到 `0600` / `0700`。
@@ -525,9 +531,9 @@ acquire → 起后台 heartbeat --loop → up → verify → promote → switch 
 四者共同的根因是**步骤记忆**这个变量。把顺序写进代码、心跳交给后台进程、收锁交给 `trap`，这四类故障在结构上消失。
 
 - **顺序不可配**：`promote` 必须早于 `switch`（switch 的 DRY_RUN 守卫会拒未转正的绿），脚本内写死。
-- **收锁不可漏**：`trap cleanup EXIT` 保证成功 → `release success`、失败/中断 → `release failed`（记 `last_attempt`，`deployed` 不假前进）。失败路径不重试，交回 `catchup` 或人工。
-- **心跳不可断**：`heartbeat --loop --interval 120` 后台常驻，阶段耗时不再受 TTL 约束（TTL 只需兜「进程被 KILL」）。
-- **幂等**：`deployed.sha` 已等于目标 sha → 直接 rc 0 退出，不动任何子脚本。
+- **收锁结果必须诚实**：`trap cleanup EXIT` 保证尝试收锁；成功须确认 `release success` 已推进锚点，失败/中断尝试 `release failed`（记 `last_attempt`，`deployed` 不假前进）。release 失败不得回写 rc 0，日志/审计保留未知状态待恢复核验；不自动重试。
+- **进度心跳**：`heartbeat --loop --interval 120` 后台常驻并固定原 token；互斥依赖完整 attempt OS 锁，TTL 仅描述租约新鲜度，不代表进程退出。
+- **幂等**：结构化 `deployed.sha` 与目标完整 40 位 SHA 精确相等 → 直接 rc 0 退出，不动任何子脚本。
 - **`--dry-run`**：只透传子脚本的 `--dry-run`，**不** acquire / 不 release / 不进观察窗（不碰部署状态）。
 - **⚠️ 工作树漂移守卫（F1，2026-10-18）**：verify 前后各取一次 `git -C ${REPO_ROOT} rev-parse HEAD`，**不一致即 rc 21 中止，绝不 promote/switch**。根因是 #110 首轮 verify 判红（195 failed + `BuildError: feedback.submit_feedback_api`）的真因不是代码——verify 跑的 10 分钟里另一会话合了 #111 并 `git pull`，**工作树被换**：check1 的 pytest 进程已 import 旧模块、Jinja 模板却读新文件；check2 的绿实例同理（`WorkingDirectory` 固定 `/root/DailyCheck`）。结构性漏洞是**部署锁只护脚本、护不住 `git pull`**。守卫把「神秘 195 failed」变成「工作树在 verify 中被改动」这条明确归因。⚠️ **不能用 `run_stage` 包 verify**：它在子命令失败时直接 exit，而 #110 正是 verify 因漂移而失败 → 检测永远跑不到、恰好错过要诊断的场景，故手动捕获 rc 后先判漂移再判失败。两侧 HEAD 取不到（非 git 目录）时守卫跳过（dev 沙盒 / 离线不误伤）。**残余缺口**：让绿实例也跑 pinned 代码需改生产 systemd unit（`WorkingDirectory` 指向 `git worktree` 出的固定树），属 owner 决策 + 运维执行，脚本层做不到。
 - **观察窗**：默认 10 分钟，每 5 分钟探 `:8080/` 与 `journalctl -u dailycheck-green | grep BLOCKED`；任一异常即 `switch.sh blue 100` 回滚并 rc 24。**BLOCKED 的统计起点是观察窗开始时刻，不是「回溯总观察时长」**——promote 之前绿实例还在 DRY_RUN 下承接 verify 探针，那批 `[dry_run] BLOCKED` 会被按总时长回溯的窗口捞进来，使首次检查（+5min）必然误判「写隔离没关」并回滚蓝（2026-10-17 PR #101 首次完整跑观察窗即命中：脚本判定 rc 24、回滚蓝成功，新代码白转正没上线，靠人工 `switch.sh green 100` 恢复）。回滚输出写 `${LOG}.rollback` 独立文件——与主日志同文件双写时，父进程 stdout 缓冲会按旧 offset 覆盖子进程刚写的行，把「观察 +Nmin / 观察窗异常」两行诊断吃掉，事后只剩「已回滚」而无缘由。观察窗的三个外部依赖（`curl` / `journalctl` / unit 名）都可经 `DAILYCHECK_PIPELINE_CURL` / `_JOURNALCTL` / `_GREEN_UNIT` 注入，测试才能脱离 Linux 与真流量同构跑。

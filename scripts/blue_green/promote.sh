@@ -286,6 +286,13 @@ _fail_and_restore() {
 # 注：promote 不是 PR 粒度操作，故 `check` 不带 --pr（与 switch.sh 一致）。
 if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   _DS_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-/var/lib/dailycheck-deploy}"
+  # Pipeline children must prove the original attempt even for the same PR.
+  if [[ -n "${DAILYCHECK_DEPLOY_ATTEMPT+x}" ]]; then
+    if ! python3 "${SCRIPT_DIR}/deploy_state.py" assert-owner ; then
+      echo "[promote] ERROR: attempt ownership lost" >&2
+      exit 10
+    fi
+  fi
   if [[ "${DAILYCHECK_DEPLOY_UNLOCKED:-0}" == "1" ]]; then
     echo "[promote] WARN: DAILYCHECK_DEPLOY_UNLOCKED=1 —— 跳过部署锁校验（人工操作）" >&2
   elif [[ ! -d "${_DS_DIR}" ]]; then
