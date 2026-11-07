@@ -481,6 +481,8 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 ### 3.8 部署单飞（single-flight deploy，2026-10-16 起）
 
+Issue #161 repair-1 回归：`tests/test_deploy_candidate_ownership.py` 通过真实 helper/restore-fetch pipe 暂停、受支持 clear-lock 和临时 successor checkout 复现阶段内部的撤销后改树；修复前六个用例失败。
+
 **Issue #161 attempt 所有权修复（本地实现，待独立审查）**：`deploy_pipeline.sh` 在幂等读取/抢租约之前，通过 `deploy_state.py run` exec 自身并继承 `${STATE_DIR}/.attempt.lock` 的 POSIX flock 描述符。锁覆盖 setup、阶段间隙、八项验证、观察窗、merge/finalization、release 和结果回写，直到进程及持有描述符的子进程退出；短事务 `.state.lock` 仍只保护状态读改写。**心跳过期不是退出证明**：暂停/存活的普通 pipeline 不可被 TTL 抢占，独立 `acquire` 也必须经过同一进程锁；不新增队列服务。锁文件不可在活跃 attempt 期间删除/替换；`clear-lock` 只清租约，不解除 OS 进程锁。
 
 `acquire` 返回的 token/PR/完整 SHA/session 固定为一个 `AttemptIdentity`，由 pipeline 只读保存并传给子进程；heartbeat/release 明确使用原 token，不再重读可变的 `lock.token`。后台 heartbeat CLI 即使使用旧的默认文件交接，也只在启动时读取一次。up/verify/promote/switch-green 的 pipeline 子调用在原守卫前验证描述符和完整身份，同 PR 的替代 attempt 也不能放行；原有人工逃生变量不能绕过该校验。阶段边界续约失败立即停止后续普通部署动作（rc 28），失去身份后不恢复共享工作树。release/锚点写入失败返回 rc 27，保留日志和 `release-failed` 审计、失败/unknown 恢复证据，不写成功结果、不重试为 success；已经完成的 merge 事实仍保存在原日志和仓库事实中。该失败可能发生在流量切绿或 merge 之后，必须核验实际状态，不可把失败结果解释为“未 merge”。
