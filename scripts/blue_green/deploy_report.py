@@ -72,6 +72,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -150,6 +151,23 @@ def _web_base() -> str:
     if provider() is Provider.GITHUB:
         return HostingConfig.from_environment().web_url
     return _env("DAILYCHECK_GITEA_WEB_BASE", "").rstrip("/")
+
+
+def deployment_target() -> dict[str, str]:
+    """Auth-free identity of the target the candidate/report callers actually use.
+
+    Gitea deliberately follows `_api_base`/`_repo` (FEEDBACK_GITEA_* or their
+    legacy defaults), not the generic `HostingConfig` GITEA namespace, because
+    `deploy_merge` imports these functions. This is the single resolver the
+    pipeline must reuse for durable deployment provenance.
+    """
+    selected = provider()
+    if selected is Provider.GITHUB:
+        return {"provider": selected.value, "host": "github.com",
+                "repository": _repo()}
+    return {"provider": selected.value,
+            "host": urlsplit(_api_base()).netloc,
+            "repository": _repo()}
 
 
 # ── 事实采集 ──────────────────────────────────────────────────────────────
@@ -977,6 +995,12 @@ def cmd_assess(args: argparse.Namespace) -> int:
     return 0 if align.get("verdict") == VERDICT_ALIGNED else 1
 
 
+def cmd_target(args: argparse.Namespace) -> int:
+    """Print the actual effective deployment target (no network/credential use)."""
+    print(json.dumps(deployment_target(), ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="部署结果写回 PR")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1004,6 +1028,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--changed-files", default="",
                    help="每行一个路径；缺省用 git diff 推断")
     a.set_defaults(func=cmd_assess)
+
+    t = sub.add_parser("target", help="输出实际部署 target identity（无网络/凭据）")
+    t.set_defaults(func=cmd_target)
 
     args = ap.parse_args(argv)
     try:

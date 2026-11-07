@@ -273,22 +273,31 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------- 抢锁 + 心跳
-# Actual deployment provenance captured at attempt creation; it is immutable for
-# the outcome and cannot be retargeted later by provider/configuration changes.
-_DEPLOYMENT_PROVIDER="${DAILYCHECK_HOSTING_PROVIDER:-gitea}"
-if [[ "${_DEPLOYMENT_PROVIDER}" == "github" ]]; then
-  _DEPLOYMENT_HOST="github.com"
-  _DEPLOYMENT_REPO="${DAILYCHECK_GITHUB_REPO:-DUIDUI-Studio/DailyCheck}"
-else
-  _gitea_api="${GITEA_API:-${FEEDBACK_GITEA_API:-http://172.28.129.216:3000/api/v1}}"
-  _DEPLOYMENT_HOST="${_gitea_api#*://}"
-  _DEPLOYMENT_HOST="${_DEPLOYMENT_HOST%%/*}"
-  _DEPLOYMENT_REPO="${GITEA_REPO:-${FEEDBACK_GITEA_REPO:-eric/dailycheck}}"
-fi
-
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   log "dry-run：跳过 acquire / 心跳 / release（不碰部署状态）"
 else
+  # Capture provenance through the actual deploy/report target resolver. Do not
+  # duplicate its FEEDBACK/GITEA/default alias policy here. Extraction is
+  # auth-free and best-effort: failure leaves provenance empty, so no GitHub
+  # authority is minted while the ordinary deployment still proceeds.
+  _DEPLOYMENT_PROVIDER=""
+  _DEPLOYMENT_HOST=""
+  _DEPLOYMENT_REPO=""
+  if [[ -f "${SCRIPT_DIR}/deploy_report.py" ]]; then
+    {
+      read -r _DEPLOYMENT_PROVIDER || true
+      read -r _DEPLOYMENT_HOST || true
+      read -r _DEPLOYMENT_REPO || true
+    } < <("${PY}" "${SCRIPT_DIR}/deploy_report.py" target 2>>"${LOG}" \
+          | "${PY}" -c 'import json,sys; d=json.load(sys.stdin); print(d["provider"]); print(d["host"]); print(d["repository"])' 2>/dev/null)
+  fi
+  if [[ ! "${_DEPLOYMENT_PROVIDER}" =~ ^(github|gitea)$ \
+        || ! "${_DEPLOYMENT_HOST}" =~ ^[A-Za-z0-9.:-]+$ \
+        || ! "${_DEPLOYMENT_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    _DEPLOYMENT_PROVIDER=""
+    _DEPLOYMENT_HOST=""
+    _DEPLOYMENT_REPO=""
+  fi
   _acq_rc=0
   _acq_out="$("${PY}" "${DS}" acquire --pr "${PR}" --sha "${SHA}" \
               --session "${SESSION}" --phase "pipeline-start" \

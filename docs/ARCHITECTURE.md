@@ -1334,9 +1334,12 @@ POST 前落 uncertain 的 `intent()`、fenced CAS 的 `bind(comment_id)`。所�
 **Issue163 接入（本地实现，未激活）**：本 base 现已把真实 pipeline 与 162 ABI 接上。
 `deploy_state.py` 在既有 `state.json` 原子写 / `.state.lock` 域内新增 additive 字段
 `generation`、`outcomes`、`publications`：`acquire` 每次成功 attempt 递增 generation，并
-捕获**实际部署来源** `deployment={provider,host,repository,pr}`（来自 pipeline 的
-`DAILYCHECK_HOSTING_PROVIDER` + 实际 code repo；Gitea 默认取 `GITEA_REPO`/
-`FEEDBACK_GITEA_API`，GitHub 取 `DAILYCHECK_GITHUB_REPO`/`github.com`）。仅当 release
+捕获**实际部署来源** `deployment={provider,host,repository,pr}`。pipeline 不再复制
+alias 策略：它调用 `deploy_report.deployment_target()`（即真实 candidate/report 使用的
+`provider()` + `_api_base()`/`_repo()`；Gitea 走 `FEEDBACK_GITEA_API`/
+`FEEDBACK_GITEA_REPO` 或 legacy 默认，GitHub 走 `HostingConfig(READ)` 的 repo 与
+`github.com`），把结果传给 `acquire`。该解析 auth-free；解析失败/输出非法时 provenance
+留空（普通部署继续，但不产生 GitHub authority）。仅当 release
 操作成功且由真实 pipeline 进程描述符 + 身份锁拥有时，release 的同一原子提交写入不可变
 outcome（attempt_id、generation、PR、完整 40 位 H、public sink identity、实际
 deployment provenance、真实 result/rc/stage、私有 verification、UTC outcome_at、随机
