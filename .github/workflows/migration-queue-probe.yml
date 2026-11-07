@@ -1,0 +1,37 @@
+name: migration-queue-probe
+on:
+  pull_request:
+    branches: ['ci/mq-probe-*']
+  merge_group:
+    types: [checks_requested]
+    branches: ['ci/mq-probe-*']
+permissions:
+  contents: read
+concurrency:
+  group: migration-queue-probe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Mechanics-only literal success, or deliberate PR failure
+        env:
+          FAIL: ${{ contains(github.event.pull_request.title, 'FAIL-CI') }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          e=json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          print(json.dumps({'simulation_only':True,'event':os.environ['GITHUB_EVENT_NAME'],'sha':os.environ['GITHUB_SHA'],'ref':os.environ['GITHUB_REF'],'pr':e.get('pull_request',{}).get('number'),'H':e.get('pull_request',{}).get('head',{}).get('sha'),'B':e.get('pull_request',{}).get('base',{}).get('sha'),'merge_group':e.get('merge_group')}))
+          assert os.environ['FAIL'] != 'true', 'deliberate probe failure'
+          PY
+  agent-framework-reports:
+    name: agent-framework-reports
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Mechanics-only report
+        run: |
+          echo 'SIMULATION ONLY: literal success; not the DailyCheck report gate'
+          echo 'This job only acknowledges an asynchronous simulated admission; it holds no production lock.'
