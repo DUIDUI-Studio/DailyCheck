@@ -1,0 +1,29 @@
+name: Migration permission probe
+on:
+  push:
+    branches: [ci/permission-probe-20261107, ci/permission-probe-pr-20261107]
+  pull_request:
+    branches: [ci/permission-probe-20261107]
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: Verify that failed CI is reported
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  permission-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify secret and variable injection
+        env:
+          PROBE_SECRET: ${{ secrets.DC_PERMISSION_PROBE }}
+          PROBE_VARIABLE: ${{ vars.DC_PERMISSION_PROBE }}
+        run: |
+          test "$PROBE_SECRET" = permission-probe-20261107
+          test "$PROBE_VARIABLE" = permission-probe-20261107
+          echo "Secret and variable injection verified."
+      - name: Simulate failure when requested
+        if: ${{ inputs.simulate_failure == true }}
+        run: exit 1
