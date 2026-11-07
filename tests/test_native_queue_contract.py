@@ -998,7 +998,7 @@ def test_native_read_client_binds_real_HTTP_jobs_checks_and_log_artifacts(native
     host.routes[root + "/actions/workflows/ci.yml"] = {"id": policy.workflow_id, "state": "active", "path": ".github/workflows/ci.yml"}
     host.routes[root + "/git/blobs/" + policy.producer_manifest_blob_sha] = {
         "sha": policy.producer_manifest_blob_sha, "encoding": "base64",
-        "content": base64.b64encode((ROOT / "scripts/ci/producer_manifest.json").read_bytes()).decode()}
+        "content": base64.encodebytes((ROOT / "scripts/ci/producer_manifest.json").read_bytes()).decode()}
     logs = {}
     for item in raw_runs:
         run = item["run"]

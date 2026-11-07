@@ -1462,6 +1462,8 @@ reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolat
 Reader 通过 authenticated immutable Git blob API 核验 protected manifest，再核验 actual
 workflow/run/attempt/job/check/App/context、闭包/runtime/native/output/session linkage；两个
 context 的 capture 必须相等，不能靠新 envelope hash 接受另一次实际 passing fixture。
+Git blob API 的 base64 只去除传输换行 CR/LF，再严格解码并核验不可变 blob SHA；不能将
+合法换行误判为 producer 内容变化，也不能忽略其他非法编码字符。
 
 manifest 中 image 是 Coordinator 预加载的 **linux/arm64 local image ID**，scope 明确为
 `local_fixture_only`；不是已发布 registry reference，也不提供 hosted amd64/Prod runtime

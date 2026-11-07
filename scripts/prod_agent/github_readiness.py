@@ -458,9 +458,11 @@ class NativeGitHubFacts:
         if pin is None:
             raise ValueError("approved executed producer pin required")
         approved = self.client.get(self.root + "/git/blobs/" + pin)
-        if approved.get("sha") != pin or approved.get("encoding") != "base64":
+        if (approved.get("sha") != pin or approved.get("encoding") != "base64"
+                or not isinstance(approved.get("content"), str)):
             raise ValueError("missing authenticated producer manifest blob")
-        producer_manifest = parse_manifest(base64.b64decode(approved["content"], validate=True), pin)
+        encoded = approved["content"].replace("\r", "").replace("\n", "")
+        producer_manifest = parse_manifest(base64.b64decode(encoded, validate=True), pin)
         rows = self.client.pages(self.root + f"/actions/workflows/{self.policy.workflow_id}/runs",
                                  key="workflow_runs", params={"event": event, "head_sha": head})
         rows = [r for r in rows if r.get("head_sha") == head and r.get("event") == event
