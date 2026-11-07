@@ -152,8 +152,17 @@ SAFETY_STOCK_ROUND_DIGITS = 2
 # 开启 = 目录按 item_routing 合并多仓、不再出现 DC 选择器、购物车
 # dc_warehouse_code 写 NULL、提交时逐行解析路由并固化 source_warehouse_code。
 # 灰度期严禁在蓝绿旧实例仍承接流量时开启（见设计 §6）。
+#
+# 2026-11-02：开关改为 env 驱动，代码默认仍为关闭。
+# - 理由：直接翻默认值会打挂 85 个按单仓假设写的测试（对照跑过），且回滚
+#   要重新走发布；env 化后开启/回滚都只是改 env + restart。
+# - 生产开启：在 /etc/dailycheck/app.env 写 DAILYCHECK_MULTI_WAREHOUSE=1。
+# - 未设置/写 0 时为关闭，测试与本地开发保持既有单仓行为。
 # ─────────────────────────────────────────────────────────────────────
-MULTI_WAREHOUSE_FULFILLMENT = False
+MULTI_WAREHOUSE_FULFILLMENT = (
+    os.environ.get("DAILYCHECK_MULTI_WAREHOUSE", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -312,3 +321,6 @@ DIGEST_MAIL_FROM = (os.environ.get("DIGEST_MAIL_FROM") or "").strip() or DIGEST_
 DIGEST_MAIL_TO = (os.environ.get("DIGEST_MAIL_TO") or "").strip()
 DIGEST_WEEKDAY = _env_int("DIGEST_WEEKDAY", 1)
 DIGEST_HOUR = _env_int("DIGEST_HOUR", 8)
+
+# Compatibility floor stays active regardless of future proposal rollout.
+ORDER_CHANGES_ENABLED = os.environ.get("DAILYCHECK_ORDER_CHANGES", "").lower() in ("1", "true", "yes")

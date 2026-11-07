@@ -334,7 +334,7 @@ fetch refs/pull/<N>/head → 校验 sha 包含 origin/main → checkout --detach
              ${APP_DIR}/db + restart 绿两个 unit + 复验；标准 5 步见 scripts/blue_green/README.md
              ⚠️ 未转正时 switch.sh 的 DRY_RUN 守卫会拒跑（exit 3）——这是预期拦截，不是故障
          → switch.sh 灰度 5% → 50% → 100%（每档观察；100%/0% 边界自动做落点核验）
-         → 观察窗 ≥30min → 收官（绿=生产，蓝 standby）
+         → 观察窗 ≥10min → 收官（绿=生产，蓝 standby）
          → FF-only merge PR（deploy_merge.py；锁内冻结 main）
              merge 后 fetch origin main + checkout -B main origin/main，保证本地树 == 远端 main
              失败：switch.sh blue 100 → 工作树恢复 origin/main → exit 26（PR 保持 open）

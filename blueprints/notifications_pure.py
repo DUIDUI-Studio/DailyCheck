@@ -30,6 +30,11 @@ ALLOWED_EVENT_TYPES = frozenset({
     "store_order_no_approver_alert",
     # 用户反馈提单（2026-10-17）：扇出给所有平台超管，见 blueprints/feedback.py
     "feedback_submitted",
+    "store_order_change_proposed",
+    "store_order_change_accepted",
+    "store_order_change_rejected",
+    "store_order_change_withdrawn",
+    "store_order_change_stale",
 })
 
 SUMMARY_MAX_LEN = 200
@@ -41,7 +46,7 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def emit_event(
+def enqueue_event(
     db: sqlite3.Connection,
     event_type: str,
     summary: str,
@@ -69,9 +74,16 @@ def emit_event(
            VALUES (?, ?, ?, ?, ?, NULL)""",
         rows,
     )
-    db.commit()
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(rows)
 
+
+
+def emit_event(db: sqlite3.Connection, event_type: str, summary: str,
+               target_url: str | None, user_ids: list[int]) -> int:
+    """Legacy event contract commits; enqueue_event participates in caller's tx."""
+    count = enqueue_event(db, event_type, summary, target_url, user_ids)
+    db.commit()
+    return count
 
 def mark_read(db: sqlite3.Connection, user_id: int, event_id: int) -> bool:
     """Mark a single notification as read. Idempotent.

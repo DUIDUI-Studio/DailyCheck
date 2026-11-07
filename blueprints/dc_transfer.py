@@ -1,4 +1,4 @@
-"""总仓调货 blueprint：总仓发起 → 分仓接收（复用订货流程的单据与收发实现）.
+"""总仓调货 blueprint：DC 发起 → 其他 DC / 门店接收（复用订货收发实现）.
 
 路由刻意保持精简：
   - 列表（总仓看发送单 / 分仓看接收单）
@@ -44,11 +44,13 @@ def _current_warehouse() -> Any:
     return g.get("warehouse")
 
 
-def _list_stores(master: sqlite3.Connection) -> list[dict[str, Any]]:
+def _list_receivers(master: sqlite3.Connection, source_code: str) -> list[dict[str, Any]]:
     master.row_factory = sqlite3.Row
     rows = master.execute(
-        "SELECT code, name FROM warehouses WHERE warehouse_type=? ORDER BY code",
-        (STOREFRONT,),
+        """SELECT w.code, w.name FROM warehouses w
+           JOIN warehouses source ON source.code=? AND w.tenant_id=source.tenant_id
+           WHERE w.warehouse_type IN (?, ?) AND w.code<>source.code ORDER BY w.code""",
+        (source_code, *dtp.TRANSFER_RECEIVER_TYPES),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -57,7 +59,7 @@ def _list_stores(master: sqlite3.Connection) -> list[dict[str, Any]]:
 @require_login
 @require_warehouse_type(DC, STOREFRONT)
 def transfer_list() -> str:
-    """总仓：发送单列表。
+    """DC：默认本仓发送单；scope=incoming 为本仓收货单。
 
     门店不设独立入口：分仓收到的调货单对门店就是一张待收货的订单，
     统一在「本店订单」里查看与接收（2026-10-19 owner 明确），因此门店
@@ -72,11 +74,17 @@ def transfer_list() -> str:
         return redirect(url_for("store_ordering.store_orders_list"))
 
     master = get_master_db()
-    transfers = dtp.list_transfers(master, from_warehouse_code=wh["code"])
+    scope = "incoming" if request.args.get("scope") == "incoming" else "outgoing"
+    transfers = dtp.list_transfers(
+        master,
+        from_warehouse_code=wh["code"] if scope == "outgoing" else None,
+        to_warehouse_code=wh["code"] if scope == "incoming" else None,
+    )
 
     return render_template(
         "store_ordering/transfers.html",
         transfers=transfers,
+        scope=scope,
         # 建单入口只给持 transfer.create 的角色（DC manager/admin）；
         # staff 能看列表但看不到按钮，避免点进去吃 403。
         can_create=has_permission("transfer.create"),
@@ -88,7 +96,7 @@ def transfer_list() -> str:
 @require_warehouse_type(DC)
 @require_permission("transfer.create")
 def transfer_new() -> str:
-    """总仓建调货单：选分仓 + 勾品项数量，提交即 approved（免审批）。"""
+    """总仓建调货单：选其他 DC / 门店 + 勾品项数量，免审批。"""
     wh = _current_warehouse()
     if wh is None:
         flash("请先选择配送中心仓库")
@@ -114,7 +122,7 @@ def transfer_new() -> str:
                 items.append({"canonical_id": canonical_id, "quantity": qty})
 
         if not to_code:
-            flash("请选择收货分仓")
+            flash("请选择收货仓")
             return redirect(url_for("dc_transfer.transfer_new"))
         if not items:
             flash("请至少填写一项调货数量")
@@ -133,7 +141,7 @@ def transfer_new() -> str:
             flash(str(e))
             return redirect(url_for("dc_transfer.transfer_new"))
 
-        # 通知分仓经理/管理员准备接收。走与订货同一事件通道，文案区分。
+        # 通知收货仓的既有事件收件人准备接收，沿用订货事件通道及权限口径。
         sop.notify_order_event(
             master, sop.EVENT_TRANSFER_CREATED, order, g.user["id"]
         )
@@ -150,7 +158,7 @@ def transfer_new() -> str:
     return render_template(
         "store_ordering/transfer_new.html",
         dc_code=dc_code,
-        stores=_list_stores(master),
+        stores=_list_receivers(master, dc_code),
         groups=groups,
         item_count=len(items),
     )

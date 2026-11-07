@@ -180,6 +180,35 @@ def test_review_approve(dc_env):
     assert status == "approved"
 
 
+def test_admin_without_warehouse_binding_sees_ship_form(dc_env):
+    """平台管理员进「没有 warehouse_users 绑定」的 DC 也要看到发货入口。
+
+    2026-11-02 生产现象：蓝天大厦（wh_005）一条绑定都没有，g.role 为 None；
+    详情页 can_ship 之前是显式角色判断（不认 is_admin），发货区整块不渲染，
+    而 POST /orders/<id>/ship 的 @require_role("staff") 对管理员放行 ——
+    路由允许写、界面不给按钮。这里锁住「界面与路由同一判定」。
+    """
+    client = dc_env["client"]
+    _login_as(client, 5, 1)  # admin，warehouse 1 无绑定
+    client.post(
+        f"/store-ordering/orders/{dc_env['order_id']}/review",
+        data={"decision": "approved", "note": "ok"},
+    )
+
+    master = sqlite3.connect(str(dc_env["master_path"]))
+    bound = master.execute(
+        "SELECT 1 FROM warehouse_users WHERE user_id=5 AND warehouse_id=1"
+    ).fetchone()
+    master.close()
+    assert bound is None  # 前提：确实没有绑定
+
+    resp = client.get(f"/store-ordering/orders/{dc_env['order_id']}")
+    assert resp.status_code == 200
+    body = resp.data.decode()
+    assert "确认发货" in body
+    assert "shipped_items[" in body
+
+
 def test_review_reject_requires_note(dc_env):
     client = dc_env["client"]
     _login_as(client, 2, 1)

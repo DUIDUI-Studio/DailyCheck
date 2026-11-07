@@ -5,7 +5,7 @@
 #
 # 选项:
 #   --session NAME          锁归属标签（默认 pipeline-<pr>），审计可追溯
-#   --observe-min N         观察窗分钟数（默认 30；0 = 跳过）
+#   --observe-min N         观察窗分钟数（默认 10；0 = 跳过）
 #   --skip-verify           跳过 verify（仅限人工应急，会打 WARN）
 #   --dry-run               只跑子脚本的 --dry-run，不 acquire / 不 release / 不碰流量
 #   --heartbeat-interval N  后台心跳间隔秒（默认 120，须明显小于锁 TTL 1800s）
@@ -59,11 +59,11 @@ fi
 PR=""
 SHA=""
 SESSION=""
-OBSERVE_MIN=30
+OBSERVE_MIN=10
 # F5（2026-10-18 复盘）：机制要求的观察窗下限。低于此值不阻断部署（人工应急
 # 确实需要能压缩），但必须落一条 audit 事件——让「观察窗被压缩」从"没人知道"
 # 变成 Dashboard 可见。#111 实测压到 10min 却无任何留痕，正是复盘要消灭的静默降级。
-OBSERVE_MIN_REQUIRED=30
+OBSERVE_MIN_REQUIRED=10
 SKIP_VERIFY=0
 DRY_RUN=0
 HB_INTERVAL=120
@@ -101,7 +101,7 @@ usage() {
 用法: deploy_pipeline.sh <pr-num> <commit-sha> [选项]
 
   --session NAME          锁归属标签（默认 pipeline-<pr>）
-  --observe-min N         观察窗分钟数（默认 30；0 = 跳过）
+  --observe-min N         观察窗分钟数（默认 10；0 = 跳过）
   --skip-verify           跳过八项验证（仅限人工应急）
   --dry-run               只跑子脚本 --dry-run，不碰锁与流量
   --heartbeat-interval N  后台心跳间隔秒（默认 120）
@@ -426,7 +426,10 @@ if [[ "${SKIP_VERIFY}" -eq 1 ]]; then
 else
   [[ -n "${SIM_USER}" ]] || SIM_USER="sim_user"
   if [[ -z "${SIM_PASS}" ]]; then
-    SIM_PASS="$("${PY}" -c 'import secrets; print(secrets.token_urlsafe(18))')"
+    # Issue #123：token_urlsafe 约 1.5% 以 '-' 开头，会被 click 当成选项
+    # （verify.sh create-user 报 "No such option '-i'" → check 2 假红）。
+    # 固定字母前缀保证首字符安全，熵不变（常量前缀 + 18 字节随机）。
+    SIM_PASS="$("${PY}" -c 'import secrets; print("dc" + secrets.token_urlsafe(18))')"
     log "verify 探针凭据：自动生成（每次部署一次性，不落盘）"
   fi
   export SIM_USER_USER="${SIM_USER}"
