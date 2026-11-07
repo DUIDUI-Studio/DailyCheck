@@ -448,6 +448,11 @@ def dispatch_feedback(ticket_id: int):
             flash(f"未派发：{exc}")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
+        # The exact draft this request reviewed. The private claim compares it
+        # again inside its transaction, so a concurrent replacement cannot be
+        # published under this approval.
+        approved_version = draft_version(title, body)
+
         # 二审时补一句意见也要留痕（不写进正文 —— 正文已被管理员定稿）。
         comment = (request.form.get("comment") or "").strip()
         comment_id = None
@@ -478,12 +483,18 @@ def dispatch_feedback(ticket_id: int):
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
         if private_github:
-            issue = dispatch.deliver_private(db, ticket_id, g.user["id"], comment_id)
+            issue = dispatch.deliver_private(db, ticket_id, g.user["id"], comment_id,
+                                             approved_version=approved_version)
         else:
             issue = dispatch.create_issue(title, body)
         if issue is None:
             if private_github:
-                flash("私有草稿和评论已保存；送达尚未确认或被阻止，请复核私有回执，勿重复建单。")
+                current = get_ticket(db, ticket_id) or {}
+                if draft_version(current.get("draft_title"),
+                                 current.get("draft_body")) != approved_version:
+                    flash("草稿已被更新，本次未派发；请复核最新草稿后重新二审。")
+                else:
+                    flash("私有草稿和评论已保存；送达尚未确认或被阻止，请复核私有回执，勿重复建单。")
             else:
                 flash("草稿已保存，但创建 Issue 失败（详见服务端日志），请手动建单。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))

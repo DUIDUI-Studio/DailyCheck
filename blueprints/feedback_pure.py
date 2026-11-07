@@ -456,8 +456,15 @@ class PrivateDeliveryClaim:
 
 
 def claim_private_delivery(db, ticket_id: int, admin_id: int,
-                           comment_id: int | None = None) -> PrivateDeliveryClaim | None:
-    """A lease can recover an intent, never authorize a second creation POST."""
+                           comment_id: int | None = None,
+                           approved_version: str | None = None) -> PrivateDeliveryClaim | None:
+    """A lease can recover an intent, never authorize a second creation POST.
+
+    ``approved_version`` is the draft version the dispatch request reviewed.
+    When supplied, a draft replaced before this claim (for example by a
+    concurrent first review during the metadata GET) fails closed: no receipt
+    is created, the newer draft is preserved, and it needs its own review.
+    """
     owner, now = str(uuid.uuid4()), time.time()
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -465,6 +472,8 @@ def claim_private_delivery(db, ticket_id: int, admin_id: int,
         if not ticket or ticket["issue_number"] or ticket["status"] != STATUS_ANALYZED:
             return None
         version = draft_version(ticket["draft_title"], ticket["draft_body"])
+        if approved_version is not None and approved_version != version:
+            return None
         row = db.execute(
             "SELECT * FROM feedback_delivery_receipts WHERE ticket_id=?", (ticket_id,)
         ).fetchone()

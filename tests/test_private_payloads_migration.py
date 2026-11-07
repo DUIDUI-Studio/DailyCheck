@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from db import MASTER_SCHEMA, init_master_db
+from db import FEEDBACK_DELIVERY_RECEIPTS_DDL, MASTER_SCHEMA, init_master_db
 from migrations import MIGRATIONS
 
 EXPECTED_COLUMNS = {
@@ -46,8 +46,6 @@ def _table_state(path):
 
 
 def test_master_schema_uses_the_registered_receipt_ddl():
-    from migrations.feedback_receipts import FEEDBACK_DELIVERY_RECEIPTS_DDL
-
     assert FEEDBACK_DELIVERY_RECEIPTS_DDL.strip() in MASTER_SCHEMA
     assert MIGRATIONS[-1][0] == 8
 

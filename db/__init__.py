@@ -769,28 +769,8 @@ CREATE INDEX IF NOT EXISTS idx_feedback_comments_ticket
     ON feedback_comments(ticket_id, id);
 
 -- Narrow private delivery receipt; no business rows or legacy links are rewritten.
-CREATE TABLE IF NOT EXISTS feedback_delivery_receipts (
-    ticket_id       INTEGER PRIMARY KEY REFERENCES feedback_tickets(id),
-    provider        TEXT NOT NULL CHECK(provider = 'github'),
-    host            TEXT NOT NULL CHECK(host = 'github.com'),
-    repository_id   INTEGER NOT NULL CHECK(repository_id = 1449125557),
-    repository      TEXT NOT NULL CHECK(repository = 'DUIDUI-Studio/DailyCheck-ops'),
-    kind            TEXT NOT NULL CHECK(kind = 'issue'),
-    request_id      TEXT NOT NULL UNIQUE,
-    draft_sha256    TEXT NOT NULL,
-    payload_json    TEXT NOT NULL,
-    payload_sha256  TEXT NOT NULL,
-    admin_id        INTEGER NOT NULL REFERENCES users(id),
-    comment_id      INTEGER REFERENCES feedback_comments(id),
-    state           TEXT NOT NULL CHECK(state IN ('ready','sending','uncertain','blocked','linked')),
-    owner           TEXT,
-    generation      INTEGER NOT NULL DEFAULT 0,
-    lease_until     REAL NOT NULL DEFAULT 0,
-    remote_id       INTEGER,
-    remote_number   INTEGER,
-    remote_url      TEXT,
-    updated_at      TEXT NOT NULL
-);
+-- The DDL is FEEDBACK_DELIVERY_RECEIPTS_DDL below; the master v8 migration
+-- imports the same constant, so startup initialization cannot diverge.
 
 -- Owner 拍板队列（2026-10-21）。
 -- 闭环：Prod Agent 命中红线 → 登记一行 pending → 企微推反馈通知群 →
@@ -823,7 +803,35 @@ CREATE INDEX IF NOT EXISTS idx_owner_approvals_status
 # master.db 上会因列已存在而崩溃。沿用 warehouses.warehouse_type 的迁移模式：
 # 由 init_master_db() 的 PRAGMA 守卫负责幂等 ALTER。
 
+# 私有反馈送达回执（Issue #162）。注册迁移 master v8 直接导入这份 DDL，
+# 启动期建表与显式迁移不会各写一份。
+FEEDBACK_DELIVERY_RECEIPTS_DDL = """
+CREATE TABLE IF NOT EXISTS feedback_delivery_receipts (
+    ticket_id       INTEGER PRIMARY KEY REFERENCES feedback_tickets(id),
+    provider        TEXT NOT NULL CHECK(provider = 'github'),
+    host            TEXT NOT NULL CHECK(host = 'github.com'),
+    repository_id   INTEGER NOT NULL CHECK(repository_id = 1449125557),
+    repository      TEXT NOT NULL CHECK(repository = 'DUIDUI-Studio/DailyCheck-ops'),
+    kind            TEXT NOT NULL CHECK(kind = 'issue'),
+    request_id      TEXT NOT NULL UNIQUE,
+    draft_sha256    TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    payload_sha256  TEXT NOT NULL,
+    admin_id        INTEGER NOT NULL REFERENCES users(id),
+    comment_id      INTEGER REFERENCES feedback_comments(id),
+    state           TEXT NOT NULL CHECK(state IN ('ready','sending','uncertain','blocked','linked')),
+    owner           TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0,
+    lease_until     REAL NOT NULL DEFAULT 0,
+    remote_id       INTEGER,
+    remote_number   INTEGER,
+    remote_url      TEXT,
+    updated_at      TEXT NOT NULL
+)
+"""
+
 MASTER_SCHEMA += DELIVERY_ITEMS_DDL + ";\n" + ITEM_ROUTING_DDL + ";\n"
+MASTER_SCHEMA += FEEDBACK_DELIVERY_RECEIPTS_DDL + ";\n"
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
 WAREHOUSE_SCHEMA = """

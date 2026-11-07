@@ -55,10 +55,10 @@ def test_init_runner_and_repeated_init_share_schema(tmp_path, monkeypatch):
     monkeypatch.setattr(db, 'WAREHOUSE_DB_DIR', tmp_path / 'warehouses')
     monkeypatch.setattr(config, 'MASTER_DB', path)
     db.init_master_db()
-    assert migrate_up(path, MIGRATIONS, tmp_path / 'backups') == list(range(1, 8))
+    assert migrate_up(path, MIGRATIONS, tmp_path / 'backups') == list(range(1, 9))
     db.init_master_db()
     assert migrate_up(path, MIGRATIONS, tmp_path / 'backups') == []
     with sqlite3.connect(path) as conn:
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
         assert len(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'store_order_change_%'").fetchall()) == 4
         assert conn.execute('PRAGMA foreign_key_check').fetchall() == []

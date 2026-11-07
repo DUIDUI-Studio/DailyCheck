@@ -1242,12 +1242,17 @@ GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`，保留原同 SHA 
 先 `verify_repository()`，再 GET 经过完整 identity 映射的私有 Issue；不授予新成员权限，
 不把运维/反馈/Prod 凭据传入 CI。
 
-Flask 二审先保存原评论和带版本 CAS 的草稿，再调用 `deliver_private`。
+Flask 二审先保存原评论和带版本 CAS 的草稿，再调用 `deliver_private`；调用时传入
+本次请求审核过的草稿版本。claim 在同一个 `BEGIN IMMEDIATE` 事务内重新读取票据并
+比对版本：若私有 metadata GET 期间已有并发一审替换草稿，则不建 receipt、不调外部
+创建接口，保留新草稿并要求对它重新二审。
 唯一新增 master 表 `feedback_delivery_receipts` 以 ticket_id 为主键，保存固定
 provider/host/repositoryID/kind、稳定 request UUID、精确 payload/hash、原审核人/评论、
-owner/generation/120 秒租约和 remote ID/number/URL。`init_master_db` 的既有建表机制
-只增表，不重写旧票据；旧 schema 缺表时送达 fail closed，升级后可继续。
-本任务只在临时 SQLite 验证，未执行真实 DB migration。
+owner/generation/120 秒租约和 remote ID/number/URL。DDL 在 `db/__init__.py`
+（`FEEDBACK_DELIVERY_RECEIPTS_DDL`）单点定义；`init_master_db` 幂等建表保留为兜底，
+注册迁移 master v8（`migrations/feedback_receipts.py`）让 `flask migrate up` 先备份
+再安装同一张表。只增表，不重写旧票据；旧 schema 缺表时送达 fail closed，升级后可继续。
+本任务只在临时 SQLite/合成 v7 库验证，未执行真实生产 DB migration。
 新增 receipt 表同时由既有 `scripts/arch_map.py --write` 同步派生表清单
 `docs/ARCHITECTURE_MAP.md`；生成器与 schema version 规则不变。
 
@@ -1622,7 +1627,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v7**（订单变更兼容底座；仓库仍为 v7，互不混用）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v8**（私有反馈回执表；仓库仍为 v7，互不混用）。
 
 ---
 

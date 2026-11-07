@@ -159,15 +159,22 @@ def _confirmed_private_issue(client: HostingClient, data: object, payload: dict)
 
 
 def deliver_private(db, ticket_id: int, admin_id: int,
-                    comment_id: int | None = None) -> dict | None:
-    """Only this caller can create GitHub feedback; uncertainty never re-POSTs."""
+                    comment_id: int | None = None,
+                    approved_version: str | None = None) -> dict | None:
+    """Only this caller can create GitHub feedback; uncertainty never re-POSTs.
+
+    ``approved_version`` binds the claim to the exact draft reviewed by the
+    dispatch request, so a replacement saved during the metadata GET cannot
+    be published under this request's approval.
+    """
     claim = None
     try:
         client = HostingClient(HostingConfig.from_environment(AccessRole.FEEDBACK))
         if client.config.provider is not Provider.GITHUB:
             raise HostingError("private_github_destination_required")
         client.verify_repository()
-        claim = claim_private_delivery(db, ticket_id, admin_id, comment_id)
+        claim = claim_private_delivery(
+            db, ticket_id, admin_id, comment_id, approved_version)
         if claim is None:
             return None
         payload = json.loads(claim.payload_json)

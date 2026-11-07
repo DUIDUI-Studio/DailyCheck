@@ -14,6 +14,8 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 
+from migrations.feedback_receipts import registered_down as feedback_receipts_down
+from migrations.feedback_receipts import registered_up as feedback_receipts_up
 from migrations.multi_warehouse_fulfillment import (
     migrate_multi_warehouse_fulfillment,
     registered_down,
@@ -116,4 +118,6 @@ MIGRATIONS: list[Migration] = [
      receipt_op_up, receipt_op_down),
     (7, "order changes: durable compatibility floor, snapshots and ship claims",
      order_changes_up, order_changes_down),
+    (8, "private feedback delivery receipts（Issue #162）",
+     feedback_receipts_up, feedback_receipts_down),
 ]
