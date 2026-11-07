@@ -481,7 +481,11 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 ### 3.8 部署单飞（single-flight deploy，2026-10-16 起）
 
-Issue #161 repair-1 回归：`tests/test_deploy_candidate_ownership.py` 通过真实 helper/restore-fetch pipe 暂停、受支持 clear-lock 和临时 successor checkout 复现阶段内部的撤销后改树；修复前六个用例失败。
+**Issue #161 repair-1：候选阶段内撤销与改树的排序**。`tests/test_deploy_candidate_ownership.py` 通过真实 helper/restore-fetch pipe 暂停、受支持 `clear-lock --yes` 和临时 successor checkout 复现阶段内部的撤销后改树（修复前六例失败）。candidate helper/merge helper 返回后、restore 的 fetch 返回后均重新判断原 attempt；远端 merge 成功事实先记录，再判断本地恢复权限，失去权限不回滚/改写 successor checkout、不推进成功锚点、不回写成功。助手失败仍保留 candidate/merge 原失败码 25/26，cleanup 中失去权限保留原阶段失败码。
+
+两个本地改树路径统一调用 `deploy_state.py owned-checkout`：在同一 `.state.lock` 临界区内校验不可变身份并执行 detach candidate 或恢复 main；状态边界与 attempt 两个描述符均传给 Git 子进程，使等待它的 Python 进程被 KILL 后，尚未完成的本地改树仍阻塞受支持的撤销。`clear-lock` 同样使用 `.state.lock`：撤销先完成则旧 checkout 被拒绝；checkout 先获得临界区则它先结束，撤销才能返回，之后的手工 successor checkout 不被旧进程覆盖。fetch/远端 helper **不在该临界区内**，仍可及时撤销；已在途 fetch 可以更新 Git 对象/远端跟踪引用，但无权在返回后改 checkout。该约束不是针对任意同用户/特权文件篡改的安全边界，也不改变外部 merge/最终确认策略。
+
+回归还验证正常/被杀父进程下的 candidate 与 main 两种 checkout 排序（真实 FIFO、独立 kernel flock 探针、并行 clear-lock 和 heartbeat，无 sleep 充当证明）、原始四类 helper 撤销、restore/cleanup fetch 撤销、同 PR successor 身份与既有锚点不变，以及成功远端事实/非零回写/原失败码。原有八项验证、真实默认观察窗、DB/DRY_RUN 和应急 rollback/down/switch-blue 豁免保持原样。
 
 **Issue #161 attempt 所有权修复（本地实现，待独立审查）**：`deploy_pipeline.sh` 在幂等读取/抢租约之前，通过 `deploy_state.py run` exec 自身并继承 `${STATE_DIR}/.attempt.lock` 的 POSIX flock 描述符。锁覆盖 setup、阶段间隙、八项验证、观察窗、merge/finalization、release 和结果回写，直到进程及持有描述符的子进程退出；短事务 `.state.lock` 仍只保护状态读改写。**心跳过期不是退出证明**：暂停/存活的普通 pipeline 不可被 TTL 抢占，独立 `acquire` 也必须经过同一进程锁；不新增队列服务。锁文件不可在活跃 attempt 期间删除/替换；`clear-lock` 只清租约，不解除 OS 进程锁。
 

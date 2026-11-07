@@ -182,6 +182,24 @@ def cmd_assert_owner(args) -> int:
     return EXIT_OK
 
 
+def cmd_owned_checkout(args) -> int:
+    """Order a local checkout with supported revocation; never hold across fetch."""
+    with _write_lock(_state_dir()) as boundary_fd:
+        lock = _load_state(_state_dir()).get("lock")
+        if ATTEMPT_ENV not in os.environ or not _attempt_owns(lock):
+            return _fail("attempt ownership lost before checkout", EXIT_TOKEN_MISMATCH)
+        if args.candidate and args.candidate != lock.get("sha"):
+            return _fail("checkout sha differs from attempt", EXIT_TOKEN_MISMATCH)
+        command = ["git", "-C", args.repo, "checkout", "--quiet"]
+        if args.main:
+            command.extend(["-B", "main", "origin/main"])
+        else:
+            command.extend(["--detach", args.candidate])
+        # The mutator retains both fences if its waiting Python parent is killed.
+        process_fd = int(os.environ[ATTEMPT_FD_ENV])
+        return subprocess.call(command, pass_fds=(boundary_fd, process_fd))
+
+
 def _state_dir() -> Path:
     return Path(os.environ.get("DAILYCHECK_DEPLOY_STATE_DIR", DEFAULT_STATE_DIR))
 
@@ -296,7 +314,7 @@ def _write_lock(directory: Path):
     with open(directory / FLOCK_FILENAME, "a+") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
-            yield
+            yield fh.fileno()
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
@@ -700,6 +718,13 @@ def main(argv=None) -> int:
     p.add_argument("--pr", type=int, default=None)
     p.add_argument("--sha", default="")
     p.set_defaults(func=cmd_assert_owner)
+
+    p = sub.add_parser("owned-checkout", help="order local candidate/main checkout with revocation")
+    p.add_argument("--repo", required=True)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--candidate", default="")
+    g.add_argument("--main", action="store_true")
+    p.set_defaults(func=cmd_owned_checkout)
 
     p = sub.add_parser("check", help="锁活跃性检查（rc 0=无锁 / 10=活跃 / 12=PR 不匹配）")
     p.add_argument("--pr", type=int, default=None, help="交叉校验：锁须属于该 PR（或锁未绑定 PR）")

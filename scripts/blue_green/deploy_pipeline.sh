@@ -288,6 +288,23 @@ _owns_attempt() {
   "${PY}" "${DS}" assert-owner >>"${LOG}" 2>&1
 }
 
+
+_candidate_owner() {
+  _owns_attempt && return 0
+  FAIL_STAGE="${FAIL_STAGE:-ownership}"
+  log "ERROR: candidate attempt 所有权丢失；停止后续动作，checkout/锚点需恢复核验（$1）"
+  _audit_event "ownership-lost" "$1; shared checkout preserved; anchor unconfirmed"
+  return 28
+}
+
+_require_candidate_owner() {
+  _candidate_owner "$1" || exit 28
+}
+
+_owned_checkout() {
+  "${PY}" "${DS}" owned-checkout --repo "${REPO_ROOT}" "$@" >>"${LOG}" 2>&1
+}
+
 # 主流程阶段打点（后台循环只在第一拍写 phase，这里不会被盖回去）
 _hb() {
   [[ "${DS_READY}" -eq 1 ]] || return 0
@@ -324,12 +341,16 @@ _merge_helper() {
 }
 
 _restore_main() {
-  if git -C "${REPO_ROOT}" fetch --quiet origin main \
-     && git -C "${REPO_ROOT}" checkout --quiet -B main origin/main; then
-    TREE_MOVED=0
-    log "✓ 工作树已恢复到 origin/main"
-    return 0
+  _candidate_owner "restore-before-fetch" || return 28
+  # Fetch may block: revocation must remain available throughout it.
+  if git -C "${REPO_ROOT}" fetch --quiet origin main; then
+    if _owned_checkout --main; then
+      TREE_MOVED=0
+      log "✓ 工作树已恢复到 origin/main"
+      return 0
+    fi
   fi
+  _candidate_owner "restore-after-fetch/checkout" || return 28
   log "WARN: 恢复 origin/main 失败 —— 工作树可能不在已知好版本（${REPO_ROOT}）"
   return 1
 }
@@ -340,6 +361,7 @@ _prepare_candidate() {
     log "✗ fetch refs/pull/${PR}/head 失败"
     return 1
   fi
+  _require_candidate_owner "candidate-pr-fetch-return"
   local fetched
   fetched="$(git -C "${REPO_ROOT}" rev-parse FETCH_HEAD 2>/dev/null || true)"
   if [[ "${fetched}" != "${SHA}" ]]; then
@@ -350,21 +372,25 @@ _prepare_candidate() {
     log "✗ fetch origin main 失败"
     return 1
   fi
+  _require_candidate_owner "candidate-main-fetch-return"
   if ! git -C "${REPO_ROOT}" merge-base --is-ancestor origin/main "${SHA}"; then
     log "✗ 候选分支未包含 origin/main —— 先 rebase/merge main 再部署"
     return 1
   fi
   if ! _merge_helper check --pr "${PR}" --sha "${SHA}" >>"${LOG}" 2>&1; then
     log "✗ Gitea PR 前置校验失败（closed / draft / head sha 不符）"
+    _candidate_owner "candidate-check-return failure; skip stale recovery" || return 1
     return 1
   fi
+  _require_candidate_owner "candidate-check-return"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "dry-run：候选前置校验通过，不 checkout"
     return 0
   fi
   ORIG_REF="$(git -C "${REPO_ROOT}" symbolic-ref --short -q HEAD \
     || git -C "${REPO_ROOT}" rev-parse HEAD)"
-  if ! git -C "${REPO_ROOT}" checkout --quiet --detach "${SHA}"; then
+  if ! _owned_checkout --candidate "${SHA}"; then
+    _require_candidate_owner "candidate-checkout-rejected"
     log "✗ checkout ${SHA:0:12} 失败"
     return 1
   fi
@@ -381,13 +407,18 @@ _merge_candidate() {
   printf '%s\n' "${out}" >>"${LOG}"
   if [[ ${rc} -ne 0 ]]; then
     log "✗ FF 合并失败 rc=${rc}：${out}"
-    log "  回滚流量到蓝，main 不动"
+    # Preserve the merge failure code, but never recover over a successor.
+    _candidate_owner "merge-return rc=${rc}; skip stale recovery" || return 1
+    log "  回滚流量到蓝；远端结果按助手日志核验"
     bash "${SCRIPT_DIR}/switch.sh" blue 100 >>"${LOG}" 2>&1 \
       || log "WARN: 回滚蓝失败，见 ${LOG}"
     return 1
   fi
+  # Record the completed remote fact before checking ownership of local recovery.
   log "✓ FF 合并完成：${out}"
+  _require_candidate_owner "merge-return; remote merge confirmed sha=${SHA}"
   _restore_main || true
+  _require_candidate_owner "merge-restore-return; remote merge confirmed sha=${SHA}"
   local head
   head="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
   if [[ "${head}" != "${SHA}" ]]; then
