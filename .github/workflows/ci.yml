@@ -110,7 +110,7 @@ jobs:
           fi
           python3 -m venv "${CI_ROOT}/venv"
           ${CI_ROOT}/venv/bin/pip install -r requirements.txt -q
-          ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" -q
+          ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" "PyYAML==6.0.3" -q
 
       - name: Ruff (changed .py files only)
         run: |
@@ -251,7 +251,7 @@ jobs:
           fi
           python3 -m venv "${CI_ROOT}/venv"
           ${CI_ROOT}/venv/bin/pip install -r requirements.txt -q
-          ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" radon bandit -q
+          ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" "PyYAML==6.0.3" radon bandit -q
 
       # 同一既有必需 check：台账必须与全部实现/文档一致，再验证 PR 的影响声明。
       # BASE_SHA 只作 main 参考；检查器内部用 merge-base，避免计入他人 main 变更。

@@ -1168,7 +1168,7 @@ Issue #155 的历史合并回归断言 fresh / archived / fallback 组合的事�
 `DAILYCHECK_HOSTING_PROVIDER` 缺省为 `gitea`，现有生产地址、凭据路径、部署阶段与
 队列不变。`scripts/hosting.py` 定义显式 `Provider` / `AccessRole` / `HostingConfig`，
 集中 GitHub REST 认证、JSON 响应、分页与错误边界。未知 provider、缺凭据、错误 host/repo、
-不完整或耗尽分页、网络/HTTP 错误均拒绝，不能把故障解释为零结果。
+不完整或耗尽分页、网络/HTTP 错误（含不符合 GitHub GET/POST/PATCH 契约的 2xx）均拒绝，不能把故障解释为零结果。
 GitHub 只接受 `https://api.github.com` 和 `DUIDUI-Studio/DailyCheck`（ID `1448986421`）。
 
 | 角色 | GitHub 凭据来源 | 可写范围 |
@@ -1222,7 +1222,8 @@ venv、测试 DB、pytest basetemp、证据和报告临时文件；Gitea 无 run
 event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 比较该 identity，同时
 重验真实 native exit/session/hash，v1 仅供已有直接调用，绑定请求不接受降级。
 只按同一 PR 取消过时 CI；push/dispatch 各自独立，不配置部署 concurrency。
-无 artifact-v4 依赖，不把 canceled/skipped 当成成功。
+无 artifact-v4 依赖，不把 canceled/skipped 当成成功。CI 测试依赖显式固定 PyYAML 6.0.3，
+用于 workflow fixture 解析，避免 test job 隐式依赖 reports job 的 bandit 间接安装。
 官方 action 版本与 Checks/Actions REST 形状经当前文档及目标仓只读 API 核实；本地校验不能
 证明远端 Gitea/GitHub runner 执行已成功，真实两端 CI 必须在后续授权发布后验证。
 

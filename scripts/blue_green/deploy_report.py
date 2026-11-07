@@ -240,7 +240,7 @@ def gitea(method: str, path: str, payload: dict[str, Any] | None = None) -> tupl
         client = HostingClient(HostingConfig.from_environment(role))
         try:
             client.verify_repository()
-            return 200 if method == "GET" else 201, json.dumps(client.request(method, path, payload)[0])
+            return 201 if method == "POST" else 200, json.dumps(client.request(method, path, payload)[0])
         except HostingError as exc:
             return exc.status, ""
     token = _token()

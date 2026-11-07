@@ -39,6 +39,7 @@ def test_both_servers_have_explicit_checkout_and_python_paths():
         assert gh["with"]["persist-credentials"] == "false"
         assert by_name["Setup Python on GitHub"]["uses"] == "actions/setup-python@v7"
         assert by_name["Python on Gitea (runner image)"]["if"] == source["if"]
+        assert '"PyYAML==6.0.3"' in by_name["Install dependencies"]["run"]
         assert "mktemp -d" in steps[0]["run"] and "$GITHUB_ENV" in steps[0]["run"]
         assert "candidate_binding.py" in by_name["Bind tested H and event H/B to this run"]["run"]
 

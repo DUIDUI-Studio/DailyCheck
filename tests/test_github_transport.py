@@ -505,7 +505,7 @@ def test_deploy_report_comment_pagination_and_edit_endpoint(api, monkeypatch):
     api.write(table)
     assert deploy_report.find_same_sha_comment(160, SHA) == 2
     status, _ = deploy_report.gitea("PATCH", ROOT + "/issues/comments/2", {"body": "updated"})
-    assert status == 201
+    assert status == 200
     assert api.log()[-1]["path"] == ROOT + "/issues/comments/2"
     table[ROOT + "/issues/160/comments?page=1"] = response([], status=401)
     api.write(table)
@@ -683,3 +683,23 @@ def test_shadow_root_cannot_overlap_production_state(api, monkeypatch, root):
     monkeypatch.setenv("DAILYCHECK_GITHUB_SHADOW_DIR", root)
     with pytest.raises(HostingError):
         require_shadow_path(Path(root) / "inbox.jsonl")
+
+
+@pytest.mark.parametrize(
+    "method,status,role,path",
+    [
+        ("GET", 202, AccessRole.READ, ROOT),
+        ("GET", 201, AccessRole.READ, ROOT),
+        ("POST", 200, AccessRole.FEEDBACK, ROOT + "/issues"),
+        ("PATCH", 201, AccessRole.REPORT, ROOT + "/issues/comments/1"),
+    ],
+)
+def test_github_unexpected_success_code_is_not_terminal_success(
+    api, monkeypatch, method, status, role, path
+):
+    monkeypatch.setenv("DAILYCHECK_GITHUB_FEEDBACK_TOKEN", "test-credential")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_REPORT_TOKEN", "test-credential")
+    api.write({path: response({"id": 1}, status=status)})
+    with pytest.raises(HostingError) as error:
+        api.client(role).request(method, path)
+    assert error.value.status == status

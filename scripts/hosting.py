@@ -239,7 +239,10 @@ class HostingClient:
             if proc.returncode or not sep or len(raw.encode()) > self.MAX_BYTES:
                 raise HostingError("hosting_network_error")
             code = int(status)
-            if not 200 <= code < 300:
+            expected = {"GET": 200, "POST": 201, "PATCH": 200}
+            if not 200 <= code < 300 or (
+                c.provider is Provider.GITHUB and code != expected.get(method)
+            ):
                 raise HostingError("hosting_http_error", code)
             data = json.loads(raw, object_pairs_hook=_json_object, parse_constant=_invalid_constant)
             return data, raw_headers
