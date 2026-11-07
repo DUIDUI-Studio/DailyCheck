@@ -481,6 +481,8 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 ### 3.8 部署单飞（single-flight deploy，2026-10-16 起）
 
+Issue #161 本地回归入口：`tests/test_deploy_attempt_fencing.py`，以真实 pipeline/CLI 子进程和 pipe 栅栏复现暂停活进程的过期租约、同 PR token 替换、release 失败及完整 SHA 前缀碰撞；测试不连接生产设施，pipe 子进程在完成后显式回收。
+
 **问题**：Prod Agent 的一个「merge → 部署」会话是 40-60 分钟长流程（up → verify → 绿转正 → switch → 观察窗），而 webhook 事件天生并发（两个 PR 同时全绿 / 同一 PR 多个 check_suite / 兜底轮询补刀）——两个部署会话在同一套蓝绿设施上重叠 = up/switch/rollback 交错互踩。**单飞 = 同一时刻全系统至多一个部署会话在动蓝绿设施**，且「谁欠谁一次部署」由状态事实判定，不靠会话记忆。
 
 **① 状态原语** `scripts/blue_green/deploy_state.py`（stdlib only；状态目录 `DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy/`）：
