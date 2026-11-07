@@ -817,3 +817,98 @@ def test_public_summary_rejects_private_or_unknown_fields(changes):
     with pytest.raises(ValueError):
         fp.public_engineering_projection(public_draft(**changes), str(uuid.uuid4()),
                                         "synthetic-authorized-review", review=SyntheticTrustedReview())
+
+
+def test_claim_requires_exact_approved_draft_version(master_conn):
+    value = ticket(master_conn)
+    approved = fp.draft_version(value["draft_title"], value["draft_body"])
+    assert fp.save_private_draft(
+        master_conn, value, "Replacement title", PRIVATE + " replacement draft", approved)
+    replaced = fp.get_ticket(master_conn, value["id"])
+    assert replaced["draft_body"].endswith("replacement draft")
+
+    assert fp.claim_private_delivery(
+        master_conn, value["id"], 1, approved_version=approved) is None
+    assert not master_conn.execute("SELECT * FROM feedback_delivery_receipts").fetchall()
+    assert fp.get_ticket(master_conn, value["id"])["draft_body"].endswith("replacement draft")
+
+
+def test_dispatch_rejects_draft_replaced_during_private_metadata(
+        http_api, logged_client, tmp_path):
+    """A concurrent first review must not be published by an older second review."""
+    import config
+
+    client, _ = logged_client
+    assert client.post("/feedback", data={
+        "title": "Synthetic HTTP interleaving", "body": PRIVATE}).status_code == 302
+    with sqlite3.connect(config.MASTER_DB) as db:
+        tid = db.execute("SELECT id FROM feedback_tickets").fetchone()[0]
+    assert client.post(
+        f"/admin/feedback/{tid}/analyze", data={"mode": "template"}).status_code == 302
+    with sqlite3.connect(config.MASTER_DB) as db:
+        db.row_factory = sqlite3.Row
+        original = fp.get_ticket(db, tid)
+    approved_body = PRIVATE + " second-reviewed approved payload"
+    reanalyzed = []
+
+    def concurrent_first_review(_metadata):
+        if reanalyzed:
+            return
+        reanalyzed.append("entered")
+        independent = client.application.test_client()
+        with independent.session_transaction() as session:
+            session["user_id"], session["warehouse_id"] = 1, 1
+        response = independent.post(f"/admin/feedback/{tid}/analyze", data={
+            "mode": "template",
+            "comment": PRIVATE + "_NEW_FIRST_REVIEW_NOT_SECOND_APPROVED"})
+        reanalyzed.append(response.status_code)
+
+    http_api["metadata_hook"] = concurrent_first_review
+    result = client.post(f"/admin/feedback/{tid}/dispatch", data={
+        "draft_title": "Synthetic approved HTTP title", "draft_body": approved_body,
+        "draft_version": fp.draft_version(original["draft_title"], original["draft_body"]),
+        "comment": "Synthetic old second review"})
+    assert result.status_code == 302 and reanalyzed == ["entered", 302]
+    with sqlite3.connect(config.MASTER_DB) as db:
+        db.row_factory = sqlite3.Row
+        stored = fp.get_ticket(db, tid)
+        receipt_count = db.execute(
+            "SELECT count(*) FROM feedback_delivery_receipts").fetchone()[0]
+        old_review = db.execute(
+            "SELECT dispatched_at FROM feedback_comments WHERE body=?",
+            ("Synthetic old second review",)).fetchone()[0]
+    observed = {
+        "source_function_wrappers": False,
+        "preflight_http_allowed_concurrent_native_reanalysis": True,
+        "issue_post_count": len([r for r in writes(http_api)
+                                 if r["path"].endswith("/issues")]),
+        "ticket_status": stored["status"], "receipt_count": receipt_count,
+        "replacement_draft_preserved": (
+            PRIVATE + "_NEW_FIRST_REVIEW_NOT_SECOND_APPROVED" in stored["draft_body"]),
+        "old_second_review_marked_dispatched": old_review is not None,
+    }
+    (tmp_path / "repair-race-observed.json").write_text(json.dumps(observed, indent=2))
+    print(json.dumps(observed, indent=2))
+    assert observed["replacement_draft_preserved"]
+    assert observed["issue_post_count"] == 0
+    assert observed["receipt_count"] == 0
+    assert observed["ticket_status"] == "analyzed"
+    assert not observed["old_second_review_marked_dispatched"]
+
+    # The replacement draft, after its own second review, dispatches exactly once.
+    http_api["metadata_hook"] = None
+    with sqlite3.connect(config.MASTER_DB) as db:
+        db.row_factory = sqlite3.Row
+        replacement = fp.get_ticket(db, tid)
+    assert client.post(f"/admin/feedback/{tid}/dispatch", data={
+        "draft_title": replacement["draft_title"], "draft_body": replacement["draft_body"],
+        "draft_version": fp.draft_version(
+            replacement["draft_title"], replacement["draft_body"]),
+        "comment": "Synthetic second review of replacement"}).status_code == 302
+    assert len(http_api["issues"]) == 1
+    with sqlite3.connect(config.MASTER_DB) as db:
+        assert db.execute(
+            "SELECT status FROM feedback_tickets WHERE id=?", (tid,)).fetchone()[0] == "dispatched"
+        assert db.execute(
+            "SELECT state FROM feedback_delivery_receipts WHERE ticket_id=?",
+            (tid,)).fetchone()[0] == "linked"
