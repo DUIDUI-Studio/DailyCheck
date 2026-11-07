@@ -283,7 +283,8 @@ class QueueReader:
         return validate_manifest(repo, value), bodies
 
 
-def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: Path, text: Path) -> None:
+def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: Path, text: Path,
+                 *, trusted: bool = False) -> None:
     """Full G coverage is reused only after the caller compared its tagged binding.
 
     Each member's body, MCP impact, redlines and hygiene run on that exact H in
@@ -294,10 +295,15 @@ def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: P
     if git(repo, "rev-parse", "HEAD") != manifest["group_sha"]:
         raise ValueError("member report controller must be checked out at G")
     python = sys.executable
-    subprocess.run([python, "-I", "-c",
-                    "import sys,runpy;sys.path.insert(0,sys.argv.pop(1));"
-                    "runpy.run_module('scripts.mcp_contracts',run_name='__main__')",
-                    str(repo), "--check"], cwd=repo, check=True)
+    if trusted:
+        from scripts.ci.trusted_producer import AUTHORITY, python_gate_command
+
+        subprocess.run(python_gate_command("mcp", repo, "--check"), cwd=repo, check=True)
+    else:
+        subprocess.run([python, "-I", "-c",
+                        "import sys,runpy;sys.path.insert(0,sys.argv.pop(1));"
+                        "runpy.run_module('scripts.mcp_contracts',run_name='__main__')",
+                        str(repo), "--check"], cwd=repo, check=True)
     with tempfile.TemporaryDirectory(prefix="dailycheck-members-", dir=os.environ.get("CI_ROOT")) as temp:
         for member in manifest["members"]:
             body = bodies[member["number"]]
@@ -313,15 +319,23 @@ def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: P
                                "--base", member["base_sha"], "--body-file", str(body_file)]
                     if script == "check_pr_hygiene.py":
                         command += ["--branch", member["head_ref"]]
+                    if trusted:
+                        gate = {"check_mcp_impact.py": "mcp-impact", "check_redlines.py": "redlines",
+                                "check_pr_hygiene.py": "hygiene"}[script]
+                        command = python_gate_command(gate, repo, *command[3:])
                     subprocess.run(command, cwd=root, check=True)
             finally:
                 subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(root)], check=True)
             env = {**os.environ, "PR_NUM": str(member["number"]), "PR_BODY_FILE": str(body_file),
                    "BASE_SHA": manifest["expected_predecessor_sha"], "HEAD_SHA": manifest["group_sha"],
                    "PYTEST_REUSE_FILE": str(text.resolve()), "PYTEST_REUSE_EVIDENCE": str(evidence.resolve())}
+            if trusted:
+                env["DAILYCHECK_CI_AUTHORITY"] = str(AUTHORITY)
             subprocess.run(["bash", "scripts/agent_framework/generate_reports.sh"], cwd=repo, env=env, check=True)
-            subprocess.run(["bash", "scripts/agent_framework/preview.sh", str(member["number"])], cwd=repo, env=env, check=True)
-            subprocess.run([python, "scripts/agent_framework/check_reports.py"], cwd=repo, env=env, check=True)
+            subprocess.run(["bash", "scripts/agent_framework/preview.sh", str(member["number"]),
+                            *(["--trusted-ci"] if trusted else [])], cwd=repo, env=env, check=True)
+            subprocess.run(python_gate_command("reports", repo) if trusted else
+                           [python, "scripts/agent_framework/check_reports.py"], cwd=repo, env=env, check=True)
 
 
 def make_attestation(envelope: dict, members: list[dict], context: str) -> dict:

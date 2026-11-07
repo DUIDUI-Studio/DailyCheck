@@ -11,16 +11,91 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib.util
 import json
+import multiprocessing
 import os
 import re
 import subprocess
 import sys
+import traceback
 import uuid
 from pathlib import Path, PurePosixPath
 
 AUTHORITY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHORITY))
+
+# A fixed set of approved CI entrypoints, not candidate-selected executable paths.
+PYTHON_GATES = {
+    "preview": ("scripts/dev_smoke_t11_e2e.py", "e2e_smoke"),
+    "mcp": ("scripts/mcp_contracts.py", "main"),
+    "reports": ("scripts/agent_framework/check_reports.py", "main"),
+    "mcp-impact": ("scripts/agent_framework/check_mcp_impact.py", "main"),
+    "redlines": ("scripts/agent_framework/check_redlines.py", "main"),
+    "hygiene": ("scripts/agent_framework/check_pr_hygiene.py", "main"),
+}
+
+
+def python_gate_command(gate: str, repo: Path, *arguments: str) -> list[str]:
+    return [sys.executable, "-I", str(AUTHORITY / "scripts/ci/trusted_producer.py"),
+            "python-gate", "--gate", gate, "--repo", str(repo), "--", *arguments]
+
+
+def _python_gate_child(gate: str, repo: Path, arguments: list[str], completion):
+    """Only this child imports the application. The supervisor never does.
+
+    Runtime/approved packages precede explicit application-under-test lookup.
+    The pipe reports a normal return of the pinned entrypoint, never log text.
+    This is execution supervision, not cryptographic integrity over arbitrary
+    Python code that deliberately tampers with its own process.
+    """
+    try:
+        if not __debug__:
+            raise ValueError("CI assertions must be enabled")
+        repo = repo.resolve()
+        sys.path[:] = [path for path in sys.path
+                       if not Path(path or os.getcwd()).resolve().is_relative_to(repo)]
+        sys.path.append(str(repo))
+        filename, entrypoint = PYTHON_GATES[gate]
+        path = repo / filename
+        sys.argv = [str(path), *arguments]
+        spec = importlib.util.spec_from_file_location("_dailycheck_ci_gate", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        result = getattr(module, entrypoint)()
+        expected = result is None if gate == "preview" else type(result) is int and result == 0
+        if not expected:
+            raise ValueError("CI entrypoint did not return success")
+        completion.send(("normal_return", gate))
+    except BaseException:
+        traceback.print_exc()
+        raise SystemExit(1) from None
+    finally:
+        completion.close()
+
+
+def run_python_gate(gate: str, repo: Path, arguments: list[str]) -> int:
+    """Native0 without a normal driver return fails, including os._exit(0)."""
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_python_gate_child, args=(gate, repo, arguments, sender))
+    try:
+        process.start()
+        sender.close()
+        process.join()  # The enclosing owned container retains its wall limit.
+        try:
+            completed = receiver.recv() if receiver.poll() else None
+        except EOFError:
+            completed = None
+        if process.exitcode != 0 or completed != ("normal_return", gate):
+            print(f"[ci-python-gate] {gate}: missing normal driver completion", file=sys.stderr)
+            return 1
+        print(f"[ci-python-gate] {gate}: normal driver completion")
+        return 0
+    finally:
+        sender.close()
+        receiver.close()
 
 
 def digest(value):
@@ -257,6 +332,7 @@ def report_inner(candidate: Path, context: str):
     members, binding = data["members"], data["binding"]
     proof = Path("/input")
     env = {**os.environ, "CI_ROOT": "/tmp", "DAILYCHECK_CI_TMP": "/tmp",
+           "DAILYCHECK_CI_AUTHORITY": str(AUTHORITY),
            "PYTEST_REUSE_FILE": str(proof / "output.txt"),
            "PYTEST_REUSE_EVIDENCE": str(proof / "evidence.json")}
 
@@ -266,27 +342,28 @@ def report_inner(candidate: Path, context: str):
     if context == "report-verify":
         # No candidate module imports or execution in this fresh verifier.
         for member in members:
-            run([sys.executable, "-I", "scripts/agent_framework/check_reports.py"],
+            run(python_gate_command("reports", candidate),
                 {"PR_NUM": str(member["number"]), "PR_BODY_FILE": str(proof / f'body-{member["number"]}.md')})
         return
     if binding["phase"] == "G":
         os.environ.update(env)
         member_gates(candidate, data["manifest"], {m["number"]: m["body"] for m in members},
-                     proof / "evidence.json", proof / "output.txt")
+                     proof / "evidence.json", proof / "output.txt", trusted=True)
     else:
-        run([sys.executable, "-I", "-c", "import sys,runpy;sys.path.insert(0,'/candidate');runpy.run_module('scripts.mcp_contracts',run_name='__main__')", "--check"])
+        run(python_gate_command("mcp", candidate, "--check"))
         member = members[0]
         body = str(proof / f'body-{member["number"]}.md')
         for script in ("check_mcp_impact.py", "check_redlines.py", "check_pr_hygiene.py"):
-            argv = [sys.executable, "-I", "scripts/agent_framework/" + script,
-                    "--base", binding["CI_BASE_SHA"], "--body-file", body]
+            gate = {"check_mcp_impact.py": "mcp-impact", "check_redlines.py": "redlines",
+                    "check_pr_hygiene.py": "hygiene"}[script]
+            arguments = ["--base", binding["CI_BASE_SHA"], "--body-file", body]
             if script == "check_pr_hygiene.py":
-                argv += ["--branch", member["head_ref"]]
-            run(argv)
+                arguments += ["--branch", member["head_ref"]]
+            run(python_gate_command(gate, candidate, *arguments))
         extra = {"PR_NUM": str(member["number"]), "BASE_SHA": binding["CI_BASE_SHA"],
                  "HEAD_SHA": binding["tested_sha"], "PR_BODY_FILE": body}
         run(["bash", "scripts/agent_framework/generate_reports.sh"], extra)
-        run(["bash", "scripts/agent_framework/preview.sh", str(member["number"])], extra)
+        run(["bash", "scripts/agent_framework/preview.sh", str(member["number"]), "--trusted-ci"], extra)
 
 
 def snapshot(repo: Path, destination: Path, head: str):
@@ -377,7 +454,7 @@ def job(args):
         gates = []
         for kind in ("report-generate", "report-verify"):
             captured, _, _ = runner.capture(candidate, binding, kind, args.context,
-                ["python3", "-I", "/candidate/scripts/ci/trusted_producer.py", kind], {},
+                ["python3", "-I", "/authority/scripts/ci/trusted_producer.py", kind], {},
                 trusted_scripts=True, readonly=kind == "report-verify", inputs=proof)
             if captured["native_exit"] != 0:
                 raise ValueError("actual report gate failed")
@@ -404,12 +481,20 @@ def job(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("job", "report-generate", "report-verify"))
+    parser.add_argument("command", choices=("job", "report-generate", "report-verify", "python-gate"))
     parser.add_argument("--context", choices=("test", "agent-framework-reports"))
     parser.add_argument("--docker", default="/usr/bin/docker")
     parser.add_argument("--docker-config")
     parser.add_argument("--docker-host")
-    args = parser.parse_args()
+    parser.add_argument("--gate", choices=PYTHON_GATES)
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    args, arguments = parser.parse_known_args()
+    if args.command == "python-gate":
+        if not args.gate:
+            parser.error("--gate required")
+        raise SystemExit(run_python_gate(args.gate, args.repo, arguments[1:] if arguments[:1] == ["--"] else arguments))
+    if arguments:
+        parser.error("unexpected arguments")
     if args.command == "job":
         job(args)
     else:

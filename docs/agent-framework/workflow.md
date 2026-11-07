@@ -185,8 +185,11 @@ HEAD 或 PR body 选择 producer。helper/runtime 更新需新的独立批准 pi
 native job 的平台 controller 不执行 candidate code；pytest 在无网络、无 daemon socket、
 nonroot/read-only runtime 容器运行，controller 在容器外捕获 native exit/output。reports 复用
 exact test capture，在隔离容器执行全部报告/成员门禁，再由 fresh verifier 核验；失败、
-skip、cancel、timeout、缺 session/provenance 不能作为 green。candidate log 不能注入原生
-attestation。queue 的普通 unbuilt tail 不属于 ready G prefix；included graph/成员仍严格验证。
+skip、cancel、timeout、缺 session/provenance 不能作为 green。candidate log 不能注入原生 attestation。
+preview 的 trusted-mode 依赖来自固定 runtime/authority，candidate app 仅为显式被测对象，
+不从其 venv 选取 gate 依赖。固定 supervisor 通过正常返回与进程 exit 同时确认 T11/MCP/
+Python gate 完成；native0、早退或 stdout 成功文本不能单独证明完成。默认 Gitea 入口保留。
+queue 的普通 unbuilt tail 不属于 ready G prefix；included graph/成员仍严格验证。
 当前 manifest 仅批准 bounded local linux/arm64 fixture，hosted CI/amd64/Prod 安装未证明，
 真实 activation 保持 OFF；不将 synthetic parser/unit proof 或本地 fixture 报为部署成功。
 PR body 是数据。只取消同 PR 旧 CI；group 以 event/G/run 独立并发，不取消 production。

@@ -24,7 +24,12 @@ echo "[preview] running T11 E2E smoke for PR #${PR_NUM} ..."
 
 # 跑现有冒烟脚本（test client 形式，不依赖真实端口）
 SMOKE_OUTPUT="${DAILYCHECK_CI_TMP:-/tmp}/preview-smoke-${PR_NUM}.txt"
-if python3 "${REPO_ROOT}/scripts/dev_smoke_t11_e2e.py" > "${SMOKE_OUTPUT}" 2>&1; then
+if [[ "${2:-}" == "--trusted-ci" ]]; then
+  SMOKE_COMMAND=(python3 -I "${DAILYCHECK_CI_AUTHORITY:?approved CI authority required}/scripts/ci/trusted_producer.py" python-gate --gate preview --repo "${REPO_ROOT}")
+else
+  SMOKE_COMMAND=(python3 "${REPO_ROOT}/scripts/dev_smoke_t11_e2e.py")
+fi
+if "${SMOKE_COMMAND[@]}" > "${SMOKE_OUTPUT}" 2>&1; then
   SMOKE_STATUS="✅ PASS"
 else
   SMOKE_STATUS="❌ FAIL"

@@ -1441,8 +1441,10 @@ runtime、independent review 和 signer identity 必须来自受保护 port；�
 默认 signer 缺失即拒绝，shadow reducer/HostingClient 写权限不扩张。
 
 **Issue164 producer ownership 修复（local fixture only，真实激活仍关闭）**：protected
-bc77 独立 review 另证实 preview 仍会显式导入 candidate venv，且 native0 不证明 T11
-driver 正常完成；对应三种早退回归当前为红，后续修复须覆盖依赖查找与正常返回边界。
+bc77 独立 review 证实原 preview 的 candidate venv 查找与 native0 成功判据可跳过 T11。
+修复后 trusted CI 的固定 Python gate supervisor 只在子进程正常返回 pinned entrypoint 后
+成功；通过独立 IPC 接收正常返回，且同时检查子进程 exit，而非依赖 stdout token/native0。
+SystemExit0、os._exit0、异常、缺失返回均失败。该机制不是任意恶意 Python app 的密码学证明。
 `ProducerPolicy.producer_manifest_blob_sha` 与 workflow blob 分别固定；approved YAML 用
 literal manifest Git blob 导出 `producer_manifest.json` 的整个执行闭包。manifest 不包含自身
 或 YAML，避免循环 commit pin；helper/runtime 更新必须产生新的、独立审批的两个 pin，PR
@@ -1459,6 +1461,11 @@ daemon socket/credentials/host PID 的固定 image 容器运行一次完整 pyte
 或 attestation channel。timeout/OOM/不明 exit/缺 session/logs 均失败，controller 死亡无 proof。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
+该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找
+优先于显式 candidate application-under-test 路径。preview 的 `--trusted-ci` 调用 supervised
+T11 函数，MCP 与 Python report/member gates 共用正常返回边界。driver 不在可信模式添加
+candidate venv，report checker 不再提升 candidate 根到依赖查找首位。默认 Gitea/direct
+preview 仍走原入口；T11 业务断言、日期、模板未修改，当前未适配 app 的失败仍保持失败。
 新的 read-only verifier 容器不导入 candidate application。其 helper/runtime 与输入 body/proof
 均只读；controller 复核生成报告的 exact test evidence，并记录两个真实 gate native exits。
 Reader 通过 authenticated immutable Git blob API 核验 protected manifest，再核验 actual

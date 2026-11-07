@@ -1,23 +1,18 @@
 """T11 端到端冒烟：模拟 storefront → DC → storefront 三角色流。"""
 from __future__ import annotations
 
-import re
 import sqlite3
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / ".venv/lib/python3.12/site-packages"))
-
-from app import create_app  # noqa: E402
-
 MASTER_DB = REPO / "db/master.db"
 
 
 def _make_test_env():
     """创建临时 master.db + warehouse dbs（不影响 dev 数据）。"""
-    import tempfile, os, shutil
+    import tempfile
+
     from db import init_master_db, init_warehouse_db
 
     tmp = Path(tempfile.mkdtemp(prefix="dc_e2e_t11_"))
@@ -28,8 +23,8 @@ def _make_test_env():
     store_path = wh_dir / "store.db"
     init_master_db()
     # monkey-patch
-    import db as db_module
     import config as config_module
+    import db as db_module
     db_module.MASTER_DB = master_path
     db_module.WAREHOUSE_DB_DIR = wh_dir
     config_module.MASTER_DB = master_path
@@ -83,6 +78,8 @@ def _make_test_env():
 
 
 def e2e_smoke():
+    from app import create_app
+
     tmp, master_path = _make_test_env()
     app = create_app()
     app.config["TESTING"] = True
@@ -224,4 +221,8 @@ def e2e_smoke():
 
 
 if __name__ == "__main__":
+    # Legacy direct/Gitea invocation retains its established environment.
+    # Trusted CI calls e2e_smoke through the approved runtime-first supervisor.
+    sys.path.insert(0, str(REPO))
+    sys.path.insert(0, str(REPO / ".venv/lib/python3.12/site-packages"))
     e2e_smoke()

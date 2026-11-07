@@ -145,11 +145,13 @@ def test_changed_producer_requires_new_explicit_pin():
 @pytest.mark.parametrize("attack", ["venv", "system_exit", "os_exit"])
 def test_trusted_preview_requires_driver_normal_return(tmp_path, attack):
     repo = tmp_path / "candidate"
-    for name in ("scripts/agent_framework/preview.sh", "scripts/dev_smoke_t11_e2e.py",
-                 "scripts/ci/trusted_producer.py"):
+    for name in ("scripts/agent_framework/preview.sh", "scripts/dev_smoke_t11_e2e.py"):
         target = repo / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, target)
+    authority = tmp_path / "authority"
+    (authority / "scripts/ci").mkdir(parents=True)
+    shutil.copyfile(ROOT / "scripts/ci/trusted_producer.py", authority / "scripts/ci/trusted_producer.py")
     marker = repo / "venv-hit"
     payload = (f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
                "print('=== T11 E2E SMOKE PASSED ===')\nraise SystemExit(0)\n")
@@ -163,13 +165,71 @@ def test_trusted_preview_requires_driver_normal_return(tmp_path, attack):
     else:
         (repo / "app.py").write_text("import os\nprint('=== T11 E2E SMOKE PASSED ===',flush=True)\nos._exit(0)\n")
     env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
-           "DAILYCHECK_CI_TMP": str(tmp_path), "DAILYCHECK_DB_DIR": str(tmp_path / "db")}
+           "DAILYCHECK_CI_TMP": str(tmp_path), "DAILYCHECK_DB_DIR": str(tmp_path / "db"),
+           "DAILYCHECK_CI_AUTHORITY": str(authority)}
     result = subprocess.run(["bash", str(repo / "scripts/agent_framework/preview.sh"), "3", "--trusted-ci"],
                             cwd=repo, env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "FAIL" in (repo / "reports/pr-3/04-local-deploy-preview.md").read_text()
     if attack == "venv":
         assert not marker.exists()
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("return None", 0),
+    ("raise SystemExit(0)", 1),
+    ("import os; os._exit(0)", 1),
+    ("raise RuntimeError('incomplete')", 1),
+])
+def test_python_gate_observes_normal_return_not_stdout_or_native_zero(tmp_path, body, expected):
+    # Synthetic driver tests the supervisor's call/return contract. The runtime
+    # cohort separately executes the real pinned T11 assertions and application.
+    repo = tmp_path / "candidate"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "scripts/dev_smoke_t11_e2e.py").write_text(
+        "def e2e_smoke():\n    print('normal driver completion',flush=True)\n    " + body + "\n")
+    result = subprocess.run([sys.executable, "-I", str(ROOT / "scripts/ci/trusted_producer.py"),
+                             "python-gate", "--gate", "preview", "--repo", str(repo)],
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == expected, result.stdout + result.stderr
+
+
+def test_trusted_preview_keeps_runtime_dependencies_ahead_of_candidate(tmp_path):
+    repo = tmp_path / "candidate"
+    for name in ("scripts/agent_framework/preview.sh", "scripts/dev_smoke_t11_e2e.py"):
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, target)
+    shadow_hit = repo / "shadow-hit"
+    selected = repo / "selected-runtime"
+    (repo / "flask.py").write_text(
+        f"from pathlib import Path\nPath({str(shadow_hit)!r}).write_text('shadow')\nraise SystemExit(0)\n")
+    (repo / "app.py").write_text(
+        f"import flask\nfrom pathlib import Path\nPath({str(selected)!r}).write_text(flask.__file__)\n"
+        "raise RuntimeError('stop after dependency control')\n")
+    authority = tmp_path / "authority"
+    (authority / "scripts/ci").mkdir(parents=True)
+    shutil.copyfile(ROOT / "scripts/ci/trusted_producer.py", authority / "scripts/ci/trusted_producer.py")
+    env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+           "DAILYCHECK_CI_AUTHORITY": str(authority), "DAILYCHECK_CI_TMP": str(tmp_path)}
+    result = subprocess.run(["bash", str(repo / "scripts/agent_framework/preview.sh"), "3", "--trusted-ci"],
+                            cwd=repo, env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1
+    assert not shadow_hit.exists()
+    assert not Path(selected.read_text()).is_relative_to(repo)
+
+
+def test_legacy_preview_keeps_direct_driver_and_failure(tmp_path):
+    repo = tmp_path / "candidate"
+    (repo / "scripts/agent_framework").mkdir(parents=True)
+    shutil.copyfile(ROOT / "scripts/agent_framework/preview.sh", repo / "scripts/agent_framework/preview.sh")
+    (repo / "scripts/dev_smoke_t11_e2e.py").write_text("print('legacy driver really ran')\nraise SystemExit(1)\n")
+    env = {key: value for key, value in os.environ.items() if key != "DAILYCHECK_CI_AUTHORITY"}
+    env["DAILYCHECK_CI_TMP"] = str(tmp_path)
+    result = subprocess.run(["bash", str(repo / "scripts/agent_framework/preview.sh"), "3"],
+                            cwd=repo, env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1
+    assert "legacy driver really ran" in (tmp_path / "preview-smoke-3.txt").read_text()
 
 
 @pytest.mark.skipif(not os.environ.get("DAILYCHECK_NATIVE_PRODUCER_FIXTURE_DRIVER"),
