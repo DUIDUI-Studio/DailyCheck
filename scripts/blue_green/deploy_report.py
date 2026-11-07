@@ -712,6 +712,7 @@ def publish_public(facts: PublicDeployFacts, context: PublicationContext,
     root = f"/repos/{client.config.repo}"
     with authority.claim(context, digest) as claim:
         claim.check_current()
+        guard_fd = getattr(claim, "transport_guard_fd", None)
         metadata = client.verify_repository()
         if metadata.get("private") is not False or metadata.get("visibility") != "public":
             raise HostingError("public_report_destination_mismatch")
@@ -745,7 +746,7 @@ def publish_public(facts: PublicDeployFacts, context: PublicationContext,
             claim.intent()
             claim.check_current()
             ident = confirm(client.request("POST", root + f"/issues/{facts.pr}/comments",
-                                           {"body": body})[0])
+                                           {"body": body}, guard_fd=guard_fd)[0])
         claim.check_current()
         claim.bind(ident)
         return ident

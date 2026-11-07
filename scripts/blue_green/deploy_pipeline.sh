@@ -170,7 +170,11 @@ log "log=${LOG}"
 
 # ---------------------------------------------------------------- 收锁
 _release() {
-  local result=$1 note="${2:-}"
+  local result=$1 note="${2:-}" rc="${3:-0}" stage="${4:-complete}"
+  if [[ "${result}" == "success" ]]; then
+    rc=0
+    stage="complete"
+  fi
   # Honest private classification: a success that skipped verify or used a
   # shortened observation window must not be recorded as normal verification.
   local verification="normal"
@@ -182,7 +186,7 @@ _release() {
     verification="short-observe"
   fi
   RELEASE_ATTEMPTED=1
-  if "${PY}" "${DS}" release --token "${ATTEMPT_TOKEN}" --result "${result}" --sha "${SHA}" --note "${note}" --verification "${verification}" >>"${LOG}" 2>&1; then
+  if "${PY}" "${DS}" release --token "${ATTEMPT_TOKEN}" --result "${result}" --sha "${SHA}" --note "${note}" --rc "${rc}" --stage "${stage}" --verification "${verification}" >>"${LOG}" 2>&1; then
     log "release(${result}) 完成"
   else
     FAIL_STAGE="${FAIL_STAGE:-release}"
@@ -244,7 +248,7 @@ cleanup() {
     if [[ ${rc} -eq 0 ]]; then
       _release success || rc=27
     else
-      _release failed "${FAIL_STAGE:-aborted} rc=${rc}" \
+      _release failed "${FAIL_STAGE:-aborted} rc=${rc}" "${rc}" "${FAIL_STAGE:-aborted}" \
         || log "收锁结果未确认；保留原失败码 rc=${rc}"
     fi
   fi
@@ -269,12 +273,28 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------- 抢锁 + 心跳
+# Actual deployment provenance captured at attempt creation; it is immutable for
+# the outcome and cannot be retargeted later by provider/configuration changes.
+_DEPLOYMENT_PROVIDER="${DAILYCHECK_HOSTING_PROVIDER:-gitea}"
+if [[ "${_DEPLOYMENT_PROVIDER}" == "github" ]]; then
+  _DEPLOYMENT_HOST="github.com"
+  _DEPLOYMENT_REPO="${DAILYCHECK_GITHUB_REPO:-DUIDUI-Studio/DailyCheck}"
+else
+  _gitea_api="${GITEA_API:-${FEEDBACK_GITEA_API:-http://172.28.129.216:3000/api/v1}}"
+  _DEPLOYMENT_HOST="${_gitea_api#*://}"
+  _DEPLOYMENT_HOST="${_DEPLOYMENT_HOST%%/*}"
+  _DEPLOYMENT_REPO="${GITEA_REPO:-${FEEDBACK_GITEA_REPO:-eric/dailycheck}}"
+fi
+
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   log "dry-run：跳过 acquire / 心跳 / release（不碰部署状态）"
 else
   _acq_rc=0
   _acq_out="$("${PY}" "${DS}" acquire --pr "${PR}" --sha "${SHA}" \
-              --session "${SESSION}" --phase "pipeline-start" 2>>"${LOG}")" || _acq_rc=$?
+              --session "${SESSION}" --phase "pipeline-start" \
+              --deployment-provider "${_DEPLOYMENT_PROVIDER}" \
+              --deployment-host "${_DEPLOYMENT_HOST}" \
+              --deployment-repository "${_DEPLOYMENT_REPO}" 2>>"${LOG}")" || _acq_rc=$?
   case "${_acq_rc}" in
     0)
       ATTEMPT_TOKEN="$(printf '%s' "${_acq_out}" | "${PY}" -c 'import json,sys; print(json.load(sys.stdin)["token"])')"

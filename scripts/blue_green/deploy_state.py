@@ -85,9 +85,14 @@ PUBLIC_CODE_HOSTING = {
     "repository": "DUIDUI-Studio/DailyCheck",
 }
 OUTCOME_RESULT_SUCCESS = "success"
+OUTCOME_RESULT_FAILED = "failed"
+DEPLOYMENT_PROVIDERS = {"github", "gitea"}
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 ATTEMPT_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
 VERIFICATION = re.compile(r"[A-Za-z0-9._+-]{1,60}")
+HOST_NAME = re.compile(r"[A-Za-z0-9.:-]+")
+REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+OUTCOME_STAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
 
 
 EXIT_OK = 0
@@ -352,6 +357,34 @@ process_lock_fd = _process_lock_fd
 now_epoch = _now
 
 
+@contextmanager
+def publication_config_transaction(directory: Path):
+    """Order a cooperating private-mapping write against publication HTTP.
+
+    The future off-repo installer updates `bindings.json` through this helper:
+    it takes the same `.attempt.lock` process exclusion a normal pipeline or a
+    post-exit publication retry holds, then the ordinary `.state.lock`
+    transaction. A writer that wins first therefore changes the binding before
+    the claim reads it (the stale context then fails closed); a writer that
+    loses waits until the publication and its actual HTTP mutator finish, so
+    the accepted POST is ordered before the binding change. This is not a new
+    lock family, queue or service.
+    """
+    if _process_lock_fd() is not None:
+        raise RuntimeError(
+            "publication_config_transaction cannot nest inside a deployment attempt")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(directory / ATTEMPT_LOCK_FILENAME, "a+") as fh:
+        os.chmod(fh.name, 0o600)
+        fcntl.flock(fh, fcntl.LOCK_EX)  # blocking: wait for an in-flight publication
+        try:
+            with _write_lock(directory) as boundary:
+                yield boundary
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _lock_active(lock, now: int, ttl: int) -> bool:
     if not isinstance(lock, dict):
         return False
@@ -424,6 +457,21 @@ def cmd_check(args) -> int:
     return EXIT_LOCK_BUSY if active else EXIT_OK
 
 
+def _deployment_identity(provider, host, repository, pr) -> dict | None:
+    """Immutable actual deployment provenance; never default a missing provider."""
+    provider = (provider or "").strip().lower()
+    host = (host or "").strip()
+    repository = (repository or "").strip()
+    if not provider and not host and not repository:
+        return None
+    if (provider not in DEPLOYMENT_PROVIDERS
+            or HOST_NAME.fullmatch(host) is None
+            or REPOSITORY_NAME.fullmatch(repository) is None
+            or type(pr) is not int or pr <= 0):
+        return None
+    return {"provider": provider, "host": host, "repository": repository, "pr": pr}
+
+
 def cmd_acquire(args) -> int:
     if os.environ.get(ATTEMPT_ENV) is not None:
         return _fail("cannot acquire another lease inside an attempt", EXIT_TOKEN_MISMATCH)
@@ -453,6 +501,15 @@ def _acquire(args) -> int:
             state["last_evicted"] = evicted
 
         token = secrets.token_hex(8)
+        deployment = _deployment_identity(
+            getattr(args, "deployment_provider", ""),
+            getattr(args, "deployment_host", ""),
+            getattr(args, "deployment_repository", ""),
+            args.pr)
+        if (getattr(args, "deployment_provider", "")
+                or getattr(args, "deployment_host", "")
+                or getattr(args, "deployment_repository", "")) and deployment is None:
+            return _fail("invalid deployment identity", EXIT_USAGE)
         try:
             previous_generation = int(state.get("generation") or 0)
         except (TypeError, ValueError):
@@ -469,6 +526,7 @@ def _acquire(args) -> int:
             "heartbeat_at": now,
             "generation": generation,
             "attempt_id": secrets.token_hex(16),
+            "deployment": deployment,
         }
         _save_state(directory, state)
         token_file = _write_token_file(directory, token)
@@ -568,13 +626,16 @@ def cmd_heartbeat(args) -> int:
 
 
 def _mint_outcome(state: dict, lock: dict, sha: str, pr, now: int,
-                  verification: str) -> dict | None:
+                  result: str, rc: int, stage: str, verification: str) -> dict | None:
     """Create the immutable outcome for a successful, owned normal release.
 
-    Issuance requires the live pipeline descriptor AND an identity-bound lock;
-    a legacy/manual CLI release, a failed result, a short SHA, a non-numeric PR
-    or a locked-state generation mismatch returns None. The caller commits this
-    record in the same atomic state write that advances `deployed`.
+    Issuance requires the live pipeline descriptor AND an identity-bound lock
+    that captured the actual deployment provenance. A legacy/manual CLI
+    release, a failed release operation, a no-op/dry-run path, a short SHA, a
+    non-numeric PR, a missing deployment identity or a generation mismatch
+    returns None. Both a valid success and a valid failed deployment result are
+    recorded with their actual rc/stage; the caller commits this record in the
+    same atomic state write that closes the attempt.
     """
     if os.environ.get(ATTEMPT_ENV) is None or _process_lock_fd() is None:
         return None
@@ -586,6 +647,24 @@ def _mint_outcome(state: dict, lock: dict, sha: str, pr, now: int,
     outcomes = state.get("outcomes")
     if not isinstance(outcomes, dict):
         return None
+    deployment = lock.get("deployment")
+    if (not isinstance(deployment, dict)
+            or _deployment_identity(deployment.get("provider"), deployment.get("host"),
+                                    deployment.get("repository"), deployment.get("pr"))
+            != deployment):
+        return None
+    if result not in {OUTCOME_RESULT_SUCCESS, OUTCOME_RESULT_FAILED}:
+        return None
+    if type(rc) is not int or not 0 <= rc <= 255:
+        return None
+    if (rc == 0) != (result == OUTCOME_RESULT_SUCCESS):
+        return None
+    if result == OUTCOME_RESULT_SUCCESS:
+        stage = "complete"
+    else:
+        stage = (stage or "").strip()
+        if not OUTCOME_STAGE.fullmatch(stage):
+            stage = "unknown"
     attempt_id = lock.get("attempt_id")
     if not isinstance(attempt_id, str) or not ATTEMPT_ID.fullmatch(attempt_id):
         attempt_id = secrets.token_hex(16)
@@ -600,9 +679,10 @@ def _mint_outcome(state: dict, lock: dict, sha: str, pr, now: int,
         "pr": pr,
         "sha": sha,
         "hosting": dict(PUBLIC_CODE_HOSTING),
-        "result": OUTCOME_RESULT_SUCCESS,
-        "rc": 0,
-        "stage": "complete",
+        "deployment": dict(deployment),
+        "result": result,
+        "rc": rc,
+        "stage": stage,
         "verification": notice,
         "outcome_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         "public_receipt": str(uuid.uuid4()),
@@ -640,7 +720,9 @@ def cmd_release(args) -> int:
             deployed = {"sha": sha, "pr": pr, "at": now}
             # Same atomic commit carries both the release anchor and the
             # immutable outcome reference. No outcome -> no GitHub authority.
-            outcome = _mint_outcome(state, lock, sha, pr, now, args.verification)
+            outcome = _mint_outcome(
+                state, lock, sha, pr, now, OUTCOME_RESULT_SUCCESS, 0, "complete",
+                args.verification)
             if outcome is not None:
                 deployed["generation"] = outcome["generation"]
                 deployed["outcome_id"] = outcome["attempt_id"]
@@ -654,6 +736,15 @@ def cmd_release(args) -> int:
                 "note": args.note or "",
                 "at": now,
             }
+            # A successfully released FAILED deployment keeps its actual typed
+            # rc/stage as a durable outcome. A failed release operation or an
+            # unowned caller still mints nothing.
+            outcome = _mint_outcome(
+                state, lock, sha, pr, now, OUTCOME_RESULT_FAILED, args.rc,
+                args.stage, args.verification)
+            if outcome is not None:
+                state["last_attempt"]["generation"] = outcome["generation"]
+                state["last_attempt"]["outcome_id"] = outcome["attempt_id"]
 
         state["lock"] = None
         _save_state(directory, state)
@@ -833,6 +924,10 @@ def main(argv=None) -> int:
     p.add_argument("--sha", default="")
     p.add_argument("--session", default="")
     p.add_argument("--phase", default="")
+    p.add_argument("--deployment-provider", default="",
+                   help="actual deployment hosting provider: github|gitea")
+    p.add_argument("--deployment-host", default="")
+    p.add_argument("--deployment-repository", default="")
     p.set_defaults(func=cmd_acquire)
 
     p = sub.add_parser("heartbeat", help="续约（rc 11=token 不匹配）")
@@ -855,6 +950,9 @@ def main(argv=None) -> int:
     p.add_argument("--result", required=True, choices=["success", "failed"])
     p.add_argument("--sha", default="")
     p.add_argument("--note", default="")
+    p.add_argument("--rc", type=int, default=-1,
+                   help="actual pipeline exit code for a failed deployment result")
+    p.add_argument("--stage", default="", help="actual failing stage for a failed result")
     p.add_argument("--verification", default="normal",
                    help="private honest notice: normal|skip-verify|short-observe|…")
     p.set_defaults(func=cmd_release)

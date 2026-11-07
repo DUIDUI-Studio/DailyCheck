@@ -45,10 +45,38 @@ SOURCE_KEYS = ("provider", "host", "repository_id", "repository", "kind", "numbe
 PUBLIC_KEYS = ("provider", "host", "repository_id", "repository")
 GITHUB_SOURCE_IDENTITY = ("github.com", 1449125557, "DUIDUI-Studio/DailyCheck-ops")
 OUTCOME_FIELDS = (
-    "attempt_id", "generation", "pr", "sha", "hosting", "result", "rc", "stage",
-    "verification", "outcome_at", "public_receipt", "created_at",
+    "attempt_id", "generation", "pr", "sha", "hosting", "deployment", "result",
+    "rc", "stage", "verification", "outcome_at", "public_receipt", "created_at",
 )
 PUBLICATION_STATES = {"ready", "uncertain", "linked"}
+DEPLOYMENT_KEYS = {"provider", "host", "repository", "pr"}
+
+
+def _valid_deployment(value: object, pr: int) -> bool:
+    return (isinstance(value, dict) and set(value) == DEPLOYMENT_KEYS
+            and value.get("provider") in {"github", "gitea"}
+            and value.get("pr") == pr
+            and isinstance(value.get("host"), str)
+            and re.fullmatch(r"[A-Za-z0-9.:-]+", value["host"]) is not None
+            and isinstance(value.get("repository"), str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",
+                             value["repository"]) is not None)
+
+
+def require_public_deployment(outcome: dict, pr: int) -> dict:
+    """The actual deployment provenance must be this GitHub code PR.
+
+    A Gitea (or unknown) deployment cannot be relabelled as GitHub authority by
+    an integer PR/full-H coincidence plus a metadata-only binding. Missing or
+    legacy unproven provenance fails closed; it never defaults to GitHub.
+    """
+    deployment = outcome.get("deployment")
+    if not _valid_deployment(deployment, pr):
+        raise HostingError("deployment_provenance_missing")
+    if (deployment["provider"], deployment["host"], deployment["repository"]) != (
+            "github", "github.com", deploy_state.PUBLIC_CODE_HOSTING["repository"]):
+        raise HostingError("deployment_provider_not_public_github")
+    return deployment
 
 
 def _canonical(value: Any) -> str:
@@ -77,9 +105,16 @@ def _validate_outcome(attempt_id: str, outcome: object, generation: int) -> dict
             or not isinstance(outcome.get("sha"), str)
             or re.fullmatch(r"[0-9a-f]{40}", outcome["sha"]) is None
             or outcome.get("hosting") != deploy_state.PUBLIC_CODE_HOSTING
-            or outcome.get("result") != deploy_state.OUTCOME_RESULT_SUCCESS
-            or outcome.get("rc") != 0):
+            or outcome.get("result") not in {
+                deploy_state.OUTCOME_RESULT_SUCCESS, deploy_state.OUTCOME_RESULT_FAILED}
+            or type(outcome.get("rc")) is not int or not 0 <= outcome["rc"] <= 255
+            or (outcome["rc"] == 0) != (outcome["result"] == deploy_state.OUTCOME_RESULT_SUCCESS)
+            or not isinstance(outcome.get("stage"), str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}",
+                            outcome["stage"]) is None):
         raise HostingError("durable_outcome_malformed")
+    if not _valid_deployment(outcome.get("deployment"), outcome["pr"]):
+        raise HostingError("deployment_provenance_missing")
     try:
         if str(uuid.UUID(outcome["public_receipt"])) != outcome["public_receipt"]:
             raise ValueError
@@ -92,12 +127,13 @@ def _validate_outcome(attempt_id: str, outcome: object, generation: int) -> dict
     return outcome
 
 
-def load_durable_outcome(directory: Path, pr: int, sha: str) -> tuple[str, dict, int]:
-    """Resolve the current immutable success outcome for (pr, full SHA).
+def load_durable_outcome(directory: Path, pr: int, sha: str,
+                         *, require_public_github: bool = True) -> tuple[str, dict, int]:
+    """Resolve the current immutable outcome for (pr, full SHA).
 
     Read-only. The publication claim revalidates generation/identity under the
-    state transaction before any HTTP. Missing, foreign or superseded state
-    fails closed.
+    state transaction before any HTTP. Missing, foreign, superseded or
+    non-GitHub deployment provenance fails closed.
     """
     state = deploy_state.load_state(directory)
     try:
@@ -120,7 +156,10 @@ def load_durable_outcome(directory: Path, pr: int, sha: str) -> tuple[str, dict,
     if len(matches) > 1:
         raise HostingError("durable_outcome_ambiguous")
     attempt_id, outcome = matches[0]
-    return attempt_id, _validate_outcome(attempt_id, outcome, generation), generation
+    outcome = _validate_outcome(attempt_id, outcome, generation)
+    if require_public_github:
+        require_public_deployment(outcome, pr)
+    return attempt_id, outcome, generation
 
 
 def freeze_public_facts(directory: Path, attempt_id: str, generation: int,
@@ -255,6 +294,7 @@ class DurablePublicationClaim:
             raise HostingError("durable_outcome_missing")
         outcome = _validate_outcome(
             self._attempt_id, outcomes[self._attempt_id], self._generation)
+        require_public_deployment(outcome, self._context.pr)
         if (outcome.get("pr") != self._context.pr
                 or outcome.get("sha") != self._context.sha
                 or outcome.get("public_receipt") != self._context.public_receipt
@@ -286,6 +326,15 @@ class DurablePublicationClaim:
     def _apply(self, record: dict) -> None:
         self.state = record["state"]
         self.comment_id = int(record.get("comment_id") or 0)
+
+    @property
+    def transport_guard_fd(self) -> int | None:
+        """Explicit descriptor the trusted publication mutator must inherit.
+
+        Passing it to the HTTP child keeps the real process fence held until
+        that mutator exits, including when this Python reporter is killed.
+        """
+        return self._fd
 
     # -- PublicationClaim protocol --------------------------------------
     def check_current(self) -> None:

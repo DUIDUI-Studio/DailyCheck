@@ -277,12 +277,23 @@ class HostingClient:
     def __init__(self, config: HostingConfig):
         self.config = config
 
-    def request(self, method: str, path: str, payload: dict | None = None) -> tuple[object, str]:
+    def request(self, method: str, path: str, payload: dict | None = None, *,
+                guard_fd: int | None = None) -> tuple[object, str]:
         c = self.config
         if not c.token:
             raise HostingError("credentials_unavailable")
         if method != "GET" and c.role in {AccessRole.READ, AccessRole.OPS_READ}:
             raise HostingError("read_role_cannot_write")
+        # Issue163: only the trusted publication mutator may hand one explicit
+        # deployment-fence descriptor to its HTTP child. Read/feedback/Gitea
+        # requests keep the ordinary close_fds default and inherit nothing.
+        if guard_fd is not None:
+            if type(guard_fd) is not int or guard_fd < 3 or method == "GET":
+                raise HostingError("invalid_transport_guard")
+            try:
+                os.fstat(guard_fd)
+            except OSError as exc:
+                raise HostingError("invalid_transport_guard") from exc
         # This transport deliberately has no GitHub finalization primitive.
         routes = {
             AccessRole.FEEDBACK: rf"/repos/{re.escape(c.repo)}/(?:issues|labels)",
@@ -357,6 +368,7 @@ class HostingClient:
                     capture_output=True,
                     timeout=c.timeout + 5,
                     check=False,
+                    **({"pass_fds": (guard_fd,)} if guard_fd is not None else {}),
                 )
                 raw_headers = Path(dump.name).read_bytes().decode("latin1")
             raw, sep, status = proc.stdout.rpartition("\n")
