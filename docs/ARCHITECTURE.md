@@ -1209,7 +1209,8 @@ check payload 缺 PR 列表也不猜第一个；分页查当前 open PR，同 H 
 同样要求独立 shadow 路径。模板 `deploy/github-shadow.env.example` 和
 `deploy/systemd/dc-github-shadow.service` 仅供审查，独立 loopback `8444`，无 Install 段、
 无生产 watcher 依赖。本变更不安装服务、不配 live token、不投递生产 lane。
-`deploy/scripts/dailycheck_pr_poll.py` 统一调用仓库 poller，Hermes shim 可用
+`deploy/scripts/dailycheck_pr_poll.py` 的 Gitea 入口保留原 `GITEA_URL`（含 URL root）、
+`GITEA_TOKEN_FILE`、参数优先级和逐字输出；仅显式 GitHub 模式调用主 poller。Hermes shim 可用
 `DAILYCHECK_SOURCE_DIR` 指定源码目录，缺省 `/root/DailyCheck` 不变。
 
 **CI 共存**（workflow 红线，准备不等于获准落地）：同一两个 required jobs 和现有报告、redline、

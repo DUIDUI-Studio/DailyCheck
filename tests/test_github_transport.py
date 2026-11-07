@@ -703,3 +703,128 @@ def test_github_unexpected_success_code_is_not_terminal_success(
     with pytest.raises(HostingError) as error:
         api.client(role).request(method, path)
     assert error.value.status == status
+
+
+@pytest.fixture
+def legacy_http(tmp_path):
+    import http.server
+    import threading
+
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append({"path": self.path, "auth": self.headers.get("Authorization")})
+            if self.headers.get("Authorization") != "token legacy-file-token":
+                self.send_error(401)
+                return
+            data = (
+                [
+                    {
+                        "number": 42,
+                        "title": "legacy fixture",
+                        "head": {"sha": SHA, "ref": "fix/issue-160-test"},
+                        "mergeable": True,
+                        "draft": False,
+                    }
+                ]
+                if "/pulls?" in self.path
+                else {"statuses": [{"context": "CI / test (pull_request)", "status": "success"}]}
+            )
+            raw = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    token = tmp_path / "legacy-token"
+    token.write_text("legacy-file-token\n")
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", token, requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("selected", [None, "gitea"])
+@pytest.mark.parametrize("url_root", ["/", "/forge/"])
+def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
+    legacy_http, tmp_path, selected, url_root
+):
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    host, token, requests = legacy_http
+    source = subprocess.check_output(
+        ["git", "show", "origin/main:deploy/scripts/dailycheck_pr_poll.py"], cwd=root, text=True
+    )
+    reference = tmp_path / "original-poller.py"
+    reference.write_text(source)
+    env = {
+        **os.environ,
+        "GITEA_URL": host + url_root,
+        "GITEA_API": "http://127.0.0.1:1/ignored-by-legacy",
+        "GITEA_TOKEN_FILE": str(token),
+        "GITEA_TOKEN": "ignored-direct-token",
+        "GITEA_REPO": "ignored/repo",
+        "DCPOLL_REPO": "legacy/fixture",
+    }
+    env.pop("DAILYCHECK_HOSTING_PROVIDER", None)
+    if selected is not None:
+        env["DAILYCHECK_HOSTING_PROVIDER"] = selected
+    before = subprocess.run(
+        [sys.executable, str(reference)],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    requests.clear()
+    current = subprocess.run(
+        [sys.executable, str(root / "deploy/scripts/dailycheck_pr_poll.py")],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert current.returncode == before.returncode == 0
+    assert current.stdout == before.stdout and "30 分钟兜底轮询" in current.stdout
+    assert len(requests) == 2
+    prefix = url_root.rstrip("/") + "/api/v1/repos/legacy/fixture/"
+    assert all(
+        r["path"].startswith(prefix) and r["auth"] == "token legacy-file-token" for r in requests
+    )
+
+
+def test_legacy_launcher_explicit_github_selects_canonical_without_gitea(
+    api, legacy_http, monkeypatch
+):
+    import subprocess
+
+    api.write(evidence())
+    host, token, requests = legacy_http
+    monkeypatch.setenv("GITEA_URL", host + "/forge/")
+    monkeypatch.setenv("GITEA_TOKEN_FILE", str(token))
+    root = Path(__file__).resolve().parents[1]
+    current = subprocess.run(
+        [sys.executable, str(root / "deploy/scripts/dailycheck_pr_poll.py")],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert current.returncode == 0 and "GitHub shadow-only" in current.stdout
+    assert "checks=ready" in current.stdout
+    assert not requests
+    assert api.log() and all(r["bearer"] for r in api.log())
