@@ -1244,6 +1244,9 @@ malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/tes
 `tests/test_github_shadow_boundary.py` 真跑 receiver→CLI、adapter→sender、本机 HTTP 捕获器与
 预存未标记 SQLite row，断言零 shadow POST / 零越界写，且 Gitea 正控仍恰好投递一次；
 `tests/test_pytest_gate_completeness.py` 用真实 pytest 子进程验证候选/运行绑定的摘要转交。
+`tests/test_transport_boundary_repair.py` 的原始回归覆盖 raw sender/guard、带空白的冲突 alias
+和混合旧行队列的实际 shell/HTTP/SQLite 行为；这些回归先在 `25b125a` 上记录失败，
+用于约束后续共享解析和持久拒绝修复。
 
 ## 4. 数据架构
 
