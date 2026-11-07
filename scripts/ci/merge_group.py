@@ -246,11 +246,20 @@ class QueueReader:
                     REPOSITORY_ID, REPOSITORY_NODE, REPOSITORY)):
             raise ValueError("invalid merge_group event")
         queue_id, entries = self.entries()
-        matches = [i for i, row in enumerate(entries) if row["headCommit"]["oid"] == group["head_sha"]]
+        # GitHub leaves head/base null while an entry is queued but not built.
+        # Only the prefix ending at this event's built G supplies membership.
+        matches = [i for i, row in enumerate(entries)
+                   if row["headCommit"] is not None
+                   and sha(row["headCommit"]["oid"]) == sha(group["head_sha"])]
         if len(matches) != 1:
             raise ValueError("group absent/ambiguous in authenticated queue")
         included, members, bodies = entries[:matches[0]+1], [], {}
         for row in included:
+            if row["headCommit"] is None or row["baseCommit"] is None:
+                raise ValueError("unbuilt entry inside included prefix")
+            integration = sha(row["headCommit"]["oid"])
+            if sha(row["baseCommit"]["oid"]) != commit(repo, integration)[1][0]:
+                raise ValueError("included queue base differs from MERGE predecessor")
             pr = row["pullRequest"]
             if (pr["repository"]["id"], pr["repository"]["databaseId"], pr["repository"]["nameWithOwner"]) != (
                     REPOSITORY_NODE, REPOSITORY_ID, REPOSITORY):
@@ -285,7 +294,10 @@ def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: P
     if git(repo, "rev-parse", "HEAD") != manifest["group_sha"]:
         raise ValueError("member report controller must be checked out at G")
     python = sys.executable
-    subprocess.run([python, "-m", "scripts.mcp_contracts", "--check"], cwd=repo, check=True)
+    subprocess.run([python, "-I", "-c",
+                    "import sys,runpy;sys.path.insert(0,sys.argv.pop(1));"
+                    "runpy.run_module('scripts.mcp_contracts',run_name='__main__')",
+                    str(repo), "--check"], cwd=repo, check=True)
     with tempfile.TemporaryDirectory(prefix="dailycheck-members-", dir=os.environ.get("CI_ROOT")) as temp:
         for member in manifest["members"]:
             body = bodies[member["number"]]
@@ -297,7 +309,7 @@ def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: P
             subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", str(root), member["head_sha"]], check=True)
             try:
                 for script in ("check_mcp_impact.py", "check_redlines.py", "check_pr_hygiene.py"):
-                    command = [python, str(repo / "scripts/agent_framework" / script),
+                    command = [python, "-I", str(repo / "scripts/agent_framework" / script),
                                "--base", member["base_sha"], "--body-file", str(body_file)]
                     if script == "check_pr_hygiene.py":
                         command += ["--branch", member["head_ref"]]

@@ -1421,6 +1421,9 @@ Prod 安装仍属外部依赖；CI/policy/生产模式未变。返回的 comment
 v3 tagged H/G，Gitea 保留原 v2 compact identity。`merge_group.py` 通过固定只读 GraphQL
 query 分页读取 authenticated queue/entry/repository/members，不解析 queue branch 拼写。
 manifest 绑定完整 tree/ordered parents/成员 H/body digest；CI 不接触私有 Issue tuple。
+只在已构建 entry 中定位 event G，再严格验证截至 G 的完整 prefix；其后的普通
+`headCommit=null/baseCommit=null` queued tail 不属于本次 proof。included prefix 的 null、
+重复、位置/graph/base/repository 不一致仍拒绝；tail 长度或 build concurrency 不改变 manifest。
 两个 literal required jobs 在 H/G 均覆盖完整门禁；每个 workflow 仅 test 全量跑一次
 pytest/native/session/hash，reports 用 always() 并显式拒绝 upstream failed/skipped/missing。
 GitHub compact binding 额外绑定 workflow path/blob；test job 输出完整 envelope digest，
@@ -1436,6 +1439,37 @@ reports attestation 明确以 pytest_source 链接实际 test artifact/envelope 
 日志下载只接受 authenticated API 的限定 presigned HTTPS host，下载不转发 auth。真实 Prod
 runtime、independent review 和 signer identity 必须来自受保护 port；本源码不安装这些 port。
 默认 signer 缺失即拒绝，shadow reducer/HostingClient 写权限不扩张。
+
+**Issue164 producer ownership 修复（local fixture only，真实激活仍关闭）**：protected
+`ProducerPolicy.producer_manifest_blob_sha` 与 workflow blob 分别固定；approved YAML 用
+literal manifest Git blob 导出 `producer_manifest.json` 的整个执行闭包。manifest 不包含自身
+或 YAML，避免循环 commit pin；helper/runtime 更新必须产生新的、独立审批的两个 pin，PR
+body/HEAD manifest/自报 hash 无审批权。Git blob identity 在已批准的 public history rewrite
+后保持稳定，不能混同 source/public commit SHA。缺失 producer policy pin 一律拒绝 native proof。
+
+`trusted_producer.py` 由平台 Python `-I` 在 candidate 之外执行；不安装或导入 candidate
+venv/helper。approved bootstrap 生成空 package init，防止 candidate `scripts.py`/package
+初始化代码进入 verifier。closure 包括 capture/session/checker/baseline/binding/summary/member/
+report/MCP/preview helpers 及未修改的 hosting 依赖。native H/G 在 read-only、nonroot、无网络/
+daemon socket/credentials/host PID 的固定 image 容器运行一次完整 pytest；只有 candidate copy
+和 tmp 可写。controller 从 daemon wait/inspect/logs 捕获实际 exit/output，session 文件仍是
+待核验数据；容器退出并删除后才验证/发布。candidate 日志绝不原样进入 Actions log command
+或 attestation channel。timeout/OOM/不明 exit/缺 session/logs 均失败，controller 死亡无 proof。
+
+reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
+新的 read-only verifier 容器不导入 candidate application。其 helper/runtime 与输入 body/proof
+均只读；controller 复核生成报告的 exact test evidence，并记录两个真实 gate native exits。
+Reader 通过 authenticated immutable Git blob API 核验 protected manifest，再核验 actual
+workflow/run/attempt/job/check/App/context、闭包/runtime/native/output/session linkage；两个
+context 的 capture 必须相等，不能靠新 envelope hash 接受另一次实际 passing fixture。
+
+manifest 中 image 是 Coordinator 预加载的 **linux/arm64 local image ID**，scope 明确为
+`local_fixture_only`；不是已发布 registry reference，也不提供 hosted amd64/Prod runtime
+或隔离 signer 的安装证明。GitHub runner/platform Python/daemon 属于平台信任根，candidate
+不能在该主机执行；runtime 自身恶意或任意 malicious pytest/test intent 不在本次证明内，仍需
+独立语义 review。`tests/test_trusted_ci_producer.py` 的普通 parser fixtures 明确标记 synthetic；
+只有显式授权的 owned runtime driver 才运行隔离集成证据。旧 native_base 使用 legacy shell/
+synthetic isolation facts 作 consumer unit controls，不能冒充修复后原生隔离执行。
 
 私有 binding 的可选完整 source_revision={provider,host,repository_id,repository,sha,
 source_public_map_sha256} 独立于 source Issue composite identity；native 必须有该字段，

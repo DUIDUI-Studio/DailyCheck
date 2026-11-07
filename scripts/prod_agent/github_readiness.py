@@ -294,6 +294,14 @@ def _validate_native_runs(repo, manifest, policy, runs, expected):
     from scripts.ci.candidate_binding import parse_binding
     from scripts.ci.merge_group import CONTEXTS, commit, digest, git
     from scripts.ci.pytest_summary import decode_result
+    from scripts.ci.trusted_producer import parse_manifest, validate_producer
+
+    producer_pin = policy.producer_manifest_blob_sha
+    if producer_pin is None:
+        raise ValueError("approved executed producer pin required")
+    import subprocess
+    producer_manifest = parse_manifest(subprocess.check_output(
+        ["git", "-C", str(repo), "cat-file", "blob", producer_pin]), producer_pin)
 
     if not isinstance(runs, list) or len(runs) != len(expected):
         raise ValueError("missing H/G evidence")
@@ -303,6 +311,8 @@ def _validate_native_runs(repo, manifest, policy, runs, expected):
         if len(matches) != 1:
             raise ValueError("ambiguous native CI evidence")
         evidence = matches[0]
+        if evidence.get("producer_manifest") != producer_manifest:
+            raise ValueError("missing authenticated approved producer manifest")
         run, workflow, jobs = evidence["run"], evidence["workflow"], evidence["jobs"]
         event = "merge_group" if phase == "G" else "pull_request"
         if (phase == "H" and len(commit(repo, tested)[1]) != 1
@@ -346,7 +356,8 @@ def _validate_native_runs(repo, manifest, policy, runs, expected):
                         or binding["member_manifest_sha256"] != digest(manifest))):
                 raise ValueError("native binding is stale or from another domain")
             decode_result(envelope, binding)
-            artifact = {"envelope": envelope, "obligations": job["obligations"]}
+            validate_producer(job.get("producer"), producer_manifest, producer_pin, envelope, job["name"])
+            artifact = {"envelope": envelope, "obligations": job["obligations"], "producer": job["producer"]}
             if "pytest_source" in job:
                 artifact["pytest_source"] = job["pytest_source"]
             if job["artifact_sha256"] != digest(artifact):
@@ -373,6 +384,8 @@ def _validate_native_runs(repo, manifest, policy, runs, expected):
         by_context = {job["name"]: job for job in jobs}
         test, reports = (by_context[name] for name in CONTEXTS)
         if ("pytest_source" in test or reports["envelope"] != test["envelope"]
+                or {k: v for k, v in reports["producer"].items() if k != "gates"}
+                    != {k: v for k, v in test["producer"].items() if k != "gates"}
                 or reports.get("pytest_source") != {
                     "context": "test", "artifact_sha256": test["artifact_sha256"],
                     "envelope_sha256": digest(test["envelope"])}):
@@ -431,6 +444,7 @@ class NativeGitHubFacts:
         import json
 
         from scripts.ci.merge_group import digest
+        from scripts.ci.trusted_producer import parse_manifest, validate_producer
 
         event = "merge_group" if phase == "G" else "pull_request"
         workflow = _object(self.client.get(self.root + "/actions/workflows/ci.yml"))
@@ -440,6 +454,13 @@ class NativeGitHubFacts:
         blob = self.client.get(self.root + "/contents/.github/workflows/ci.yml?ref=" + head)
         if blob.get("sha") != self.policy.workflow_blob_sha:
             raise ValueError("unapproved workflow content")
+        pin = self.policy.producer_manifest_blob_sha
+        if pin is None:
+            raise ValueError("approved executed producer pin required")
+        approved = self.client.get(self.root + "/git/blobs/" + pin)
+        if approved.get("sha") != pin or approved.get("encoding") != "base64":
+            raise ValueError("missing authenticated producer manifest blob")
+        producer_manifest = parse_manifest(base64.b64decode(approved["content"], validate=True), pin)
         rows = self.client.pages(self.root + f"/actions/workflows/{self.policy.workflow_id}/runs",
                                  key="workflow_runs", params={"event": event, "head_sha": head})
         rows = [r for r in rows if r.get("head_sha") == head and r.get("event") == event
@@ -473,7 +494,8 @@ class NativeGitHubFacts:
             if len(markers) != 1:
                 raise ValueError("native attestation log missing/ambiguous")
             record = json.loads(base64.b64decode(markers[0], validate=True))
-            artifact = {"envelope": record["envelope"], "obligations": record["obligations"]}
+            validate_producer(record.get("producer"), producer_manifest, pin, record["envelope"], context)
+            artifact = {"envelope": record["envelope"], "obligations": record["obligations"], "producer": record["producer"]}
             if "pytest_source" in record:
                 artifact["pytest_source"] = record["pytest_source"]
             if record["artifact_sha256"] != digest(artifact):
@@ -486,6 +508,7 @@ class NativeGitHubFacts:
                 "status": check["status"], "conclusion": check["conclusion"]},
                 "envelope": record["envelope"], "obligations": record["obligations"],
                 "artifact_sha256": record["artifact_sha256"],
+                "producer": record["producer"],
                 **({"pytest_source": record["pytest_source"]} if "pytest_source" in record else {})})
         associations = [p for p in run.get("pull_requests", []) if p.get("number") == pr]
         historical_base = associations[0]["base"]["sha"] if len(associations) == 1 else None
@@ -499,7 +522,8 @@ class NativeGitHubFacts:
                         "repository_node_id": run["repository"]["node_id"], "status": run["status"],
                         "conclusion": run["conclusion"], "suite_id": run["check_suite_id"],
                         "historical_base_sha": historical_base},
-                "latest_run_id": run["id"], "latest_attempt": run["run_attempt"], "jobs": normalized}
+                "latest_run_id": run["id"], "latest_attempt": run["run_attempt"], "jobs": normalized,
+                "producer_manifest": producer_manifest}
 
     policy_contexts = ("test", "agent-framework-reports")
 

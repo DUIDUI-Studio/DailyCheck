@@ -179,6 +179,16 @@ reports always 运行并显式拒绝缺失/失败/跳过 upstream；其 attestat
 artifact/envelope，不创建自己的 pytest session 或退出码。成员四报告/body/MCP/redline/hygiene
 义务不减。现有 main push/workflow_dispatch test 开销保留，本次不改触发器或分片。
 Prod 验证 approved workflow/check/run/attempt/App/evidence identity，不只看同名 green。
+approved producer 还必须包含实际执行的 helper closure、known baseline 与固定 runtime。
+protected policy pin 和 approved YAML literal pin 独立固定 manifest Git blob；不从 candidate
+HEAD 或 PR body 选择 producer。helper/runtime 更新需新的独立批准 pin；缺 pin 即拒绝。
+native job 的平台 controller 不执行 candidate code；pytest 在无网络、无 daemon socket、
+nonroot/read-only runtime 容器运行，controller 在容器外捕获 native exit/output。reports 复用
+exact test capture，在隔离容器执行全部报告/成员门禁，再由 fresh verifier 核验；失败、
+skip、cancel、timeout、缺 session/provenance 不能作为 green。candidate log 不能注入原生
+attestation。queue 的普通 unbuilt tail 不属于 ready G prefix；included graph/成员仍严格验证。
+当前 manifest 仅批准 bounded local linux/arm64 fixture，hosted CI/amd64/Prod 安装未证明，
+真实 activation 保持 OFF；不将 synthetic parser/unit proof 或本地 fixture 报为部署成功。
 PR body 是数据。只取消同 PR 旧 CI；group 以 event/G/run 独立并发，不取消 production。
 
 原生队列可并行验证当前及一个 lookahead。G2 含尚未 merge 的 G1 可以先 CI；Prod 必须等

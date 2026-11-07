@@ -13,6 +13,7 @@ env:
   CI_BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
   CI_GROUP_SHA: ${{ github.event.merge_group.head_sha }}
   CI_EVENT_SHA: ${{ github.sha }}
+  CI_NATIVE_PRODUCER: ${{ github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   PIP_TRUSTED_HOST: mirrors.aliyun.com
 
@@ -39,7 +40,8 @@ jobs:
     outputs:
       pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
       pytest_envelope_sha256: ${{ steps.pytest_summary.outputs.pytest_envelope_sha256 }}
-      member_manifest_b64: ${{ steps.member_manifest.outputs.member_manifest_b64 }}
+      member_manifest_b64: ${{ steps.native_producer.outputs.member_manifest_b64 || steps.member_manifest.outputs.member_manifest_b64 }}
+      native_test_b64: ${{ steps.native_producer.outputs.native_test_b64 }}
     steps:
       - name: Prepare isolated job paths
         run: |
@@ -103,9 +105,44 @@ jobs:
         if: github.server_url != 'https://github.com'
         run: python3 --version && python3 -m pip --version
 
+      - name: Execute approved isolated native producer
+        id: native_producer
+        if: env.CI_NATIVE_PRODUCER == 'true'
+        env:
+          CI_PRODUCER_MANIFEST_BLOB: e883e45e3aa6935419cc9836dc6f327b742c3482
+          NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
+          NATIVE_CONTEXT: test
+        run: |
+          set -euo pipefail
+          # Literal approved manifest blob; HEAD/PR body cannot select a pin.
+          # The platform Python is isolated from candidate imports and venvs.
+          python3 -I - <<'PYCODE'
+          import hashlib, json, os, pathlib, subprocess
+          pin = os.environ["CI_PRODUCER_MANIFEST_BLOB"]
+          def blob(oid):
+              raw = subprocess.check_output(["git", "cat-file", "blob", oid])
+              actual = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+              if actual != oid: raise SystemExit("approved producer object changed")
+              return raw
+          raw = blob(pin)
+          manifest = json.loads(raw)
+          root = pathlib.Path(os.environ["CI_ROOT"], "authority")
+          root.mkdir()
+          for name, oid in manifest["files"].items():
+              path = pathlib.PurePosixPath(name)
+              if path.is_absolute() or ".." in path.parts: raise SystemExit("invalid producer path")
+              target = root / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(blob(oid))
+          (root / "scripts/ci/producer_manifest.json").write_bytes(raw)
+          (root / "dc_approved_evidence.py").write_bytes((root / "scripts/ci/pytest_evidence.py").read_bytes())
+          for package in ("scripts", "scripts/ci", "scripts/agent_framework"):
+              (root / package / "__init__.py").write_bytes(b"")
+          PYCODE
+          python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
       - name: Resolve authenticated merge-group members
         id: member_manifest
-        if: github.event_name == 'merge_group'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')
         env:
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
         run: |
@@ -113,12 +150,14 @@ jobs:
           printf 'CI_MEMBER_MANIFEST=%s/members.json\n' "$CI_ROOT" >> "$GITHUB_ENV"
 
       - name: Bind tested H and event H/B to this run
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: |
           set -euo pipefail
           mkdir -p "${CI_ROOT}/tmp" "${CI_ROOT}/db"
           python3 scripts/ci/candidate_binding.py "${CI_ROOT}/binding.json"
 
       - name: Install dependencies
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: |
           if [ "${{ github.server_url }}" = "https://github.com" ]; then
             unset PIP_INDEX_URL PIP_TRUSTED_HOST
@@ -128,6 +167,7 @@ jobs:
           ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" "PyYAML==6.0.3" -q
 
       - name: Ruff (changed .py files only)
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             # 三点 diff（merge-base）只算「本分支引入的改动」。用两点会把 base
@@ -148,6 +188,7 @@ jobs:
           fi
 
       - name: Pytest (full suite, including MCP)
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: |
           set -euo pipefail
           TEST_DB_DIR="$(mktemp -d)"
@@ -163,16 +204,18 @@ jobs:
           tail -3 ${CI_ROOT}/pytest-output.txt
 
       - name: Zero-new-failure gate
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: ${CI_ROOT}/venv/bin/python scripts/check_known_failures.py ${CI_ROOT}/pytest-output.txt --pytest-exit-file ${CI_ROOT}/pytest-native.exit --session-file ${CI_ROOT}/pytest-session.json --write-evidence ${CI_ROOT}/pytest-evidence.json
 
       # Gitea 不支持 artifact v4。只传递下游报告和零新增门禁所需的小型摘要：
       # 全部 FAILED/ERROR、终态摘要与真实 native/session/hash 证据，不能重建假退出码。
       - name: Create compact pytest summary output
+        if: env.CI_NATIVE_PRODUCER != 'true'
         id: pytest_summary
         run: python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --envelope-output "${CI_ROOT}/envelope.json" --digest-output
 
       - name: Attest test evidence for independent Prod reader
-        if: github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.event_name == 'merge_group'))
         run: python3 scripts/ci/merge_group.py attest --context test --manifest "${CI_ROOT}/members.json"
 
   agent-framework-reports:
@@ -249,9 +292,47 @@ jobs:
         if: github.server_url != 'https://github.com'
         run: python3 --version && python3 -m pip --version
 
+      - name: Execute approved isolated native producer
+        id: native_producer
+        if: env.CI_NATIVE_PRODUCER == 'true'
+        env:
+          CI_PRODUCER_MANIFEST_BLOB: e883e45e3aa6935419cc9836dc6f327b742c3482
+          NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
+          NATIVE_CONTEXT: agent-framework-reports
+          UPSTREAM_RESULT: ${{ needs.test.result }}
+          NATIVE_TEST_B64: ${{ needs.test.outputs.native_test_b64 }}
+          UPSTREAM_MEMBER_MANIFEST_B64: ${{ needs.test.outputs.member_manifest_b64 }}
+        run: |
+          set -euo pipefail
+          # Literal approved manifest blob; HEAD/PR body cannot select a pin.
+          # The platform Python is isolated from candidate imports and venvs.
+          python3 -I - <<'PYCODE'
+          import hashlib, json, os, pathlib, subprocess
+          pin = os.environ["CI_PRODUCER_MANIFEST_BLOB"]
+          def blob(oid):
+              raw = subprocess.check_output(["git", "cat-file", "blob", oid])
+              actual = hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
+              if actual != oid: raise SystemExit("approved producer object changed")
+              return raw
+          raw = blob(pin)
+          manifest = json.loads(raw)
+          root = pathlib.Path(os.environ["CI_ROOT"], "authority")
+          root.mkdir()
+          for name, oid in manifest["files"].items():
+              path = pathlib.PurePosixPath(name)
+              if path.is_absolute() or ".." in path.parts: raise SystemExit("invalid producer path")
+              target = root / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(blob(oid))
+          (root / "scripts/ci/producer_manifest.json").write_bytes(raw)
+          (root / "dc_approved_evidence.py").write_bytes((root / "scripts/ci/pytest_evidence.py").read_bytes())
+          for package in ("scripts", "scripts/ci", "scripts/agent_framework"):
+              (root / package / "__init__.py").write_bytes(b"")
+          PYCODE
+          python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
       - name: Resolve authenticated merge-group members
         id: member_manifest
-        if: github.event_name == 'merge_group'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')
         env:
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           UPSTREAM_MEMBER_MANIFEST_B64: ${{ needs.test.outputs.member_manifest_b64 }}
@@ -261,12 +342,14 @@ jobs:
           printf 'CI_MEMBER_MANIFEST=%s/members.json\n' "$CI_ROOT" >> "$GITHUB_ENV"
 
       - name: Bind tested H and event H/B to this run
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: |
           set -euo pipefail
           mkdir -p "${CI_ROOT}/tmp" "${CI_ROOT}/db"
           python3 scripts/ci/candidate_binding.py "${CI_ROOT}/binding.json"
 
       - name: Decode pytest summary from test job
+        if: env.CI_NATIVE_PRODUCER != 'true'
         env:
           PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}
           PYTEST_ENVELOPE_SHA256: ${{ needs.test.outputs.pytest_envelope_sha256 }}
@@ -285,6 +368,7 @@ jobs:
           test -s ${CI_ROOT}/ci-pytest/pytest-output.txt
 
       - name: Install dependencies
+        if: env.CI_NATIVE_PRODUCER != 'true'
         run: |
           if [ "${{ github.server_url }}" = "https://github.com" ]; then
             unset PIP_INDEX_URL PIP_TRUSTED_HOST
@@ -294,7 +378,7 @@ jobs:
           ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" "PyYAML==6.0.3" radon bandit -q
 
       - name: Merge-group member obligations
-        if: github.event_name == 'merge_group'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')
         env:
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           UPSTREAM_MEMBER_MANIFEST_B64: ${{ needs.test.outputs.member_manifest_b64 }}
@@ -307,7 +391,7 @@ jobs:
       # 同一既有必需 check：台账必须与全部实现/文档一致，再验证 PR 的影响声明。
       # BASE_SHA 只作 main 参考；检查器内部用 merge-base，避免计入他人 main 变更。
       - name: MCP contracts and PR impact gate
-        if: github.event_name == 'pull_request'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'pull_request')
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -319,7 +403,7 @@ jobs:
           ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_mcp_impact.py --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md
 
       - name: Generate reports 02 + 03
-        if: github.event_name == 'pull_request'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'pull_request')
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -332,7 +416,7 @@ jobs:
           bash scripts/agent_framework/generate_reports.sh
 
       - name: Generate report 04 (local deploy preview)
-        if: github.event_name == 'pull_request'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'pull_request')
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
@@ -340,7 +424,7 @@ jobs:
           bash scripts/agent_framework/preview.sh "${PR_NUM}"
 
       - name: Check four reports gate
-        if: github.event_name == 'pull_request'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'pull_request')
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -353,7 +437,7 @@ jobs:
       # PR #13 改了 .github/workflows/ci.yml（红线 2）被自行合并，没人拦得住。
       # 这里把「改了什么」变成判据：命中红线且 PR body 无 owner 授权 → 本 job 红。
       - name: Redline check（命中红线须 owner 授权）
-        if: github.event_name == 'pull_request'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'pull_request')
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -366,7 +450,7 @@ jobs:
       # 开工规范机验（2026-10-24 新增，Issue #26）：分支前缀 / issue 号一致性 /
       # 无号分支必须声明。此前这些规矩只活在 Dev Agent 的本地记忆里，换 session 就丢。
       - name: PR hygiene check（分支命名 + issue 关联）
-        if: github.event_name == 'pull_request'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'pull_request')
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -378,6 +462,6 @@ jobs:
             --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md
 
       - name: Attest reports evidence for independent Prod reader
-        if: github.server_url == 'https://github.com'
+        if: env.CI_NATIVE_PRODUCER != 'true' && (github.server_url == 'https://github.com')
         run: |
           python3 scripts/ci/merge_group.py attest --context agent-framework-reports --manifest "${CI_ROOT}/members.json"

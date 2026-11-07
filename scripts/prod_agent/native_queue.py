@@ -48,9 +48,12 @@ class ProducerPolicy:
     prod_installation_id: int
     release_validity: str = "irrevocable_immutable_G"
     minimum_observation_seconds: int = 600
+    producer_manifest_blob_sha: str | None = None
 
     def __post_init__(self):
         sha(self.workflow_blob_sha)
+        if self.producer_manifest_blob_sha is not None:
+            sha(self.producer_manifest_blob_sha)
         if (any(type(getattr(self, k)) is not int or getattr(self, k) <= 0 for k in (
                 "actions_app_id", "workflow_id", "prod_app_id", "prod_installation_id"))
                 or self.release_validity != "irrevocable_immutable_G"

@@ -247,11 +247,19 @@ if __name__ == "__main__":
 """
     (repo / "scripts/ci/merge_group.py").write_text(raw.replace('if __name__ == "__main__":\n', port))
     (repo / "scripts/dev_smoke_t11_e2e.py").write_text("import sqlite3\nc=sqlite3.connect(':memory:'); assert c.execute('select 1').fetchone()==(1,)\n")
-    (repo / "scripts/mcp_contracts").symlink_to(ROOT / "scripts/mcp_contracts", target_is_directory=True)
+    # Unit fixture checks the real source ledger; the isolated producer tests
+    # separately execute the candidate's complete MCP and preview paths.
+    (repo / "scripts/mcp_contracts.py").write_text(
+        f"import runpy,sys\nsys.path.insert(0,{str(ROOT)!r})\n"
+        f"runpy.run_path({str(ROOT / 'scripts/mcp_contracts.py')!r},run_name='__main__')\n")
 
 
 def tiny_full_ci(repo: Path, root: Path, manifest: dict, policy: ProducerPolicy) -> list[dict]:
-    """Execute the literal test/reports paths; the whole tiny suite runs once per H/G."""
+    """Legacy shell/consumer unit fixture, with SYNTHETIC isolation facts.
+
+    This does not prove the native producer boundary; test_trusted_ci_producer
+    drives the approved native entrypoint and actual isolated runtime instead.
+    """
     import base64
 
     workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
@@ -338,6 +346,24 @@ def tiny_full_ci(repo: Path, root: Path, manifest: dict, policy: ProducerPolicy)
             records = [line[len(marker):] for line in result.stdout.splitlines() if line.startswith(marker)]
             assert len(records) == 1
             record = json.loads(base64.b64decode(records[0], validate=True))
+            from scripts.ci.trusted_producer import attest, identity, parse_manifest
+            pin = policy.producer_manifest_blob_sha
+            approved = parse_manifest((ROOT / "scripts/ci/producer_manifest.json").read_bytes(), pin)
+            if context == "test":
+                raw = (jobroot / "pytest-output.txt").read_bytes()
+                capture = {"version": 1, "container_id": digest([head, index]),
+                    "image": approved["runtime"]["image"], "kind": "pytest", "context": "test",
+                    "binding_sha256": digest(record["envelope"]["binding"]),
+                    "native_exit": record["envelope"]["evidence"]["native_exit"],
+                    "stdout_sha256": __import__("hashlib").sha256(raw).hexdigest(),
+                    "session_sha256": digest(record["envelope"]["evidence"]["session"]),
+                    "exited": True, "removed": True, "oom_killed": False}
+                producer = {"identity": identity(approved, pin), "test_capture": capture,
+                            "lint_capture": {**capture, "kind": "lint", "native_exit": 0, "session_sha256": None}, "gates": []}
+            else:
+                producer = {**producer, "gates": [{**capture, "kind": kind, "context": context,
+                    "native_exit": 0, "session_sha256": None} for kind in ("report-generate", "report-verify")]}
+            record = attest(record["envelope"], members, context, producer)
             assert record["envelope"]["evidence"]["session"]["selected"] == 2
             (jobroot / "steps.log").write_text("\n".join(logs))
             (jobroot / "executed-steps.json").write_text(json.dumps(executed, indent=2))
@@ -348,6 +374,7 @@ def tiny_full_ci(repo: Path, root: Path, manifest: dict, policy: ProducerPolicy)
                                    "suite_id": index*10, "app_id": policy.actions_app_id, "app_slug": "github-actions",
                                    "status": "completed", "conclusion": "success"}, **record})
         runs.append({"phase": phase, "pr": pr,
+                     "producer_manifest": approved,
                      "workflow": {"id": policy.workflow_id, "path": ".github/workflows/ci.yml", "blob_sha": policy.workflow_blob_sha},
                      "run": {"id": index, "workflow_id": policy.workflow_id, "attempt": 1, "event": "merge_group" if phase == "G" else "pull_request",
                              "head_sha": head, "repository_id": 1448986421, "repository_node_id": "R_kgDOVl3HNQ", "status": "completed",
@@ -419,7 +446,9 @@ def native_base(tmp_path_factory):
     checked(["git", "clone", "-q", "--bare", repo, root / "host.git"])
     git(root / "host.git", "update-ref", "refs/heads/main", base)
     workflow_blob = git(repo, "rev-parse", "HEAD:.github/workflows/ci.yml")
-    policy = ProducerPolicy(15368, 51, workflow_blob, 76543, 65432)
+    producer_raw = (ROOT / "scripts/ci/producer_manifest.json").read_bytes()
+    producer_pin = subprocess.check_output(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=producer_raw).decode().strip()
+    policy = ProducerPolicy(15368, 51, workflow_blob, 76543, 65432, producer_manifest_blob_sha=producer_pin)
     members = [{"number": n, "node_id": f"PR_{n}", "head_sha": h, "base_sha": base,
                 "head_ref": f"feat/issue-{n}-fixture", "body_sha256": digest(ci_body(n)),
                 "queue_entry_id": f"entry{n}", "position_at_creation": n, "integration_sha": g}
@@ -894,7 +923,7 @@ def test_authenticated_paginated_queue_manifest_ignores_ref_spelling(native_base
               "baseRefOid": member["base_sha"], "headRefName": member["head_ref"], "body": ci_body(member["number"]),
               "repository": {"id": "R_kgDOVl3HNQ", "databaseId": 1448986421, "nameWithOwner": CODE}}
         row = {"id": member["queue_entry_id"], "position": i+1, "headCommit": {"oid": member["integration_sha"]},
-               "baseCommit": {"oid": manifest["creation_base_sha"]}, "pullRequest": pr}
+               "baseCommit": {"oid": commit(base["repo"], member["integration_sha"])[1][0]}, "pullRequest": pr}
         page = {"data": {"repository": {"id": "R_kgDOVl3HNQ", "databaseId": 1448986421, "nameWithOwner": CODE,
                 "mergeQueue": {"id": "queue", "entries": {"nodes": [row], "pageInfo": {
                     "hasNextPage": i == 0, "endCursor": "next" if i == 0 else None}}}}}}
@@ -967,6 +996,9 @@ def test_native_read_client_binds_real_HTTP_jobs_checks_and_log_artifacts(native
     raw_runs = base["host"].facts[base["g1"]]["ci"]
     root = f"/repos/{CODE}"
     host.routes[root + "/actions/workflows/ci.yml"] = {"id": policy.workflow_id, "state": "active", "path": ".github/workflows/ci.yml"}
+    host.routes[root + "/git/blobs/" + policy.producer_manifest_blob_sha] = {
+        "sha": policy.producer_manifest_blob_sha, "encoding": "base64",
+        "content": base64.b64encode((ROOT / "scripts/ci/producer_manifest.json").read_bytes()).decode()}
     logs = {}
     for item in raw_runs:
         run = item["run"]
@@ -987,7 +1019,7 @@ def test_native_read_client_binds_real_HTTP_jobs_checks_and_log_artifacts(native
                          "check_run_url": "https://api.github.com" + root + f"/check-runs/{check['id']}"})
             checks.append({"id": check["id"], "name": check["name"], "head_sha": head, "check_suite": {"id": run["suite_id"]},
                            "app": {"id": policy.actions_app_id, "slug": "github-actions"}, "status": "completed", "conclusion": "success"})
-            record = {k: job[k] for k in ("envelope", "obligations", "artifact_sha256", "pytest_source") if k in job}
+            record = {k: job[k] for k in ("envelope", "obligations", "artifact_sha256", "pytest_source", "producer") if k in job}
             logs[job["id"]] = "2026-11-07T00:00:00Z DAILYCHECK_NATIVE_EVIDENCE=" + base64.b64encode(json.dumps(record).encode()).decode() + "\n"
             host.routes[f"/job-log/{job['id']}"] = logs[job["id"]]
         host.routes[root + f"/actions/runs/{run['id']}/attempts/1/jobs?per_page=100&page=1"] = {"total_count": 2, "jobs": jobs}
@@ -1013,7 +1045,8 @@ os.execv('/usr/bin/curl',['/usr/bin/curl',*args])
     monkeypatch.setattr(host, "read_auth", "Bearer synthetic-authenticated-read")
     reader = Reader(HostingClient(HostingConfig.from_environment(AccessRole.READ)), None, policy,
                     runtime=None, review=None, directory=base["root"])
-    actual = [reader._run("G", base["g1"], None), reader._run("H", base["h1"], 1)]
+    member_number = base["values"][0]["manifest"]["subject_pr_number"]
+    actual = [reader._run("G", base["g1"], None), reader._run("H", base["h1"], member_number)]
     proof = validate_native_ci(base["repo"], base["values"][0]["manifest"], policy, actual)
     assert len(proof) == 4
     assert host.auth_seen and set(host.auth_seen) == {"Bearer synthetic-authenticated-read"}
@@ -1021,7 +1054,7 @@ os.execv('/usr/bin/curl',['/usr/bin/curl',*args])
     assert h["run"]["historical_base_sha"] == base["base"]
     # Run's historical B is accepted even after main advances; there is no current-base equality here.
     host.routes[root + "/branches/main"] = {"commit": {"sha": base["g2"]}}
-    assert reader._run("H", base["h1"], 1) == h
+    assert reader._run("H", base["h1"], member_number) == h
     route = root + f"/commits/{base['g1']}/check-runs?filter=all&per_page=100&page=1"
     host.routes[route]["check_runs"][1]["app"]["id"] += 1
     bad = [reader._run("G", base["g1"], None), h]
