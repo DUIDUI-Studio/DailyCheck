@@ -1441,6 +1441,8 @@ runtime、independent review 和 signer identity 必须来自受保护 port；�
 默认 signer 缺失即拒绝，shadow reducer/HostingClient 写权限不扩张。
 
 **Issue164 producer ownership 修复（local fixture only，真实激活仍关闭）**：protected
+bc77 独立 review 另证实 preview 仍会显式导入 candidate venv，且 native0 不证明 T11
+driver 正常完成；对应三种早退回归当前为红，后续修复须覆盖依赖查找与正常返回边界。
 `ProducerPolicy.producer_manifest_blob_sha` 与 workflow blob 分别固定；approved YAML 用
 literal manifest Git blob 导出 `producer_manifest.json` 的整个执行闭包。manifest 不包含自身
 或 YAML，避免循环 commit pin；helper/runtime 更新必须产生新的、独立审批的两个 pin，PR

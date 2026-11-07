@@ -9,6 +9,9 @@ import copy
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -137,6 +140,36 @@ def test_changed_producer_requires_new_explicit_pin():
     # Parsing a proposed pin does not install it. The protected policy and
     # approved workflow must both be updated independently after review.
     assert new_pin not in (ROOT / ".github/workflows/ci.yml").read_text()
+
+
+@pytest.mark.parametrize("attack", ["venv", "system_exit", "os_exit"])
+def test_trusted_preview_requires_driver_normal_return(tmp_path, attack):
+    repo = tmp_path / "candidate"
+    for name in ("scripts/agent_framework/preview.sh", "scripts/dev_smoke_t11_e2e.py",
+                 "scripts/ci/trusted_producer.py"):
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, target)
+    marker = repo / "venv-hit"
+    payload = (f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
+               "print('=== T11 E2E SMOKE PASSED ===')\nraise SystemExit(0)\n")
+    if attack == "venv":
+        shadow = repo / ".venv/lib/python3.12/site-packages/app.py"
+        shadow.parent.mkdir(parents=True)
+        shadow.write_text(payload)
+        (repo / "app.py").write_text("raise RuntimeError('real candidate app selected')\n")
+    elif attack == "system_exit":
+        (repo / "app.py").write_text(payload)
+    else:
+        (repo / "app.py").write_text("import os\nprint('=== T11 E2E SMOKE PASSED ===',flush=True)\nos._exit(0)\n")
+    env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+           "DAILYCHECK_CI_TMP": str(tmp_path), "DAILYCHECK_DB_DIR": str(tmp_path / "db")}
+    result = subprocess.run(["bash", str(repo / "scripts/agent_framework/preview.sh"), "3", "--trusted-ci"],
+                            cwd=repo, env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "FAIL" in (repo / "reports/pr-3/04-local-deploy-preview.md").read_text()
+    if attack == "venv":
+        assert not marker.exists()
 
 
 @pytest.mark.skipif(not os.environ.get("DAILYCHECK_NATIVE_PRODUCER_FIXTURE_DRIVER"),
