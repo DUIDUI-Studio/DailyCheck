@@ -312,6 +312,28 @@ def member_gates(repo: Path, manifest: dict, bodies: dict[int, str], evidence: P
             subprocess.run([python, "scripts/agent_framework/check_reports.py"], cwd=repo, env=env, check=True)
 
 
+def make_attestation(envelope: dict, members: list[dict], context: str) -> dict:
+    """Reports attests its gates and the exact test proof it consumed, not a new session."""
+    from scripts.ci.candidate_binding import parse_binding
+    from scripts.ci.pytest_summary import decode_result
+
+    binding = parse_binding(envelope["binding"])
+    decode_result(envelope, binding)
+    if binding.get("version") != 3 or context not in CONTEXTS:
+        raise ValueError("tagged native attestation required")
+    obligations = {"full_suite": True, "members": [
+        {key: member[key] for key in ("number", "head_sha", "body_sha256")} for member in members]}
+    artifact = {"envelope": envelope, "obligations": obligations}
+    if context == "agent-framework-reports":
+        test_artifact_sha256 = digest(artifact)
+        # The final approved workflow step runs only after every report gate passed.
+        obligations.update({k: True for k in ("report01", "report02", "report03", "report04",
+                           "mcp_contracts", "mcp_impact", "redlines", "hygiene", "upstream_success")})
+        artifact["pytest_source"] = {"context": "test", "artifact_sha256": test_artifact_sha256,
+                                     "envelope_sha256": digest(envelope)}
+    return {**artifact, "artifact_sha256": digest(artifact)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["manifest", "reports", "attest"])
@@ -338,14 +360,7 @@ def main() -> int:
                         "body_sha256": digest(pr["body"])}]
             if members[0]["head_sha"] != binding["CI_HEAD_SHA"]:
                 raise ValueError("attestation head mismatch")
-        obligations = {"full_suite": True, "members": [
-            {key: member[key] for key in ("number", "head_sha", "body_sha256")} for member in members]}
-        if args.context == "agent-framework-reports":
-            # This final workflow step runs only after every actual gate passed.
-            obligations.update({k: True for k in ("report01", "report02", "report03", "report04",
-                               "mcp_contracts", "mcp_impact", "redlines", "hygiene", "upstream_success")})
-        artifact = {"envelope": envelope, "obligations": obligations}
-        record = {**artifact, "artifact_sha256": digest(artifact)}
+        record = make_attestation(envelope, members, args.context)
         print("DAILYCHECK_NATIVE_EVIDENCE=" + base64.b64encode(json.dumps(record, sort_keys=True).encode()).decode())
         return 0
     reader = QueueReader(os.environ["NATIVE_QUEUE_READ_TOKEN"])

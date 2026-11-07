@@ -338,13 +338,18 @@ def _validate_native_runs(repo, manifest, policy, runs, expected):
                     or binding["tested_sha"] != tested or binding["CI_EVENT"] != event
                     or binding["CI_RUN_ID"] != str(run["id"])
                     or binding["CI_RUN_ATTEMPT"] != str(run["attempt"])
+                    or binding["workflow_path"] != workflow["path"]
+                    or binding["workflow_blob_sha"] != workflow["blob_sha"]
                     or phase == "H" and binding["CI_BASE_SHA"] != run["historical_base_sha"]
                     or phase == "G" and (
                         binding["CI_BASE_SHA"] != manifest["creation_base_sha"]
                         or binding["member_manifest_sha256"] != digest(manifest))):
                 raise ValueError("native binding is stale or from another domain")
             decode_result(envelope, binding)
-            if job["artifact_sha256"] != digest({"envelope": envelope, "obligations": job["obligations"]}):
+            artifact = {"envelope": envelope, "obligations": job["obligations"]}
+            if "pytest_source" in job:
+                artifact["pytest_source"] = job["pytest_source"]
+            if job["artifact_sha256"] != digest(artifact):
                 raise ValueError("native artifact digest mismatch")
             obligations = job["obligations"]
             expected_members = [{"number": m["number"], "head_sha": m["head_sha"],
@@ -365,6 +370,13 @@ def _validate_native_runs(repo, manifest, policy, runs, expected):
                           "artifact_sha256": job["artifact_sha256"]})
         if bindings[0] != bindings[1]:
             raise ValueError("native jobs tested different identities")
+        by_context = {job["name"]: job for job in jobs}
+        test, reports = (by_context[name] for name in CONTEXTS)
+        if ("pytest_source" in test or reports["envelope"] != test["envelope"]
+                or reports.get("pytest_source") != {
+                    "context": "test", "artifact_sha256": test["artifact_sha256"],
+                    "envelope_sha256": digest(test["envelope"])}):
+            raise ValueError("reports did not reuse the exact trusted test attestation")
     return proof
 
 
@@ -461,7 +473,10 @@ class NativeGitHubFacts:
             if len(markers) != 1:
                 raise ValueError("native attestation log missing/ambiguous")
             record = json.loads(base64.b64decode(markers[0], validate=True))
-            if record["artifact_sha256"] != digest({"envelope": record["envelope"], "obligations": record["obligations"]}):
+            artifact = {"envelope": record["envelope"], "obligations": record["obligations"]}
+            if "pytest_source" in record:
+                artifact["pytest_source"] = record["pytest_source"]
+            if record["artifact_sha256"] != digest(artifact):
                 raise ValueError("native log evidence corrupted")
             normalized.append({"id": job["id"], "name": context, "run_id": job["run_id"],
                 "attempt": job["run_attempt"], "head_sha": job["head_sha"], "status": job["status"],
@@ -470,7 +485,8 @@ class NativeGitHubFacts:
                 "app_id": check["app"]["id"], "app_slug": check["app"]["slug"],
                 "status": check["status"], "conclusion": check["conclusion"]},
                 "envelope": record["envelope"], "obligations": record["obligations"],
-                "artifact_sha256": record["artifact_sha256"]})
+                "artifact_sha256": record["artifact_sha256"],
+                **({"pytest_source": record["pytest_source"]} if "pytest_source" in record else {})})
         associations = [p for p in run.get("pull_requests", []) if p.get("number") == pr]
         historical_base = associations[0]["base"]["sha"] if len(associations) == 1 else None
         if phase == "H" and (len(associations) != 1 or associations[0]["head"]["sha"] != head

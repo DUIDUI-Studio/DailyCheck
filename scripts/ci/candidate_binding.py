@@ -25,9 +25,14 @@ FIELDS = (
 
 def parse_binding(value: object) -> dict:
     if isinstance(value, dict) and value.get("version") == 3:
-        keys = set(FIELDS) | {"version", "phase", "CI_GROUP_SHA", "member_manifest_sha256"}
+        keys = set(FIELDS) | {"version", "phase", "CI_GROUP_SHA", "member_manifest_sha256",
+                              "workflow_path", "workflow_blob_sha"}
         if set(value) != keys or type(value["version"]) is not int:
             raise ValueError("invalid tagged CI identity")
+        if (value["workflow_path"] != ".github/workflows/ci.yml"
+                or not isinstance(value["workflow_blob_sha"], str)
+                or not re.fullmatch(r"[0-9a-f]{40}", value["workflow_blob_sha"])):
+            raise ValueError("missing/invalid workflow binding")
         phase = value["phase"]
         if (not isinstance(phase, str) or phase not in {"H", "G"}
                 or value["CI_REPOSITORY"] != "DUIDUI-Studio/DailyCheck"
@@ -83,7 +88,9 @@ def binding() -> dict:
         group = result["CI_EVENT"] == "merge_group"
         result.update(version=3, phase="G" if group else "H",
                       CI_GROUP_SHA=os.environ.get("CI_GROUP_SHA") if group else None,
-                      member_manifest_sha256=None)
+                      member_manifest_sha256=None, workflow_path=".github/workflows/ci.yml",
+                      workflow_blob_sha=subprocess.check_output(
+                          ["git", "rev-parse", "HEAD:.github/workflows/ci.yml"], text=True).strip())
         if group:
             from scripts.ci.merge_group import digest, validate_manifest
 

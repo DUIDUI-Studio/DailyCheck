@@ -46,10 +46,12 @@ def test_both_servers_have_explicit_checkout_and_python_paths():
         assert '"PyYAML==6.0.3"' in by_name["Install dependencies"]["run"]
         prepare = by_name["Prepare isolated job paths"]["run"]
         assert "mktemp -d" in prepare and "$GITHUB_ENV" in prepare
-        assert "Pytest (full suite, including MCP)" in by_name
-        assert "Zero-new-failure gate" in by_name
-        if job is value["jobs"]["agent-framework-reports"]:
-            assert by_name["Pytest (full suite, including MCP)"]["if"] == "github.server_url == 'https://github.com'"
+        if job is value["jobs"]["test"]:
+            assert "Pytest (full suite, including MCP)" in by_name
+            assert "Zero-new-failure gate" in by_name
+        else:
+            assert not any("-m pytest" in step.get("run", "") for step in steps)
+            assert "Decode pytest summary from test job" in by_name
         assert "candidate_binding.py" in by_name["Bind tested H and event H/B to this run"]["run"]
 
 

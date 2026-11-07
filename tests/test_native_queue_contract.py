@@ -149,59 +149,137 @@ def shell(path, text):
     path.chmod(0o755)
 
 
-def tiny_full_ci(repo: Path, root: Path, manifest: dict, policy: ProducerPolicy) -> list[dict]:
-    """Execute both literal workflow full-pytest paths on every H and G.
+def ci_body(number: int) -> str:
+    return f"## 报告 1/4\n| R-001 | fixture | ✅ |\n## Checklist\n## 生产侧事项\nCloses #{number}\n"
 
-    Only the tiny synthetic repository's entire tests/ is executed, never the
-    DailyCheck full suite. Actual workflow shell capture, gate and handoff run.
-    """
+
+def prepare_ci_tools(repo: Path, root: Path) -> None:
+    """Actual gate scripts with owned temp paths and a synthetic app/queue read port."""
+    gate_dir = repo / "scripts/agent_framework"
+    gate_dir.mkdir(exist_ok=True)
+    (root / "gate-tmp").mkdir(exist_ok=True)
+    for name in ("check_mcp_impact.py", "check_redlines.py", "check_pr_hygiene.py", "check_reports.py", "generate_reports.sh", "preview.sh"):
+        raw = (ROOT / "scripts/agent_framework" / name).read_text()
+        (gate_dir / name).write_text(raw.replace("/tmp/", str(root / "gate-tmp") + "/"))
+    for name in ("candidate_binding.py", "pytest_summary.py"):
+        shutil.copy2(ROOT / "scripts/ci" / name, repo / "scripts/ci" / name)
+    raw = (ROOT / "scripts/ci/merge_group.py").read_text()
+    # TEST ONLY: the actual CLI/gates consume synthetic queue-read facts. This
+    # injects no success, pytest session, gate result, signer or hosting write.
+    port = """class FixtureQueueReader(QueueReader):
+    def entries(self):
+        value=json.loads(Path(os.environ['CI_FIXTURE_FACTS']).read_text())
+        return value['queue_id'], value['entries']
+    def public_pr(self, number):
+        value=json.loads(Path(os.environ['CI_FIXTURE_FACTS']).read_text())
+        return value['prs'][str(number)]
+
+
+if __name__ == "__main__":
+    QueueReader = FixtureQueueReader
+"""
+    (repo / "scripts/ci/merge_group.py").write_text(raw.replace('if __name__ == "__main__":\n', port))
+    (repo / "scripts/dev_smoke_t11_e2e.py").write_text("import sqlite3\nc=sqlite3.connect(':memory:'); assert c.execute('select 1').fetchone()==(1,)\n")
+    (repo / "scripts/mcp_contracts").symlink_to(ROOT / "scripts/mcp_contracts", target_is_directory=True)
+
+
+def tiny_full_ci(repo: Path, root: Path, manifest: dict, policy: ProducerPolicy) -> list[dict]:
+    """Execute the literal test/reports paths; the whole tiny suite runs once per H/G."""
+    import base64
+
     workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
     runs = []
     subjects = [("G", None, manifest["group_sha"], manifest["members"])]
     subjects += [("H", m["number"], m["head_sha"], [m]) for m in manifest["members"]]
-    for index, (phase, pr, head, members) in enumerate(subjects, 1):
+    for offset_run, (phase, pr, head, members) in enumerate(subjects):
+        index = int(manifest["event_delivery_id"]) + offset_run
         git(repo, "checkout", "--detach", head)
-        jobs = []
+        jobs, upstream = [], None
         for offset, context in enumerate(("test", "agent-framework-reports"), 1):
             jobroot = root / f"{head}-{context}"
             jobroot.mkdir(parents=True, exist_ok=True)
             (jobroot / "tmp").mkdir(exist_ok=True)
             (jobroot / "venv/bin").mkdir(parents=True, exist_ok=True)
-            (jobroot / "venv/bin/python").symlink_to(sys.executable)
+            python_bin = jobroot / "venv/bin/python"
+            python_bin.write_text(f"#!{sys.executable}\nimport os,sys\nos.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n")
+            python_bin.chmod(0o755)
             env = {**os.environ, "CI_ROOT": str(jobroot), "CI_REPOSITORY": CODE,
                    "CI_RUN_ID": str(index), "CI_RUN_ATTEMPT": "1", "CI_EVENT": "merge_group" if phase == "G" else "pull_request",
                    "CI_EVENT_SHA": head if phase == "G" else manifest["group_sha"],
                    "CI_HEAD_SHA": "" if phase == "G" else head, "CI_GROUP_SHA": head if phase == "G" else "",
                    "CI_BASE_SHA": manifest["creation_base_sha"], "GITHUB_SERVER_URL": "https://github.com",
                    "PYTHONPATH": str(ROOT), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "TMPDIR": str(jobroot / "tmp"),
-                   "CI_PYTEST_INVOCATION_LOG": str(root / "pytest-invocations.jsonl")}
+                   "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+                   "CI_PYTEST_INVOCATION_LOG": str(root / "pytest-invocations.jsonl"),
+                   "GITHUB_OUTPUT": str(jobroot / "outputs"), "DAILYCHECK_CI_TMP": str(jobroot / "tmp"),
+                   "NATIVE_QUEUE_READ_TOKEN": "synthetic-read"}
             manifest_path = jobroot / "members.json"
             manifest_path.write_text(json.dumps(manifest))
             env["CI_MEMBER_MANIFEST"] = str(manifest_path)
+            event = {"action": "checks_requested", "repository": {"id": 1448986421, "node_id": "R_kgDOVl3HNQ", "full_name": CODE},
+                     "merge_group": {"base_ref": "refs/heads/main", "head_ref": manifest["group_ref"],
+                                     "base_sha": manifest["creation_base_sha"], "head_sha": manifest["group_sha"]}}
+            if phase == "H":
+                event["pull_request"] = {"number": pr, "head": {"sha": head}, "body": ci_body(pr)}
+                env.update(PR_NUM=str(pr), PR_BODY=ci_body(pr), PR_BRANCH=members[0]["head_ref"],
+                           BASE_SHA=manifest["creation_base_sha"], HEAD_SHA=head)
+            event_path = jobroot / "event.json"
+            event_path.write_text(json.dumps(event))
+            env["GITHUB_EVENT_PATH"] = str(event_path)
+            facts = {"queue_id": manifest["queue_id"], "entries": [
+                {"id": m["queue_entry_id"], "headCommit": {"oid": m["integration_sha"]}, "pullRequest": {"number": m["number"]}}
+                for m in manifest["members"]], "prs": {str(m["number"]): {
+                    "number": m["number"], "node_id": m["node_id"], "head": {"sha": m["head_sha"], "repo": {"id": 1448986421}},
+                    "base": {"repo": {"id": 1448986421}}, "body": ci_body(m["number"]), "merged": False, "merge_commit_sha": None}
+                    for m in manifest["members"]}}
+            facts_path = jobroot / "queue-facts.json"
+            facts_path.write_text(json.dumps(facts))
+            env["CI_FIXTURE_FACTS"] = str(facts_path)
             binding_file = jobroot / "binding.json"
             checked([sys.executable, ROOT / "scripts/ci/candidate_binding.py", binding_file], cwd=repo, env=env)
-            steps = {s["name"]: s for s in workflow["jobs"][context]["steps"]}
-            checked(["bash", "-c", steps["Pytest (full suite, including MCP)"]["run"]], cwd=repo, env=env)
-            checked(["bash", "-c", steps["Zero-new-failure gate"]["run"]], cwd=repo, env=env)
-            checked([sys.executable, ROOT / "scripts/ci/pytest_summary.py", jobroot / "pytest-output.txt",
-                     "--evidence-file", jobroot / "pytest-evidence.json", "--binding-file", binding_file,
-                     "--output-file", jobroot / "output", "--envelope-output", jobroot / "envelope.json"], cwd=repo, env=env)
-            envelope = json.loads((jobroot / "envelope.json").read_text())
-            assert envelope["evidence"]["session"]["selected"] == 2
-            obligations = {"full_suite": True, "members": [
-                {key: m[key] for key in ("number", "head_sha", "body_sha256")} for m in members]}
-            if context == "agent-framework-reports":
-                # Separate real gate-adapter execution is tested below; these
-                # synthetic producer facts are not installation authority.
-                obligations.update({k: True for k in ("report01", "report02", "report03", "report04", "mcp_contracts",
-                                   "mcp_impact", "redlines", "hygiene", "upstream_success")})
+            steps = {step["name"]: step for step in workflow["jobs"][context]["steps"]}
+            logs, executed = [], []
+
+            def run_step(name, steps=steps, env=env, executed=executed, logs=logs):
+                result = checked(["bash", "-c", steps[name]["run"]], cwd=repo, env=env)
+                executed.append(name)
+                logs.append(result.stdout + result.stderr)
+                return result
+
+            if context == "test":
+                run_step("Pytest (full suite, including MCP)")
+                run_step("Zero-new-failure gate")
+                run_step("Create compact pytest summary output")
+                upstream_outputs = dict(line.split("=", 1) for line in Path(env["GITHUB_OUTPUT"]).read_text().splitlines())
+                upstream = upstream_outputs["pytest_summary_b64"]
+                result = run_step("Attest test evidence for independent Prod reader")
+            else:
+                env.update(UPSTREAM_RESULT="success", PYTEST_SUMMARY_B64=upstream,
+                           PYTEST_ENVELOPE_SHA256=upstream_outputs["pytest_envelope_sha256"],
+                           PYTEST_REUSE_FILE=str(jobroot / "ci-pytest/pytest-output.txt"),
+                           PYTEST_REUSE_EVIDENCE=str(jobroot / "ci-pytest/pytest-evidence.json"))
+                run_step("Require successful complete upstream")
+                run_step("Decode pytest summary from test job")
+                if phase == "G":
+                    run_step("Merge-group member obligations")
+                else:
+                    for name in ("MCP contracts and PR impact gate", "Generate reports 02 + 03", "Generate report 04 (local deploy preview)",
+                                 "Check four reports gate", "Redline check（命中红线须 owner 授权）", "PR hygiene check（分支命名 + issue 关联）"):
+                        run_step(name)
+                result = run_step("Attest reports evidence for independent Prod reader")
+            marker = "DAILYCHECK_NATIVE_EVIDENCE="
+            records = [line[len(marker):] for line in result.stdout.splitlines() if line.startswith(marker)]
+            assert len(records) == 1
+            record = json.loads(base64.b64decode(records[0], validate=True))
+            assert record["envelope"]["evidence"]["session"]["selected"] == 2
+            (jobroot / "steps.log").write_text("\n".join(logs))
+            (jobroot / "executed-steps.json").write_text(json.dumps(executed, indent=2))
+            (jobroot / "attestation.json").write_text(json.dumps(record, sort_keys=True))
             jobs.append({"id": index*100+offset, "name": context, "run_id": index, "attempt": 1,
                          "head_sha": head, "status": "completed", "conclusion": "success",
                          "check": {"id": index*1000+offset, "name": context, "head_sha": head,
                                    "suite_id": index*10, "app_id": policy.actions_app_id, "app_slug": "github-actions",
-                                   "status": "completed", "conclusion": "success"},
-                         "envelope": envelope, "obligations": obligations,
-                         "artifact_sha256": digest({"envelope": envelope, "obligations": obligations})})
+                                   "status": "completed", "conclusion": "success"}, **record})
         runs.append({"phase": phase, "pr": pr,
                      "workflow": {"id": policy.workflow_id, "path": ".github/workflows/ci.yml", "blob_sha": policy.workflow_blob_sha},
                      "run": {"id": index, "workflow_id": policy.workflow_id, "attempt": 1, "event": "merge_group" if phase == "G" else "pull_request",
@@ -230,6 +308,7 @@ def native_base(tmp_path_factory):
     (repo / "scripts/ci").mkdir()
     for name in ("check_known_failures.py",):
         shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
+    prepare_ci_tools(repo, root)
     (repo / "tests").mkdir()
     (repo / "tests/known_failures.txt").write_text("")
     (repo / "tests/conftest.py").write_text(
@@ -275,7 +354,7 @@ def native_base(tmp_path_factory):
     workflow_blob = git(repo, "rev-parse", "HEAD:.github/workflows/ci.yml")
     policy = ProducerPolicy(15368, 51, workflow_blob, 76543, 65432)
     members = [{"number": n, "node_id": f"PR_{n}", "head_sha": h, "base_sha": base,
-                "head_ref": f"feat/issue-{n}-fixture", "body_sha256": digest(f"body{n}"),
+                "head_ref": f"feat/issue-{n}-fixture", "body_sha256": digest(ci_body(n)),
                 "queue_entry_id": f"entry{n}", "position_at_creation": n, "integration_sha": g}
                for n, h, g in ((1, h1, g1), (2, h2, g2))]
     manifests = []
@@ -286,7 +365,7 @@ def native_base(tmp_path_factory):
                           "subject_entry_id": f"entry{i}", "subject_pr_number": i,
                           "creation_base_sha": base, "group_sha": group, "tree_sha": tree,
                           "parents": parents, "expected_predecessor_sha": parents[0],
-                          "group_ref": f"refs/heads/opaque-queue-{i}", "event_delivery_id": f"event{i}",
+                          "group_ref": f"refs/heads/opaque-queue-{i}", "event_delivery_id": str(i*100),
                           "members": members[:i]})
     bindings = {"version": 2, "bindings": [{"pr": n, "public": deploy_state.PUBLIC_CODE_HOSTING,
                 "source": {"provider": "gitea", "host": "fixture.invalid", "repository_id": 77,
@@ -745,7 +824,7 @@ def test_authenticated_paginated_queue_manifest_ignores_ref_spelling(native_base
     manifest = base["values"][1]["manifest"]
     for i, member in enumerate(manifest["members"]):
         pr = {"id": member["node_id"], "number": member["number"], "headRefOid": member["head_sha"],
-              "baseRefOid": member["base_sha"], "headRefName": member["head_ref"], "body": f"body{member['number']}",
+              "baseRefOid": member["base_sha"], "headRefName": member["head_ref"], "body": ci_body(member["number"]),
               "repository": {"id": "R_kgDOVl3HNQ", "databaseId": 1448986421, "nameWithOwner": CODE}}
         row = {"id": member["queue_entry_id"], "position": i+1, "headCommit": {"oid": member["integration_sha"]},
                "baseCommit": {"oid": manifest["creation_base_sha"]}, "pullRequest": pr}
@@ -763,7 +842,7 @@ def test_authenticated_paginated_queue_manifest_ignores_ref_spelling(native_base
              "merge_group": {"base_ref": "refs/heads/main", "head_ref": "refs/heads/not-a-parsable-PR-name",
                              "base_sha": base["base"], "head_sha": base["g2"]}}
     value, bodies = Reader("synthetic-read").manifest(base["repo"], event, "event2")
-    assert value["members"] == manifest["members"] and bodies == {1: "body1", 2: "body2"}
+    assert value["members"] == manifest["members"] and bodies == {1: ci_body(1), 2: ci_body(2)}
     pages[1]["data"]["repository"]["mergeQueue"]["entries"]["nodes"] = [None]
     with pytest.raises((ValueError, KeyError, TypeError)):
         Reader("synthetic-read").manifest(base["repo"], event, "event2")
@@ -778,13 +857,12 @@ def test_member_report_adapter_runs_actual_gates_for_every_H(native_base, monkey
     checked(["git", "clone", "-q", base["repo"], repo])
     git(repo, "checkout", "--detach", base["g2"])
     gate_dir = repo / "scripts/agent_framework"
-    gate_dir.mkdir()
+    gate_dir.mkdir(exist_ok=True)
     for name in ("check_mcp_impact.py", "check_redlines.py", "check_pr_hygiene.py", "check_reports.py", "generate_reports.sh", "preview.sh"):
         raw = (ROOT / "scripts/agent_framework" / name).read_text()
         (gate_dir / name).write_text(raw.replace("/tmp/", str(base["root"] / "gate-tmp") + "/"))
-    (base["root"] / "gate-tmp").mkdir()
+    (base["root"] / "gate-tmp").mkdir(exist_ok=True)
     (repo / "scripts/dev_smoke_t11_e2e.py").write_text("import sqlite3\nc=sqlite3.connect(':memory:'); assert c.execute('select 1').fetchone()==(1,)\n")
-    (repo / "scripts/mcp_contracts").symlink_to(ROOT / "scripts/mcp_contracts", target_is_directory=True)
     # Gate tools must exist in each member's checked-out H. Real script paths run
     # from the controller tree, while Git diffs/body checks run in exact H worktrees.
     manifest = copy.deepcopy(base["values"][1]["manifest"])
@@ -842,7 +920,7 @@ def test_native_read_client_binds_real_HTTP_jobs_checks_and_log_artifacts(native
                          "check_run_url": "https://api.github.com" + root + f"/check-runs/{check['id']}"})
             checks.append({"id": check["id"], "name": check["name"], "head_sha": head, "check_suite": {"id": run["suite_id"]},
                            "app": {"id": policy.actions_app_id, "slug": "github-actions"}, "status": "completed", "conclusion": "success"})
-            record = {k: job[k] for k in ("envelope", "obligations", "artifact_sha256")}
+            record = {k: job[k] for k in ("envelope", "obligations", "artifact_sha256", "pytest_source") if k in job}
             logs[job["id"]] = "2026-11-07T00:00:00Z DAILYCHECK_NATIVE_EVIDENCE=" + base64.b64encode(json.dumps(record).encode()).decode() + "\n"
             host.routes[f"/job-log/{job['id']}"] = logs[job["id"]]
         host.routes[root + f"/actions/runs/{run['id']}/attempts/1/jobs?per_page=100&page=1"] = {"total_count": 2, "jobs": jobs}
@@ -926,7 +1004,7 @@ def test_unchanged_G2_reports_keep_creation_manifest_after_G1_leaves_queue(nativ
         n = member["number"]
         base["host"].routes[f"/remaining-pr/{n}"] = {"number": n, "node_id": member["node_id"],
             "head": {"sha": member["head_sha"], "repo": {"id": 1448986421}}, "base": {"repo": {"id": 1448986421}},
-            "body": f"body{n}", "merged": n == 1, "merge_commit_sha": base["g1"] if n == 1 else None}
+            "body": ci_body(n), "merged": n == 1, "merge_commit_sha": base["g1"] if n == 1 else None}
 
     class Reader(QueueReader):
         def entries(self):
@@ -937,12 +1015,12 @@ def test_unchanged_G2_reports_keep_creation_manifest_after_G1_leaves_queue(nativ
             return base["scope"].get(f"/remaining-pr/{number}")
 
     before = digest(original)
-    manifest, bodies = Reader("synthetic-read").revalidate(base["repo"], original, event, "event2")
-    assert digest(manifest) == before and bodies == {1: "body1", 2: "body2"}
+    manifest, bodies = Reader("synthetic-read").revalidate(base["repo"], original, event, original["event_delivery_id"])
+    assert digest(manifest) == before and bodies == {1: ci_body(1), 2: ci_body(2)}
     assert manifest["creation_base_sha"] != manifest["expected_predecessor_sha"]
     base["host"].routes["/remaining-pr/1"]["merge_commit_sha"] = base["h1"]
     with pytest.raises(ValueError, match="recorded G"):
-        Reader("synthetic-read").revalidate(base["repo"], original, event, "event2")
+        Reader("synthetic-read").revalidate(base["repo"], original, event, original["event_delivery_id"])
 
 
 def test_guard_blocks_config_writer_even_when_native_state_is_missing(native_base):
@@ -969,3 +1047,132 @@ def test_ci_runs_full_pytest_once_per_H_and_G(native_base):
             measurements.append({"phase": run["phase"], "sha": run["run"]["head_sha"], "invocations": count})
     (base["root"] / "workflow-invocation-counts.json").write_text(json.dumps(measurements, indent=2))
     assert all(row["invocations"] == 1 for row in measurements), measurements
+
+
+@pytest.mark.parametrize("phase", ["H", "G"])
+@pytest.mark.parametrize("damage", ["none", "missing", "repo", "run", "attempt", "workflow", "blob", "head", "base", "manifest", "native", "digest", "digest_missing", "text", "raw_digest"])
+def test_reports_decode_reuses_only_exact_upstream_proof(native_base, tmp_path, phase, damage):
+    import base64
+
+    from scripts.ci.pytest_summary import envelope_digest
+
+    base = native_base
+    runs = base["host"].facts[base["g1"]]["ci"]
+    run = next(row for row in runs if row["phase"] == phase)
+    upstream = copy.deepcopy(run["jobs"][0]["envelope"])
+    expected = copy.deepcopy(upstream["binding"])
+    trusted_digest = envelope_digest(upstream)
+    if damage in {"repo", "run", "attempt", "workflow", "blob", "base", "manifest"}:
+        key = {"repo": "CI_REPOSITORY", "run": "CI_RUN_ID", "attempt": "CI_RUN_ATTEMPT", "workflow": "workflow_path",
+               "blob": "workflow_blob_sha", "base": "CI_BASE_SHA", "manifest": "member_manifest_sha256"}[damage]
+        upstream["binding"][key] = {"repo": "other/repo", "run": "999", "attempt": "9",
+                                    "workflow": ".github/workflows/other.yml"}.get(damage, "0"*(64 if damage == "manifest" else 40))
+    elif damage == "head":
+        key = "CI_GROUP_SHA" if phase == "G" else "CI_HEAD_SHA"
+        upstream["binding"][key] = base["g2"] if phase == "G" else base["h2"]
+        upstream["binding"]["tested_sha"] = upstream["binding"][key]
+    elif damage == "native":
+        upstream["evidence"]["native_exit"] = 2
+    elif damage == "digest":
+        trusted_digest = "0"*64
+    elif damage == "digest_missing":
+        trusted_digest = ""
+    elif damage == "text":
+        upstream["text"] += "tampered output\n"
+    elif damage == "raw_digest":
+        # This field cannot be recovered from compact text; the trusted full
+        # envelope digest must still reject its otherwise consistent rewrite.
+        upstream["evidence"]["raw_output_sha256"] = "0"*64
+    root = tmp_path / "reports"
+    root.mkdir()
+    (root / "binding.json").write_text(json.dumps(expected))
+    workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    step = next(s for s in workflow["jobs"]["agent-framework-reports"]["steps"] if s["name"] == "Decode pytest summary from test job")
+    encoded = base64.b64encode(json.dumps(upstream).encode()).decode()
+    env = {**os.environ, "CI_ROOT": str(root), "GITHUB_SERVER_URL": "https://github.com",
+           "PYTEST_SUMMARY_B64": "" if damage == "missing" else encoded,
+           "PYTEST_ENVELOPE_SHA256": trusted_digest, "PYTHONPATH": str(ROOT),
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
+    result = command(["bash", "-c", step["run"]], cwd=base["repo"], env=env)
+    assert (result.returncode == 0) == (damage == "none"), result.stdout + result.stderr
+    if damage == "none":
+        decoded = json.loads((root / "envelope.json").read_text())
+        assert decoded == upstream
+        assert json.loads((root / "ci-pytest/pytest-evidence.json").read_text()) == upstream["evidence"]
+        assert not (root / "pytest-native.exit").exists()  # reports minted no new pytest exit
+    else:
+        assert not (root / "envelope.json").exists()
+
+
+@pytest.mark.parametrize("upstream", ["success", "failure", "skipped", "cancelled", ""])
+def test_reports_requires_actual_upstream_success(upstream):
+    workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["agent-framework-reports"]
+    assert job["needs"] == "test" and job["if"].startswith("always()")
+    step = next(s for s in job["steps"] if s["name"] == "Require successful complete upstream")
+    result = command(["bash", "-c", step["run"]], env={**os.environ, "UPSTREAM_RESULT": upstream})
+    assert (result.returncode == 0) == (upstream == "success")
+
+
+@pytest.mark.parametrize("phase", ["H", "G"])
+@pytest.mark.parametrize("damage", ["missing_source", "source_digest", "envelope_digest", "source_context", "self_consistent_envelope",
+                                    "workflow_blob", "workflow_id", "member", "missing_test", "failed_test", "skipped_test"])
+def test_independent_reader_matches_reports_to_actual_test(native_base, phase, damage):
+    from scripts.check_known_failures import make_evidence
+    from scripts.ci.pytest_summary import envelope_digest
+
+    base = native_base
+    runs = copy.deepcopy(base["host"].facts[base["g1"]]["ci"])
+    run = next(row for row in runs if row["phase"] == phase)
+    test, reports = run["jobs"]
+    if damage == "missing_source":
+        reports.pop("pytest_source")
+    elif damage == "source_digest":
+        reports["pytest_source"]["artifact_sha256"] = "0"*64
+    elif damage == "envelope_digest":
+        reports["pytest_source"]["envelope_sha256"] = "0"*64
+    elif damage == "source_context":
+        reports["pytest_source"]["context"] = "agent-framework-reports"
+    elif damage == "self_consistent_envelope":
+        envelope = reports["envelope"]
+        envelope["text"] = "A different complete pytest invocation\n" + envelope["text"]
+        envelope["evidence"] = make_evidence(envelope["text"], 0, envelope["evidence"]["session"])
+        reports["pytest_source"]["envelope_sha256"] = envelope_digest(envelope)
+    elif damage == "workflow_blob":
+        reports["envelope"]["binding"]["workflow_blob_sha"] = "0"*40
+    elif damage == "workflow_id":
+        run["workflow"]["id"] += 1
+    elif damage == "member":
+        reports["obligations"]["members"][0]["body_sha256"] = "0"*64
+    elif damage == "missing_test":
+        run["jobs"].remove(test)
+    else:
+        test["conclusion"] = test["check"]["conclusion"] = "failure" if damage == "failed_test" else "skipped"
+    # Rehash the modified report: a self-consistent untrusted artifact still
+    # cannot claim an actual trusted upstream test job/run/check's native proof.
+    artifact = {key: reports[key] for key in ("envelope", "obligations", "pytest_source") if key in reports}
+    reports["artifact_sha256"] = digest(artifact)
+    with pytest.raises((ValueError, KeyError)):
+        validate_native_ci(base["repo"], base["values"][0]["manifest"], base["policy"], runs)
+
+
+def test_reports_gitea_legacy_compact_reuse_is_unchanged(native_base, tmp_path):
+    import base64
+
+    from scripts.ci.candidate_binding import FIELDS
+
+    base = native_base
+    upstream = copy.deepcopy(base["host"].facts[base["g1"]]["ci"][1]["jobs"][0]["envelope"])
+    upstream["binding"] = {key: upstream["binding"][key] for key in FIELDS}
+    root = tmp_path / "gitea-reports"
+    root.mkdir()
+    (root / "binding.json").write_text(json.dumps(upstream["binding"]))
+    workflow = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+    step = next(s for s in workflow["jobs"]["agent-framework-reports"]["steps"] if s["name"] == "Decode pytest summary from test job")
+    env = {**os.environ, "CI_ROOT": str(root), "GITHUB_SERVER_URL": "http://gitea.fixture.invalid",
+           "PYTEST_SUMMARY_B64": base64.b64encode(json.dumps(upstream).encode()).decode(),
+           "PYTEST_ENVELOPE_SHA256": "", "PYTHONPATH": str(ROOT),
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
+    checked(["bash", "-c", step["run"]], cwd=base["repo"], env=env)
+    assert json.loads((root / "envelope.json").read_text()) == upstream
+    assert not (root / "pytest-native.exit").exists()

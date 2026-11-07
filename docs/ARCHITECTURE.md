@@ -1412,23 +1412,27 @@ Prod 安装仍属外部依赖；CI/policy/生产模式未变。返回的 comment
 不证明真实 Prod review/admission；现有 review、候选验证、观察窗、merge/Issue closure
 仍仅由 Prod 执行。
 
-**Issue164 CI reuse 回归（修复前证据）**：owned tiny H/G fixture 的 pytest session hook
-逐次记录真实子进程；`test_ci_runs_full_pytest_once_per_H_and_G` 在 a0f2cf 行为上
-测得 test/reports 各跑一次、每个 H/G workflow 合计两次，违反一次全量执行要求。
-Coordinator 澄清两个完整 CI gate 是覆盖完整，不要求重复执行全量 pytest；下述说明待修正。
+**Issue164 CI reuse 修复**：owned tiny H/G fixture 的 pytest session hook 逐次记录真实
+子进程；`test_ci_runs_full_pytest_once_per_H_and_G` 先在 a0f2cf 行为测得每个 workflow 两次，
+修复后每个 H/G workflow 只有 test 执行一次完整 pytest。两个 required context 保持真实
+成功/失败语义与完整 gate 覆盖；reports 复用精确 test proof 并运行实际报告/成员门禁。
 
 **Issue164 CI/发布增量（本地未激活）**：`candidate_binding.py` 的 GitHub PR/group 使用
 v3 tagged H/G，Gitea 保留原 v2 compact identity。`merge_group.py` 通过固定只读 GraphQL
 query 分页读取 authenticated queue/entry/repository/members，不解析 queue branch 拼写。
 manifest 绑定完整 tree/ordered parents/成员 H/body digest；CI 不接触私有 Issue tuple。
-两个 literal required jobs 均在 H 和 G 全量跑真实 pytest/native/session/hash 门禁，reports
-用 always() 并显式拒绝 upstream failed/skipped/missing binding。Gitea reports 继续复用原 test
-的完整 compact evidence，不重复全量 pytest。每个成员 H 的 body/MCP/
+两个 literal required jobs 在 H/G 均覆盖完整门禁；每个 workflow 仅 test 全量跑一次
+pytest/native/session/hash，reports 用 always() 并显式拒绝 upstream failed/skipped/missing。
+GitHub compact binding 额外绑定 workflow path/blob；test job 输出完整 envelope digest，
+reports 在同 repo/run/attempt/event/H或G/B/member manifest 下验证 digest 并保留原 envelope，
+不重跑、不重建 native exit/session。Gitea 保持原 compact reuse/defaults。每个成员 H 的 body/MCP/
 redline/hygiene 和 G 的四报告均须通过；不以 check 同名 green 或 caller JSON 代替 producer
 证据。只有同 PR 旧 run 可取消；group key 含 event/G/run，不能取消 production。
 
 固定 workflow 最后记录 compact job-log attestation；独立只读 `NativeGitHubFacts` 验证 approved
 workflow blob、repository/workflow/run/attempt/job/check/App IDs 和最新 producer/evidence。
+reports attestation 明确以 pytest_source 链接实际 test artifact/envelope digest；reader 要求
+两个 context 的 envelope 完全相等并匹配实际可信 test attestation，不能用自洽伪摘要替代。
 日志下载只接受 authenticated API 的限定 presigned HTTPS host，下载不转发 auth。真实 Prod
 runtime、independent review 和 signer identity 必须来自受保护 port；本源码不安装这些 port。
 默认 signer 缺失即拒绝，shadow reducer/HostingClient 写权限不扩张。
@@ -1443,15 +1447,17 @@ v2 的 sha=H、deployment_sha=G、creation_base_sha=B；private canary、tuple�
 Owner 已明确接受 exact verified-G 放行规则；App/installation/保护/隔离 signer/Linux/真实
 Prod 安装与验收仍未执行。本地真实 Git/SQLite/shell/loopback 的证据不冒充生产交付。
 
-本地验收入口为 `tests/test_native_queue_contract.py`：真实 Git H/G/parent graph、两条 literal
-CI 的完整 tiny-fixture pytest/native/session/hash、真实 pipeline/state/OS flock、SQLite、
+原 a0f2cf 本地验收入口为 `tests/test_native_queue_contract.py`：真实 Git H/G/parent graph、
+当时两条 literal CI 各自运行的 tiny-fixture pytest/native/session/hash、真实 pipeline/state/OS flock、SQLite、
 loopback HTTP 与 reporter CLI。一次实际 observation 为 600.1887 秒；短窗不 grant，reporter
 SIGKILL 后 HTTP child 持 fence，丢响应/TTL/clear-lock/corruption 保留 barrier，exact G 才写
 一次 anchor/outcome/public v2。新增 init/config guard 与 lookahead-manifest 回归单独跑过。
 这些证据中的 App/policy/review 是明确 synthetic fixture，up/verify/promote/switch 外部设施
 使用 owned stand-ins；没有真实 systemd/nginx/业务库、hosting 或 Linux/Prod 验收。Gitea /
 shadow / publication / fencing 兼容回归保留；全仓测试由 Coordinator 在独立 Review PASS 后
-另行决定，本次没有 full-suite lease，也没有把 6b 基线重标成新源码结果。
+另行决定，没有 full-suite lease，也没有把 6b 基线重标成新源码结果。CI reuse 修复仅跑
+便宜 CI/readiness/handoff 回归，不重跑这次 600 秒证明，也不把旧 fixture 重标成修复 pin 的执行。
+现有 main push/workflow_dispatch 仍各可触发 test；本修复没有改变触发器或消除所有可能重跑。
 
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。

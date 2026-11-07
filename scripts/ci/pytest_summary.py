@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -68,6 +69,11 @@ def encode_summary(summary: str) -> str:
     return base64.b64encode(summary.encode("utf-8")).decode("ascii")
 
 
+def envelope_digest(envelope: dict) -> str:
+    return hashlib.sha256(json.dumps(envelope, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
 def decode_result(envelope: dict, expected_binding: dict | None = None) -> tuple[str, dict]:
     version = 2 if expected_binding is not None else 1
     keys = {"schema_version", "text", "evidence"} | ({"binding"} if version == 2 else set())
@@ -92,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-output", type=Path)
     parser.add_argument("--binding-file", type=Path, help="expected tested H/base B/run identity")
     parser.add_argument("--envelope-output", type=Path, help="retain bound envelope for authenticated job-log attestation")
+    parser.add_argument("--digest-output", action="store_true", help="also export the exact envelope digest as a job output")
+    parser.add_argument("--expected-envelope-sha256", help="trusted upstream job-output digest required at decode")
     args = parser.parse_args(argv)
     try:
         binding = json.loads(args.binding_file.read_text(encoding="utf-8")) if args.binding_file else None
@@ -101,9 +109,17 @@ def main(argv: list[str] | None = None) -> int:
             if not args.text_output or not args.evidence_output or args.input:
                 print("[ci-pytest-summary] --decode requires --text-output and --evidence-output, without input", file=sys.stderr)
                 return 2
-            text, evidence = decode_result(json.loads(args.decode.read_text(encoding="utf-8")), binding)
+            envelope = json.loads(args.decode.read_text(encoding="utf-8"))
+            text, evidence = decode_result(envelope, binding)
+            if (args.expected_envelope_sha256 is not None
+                    and args.expected_envelope_sha256 != envelope_digest(envelope)):
+                raise ValueError("upstream test envelope digest mismatch")
             args.text_output.write_text(text, encoding="utf-8")
             args.evidence_output.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+            if args.envelope_output:
+                if binding is None:
+                    raise ValueError("attestation requires a candidate binding")
+                args.envelope_output.write_text(json.dumps(envelope, sort_keys=True), encoding="utf-8")
             print("[ci-pytest-summary] decoded and validated native/session evidence")
             return 0
         if args.input is None or args.evidence_file is None:
@@ -135,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
             args.envelope_output.write_text(payload, encoding="utf-8")
         with output_file.open("a", encoding="utf-8") as handle:
             handle.write(f"{OUTPUT_NAME}={encoded}\n")
+            if args.digest_output:
+                handle.write(f"pytest_envelope_sha256={envelope_digest(envelope)}\n")
     except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as exc:
         print(f"[ci-pytest-summary] failed: {exc}", file=sys.stderr)
         return 1

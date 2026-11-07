@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
+      pytest_envelope_sha256: ${{ steps.pytest_summary.outputs.pytest_envelope_sha256 }}
       member_manifest_b64: ${{ steps.member_manifest.outputs.member_manifest_b64 }}
     steps:
       - name: Prepare isolated job paths
@@ -168,7 +169,7 @@ jobs:
       # 全部 FAILED/ERROR、终态摘要与真实 native/session/hash 证据，不能重建假退出码。
       - name: Create compact pytest summary output
         id: pytest_summary
-        run: python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --envelope-output "${CI_ROOT}/envelope.json"
+        run: python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --envelope-output "${CI_ROOT}/envelope.json" --digest-output
 
       - name: Attest test evidence for independent Prod reader
         if: github.server_url == 'https://github.com' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
@@ -268,13 +269,19 @@ jobs:
       - name: Decode pytest summary from test job
         env:
           PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}
+          PYTEST_ENVELOPE_SHA256: ${{ needs.test.outputs.pytest_envelope_sha256 }}
         run: |
           set -euo pipefail
           test -n "${PYTEST_SUMMARY_B64}"
+          set --
+          if [[ "${GITHUB_SERVER_URL:-}" == "https://github.com" ]]; then
+            test -n "${PYTEST_ENVELOPE_SHA256}"
+            set -- --expected-envelope-sha256 "${PYTEST_ENVELOPE_SHA256}"
+          fi
           mkdir -p ${CI_ROOT}/ci-pytest
           printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > ${CI_ROOT}/ci-pytest/pytest-result.json
           python3 scripts/ci/pytest_summary.py --decode ${CI_ROOT}/ci-pytest/pytest-result.json \
-            --text-output "${CI_ROOT}/ci-pytest/pytest-output.txt" --evidence-output "${CI_ROOT}/ci-pytest/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json"
+            --text-output "${CI_ROOT}/ci-pytest/pytest-output.txt" --evidence-output "${CI_ROOT}/ci-pytest/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --envelope-output "${CI_ROOT}/envelope.json" "$@"
           test -s ${CI_ROOT}/ci-pytest/pytest-output.txt
 
       - name: Install dependencies
@@ -285,32 +292,6 @@ jobs:
           python3 -m venv "${CI_ROOT}/venv"
           ${CI_ROOT}/venv/bin/pip install -r requirements.txt -q
           ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" "PyYAML==6.0.3" radon bandit -q
-
-      - name: Pytest (full suite, including MCP)
-        if: github.server_url == 'https://github.com'
-        run: |
-          set -euo pipefail
-          TEST_DB_DIR="$(mktemp -d)"
-          python3 -c 'import os; from pathlib import Path; [Path(os.environ["CI_ROOT"], p).unlink(missing_ok=True) for p in ["pytest-session.json", "pytest-native.exit", "pytest-evidence.json"]]'
-          set +e
-          DAILYCHECK_DB_DIR="${TEST_DB_DIR}" \
-            ${CI_ROOT}/venv/bin/python -m pytest --basetemp=${CI_ROOT}/pytest-dc -q --tb=no -rfE --color=no \
-            -p scripts.ci.pytest_evidence --dc-evidence=${CI_ROOT}/pytest-session.json \
-            > ${CI_ROOT}/pytest-output.txt 2>&1
-          PYTEST_EXIT=$?
-          set -e
-          printf '%s\n' "${PYTEST_EXIT}" > ${CI_ROOT}/pytest-native.exit
-          tail -3 ${CI_ROOT}/pytest-output.txt
-
-      - name: Zero-new-failure gate
-        if: github.server_url == 'https://github.com'
-        run: ${CI_ROOT}/venv/bin/python scripts/check_known_failures.py ${CI_ROOT}/pytest-output.txt --pytest-exit-file ${CI_ROOT}/pytest-native.exit --session-file ${CI_ROOT}/pytest-session.json --write-evidence ${CI_ROOT}/pytest-evidence.json
-
-      - name: Retain reports full-suite evidence at documented reuse path
-        if: github.server_url == 'https://github.com'
-        run: |
-          cp "${CI_ROOT}/pytest-output.txt" "${CI_ROOT}/ci-pytest/pytest-output.txt"
-          cp "${CI_ROOT}/pytest-evidence.json" "${CI_ROOT}/ci-pytest/pytest-evidence.json"
 
       - name: Merge-group member obligations
         if: github.event_name == 'merge_group'
@@ -399,5 +380,4 @@ jobs:
       - name: Attest reports evidence for independent Prod reader
         if: github.server_url == 'https://github.com'
         run: |
-          python3 scripts/ci/pytest_summary.py "${CI_ROOT}/pytest-output.txt" --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json" --output-file "${CI_ROOT}/reports-output" --envelope-output "${CI_ROOT}/envelope.json"
           python3 scripts/ci/merge_group.py attest --context agent-framework-reports --manifest "${CI_ROOT}/members.json"

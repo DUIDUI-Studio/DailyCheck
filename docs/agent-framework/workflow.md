@@ -172,8 +172,12 @@ deployed group；P 是实际 Git graph 直接前驱。保留有序成员、authe
 和原私有 composite/source-map digest，不能从分支拼写猜成员，也不能把所有 H 替换成 G。
 
 MERGE only：H 一父、G 至少二父且成员 H 都在 ancestry。`test` 与
-`agent-framework-reports` 两个原 check 在 H/G 各跑完整真实 coverage；reports always 运行并
-显式拒绝缺失/失败/跳过 upstream、binding、成员四报告/body/MCP/redline/hygiene 义务。
+`agent-framework-reports` 两个原 check 在 H/G 均覆盖完整门禁；每个 workflow 的全量
+pytest 仅由 test 运行一次，reports 复用 exact repo/workflow blob/run/attempt/event/H或G/B/
+member manifest 和 digest 绑定的原 native/session/hash proof，实际执行全部报告/成员门禁。
+reports always 运行并显式拒绝缺失/失败/跳过 upstream；其 attestation 链接实际可信 test
+artifact/envelope，不创建自己的 pytest session 或退出码。成员四报告/body/MCP/redline/hygiene
+义务不减。现有 main push/workflow_dispatch test 开销保留，本次不改触发器或分片。
 Prod 验证 approved workflow/check/run/attempt/App/evidence identity，不只看同名 green。
 PR body 是数据。只取消同 PR 旧 CI；group 以 event/G/run 独立并发，不取消 production。
 
