@@ -186,6 +186,7 @@ def test_docstring_paths_point_at_real_file():
     shim = (Path(__file__).resolve().parents[1]
             / "deploy" / "scripts" / "dailycheck_pr_poll_shim.py")
     content = shim.read_text(encoding="utf-8")
-    assert 'TARGET = "/root/DailyCheck/scripts/prod_agent/pr_poll.py"' in content
+    assert 'os.environ.get("DAILYCHECK_SOURCE_DIR", "/root/DailyCheck")' in content
+    assert '"scripts", "prod_agent", "pr_poll.py"' in content
     assert (Path(__file__).resolve().parents[1]
             / "scripts" / "prod_agent" / "pr_poll.py").exists()

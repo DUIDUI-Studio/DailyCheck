@@ -459,12 +459,12 @@ def dispatch_feedback(ticket_id: int):
         save_draft(db, ticket_id, title, body)
 
         if not dispatch.dispatch_enabled():
-            flash("草稿已保存，但派发通道未配置（FEEDBACK_GITEA_TOKEN 为空），请手动建 Issue。")
+            flash("草稿已保存，但派发通道未配置，请手动建 Issue。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
         issue = dispatch.create_issue(title, body)
         if issue is None:
-            flash("草稿已保存，但创建 Gitea Issue 失败（详见服务端日志），请手动建单。")
+            flash("草稿已保存，但创建 Issue 失败（详见服务端日志），请手动建单。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
         attach_issue(db, ticket_id, issue["number"], issue["url"], g.user["id"])

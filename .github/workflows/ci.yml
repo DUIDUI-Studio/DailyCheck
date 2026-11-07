@@ -5,8 +5,23 @@
 name: CI
 
 env:
+  CI_REPOSITORY: ${{ github.repository }}
+  CI_RUN_ID: ${{ github.run_id }}
+  CI_RUN_ATTEMPT: ${{ github.run_attempt || '1' }}
+  CI_EVENT: ${{ github.event_name }}
+  CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  CI_EVENT_SHA: ${{ github.sha }}
   PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
   PIP_TRUSTED_HOST: mirrors.aliyun.com
+
+permissions:
+  contents: read
+
+# Only superseded CI for the same PR is canceled. No deployment serialization.
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
   pull_request:
@@ -20,20 +35,82 @@ jobs:
     outputs:
       pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
     steps:
-      - name: Checkout code
-        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
+      - name: Prepare isolated job paths
+        run: |
+          set -euo pipefail
+          CI_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/dailycheck-${CI_RUN_ID}-${CI_RUN_ATTEMPT}.XXXXXX")"
+          mkdir -p "${CI_ROOT}/tmp" "${CI_ROOT}/db"
+          printf 'CI_ROOT=%s\nTMPDIR=%s/tmp\nDAILYCHECK_CI_TMP=%s/tmp\nDAILYCHECK_DB_DIR=%s/db\n' \
+            "$CI_ROOT" "$CI_ROOT" "$CI_ROOT" "$CI_ROOT" >> "$GITHUB_ENV"
+
+      - name: Checkout candidate H on GitHub
+        if: github.server_url == 'https://github.com'
+        uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Python（镜像自带 3.12 + pip）
+      - name: Checkout candidate H on Gitea
+        if: github.server_url != 'https://github.com'
+        env:
+          CHECKOUT_SERVER: ${{ github.server_url }}
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYCODE'
+          import base64, os, re, subprocess
+          from urllib.parse import urlsplit
+          server = os.environ["CHECKOUT_SERVER"].rstrip("/")
+          parsed = urlsplit(server)
+          repo, head, base = (os.environ[k] for k in ("CI_REPOSITORY", "CI_HEAD_SHA", "CI_BASE_SHA"))
+          token = os.environ["CHECKOUT_TOKEN"]
+          if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username
+                  or parsed.password or parsed.path or parsed.query or parsed.fragment
+                  or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+                  or not re.fullmatch(r"[0-9a-f]{40}", head) or not token
+                  or any(ord(c) < 33 or ord(c) == 127 for c in token)
+                  or base and not re.fullmatch(r"[0-9a-f]{40}", base)):
+              raise SystemExit("invalid source checkout identity/credentials")
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+          env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "2",
+                 "GIT_CONFIG_KEY_0": f"http.{server}/.extraheader",
+                 "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic " + auth,
+                 "GIT_CONFIG_KEY_1": "safe.directory", "GIT_CONFIG_VALUE_1": workspace}
+          def git(*args):
+              subprocess.run(["git", *args], cwd=workspace, env=env, check=True)
+          git("init")
+          existing = subprocess.run(["git", "remote", "get-url", "origin"], cwd=workspace, env=env, capture_output=True)
+          git("remote", "set-url" if existing.returncode == 0 else "add", "origin", f"{server}/{repo}.git")
+          git("fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main", head, *([base] if base else []))
+          git("checkout", "--force", "--detach", head)
+          git("clean", "-ffdx")
+          PYCODE
+
+      - name: Setup Python on GitHub
+        if: github.server_url == 'https://github.com'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Python on Gitea (runner image)
+        if: github.server_url != 'https://github.com'
         run: python3 --version && python3 -m pip --version
+
+      - name: Bind tested H and event H/B to this run
+        run: |
+          set -euo pipefail
+          mkdir -p "${CI_ROOT}/tmp" "${CI_ROOT}/db"
+          python3 scripts/ci/candidate_binding.py "${CI_ROOT}/binding.json"
 
       - name: Install dependencies
         run: |
-          python3 -m venv /opt/venv
-          /opt/venv/bin/pip install -r requirements.txt -q
-          /opt/venv/bin/pip install pytest "ruff==0.16.10" -q
+          if [ "${{ github.server_url }}" = "https://github.com" ]; then
+            unset PIP_INDEX_URL PIP_TRUSTED_HOST
+          fi
+          python3 -m venv "${CI_ROOT}/venv"
+          ${CI_ROOT}/venv/bin/pip install -r requirements.txt -q
+          ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" -q
 
       - name: Ruff (changed .py files only)
         run: |
@@ -44,13 +121,13 @@ jobs:
             # tests/test_store_ordering_board.py，ruff 报 E902 整步失败。
             # --diff-filter=d 再兜一层：本分支自己删掉的 .py 不喂给 ruff。
             FILES=$(git diff --name-only --diff-filter=d \
-              "${{ github.event.pull_request.base.sha }}...HEAD" -- '*.py')
+              "${CI_BASE_SHA}...HEAD" -- '*.py')
           else
             FILES=$(git diff --name-only --diff-filter=d "HEAD~1" -- '*.py')
           fi
           if [ -n "$FILES" ]; then
             echo "ruff checking: $FILES"
-            /opt/venv/bin/ruff check $FILES
+            ${CI_ROOT}/venv/bin/ruff check $FILES
           else
             echo "no python files changed, skip"
           fi
@@ -59,25 +136,25 @@ jobs:
         run: |
           set -euo pipefail
           TEST_DB_DIR="$(mktemp -d)"
-          python3 -c 'from pathlib import Path; [Path(p).unlink(missing_ok=True) for p in ["/tmp/pytest-session.json", "/tmp/pytest-native.exit", "/tmp/pytest-evidence.json"]]'
+          python3 -c 'import os; from pathlib import Path; [Path(os.environ["CI_ROOT"], p).unlink(missing_ok=True) for p in ["pytest-session.json", "pytest-native.exit", "pytest-evidence.json"]]'
           set +e
           DAILYCHECK_DB_DIR="${TEST_DB_DIR}" \
-            /opt/venv/bin/python -m pytest --basetemp=/tmp/pytest-dc -q --tb=no -rfE --color=no \
-            -p scripts.ci.pytest_evidence --dc-evidence=/tmp/pytest-session.json \
-            > /tmp/pytest-output.txt 2>&1
+            ${CI_ROOT}/venv/bin/python -m pytest --basetemp=${CI_ROOT}/pytest-dc -q --tb=no -rfE --color=no \
+            -p scripts.ci.pytest_evidence --dc-evidence=${CI_ROOT}/pytest-session.json \
+            > ${CI_ROOT}/pytest-output.txt 2>&1
           PYTEST_EXIT=$?
           set -e
-          printf '%s\n' "${PYTEST_EXIT}" > /tmp/pytest-native.exit
-          tail -3 /tmp/pytest-output.txt
+          printf '%s\n' "${PYTEST_EXIT}" > ${CI_ROOT}/pytest-native.exit
+          tail -3 ${CI_ROOT}/pytest-output.txt
 
       - name: Zero-new-failure gate
-        run: /opt/venv/bin/python scripts/check_known_failures.py /tmp/pytest-output.txt --pytest-exit-file /tmp/pytest-native.exit --session-file /tmp/pytest-session.json --write-evidence /tmp/pytest-evidence.json
+        run: ${CI_ROOT}/venv/bin/python scripts/check_known_failures.py ${CI_ROOT}/pytest-output.txt --pytest-exit-file ${CI_ROOT}/pytest-native.exit --session-file ${CI_ROOT}/pytest-session.json --write-evidence ${CI_ROOT}/pytest-evidence.json
 
       # Gitea 不支持 artifact v4。只传递下游报告和零新增门禁所需的小型摘要：
       # 全部 FAILED/ERROR、终态摘要与真实 native/session/hash 证据，不能重建假退出码。
       - name: Create compact pytest summary output
         id: pytest_summary
-        run: python3 scripts/ci/pytest_summary.py /tmp/pytest-output.txt --evidence-file /tmp/pytest-evidence.json
+        run: python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt --evidence-file "${CI_ROOT}/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json"
 
   agent-framework-reports:
     # Phase MVE: 四报告门禁（独立 status check，让 branch protection 可独立勾选）
@@ -87,37 +164,94 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - name: Checkout code
-        uses: http://172.28.129.216:3000/eric/actions-checkout@v4
+      - name: Prepare isolated job paths
+        run: |
+          set -euo pipefail
+          CI_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/dailycheck-${CI_RUN_ID}-${CI_RUN_ATTEMPT}.XXXXXX")"
+          mkdir -p "${CI_ROOT}/tmp" "${CI_ROOT}/db"
+          printf 'CI_ROOT=%s\nTMPDIR=%s/tmp\nDAILYCHECK_CI_TMP=%s/tmp\nDAILYCHECK_DB_DIR=%s/db\n' \
+            "$CI_ROOT" "$CI_ROOT" "$CI_ROOT" "$CI_ROOT" >> "$GITHUB_ENV"
+
+      - name: Checkout candidate H on GitHub
+        if: github.server_url == 'https://github.com'
+        uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-          # 红线检查与 generate_reports.sh 都要 `git diff BASE_SHA..HEAD`，
-          # 默认 fetch-depth=1 时 base commit 不在本地，diff 会失败 —— 而
-          # generate_reports.sh 那条是 `|| true`，失败被静默吞掉。
           fetch-depth: 0
 
-      # test job 成功才进入本 job，因此输出缺失/损坏必须显式失败，
-      # 不能假装有复用文件而进入 pytest 重跑 fallback。
+      - name: Checkout candidate H on Gitea
+        if: github.server_url != 'https://github.com'
+        env:
+          CHECKOUT_SERVER: ${{ github.server_url }}
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYCODE'
+          import base64, os, re, subprocess
+          from urllib.parse import urlsplit
+          server = os.environ["CHECKOUT_SERVER"].rstrip("/")
+          parsed = urlsplit(server)
+          repo, head, base = (os.environ[k] for k in ("CI_REPOSITORY", "CI_HEAD_SHA", "CI_BASE_SHA"))
+          token = os.environ["CHECKOUT_TOKEN"]
+          if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username
+                  or parsed.password or parsed.path or parsed.query or parsed.fragment
+                  or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+                  or not re.fullmatch(r"[0-9a-f]{40}", head) or not token
+                  or any(ord(c) < 33 or ord(c) == 127 for c in token)
+                  or base and not re.fullmatch(r"[0-9a-f]{40}", base)):
+              raise SystemExit("invalid source checkout identity/credentials")
+          workspace = os.environ["GITHUB_WORKSPACE"]
+          auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+          env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "2",
+                 "GIT_CONFIG_KEY_0": f"http.{server}/.extraheader",
+                 "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic " + auth,
+                 "GIT_CONFIG_KEY_1": "safe.directory", "GIT_CONFIG_VALUE_1": workspace}
+          def git(*args):
+              subprocess.run(["git", *args], cwd=workspace, env=env, check=True)
+          git("init")
+          existing = subprocess.run(["git", "remote", "get-url", "origin"], cwd=workspace, env=env, capture_output=True)
+          git("remote", "set-url" if existing.returncode == 0 else "add", "origin", f"{server}/{repo}.git")
+          git("fetch", "--force", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main", head, *([base] if base else []))
+          git("checkout", "--force", "--detach", head)
+          git("clean", "-ffdx")
+          PYCODE
+
+      - name: Setup Python on GitHub
+        if: github.server_url == 'https://github.com'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Python on Gitea (runner image)
+        if: github.server_url != 'https://github.com'
+        run: python3 --version && python3 -m pip --version
+
+      - name: Bind tested H and event H/B to this run
+        run: |
+          set -euo pipefail
+          mkdir -p "${CI_ROOT}/tmp" "${CI_ROOT}/db"
+          python3 scripts/ci/candidate_binding.py "${CI_ROOT}/binding.json"
+
       - name: Decode pytest summary from test job
         env:
           PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}
         run: |
           set -euo pipefail
           test -n "${PYTEST_SUMMARY_B64}"
-          mkdir -p /tmp/ci-pytest
-          printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > /tmp/ci-pytest/pytest-result.json
-          python3 scripts/ci/pytest_summary.py --decode /tmp/ci-pytest/pytest-result.json \
-            --text-output /tmp/ci-pytest/pytest-output.txt --evidence-output /tmp/ci-pytest/pytest-evidence.json
-          test -s /tmp/ci-pytest/pytest-output.txt
-
-      - name: Python（镜像自带 3.12 + pip）
-        run: python3 --version && python3 -m pip --version
+          mkdir -p ${CI_ROOT}/ci-pytest
+          printf '%s' "${PYTEST_SUMMARY_B64}" | base64 --decode > ${CI_ROOT}/ci-pytest/pytest-result.json
+          python3 scripts/ci/pytest_summary.py --decode ${CI_ROOT}/ci-pytest/pytest-result.json \
+            --text-output "${CI_ROOT}/ci-pytest/pytest-output.txt" --evidence-output "${CI_ROOT}/ci-pytest/pytest-evidence.json" --binding-file "${CI_ROOT}/binding.json"
+          test -s ${CI_ROOT}/ci-pytest/pytest-output.txt
 
       - name: Install dependencies
         run: |
-          python3 -m venv /opt/venv
-          /opt/venv/bin/pip install -r requirements.txt -q
-          /opt/venv/bin/pip install pytest "ruff==0.16.10" radon bandit -q
+          if [ "${{ github.server_url }}" = "https://github.com" ]; then
+            unset PIP_INDEX_URL PIP_TRUSTED_HOST
+          fi
+          python3 -m venv "${CI_ROOT}/venv"
+          ${CI_ROOT}/venv/bin/pip install -r requirements.txt -q
+          ${CI_ROOT}/venv/bin/pip install pytest "ruff==0.16.10" radon bandit -q
 
       # 同一既有必需 check：台账必须与全部实现/文档一致，再验证 PR 的影响声明。
       # BASE_SHA 只作 main 参考；检查器内部用 merge-base，避免计入他人 main 变更。
@@ -127,27 +261,28 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/pr
-          printf '%s\n' "$PR_BODY" > /tmp/pr/body.md
-          /opt/venv/bin/python -m scripts.mcp_contracts --check
-          /opt/venv/bin/python scripts/agent_framework/check_mcp_impact.py --base "${BASE_SHA}" --body-file /tmp/pr/body.md
+          mkdir -p ${CI_ROOT}/pr
+          printf '%s\n' "$PR_BODY" > ${CI_ROOT}/pr/body.md
+          ${CI_ROOT}/venv/bin/python -m scripts.mcp_contracts --check
+          ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_mcp_impact.py --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md
 
       - name: Generate reports 02 + 03
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUM: ${{ github.event.pull_request.number }}
-          PYTEST_REUSE_FILE: /tmp/ci-pytest/pytest-output.txt
-          PYTEST_REUSE_EVIDENCE: /tmp/ci-pytest/pytest-evidence.json
+          PYTEST_REUSE_FILE: ${{ env.CI_ROOT }}/ci-pytest/pytest-output.txt
+          PYTEST_REUSE_EVIDENCE: ${{ env.CI_ROOT }}/ci-pytest/pytest-evidence.json
         run: |
           # 即便脚本退出非 0 也跑完（让 reports/ 至少部分生成供 review 看）
-          export PATH=/opt/venv/bin:$PATH
+          export PATH=${CI_ROOT}/venv/bin:$PATH
           bash scripts/agent_framework/generate_reports.sh || echo "[warn] generate_reports exit non-zero"
 
       - name: Generate report 04 (local deploy preview)
         env:
           PR_NUM: ${{ github.event.pull_request.number }}
         run: |
+          export PATH="${CI_ROOT}/venv/bin:$PATH"
           bash scripts/agent_framework/preview.sh "${PR_NUM}" || echo "[warn] preview exit non-zero"
 
       - name: Check four reports gate
@@ -155,9 +290,9 @@ jobs:
           PR_NUM: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          mkdir -p /tmp/pr
-          echo "$PR_BODY" > /tmp/pr/body.md
-          PR_BODY_FILE=/tmp/pr/body.md PR_NUM="${PR_NUM}" /opt/venv/bin/python scripts/agent_framework/check_reports.py
+          mkdir -p ${CI_ROOT}/pr
+          echo "$PR_BODY" > ${CI_ROOT}/pr/body.md
+          PR_BODY_FILE=${CI_ROOT}/pr/body.md PR_NUM="${PR_NUM}" ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_reports.py
 
       # 红线机验（2026-10-24 新增）：workflow.md §四 的 6 条红线此前全是自述，
       # PR #13 改了 .github/workflows/ci.yml（红线 2）被自行合并，没人拦得住。
@@ -167,10 +302,10 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          mkdir -p /tmp/pr
-          echo "$PR_BODY" > /tmp/pr/body.md
-          /opt/venv/bin/python scripts/agent_framework/check_redlines.py \
-            --base "${BASE_SHA}" --body-file /tmp/pr/body.md
+          mkdir -p ${CI_ROOT}/pr
+          echo "$PR_BODY" > ${CI_ROOT}/pr/body.md
+          ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_redlines.py \
+            --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md
 
       # 开工规范机验（2026-10-24 新增，Issue #26）：分支前缀 / issue 号一致性 /
       # 无号分支必须声明。此前这些规矩只活在 Dev Agent 的本地记忆里，换 session 就丢。
@@ -180,7 +315,7 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_BRANCH: ${{ github.head_ref }}
         run: |
-          mkdir -p /tmp/pr
-          echo "$PR_BODY" > /tmp/pr/body.md
-          /opt/venv/bin/python scripts/agent_framework/check_pr_hygiene.py \
-            --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file /tmp/pr/body.md
+          mkdir -p ${CI_ROOT}/pr
+          echo "$PR_BODY" > ${CI_ROOT}/pr/body.md
+          ${CI_ROOT}/venv/bin/python scripts/agent_framework/check_pr_hygiene.py \
+            --branch "${PR_BRANCH}" --base "${BASE_SHA}" --body-file ${CI_ROOT}/pr/body.md

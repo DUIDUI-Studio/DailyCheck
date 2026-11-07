@@ -216,14 +216,14 @@ def test_existing_required_job_runs_consistency_and_impact_checks(tmp_path):
     step = reports.split("      - name: MCP contracts and PR impact gate\n", 1)[1].split("      - name:", 1)[0]
     assert "BASE_SHA: ${{ github.event.pull_request.base.sha }}" in step
     assert "PR_BODY: ${{ github.event.pull_request.body }}" in step
-    run = textwrap.dedent(step.split("        run: |\n", 1)[1]).replace("/opt/venv/bin/python", "python")
+    run = textwrap.dedent(step.split("        run: |\n", 1)[1]).replace("${CI_ROOT}/venv/bin/python", "python")
     assert "python -m scripts.mcp_contracts --check" in run
     assert 'check_mcp_impact.py --base "${BASE_SHA}" --body-file' in run
     # Execute the actual step with command stubs: neither failed check may be swallowed.
     stub = tmp_path / "python"
     stub.write_text('#!/bin/sh\ncase "$*" in\n  *scripts.mcp_contracts*) exit "${CONTRACT_EXIT}";;\n  *check_mcp_impact.py*) exit "${IMPACT_EXIT}";;\n  *) exit 90;;\nesac\n', encoding="utf-8")
     stub.chmod(0o755)
-    run = run.replace("/tmp/pr", str(tmp_path / "pr"))
+    run = run.replace("${CI_ROOT}/pr", str(tmp_path / "pr"))
     for contract_exit, impact_exit in [(0, 0), (1, 0), (0, 1)]:
         env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "BASE_SHA": "main", "PR_BODY": body(entry()), "CONTRACT_EXIT": str(contract_exit), "IMPACT_EXIT": str(impact_exit)}
         result = subprocess.run(["bash", "-c", run], env=env, cwd=tmp_path, check=False)

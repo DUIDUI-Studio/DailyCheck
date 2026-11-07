@@ -58,7 +58,7 @@ def test_test_job_exports_the_compact_summary_only(workflow):
 
     assert "outputs:" in test_job
     assert "pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}" in test_job
-    assert "python3 scripts/ci/pytest_summary.py /tmp/pytest-output.txt" in test_job
+    assert "python3 scripts/ci/pytest_summary.py ${CI_ROOT}/pytest-output.txt" in test_job
     assert test_job.index("Zero-new-failure gate") < test_job.index(
         "Create compact pytest summary output"
     )
@@ -68,10 +68,10 @@ def test_reports_job_decodes_to_the_documented_reuse_path(workflow):
     reports_job = _job(workflow, "agent-framework-reports")
 
     assert "PYTEST_SUMMARY_B64: ${{ needs.test.outputs.pytest_summary_b64 }}" in reports_job
-    assert "mkdir -p /tmp/ci-pytest" in reports_job
-    assert "base64 --decode > /tmp/ci-pytest/pytest-result.json" in reports_job
-    assert "--evidence-output /tmp/ci-pytest/pytest-evidence.json" in reports_job
-    assert "PYTEST_REUSE_FILE: /tmp/ci-pytest/pytest-output.txt" in reports_job
+    assert "mkdir -p ${CI_ROOT}/ci-pytest" in reports_job
+    assert "base64 --decode > ${CI_ROOT}/ci-pytest/pytest-result.json" in reports_job
+    assert '--evidence-output "${CI_ROOT}/ci-pytest/pytest-evidence.json"' in reports_job
+    assert "PYTEST_REUSE_FILE: ${{ env.CI_ROOT }}/ci-pytest/pytest-output.txt" in reports_job
 
 
 def test_reports_job_keeps_all_existing_gates(workflow):

@@ -24,9 +24,9 @@ if [[ -z "${HEAD_SHA}" ]]; then
   HEAD_SHA="$(git rev-parse HEAD)"
 fi
 
-PYTEST_OUTPUT="/tmp/pytest-output-af.txt"
-RUFF_OUTPUT="/tmp/ruff-output-af.txt"
-BANDIT_OUTPUT="/tmp/bandit-output-af.txt"
+PYTEST_OUTPUT="${DAILYCHECK_CI_TMP:-/tmp}/pytest-output-af.txt"
+RUFF_OUTPUT="${DAILYCHECK_CI_TMP:-/tmp}/ruff-output-af.txt"
+BANDIT_OUTPUT="${DAILYCHECK_CI_TMP:-/tmp}/bandit-output-af.txt"
 
 # ============================================================
 # 报告 02：测试
@@ -36,7 +36,7 @@ BANDIT_OUTPUT="/tmp/bandit-output-af.txt"
 # 显式空/缺失/损坏请求拒绝，不重跑掩盖；未请求时始终 fresh pytest。
 REUSE_FILE="${PYTEST_REUSE_FILE-/tmp/ci-pytest/pytest-output.txt}"
 REUSE_EVIDENCE="${PYTEST_REUSE_EVIDENCE-${REUSE_FILE}.evidence.json}"
-PYTEST_EVIDENCE="/tmp/pytest-evidence-af.json"
+PYTEST_EVIDENCE="${DAILYCHECK_CI_TMP:-/tmp}/pytest-evidence-af.json"
 PYTEST_EXIT=null
 COMPLETE=false
 PASSED=null
@@ -61,7 +61,7 @@ else
   TEST_DB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")"
   if [[ -n "${TEST_DB_DIR}" && -d "${TEST_DB_DIR}" ]]; then
     DAILYCHECK_DB_DIR="${TEST_DB_DIR}" python3 -m pytest \
-      --basetemp=/tmp/pytest-dc-af -q --tb=no -rfE --color=no \
+      --basetemp=${DAILYCHECK_CI_TMP:-/tmp}/pytest-dc-af -q --tb=no -rfE --color=no \
       -p scripts.ci.pytest_evidence --dc-evidence="${TEST_DB_DIR}/session.json" \
       > "${PYTEST_OUTPUT}" 2>&1
     PYTEST_EXIT=$?

@@ -29,6 +29,15 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.hosting import (
+    AccessRole,
+    HostingClient,
+    HostingConfig,
+    HostingError,
+    Provider,
+    provider,
+)
+
 FETCH_TIMEOUT = 30.0
 
 
@@ -73,10 +82,14 @@ API_MAX_PAGES = 6
 
 def api_base() -> str:
     """Gitea API 根地址；`GITEA_API_BASE` 可覆盖（本机 / CI 用）。"""
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment().api_url
     return (os.environ.get("GITEA_API_BASE") or DEFAULT_API_BASE).rstrip("/")
 
 
 def repo_slug() -> str:
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment().repo
     return (os.environ.get("GITEA_REPO") or DEFAULT_REPO).strip().strip("/")
 
 
@@ -133,6 +146,13 @@ def _api_get(path: str, params: dict[str, str] | None = None) -> list[dict]:
 
 def _api_get_all(path: str, params: dict[str, str] | None = None) -> list[dict]:
     """按 limit=50 翻页，最多 API_MAX_PAGES 页。"""
+    try:
+        if provider() is Provider.GITHUB:
+            client = HostingClient(HostingConfig.from_environment(AccessRole.READ))
+            client.verify_repository()
+            return client.pages(path, params=params)
+    except HostingError as exc:
+        raise FetchError(f"hosting API failure: {exc} HTTP {exc.status}") from exc
     items: list[dict] = []
     for page in range(1, API_MAX_PAGES + 1):
         chunk = _api_get(
@@ -160,7 +180,7 @@ def fetch_issues(repo: str | None = None) -> list[dict]:
     repo = repo or repo_slug()
     items = _api_get_all(
         f"/repos/{repo}/issues",
-        {"state": "all", "sort": "recentupdate", "direction": "desc"},
+        {"state": "all", "sort": "updated" if provider() is Provider.GITHUB else "recentupdate", "direction": "desc"},
     )
     return [
         {
@@ -186,7 +206,7 @@ def fetch_prs(repo: str | None = None) -> list[dict]:
     repo = repo or repo_slug()
     items = _api_get_all(
         f"/repos/{repo}/pulls",
-        {"state": "all", "sort": "recentupdate"},
+        {"state": "all", "sort": "updated" if provider() is Provider.GITHUB else "recentupdate", "direction": "desc"},
     )
     return [
         {
@@ -196,7 +216,7 @@ def fetch_prs(repo: str | None = None) -> list[dict]:
             "head_ref": ((it.get("head") or {}).get("ref")) or "",
             "head_sha": ((it.get("head") or {}).get("sha")) or None,
             "merge_sha": it.get("merge_commit_sha") or None,
-            "repo_id": "git:hub01/" + repo,
+            "repo_id": ("git:github.com/" if provider() is Provider.GITHUB else "git:hub01/") + repo,
             "created_at": (it.get("created_at") or "")[:10] or None,
             "merged_at": (it.get("merged_at") or "")[:10] or None,
             "created_ts": _norm_ts(it.get("created_at")),

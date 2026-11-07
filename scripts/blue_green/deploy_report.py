@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from deploy_triage_pure import (  # noqa: E402
     KIND_SUCCESS,
@@ -79,6 +80,16 @@ from deploy_triage_pure import (  # noqa: E402
     assess_alignment,
     next_action,
     triage,
+)
+
+from scripts.hosting import (  # noqa: E402
+    AccessRole,
+    HostingClient,
+    HostingConfig,
+    HostingError,
+    Provider,
+    provider,
+    require_shadow_path,
 )
 
 MARKER = "<!-- deploy-report:v1 -->"
@@ -106,6 +117,8 @@ def _env(key: str, default: str = "") -> str:
 
 
 def _token() -> str:
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment(AccessRole.REPORT).token
     env_token = _env("DAILYCHECK_GITEA_TOKEN") or _env("FEEDBACK_GITEA_TOKEN")
     if env_token:
         return env_token
@@ -117,14 +130,20 @@ def _token() -> str:
 
 
 def _api_base() -> str:
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment().api_url
     return _env("FEEDBACK_GITEA_API", DEFAULT_API).rstrip("/")
 
 
 def _repo() -> str:
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment().repo
     return _env("FEEDBACK_GITEA_REPO", DEFAULT_REPO)
 
 
 def _web_base() -> str:
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment().web_url
     return _env("DAILYCHECK_GITEA_WEB_BASE", "").rstrip("/")
 
 
@@ -216,6 +235,14 @@ def gitea(method: str, path: str, payload: dict[str, Any] | None = None) -> tupl
     用临时文件 + ``--data-binary @file``（不是 ``@-``）：这是本仓在生产上验证
     过能用的形态，别改成管道传参。
     """
+    if provider() is Provider.GITHUB:
+        role = AccessRole.READ if method == "GET" else AccessRole.REPORT
+        client = HostingClient(HostingConfig.from_environment(role))
+        try:
+            client.verify_repository()
+            return 200 if method == "GET" else 201, json.dumps(client.request(method, path, payload)[0])
+        except HostingError as exc:
+            return exc.status, ""
     token = _token()
     if not token:
         return 0, ""
@@ -267,6 +294,13 @@ def find_same_sha_comment(pr: int, sha: str) -> int:
     就没人看了，等于回到「没有留档」。所以按 sha 幂等：同 sha 更新，不同 sha
     各留一条（多次部署的历史是需要的，那是「这次改动修好了没」的证据链）。
     """
+    if provider() is Provider.GITHUB:
+        client = HostingClient(HostingConfig.from_environment(AccessRole.READ))
+        client.verify_repository()
+        rows = client.pages(f"/repos/{client.config.repo}/issues/{pr}/comments")
+        needle = f"`{sha[:12]}`"
+        matches = [row["id"] for row in rows if MARKER in str(row.get("body") or "") and needle in str(row.get("body") or "")]
+        return max(matches, default=0)
     status, body = gitea("GET", f"/repos/{_repo()}/issues/{pr}/comments")
     if status != 200:
         return 0
@@ -389,7 +423,7 @@ def push_inbox_event(
         "repo_full_name": repo,
         "pr_number": int(pr),
         "pr_head_sha": sha,
-        "pr_url": f"{web}/{repo}/pulls/{pr}" if web else "",
+        "pr_url": f"{web}/{repo}/{'pull' if provider() is Provider.GITHUB else 'pulls'}/{pr}" if web else "",
         "pr_base_ref": "main",
         "deploy_rc": int(tr.get("rc") or 0),
         "deploy_stage": str(tr.get("stage") or ""),
@@ -402,6 +436,12 @@ def push_inbox_event(
         "deploy_log": log_path,
     }
     p = inbox_path()
+    if provider() is Provider.GITHUB:
+        try:
+            require_shadow_path(p)
+        except HostingError:
+            print("[deploy-report] GitHub production intake unsupported", file=sys.stderr)
+            return False
     line = json.dumps(payload, ensure_ascii=False) + "\n"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -491,7 +531,9 @@ def render(
             "",
         ]
     if _web_base():
-        lines.append(f"[在 Gitea 查看 PR #{pr}]({_web_base()}/{_repo()}/pulls/{pr})")
+        noun = "pull" if provider() is Provider.GITHUB else "pulls"
+        host = "GitHub" if provider() is Provider.GITHUB else "Gitea"
+        lines.append(f"[在 {host} 查看 PR #{pr}]({_web_base()}/{_repo()}/{noun}/{pr})")
     return "\n".join(lines)[:COMMENT_MAX]
 
 
@@ -518,6 +560,13 @@ def cmd_write(args: argparse.Namespace) -> int:
         return 0
     if args.dry_run:
         return 0
+    if provider() is Provider.GITHUB:
+        try:
+            require_shadow_path(event_log_path())
+            require_shadow_path(inbox_path())
+        except HostingError:
+            print("[deploy-report] GitHub requires isolated shadow report paths", file=sys.stderr)
+            return 1
     tail = log_tail(args.log)
     tr, align, fetch_error = _assess(
         args.pr, args.repo, args.sha, args.rc, args.stage, tail, None, args.base
@@ -526,7 +575,11 @@ def cmd_write(args: argparse.Namespace) -> int:
     body = render(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
 
     comment_id = 0
-    existing = find_same_sha_comment(args.pr, args.sha) if args.sha else 0
+    try:
+        existing = find_same_sha_comment(args.pr, args.sha) if args.sha else 0
+    except HostingError:
+        print("[deploy-report] hosting comment lookup failed", file=sys.stderr)
+        return 1
     if existing:
         status, resp = gitea("PATCH", f"/repos/{_repo()}/issues/comments/{existing}",
                              {"body": body})

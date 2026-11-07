@@ -14,11 +14,24 @@ import json
 import os
 import re
 import subprocess
+import sys
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.hosting import (  # noqa: E402
+    AccessRole,
+    HostingClient,
+    HostingConfig,
+    HostingError,
+    Provider,
+    provider,
+)
+from scripts.prod_agent.github_readiness import GitHubReadinessClient  # noqa: E402
 
 DEFAULT_REQUIRED_CONTEXTS = ("test", "agent-framework-reports")
 DEFAULT_REQUIRED_CONTEXTS_ENV = ",".join(DEFAULT_REQUIRED_CONTEXTS)
@@ -91,10 +104,16 @@ class ReadinessConfig:
     required_contexts: tuple[str, ...] = DEFAULT_REQUIRED_CONTEXTS
     timeout_s: float = DEFAULT_TIMEOUT_S
     curl_path: str = DEFAULT_CURL
+    hosting: HostingConfig | None = None
 
     @classmethod
     def from_environment(cls, environ: dict[str, str] | None = None) -> ReadinessConfig:
         env = dict(os.environ if environ is None else environ)
+        if provider(env) is Provider.GITHUB:
+            hosting = HostingConfig.from_environment(AccessRole.READ, env)
+            return cls(api_url=hosting.api_url, repo=hosting.repo, token=hosting.token,
+                       required_contexts=parse_required_contexts(env.get("DAILYCHECK_REQUIRED_CONTEXTS", DEFAULT_REQUIRED_CONTEXTS_ENV)),
+                       hosting=hosting)
         raw_contexts = env.get("DAILYCHECK_REQUIRED_CONTEXTS", DEFAULT_REQUIRED_CONTEXTS_ENV)
         api_url = (
             env.get("GITEA_API")
@@ -212,6 +231,9 @@ class GiteaReadinessClient:
         *,
         repo: str | None = None,
     ) -> dict[str, Any]:
+        if self.config.hosting is not None:
+            return GitHubReadinessClient(HostingClient(self.config.hosting), self.config.required_contexts).check(
+                pr_number, expected_head_sha, repo=repo)
         expected = expected_head_sha.lower()
         required = self.config.required_contexts
         if not self.config.token:
@@ -405,7 +427,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    base = ReadinessConfig.from_environment()
+    try:
+        base = ReadinessConfig.from_environment()
+    except (HostingError, ValueError):
+        print(json.dumps({"ready": False, "reason": "invalid_hosting_configuration"}))
+        return 10
     config = ReadinessConfig(
         api_url=base.api_url,
         repo=base.repo,
@@ -413,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         required_contexts=parse_required_contexts(args.required_contexts),
         timeout_s=base.timeout_s,
         curl_path=base.curl_path,
+        hosting=base.hosting,
     )
     result = GiteaReadinessClient(config).check(args.pr, args.head_sha)
     print(

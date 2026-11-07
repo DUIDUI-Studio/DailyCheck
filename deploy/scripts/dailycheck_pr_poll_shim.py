@@ -15,10 +15,12 @@
 没有任何人会知道。放在 git 里至少有 pytest 和 code review；留在
 ``~/.hermes/scripts`` 就只能靠人记得它长什么样。
 """
+import os
 import runpy
 import sys
 
-TARGET = "/root/DailyCheck/scripts/prod_agent/pr_poll.py"
+TARGET = os.path.join(os.environ.get("DAILYCHECK_SOURCE_DIR", "/root/DailyCheck"),
+                      "scripts", "prod_agent", "pr_poll.py")
 
 if __name__ == "__main__":
     try:

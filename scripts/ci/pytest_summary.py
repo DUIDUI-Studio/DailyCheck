@@ -18,6 +18,7 @@ from pathlib import Path
 # Direct script execution starts sys.path at scripts/ci, not the repository root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.check_known_failures import make_evidence, validate_evidence  # noqa: E402
+from scripts.ci.candidate_binding import parse_binding  # noqa: E402
 
 OUTPUT_NAME = "pytest_summary_b64"
 SUMMARY_LINE_COUNT = 5
@@ -67,9 +68,13 @@ def encode_summary(summary: str) -> str:
     return base64.b64encode(summary.encode("utf-8")).decode("ascii")
 
 
-def decode_result(envelope: dict) -> tuple[str, dict]:
-    if not isinstance(envelope, dict) or type(envelope.get("schema_version")) is not int or envelope["schema_version"] != 1 or set(envelope) != {"schema_version", "text", "evidence"}:
+def decode_result(envelope: dict, expected_binding: dict | None = None) -> tuple[str, dict]:
+    version = 2 if expected_binding is not None else 1
+    keys = {"schema_version", "text", "evidence"} | ({"binding"} if version == 2 else set())
+    if not isinstance(envelope, dict) or type(envelope.get("schema_version")) is not int or envelope["schema_version"] != version or set(envelope) != keys:
         raise ValueError("missing/invalid compact pytest envelope")
+    if expected_binding is not None and envelope.get("binding") != expected_binding:
+        raise ValueError("CI candidate/run binding mismatch")
     text = envelope["text"]
     if not isinstance(text, str):
         raise ValueError("invalid compact pytest text")
@@ -85,13 +90,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decode", type=Path, help="decode/revalidate a JSON envelope after base64 decoding")
     parser.add_argument("--text-output", type=Path)
     parser.add_argument("--evidence-output", type=Path)
+    parser.add_argument("--binding-file", type=Path, help="expected tested H/base B/run identity")
     args = parser.parse_args(argv)
     try:
+        binding = json.loads(args.binding_file.read_text(encoding="utf-8")) if args.binding_file else None
+        if args.binding_file is not None:
+            binding = parse_binding(binding)
         if args.decode:
             if not args.text_output or not args.evidence_output or args.input:
                 print("[ci-pytest-summary] --decode requires --text-output and --evidence-output, without input", file=sys.stderr)
                 return 2
-            text, evidence = decode_result(json.loads(args.decode.read_text(encoding="utf-8")))
+            text, evidence = decode_result(json.loads(args.decode.read_text(encoding="utf-8")), binding)
             args.text_output.write_text(text, encoding="utf-8")
             args.evidence_output.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
             print("[ci-pytest-summary] decoded and validated native/session evidence")
@@ -112,7 +121,10 @@ def main(argv: list[str] | None = None) -> int:
         compact = extract_pytest_summary(text)
         evidence = make_evidence(compact, original["native_exit"], original["session"])
         evidence["raw_output_sha256"] = original.get("raw_output_sha256", original["output_sha256"])
-        payload = json.dumps({"schema_version": 1, "text": compact, "evidence": evidence}, sort_keys=True)
+        envelope = {"schema_version": 1, "text": compact, "evidence": evidence}
+        if binding is not None:
+            envelope.update(schema_version=2, binding=binding)
+        payload = json.dumps(envelope, sort_keys=True)
         if len(payload.encode("utf-8")) > MAX_SUMMARY_BYTES:
             raise ValueError("compact pytest envelope too large; refusing to truncate evidence")
         encoded = encode_summary(payload)

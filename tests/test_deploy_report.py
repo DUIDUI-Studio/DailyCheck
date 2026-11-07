@@ -627,6 +627,8 @@ def pipeline_sandbox(tmp_path, monkeypatch):
                  "deploy_report.py", "deploy_triage_pure.py"):
         shutil.copy2(BG_DIR / name, sb / name)
         (sb / name).chmod(0o755)
+    # The report now imports the shared hosting boundary from its repository root.
+    monkeypatch.setenv("PYTHONPATH", str(BG_DIR.parents[1]))
     calls = tmp_path / "calls.txt"
     for name, rc in (("up.sh", 0), ("verify.sh", 1), ("promote.sh", 0), ("switch.sh", 0)):
         path = sb / name

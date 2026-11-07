@@ -34,6 +34,12 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.hosting import HostingClient, HostingConfig, Provider, provider  # noqa: E402
+from scripts.prod_agent.github_readiness import GitHubReadinessClient  # noqa: E402
 
 CURL = os.environ.get("DAILYCHECK_CURL", "/usr/bin/curl")
 TIMEOUT = 20
@@ -99,6 +105,8 @@ def _gitea_get(path: str, token: str) -> tuple[int, object]:
 
 def _catchup_block() -> str:
     """检查 A：部署追平。返回输出块（空串 = 已追平/未激活，静默）。"""
+    if provider() is Provider.GITHUB:
+        return ""  # Shadow transport cannot inspect/mutate the production deployment lane.
     if os.environ.get("DCPOLL_REPO"):
         return ""  # 测试借用模式：仅验证 PR 输出格式
     if not os.path.exists(DEPLOY_STATE):
@@ -159,6 +167,8 @@ def _combined(sha: str, token: str) -> tuple[str, list[str]]:
 
 def _pr_block() -> str:
     """检查 B：open PR 清单。返回输出块（空串 = 无 PR，静默）。"""
+    if provider() is Provider.GITHUB:
+        return _github_pr_block()
     token = _token()
     if not token:
         return _alert(f"Gitea token 读不到（试过 {', '.join(p for p in TOKEN_FILES if p)}）")
@@ -199,6 +209,24 @@ def _pr_block() -> str:
     return "\n".join(lines)
 
 
+def _github_pr_block() -> str:
+    client = HostingClient(HostingConfig.from_environment())
+    client.verify_repository()
+    prs = client.pages(f"/repos/{client.config.repo}/pulls", params={"state": "open"})
+    if not prs:
+        return ""
+    lines = [f"{client.config.repo} open PRs (GitHub shadow-only):"]
+    for pr in prs:
+        number = pr.get("number")
+        head = pr.get("head")
+        if type(number) is not int or not isinstance(head, dict) or not isinstance(head.get("sha"), str):
+            raise ValueError("invalid_pr_response")
+        evidence = GitHubReadinessClient(client).check(number, head["sha"])
+        lines.append(f"- PR #{number} {client.config.pr_url(number)} head={head['sha']} base={evidence.get('base_sha')} checks={evidence['reason']}")
+    lines.append("Shadow evidence only; GitHub finalization is unsupported.")
+    return "\n".join(lines)
+
+
 def main() -> int:
     blocks = []
     for fn in (_catchup_block, _pr_block):
@@ -207,7 +235,8 @@ def main() -> int:
             if block:
                 blocks.append(block)
         except Exception as exc:  # 保底通道：任何异常都必须可见
-            blocks.append(_alert(f"{fn.__name__} 未捕获异常（{exc}）"))
+            detail = str(exc) if os.environ.get("DAILYCHECK_HOSTING_PROVIDER", "gitea") == "gitea" else type(exc).__name__
+            blocks.append(_alert(f"{fn.__name__} 未捕获异常（{detail}）"))
     if blocks:
         print("\n".join(blocks))
     return 0

@@ -204,14 +204,14 @@
 
 {% if not dispatch_enabled %}
 <p class="feedback-warn">
-  派发通道未配置（<code>FEEDBACK_GITEA_TOKEN</code> 为空）。草稿可以保存，但不会真正建 Issue；
+  派发通道未配置。草稿可以保存，但不会真正建 Issue；
   需在服务器 env 注入该变量后重启。
 </p>
 {% endif %}
 
 <h3>二审：确认要发出去的 Issue</h3>
 <p class="feedback-hint">
-  下面就是派发后会写进 Gitea Issue 的<b>全文</b>。可以直接改 —— 改完再点派发即生效。
+  下面就是派发后会写进 Issue 的<b>全文</b>。可以直接改 —— 改完再点派发即生效。
 </p>
 
 <form method="post" action="{{ url_for('feedback.dispatch_feedback', ticket_id=ticket.id) }}" class="grid">
@@ -225,7 +225,7 @@
               style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;">{{ draft.body or '' }}</textarea>
   </label>
   <button type="submit" {% if not dispatch_enabled %}disabled{% endif %}>
-    确认派发（建 Gitea Issue）
+    确认派发（建 Issue）
   </button>
   <button type="submit" class="btn-secondary"
           formaction="{{ url_for('feedback.analyze_feedback', ticket_id=ticket.id) }}">

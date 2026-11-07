@@ -28,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deploy_report import _repo, gitea  # noqa: E402
 
+from scripts.hosting import Provider, provider  # noqa: E402
+
 RC_OK = 0
 RC_NOT_FF = 30
 RC_PRECONDITION = 31
@@ -35,6 +37,8 @@ RC_API = 32
 
 
 def _get_pr(pr: int) -> tuple[dict[str, Any] | None, str]:
+    if provider() is Provider.GITHUB:
+        return None, "github_finalization_unsupported"
     status, body = gitea("GET", f"/repos/{_repo()}/pulls/{pr}")
     if status != 200:
         return None, f"GET PR HTTP {status}"

@@ -206,8 +206,8 @@ def test_actual_ci_capture_and_gate_steps_keep_native_exit(run_pytest, tmp_path,
     artifacts = tmp_path / "ci"
     artifacts.mkdir()
     def local(command):
-        return command.replace("/tmp/", str(artifacts) + "/").replace("/opt/venv/bin/python", sys.executable)
-    env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTEST_ADDOPTS": "", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "TMPDIR": str(tmp_path)}
+        return command.replace("${CI_ROOT}/venv/bin/python", sys.executable).replace("/tmp/", str(artifacts) + "/")
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTEST_ADDOPTS": "", "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "TMPDIR": str(tmp_path), "CI_ROOT": str(artifacts)}
     result = subprocess.run(["bash", "-c", local(capture)], cwd=run["repo"], env=env, text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (artifacts / "pytest-native.exit").read_text().strip() == str(native)
@@ -348,3 +348,56 @@ def test_local_reports_ignore_stale_defaults_without_explicit_reuse(run_pytest, 
         assert data["pytest"]["gate_exit"] == 1 and data["pytest"]["complete"] is False
         assert data["pytest"]["native_exit"] is None
     assert (repo / "reports/02-test-report.md").exists() and (repo / "reports/03-code-quality.md").exists()
+
+
+@pytest.mark.parametrize("damage", [None, "head", "base", "run", "attempt", "event-sha", "downgrade", "malformed", "null"])
+def test_bound_ci_handoff_rejects_other_candidate_or_run(run_pytest, tmp_path, damage):
+    run = run_pytest("def test_known(): assert False\ndef test_pass(): pass\n")
+    assert gate(run).returncode == 0
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    producer = tmp_path / "producer-binding.json"
+    env = {**os.environ, "CI_REPOSITORY": "DUIDUI-Studio/DailyCheck", "CI_RUN_ID": "100", "CI_RUN_ATTEMPT": "2",
+           "CI_EVENT": "pull_request", "CI_HEAD_SHA": head, "CI_BASE_SHA": head, "CI_EVENT_SHA": "e" * 40}
+    bind = subprocess.run([sys.executable, str(ROOT / "scripts/ci/candidate_binding.py"), str(producer)], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert bind.returncode == 0, bind.stderr
+    binding = json.loads(producer.read_text())
+    assert binding["tested_sha"] == binding["CI_HEAD_SHA"] != binding["CI_EVENT_SHA"]
+    job = tmp_path / "job-output"
+    encoded = subprocess.run([sys.executable, str(SUMMARY), str(run["output"]), "--evidence-file", str(run["evidence"]), "--binding-file", str(producer), "--output-file", str(job)], capture_output=True, text=True)
+    assert encoded.returncode == 0, encoded.stderr
+    payload = json.loads(base64.b64decode(job.read_text().split("=", 1)[1]))
+    assert payload["schema_version"] == 2 and payload["evidence"]["native_exit"] == 1
+    expected = dict(binding)
+    changed = {"head": "CI_HEAD_SHA", "base": "CI_BASE_SHA", "run": "CI_RUN_ID", "attempt": "CI_RUN_ATTEMPT", "event-sha": "CI_EVENT_SHA"}
+    if damage in changed:
+        key = changed[damage]
+        expected[key] = "999" if key in {"CI_RUN_ID", "CI_RUN_ATTEMPT"} else "f" * 40
+        if damage == "head":
+            expected["tested_sha"] = expected[key]
+    if damage == "downgrade":
+        payload.pop("binding")
+        payload["schema_version"] = 1
+    if damage == "malformed":
+        expected = {"unknown": "identity"}
+    if damage == "null":
+        expected = None
+    consumer = tmp_path / "consumer-binding.json"
+    consumer.write_text(json.dumps(expected))
+    envelope = tmp_path / "envelope.json"
+    envelope.write_text(json.dumps(payload))
+    text, evidence = tmp_path / "consumer-out.txt", tmp_path / "consumer-evidence.json"
+    decoded = subprocess.run([sys.executable, str(SUMMARY), "--decode", str(envelope), "--binding-file", str(consumer), "--text-output", str(text), "--evidence-output", str(evidence)], capture_output=True, text=True)
+    assert (decoded.returncode == 0) == (damage is None), decoded.stdout + decoded.stderr
+    if damage is None:
+        validated = validate_evidence(text.read_text(), json.loads(evidence.read_text()))
+        assert validated["failed"] == 1 and validated["passed"] == 1
+    else:
+        assert not text.exists() and not evidence.exists()
+
+
+def test_binding_cli_rejects_unchecked_head(tmp_path):
+    env = {**os.environ, "CI_REPOSITORY": "DUIDUI-Studio/DailyCheck", "CI_RUN_ID": "100", "CI_RUN_ATTEMPT": "1",
+           "CI_EVENT": "pull_request", "CI_HEAD_SHA": "f"*40, "CI_BASE_SHA": "e"*40, "CI_EVENT_SHA": "f"*40}
+    output = tmp_path / "binding.json"
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/ci/candidate_binding.py"), str(output)], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert result.returncode == 1 and not output.exists()

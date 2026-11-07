@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from merge_readiness import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.prod_agent.merge_readiness import (  # noqa: E402
     DEFAULT_REQUIRED_CONTEXTS,
     DEFAULT_REQUIRED_CONTEXTS_ENV,
     GiteaReadinessClient,
@@ -281,11 +283,15 @@ class EventReducer:
                 required_contexts=config.required_contexts,
                 timeout_s=base.timeout_s,
                 curl_path=base.curl_path,
+                hosting=base.hosting,
             )
             client = GiteaReadinessClient(readiness_config)
 
             def check_readiness(repo: str, pr_number: int, head_sha: str) -> dict[str, Any]:
-                return client.check(pr_number, head_sha, repo=repo)
+                result = client.check(pr_number, head_sha, repo=repo)
+                if base.hosting is not None:
+                    return {**result, "ready": False, "reason": "github_shadow_only"}
+                return result
 
             self._readiness_checker = check_readiness
         else:

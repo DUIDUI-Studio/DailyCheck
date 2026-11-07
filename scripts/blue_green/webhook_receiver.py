@@ -46,12 +46,28 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.hosting import (  # noqa: E402
+    HostingClient,
+    HostingConfig,
+    HostingError,
+    Provider,
+    provider,
+    require_shadow_path,
+)
+
+_GITHUB_INTAKE_LOCK = threading.Lock()
 
 # ============================================================
 # 配置（env 驱动，禁写死）
@@ -120,10 +136,12 @@ def _verify_signature(payload: bytes, signature: str) -> bool:
 def _read_inbox_delivery_ids() -> set[str]:
     """读 inbox 已存在的 delivery_id 集合（幂等用）。"""
     ids: set[str] = set()
-    if not INBOX_PATH.exists():
-        return ids
-    with INBOX_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
+    for path in (INBOX_PATH, PROCESSED_PATH):
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            rows = list(f)
+        for line in rows:
             line = line.strip()
             if not line:
                 continue
@@ -292,6 +310,97 @@ def _build_status_record(delivery_id: str, data: dict, pr: dict) -> dict:
     }
 
 
+def _github_webhook(payload: bytes):
+    """Native GitHub events are hints in a separately configured shadow inbox."""
+    try:
+        config = HostingConfig.from_environment()
+        shadow = require_shadow_path(INBOX_PATH)
+        require_shadow_path(PROCESSED_PATH)
+        if (INBOX_PATH.resolve() != (shadow / "inbox.jsonl").resolve()
+                or PROCESSED_PATH.resolve() != (shadow / "processed.jsonl").resolve()):
+            abort(503, "GitHub requires isolated shadow intake")
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            abort(400, "invalid payload")
+        repository = data.get("repository")
+        if not isinstance(repository, dict) or repository.get("id") != config.repo_id or repository.get("full_name") != config.repo:
+            abort(400, "repository mismatch")
+        event = request.headers.get("X-GitHub-Event", "")
+        action = data.get("action")
+        if event == "pull_request":
+            if action not in {"opened", "synchronize", "reopened", "ready_for_review"}:
+                return jsonify(status="ignored", reason="action"), 200
+            source = data.get("pull_request")
+            if not isinstance(source, dict) or not isinstance(source.get("head"), dict):
+                abort(400, "invalid pull request")
+            sha = source["head"].get("sha")
+        elif event in {"check_suite", "check_run", "workflow_run"}:
+            if action not in {"completed", "requested", "rerequested", "created", "in_progress"}:
+                return jsonify(status="ignored", reason="action"), 200
+            source = data.get(event)
+            if not isinstance(source, dict):
+                abort(400, "invalid check payload")
+            sha = source.get("head_sha")
+        elif event == "status":
+            source = data
+            sha = data.get("sha")
+        else:
+            return jsonify(status="ignored", reason="event"), 200
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            abort(400, "invalid head sha")
+        delivery = request.headers.get("X-GitHub-Delivery", "")
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,128}", delivery):
+            abort(400, "invalid delivery id")
+        # The supported receiver is one worker with multiple threads.
+        with _GITHUB_INTAKE_LOCK:
+            seen = _read_inbox_delivery_ids()
+            client = HostingClient(config)
+            client.verify_repository()
+            # Native check associations can be absent (forks) or contain multiple PRs.
+            # Enumerate all current open PRs; bind only exact H and target base identity.
+            prs = client.pages(f"/repos/{config.repo}/pulls", params={"state": "open"})
+            matches = []
+            for pr in prs:
+                head, base = pr.get("head"), pr.get("base")
+                if not isinstance(head, dict) or not isinstance(base, dict):
+                    raise HostingError("invalid_pr_payload")
+                if head.get("sha") != sha:
+                    continue
+                base_repo = base.get("repo")
+                if not isinstance(base_repo, dict) or base_repo.get("id") != config.repo_id:
+                    raise HostingError("invalid_pr_base")
+                if base.get("ref") != config.base_ref or pr.get("state") != "open":
+                    continue
+                if event == "pull_request" and pr.get("number") != data.get("number"):
+                    continue
+                if type(pr.get("number")) is not int or pr["number"] <= 0:
+                    raise HostingError("invalid_pr_number")
+                matches.append(pr)
+            if not matches:
+                return jsonify(status="ignored", reason="no_current_pr"), 200
+            matches = [pr for pr in matches if f"{delivery}:pr:{pr['number']}" not in seen]
+            if not matches:
+                return jsonify(status="duplicate", delivery_id=delivery), 200
+            if _inbox_line_count() + len(matches) > MAX_INBOX_LINES:
+                abort(503, "inbox full")
+            for pr in matches:
+                did = f"{delivery}:pr:{pr['number']}"
+                if event == "pull_request":
+                    record = _build_pull_request_record(did, action, {**data, "pull_request": pr})
+                else:
+                    hint = {**data, "state": source.get("conclusion") or source.get("status") or source.get("state") or "pending"}
+                    record = _build_status_record(did, hint, pr)
+                    record["source_event"] = event
+                    record["check_suite_id"] = source.get("id")
+                record.update(hosting_provider="github", intake_mode="shadow", source_delivery_id=delivery, pr_base_sha=pr["base"].get("sha"))
+                _append_inbox(record)
+        return jsonify(status="queued", delivery_id=delivery, mode="shadow"), 202
+    except (HostingError, OSError):
+        abort(503, "hosting lookup unavailable")
+    except (ValueError, UnicodeError):
+        abort(400, "invalid payload")
+
+
 # ============================================================
 # 路由
 # ============================================================
@@ -305,6 +414,12 @@ def webhook():
         # 不暴露 detail（防攻击者探测）
         abort(401, "invalid signature")
 
+    try:
+        if provider() is Provider.GITHUB:
+            return _github_webhook(payload)
+    except HostingError:
+        abort(503, "invalid hosting configuration")
+
     # 2. event 过滤
     event = request.headers.get("X-GitHub-Event", "")
     if event not in ALLOWED_EVENTS:
@@ -313,8 +428,10 @@ def webhook():
     # 3. 解析 JSON
     try:
         data = json.loads(payload)
-    except json.JSONDecodeError:
+    except (ValueError, UnicodeError):
         abort(400, "invalid json")
+    if not isinstance(data, dict):
+        abort(400, "invalid payload")
 
     # 4. action 过滤（按事件类型分白名单；status 事件无 action，跳过）
     action = data.get("action")

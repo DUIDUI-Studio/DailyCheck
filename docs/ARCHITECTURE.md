@@ -203,6 +203,8 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
 
 ### 3.5 PR Webhook 接收器（2026-10-15 实装）
 
+**Issue #160 共存准备**：hosting transport 默认仍为 Gitea；显式 GitHub 配置仅支持隔离的 shadow intake，不能接现有生产 inbox。签名、原生 delivery ID 与多 PR 关联在边界归一化，GitHub admission / finalization 未启用；配置与 CI 可移植边界见 §3.17。
+
 Dev Agent 提完 PR 后，**Gitea repo → webhook → VPS `dc-webhook-receiver` → `inbox.jsonl` → `dc-inbox-watcher`（≤5s 触发）→ Prod Agent 入口 → 跑 merge 决策**。秒级通知，替代 30 分钟轮询。
 
 **组件**（`scripts/blue_green/webhook_receiver.py`，Flask 127.0.0.1:8443）：
@@ -1160,6 +1162,74 @@ Issue #155 的历史合并回归断言 fresh / archived / fallback 组合的事�
 用量合计、部分覆盖、原采集时间及重复对账结果。
 
 ---
+
+### 3.17 Hosting transport 共存准备（Issue #160）
+
+`DAILYCHECK_HOSTING_PROVIDER` 缺省为 `gitea`，现有生产地址、凭据路径、部署阶段与
+队列不变。`scripts/hosting.py` 定义显式 `Provider` / `AccessRole` / `HostingConfig`，
+集中 GitHub REST 认证、JSON 响应、分页与错误边界。未知 provider、缺凭据、错误 host/repo、
+不完整或耗尽分页、网络/HTTP 错误均拒绝，不能把故障解释为零结果。
+GitHub 只接受 `https://api.github.com` 和 `DUIDUI-Studio/DailyCheck`（ID `1448986421`）。
+
+| 角色 | GitHub 凭据来源 | 可写范围 |
+|---|---|---|
+| read | `DAILYCHECK_GITHUB_READ_TOKEN`，或 `GH_TOKEN` / `GITHUB_TOKEN`，或显式 `DAILYCHECK_GITHUB_READ_TOKEN_FILE` | 无 |
+| feedback | `DAILYCHECK_GITHUB_FEEDBACK_TOKEN` / `_TOKEN_FILE` | Issue / label 创建 |
+| report | `DAILYCHECK_GITHUB_REPORT_TOKEN` / `_TOKEN_FILE` | Issue/PR comment 创建、编辑 |
+
+显式文件不可读或显式凭据非法即拒绝；write 角色不会回退 read、Gitea 或当前 `gh` 登录。
+这里的角色是应用侧权限约束；真实 token scope 由部署侧独立配置，凭据不入库、不输出到 argv / 日志。
+GitHub curl 忽略用户 curlrc、不跟随重定向，auth 经 stdin 的 config 传入。
+Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置隐式切换生产。
+
+**Readiness**：`scripts/prod_agent/github_readiness.py` 把候选建模为 `(PR, H, B, head_ref)`。
+必须是当前 open / 非 draft / mergeable / main base，base repo ID 和 head source repo 符合目标。
+读取真实 Actions workflow、run、全部 job attempts 和 Checks；required job 的名字、workflow ID/path、
+`pull_request` 事件、源仓库、PR H/B 关联、GitHub Actions app ID/slug、suite 和 job→check-run ID
+必须一致。每个 required job 选择最新 attempt，允许 partial rerun 继承未重跑 job 的成功；
+同一最新 attempt 重名、缺证据或新 pending/failure/canceled/skipped 均不就绪。
+旧失败不覆盖新成功，旧成功不覆盖新执行；suite / combined status 单独成功无效。
+再次读取最新 workflow run 和当前 PR/main，变化即拒绝。输出 H/B、run/attempt/check IDs、
+采样时间与 freshness 标签；这是可复核快照，不是部署租约，后续 admission/finalization 必须重验。
+`merge_readiness.py` 保留 Gitea 入口；现有 reducer 对 GitHub 证据强制 `ready=false`，
+`deploy_merge.py` 明确拒绝 GitHub finalization，不引入 merge queue / group delivery。
+
+**调用方**：poller 的 GitHub 分支只输出 shadow readiness，不运行生产 catchup；dashboard 使用
+GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 label 传名字；报告 comment
+走 `/issues/N/comments` 和 `/issues/comments/ID`，完整分页查找同 SHA，查询失败不当成“没有评论”
+另建重复项。GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`。
+反馈的缺凭据降级继续保留，外部失败不丢已保存草稿/管理员评论。
+
+**Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
+`status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。
+check payload 缺 PR 列表也不猜第一个；分页查当前 open PR，同 H 的多个 PR 分别归一化。
+记录保留 `source_delivery_id`，传输键为 `delivery:pr:N`，同进程多线程串行检查/append，部分
+写入失败的重投只补缺项；已有 processed ledger 也参与查重，不增加新队列或数据库。
+只有显式 `DAILYCHECK_GITHUB_SHADOW_DIR` 下的 inbox/processed 路径可用；报告 event log/inbox
+同样要求独立 shadow 路径。模板 `deploy/github-shadow.env.example` 和
+`deploy/systemd/dc-github-shadow.service` 仅供审查，独立 loopback `8444`，无 Install 段、
+无生产 watcher 依赖。本变更不安装服务、不配 live token、不投递生产 lane。
+`deploy/scripts/dailycheck_pr_poll.py` 统一调用仓库 poller，Hermes shim 可用
+`DAILYCHECK_SOURCE_DIR` 指定源码目录，缺省 `/root/DailyCheck` 不变。
+
+**CI 共存**（workflow 红线，准备不等于获准落地）：同一两个 required jobs 和现有报告、redline、
+hygiene、MCP contracts/impact、零新增失败门禁保留。GitHub 用官方 checkout/setup-python v7，
+Gitea 用原生 Git 和 runner 自带 Python；绝对 `uses: http://...` 即使条件不成立也不合法，
+因此源 checkout 用 transient Git config 的 scoped auth，既不落 config 也不入 argv。
+两端均显式 checkout PR head H，fetch main/base 与完整历史。每个 job 用 `mktemp` 根目录隔离
+venv、测试 DB、pytest basetemp、证据和报告临时文件；Gitea 无 run_attempt context 时记录 `1`，
+实际目录仍唯一。`scripts/ci/candidate_binding.py` 核对真实 checkout H、base commit 存在、
+event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 比较该 identity，同时
+重验真实 native exit/session/hash，v1 仅供已有直接调用，绑定请求不接受降级。
+只按同一 PR 取消过时 CI；push/dispatch 各自独立，不配置部署 concurrency。
+无 artifact-v4 依赖，不把 canceled/skipped 当成成功。
+官方 action 版本与 Checks/Actions REST 形状经当前文档及目标仓只读 API 核实；本地校验不能
+证明远端 Gitea/GitHub runner 执行已成功，真实两端 CI 必须在后续授权发布后验证。
+
+测试：`tests/test_github_transport.py` 经 fake curl 子进程覆盖 credential roles、HTTP/auth、分页、
+malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/test_ci_portability.py`
+对本机认证 Git HTTP endpoint 真执行 source checkout，并验证 job 隔离；
+`tests/test_pytest_gate_completeness.py` 用真实 pytest 子进程验证候选/运行绑定的摘要转交。
 
 ## 4. 数据架构
 

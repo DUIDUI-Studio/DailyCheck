@@ -23,6 +23,14 @@ import urllib.request
 from typing import Any
 
 import config
+from scripts.hosting import (
+    AccessRole,
+    HostingClient,
+    HostingConfig,
+    HostingError,
+    Provider,
+    provider,
+)
 
 from .feedback_issue_body import (  # noqa: F401 - 对外 re-export
     MIN_ADMIN_NOTE_LEN,
@@ -44,15 +52,24 @@ FEEDBACK_LABEL_DESC = "用户在站内提交的使用问题，由管理员确认
 
 def dispatch_enabled() -> bool:
     """token 为空 = 未启用派发（降级为「只存评论」）。"""
-    return bool(str(getattr(config, "FEEDBACK_GITEA_TOKEN", "") or "").strip())
+    try:
+        if provider() is Provider.GITHUB:
+            return bool(HostingConfig.from_environment(AccessRole.FEEDBACK).token)
+        return bool(str(getattr(config, "FEEDBACK_GITEA_TOKEN", "") or "").strip())
+    except HostingError:
+        return False
 
 
 def repo_slug() -> str:
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment(AccessRole.FEEDBACK).repo
     return str(getattr(config, "FEEDBACK_GITEA_REPO", "") or "").strip() or "eric/dailycheck"
 
 
 def web_base() -> str:
     """给人点的链接基址。"""
+    if provider() is Provider.GITHUB:
+        return HostingConfig.from_environment(AccessRole.FEEDBACK).web_url
     return str(getattr(config, "FEEDBACK_GITEA_WEB_BASE", "") or "").strip().rstrip("/")
 
 
@@ -83,6 +100,26 @@ def create_issue(
     label 处理：先尽力确保标签存在（已存在不算错），确保不了就不带标签建单 ——
     标签是「给自动化识别用」的增强，不是创建 Issue 的前提。
     """
+    try:
+        if provider() is Provider.GITHUB:
+            client = HostingClient(HostingConfig.from_environment(AccessRole.FEEDBACK))
+            client.verify_repository()
+            payload = {"title": title, "body": body}
+            if label:
+                # GitHub Issue labels are names. A failed lookup is not an empty list.
+                labels = client.pages(f"/repos/{client.config.repo}/labels")
+                if not any(row.get("name") == label for row in labels):
+                    client.request("POST", f"/repos/{client.config.repo}/labels", {
+                        "name": label, "color": FEEDBACK_LABEL_COLOR, "description": FEEDBACK_LABEL_DESC,
+                    })
+                payload["labels"] = [label]
+            data = client.request("POST", f"/repos/{client.config.repo}/issues", payload)[0]
+            if not isinstance(data, dict) or type(data.get("number")) is not int or data["number"] <= 0:
+                raise HostingError("invalid_created_issue")
+            return {"number": data["number"], "url": issue_url(data["number"], data)}
+    except HostingError as exc:
+        logger.warning("feedback_dispatch_hosting_error: type=%s status=%s", type(exc).__name__, exc.status)
+        return None
     token = str(getattr(config, "FEEDBACK_GITEA_TOKEN", "") or "").strip()
     if not token:
         logger.warning("feedback_dispatch_skip: no token configured")
@@ -118,15 +155,22 @@ def _ensure_label(token: str, repo: str, name: str) -> int | None:
     再生成一个同名标签（2026-10-24 实测：连发两次 → 出现 #5/#6 两个
     user-feedback）。靠 409/422 判幂等在 Gitea 上不成立。
     """
-    try:
-        code, data = _request(token, f"/repos/{repo}/labels?limit=50", None, method="GET")
-    except Exception:
-        logger.warning("feedback_dispatch_label_error: label=%s", name)
-        return None
-    if code == 200 and isinstance(data, list):
+    for page in range(1, 51):
+        path = f"/repos/{repo}/labels?limit=50" + (f"&page={page}" if page > 1 else "")
+        try:
+            code, data = _request(token, path, None, method="GET")
+        except Exception:
+            logger.warning("feedback_dispatch_label_error: label=%s", name)
+            return None
+        if code != 200 or not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+            return None
         for item in data:
-            if item.get("name") == name and isinstance(item.get("id"), int):
+            if item.get("name") == name and type(item.get("id")) is int:
                 return item["id"]
+        if len(data) < 50:
+            break
+    else:
+        return None
     payload = {
         "name": name,
         "color": FEEDBACK_LABEL_COLOR,
