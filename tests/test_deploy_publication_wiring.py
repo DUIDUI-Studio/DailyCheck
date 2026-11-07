@@ -958,6 +958,93 @@ sys.stdout.write("{{}}\\n" + ("201" if method == "POST" else "200"))
                     {"opened": True, "method": "POST"}]
 
 
+# ---------------------------------------------------------------- target resolver
+
+
+TARGET_KEYS = (
+    "GITEA_API", "GITEA_REPO", "GITEA_TOKEN", "GITEA_TOKEN_FILE",
+    "FEEDBACK_GITEA_API", "FEEDBACK_GITEA_REPO", "FEEDBACK_GITEA_TOKEN",
+    "DAILYCHECK_HOSTING_PROVIDER", "DAILYCHECK_GITHUB_REPO",
+)
+
+TARGET_CASES = {
+    "default": {},
+    "feedback_only": {
+        "FEEDBACK_GITEA_API": "http://feedback.invalid:3010/api/v1",
+        "FEEDBACK_GITEA_REPO": "feedback/source"},
+    "gitea_only": {
+        "GITEA_API": "http://primary.invalid:3020/api/v1",
+        "GITEA_REPO": "primary/source"},
+    "both_same": {
+        "FEEDBACK_GITEA_API": "http://same.invalid:3000/api/v1",
+        "FEEDBACK_GITEA_REPO": "same/source",
+        "GITEA_API": "http://same.invalid:3000/api/v1",
+        "GITEA_REPO": "same/source"},
+    "conflicting_values": {
+        "FEEDBACK_GITEA_API": "http://feedback.invalid:3010/api/v1",
+        "FEEDBACK_GITEA_REPO": "feedback/source",
+        "GITEA_API": "http://primary.invalid:3020/api/v1",
+        "GITEA_REPO": "primary/source"},
+    "feedback_blank_primary_set": {
+        "FEEDBACK_GITEA_API": "", "FEEDBACK_GITEA_REPO": "",
+        "GITEA_API": "http://primary.invalid:3020/api/v1",
+        "GITEA_REPO": "primary/source"},
+    "feedback_whitespace": {"FEEDBACK_GITEA_REPO": " feedback/source "},
+    "feedback_trailing_slash": {
+        "FEEDBACK_GITEA_API": "http://feedback.invalid:3010/api/v1/",
+        "FEEDBACK_GITEA_REPO": "feedback/source"},
+    "github_default": {"DAILYCHECK_HOSTING_PROVIDER": "github"},
+    "github_ignores_legacy_aliases": {
+        "DAILYCHECK_HOSTING_PROVIDER": "github",
+        "GITEA_API": "http://unused.invalid:9876/api/v1",
+        "GITEA_REPO": "other/other", "FEEDBACK_GITEA_REPO": "other/other"},
+}
+
+
+def _target_case_env(sb, overrides: dict) -> dict:
+    env = dict(sb["env"])
+    for key in TARGET_KEYS:
+        env.pop(key, None)
+    env.update({"DAILYCHECK_HOSTING_PROVIDER": "gitea",
+                "DAILYCHECK_GITHUB_REPO": CODE,
+                "DAILYCHECK_DEPLOY_REPORT": "0"})
+    env.update({key: str(value) for key, value in overrides.items()})
+    return env
+
+
+def _actual_target(monkeypatch, overrides: dict) -> dict:
+    """The actual report/candidate resolver, not a reimplementation."""
+    sys.path.insert(0, str(BG_DIR))
+    import deploy_report as report_mod
+
+    with monkeypatch.context() as ctx:
+        for key in TARGET_KEYS:
+            ctx.delenv(key, raising=False)
+        ctx.setenv("DAILYCHECK_HOSTING_PROVIDER", "gitea")
+        ctx.setenv("DAILYCHECK_GITHUB_REPO", CODE)
+        for key, value in overrides.items():
+            ctx.setenv(key, str(value))
+        if report_mod.provider() is report_mod.Provider.GITHUB:
+            return {"provider": "github", "host": "github.com",
+                    "repository": report_mod._repo()}
+        return {"provider": "gitea",
+                "host": urlsplit(report_mod._api_base()).netloc,
+                "repository": report_mod._repo()}
+
+
+@pytest.mark.parametrize("case", list(TARGET_CASES))
+def test_pipeline_captures_the_actual_target_resolver(sandbox, monkeypatch, case):
+    overrides = TARGET_CASES[case]
+    expected = _actual_target(monkeypatch, overrides)
+    proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0",
+                 env=_target_case_env(sandbox, overrides))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    _, _, outcome = _outcome(sandbox)
+    assert outcome is not None, f"no outcome for {case}"
+    assert outcome["deployment"] == {**expected, "pr": PR}, (
+        f"captured deployment provenance must follow the actual target resolver for {case}")
+
+
 # ---------------------------------------------------------------- successor/fence
 
 
