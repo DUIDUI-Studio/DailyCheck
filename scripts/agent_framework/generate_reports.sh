@@ -31,33 +31,64 @@ BANDIT_OUTPUT="/tmp/bandit-output-af.txt"
 # ============================================================
 # 报告 02：测试
 # ============================================================
-# 优先复用 test job 的 pytest 摘要（CI 里由 base64 job output 传下来）。
-# 文件不存在 / 为空 → 回退到本地重跑，保证单独运行本脚本仍可用。
-REUSE_FILE="${PYTEST_REUSE_FILE:-/tmp/ci-pytest/pytest-output.txt}"
+# 只有显式请求才复用 hash/native/session 摘要；默认路径存在不代表请求。
+# 调用者负责证据来自本次候选运行；哈希证明数据一致，不证明当前 HEAD 或执行身份。
+# 显式空/缺失/损坏请求拒绝，不重跑掩盖；未请求时始终 fresh pytest。
+REUSE_FILE="${PYTEST_REUSE_FILE-/tmp/ci-pytest/pytest-output.txt}"
+REUSE_EVIDENCE="${PYTEST_REUSE_EVIDENCE-${REUSE_FILE}.evidence.json}"
+PYTEST_EVIDENCE="/tmp/pytest-evidence-af.json"
+PYTEST_EXIT=null
+COMPLETE=false
+PASSED=null
+FAILED=null
+TEST_DB_DIR=""
+GATE_EXIT=1
+GATE_RESULT="FAIL: pytest evidence unavailable"
+python3 -c 'from pathlib import Path; [Path(p).unlink(missing_ok=True) for p in __import__("sys").argv[1:]]' "${PYTEST_EVIDENCE}"
+: > "${PYTEST_OUTPUT}"
 
-if [[ -s "${REUSE_FILE}" ]]; then
+if [[ -n "${PYTEST_REUSE_FILE+x}" || -n "${PYTEST_REUSE_EVIDENCE+x}" ]]; then
   echo "[generate_reports] 复用 test job 的 pytest 输出：${REUSE_FILE}（跳过重跑）"
-  cp "${REUSE_FILE}" "${PYTEST_OUTPUT}"
-  PYTEST_EXIT=0
+  if [[ -n "${REUSE_FILE}" && -n "${REUSE_EVIDENCE}" && -s "${REUSE_FILE}" ]] && cp "${REUSE_FILE}" "${PYTEST_OUTPUT}"; then
+    GATE_RESULT="$(python3 "${REPO_ROOT}/scripts/check_known_failures.py" "${PYTEST_OUTPUT}" \
+      --evidence-file "${REUSE_EVIDENCE}" --write-evidence "${PYTEST_EVIDENCE}" 2>&1)"
+    GATE_EXIT=$?
+  else
+    GATE_RESULT="FAIL: requested pytest reuse output missing/empty; refusing fallback"
+  fi
 else
   echo "[generate_reports] running pytest ..."
-  TEST_DB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")" || exit 2
-  DAILYCHECK_DB_DIR="${TEST_DB_DIR}" python3 -m pytest \
-    --basetemp=/tmp/pytest-dc-af \
-    -q --tb=no -rfE \
-    > "${PYTEST_OUTPUT}" 2>&1
-  PYTEST_EXIT=$?
-  rm -rf "${TEST_DB_DIR}"
+  TEST_DB_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")"
+  if [[ -n "${TEST_DB_DIR}" && -d "${TEST_DB_DIR}" ]]; then
+    DAILYCHECK_DB_DIR="${TEST_DB_DIR}" python3 -m pytest \
+      --basetemp=/tmp/pytest-dc-af -q --tb=no -rfE --color=no \
+      -p scripts.ci.pytest_evidence --dc-evidence="${TEST_DB_DIR}/session.json" \
+      > "${PYTEST_OUTPUT}" 2>&1
+    PYTEST_EXIT=$?
+    GATE_RESULT="$(python3 "${REPO_ROOT}/scripts/check_known_failures.py" "${PYTEST_OUTPUT}" \
+      --pytest-exit "${PYTEST_EXIT}" --session-file "${TEST_DB_DIR}/session.json" \
+      --write-evidence "${PYTEST_EVIDENCE}" 2>&1)"
+    GATE_EXIT=$?
+  else
+    GATE_RESULT="FAIL: cannot allocate isolated pytest database directory"
+  fi
 fi
 
-# 提取数字（pytest -q 输出形如 "5 failed, 800 passed in 30.5s"）
+# Only the strict checker may create validated evidence; unknown failures still
+# retain truthful completion/native metadata and produce failure reports.
+if [[ -s "${PYTEST_EVIDENCE}" ]]; then
+  read -r PYTEST_EXIT PASSED FAILED < <(python3 -c \
+    'import json,sys; d=json.load(open(sys.argv[1])); c=d["session"]["counts"]; print(d["native_exit"], c["passed"], c["failed"])' "${PYTEST_EVIDENCE}")
+  COMPLETE=true
+  cp "${PYTEST_EVIDENCE}" "${OUT_DIR}/pytest-evidence.json"
+else
+  python3 -c 'from pathlib import Path; Path(__import__("sys").argv[1]).unlink(missing_ok=True)' "${OUT_DIR}/pytest-evidence.json"
+fi
+cp "${PYTEST_OUTPUT}" "${OUT_DIR}/pytest-output.txt"
+if [[ -n "${TEST_DB_DIR}" ]]; then
+  rm -rf "${TEST_DB_DIR}"
+fi
 PYTEST_SUMMARY="$(tail -5 "${PYTEST_OUTPUT}")"
-FAILED=$(echo "${PYTEST_SUMMARY}" | grep -oE '[0-9]+ failed' | head -1 | grep -oE '[0-9]+' || echo "0")
-PASSED=$(echo "${PYTEST_SUMMARY}" | grep -oE '[0-9]+ passed' | head -1 | grep -oE '[0-9]+' || echo "0")
-
-# 跑 known_failures 门禁
-GATE_RESULT="$(python3 "${REPO_ROOT}/scripts/check_known_failures.py" "${PYTEST_OUTPUT}" 2>&1)"
-GATE_EXIT=$?
 
 cat > "${OUT_DIR}/02-test-report.md" <<EOF
 # 报告 02/4：测试报告（自动产出）
@@ -80,7 +111,7 @@ cat > "${OUT_DIR}/02-test-report.md" <<EOF
 | 层 | 命令 | 通过 | 失败 | 跳过 | 与基线差 |
 |----|------|------|------|------|---------|
 | L1 静态扫描 | ruff | 见报告 03 | 见报告 03 | 0 | — |
-| L2 单元测试 | pytest | ${PASSED} | ${FAILED} | — | **零新增门禁：${GATE_EXIT}** |
+| L2 单元测试 | pytest（native=${PYTEST_EXIT}, complete=${COMPLETE}） | ${PASSED} | ${FAILED} | — | **零新增门禁：${GATE_EXIT}** |
 | L3 契约测试 | pytest tests/contract | (含 L2) | (含 L2) | — | — |
 | L4 UI 测试 | 待接 | — | — | — |
 | L5 本地冒烟 | 报告 04 | — | — | — |
@@ -218,7 +249,9 @@ cat > "${OUT_DIR}/ci-summary.json" <<EOF
   "pytest": {
     "passed": ${PASSED},
     "failed": ${FAILED},
-    "gate_exit": ${GATE_EXIT}
+    "gate_exit": ${GATE_EXIT},
+    "native_exit": ${PYTEST_EXIT},
+    "complete": ${COMPLETE}
   },
   "ruff": {
     "warnings": ${RUFF_WARNINGS}

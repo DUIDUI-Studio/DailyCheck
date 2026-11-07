@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -22,8 +24,18 @@ KNOWN = REPO_ROOT / "tests" / "known_failures.txt"
 def _run(tmp_path: Path, text: str) -> subprocess.CompletedProcess:
     out = tmp_path / "pytest-out.txt"
     out.write_text(text, encoding="utf-8")
+    ids = [line.split(" - ", 1)[0].removeprefix("FAILED ") for line in text.splitlines() if line.startswith("FAILED ")]
+    passed = re.search(r"(\d+) passed", text)
+    count = int(passed[1]) if passed else 0
+    native = 2 if "Interrupted:" in text else (1 if ids else 0)
+    session = {"schema_version": 1, "pytest_exit": native, "selected": count + len(ids),
+               "selected_unique": count + len(ids), "completed": count + len(ids),
+               "uncompleted": [], "unexpected": [], "error_nodeids": [], "failed_nodeids": ids,
+               "counts": {"passed": count, "failed": len(ids), "skipped": 0, "xfailed": 0, "xpassed": 0, "error": 0}}
+    meta = tmp_path / "session.json"
+    meta.write_text(json.dumps(session), encoding="utf-8")
     return subprocess.run(
-        [sys.executable, str(SCRIPT), str(out)],
+        [sys.executable, str(SCRIPT), str(out), "--pytest-exit", str(native), "--session-file", str(meta)],
         capture_output=True, text=True, timeout=30,
     )
 
