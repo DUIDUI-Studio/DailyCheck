@@ -1412,6 +1412,11 @@ Prod 安装仍属外部依赖；CI/policy/生产模式未变。返回的 comment
 不证明真实 Prod review/admission；现有 review、候选验证、观察窗、merge/Issue closure
 仍仅由 Prod 执行。
 
+**Issue164 CI reuse 回归（修复前证据）**：owned tiny H/G fixture 的 pytest session hook
+逐次记录真实子进程；`test_ci_runs_full_pytest_once_per_H_and_G` 在 a0f2cf 行为上
+测得 test/reports 各跑一次、每个 H/G workflow 合计两次，违反一次全量执行要求。
+Coordinator 澄清两个完整 CI gate 是覆盖完整，不要求重复执行全量 pytest；下述说明待修正。
+
 **Issue164 CI/发布增量（本地未激活）**：`candidate_binding.py` 的 GitHub PR/group 使用
 v3 tagged H/G，Gitea 保留原 v2 compact identity。`merge_group.py` 通过固定只读 GraphQL
 query 分页读取 authenticated queue/entry/repository/members，不解析 queue branch 拼写。

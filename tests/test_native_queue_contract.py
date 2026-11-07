@@ -173,7 +173,8 @@ def tiny_full_ci(repo: Path, root: Path, manifest: dict, policy: ProducerPolicy)
                    "CI_EVENT_SHA": head if phase == "G" else manifest["group_sha"],
                    "CI_HEAD_SHA": "" if phase == "G" else head, "CI_GROUP_SHA": head if phase == "G" else "",
                    "CI_BASE_SHA": manifest["creation_base_sha"], "GITHUB_SERVER_URL": "https://github.com",
-                   "PYTHONPATH": str(ROOT), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "TMPDIR": str(jobroot / "tmp")}
+                   "PYTHONPATH": str(ROOT), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "TMPDIR": str(jobroot / "tmp"),
+                   "CI_PYTEST_INVOCATION_LOG": str(root / "pytest-invocations.jsonl")}
             manifest_path = jobroot / "members.json"
             manifest_path.write_text(json.dumps(manifest))
             env["CI_MEMBER_MANIFEST"] = str(manifest_path)
@@ -231,6 +232,13 @@ def native_base(tmp_path_factory):
         shutil.copy2(ROOT / "scripts" / name, repo / "scripts" / name)
     (repo / "tests").mkdir()
     (repo / "tests/known_failures.txt").write_text("")
+    (repo / "tests/conftest.py").write_text(
+        "import json,os,subprocess\n"
+        "def pytest_sessionstart(session):\n"
+        " path=os.environ.get('CI_PYTEST_INVOCATION_LOG')\n"
+        " if path:\n"
+        "  sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()\n"
+        "  with open(path,'a') as output: output.write(json.dumps({'sha':sha,'pid':os.getpid()})+'\\n')\n")
     (repo / "tests/test_fixture.py").write_text("def test_one(): assert 2+2 == 4\ndef test_two(): assert 'G' != 'H'\n")
     ledger = repo / "docs/integrations/dailycheck-mcp/registry.json"
     ledger.parent.mkdir(parents=True)
@@ -949,3 +957,15 @@ def test_guard_blocks_config_writer_even_when_native_state_is_missing(native_bas
     (runner.directory / "state.json").write_bytes(original)
     with deploy_state.publication_config_transaction(runner.directory):
         assert deploy_state.native_consistent(runner.directory, deploy_state.load_state(runner.directory))
+
+
+def test_ci_runs_full_pytest_once_per_H_and_G(native_base):
+    base = native_base
+    measurements = []
+    for i, value in enumerate(base["values"], 1):
+        rows = [json.loads(line) for line in (base["root"] / f"ci{i}" / "pytest-invocations.jsonl").read_text().splitlines()]
+        for run in base["host"].facts[value["manifest"]["group_sha"]]["ci"]:
+            count = sum(row["sha"] == run["run"]["head_sha"] for row in rows)
+            measurements.append({"phase": run["phase"], "sha": run["run"]["head_sha"], "invocations": count})
+    (base["root"] / "workflow-invocation-counts.json").write_text(json.dumps(measurements, indent=2))
+    assert all(row["invocations"] == 1 for row in measurements), measurements
