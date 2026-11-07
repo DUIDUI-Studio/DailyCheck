@@ -153,6 +153,73 @@ def ci_body(number: int) -> str:
     return f"## 报告 1/4\n| R-001 | fixture | ✅ |\n## Checklist\n## 生产侧事项\nCloses #{number}\n"
 
 
+@pytest.fixture
+def ready_prefix(tmp_path):
+    """Small independent Git graph; no native_base CI or observation fixture."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.name", "Queue prefix fixture")
+    git(repo, "config", "user.email", "queue@example.invalid")
+    (repo / "base").write_text("base")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-qb", "feat/issue-3-prefix")
+    (repo / "member").write_text("member")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "member")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "--no-ff", "-qm", "G", head)
+    group = git(repo, "rev-parse", "HEAD")
+    row = {"id": "ready", "position": 1, "headCommit": {"oid": group},
+           "baseCommit": {"oid": base}, "pullRequest": {
+               "id": "PR_3", "number": 3, "headRefOid": head, "baseRefOid": base,
+               "headRefName": "feat/issue-3-prefix", "body": ci_body(3),
+               "repository": {"id": "R_kgDOVl3HNQ", "databaseId": 1448986421, "nameWithOwner": CODE}}}
+    event = {"action": "checks_requested", "repository": {
+        "id": 1448986421, "node_id": "R_kgDOVl3HNQ", "full_name": CODE},
+        "merge_group": {"base_ref": "refs/heads/main", "head_ref": "refs/heads/opaque",
+                        "head_sha": group, "base_sha": base}}
+    return repo, row, event
+
+
+@pytest.mark.parametrize("tail_length", [0, 1, 2, 30])
+def test_ready_prefix_ignores_ordinary_unbuilt_tail(ready_prefix, tail_length):
+    repo, row, event = ready_prefix
+    reader = QueueReader("synthetic-read")
+    reader.entries = lambda: ("queue", [row] + [
+        {"id": f"queued-{n}", "position": n + 2, "headCommit": None, "baseCommit": None,
+         "pullRequest": {"number": n + 4, "headRefOid": row["pullRequest"]["headRefOid"]}}
+        for n in range(tail_length)])
+    manifest, _ = reader.manifest(repo, event, "1")
+    assert [m["number"] for m in manifest["members"]] == [3]
+    assert manifest["group_sha"] == event["merge_group"]["head_sha"]
+
+
+@pytest.mark.parametrize("damage", ["null_head", "null_base", "wrong_base", "duplicate_group", "position", "foreign"])
+def test_ready_prefix_still_rejects_invalid_included_data(ready_prefix, damage):
+    repo, row, event = ready_prefix
+    rows = [copy.deepcopy(row)]
+    if damage == "null_head":
+        rows.insert(0, {"id": "unbuilt-first", "headCommit": None, "baseCommit": None})
+    elif damage == "null_base":
+        rows[0]["baseCommit"] = None
+    elif damage == "wrong_base":
+        rows[0]["baseCommit"]["oid"] = row["pullRequest"]["headRefOid"]
+    elif damage == "duplicate_group":
+        rows.append({**row, "id": "duplicate"})
+    elif damage == "position":
+        rows[0]["position"] = 2
+    else:
+        rows[0]["pullRequest"]["repository"]["databaseId"] += 1
+    reader = QueueReader("synthetic-read")
+    reader.entries = lambda: ("queue", rows)
+    with pytest.raises(ValueError):
+        reader.manifest(repo, event, "1")
+
+
 def prepare_ci_tools(repo: Path, root: Path) -> None:
     """Actual gate scripts with owned temp paths and a synthetic app/queue read port."""
     gate_dir = repo / "scripts/agent_framework"
