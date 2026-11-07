@@ -1,1 +1,1 @@
-GitHub migration permission probe. No production changes.
+Unassociated commit: verifies direct push is rejected without an open pull request.
