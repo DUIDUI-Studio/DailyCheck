@@ -1248,6 +1248,8 @@ provider/host/repositoryID/kind、稳定 request UUID、精确 payload/hash、�
 owner/generation/120 秒租约和 remote ID/number/URL。`init_master_db` 的既有建表机制
 只增表，不重写旧票据；旧 schema 缺表时送达 fail closed，升级后可继续。
 本任务只在临时 SQLite 验证，未执行真实 DB migration。
+新增 receipt 表同时由既有 `scripts/arch_map.py --write` 同步派生表清单
+`docs/ARCHITECTURE_MAP.md`；生成器与 schema version 规则不变。
 
 状态为 `ready → sending → linked | uncertain`，事实变化时 `blocked`。
 SQLite immediate transaction 只保护 claim/finalize，HTTP 在 commit 后；过期 claim
