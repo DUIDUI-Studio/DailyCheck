@@ -27,8 +27,16 @@ from scripts.hosting import (  # noqa: E402
     Provider,
     is_shadow_event,
     provider,
-    require_production_work,
     require_shadow_path,
+)
+from scripts.hosting import (
+    PayloadError as ValidationError,
+)
+from scripts.hosting import (
+    parse_json_object as strict_json_loads,
+)
+from scripts.hosting import (
+    validate_json_tree as _validate_json_tree,
 )
 from scripts.prod_agent.merge_readiness import (  # noqa: E402
     DEFAULT_REQUIRED_CONTEXTS,
@@ -138,8 +146,27 @@ CREATE TABLE IF NOT EXISTS provider_state (
 """
 
 
-class ValidationError(ValueError):
-    """The input cannot be safely reduced."""
+REJECTION_BUDGET = 32
+REJECTION_REASONS = frozenset({"shadow_rejected", "invalid_stored_payload"})
+
+
+@dataclass(frozen=True)
+class Claimed:
+    decision: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Rejected:
+    trigger_id: str
+    reason: str
+
+    def decision(self) -> dict[str, Any]:
+        return {"decision": "suppress", "reason": self.reason, "trigger_id": self.trigger_id}
+
+
+@dataclass(frozen=True)
+class NotEligible:
+    pass
 
 
 def _text(value: Any, *, field: str, limit: int = 512, required: bool = True) -> str:
@@ -165,65 +192,6 @@ def redact_sensitive(value: Any, *, limit: int = 400) -> str:
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     return text[:limit]
-
-
-def _validate_json_tree(value: Any, *, path: str = "$", depth: int = 0) -> None:
-    """Reject values Python accepts but RFC JSON cannot represent faithfully."""
-    if depth > 100:
-        raise ValidationError(f"{path} is nested too deeply")
-    if value is None or isinstance(value, bool):
-        return
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValidationError(f"{path} contains an invalid Unicode surrogate") from exc
-        return
-    if isinstance(value, int):
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValidationError(f"{path} contains a non-finite number")
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_json_tree(item, path=f"{path}[{index}]", depth=depth + 1)
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValidationError(f"{path} contains a non-string object key")
-            try:
-                key.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise ValidationError(f"{path} contains an invalid object key") from exc
-            _validate_json_tree(item, path=f"{path}.*", depth=depth + 1)
-        return
-    raise ValidationError(f"{path} contains a non-JSON value")
-
-
-def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValidationError("duplicate JSON object key")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValidationError(f"non-RFC JSON number {value}")
-
-
-def strict_json_loads(raw: bytes | str) -> Any:
-    """Parse JSON while rejecting NaN, Infinity, overflow and duplicate keys."""
-    payload = json.loads(
-        raw,
-        parse_constant=_reject_json_constant,
-        object_pairs_hook=_strict_object,
-    )
-    _validate_json_tree(payload)
-    return payload
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -555,29 +523,65 @@ class EventReducer:
         )
 
     @staticmethod
+    def _stored_rejection(
+        conn: sqlite3.Connection, row: sqlite3.Row, *, now_ms: int
+    ) -> Rejected | None:
+        """Return a stable rejection; only pending rows may transition to terminal."""
+        if row["state"] == "done" and row["last_error"] in REJECTION_REASONS:
+            return Rejected(row["trigger_id"], row["last_error"])
+        if row["state"] != "pending":
+            return None
+        try:
+            payload = strict_json_loads(row["payload_json"])
+        except ValidationError:
+            reason = "invalid_stored_payload"
+        else:
+            reason = (
+                "shadow_rejected"
+                if is_shadow_event({"repo": row["repo"], "payload": payload})
+                else ""
+            )
+        if not reason:
+            return None
+        conn.execute(
+            """UPDATE trigger_queue SET state = 'done', last_error = ?, completed_at_ms = ?,
+               updated_at_ms = ?, lease_token = NULL, lease_expires_ms = NULL
+               WHERE trigger_id = ? AND state = 'pending'""",
+            (reason, now_ms, now_ms, row["trigger_id"]),
+        )
+        conn.execute(
+            "UPDATE deliveries SET disposition = ? WHERE trigger_id = ?",
+            (reason, row["trigger_id"]),
+        )
+        return Rejected(row["trigger_id"], reason)
+
+    @staticmethod
     def _claim_specific(
         conn: sqlite3.Connection,
         *,
         trigger_id: str,
         now_ms: int,
         lease_ttl_ms: int,
-    ) -> dict[str, Any] | None:
+        allow_claim: bool = True,
+    ) -> Claimed | Rejected | NotEligible:
         row = conn.execute(
             "SELECT * FROM trigger_queue WHERE trigger_id = ?",
             (trigger_id,),
         ).fetchone()
-        if row is None or row["state"] != "pending" or row["due_at_ms"] > now_ms:
-            return None
+        if row is None or row["state"] != "pending":
+            return NotEligible()
+        rejected = EventReducer._stored_rejection(conn, row, now_ms=now_ms)
+        if rejected is not None:
+            return rejected
+        if not allow_claim or row["due_at_ms"] > now_ms:
+            return NotEligible()
         active = conn.execute(
-            """
-            SELECT 1 FROM trigger_queue
-            WHERE repo = ? AND pr_number = ? AND state = 'claimed'
-            """,
+            """SELECT 1 FROM trigger_queue
+               WHERE repo = ? AND pr_number = ? AND state = 'claimed'""",
             (row["repo"], row["pr_number"]),
         ).fetchone()
         if active is not None:
-            return None
-        require_production_work({"repo": row["repo"], "payload": json.loads(row["payload_json"])})
+            return NotEligible()
         attempts = int(row["attempts"]) + 1
         lease = hashlib.sha256(f"{trigger_id}|{attempts}|{now_ms}|lease".encode()).hexdigest()[:40]
         conn.execute(
@@ -593,7 +597,7 @@ class EventReducer:
             "SELECT * FROM trigger_queue WHERE trigger_id = ?",
             (trigger_id,),
         ).fetchone()
-        return EventReducer._trigger_decision(row)
+        return Claimed(EventReducer._trigger_decision(row))
 
     @staticmethod
     def _trigger_decision(
@@ -612,7 +616,7 @@ class EventReducer:
             "due_at_ms": row["due_at_ms"],
             "collapsed_count": row["collapsed_count"],
             "recovered": recovered or [],
-            "payload": json.loads(row["payload_json"]),
+            "payload": strict_json_loads(row["payload_json"]),
         }
 
     @staticmethod
@@ -634,7 +638,7 @@ class EventReducer:
             "route": row["route"],
             "due_at_ms": due,
             "wait_ms": max(0, due - now_ms),
-            "payload": json.loads(row["payload_json"]),
+            "payload": strict_json_loads(row["payload_json"]),
         }
 
     def _recover_expired(self, conn: sqlite3.Connection, *, now_ms: int) -> list[str]:
@@ -864,16 +868,18 @@ class EventReducer:
     def ingest(self, payload: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         event = self.normalize(payload)
         if provider() is Provider.GITHUB or is_shadow_event(event):
-            return {"decision": "silent", "reason": "github_shadow_only", "delivery_id": event["delivery_id"]}
+            return {
+                "decision": "silent",
+                "reason": "github_shadow_only",
+                "delivery_id": event["delivery_id"],
+            }
         if event["event"] == "pull_request":
             return self._ingest_pull_request(event, now_ms=now_ms)
         if event["event"] == "check_suite":
             return self._ingest_check_suite(event, now_ms=now_ms)
         return self._ingest_deploy_result(event, now_ms=now_ms)
 
-    def _ingest_pull_request(
-        self, event: dict[str, Any], *, now_ms: int
-    ) -> dict[str, Any]:
+    def _ingest_pull_request(self, event: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         """Record PR lifecycle without creating any provider work."""
         key = event_key(event)
         repo = event["repo_full_name"].lower()
@@ -1051,9 +1057,7 @@ class EventReducer:
             "route": ROUTES["check_suite"],
         }
 
-    def _ingest_check_suite(
-        self, event: dict[str, Any], *, now_ms: int
-    ) -> dict[str, Any]:
+    def _ingest_check_suite(self, event: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         conclusion = event["conclusion"].lower()
         key = event_key(event)
         if conclusion != "success":
@@ -1065,8 +1069,10 @@ class EventReducer:
                 "running",
                 "waiting",
             }
-            status = "pending" if conclusion in busy else (
-                "failure" if conclusion in {"failure", "error"} else "unknown"
+            status = (
+                "pending"
+                if conclusion in busy
+                else ("failure" if conclusion in {"failure", "error"} else "unknown")
             )
             return self._record_check_state(
                 event,
@@ -1109,12 +1115,38 @@ class EventReducer:
                     if delivery is not None and delivery["trigger_id"]
                     else None
                 )
+                if queued is None:
+                    queued = conn.execute(
+                        "SELECT * FROM trigger_queue WHERE trigger_id = ?",
+                        (state["merge_ready_trigger_id"],),
+                    ).fetchone()
+                if queued is not None:
+                    rejected = self._stored_rejection(conn, queued, now_ms=now_ms)
+                    if rejected:
+                        self._record_delivery(
+                            conn, event, key, queued["trigger_id"], rejected.reason, now_ms
+                        )
+                        conn.execute("COMMIT")
+                        return rejected.decision()
                 blocked = self._provider_gate(conn, now_ms=now_ms)
-                if (
-                    delivery is not None
-                    and queued is not None
-                    and queued["state"] == "pending"
-                ):
+                if delivery is not None and queued is not None and queued["state"] == "pending":
+                    outcome = self._claim_specific(
+                        conn,
+                        trigger_id=queued["trigger_id"],
+                        now_ms=now_ms,
+                        lease_ttl_ms=self.config.lease_ttl_ms,
+                        allow_claim=blocked is None,
+                    )
+                    if isinstance(outcome, Rejected):
+                        conn.execute("COMMIT")
+                        return outcome.decision()
+                    if isinstance(outcome, Claimed):
+                        conn.execute(
+                            "UPDATE deliveries SET disposition = 'triggered' WHERE delivery_id = ?",
+                            (event["delivery_id"],),
+                        )
+                        conn.execute("COMMIT")
+                        return outcome.decision
                     if blocked is not None:
                         conn.execute("COMMIT")
                         return self._pending_decision(
@@ -1135,19 +1167,6 @@ class EventReducer:
                             delivery_id=event["delivery_id"],
                             now_ms=now_ms,
                         )
-                    triggered = self._claim_specific(
-                        conn,
-                        trigger_id=queued["trigger_id"],
-                        now_ms=now_ms,
-                        lease_ttl_ms=self.config.lease_ttl_ms,
-                    )
-                    if triggered is not None:
-                        conn.execute(
-                            "UPDATE deliveries SET disposition = 'triggered' WHERE delivery_id = ?",
-                            (event["delivery_id"],),
-                        )
-                        conn.execute("COMMIT")
-                        return triggered
                 self._record_delivery(
                     conn,
                     event,
@@ -1252,9 +1271,28 @@ class EventReducer:
                     "current_head": state["head_sha"],
                 }
             if state is not None and state["merge_ready_at_ms"] is not None:
+                existing = conn.execute(
+                    "SELECT * FROM trigger_queue WHERE trigger_id = ?",
+                    (state["merge_ready_trigger_id"],),
+                ).fetchone()
+                rejected = (
+                    self._stored_rejection(conn, existing, now_ms=now_ms)
+                    if existing is not None
+                    else None
+                )
+                if rejected:
+                    self._record_delivery(
+                        conn, event, ready_key, rejected.trigger_id, rejected.reason, now_ms
+                    )
+                    conn.execute("COMMIT")
+                    return rejected.decision()
                 self._record_delivery(
-                    conn, event, ready_key, state["merge_ready_trigger_id"],
-                    "already_merge_ready", now_ms,
+                    conn,
+                    event,
+                    ready_key,
+                    state["merge_ready_trigger_id"],
+                    "already_merge_ready",
+                    now_ms,
                 )
                 conn.execute("COMMIT")
                 return {
@@ -1270,6 +1308,13 @@ class EventReducer:
                 (trigger_id,),
             ).fetchone()
             if queued is not None:
+                rejected = self._stored_rejection(conn, queued, now_ms=now_ms)
+                if rejected:
+                    self._record_delivery(
+                        conn, event, ready_key, trigger_id, rejected.reason, now_ms
+                    )
+                    conn.execute("COMMIT")
+                    return rejected.decision()
                 self._record_delivery(
                     conn, event, ready_key, trigger_id, "already_merge_ready", now_ms
                 )
@@ -1323,9 +1368,7 @@ class EventReducer:
                 """,
                 (now_ms, trigger_id, now_ms, repo, event["pr_number"], event["pr_head_sha"]),
             )
-            self._record_delivery(
-                conn, event, ready_key, trigger_id, "deferred", now_ms
-            )
+            self._record_delivery(conn, event, ready_key, trigger_id, "deferred", now_ms)
             queued = conn.execute(
                 "SELECT * FROM trigger_queue WHERE trigger_id = ?",
                 (trigger_id,),
@@ -1343,15 +1386,11 @@ class EventReducer:
             delivery_id=event["delivery_id"],
             now_ms=now_ms,
             due_at_ms=(
-                max(int(queued["due_at_ms"]), cooldown_until_ms)
-                if provider_blocked
-                else None
+                max(int(queued["due_at_ms"]), cooldown_until_ms) if provider_blocked else None
             ),
         )
 
-    def _ingest_deploy_result(
-        self, event: dict[str, Any], *, now_ms: int
-    ) -> dict[str, Any]:
+    def _ingest_deploy_result(self, event: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         key = event_key(event)
         route = ROUTES[event["event"]]
         try:
@@ -1403,6 +1442,23 @@ class EventReducer:
                     else None
                 )
                 if queued is not None and queued["state"] == "pending":
+                    outcome = self._claim_specific(
+                        conn,
+                        trigger_id=queued["trigger_id"],
+                        now_ms=now_ms,
+                        lease_ttl_ms=self.config.lease_ttl_ms,
+                        allow_claim=not provider_blocked,
+                    )
+                    if isinstance(outcome, Rejected):
+                        conn.execute("COMMIT")
+                        return outcome.decision()
+                    if isinstance(outcome, Claimed):
+                        conn.execute(
+                            "UPDATE deliveries SET disposition = 'triggered' WHERE delivery_id = ?",
+                            (event["delivery_id"],),
+                        )
+                        conn.execute("COMMIT")
+                        return outcome.decision
                     if provider_blocked:
                         conn.execute("COMMIT")
                         return self._pending_decision(
@@ -1412,19 +1468,6 @@ class EventReducer:
                             now_ms=now_ms,
                             due_at_ms=max(int(queued["due_at_ms"]), cooldown_until_ms),
                         )
-                    triggered = self._claim_specific(
-                        conn,
-                        trigger_id=queued["trigger_id"],
-                        now_ms=now_ms,
-                        lease_ttl_ms=self.config.lease_ttl_ms,
-                    )
-                    if triggered is not None:
-                        conn.execute(
-                            "UPDATE deliveries SET disposition = 'triggered' WHERE delivery_id = ?",
-                            (event["delivery_id"],),
-                        )
-                        conn.execute("COMMIT")
-                        return triggered
                     if queued["due_at_ms"] > now_ms:
                         conn.execute("COMMIT")
                         return self._pending_decision(
@@ -1446,7 +1489,11 @@ class EventReducer:
                     "reason": (
                         "equivalent_active"
                         if queued is not None and queued["state"] == "claimed"
-                        else "already_processed"
+                        else (
+                            queued["last_error"]
+                            if queued is not None and queued["last_error"] in REJECTION_REASONS
+                            else "already_processed"
+                        )
                     ),
                     "delivery_id": event["delivery_id"],
                     "event_key": delivery["event_key"],
@@ -1483,6 +1530,14 @@ class EventReducer:
                 (key,),
             ).fetchone()
             if equivalent is not None:
+                rejected = self._stored_rejection(conn, equivalent, now_ms=now_ms)
+                reason = rejected.reason if rejected else ""
+                if reason:
+                    self._record_delivery(
+                        conn, event, key, equivalent["trigger_id"], reason, now_ms
+                    )
+                    conn.execute("COMMIT")
+                    return Rejected(equivalent["trigger_id"], reason).decision()
                 self._record_delivery(
                     conn, event, key, equivalent["trigger_id"], "coalesced", now_ms
                 )
@@ -1542,6 +1597,8 @@ class EventReducer:
                     event["pr_head_sha"],
                 ),
             ).fetchone()
+            if pending is not None and self._stored_rejection(conn, pending, now_ms=now_ms):
+                pending = None
             if pending is not None:
                 merged = self._merge_pending(
                     conn,
@@ -1630,56 +1687,74 @@ class EventReducer:
                     "cooldown_until_ms": blocked["cooldown_until_ms"],
                     "recovered": recovered,
                 }
-            candidate = conn.execute(
-                """
-                SELECT q.trigger_id FROM trigger_queue q
-                WHERE q.state = 'pending' AND q.due_at_ms <= ?
-                  AND NOT EXISTS (
-                    SELECT 1 FROM trigger_queue active
-                    WHERE active.repo = q.repo
-                      AND active.pr_number = q.pr_number
-                      AND active.state = 'claimed'
-                  )
-                ORDER BY q.due_at_ms, q.first_seen_ms, q.trigger_id
-                LIMIT 1
-                """,
-                (now_ms,),
-            ).fetchone()
-            if candidate is None:
-                active_count = conn.execute(
-                    "SELECT COUNT(*) FROM trigger_queue WHERE state = 'claimed'"
-                ).fetchone()[0]
-                pending_count = conn.execute(
-                    "SELECT COUNT(*) FROM trigger_queue WHERE state = 'pending'"
-                ).fetchone()[0]
-                conn.execute("COMMIT")
-                return {
-                    "decision": "silent",
-                    "reason": "active_lease" if active_count else "no_due",
-                    "active_count": active_count,
-                    "pending_count": pending_count,
-                    "recovered": recovered,
-                }
-            decision = self._claim_specific(
-                conn,
-                trigger_id=candidate["trigger_id"],
-                now_ms=now_ms,
-                lease_ttl_ms=self.config.lease_ttl_ms,
-            )
-            if decision is None:
+            rejected = []
+            for _ in range(REJECTION_BUDGET):
+                candidate = conn.execute(
+                    """
+                    SELECT q.trigger_id FROM trigger_queue q
+                    WHERE q.state = 'pending' AND q.due_at_ms <= ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM trigger_queue active
+                        WHERE active.repo = q.repo
+                          AND active.pr_number = q.pr_number
+                          AND active.state = 'claimed'
+                      )
+                    ORDER BY q.due_at_ms, q.first_seen_ms, q.trigger_id
+                    LIMIT 1
+                    """,
+                    (now_ms,),
+                ).fetchone()
+                if candidate is None:
+                    active_count = conn.execute(
+                        "SELECT COUNT(*) FROM trigger_queue WHERE state = 'claimed'"
+                    ).fetchone()[0]
+                    pending_count = conn.execute(
+                        "SELECT COUNT(*) FROM trigger_queue WHERE state = 'pending'"
+                    ).fetchone()[0]
+                    conn.execute("COMMIT")
+                    return {
+                        "decision": "silent",
+                        "reason": "active_lease" if active_count else "no_due",
+                        "active_count": active_count,
+                        "pending_count": pending_count,
+                        "rejected": rejected,
+                        "recovered": recovered,
+                    }
+                outcome = self._claim_specific(
+                    conn,
+                    trigger_id=candidate["trigger_id"],
+                    now_ms=now_ms,
+                    lease_ttl_ms=self.config.lease_ttl_ms,
+                )
+                if isinstance(outcome, Rejected):
+                    rejected.append(outcome.decision())
+                    continue
+                if isinstance(outcome, Claimed):
+                    decision = outcome.decision
+                    decision["recovered"] = recovered
+                    decision["rejected"] = rejected
+                    conn.execute(
+                        "UPDATE deliveries SET disposition = 'triggered' WHERE trigger_id = ?",
+                        (candidate["trigger_id"],),
+                    )
+                    conn.execute("COMMIT")
+                    return decision
                 conn.execute("COMMIT")
                 return {
                     "decision": "silent",
                     "reason": "active_lease",
                     "recovered": recovered,
+                    "rejected": rejected,
                 }
-            decision["recovered"] = recovered
-            conn.execute(
-                "UPDATE deliveries SET disposition = 'triggered' WHERE trigger_id = ?",
-                (candidate["trigger_id"],),
-            )
             conn.execute("COMMIT")
-            return decision
+            return {
+                "decision": "defer",
+                "reason": "rejection_budget",
+                "rejected": rejected,
+                "recovered": recovered,
+                "due_at_ms": now_ms,
+                "wait_ms": 0,
+            }
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -1913,7 +1988,9 @@ class EventReducer:
 
 
 def _emit(decision: dict[str, Any]) -> None:
-    if decision.get("decision") in {"trigger", "defer"} and (provider() is Provider.GITHUB or is_shadow_event(decision)):
+    if decision.get("decision") in {"trigger", "defer"} and (
+        provider() is Provider.GITHUB or is_shadow_event(decision)
+    ):
         decision = {"decision": "suppress", "reason": "github_shadow_only"}
     print(
         json.dumps(
@@ -1958,9 +2035,7 @@ def build_parser() -> Any:
     parser.add_argument("--provider-cooldown-ms", type=int, default=60_000)
     parser.add_argument(
         "--required-contexts",
-        default=os.environ.get(
-            "DAILYCHECK_REQUIRED_CONTEXTS", DEFAULT_REQUIRED_CONTEXTS_ENV
-        ),
+        default=os.environ.get("DAILYCHECK_REQUIRED_CONTEXTS", DEFAULT_REQUIRED_CONTEXTS_ENV),
         help="comma-separated exact required CI context names",
     )
     parser.add_argument("--now-ms", type=int, help=argparse.SUPPRESS)

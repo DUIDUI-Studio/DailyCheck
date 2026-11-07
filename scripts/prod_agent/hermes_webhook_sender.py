@@ -28,7 +28,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.hosting import HostingError, require_production_work  # noqa: E402
+from scripts.hosting import (  # noqa: E402
+    HostingError,
+    PayloadError,
+    parse_json_object,
+    require_production_work,
+)
 
 ROUTES = frozenset({"wdg-ci", "dailycheck-deploy"})
 EVENTS = frozenset({"check_suite", "deploy_result"})
@@ -108,13 +113,16 @@ def send(
     timeout_s: float = 10.0,
 ) -> tuple[int, dict[str, Any]]:
     try:
-        try:
-            payload = json.loads(body)
-        except (ValueError, UnicodeError):
-            payload = None
+        payload = parse_json_object(body)
         require_production_work(payload)
-    except HostingError:
-        return 5, {"accepted": False, "reason": "github_shadow_only"}
+    except PayloadError:
+        return 5, {"accepted": False, "reason": "invalid_payload"}
+    except HostingError as exc:
+        shadow = str(exc) == "github_shadow_only"
+        return (5 if shadow else 1), {
+            "accepted": False,
+            "reason": "github_shadow_only" if shadow else "invalid_hosting_configuration",
+        }
     if route not in ROUTES or event not in EVENTS:
         return 5, {"accepted": False, "reason": "invalid_route_or_event"}
     if not delivery_id or len(delivery_id) > 256:
@@ -188,22 +196,26 @@ def main(argv: list[str] | None = None) -> int:
     if arguments == ["--production-guard"]:
         try:
             raw = sys.stdin.buffer.read(MAX_BODY_BYTES + 1)
-            if len(raw) > MAX_BODY_BYTES:
-                raise HostingError("invalid_guard_payload")
-            try:
-                payload = json.loads(raw) if raw else None
-            except (ValueError, UnicodeError):
-                payload = None
+            # Only an actually absent body is the explicit config-only drain guard.
+            payload = parse_json_object(raw) if raw else None
             require_production_work(payload)
+        except PayloadError:
+            _emit({"decision": "suppress", "reason": "invalid_payload"})
+            return 5
         except HostingError as exc:
             shadow = str(exc) == "github_shadow_only"
-            _emit({"decision": "suppress" if shadow else "retry",
-                   "reason": "github_shadow_only" if shadow else "invalid_hosting_configuration"})
+            _emit(
+                {
+                    "decision": "suppress" if shadow else "retry",
+                    "reason": "github_shadow_only" if shadow else "invalid_hosting_configuration",
+                }
+            )
             return 5 if shadow else 1
         return 0
     args = build_parser().parse_args(argv)
     try:
-        body = Path(args.body_file).read_bytes()
+        with Path(args.body_file).open("rb") as stream:
+            body = stream.read(MAX_BODY_BYTES + 1)
     except OSError:
         _emit({"accepted": False, "reason": "body_unreadable"})
         return 5

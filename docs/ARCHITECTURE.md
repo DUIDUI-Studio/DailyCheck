@@ -1193,13 +1193,32 @@ Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置
 采样时间与 freshness 标签；这是可复核快照，不是部署租约，后续 admission/finalization 必须重验。
 `merge_readiness.py` 保留 Gitea 入口；现有 reducer 对 GitHub 证据强制 `ready=false`，
 `deploy_merge.py` 明确拒绝 GitHub finalization，不引入 merge queue / group delivery。
-Shadow 边界不依赖 readiness helper：reducer ingress 在规范化后拒绝 GitHub/已标记 shadow/目标仓库事件的
-provider work；任何 GitHub 配置的 drain 都静默，已有未标记队列行在 claim 前按 row repo 与 payload
-拒绝，不领取 lease。CLI 的 SQLite 路径在构造和每次连接前检查，DB 以及 `-wal/-shm/-journal`
-均必须在解析 symlink 后位于 shadow root；缺 root 或越界在任何 mkdir/SQLite 写入前失败。
-`dc-notify-prod-agent.sh` 在 ingress、drain 和 reducer trigger 输出后调用 sender 的纯
-`--production-guard`，先于状态/临时文件/secret/HTTP；sender 的实际 `send` 也独立阻断，不能绕过
-adapter 直接投递。未标记或延迟的目标仓库 `deploy_result` 同样受限，Gitea 正常路由/租约/输出不变。
+Shadow 边界不依赖 readiness helper：`hosting.py` 统一严格 JSON object 解析与 policy 分类。
+raw sender、shell ingress/output guard、reducer 和存储行共用重复键、finite number、UTF-8、
+1 MiB、深度 100 保护；body 错误与 hosting config 错误分离，不能把解析失败当成缺省输入。
+只有 guard 的实际空输入允许 config-only drain；`null` / array 不可进入该分支。
+通用 sender object（如 `{}`）不要求 reducer domain fields，HMAC/POST 保留原始 bytes。
+每个已提供的 `repo_full_name`、`repository.full_name`、row/envelope `repo` 和递归 `payload`
+均按 `strip().casefold()` 检查；任一目标 identity 或 shadow provenance 即阻断，
+非目标 alias 的既有优先级不变。显式 GitHub 配置对所有 body 均 shadow-only。
+`dc-notify-prod-agent.sh` 在 ingress、config-only drain 和 reducer trigger 输出后复用 sender 的
+纯 `--production-guard`，先于状态/临时文件/secret/HTTP；实际 sender 也独立严格解析并阻断。
+
+旧存储行在 claim/coalesce 前严格解析；永久不合格的 pending 行以既有 `done` 状态保留，
+`last_error` 与 linked delivery disposition 为 `shadow_rejected` 或 `invalid_stored_payload`，
+设置 completion/update 时间、清除 inactive lease，保留原 raw payload、identity/key、attempts 和记录。
+这不是投递成功，不调用 `complete()`、不 reset provider health。三条 claim 调用路径明确区分
+claimed / rejected / not eligible；同/等价 delivery 不复活拒绝行，也不把拒绝标成 triggered。
+每次 drain 在一个 immediate transaction 内最多处理 K=32 个拒绝并领取一个有效 lease，
+HTTP 在 commit 后；预算耗尽 commit 后输出 `defer/rejection_budget`（native 75）。
+健康存储/provider、已到期且无 blocking live lease 时，N 个拒绝行后的有效工作在
+`floor(N/32)+1` 次 drain 内可领取。live lease 不被抢占，expired recovery 与拒绝一起提交；
+真实 SQLite/commit 错误仍 rollback/retry。既有 HTTP 接受后、complete 前 crash 仍可能在 lease
+过期后重投；本准备不保证外部业务 exactly-once，也不改变 exact-H deploy-first 顺序。
+
+CLI 的 SQLite 路径在构造和每次连接前检查，DB 以及 `-wal/-shm/-journal` 均必须在解析
+symlink 后位于 shadow root；缺 root 或越界在任何 mkdir/SQLite 写入前失败。
+GitHub 配置的 drain 不启用 provider work，Gitea 正常路由/租约/输出继续兼容。
 
 **调用方**：poller 的 GitHub 分支只输出 shadow readiness，不运行生产 catchup；dashboard 使用
 GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 label 传名字；报告 comment
@@ -1246,7 +1265,8 @@ malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/tes
 `tests/test_pytest_gate_completeness.py` 用真实 pytest 子进程验证候选/运行绑定的摘要转交。
 `tests/test_transport_boundary_repair.py` 的原始回归覆盖 raw sender/guard、带空白的冲突 alias
 和混合旧行队列的实际 shell/HTTP/SQLite 行为；这些回归先在 `25b125a` 上记录失败，
-用于约束后续共享解析和持久拒绝修复。
+后续通过真实 entrypoint/HMAC/SQLite 验证严格解析、K=32 进度、双 duplicate-ingest、
+并发租约、503/429 重试、事务 rollback 和 pre-commit process interruption 的收敛。
 
 ## 4. 数据架构
 

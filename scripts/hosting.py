@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 
@@ -32,17 +33,77 @@ class HostingError(RuntimeError):
         self.status = status
 
 
-def _json_object(pairs: list[tuple[str, object]]) -> dict:
-    result = {}
+class PayloadError(ValueError):
+    """Invalid external body; distinct from unavailable/invalid hosting configuration."""
+
+
+def validate_json_tree(value: Any, *, path: str = "$", depth: int = 0) -> None:
+    """Reject values Python accepts but RFC JSON cannot represent faithfully."""
+    if depth > 100:
+        raise PayloadError(f"{path} is nested too deeply")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise PayloadError(f"{path} contains an invalid Unicode surrogate") from exc
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise PayloadError(f"{path} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            validate_json_tree(item, path=f"{path}[{index}]", depth=depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise PayloadError(f"{path} contains a non-string object key")
+            try:
+                key.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise PayloadError(f"{path} contains an invalid object key") from exc
+            validate_json_tree(item, path=f"{path}.*", depth=depth + 1)
+        return
+    raise PayloadError(f"{path} contains a non-JSON value")
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise HostingError("duplicate_json_key")
+            raise PayloadError("duplicate JSON object key")
         result[key] = value
     return result
 
 
-def _invalid_constant(value: str):
-    raise HostingError("invalid_json_constant")
+def _reject_json_constant(value: str) -> None:
+    raise PayloadError(f"non-RFC JSON number {value}")
+
+
+def strict_json_loads(raw: bytes | str, *, max_bytes: int = 1_048_576):
+    """Validate untrusted JSON without accepting Python-only values or duplicate keys."""
+    try:
+        if len(raw if isinstance(raw, bytes) else raw.encode("utf-8")) > max_bytes:
+            raise PayloadError("payload_too_large")
+        payload = json.loads(
+            raw, parse_constant=_reject_json_constant, object_pairs_hook=_strict_object
+        )
+        validate_json_tree(payload)
+        return payload
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise PayloadError(str(exc)) from exc
+
+
+def parse_json_object(raw: bytes | str) -> dict:
+    payload = strict_json_loads(raw)
+    if not isinstance(payload, dict):
+        raise PayloadError("JSON body must be an object")
+    return payload
 
 
 def provider(environ: Mapping[str, str] | None = None) -> Provider:
@@ -70,14 +131,17 @@ def is_shadow_event(payload: object) -> bool:
     """Identify delayed/untagged target events as well as explicit shadow provenance."""
     if not isinstance(payload, dict):
         return False
-    if payload.get("hosting_provider") == "github" or payload.get("intake_mode") == "shadow":
+    if any(
+        isinstance(payload.get(key), str) and payload[key].strip().casefold() == value
+        for key, value in (("hosting_provider", "github"), ("intake_mode", "shadow"))
+    ):
         return True
     repository = payload.get("repository")
     identities = [payload.get("repo_full_name"), payload.get("repo")]
     if isinstance(repository, dict):
         identities.append(repository.get("full_name"))
     if any(
-        isinstance(repo, str) and repo.casefold() == "duidui-studio/dailycheck"
+        isinstance(repo, str) and repo.strip().casefold() == "duidui-studio/dailycheck"
         for repo in identities
     ):
         return True
@@ -268,7 +332,7 @@ class HostingClient:
                 c.provider is Provider.GITHUB and code != expected.get(method)
             ):
                 raise HostingError("hosting_http_error", code)
-            data = json.loads(raw, object_pairs_hook=_json_object, parse_constant=_invalid_constant)
+            data = strict_json_loads(raw, max_bytes=4_194_304)
             return data, raw_headers
         except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as exc:
             raise HostingError("hosting_invalid_response") from exc

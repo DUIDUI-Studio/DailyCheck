@@ -255,7 +255,11 @@ def test_actual_adapter_never_posts_preexisting_untagged_delayed_rows(lane, mode
     assert result.returncode == 0, result.stdout + result.stderr
     assert not posts
     with sqlite3.connect(env["DAILYCHECK_EVENT_REDUCER_DB"]) as conn:
-        assert conn.execute("SELECT state,attempts FROM trigger_queue").fetchone() == ("pending", 0)
+        assert conn.execute("SELECT state,attempts FROM trigger_queue").fetchone() == (
+            "pending" if mode == "github" else "done", 0
+        )
+        if mode != "github":
+            assert conn.execute("SELECT last_error FROM trigger_queue").fetchone()[0] == "shadow_rejected"
 
 
 @pytest.mark.parametrize("mode", [None, "gitea", "github"])
