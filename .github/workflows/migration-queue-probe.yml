@@ -21,9 +21,10 @@ jobs:
           FAIL: ${{ contains(github.event.pull_request.title, 'FAIL-CI') }}
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, time
           e=json.load(open(os.environ['GITHUB_EVENT_PATH']))
           print(json.dumps({'simulation_only':True,'event':os.environ['GITHUB_EVENT_NAME'],'sha':os.environ['GITHUB_SHA'],'ref':os.environ['GITHUB_REF'],'pr':e.get('pull_request',{}).get('number'),'H':e.get('pull_request',{}).get('head',{}).get('sha'),'B':e.get('pull_request',{}).get('base',{}).get('sha'),'merge_group':e.get('merge_group')}))
+          time.sleep(65 if 'slow-ci-' in e.get('pull_request',{}).get('title','') else 0)
           assert os.environ['FAIL'] != 'true', 'deliberate probe failure'
           PY
   agent-framework-reports:
