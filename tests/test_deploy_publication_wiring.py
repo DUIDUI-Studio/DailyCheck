@@ -9,9 +9,11 @@ state, logs, shadow paths and bindings stay under `tmp_path`.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -23,6 +25,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+
+from scripts.hosting import AccessRole, HostingClient, HostingConfig, HostingError
 
 BG_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
 REPO_ROOT = BG_DIR.parents[1]
@@ -207,6 +211,7 @@ def sandbox(tmp_path, loopback):
         "DAILYCHECK_DASHBOARD_HOOK": "0",
         "DAILYCHECK_BG_LOCK_FILE": str(tmp_path / "bg.lock"),
         "DAILYCHECK_HOSTING_PROVIDER": "github",
+        "DAILYCHECK_GITHUB_REPO": CODE,
         "DAILYCHECK_GITHUB_SHADOW_DIR": str(shadow),
         "DAILYCHECK_DEPLOY_EVENT_LOG": str(shadow / "events.jsonl"),
         "DAILYCHECK_PROD_AGENT_INBOX": str(shadow / "inbox.jsonl"),
@@ -250,6 +255,92 @@ def _success(sb):
 
 def _private_text(sb) -> str:
     return "\n".join(p.read_text() for p in (sb["shadow"] / "reports").glob("*.md"))
+
+
+def _prepare(sb):
+    """Real owned success outcome with GitHub reporting intentionally disabled."""
+    env = dict(sb["env"], DAILYCHECK_DEPLOY_REPORT="0")
+    proc = _pipe(sb, str(PR), SHA, "--observe-min", "0", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state, outcome_id, outcome = _outcome(sb)
+    assert outcome_id and outcome is not None
+    assert not sb["api"].posts
+    return state, outcome_id, outcome
+
+
+def wait_file(path: Path, proc=None, timeout: float = 15.0) -> None:
+    end = time.monotonic() + timeout
+    while not path.exists():
+        if proc is not None and proc.poll() is not None:
+            raise AssertionError(f"process exited {proc.returncode} before {path}")
+        assert time.monotonic() < end, f"barrier timed out: {path}"
+        time.sleep(0.02)
+
+
+def open_gate(gate: Path) -> None:
+    with gate.open("wb", buffering=0) as fh:
+        fh.write(b"G")
+
+
+def gated_report(sb, *, rc: int = 0, stage: str = ""):
+    """Real report CLI whose actual curl child waits immediately before POST."""
+    ready = sb["tmp"] / "post-ready.json"
+    gate = sb["tmp"] / "post-gate"
+    done = sb["tmp"] / "post-done.json"
+    for path in (ready, gate, done):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    os.mkfifo(gate, 0o600)
+    shim = sb["tmp"] / "gated-curl"
+    shim.write_text(
+        f"""#!{sys.executable}
+import json, os, subprocess, sys
+from pathlib import Path
+from urllib.parse import urlsplit
+args = sys.argv[1:]
+url = urlsplit(args[-1])
+assert url.scheme == "https" and url.netloc == "api.github.com"
+args[-1] = "http://127.0.0.1:{sb['api'].server.server_port}" + url.path + (
+    "?" + url.query if url.query else "")
+config = sys.stdin.read()
+post = args[args.index("--request") + 1] == "POST"
+if post:
+    Path({str(ready)!r}).write_text(json.dumps({{
+        "pid": os.getpid(), "ppid": os.getppid(),
+        "fd_env": os.getenv("DAILYCHECK_DEPLOY_ATTEMPT_FD")}}))
+    with open({str(gate)!r}, "rb", buffering=0) as fh:
+        assert fh.read(1) == b"G"
+proc = subprocess.run(["/usr/bin/curl", *args], input=config, text=True,
+                      capture_output=True)
+if post:
+    Path({str(done)!r}).write_text(json.dumps(
+        {{"pid": os.getpid(), "curl_exit": proc.returncode}}))
+sys.stdout.write(proc.stdout)
+sys.stderr.write(proc.stderr)
+sys.exit(proc.returncode)
+""")
+    shim.chmod(0o700)
+    env = dict(sb["env"], DAILYCHECK_CURL=str(shim))
+    stdout = (sb["tmp"] / "retry.stdout").open("w")
+    stderr = (sb["tmp"] / "retry.stderr").open("w")
+    proc = subprocess.Popen(
+        [sys.executable, str(sb["dir"] / "deploy_report.py"), "write",
+         "--pr", str(PR), "--sha", SHA, "--rc", str(rc), "--stage", stage,
+         "--log", str(sb["tmp"] / "pipeline.log"), "--repo", str(sb["tmp"])],
+        env=env, stdout=stdout, stderr=stderr)
+    stdout.close()
+    stderr.close()
+    wait_file(ready, proc)
+    return proc, gate, done
+
+
+def _acquire_process(sb):
+    return subprocess.run(
+        [sys.executable, str(sb["dir"] / "deploy_state.py"), "acquire",
+         "--pr", "43", "--sha", OTHER_SHA],
+        env=sb["env"], capture_output=True, text=True, timeout=30)
 
 
 # ---------------------------------------------------------------- positive
@@ -319,20 +410,89 @@ def test_idempotent_skip_reuses_receipt_without_new_outcome_or_post(sandbox):
     assert len(sandbox["api"].posts) == 1, "idempotent skip must not re-POST"
 
 
+def test_live_reporter_fence_blocks_successor_then_links_once(sandbox):
+    _prepare(sandbox)
+    proc, gate, done = gated_report(sandbox)
+    try:
+        successor = _acquire_process(sandbox)
+        assert successor.returncode == 10, successor.stdout + successor.stderr
+        open_gate(gate)
+        wait_file(done)
+        assert proc.wait(timeout=15) == 0
+        state = _state(sandbox)
+        outcome_id = next(iter(state["outcomes"]))
+        assert state["publications"][outcome_id]["state"] == "linked"
+        assert state["publications"][outcome_id]["comment_id"] == 201
+        assert len(sandbox["api"].posts) == 1
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_http_mutator_retains_fence_after_reporter_death(sandbox):
+    _prepare(sandbox)
+    proc, gate, done = gated_report(sandbox)
+    try:
+        proc.kill()
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+        # The reporter Python is gone, but the actual HTTP child still holds the
+        # inherited/serialized process fence until it exits.
+        successor = _acquire_process(sandbox)
+        assert successor.returncode == 10, (
+            "successor acquired while the actual HTTP mutator still held the fence")
+        open_gate(gate)
+        wait_file(done)
+        late = None
+        for _ in range(100):
+            late = _acquire_process(sandbox)
+            if late.returncode == 0:
+                break
+            time.sleep(0.05)
+        assert late is not None and late.returncode == 0
+        state = _state(sandbox)
+        assert state["generation"] == 2
+        assert len(sandbox["api"].posts) == 1
+        outcome_id = next(iter(state["outcomes"]))
+        assert state["publications"][outcome_id]["state"] == "uncertain"
+        assert state["publications"][outcome_id]["comment_id"] == 0
+        assert state["lock"]["pr"] == 43
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
 # ---------------------------------------------------------------- negative
 
 
-def test_failed_pipeline_mints_no_outcome_and_publishes_nothing(sandbox):
+def test_owned_failed_deployment_retains_typed_failure_and_publishes_once(sandbox):
     (sandbox["dir"] / "up.sh").write_text(
         f"#!/bin/sh\necho '{PRIVATE_CANARY} failed stage'\nexit 7\n")
     proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0")
     assert proc.returncode == 20, proc.stdout + proc.stderr
     state = _state(sandbox)
-    assert not state.get("outcomes")
-    assert state["deployed"] is None
+    assert state["lock"] is None
     assert state["last_attempt"]["result"] == "failed"
-    assert not sandbox["api"].posts
-    assert PRIVATE_CANARY in _private_text(sandbox)
+    assert state["last_attempt"]["note"] == "up rc=20"
+    assert state["last_attempt"]["outcome_id"]
+    assert len(state["outcomes"]) == 1, "owned FAILED deployment must have a durable outcome"
+    outcome = next(iter(state["outcomes"].values()))
+    assert outcome["result"] == "failed" and outcome["rc"] == 20
+    assert outcome["stage"] == "up"
+    assert uuid.UUID(outcome["public_receipt"])
+    assert outcome["deployment"] == {
+        "provider": "github", "host": "github.com", "repository": CODE, "pr": PR}
+
+    posts = sandbox["api"].posts
+    assert len(posts) == 1, posts
+    body = posts[0]["payload"]["body"]
+    assert "| RC | 20 |" in body and "| 阶段 | `up` |" in body
+    assert "部署结果 · 失败（rc=20）" in body
+    events = [json.loads(line) for line in
+              (sandbox["shadow"] / "events.jsonl").read_text().splitlines()]
+    assert events[-1]["rc"] == 20 and events[-1]["stage"] == "up"
+    assert events[-1]["report_comment"] == 201
 
 
 def test_dry_run_mints_no_outcome_and_publishes_nothing(sandbox):
@@ -350,6 +510,53 @@ def test_missing_binding_blocks_publication_but_keeps_private_outcome(sandbox):
     assert outcome is not None, "the durable receipt must survive a blocked publication"
     assert not sandbox["api"].posts
     assert PRIVATE_CANARY in _private_text(sandbox)
+
+
+def test_gitea_deployment_cannot_authorize_github_pr(sandbox):
+    env = dict(sandbox["env"], DAILYCHECK_HOSTING_PROVIDER="gitea",
+               GITEA_REPO="private-example/production-source",
+               FEEDBACK_GITEA_REPO="private-example/production-source",
+               DAILYCHECK_DEPLOY_REPORT="0")
+    proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    _, _, outcome = _outcome(sandbox)
+    assert outcome["deployment"]["provider"] == "gitea"
+    assert outcome["deployment"]["repository"] == "private-example/production-source"
+
+    retry = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                    "--stage", "", "--log", str(sandbox["tmp"] / "pipeline.log"),
+                    "--repo", str(sandbox["tmp"]))
+    assert retry.returncode == 1
+    assert "publication blocked" in retry.stderr
+    assert not sandbox["api"].posts, "Gitea provenance must not become GitHub authority"
+
+
+def test_missing_deployment_provenance_cannot_publish(sandbox):
+    _success(sandbox)
+    state = _state(sandbox)
+    outcome_id = state["deployed"]["outcome_id"]
+    del state["outcomes"][outcome_id]["deployment"]
+    (sandbox["state"] / "state.json").write_text(json.dumps(state))
+
+    retry = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                    "--stage", "", "--log", str(sandbox["tmp"] / "pipeline.log"),
+                    "--repo", str(sandbox["tmp"]))
+    assert retry.returncode == 1
+    assert "publication blocked" in retry.stderr
+    assert len(sandbox["api"].posts) == 1
+
+
+def test_gitea_private_issue_binding_allowed_for_github_deployment(sandbox):
+    document = bindings()
+    document["bindings"][0]["source"] = {
+        "provider": "gitea", "host": "gitea.example", "repository_id": 12345,
+        "repository": "private/source", "kind": "issue", "number": 7}
+    (sandbox["state"] / "bindings.json").write_text(json.dumps(document))
+    _success(sandbox)
+    posts = sandbox["api"].posts
+    assert len(posts) == 1
+    body = posts[0]["payload"]["body"]
+    assert "gitea.example" not in body and "private/source" not in body
 
 
 def test_foreign_outcome_hosting_identity_cannot_publish(sandbox):
@@ -588,6 +795,167 @@ def test_missing_receipt_outcome_cannot_publish(sandbox):
     assert retry.returncode == 1
     assert "publication blocked" in retry.stderr
     assert len(sandbox["api"].posts) == 1
+
+
+# ---------------------------------------------------------------- failure/recovery
+
+
+def test_failed_outcome_recovery_is_exact_and_does_not_duplicate(sandbox):
+    (sandbox["dir"] / "up.sh").write_text("#!/bin/sh\nexit 7\n")
+    sandbox["api"].drop_comment = True
+    proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0")
+    assert proc.returncode == 20, proc.stdout + proc.stderr
+    sandbox["api"].drop_comment = False
+
+    state = _state(sandbox)
+    outcome = next(iter(state["outcomes"].values()))
+    outcome_id = outcome["attempt_id"]
+    assert outcome["result"] == "failed" and outcome["rc"] == 20 and outcome["stage"] == "up"
+    assert state["publications"][outcome_id]["state"] == "uncertain"
+    assert len(sandbox["api"].posts) == 1
+    frozen = json.dumps(outcome["facts"], sort_keys=True)
+
+    retry = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "20",
+                    "--stage", "up", "--log", str(sandbox["tmp"] / "pipeline.log"),
+                    "--repo", str(sandbox["tmp"]))
+    assert retry.returncode == 0, retry.stdout + retry.stderr
+    state = _state(sandbox)
+    assert state["publications"][outcome_id]["state"] == "linked"
+    assert len(sandbox["api"].posts) == 1, "failure recovery must not duplicate the POST"
+    assert state["outcomes"][outcome_id]["rc"] == 20
+    assert state["outcomes"][outcome_id]["stage"] == "up"
+    assert state["outcomes"][outcome_id]["public_receipt"] == outcome["public_receipt"]
+    assert json.dumps(state["outcomes"][outcome_id]["facts"], sort_keys=True) == frozen
+
+
+# ---------------------------------------------------------------- binding ordering
+
+
+WRITER_CODE = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import deploy_state
+directory = Path(sys.argv[2])
+with deploy_state.publication_config_transaction(directory):
+    path = directory / "bindings.json"
+    value = json.loads(path.read_text())
+    value["version"] += 1
+    value["bindings"][0]["source"]["number"] = 8
+    path.write_text(json.dumps(value))
+Path(sys.argv[3]).write_text(json.dumps({"version": value["version"]}))
+"""
+
+
+def test_binding_writer_waits_for_inflight_publication(sandbox):
+    _prepare(sandbox)
+    proc, gate, done = gated_report(sandbox)
+    writer_done = sandbox["tmp"] / "writer-done.json"
+    writer = subprocess.Popen(
+        [sys.executable, "-c", WRITER_CODE, str(sandbox["dir"]),
+         str(sandbox["state"]), str(writer_done)],
+        env=sandbox["env"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(0.5)
+        assert writer.poll() is None, "writer must wait for the in-flight publication"
+        assert json.loads((sandbox["state"] / "bindings.json").read_text())["version"] == 1
+
+        open_gate(gate)
+        wait_file(done)
+        assert proc.wait(timeout=15) == 0
+        writer.wait(timeout=15)
+        assert writer.returncode == 0, writer.stderr.read() if writer.stderr else ""
+        assert json.loads(writer_done.read_text())["version"] == 2
+        assert len(sandbox["api"].posts) == 1
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+            writer.wait(timeout=10)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_binding_change_before_claim_blocks_stale_context(sandbox):
+    _prepare(sandbox)
+    sys.path.insert(0, str(BG_DIR))
+    import deploy_report as report_mod
+    import deploy_state as state_mod
+    import publication_authority as authority_mod
+
+    state_dir = sandbox["state"]
+    attempt_id, outcome, generation = authority_mod.load_durable_outcome(
+        state_dir, PR, SHA)
+    facts = report_mod.PublicDeployFacts(
+        PR, SHA, outcome["public_receipt"], outcome["outcome_at"], outcome["rc"],
+        "complete", "success", "out-of-scope", "aligned", "none")
+    frozen, digest = authority_mod.freeze_public_facts(
+        state_dir, attempt_id, generation, dataclasses.asdict(facts),
+        report_mod._payload_digest(report_mod.render_public(facts)))
+    facts = report_mod.PublicDeployFacts(**frozen)
+    binding = authority_mod.resolve_source_binding(state_dir, PR)
+    context = report_mod._publication_context(outcome, binding, digest)
+
+    with state_mod.publication_config_transaction(state_dir):
+        document = json.loads((state_dir / "bindings.json").read_text())
+        document["version"] += 1
+        document["bindings"][0]["source"]["number"] = 8
+        (state_dir / "bindings.json").write_text(json.dumps(document))
+
+    adapter = authority_mod.DurablePublicationAuthority(
+        state_dir=state_dir, outcome_id=attempt_id, generation=generation,
+        context=context, payload_sha256=digest,
+        binding_sha256=binding.binding_sha256)
+    with pytest.raises(HostingError, match="source_binding_changed"):
+        with adapter.claim(context, digest):
+            pass
+    assert not sandbox["api"].posts
+
+
+# ---------------------------------------------------------------- transport guard
+
+
+def test_publication_mutator_guard_fd_is_explicit_and_narrow(tmp_path, monkeypatch):
+    observed = tmp_path / "fd-observed.jsonl"
+    shim = tmp_path / "fd-curl"
+    shim.write_text(
+        f"""#!{sys.executable}
+import json, os, sys
+sys.stdin.read()
+fd = int(os.environ["GUARD_FD"])
+try:
+    os.fstat(fd)
+    opened = True
+except OSError:
+    opened = False
+method = sys.argv[sys.argv.index("--request") + 1]
+with open({str(observed)!r}, "a") as fh:
+    fh.write(json.dumps({{"opened": opened, "method": method}}) + "\\n")
+sys.stdout.write("{{}}\\n" + ("201" if method == "POST" else "200"))
+""")
+    shim.chmod(0o755)
+    for key in ("GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("DAILYCHECK_HOSTING_PROVIDER", "github")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_REPORT_TOKEN", "synthetic-report")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_READ_TOKEN", "synthetic-read")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_API", "https://api.github.com")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_REPO", CODE)
+    monkeypatch.setenv("DAILYCHECK_CURL", str(shim))
+
+    with (tmp_path / "guard").open("w") as guard:
+        fd = guard.fileno()
+        monkeypatch.setenv("GUARD_FD", str(fd))
+        client = HostingClient(HostingConfig.from_environment(AccessRole.REPORT))
+        client.request("GET", f"/repos/{CODE}")
+        client.request("POST", f"/repos/{CODE}/issues/{PR}/comments",
+                       {"body": "synthetic"}, guard_fd=fd)
+        with pytest.raises(HostingError):
+            client.request("GET", f"/repos/{CODE}", guard_fd=fd)
+
+    rows = [json.loads(line) for line in observed.read_text().splitlines()]
+    assert rows == [{"opened": False, "method": "GET"},
+                    {"opened": True, "method": "POST"}]
 
 
 # ---------------------------------------------------------------- successor/fence
