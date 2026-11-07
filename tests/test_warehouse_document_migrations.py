@@ -238,10 +238,11 @@ def test_target_master_future_missing_schema_cli(tmp_path, monkeypatch):
         assert list(conn.iterdump()) == original
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
     assert snapshot(future)[0] == 8
+    from migrations.feedback_receipts import registered_up as master_feedback_receipts_up
     from migrations.order_changes import registered_up as master_order_changes_up
     from migrations.warehouse import up_document_lines
-    assert [m[0] for m in MIGRATIONS] == list(range(1, 8))
-    assert MIGRATIONS[-1][2] is master_order_changes_up
+    assert [m[0] for m in MIGRATIONS] == list(range(1, 9))
+    assert MIGRATIONS[-1][2] is master_feedback_receipts_up
     assert WAREHOUSE_MIGRATIONS[0][2] is up_document_lines
     assert all(m[2] is not up_document_lines for m in MIGRATIONS)
     assert all(m[2] is not master_order_changes_up for m in WAREHOUSE_MIGRATIONS)
