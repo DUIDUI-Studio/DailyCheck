@@ -68,7 +68,7 @@ import sys
 import tempfile
 import uuid
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -691,12 +691,16 @@ class PublicationAuthority(Protocol):
               ) -> AbstractContextManager[PublicationClaim]: ...
 
 
+def _payload_digest(body: str) -> str:
+    return hashlib.sha256(json.dumps({"body": body}, ensure_ascii=False,
+                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def publish_public(facts: PublicDeployFacts, context: PublicationContext,
                    *, authority: PublicationAuthority | None = None) -> int:
-    """Trusted caller injection only. No CLI/env/JSON authority implementation exists."""
+    """Requires a trusted adapter; a context JSON alone never grants authority."""
     body = render_public(facts)
-    digest = hashlib.sha256(json.dumps({"body": body}, ensure_ascii=False,
-                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    digest = _payload_digest(body)
     if authority is None:
         raise HostingError("trusted_fencing_adapter_not_wired")
     if (context.pr, context.sha, context.public_receipt, context.outcome_at,
@@ -765,11 +769,123 @@ def _assess(pr: int, repo: str, sha: str, rc: int, stage: str, tail: str,
     return tr, align, fetch_error
 
 
+def _write_private_diagnostic(private_dir: Path, body: str) -> None:
+    private_file = private_dir / f"{uuid.uuid4()}.md"
+    fd = os.open(private_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+
+def _public_stage(tr: dict, rc: int) -> str:
+    stage = tr["stage"]
+    if stage == "verify-drift":
+        return "verify"
+    if stage == "unknown" and rc == 0:
+        return "complete"
+    return stage
+
+
+def _publication_context(outcome: dict, binding, payload_sha256: str) -> PublicationContext:
+    from publication_authority import SOURCE_KEYS
+
+    hosting = outcome["hosting"]
+    return PublicationContext.parse({
+        "provider": hosting["provider"], "host": hosting["host"],
+        "repository_id": hosting["repository_id"], "repository": hosting["repository"],
+        "pr": outcome["pr"], "sha": outcome["sha"],
+        "attempt_id": outcome["attempt_id"], "generation": outcome["generation"],
+        "outcome_at": outcome["outcome_at"],
+        "public_receipt": outcome["public_receipt"],
+        "private_source": dict(zip(SOURCE_KEYS, binding.source, strict=True)),
+        "payload_sha256": payload_sha256,
+    })
+
+
+def _cmd_write_github(args, tail: str, authority):
+    """Real GitHub path: durable outcome + binding -> the existing publish_public."""
+    import deploy_state
+    import publication_authority
+
+    private_dir = event_log_path().parent / "reports"
+    require_shadow_path(private_dir)
+    private_dir.mkdir(parents=True, exist_ok=True)
+
+    outcome_info = None
+    resolve_error = None
+    if authority is None:
+        try:
+            outcome_info = publication_authority.load_durable_outcome(
+                deploy_state.state_dir(), args.pr, args.sha)
+        except (HostingError, OSError, ValueError, TypeError) as exc:
+            resolve_error = exc
+
+    outcome = outcome_info[1] if outcome_info else None
+    tr, align, fetch_error = _assess(
+        args.pr, args.repo, args.sha,
+        outcome["rc"] if outcome else args.rc,
+        outcome["stage"] if outcome else args.stage,
+        tail, None, args.base)
+    nxt = next_action(tr, align, autofix_count(args.pr) if args.pr else 0)
+    private_body = render_private(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
+    if outcome_info:
+        private_body += (
+            f"\n\n**Durable outcome**：`{outcome_info[0]}` generation={outcome_info[2]} "
+            f"verification=`{outcome.get('verification', 'normal')}` "
+            f"receipt=`{outcome['public_receipt']}`\n")
+    _write_private_diagnostic(private_dir, private_body)
+
+    comment_id = 0
+    write_rc = 0
+    try:
+        if authority is not None:
+            # Trusted code injection retained for the staged ABI and its tests;
+            # the CLI never supplies one.
+            path = getattr(args, "publication_context", "")
+            if not path:
+                raise HostingError("private_publication_context_required")
+            context = PublicationContext.parse(parse_json_object(Path(path).read_bytes()))
+            facts = PublicDeployFacts(
+                args.pr, args.sha, context.public_receipt, context.outcome_at,
+                tr["rc"], _public_stage(tr, args.rc), tr["kind"], tr["scope"],
+                align["verdict"], nxt)
+            comment_id = publish_public(facts, context, authority=authority)
+        else:
+            if resolve_error is not None:
+                raise resolve_error
+            attempt_id, outcome, generation = outcome_info
+            if args.rc != outcome["rc"]:
+                raise HostingError("publication_result_mismatch")
+            facts = PublicDeployFacts(
+                args.pr, args.sha, outcome["public_receipt"], outcome["outcome_at"],
+                outcome["rc"], _public_stage(tr, outcome["rc"]), tr["kind"],
+                tr["scope"], align["verdict"], nxt)
+            frozen, digest = publication_authority.freeze_public_facts(
+                deploy_state.state_dir(), attempt_id, generation,
+                asdict(facts), _payload_digest(render_public(facts)))
+            facts = PublicDeployFacts(**frozen)
+            binding = publication_authority.resolve_source_binding(
+                deploy_state.state_dir(), args.pr)
+            context = _publication_context(outcome, binding, digest)
+            adapter = publication_authority.DurablePublicationAuthority(
+                state_dir=deploy_state.state_dir(), outcome_id=attempt_id,
+                generation=generation, context=context,
+                payload_sha256=digest, binding_sha256=binding.binding_sha256)
+            comment_id = publish_public(facts, context, authority=adapter)
+    except (HostingError, OSError, ValueError, TypeError) as exc:
+        print(f"[deploy-report] public publication blocked: {type(exc).__name__}",
+              file=sys.stderr)
+        write_rc = 1
+    return comment_id, tr, align, fetch_error, nxt, write_rc
+
+
 def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | None = None) -> int:
     if _env("DAILYCHECK_DEPLOY_REPORT", "1") == "0":
         return 0
     if args.dry_run:
         return 0
+    tail = log_tail(args.log)
+    comment_id = 0
+    write_rc = 0
     if provider() is Provider.GITHUB:
         try:
             require_shadow_path(event_log_path())
@@ -777,42 +893,12 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
         except HostingError:
             print("[deploy-report] GitHub requires isolated shadow report paths", file=sys.stderr)
             return 1
-    tail = log_tail(args.log)
-    tr, align, fetch_error = _assess(
-        args.pr, args.repo, args.sha, args.rc, args.stage, tail, None, args.base
-    )
-    nxt = next_action(tr, align, autofix_count(args.pr) if args.pr else 0)
-    comment_id = 0
-    write_rc = 0
-    if provider() is Provider.GITHUB:
-        try:
-            # This is private diagnostic storage, not a deployment/attempt receipt.
-            private_dir = event_log_path().parent / "reports"
-            require_shadow_path(private_dir)
-            private_dir.mkdir(parents=True, exist_ok=True)
-            private_body = render_private(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
-            private_file = private_dir / f"{uuid.uuid4()}.md"
-            fd = os.open(private_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(private_body)
-            if authority is None:
-                raise HostingError("trusted_fencing_adapter_not_wired")
-            path = getattr(args, "publication_context", "")
-            if not path:
-                raise HostingError("private_publication_context_required")
-            context = PublicationContext.parse(parse_json_object(Path(path).read_bytes()))
-            stage = tr["stage"]
-            if stage == "verify-drift":
-                stage = "verify"
-            elif stage == "unknown" and args.rc == 0:
-                stage = "complete"
-            facts = PublicDeployFacts(args.pr, args.sha, context.public_receipt, context.outcome_at,
-                                      tr["rc"], stage, tr["kind"], tr["scope"], align["verdict"], nxt)
-            comment_id = publish_public(facts, context, authority=authority)
-        except (HostingError, OSError, ValueError, TypeError) as exc:
-            print(f"[deploy-report] public publication blocked: {type(exc).__name__}", file=sys.stderr)
-            write_rc = 1
+        comment_id, tr, align, fetch_error, nxt, write_rc = _cmd_write_github(
+            args, tail, authority)
     else:
+        tr, align, fetch_error = _assess(
+            args.pr, args.repo, args.sha, args.rc, args.stage, tail, None, args.base)
+        nxt = next_action(tr, align, autofix_count(args.pr) if args.pr else 0)
         body = render(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
         try:
             existing = find_same_sha_comment(args.pr, args.sha) if args.sha else 0
@@ -907,7 +993,8 @@ def main(argv: list[str] | None = None) -> int:
     common(w)
     w.add_argument("--dry-run", action="store_true")
     w.add_argument("--publication-context", default="",
-                   help="Private context ABI; GitHub still requires a trusted code-supplied fencing adapter (NOT WIRED)")
+                   help="Only for trusted injected callers; the CLI builds the "
+                        "durable outcome/binding context itself and ignores this file")
     w.set_defaults(func=cmd_write)
 
     a = sub.add_parser("assess", help="只输出对齐判定（供 agent 动手前调用）")

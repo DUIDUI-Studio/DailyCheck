@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -322,7 +323,8 @@ def test_idempotent_skip_reuses_receipt_without_new_outcome_or_post(sandbox):
 
 
 def test_failed_pipeline_mints_no_outcome_and_publishes_nothing(sandbox):
-    (sandbox["dir"] / "up.sh").write_text("#!/bin/sh\nexit 7\n")
+    (sandbox["dir"] / "up.sh").write_text(
+        f"#!/bin/sh\necho '{PRIVATE_CANARY} failed stage'\nexit 7\n")
     proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0")
     assert proc.returncode == 20, proc.stdout + proc.stderr
     state = _state(sandbox)
@@ -513,6 +515,48 @@ def test_changed_binding_invalidates_an_existing_publication_claim(sandbox):
     assert retry.returncode == 1
     assert len(sandbox["api"].posts) == 1
     assert _state(sandbox)["publications"][outcome_id]["state"] == "uncertain"
+
+
+def test_ambiguous_binding_blocks_publication_and_keeps_private_outcome(sandbox):
+    document = bindings()
+    document["bindings"].append(json.loads(json.dumps(document["bindings"][0])))
+    document["bindings"][1]["source"]["number"] = 8
+    (sandbox["state"] / "bindings.json").write_text(json.dumps(document))
+    _success(sandbox)
+    _, _, outcome = _outcome(sandbox)
+    assert outcome is not None
+    assert not sandbox["api"].posts
+    assert PRIVATE_CANARY in _private_text(sandbox)
+
+
+def test_retry_requires_real_process_exclusion(sandbox):
+    _success(sandbox)
+    before = json.loads((sandbox["state"] / "state.json").read_text())
+    sentinel = sandbox["tmp"] / "process-lock-held"
+    holder = subprocess.Popen(
+        [sys.executable, str(sandbox["dir"] / "deploy_state.py"), "run", "--",
+         sys.executable, "-c",
+         f"import pathlib, time; pathlib.Path({str(sentinel)!r}).write_text('ready'); time.sleep(30)"],
+        env=sandbox["env"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            if sentinel.exists():
+                break
+            time.sleep(0.05)
+        assert sentinel.exists(), "holder never took the attempt lock"
+
+        retry = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                        "--stage", "", "--log", str(sandbox["tmp"] / "pipeline.log"),
+                        "--repo", str(sandbox["tmp"]))
+        assert retry.returncode == 1
+        assert "publication blocked" in retry.stderr
+        assert len(sandbox["api"].posts) == 1
+        after = json.loads((sandbox["state"] / "state.json").read_text())
+        assert after["generation"] == before["generation"]
+        assert after["lock"] == before["lock"]
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
 
 
 def test_tampered_frozen_payload_hash_blocks_without_repost(sandbox):

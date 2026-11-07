@@ -171,8 +171,18 @@ log "log=${LOG}"
 # ---------------------------------------------------------------- 收锁
 _release() {
   local result=$1 note="${2:-}"
+  # Honest private classification: a success that skipped verify or used a
+  # shortened observation window must not be recorded as normal verification.
+  local verification="normal"
+  if [[ "${SKIP_VERIFY}" -eq 1 && "${OBSERVE_MIN}" -lt "${OBSERVE_MIN_REQUIRED}" ]]; then
+    verification="skip-verify+short-observe"
+  elif [[ "${SKIP_VERIFY}" -eq 1 ]]; then
+    verification="skip-verify"
+  elif [[ "${OBSERVE_MIN}" -lt "${OBSERVE_MIN_REQUIRED}" ]]; then
+    verification="short-observe"
+  fi
   RELEASE_ATTEMPTED=1
-  if "${PY}" "${DS}" release --token "${ATTEMPT_TOKEN}" --result "${result}" --sha "${SHA}" --note "${note}" >>"${LOG}" 2>&1; then
+  if "${PY}" "${DS}" release --token "${ATTEMPT_TOKEN}" --result "${result}" --sha "${SHA}" --note "${note}" --verification "${verification}" >>"${LOG}" 2>&1; then
     log "release(${result}) 完成"
   else
     FAIL_STAGE="${FAIL_STAGE:-release}"

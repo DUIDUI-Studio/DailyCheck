@@ -495,6 +495,16 @@ python3 scripts/agent_framework/report_html.py index reports/ issue-reports/ -o 
 
 本地回归入口 `tests/test_deploy_attempt_fencing.py` 使用真实 pipeline/CLI 子进程、SIGSTOP/CONT/KILL 与 pipe 栅栏，验证过期活进程互斥、setup/观察/收锁/回写的覆盖、同 PR 替换身份、真实临时文件锚点 I/O 错误、成功本地合并后的失败结果、全 SHA 前缀碰撞、退出后恢复及应急豁免。全部状态/SQLite/nginx/命令夹具都在临时目录；不连接生产服务。
 
+**Issue163 发布接线（本地实现，未激活）**：`release --result success` 在既有原子状态提交里，
+除 `deployed`/`last_attempt` 外还写入不可变 outcome（generation/完整 H/PR/固定 GitHub code
+identity/rc/stage/UTC 时间/随机 UUID4 public_receipt + 私有 attempt token/session）并清锁；
+只有真实 pipeline 进程描述符持有且身份锁匹配时才产生 outcome。`acquire` 递增 generation，
+后继 attempt 使旧 outcome 永久失效。`deploy_report.py` 的 GitHub 路径不再依赖调用方注入
+adapter 或手写 context：它按 (PR, 完整 H) 读取当前 outcome、在锁内冻结 typed facts/body hash、
+解析私有 `bindings.json`，构造 `publication_authority.DurablePublicationAuthority` 并复用
+既有 `publish_public`。进程退出后的重试自行获取 `.attempt.lock` 排他并只承认既有 outcome。
+详见 §3.17.1；Gitea 默认路径、events/inbox 与 161 ownership/checkout 语义不变。
+
 **问题**：Prod Agent 的一个「merge → 部署」会话是 40-60 分钟长流程（up → verify → 绿转正 → switch → 观察窗），而 webhook 事件天生并发（两个 PR 同时全绿 / 同一 PR 多个 check_suite / 兜底轮询补刀）——两个部署会话在同一套蓝绿设施上重叠 = up/switch/rollback 交错互踩。**单飞 = 同一时刻全系统至多一个部署会话在动蓝绿设施**，且「谁欠谁一次部署」由状态事实判定，不靠会话记忆。
 
 **① 状态原语** `scripts/blue_green/deploy_state.py`（stdlib only；状态目录 `DAILYCHECK_DEPLOY_STATE_DIR`，默认 `/var/lib/dailycheck-deploy/`）：
@@ -1299,8 +1309,9 @@ private identity 参数；保留 `deploy-report:v1`、短 Commit 字段和 dashb
 0600 私有诊断文件，events/Hermes 的原因/action/log 继续留在私有 lane，已知 credential
 形态继续 redaction。诊断文件随机名仅是文件名，不是部署 receipt。Gitea 默认 full renderer 保留。
 
-GitHub 发布 ABI 为 `publish_public(facts, context, *, authority)`；CLI 的
-`--publication-context` 只描述事实，**没有真实 adapter，CLI 一律 fail closed**。
+GitHub 发布 ABI 为 `publish_public(facts, context, *, authority)`。CLI 的
+`--publication-context` 仅保留给可信代码注入方；真实 CLI 路径从 durable outcome +
+`bindings.json` 内部构造 context 与 adapter（见下）。
 `PublicationContext.parse` 严格字段为 provider/host/repository_id/repository/pr/sha、
 真实私有 attempt_id、单调 generation、不可变 outcome_at、nonsecret public_receipt、
 private_source 六字段 identity 和精确 `{"body": render_public(facts)}` canonical JSON SHA256。
@@ -1316,11 +1327,40 @@ POST 前落 uncertain 的 `intent()`、fenced CAS 的 `bind(comment_id)`。所�
 和 mapped comment ID；uncertain 时零/多/foreign/changed-body 不再 POST，私有 comment ID
 不能 PATCH public sink。同 H 的不同真实 attempt 使用不同 receipt/comment，原结果不可变，
 所以本 ABI 不编辑旧结果来覆盖新成功。返回 comment ID 仅证明 publication，不证明部署成功。
-**NOT WIRED**：本 base 的 pipeline 只传 PR/SHA/rc/stage/log/repo；source161 不在此分支。
-后续获准集成必须实现真实 attempt/fencing adapter，接入准确 context 和已有私有映射；
-`dc_state.py`/`dc_delivery.py`、项目技能/Prod 安装与 admission/finalizer 均属外部依赖，
-不能用这里的合成测试声称 Prod/161 端到端完成。CI/policy/生产模式未变；现有 review、
-候选验证、观察窗、merge/Issue closure 仍仅由 Prod 执行。
+**Issue163 接入（本地实现，未激活）**：本 base 现已把真实 pipeline 与 162 ABI 接上。
+`deploy_state.py` 在既有 `state.json` 原子写 / `.state.lock` 域内新增 additive 字段
+`generation`、`outcomes`、`publications`：`acquire` 每次成功 attempt 递增 generation；
+仅当 release 为 success 且由真实 pipeline 进程描述符 + 身份锁拥有时，release 的同一
+原子提交同时写 `deployed` 和不可变 outcome（attempt_id、generation、PR、完整 40 位 H、
+固定 GitHub code hosting identity、rc=0、stage=complete、私有 verification 记录、UTC
+outcome_at、随机 UUID4 public_receipt；attempt token/session 仅私有保留）。直接 CLI、
+失败 release、dry-run、幂等跳过、短 SHA 或非数字 PR 不产生 outcome；旧 Gitea 状态无
+outcome 仍可正常部署但无法授权 GitHub 发布。首次发布时在同一锁内冻结 typed facts 与
+body SHA256，重试复用同一 receipt/time/hash，不因日志/对齐重算改变 payload。
+
+`publication_authority.DurablePublicationAuthority` 是 162 Protocol 的具体实现：
+pipeline 释放逻辑租约后仍持有继承的 `.attempt.lock` 描述符，adapter 直接验证它；
+进程退出后的主动重试必须自行获取同一描述符排他，再按 (PR, 完整 H, 当前 generation)
+匹配已有 outcome，绝不从参数重建 outcome。claim 在 HTTP 前后与 bind 前在短事务内重验
+outcome/generation/完整身份/hash；`ready -> uncertain(intent-before-POST) -> linked`
+的每步都在同一 `state.json` 事务域。缺失/篡改/foreign outcome、失败 release、后继
+acquire、clear-lock+后继、丢失响应后的零/多/改写 body 均不发布或重复 POST。
+
+私有 `bindings.json`（同状态目录，未来特权安装器放置；代码永不自动创建）只声明
+PR → 固定 public code identity + provider-qualified private source tuple，授予零部署/
+审核权限。缺失/非法/歧义/变更绑定在 public POST 前阻断，私有 outcome 与诊断保留。
+绑定的版本+条目 hash 记入 publication 记录，变更使旧 claim 失效。信任边界是既有
+特权 Prod 控制的 0700/0600 文件与进程能力，不是对恶意 root/owner UID 的密码学保护。
+`tests/test_deploy_publication_wiring.py` 用真实 pipeline/state/locks、真实 loopback
+HTTP 与 curl URL shim 覆盖成功发布、幂等、失败/跳过、缺失/变更绑定、篡改 outcome、
+CLI rc 覆盖、丢失响应精确对账、零/多/改写 body、后继与 clear-lock 竞态。
+
+**仍未启用/未证明**：没有安装真实 `bindings.json`、没有分配 public/ops issue 编号、
+没有真实凭据、没有 off-repo installer/Prod 部署、没有 finalizer/admission，也没有
+GitHub 生产激活或 public source import。`dc_state.py`/`dc_delivery.py`、项目技能与
+Prod 安装仍属外部依赖；CI/policy/生产模式未变。返回的 comment ID 只证明 publication，
+不证明真实 Prod review/admission；现有 review、候选验证、观察窗、merge/Issue closure
+仍仅由 Prod 执行。
 
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。

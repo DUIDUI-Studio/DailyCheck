@@ -54,11 +54,13 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +75,20 @@ TOKEN_FILENAME = "lock.token"
 ATTEMPT_LOCK_FILENAME = ".attempt.lock"
 ATTEMPT_ENV = "DAILYCHECK_DEPLOY_ATTEMPT"
 ATTEMPT_FD_ENV = "DAILYCHECK_DEPLOY_ATTEMPT_FD"
+
+# Issue163: the public code sink is a fixed 162 identity, never a fact the
+# reporter may take from a PR body, context JSON or caller argument.
+PUBLIC_CODE_HOSTING = {
+    "provider": "github",
+    "host": "github.com",
+    "repository_id": 1448986421,
+    "repository": "DUIDUI-Studio/DailyCheck",
+}
+OUTCOME_RESULT_SUCCESS = "success"
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+ATTEMPT_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
+VERIFICATION = re.compile(r"[A-Za-z0-9._+-]{1,60}")
+
 
 EXIT_OK = 0
 EXIT_BEHIND = 1
@@ -222,6 +238,11 @@ def _empty_state() -> dict:
         "deployed": None,
         "last_attempt": None,
         "last_evicted": None,
+        # Issue163 additive domain. Old states keep working; missing keys are
+        # filled on read and never upgrade a legacy state into an outcome.
+        "generation": 0,
+        "outcomes": {},
+        "publications": {},
     }
 
 
@@ -317,6 +338,18 @@ def _write_lock(directory: Path):
             yield fh.fileno()
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+# Public state-transaction primitives shared with the Issue163 publication
+# adapter. They are the same objects the CLI uses; no second lock family or
+# storage domain is introduced.
+state_dir = _state_dir
+load_state = _load_state
+save_state = _save_state
+state_transaction = _write_lock
+attempt_lock = _attempt_lock
+process_lock_fd = _process_lock_fd
+now_epoch = _now
 
 
 def _lock_active(lock, now: int, ttl: int) -> bool:
@@ -420,6 +453,12 @@ def _acquire(args) -> int:
             state["last_evicted"] = evicted
 
         token = secrets.token_hex(8)
+        try:
+            previous_generation = int(state.get("generation") or 0)
+        except (TypeError, ValueError):
+            previous_generation = 0
+        generation = previous_generation + 1
+        state["generation"] = generation
         state["lock"] = {
             "token": token,
             "session": args.session or "",
@@ -428,6 +467,8 @@ def _acquire(args) -> int:
             "phase": args.phase or "acquire",
             "acquired_at": now,
             "heartbeat_at": now,
+            "generation": generation,
+            "attempt_id": secrets.token_hex(16),
         }
         _save_state(directory, state)
         token_file = _write_token_file(directory, token)
@@ -526,6 +567,55 @@ def cmd_heartbeat(args) -> int:
     return rc
 
 
+def _mint_outcome(state: dict, lock: dict, sha: str, pr, now: int,
+                  verification: str) -> dict | None:
+    """Create the immutable outcome for a successful, owned normal release.
+
+    Issuance requires the live pipeline descriptor AND an identity-bound lock;
+    a legacy/manual CLI release, a failed result, a short SHA, a non-numeric PR
+    or a locked-state generation mismatch returns None. The caller commits this
+    record in the same atomic state write that advances `deployed`.
+    """
+    if os.environ.get(ATTEMPT_ENV) is None or _process_lock_fd() is None:
+        return None
+    if type(pr) is not int or pr <= 0 or not FULL_SHA.fullmatch(sha or ""):
+        return None
+    generation = lock.get("generation")
+    if type(generation) is not int or generation < 1 or state.get("generation") != generation:
+        return None
+    outcomes = state.get("outcomes")
+    if not isinstance(outcomes, dict):
+        return None
+    attempt_id = lock.get("attempt_id")
+    if not isinstance(attempt_id, str) or not ATTEMPT_ID.fullmatch(attempt_id):
+        attempt_id = secrets.token_hex(16)
+    if attempt_id in outcomes:
+        return None
+    notice = (verification or "normal").strip()
+    if not VERIFICATION.fullmatch(notice):
+        notice = "normal"
+    outcome = {
+        "attempt_id": attempt_id,
+        "generation": generation,
+        "pr": pr,
+        "sha": sha,
+        "hosting": dict(PUBLIC_CODE_HOSTING),
+        "result": OUTCOME_RESULT_SUCCESS,
+        "rc": 0,
+        "stage": "complete",
+        "verification": notice,
+        "outcome_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "public_receipt": str(uuid.uuid4()),
+        "attempt_token": lock.get("token") or "",
+        "session": lock.get("session") or "",
+        "created_at": now,
+        "facts": None,
+        "payload_sha256": None,
+    }
+    outcomes[attempt_id] = outcome
+    return outcome
+
+
 def cmd_release(args) -> int:
     """收官。success -> 更新 deployed 锚点并清 last_attempt；failed -> 记 last_attempt。"""
     directory = _state_dir()
@@ -547,7 +637,14 @@ def cmd_release(args) -> int:
         if args.result == "success":
             if not sha:
                 return _fail("release success 需要 sha（锁内为空且未给 --sha）", EXIT_USAGE)
-            state["deployed"] = {"sha": sha, "pr": pr, "at": now}
+            deployed = {"sha": sha, "pr": pr, "at": now}
+            # Same atomic commit carries both the release anchor and the
+            # immutable outcome reference. No outcome -> no GitHub authority.
+            outcome = _mint_outcome(state, lock, sha, pr, now, args.verification)
+            if outcome is not None:
+                deployed["generation"] = outcome["generation"]
+                deployed["outcome_id"] = outcome["attempt_id"]
+            state["deployed"] = deployed
             state["last_attempt"] = None
         else:
             state["last_attempt"] = {
@@ -674,6 +771,7 @@ def cmd_status(args) -> int:
             "deployed": state.get("deployed"),
             "last_attempt": state.get("last_attempt"),
             "last_evicted": _lock_brief(state.get("last_evicted")) if state.get("last_evicted") else None,
+            "generation": state.get("generation", 0),
         })
         return EXIT_OK
 
@@ -757,6 +855,8 @@ def main(argv=None) -> int:
     p.add_argument("--result", required=True, choices=["success", "failed"])
     p.add_argument("--sha", default="")
     p.add_argument("--note", default="")
+    p.add_argument("--verification", default="normal",
+                   help="private honest notice: normal|skip-verify|short-observe|…")
     p.set_defaults(func=cmd_release)
 
     p = sub.add_parser("catchup", help="追平检测（rc 0/1/2/3，65=取不到 main）")
