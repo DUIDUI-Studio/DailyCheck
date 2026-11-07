@@ -119,6 +119,19 @@ jobs:
           /opt/venv/bin/pip install -r requirements.txt -q
           /opt/venv/bin/pip install pytest "ruff==0.16.10" radon bandit -q
 
+      # 同一既有必需 check：台账必须与全部实现/文档一致，再验证 PR 的影响声明。
+      # BASE_SHA 只作 main 参考；检查器内部用 merge-base，避免计入他人 main 变更。
+      - name: MCP contracts and PR impact gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pr
+          printf '%s\n' "$PR_BODY" > /tmp/pr/body.md
+          /opt/venv/bin/python -m scripts.mcp_contracts --check
+          /opt/venv/bin/python scripts/agent_framework/check_mcp_impact.py --base "${BASE_SHA}" --body-file /tmp/pr/body.md
+
       - name: Generate reports 02 + 03
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

@@ -27,8 +27,32 @@ DailyCheck PR 模板 v4（2026-10-24）
 
 **不在范围（明确排除）**：（本 PR 明确不做的事，防止 scope creep）
 
+## MCP 影响评估
+
+按「新增 / 更新 / 不变 / 暂不开放」填写，可在 changes 中列多项。tools 使用统一台账的
+准确名称；不变/暂不开放可为空，但必须解释原因并列测试命令与结果。新增工具写新台账名称；
+删除/重命名的旧名称归「更新」，额外填写 compatibility（调用者迁移/保留旧名等处理）。
+不要求每个 Web 页面开放 MCP。详见 workflow.md 的 MCP 影响评估规则。
+
+<!-- mcp-impact:v1 -->
+```json
+{
+  "version": 1,
+  "changes": [
+    {
+      "category": "不变",
+      "tools": [],
+      "reason": "待填：为什么本 PR 不改变 MCP",
+      "evidence": ["待填：测试命令与结果"]
+    }
+  ]
+}
+```
+<!-- /mcp-impact -->
+
 ## Checklist
 
+- [ ] MCP 影响评估已填写，工具台账/文档一致性与影响门禁通过
 - [ ] 报告 01 全部 R 条目已消解（表格内无未消解红叉）
 - [ ] ruff 0 告警（仅改动文件）
 - [ ] pytest 零新增失败（对比 `tests/known_failures.txt` 基线；清单只许收缩不许扩张）

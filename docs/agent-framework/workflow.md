@@ -117,6 +117,35 @@
 - ⚠️ 已知坑二：「报告 1/4」段之后（直到「报告 2/4」标题，实践中 = 全文）**不许出现字面 ❌ 字符**——门禁靠它识别未消解状态，正文叙述里写 ❌（哪怕只是举例）也会被判定未消解。写「红叉」「未消解状态」等文字替代
 - 本地自检捷径：`PR_BODY_FILE=/tmp/body.md python scripts/agent_framework/check_reports.py`
 
+#### MCP 影响评估（Issue #105，Owner 授权的维护门禁）
+
+业务功能 PR 必须保留模板的 MCP JSON 声明，按「新增 / 更新 / 不变 / 暂不开放」逐项列出
+工具名称、原因、测试命令与结果。不变/暂不开放允许 tools=[]，但不能省略理由和验证证据；
+Web 页面无需自动开放 MCP。复杂 PR 可列多个 changes，工具名称不可重复、不可未知。
+
+`check_mcp_impact.py` 对 main 参考提交与 HEAD **先取 Git merge-base 再 diff**，包括删除和
+重命名两端。blueprints、db、migrations、mcp_server、bot、config、permissions 路径以及
+所有非 tests 的 Python/SQL（含未来共享计算模块）及运行时依赖清单保守触发评估；纯文档/测试改动无声明可跳过，
+但若提供声明则必须有效。依赖清单包括 requirements*.txt/.in、requirements/constraints 目录、
+pyproject.toml、setup.cfg、常见 Python lock/环境与解释器版本文件；只改 SDK 依赖也不能漏评估。
+缺声明、非法类别、未知工具、空理由/测试证据、占位符均拒绝。
+本地命令：`python scripts/agent_framework/check_mcp_impact.py --base origin/main --body-file /tmp/body.md`。
+CI 用事件中的 main base SHA，不允许按 PR 自选比较基线。
+
+工具名取 merge-base 与 HEAD 的**完整统一台账并集**，因此新工具可正常声明为「新增」。
+名称只要求非空字符串、无重复、与台账精确匹配，不额外发明小写命名限制；实际登记有效性由
+原有 contracts checker 负责，已登记的 FutureRead 或 _private 等 SDK 合法名称同样可声明。
+实际台账/输入 schema/输出契约/ACL 等记录变化必须逐工具声明新增或更新，不许用「不变」或
+「暂不开放」遮盖。删除/重命名旧工具归更新，必须另填非空 compatibility，说明调用者迁移、
+旧名保留或其他明确处理；新名归新增。这里校验处置声明，实际兼容验证仍由专项测试负责。
+
+同一个既有 `agent-framework-reports` 必需 job 先跑
+`python -m scripts.mcp_contracts --check`（全部实现、完整 tools 与维护文档一致性），再跑影响
+检查；任何一步非零即失败，不添加 branch protection check、不扩大 known_failures、不改 Bot
+批准池或生产权限。影响检查只读取 Git 中的 JSON，不执行历史版本代码或访问业务库。
+统一台账生成 CLI 维持原样：变更登记后先 `python -m scripts.mcp_contracts --write`，提交产物。
+正常/拒绝示例见 [`mcp-impact.md`](mcp-impact.md)。
+
 ### ③′ 「生产侧事项」段落的写法铁律
 
 PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部署指引，粒度必须守住：
@@ -131,7 +160,7 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 | check | 内容 | 全绿标准 |
 |-------|------|---------|
 | `CI / test (pull_request)` | pytest 全量 + 零新增门禁 | `check_known_failures.py` exit 0（失败集 ⊆ known_failures.txt） |
-| `CI / agent-framework-reports (pull_request)` | 四报告齐全性 | 报告 01（body 段落）+ 02（pytest gate）+ 03（ruff/bandit）+ 04（CI 自动生成） |
+| `CI / agent-framework-reports (pull_request)` | 四报告齐全性 + MCP 台账/影响评估 | 报告 01（body 段落）+ 02（pytest gate）+ 03（ruff/bandit）+ 04（CI 自动生成）+ MCP 台账/文档一致、影响声明有效 |
 | `CI / deploy (pull_request)` | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：至少一次手动 workflow_dispatch 演练跑通） |
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
