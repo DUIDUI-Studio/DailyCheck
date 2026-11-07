@@ -1169,15 +1169,19 @@ Issue #155 的历史合并回归断言 fresh / archived / fallback 组合的事�
 队列不变。`scripts/hosting.py` 定义显式 `Provider` / `AccessRole` / `HostingConfig`，
 集中 GitHub REST 认证、JSON 响应、分页与错误边界。未知 provider、缺凭据、错误 host/repo、
 不完整或耗尽分页、网络/HTTP 错误（含不符合 GitHub GET/POST/PATCH 契约的 2xx）均拒绝，不能把故障解释为零结果。
-GitHub 只接受 `https://api.github.com` 和 `DUIDUI-Studio/DailyCheck`（ID `1448986421`）。
+GitHub 只接受 `https://api.github.com`；代码角色固定 `DUIDUI-Studio/DailyCheck`
+（ID `1448986421`），私有反馈/读取角色固定 `DUIDUI-Studio/DailyCheck-ops`
+（ID `1449125557`，Issue #162），不能全局改写 `DAILYCHECK_GITHUB_REPO`。
 
 | 角色 | GitHub 凭据来源 | 可写范围 |
 |---|---|---|
-| read | `DAILYCHECK_GITHUB_READ_TOKEN`，或 `GH_TOKEN` / `GITHUB_TOKEN`，或显式 `DAILYCHECK_GITHUB_READ_TOKEN_FILE` | 无 |
-| feedback | `DAILYCHECK_GITHUB_FEEDBACK_TOKEN` / `_TOKEN_FILE` | Issue / label 创建 |
-| report | `DAILYCHECK_GITHUB_REPORT_TOKEN` / `_TOKEN_FILE` | Issue/PR comment 创建、编辑 |
+| read | `DAILYCHECK_GITHUB_READ_TOKEN` / `_TOKEN_FILE` | 无，代码仓只读 |
+| ops_read | `DAILYCHECK_GITHUB_OPS_READ_TOKEN` / `_TOKEN_FILE` | 无，私有运维仓只读 |
+| feedback | `DAILYCHECK_GITHUB_FEEDBACK_TOKEN` / `_TOKEN_FILE` | 私有运维 Issue / 固定 label 创建 |
+| report | `DAILYCHECK_GITHUB_REPORT_TOKEN` / `_TOKEN_FILE` | 代码仓 PR comment；真实 fencing adapter 尚未接线 |
 
-显式文件不可读或显式凭据非法即拒绝；write 角色不会回退 read、Gitea 或当前 `gh` 登录。
+显式文件不可读或显式凭据非法即拒绝；所有 GitHub 角色均不回退 ambient
+`GH_TOKEN` / `GITHUB_TOKEN`、其他角色、Gitea 或当前 `gh` 登录。
 这里的角色是应用侧权限约束；真实 token scope 由部署侧独立配置，凭据不入库、不输出到 argv / 日志。
 GitHub curl 忽略用户 curlrc、不跟随重定向，auth 经 stdin 的 config 传入。
 Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置隐式切换生产。
@@ -1221,10 +1225,81 @@ symlink 后位于 shadow root；缺 root 或越界在任何 mkdir/SQLite 写入�
 GitHub 配置的 drain 不启用 provider work，Gitea 正常路由/租约/输出继续兼容。
 
 **调用方**：poller 的 GitHub 分支只输出 shadow readiness，不运行生产 catchup；dashboard 使用
-GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 label 传名字；报告 comment
-走 `/issues/N/comments` 和 `/issues/comments/ID`，完整分页查找同 SHA，查询失败不当成“没有评论”
-另建重复项。GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`。
+GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 label 传固定名字；
+GitHub 报告禁止同 SHA 查找/任意正文 PATCH，只接受下述 typed projection 与真实 attempt claim。
+GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`，保留原同 SHA comment 更新路径。
 反馈的缺凭据降级继续保留，外部失败不丢已保存草稿/管理员评论。
+
+#### 3.17.1 私有反馈与公开投影（Issue #162；本地实现，未启用）
+
+运维目的地必须显式设置 `DAILYCHECK_GITHUB_OPERATIONS_REPO`、`_REPO_ID` 和
+`_EXPECT_PRIVATE=true`；不提供缺省公共 fallback。私有 mutation 前由 transport
+逐次认证 GET metadata，要求完整且精确的 ID/full_name/API URL/web URL、
+`private=true`、`visibility=private`、`has_issues=true`、`archived=false`、`disabled=false`。
+缺字段、public/internal、重定向、认证/网络/HTTP 错误均保留私有草稿并阻断。
+这不是原子 visibility lease；Owner 对可见性与继承成员访问的治理仍是独立前置。
+只读 Dev/Prod 可用 `HostingClient(HostingConfig.from_environment(AccessRole.OPS_READ))`
+先 `verify_repository()`，再 GET 经过完整 identity 映射的私有 Issue；不授予新成员权限，
+不把运维/反馈/Prod 凭据传入 CI。
+
+Flask 二审先保存原评论和带版本 CAS 的草稿，再调用 `deliver_private`。
+唯一新增 master 表 `feedback_delivery_receipts` 以 ticket_id 为主键，保存固定
+provider/host/repositoryID/kind、稳定 request UUID、精确 payload/hash、原审核人/评论、
+owner/generation/120 秒租约和 remote ID/number/URL。`init_master_db` 的既有建表机制
+只增表，不重写旧票据；旧 schema 缺表时送达 fail closed，升级后可继续。
+本任务只在临时 SQLite 验证，未执行真实 DB migration。
+
+状态为 `ready → sending → linked | uncertain`，事实变化时 `blocked`。
+SQLite immediate transaction 只保护 claim/finalize，HTTP 在 commit 后；过期 claim
+只能恢复已发生 intent，旧 owner 不能创建或 finalize。Issue POST 前落 durable intent，
+丢响应/重启后完整分页 GET `issues?state=all`（含 closed），精确匹配 private request marker、
+正文/标题、kind、repository/API/web identity。恰好一项才原子绑定主 Issue link/原评论；
+零项、多项、foreign/PR/正文变动均不重发、不换 UUID、不宣称成功。
+重试不覆盖较新的原始草稿/分析/评论；未知结果需私有侧人工核实，不能从一次 GET 零结果
+推断远端不存在。旧 Gitea stored issue_url 原样保留；相同数字不构成跨仓身份。
+
+`feedback_pure.public_engineering_projection(draft, request_id, approval_receipt, *, review)`
+是现有外部 `dc_state.create_issue` 未来公共路径的 ABI，**NOT WIRED**，应用不新增 public
+Issue editor/写 token/自动发布。draft 仅含 `title/problem/synthetic_reproduction/acceptance/
+component/label`，component 和 label 为固定技术枚举；拒绝未知字段、自由 URL/图片、
+私有引用、bare closing 编号及已知 credential 形态。review 是可信代码适配器
+`verify_projection(receipt, *, payload_sha256, request_id, repository_id) -> None`，必须从
+独立私有记录确认审核角色、真实 receipt、请求/目标仓与精确 canonical JSON hash，失败抛错。
+应用用户的 approved/valid 布尔值不提供 authority；任意 prose 的语义保密仍须实质审核，
+语法筛查/LLM 改写不构成去密证明。原始用户/仓库/页面/admin/model/planner/标签上下文
+留在现有私有 app/运维 sink；外部 Coordinator 必须分开保存 private source 与已审核
+public Issue/PR 映射，公共分支/Closes 只使用真实 public engineering Issue。
+六个旧 source 映射没有分配目标编号，不复制历史讨论。
+
+`deploy_report.PublicDeployFacts` 仅接受 public PR/full H/nonsecret receipt UUID/UTC outcome time、
+bounded rc 和 stage/kind/scope/verdict/next 枚举。`render_public` 无原因/需求/log/path/planner/
+private identity 参数；保留 `deploy-report:v1`、短 Commit 字段和 dashboard 的五字段投影。
+`render_private` 保留详细原因、对齐/需求、redacted log；GitHub `write` 在 shadow 内保存
+0600 私有诊断文件，events/Hermes 的原因/action/log 继续留在私有 lane，已知 credential
+形态继续 redaction。诊断文件随机名仅是文件名，不是部署 receipt。Gitea 默认 full renderer 保留。
+
+GitHub 发布 ABI 为 `publish_public(facts, context, *, authority)`；CLI 的
+`--publication-context` 只描述事实，**没有真实 adapter，CLI 一律 fail closed**。
+`PublicationContext.parse` 严格字段为 provider/host/repository_id/repository/pr/sha、
+真实私有 attempt_id、单调 generation、不可变 outcome_at、nonsecret public_receipt、
+private_source 六字段 identity 和精确 `{"body": render_public(facts)}` canonical JSON SHA256。
+source identity 不是 public body 参数；public receipt 不是 lock/attempt token。
+可信代码 `PublicationAuthority.claim(context, payload_sha256)` 必须返回 context manager，
+校验真实 attempt/outcome/私有源→public PR/H 映射/hash，并持有 fencing 直到 HTTP/receipt
+结束；yield 的 `PublicationClaim` 提供 durable `state/comment_id`、`check_current()`、
+POST 前落 uncertain 的 `intent()`、fenced CAS 的 `bind(comment_id)`。所有方法失败抛错，
+后到旧 attempt（含已存在更新成功）不得写。模块不根据 JSON 布尔值、任意 UUID、匹配 SHA、
+环境开关或合成 receipt 获得授权。正向测试仅注入明确 TEST ONLY 的合成可信 SQLite adapter。
+
+每个 sink/PR/fullH/public_receipt 的独立 marker 完整分页恢复精确 comment，验证 issue_url
+和 mapped comment ID；uncertain 时零/多/foreign/changed-body 不再 POST，私有 comment ID
+不能 PATCH public sink。同 H 的不同真实 attempt 使用不同 receipt/comment，原结果不可变，
+所以本 ABI 不编辑旧结果来覆盖新成功。返回 comment ID 仅证明 publication，不证明部署成功。
+**NOT WIRED**：本 base 的 pipeline 只传 PR/SHA/rc/stage/log/repo；source161 不在此分支。
+后续获准集成必须实现真实 attempt/fencing adapter，接入准确 context 和已有私有映射；
+`dc_state.py`/`dc_delivery.py`、项目技能/Prod 安装与 admission/finalizer 均属外部依赖，
+不能用这里的合成测试声称 Prod/161 端到端完成。CI/policy/生产模式未变；现有 review、
+候选验证、观察窗、merge/Issue closure 仍仅由 Prod 执行。
 
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。

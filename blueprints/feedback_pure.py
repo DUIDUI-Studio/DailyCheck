@@ -25,9 +25,15 @@ Spec: docs/ARCHITECTURE.md §3.10（反馈闭环）.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import sqlite3
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 # 反馈分类：给管理员分流用，不参与权限判定。
 CATEGORIES: dict[str, str] = {
@@ -416,6 +422,205 @@ def attach_issue(
     )
     db.commit()
     return cur.rowcount > 0
+
+
+def draft_version(title: str, body: str) -> str:
+    return hashlib.sha256(json.dumps([title or "", body or ""], ensure_ascii=False).encode()).hexdigest()
+
+
+def save_private_draft(db, ticket: dict, title: str, body: str, version: str) -> bool:
+    """Compare-and-save protects newer drafts from concurrent and stale retries."""
+    old_title, old_body = ticket.get("draft_title") or "", ticket.get("draft_body") or ""
+    if version and version != draft_version(old_title, old_body):
+        return False
+    if not version and (title, body) != (old_title, old_body):
+        return False
+    cur = db.execute(
+        """UPDATE feedback_tickets SET draft_title=?, draft_body=?, updated_at=?
+           WHERE id=? AND issue_number IS NULL AND COALESCE(draft_title,'')=?
+           AND COALESCE(draft_body,'')=? AND status=?""",
+        (title, body, _now(), ticket["id"], old_title, old_body, STATUS_ANALYZED),
+    )
+    db.commit()
+    return cur.rowcount == 1
+
+
+@dataclass(frozen=True)
+class PrivateDeliveryClaim:
+    ticket_id: int
+    request_id: str
+    payload_json: str
+    owner: str
+    generation: int
+    action: str
+
+
+def claim_private_delivery(db, ticket_id: int, admin_id: int,
+                           comment_id: int | None = None) -> PrivateDeliveryClaim | None:
+    """A lease can recover an intent, never authorize a second creation POST."""
+    owner, now = str(uuid.uuid4()), time.time()
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        ticket = db.execute("SELECT * FROM feedback_tickets WHERE id=?", (ticket_id,)).fetchone()
+        if not ticket or ticket["issue_number"] or ticket["status"] != STATUS_ANALYZED:
+            return None
+        version = draft_version(ticket["draft_title"], ticket["draft_body"])
+        row = db.execute(
+            "SELECT * FROM feedback_delivery_receipts WHERE ticket_id=?", (ticket_id,)
+        ).fetchone()
+        if row is None:
+            request_id = str(uuid.uuid4())
+            payload = json.dumps({
+                "title": ticket["draft_title"],
+                "body": ticket["draft_body"] + f"\n\n<!-- dailycheck-private-request:v1 {request_id} -->",
+                "labels": ["user-feedback"],
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            db.execute(
+                """INSERT INTO feedback_delivery_receipts
+                   (ticket_id,provider,host,repository_id,repository,kind,request_id,
+                    draft_sha256,payload_json,payload_sha256,admin_id,comment_id,state,updated_at)
+                   VALUES (?,'github','github.com',1449125557,'DUIDUI-Studio/DailyCheck-ops',
+                           'issue',?,?,?,?,?,?,'ready',?)""",
+                (ticket_id, request_id, version, payload, hashlib.sha256(payload.encode()).hexdigest(),
+                 admin_id, comment_id, _now()),
+            )
+            row = db.execute(
+                "SELECT * FROM feedback_delivery_receipts WHERE ticket_id=?", (ticket_id,)
+            ).fetchone()
+        if row["draft_sha256"] != version:
+            db.execute(
+                "UPDATE feedback_delivery_receipts SET state='blocked',updated_at=? WHERE ticket_id=?",
+                (_now(), ticket_id),
+            )
+            return None
+        if row["state"] in {"linked", "blocked"} or row["lease_until"] > now:
+            return None
+        action = "create" if row["state"] == "ready" else "reconcile"
+        generation = row["generation"] + 1
+        db.execute(
+            """UPDATE feedback_delivery_receipts SET owner=?,generation=?,lease_until=?,
+               state=?,updated_at=? WHERE ticket_id=?""",
+            (owner, generation, now + 120, "ready" if action == "create" else "uncertain",
+             _now(), ticket_id),
+        )
+        return PrivateDeliveryClaim(ticket_id, row["request_id"], row["payload_json"],
+                                    owner, generation, action)
+
+
+def begin_private_creation(db, claim: PrivateDeliveryClaim) -> bool:
+    with db:
+        cur = db.execute(
+            """UPDATE feedback_delivery_receipts SET state='sending',updated_at=?
+               WHERE ticket_id=? AND owner=? AND generation=? AND lease_until>?
+               AND state='ready'""",
+            (_now(), claim.ticket_id, claim.owner, claim.generation, time.time()),
+        )
+    return cur.rowcount == 1
+
+
+def release_private_delivery(db, claim: PrivateDeliveryClaim) -> None:
+    with db:
+        db.execute(
+            """UPDATE feedback_delivery_receipts SET owner=NULL,lease_until=0,
+               state=CASE WHEN state='sending' THEN 'uncertain' ELSE state END,updated_at=?
+               WHERE ticket_id=? AND owner=? AND generation=?""",
+            (_now(), claim.ticket_id, claim.owner, claim.generation),
+        )
+
+
+def finalize_private_delivery(db, claim: PrivateDeliveryClaim, issue: dict) -> bool:
+    """Atomically bind the confirmed private identity and original review receipt."""
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(
+            """SELECT * FROM feedback_delivery_receipts WHERE ticket_id=? AND owner=?
+               AND generation=? AND lease_until>? AND state IN ('sending','uncertain')""",
+            (claim.ticket_id, claim.owner, claim.generation, time.time()),
+        ).fetchone()
+        if row is None:
+            return False
+        ticket = db.execute("SELECT * FROM feedback_tickets WHERE id=?", (claim.ticket_id,)).fetchone()
+        unchanged = (
+            ticket["issue_number"] is None and ticket["status"] == STATUS_ANALYZED
+            and draft_version(ticket["draft_title"], ticket["draft_body"]) == row["draft_sha256"]
+        )
+        db.execute(
+            """UPDATE feedback_delivery_receipts SET state=?,remote_id=?,remote_number=?,
+               remote_url=?,owner=NULL,lease_until=0,updated_at=? WHERE ticket_id=?""",
+            ("linked" if unchanged else "blocked", issue["id"], issue["number"], issue["url"],
+             _now(), claim.ticket_id),
+        )
+        if not unchanged:
+            return False
+        db.execute(
+            """UPDATE feedback_tickets SET status=?,issue_number=?,issue_url=?,handled_by=?,
+               handled_at=?,updated_at=? WHERE id=? AND issue_number IS NULL""",
+            (STATUS_DISPATCHED, issue["number"], issue["url"], row["admin_id"],
+             _now(), _now(), claim.ticket_id),
+        )
+        if row["comment_id"] is not None:
+            db.execute(
+                """UPDATE feedback_comments SET dispatched_at=? WHERE id=? AND ticket_id=?
+                   AND dispatched_at IS NULL""", (_now(), row["comment_id"], claim.ticket_id),
+            )
+    return True
+
+
+class PublicSummaryReview(Protocol):
+    """Trusted off-repo reviewer adapter, supplied by code, never by an app form.
+
+    Must check reviewer role, durable receipt, destination, request and exact hash;
+    raise on absent/stale/unapproved authority. No implementation is installed here.
+    """
+
+    def verify_projection(self, receipt: str, *, payload_sha256: str,
+                          request_id: str, repository_id: int) -> None: ...
+
+
+def public_engineering_projection(draft: dict, request_id: str, approval_receipt: str,
+                                  *, review: PublicSummaryReview) -> dict:
+    """Separately authored prose only; syntactic guards do not replace privacy review.
+
+    ABI for existing dc_state.create_issue's future public path, NOT WIRED to app
+    dispatch or any public Issue transport. Private/public mappings stay external.
+    """
+    fields = {"title", "problem", "synthetic_reproduction", "acceptance", "component", "label"}
+    if not isinstance(draft, dict) or set(draft) != fields:
+        raise ValueError("public_summary_fields")
+    if any(not isinstance(value, str) or not value.strip() for value in draft.values()):
+        raise ValueError("public_summary_text")
+    if draft["component"] not in {"feedback", "deploy", "inventory", "MCP", "automation", "migration"}:
+        raise ValueError("public_summary_component")
+    if draft["label"] not in {"bug", "enhancement", "maintenance", "migration"}:
+        raise ValueError("public_summary_label")
+    if not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id:
+        raise ValueError("public_summary_request")
+    if (not isinstance(approval_receipt, str) or not approval_receipt
+        or not callable(getattr(review, "verify_projection", None))):
+        raise ValueError("public_summary_review_required")
+    for key, limit in {"title": 120, "problem": 4000,
+                       "synthetic_reproduction": 8000, "acceptance": 4000}.items():
+        value = draft[key]
+        if len(value) > limit or re.search(
+            r"(?i)([a-z][a-z0-9+.-]*://|mailto:|data:|www\.|!\[|\]\(|[<>]|#\d+|dailycheck-ops|FB-\d{8}-|part-of:"
+            r"|(?:password|passwd|secret|api[_-]?key)\s*[:=]|bearer\s+|token\s+"
+            r"|gh[pousr]_[A-Za-z0-9_]+|github_pat_)", value,
+        ) or any(ord(c) < 32 and c not in "\n\t" for c in value):
+            raise ValueError("public_summary_prohibited_text")
+    payload = {
+        "title": draft["title"], "labels": [draft["label"]],
+        "body": f"<!-- dailycheck-public-request:v1 {request_id} -->\n"
+                f"Component: {draft['component']}\n\n## Problem\n{draft['problem']}\n\n"
+                f"## Synthetic reproduction\n{draft['synthetic_reproduction']}\n\n"
+                f"## Acceptance\n{draft['acceptance']}",
+    }
+    digest = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    if review.verify_projection(approval_receipt, payload_sha256=digest,
+                                request_id=request_id, repository_id=1448986421) is not None:
+        raise ValueError("public_summary_review_contract")
+    return payload
 
 
 # ---------------------------------------------------------------------------

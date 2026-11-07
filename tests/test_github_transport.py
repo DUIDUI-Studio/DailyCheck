@@ -336,6 +336,9 @@ def test_missing_credentials_never_fall_back_to_gitea_or_write_role(api, monkeyp
     monkeypatch.delenv("DAILYCHECK_GITHUB_READ_TOKEN")
     monkeypatch.setenv("GITEA_TOKEN", "not-a-github-credential")
     monkeypatch.setenv("DAILYCHECK_GITHUB_REPORT_TOKEN", "report-only")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_REPO", "DUIDUI-Studio/DailyCheck-ops")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_REPO_ID", "1449125557")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_EXPECT_PRIVATE", "true")
     assert HostingConfig.from_environment().token == ""
     assert HostingConfig.from_environment(AccessRole.FEEDBACK).token == ""
     with pytest.raises(HostingError, match="credentials_unavailable"):
@@ -413,29 +416,16 @@ def test_malformed_or_partial_pagination_never_returns_partial_success(api, monk
         client.pages(ROOT + "/labels", **kw)
 
 
-def test_feedback_uses_label_names_and_correct_human_url(api, monkeypatch):
+def test_feedback_raw_creation_without_private_receipt_is_rejected(api, monkeypatch):
     from blueprints import feedback_dispatch
 
     monkeypatch.setenv("DAILYCHECK_GITHUB_FEEDBACK_TOKEN", "test-credential")
-    table = evidence()
-    table[ROOT + "/labels?page=1"] = response([{"id": 9, "name": "user-feedback"}])
-    table[ROOT + "/issues"] = response(
-        {"number": 500, "html_url": "https://wrong.invalid"}, status=201
-    )
-    api.write(table)
+    monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_REPO", "DUIDUI-Studio/DailyCheck-ops")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_REPO_ID", "1449125557")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_EXPECT_PRIVATE", "true")
     assert feedback_dispatch.dispatch_enabled()
-    assert feedback_dispatch.create_issue("title", "body") == {
-        "number": 500,
-        "url": f"https://github.com/{REPO}/issues/500",
-    }
-    posted = [r for r in api.log() if r["method"] == "POST"]
-    assert len(posted) == 1 and posted[0]["path"] == ROOT + "/issues"
-    data = next(
-        line.split(" = ", 1)[1]
-        for line in posted[0]["config"].splitlines()
-        if line.startswith("data = ")
-    )
-    assert json.loads(json.loads(data))["labels"] == ["user-feedback"]
+    assert feedback_dispatch.create_issue("title", "body") is None
+    assert not api.log()
 
 
 def test_feedback_missing_or_invalid_readonly_credential_stays_disabled(api, monkeypatch):
@@ -486,31 +476,15 @@ def test_poller_is_shadow_only_and_uses_checks_not_combined_status(api, monkeypa
     assert "shadow" in text.lower() and not any(r["path"].endswith("/status") for r in api.log())
 
 
-def test_deploy_report_comment_pagination_and_edit_endpoint(api, monkeypatch):
+def test_deploy_report_sha_only_lookup_and_untyped_edit_are_rejected(api, monkeypatch):
     from scripts.blue_green import deploy_report
 
     monkeypatch.setenv("DAILYCHECK_GITHUB_REPORT_TOKEN", "test-credential")
-    monkeypatch.setattr(HostingClient, "PER_PAGE", 1)
-    table = evidence()
-    table.update(
-        {
-            ROOT + "/issues/160/comments?page=1": response([{"id": 1, "body": "unrelated"}]),
-            ROOT + "/issues/160/comments?page=2": response(
-                [{"id": 2, "body": deploy_report.MARKER + f" `{SHA[:12]}`"}]
-            ),
-            ROOT + "/issues/160/comments?page=3": response([]),
-            ROOT + "/issues/comments/2": response({"id": 2}),
-        }
-    )
-    api.write(table)
-    assert deploy_report.find_same_sha_comment(160, SHA) == 2
-    status, _ = deploy_report.gitea("PATCH", ROOT + "/issues/comments/2", {"body": "updated"})
-    assert status == 200
-    assert api.log()[-1]["path"] == ROOT + "/issues/comments/2"
-    table[ROOT + "/issues/160/comments?page=1"] = response([], status=401)
-    api.write(table)
     with pytest.raises(HostingError):
         deploy_report.find_same_sha_comment(160, SHA)
+    with pytest.raises(HostingError):
+        deploy_report.gitea("PATCH", ROOT + "/issues/comments/2", {"body": "updated"})
+    assert not api.log()
 
 
 def test_github_finalization_is_rejected_without_transport(api):
@@ -691,7 +665,7 @@ def test_shadow_root_cannot_overlap_production_state(api, monkeypatch, root):
     [
         ("GET", 202, AccessRole.READ, ROOT),
         ("GET", 201, AccessRole.READ, ROOT),
-        ("POST", 200, AccessRole.FEEDBACK, ROOT + "/issues"),
+        ("POST", 200, AccessRole.FEEDBACK, "/repos/DUIDUI-Studio/DailyCheck-ops/issues"),
         ("PATCH", 201, AccessRole.REPORT, ROOT + "/issues/comments/1"),
     ],
 )
@@ -700,9 +674,22 @@ def test_github_unexpected_success_code_is_not_terminal_success(
 ):
     monkeypatch.setenv("DAILYCHECK_GITHUB_FEEDBACK_TOKEN", "test-credential")
     monkeypatch.setenv("DAILYCHECK_GITHUB_REPORT_TOKEN", "test-credential")
-    api.write({path: response({"id": 1}, status=status)})
+    table = {path: response({"id": 1}, status=status)}
+    payload = None
+    if role is AccessRole.FEEDBACK:
+        repo = "DUIDUI-Studio/DailyCheck-ops"
+        monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_REPO", repo)
+        monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_REPO_ID", "1449125557")
+        monkeypatch.setenv("DAILYCHECK_GITHUB_OPERATIONS_EXPECT_PRIVATE", "true")
+        table[f"/repos/{repo}"] = response({
+            "id": 1449125557, "full_name": repo, "private": True, "visibility": "private",
+            "has_issues": True, "archived": False, "disabled": False,
+            "url": f"https://api.github.com/repos/{repo}", "html_url": f"https://github.com/{repo}",
+        })
+        payload = {"title": "synthetic", "body": "synthetic", "labels": ["user-feedback"]}
+    api.write(table)
     with pytest.raises(HostingError) as error:
-        api.client(role).request(method, path)
+        api.client(role).request(method, path, payload)
     assert error.value.status == status
 
 

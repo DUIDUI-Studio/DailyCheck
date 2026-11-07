@@ -768,6 +768,30 @@ CREATE TABLE IF NOT EXISTS feedback_comments (
 CREATE INDEX IF NOT EXISTS idx_feedback_comments_ticket
     ON feedback_comments(ticket_id, id);
 
+-- Narrow private delivery receipt; no business rows or legacy links are rewritten.
+CREATE TABLE IF NOT EXISTS feedback_delivery_receipts (
+    ticket_id       INTEGER PRIMARY KEY REFERENCES feedback_tickets(id),
+    provider        TEXT NOT NULL CHECK(provider = 'github'),
+    host            TEXT NOT NULL CHECK(host = 'github.com'),
+    repository_id   INTEGER NOT NULL CHECK(repository_id = 1449125557),
+    repository      TEXT NOT NULL CHECK(repository = 'DUIDUI-Studio/DailyCheck-ops'),
+    kind            TEXT NOT NULL CHECK(kind = 'issue'),
+    request_id      TEXT NOT NULL UNIQUE,
+    draft_sha256    TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    payload_sha256  TEXT NOT NULL,
+    admin_id        INTEGER NOT NULL REFERENCES users(id),
+    comment_id      INTEGER REFERENCES feedback_comments(id),
+    state           TEXT NOT NULL CHECK(state IN ('ready','sending','uncertain','blocked','linked')),
+    owner           TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0,
+    lease_until     REAL NOT NULL DEFAULT 0,
+    remote_id       INTEGER,
+    remote_number   INTEGER,
+    remote_url      TEXT,
+    updated_at      TEXT NOT NULL
+);
+
 -- Owner 拍板队列（2026-10-21）。
 -- 闭环：Prod Agent 命中红线 → 登记一行 pending → 企微推反馈通知群 →
 -- owner 在 /ops/approvals 点批准/拒绝 → Prod Agent 下次巡检读到 approved 并 merge

@@ -23,6 +23,7 @@ class Provider(str, Enum):
 
 class AccessRole(str, Enum):
     READ = "read"
+    OPS_READ = "ops_read"
     FEEDBACK = "feedback"
     REPORT = "report"
 
@@ -207,8 +208,11 @@ class HostingConfig:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repo):
             raise HostingError("invalid_repository")
         if self.provider is Provider.GITHUB and (
-            self.repo != "DUIDUI-Studio/DailyCheck"
-            or self.repo_id != 1448986421
+            (self.repo, self.repo_id) != (
+                ("DUIDUI-Studio/DailyCheck-ops", 1449125557)
+                if self.role in {AccessRole.FEEDBACK, AccessRole.OPS_READ}
+                else ("DUIDUI-Studio/DailyCheck", 1448986421)
+            )
             or self.web_url != "https://github.com"
         ):
             raise HostingError("invalid_github_repository_identity")
@@ -233,16 +237,28 @@ class HostingConfig:
                 web_url=env.get("GITEA_WEB_BASE", ""),
             )
         names = {
-            AccessRole.READ: ("DAILYCHECK_GITHUB_READ_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+            AccessRole.READ: ("DAILYCHECK_GITHUB_READ_TOKEN",),
+            AccessRole.OPS_READ: ("DAILYCHECK_GITHUB_OPS_READ_TOKEN",),
             AccessRole.FEEDBACK: ("DAILYCHECK_GITHUB_FEEDBACK_TOKEN",),
             AccessRole.REPORT: ("DAILYCHECK_GITHUB_REPORT_TOKEN",),
         }[role]
+        private = role in {AccessRole.FEEDBACK, AccessRole.OPS_READ}
+        repo = env.get("DAILYCHECK_GITHUB_REPO", "DUIDUI-Studio/DailyCheck")
+        repo_id = 1448986421
+        if private:
+            repo = env.get("DAILYCHECK_GITHUB_OPERATIONS_REPO", "")
+            if env.get("DAILYCHECK_GITHUB_OPERATIONS_REPO_ID") != "1449125557":
+                raise HostingError("explicit_operations_identity_required")
+            if env.get("DAILYCHECK_GITHUB_OPERATIONS_EXPECT_PRIVATE") != "true":
+                raise HostingError("explicit_private_destination_required")
+            repo_id = 1449125557
         return cls(
             selected,
             env.get("DAILYCHECK_GITHUB_API", "https://api.github.com"),
-            env.get("DAILYCHECK_GITHUB_REPO", "DUIDUI-Studio/DailyCheck"),
+            repo,
             role,
             _token(env, names, f"DAILYCHECK_GITHUB_{role.value.upper()}_TOKEN_FILE"),
+            repo_id=repo_id,
             curl=env.get("DAILYCHECK_CURL", "/usr/bin/curl"),
         )
 
@@ -265,7 +281,7 @@ class HostingClient:
         c = self.config
         if not c.token:
             raise HostingError("credentials_unavailable")
-        if method != "GET" and c.role is AccessRole.READ:
+        if method != "GET" and c.role in {AccessRole.READ, AccessRole.OPS_READ}:
             raise HostingError("read_role_cannot_write")
         # This transport deliberately has no GitHub finalization primitive.
         routes = {
@@ -279,6 +295,26 @@ class HostingClient:
             x in path for x in ("\r", "\n", "#", "..")
         ):
             raise HostingError("invalid_api_path")
+        if c.provider is Provider.GITHUB and c.role is AccessRole.FEEDBACK and method != "GET":
+            if method != "POST":
+                raise HostingError("unsupported_private_feedback_write")
+            if path.endswith("/labels"):
+                valid = payload == {
+                    "name": "user-feedback", "color": "0e8a16",
+                    "description": "用户在站内提交的使用问题，由管理员确认后派发",
+                }
+            else:
+                valid = (
+                    isinstance(payload, dict)
+                    and set(payload) == {"title", "body", "labels"}
+                    and isinstance(payload["title"], str)
+                    and isinstance(payload["body"], str)
+                    and payload["labels"] == ["user-feedback"]
+                )
+            if not valid:
+                raise HostingError("invalid_private_feedback_payload")
+            # Re-read authenticated metadata immediately before EVERY private mutation.
+            self.verify_repository()
         auth = "Bearer" if c.provider is Provider.GITHUB else "token"
         headers = {
             "Authorization": f"{auth} {c.token}",
@@ -393,4 +429,17 @@ class HostingClient:
             or data.get("full_name") != self.config.repo
         ):
             raise HostingError("repository_identity_mismatch")
+        if self.config.provider is Provider.GITHUB and self.config.role in {
+            AccessRole.FEEDBACK, AccessRole.OPS_READ,
+        }:
+            if (
+                data.get("private") is not True
+                or data.get("visibility") != "private"
+                or data.get("has_issues") is not True
+                or data.get("archived") is not False
+                or data.get("disabled") is not False
+                or data.get("url") != f"{self.config.api_url}/repos/{self.config.repo}"
+                or data.get("html_url") != f"{self.config.web_url}/{self.config.repo}"
+            ):
+                raise HostingError("private_repository_unavailable")
         return data

@@ -59,15 +59,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import uuid
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -88,6 +92,7 @@ from scripts.hosting import (  # noqa: E402
     HostingConfig,
     HostingError,
     Provider,
+    parse_json_object,
     provider,
     require_shadow_path,
 )
@@ -236,6 +241,8 @@ def gitea(method: str, path: str, payload: dict[str, Any] | None = None) -> tupl
     过能用的形态，别改成管道传参。
     """
     if provider() is Provider.GITHUB:
+        if method != "GET":
+            raise HostingError("trusted_publication_claim_required")
         role = AccessRole.READ if method == "GET" else AccessRole.REPORT
         client = HostingClient(HostingConfig.from_environment(role))
         try:
@@ -295,12 +302,7 @@ def find_same_sha_comment(pr: int, sha: str) -> int:
     各留一条（多次部署的历史是需要的，那是「这次改动修好了没」的证据链）。
     """
     if provider() is Provider.GITHUB:
-        client = HostingClient(HostingConfig.from_environment(AccessRole.READ))
-        client.verify_repository()
-        rows = client.pages(f"/repos/{client.config.repo}/issues/{pr}/comments")
-        needle = f"`{sha[:12]}`"
-        matches = [row["id"] for row in rows if MARKER in str(row.get("body") or "") and needle in str(row.get("body") or "")]
-        return max(matches, default=0)
+        raise HostingError("sha_only_publication_identity_forbidden")
     status, body = gitea("GET", f"/repos/{_repo()}/issues/{pr}/comments")
     if status != 200:
         return 0
@@ -371,6 +373,7 @@ def append_event(event: dict[str, Any]) -> bool:
     append 是原子的（PIPE_BUF 内），不会互相截断。不做锁 —— 锁在部署收尾
     路径上是自找的阻塞源。
     """
+    event = {k: redact(v) if isinstance(v, str) else v for k, v in event.items()}
     p = event_log_path()
     if provider() is Provider.GITHUB:
         try:
@@ -482,7 +485,7 @@ _NEXT_LABEL = {
 }
 
 
-def render(
+def render_private(
     pr: int,
     sha: str,
     tr: dict[str, Any],
@@ -542,7 +545,206 @@ def render(
         noun = "pull" if provider() is Provider.GITHUB else "pulls"
         host = "GitHub" if provider() is Provider.GITHUB else "Gitea"
         lines.append(f"[在 {host} 查看 PR #{pr}]({_web_base()}/{_repo()}/{noun}/{pr})")
-    return "\n".join(lines)[:COMMENT_MAX]
+    return redact("\n".join(lines)[:COMMENT_MAX])
+
+
+def render(*args, **kwargs) -> str:
+    if provider() is Provider.GITHUB:
+        raise HostingError("typed_public_deploy_facts_required")
+    return render_private(*args, **kwargs)
+
+
+@dataclass(frozen=True)
+class PublicDeployFacts:
+    pr: int
+    sha: str
+    receipt: str
+    outcome_at: str
+    rc: int
+    stage: str
+    kind: str
+    scope: str
+    verdict: str
+    next: str
+
+    def __post_init__(self):
+        enums = {
+            "stage": {"acquire", "candidate", "up", "verify", "promote", "switch",
+                      "observe", "merge", "release", "complete"},
+            "kind": {"success", "usage", "lock", "code", "drift", "env", "unknown"},
+            "scope": {"in-scope", "out-of-scope", "undetermined"},
+            "verdict": {"aligned", "drifted", "unverifiable", "unknown"},
+            "next": {"none", "autofix", "envfix", "derive", "audit", "halt"},
+        }
+        if type(self.pr) is not int or self.pr <= 0 or type(self.rc) is not int or not 0 <= self.rc <= 255:
+            raise HostingError("invalid_public_deploy_number")
+        if not isinstance(self.sha, str) or not re.fullmatch(r"[0-9a-f]{40}", self.sha):
+            raise HostingError("invalid_public_deploy_sha")
+        try:
+            if str(uuid.UUID(self.receipt)) != self.receipt:
+                raise ValueError
+            datetime.strptime(self.outcome_at, "%Y-%m-%dT%H:%M:%SZ")
+            if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", self.outcome_at):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HostingError("invalid_public_deploy_receipt_time") from exc
+        if any(not isinstance(getattr(self, k), str) or getattr(self, k) not in v
+               for k, v in enums.items()):
+            raise HostingError("invalid_public_deploy_enum")
+        if (self.rc == 0) != (self.kind == "success"):
+            raise HostingError("inconsistent_public_deploy_result")
+
+
+def publication_marker(facts: PublicDeployFacts) -> str:
+    return (f"<!-- deploy-publication:v1 repo=1448986421 pr={facts.pr} "
+            f"head={facts.sha} receipt={facts.receipt} -->")
+
+
+def render_public(facts: PublicDeployFacts) -> str:
+    """No requirement, explanation, log, path, planner or private identity parameter."""
+    head = "部署结果 · 成功" if facts.rc == 0 else f"部署结果 · 失败（rc={facts.rc}）"
+    return "\n".join([
+        MARKER, publication_marker(facts), f"## {head}", "", "| 项 | 值 |", "|---|---|",
+        f"| PR | #{facts.pr} |", f"| Commit | `{facts.sha[:12]}` |",
+        f"| RC | {facts.rc} |", f"| 阶段 | `{facts.stage}` |",
+        f"| 归因 | `{facts.kind}` / `{facts.scope}` |", f"| 对齐 | `{facts.verdict}` |",
+        f"| 下一步 | {_NEXT_LABEL[facts.next]} |", f"| 时间 | {facts.outcome_at} |", "",
+        "Diagnostics are retained privately.", "",
+        f"[在 GitHub 查看 PR #{facts.pr}](https://github.com/DUIDUI-Studio/DailyCheck/pull/{facts.pr})",
+    ])
+
+
+@dataclass(frozen=True)
+class PublicationContext:
+    """PRIVATE input ABI. Its JSON describes facts; it cannot grant authority."""
+
+    provider: str
+    host: str
+    repository_id: int
+    repository: str
+    pr: int
+    sha: str
+    attempt_id: str
+    generation: int
+    outcome_at: str
+    public_receipt: str
+    private_source: tuple[str, str, int, str, str, int]
+    payload_sha256: str
+
+    @classmethod
+    def parse(cls, raw: object) -> PublicationContext:
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError
+            value = dict(raw)
+            source = value["private_source"]
+            keys = {"provider", "host", "repository_id", "repository", "kind", "number"}
+            if not isinstance(source, dict) or set(source) != keys:
+                raise ValueError
+            value["private_source"] = tuple(source[k] for k in (
+                "provider", "host", "repository_id", "repository", "kind", "number"))
+            context = cls(**value)
+            if (context.provider, context.host, context.repository_id, context.repository) != (
+                "github", "github.com", 1448986421, "DUIDUI-Studio/DailyCheck"
+            ) or type(context.repository_id) is not int:
+                raise ValueError
+            if (not isinstance(context.attempt_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", context.attempt_id)
+                or context.attempt_id == context.public_receipt
+                or type(context.generation) is not int or context.generation < 1
+                or not isinstance(context.payload_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", context.payload_sha256)):
+                raise ValueError
+            sp, host, rid, repo, kind, number = context.private_source
+            if (sp not in {"gitea", "github"} or kind != "issue"
+                or type(rid) is not int or rid <= 0 or type(number) is not int or number <= 0
+                or not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9.:-]+", host)
+                or not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)):
+                raise ValueError
+            if sp == "github" and (host, rid, repo) != (
+                "github.com", 1449125557, "DUIDUI-Studio/DailyCheck-ops"
+            ):
+                raise ValueError
+            return context
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HostingError("invalid_private_publication_context") from exc
+
+
+class PublicationClaim(Protocol):
+    """Adapter owns durable per-sink state and holds fencing through HTTP.
+
+    check_current rejects superseded attempts (including newer success). intent
+    durably records uncertainty BEFORE a POST; bind is a fenced CAS, never an
+    authoritative deployment receipt. Only ready claims can make a first POST.
+    """
+
+    state: str
+    comment_id: int
+
+    def check_current(self) -> None: ...
+    def intent(self) -> None: ...
+    def bind(self, comment_id: int) -> None: ...
+
+
+class PublicationAuthority(Protocol):
+    def claim(self, context: PublicationContext, payload_sha256: str
+              ) -> AbstractContextManager[PublicationClaim]: ...
+
+
+def publish_public(facts: PublicDeployFacts, context: PublicationContext,
+                   *, authority: PublicationAuthority | None = None) -> int:
+    """Trusted caller injection only. No CLI/env/JSON authority implementation exists."""
+    body = render_public(facts)
+    digest = hashlib.sha256(json.dumps({"body": body}, ensure_ascii=False,
+                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if authority is None:
+        raise HostingError("trusted_fencing_adapter_not_wired")
+    if (context.pr, context.sha, context.public_receipt, context.outcome_at,
+        context.payload_sha256) != (facts.pr, facts.sha, facts.receipt, facts.outcome_at, digest):
+        raise HostingError("public_publication_payload_mismatch")
+    client = HostingClient(HostingConfig.from_environment(AccessRole.REPORT))
+    if client.config.provider is not Provider.GITHUB:
+        raise HostingError("public_github_destination_required")
+    root = f"/repos/{client.config.repo}"
+    with authority.claim(context, digest) as claim:
+        claim.check_current()
+        metadata = client.verify_repository()
+        if metadata.get("private") is not False or metadata.get("visibility") != "public":
+            raise HostingError("public_report_destination_mismatch")
+        pr = client.get(root + f"/pulls/{facts.pr}")
+        if (not isinstance(pr, dict) or pr.get("number") != facts.pr
+            or pr.get("html_url") != client.config.pr_url(facts.pr)
+            or pr.get("head", {}).get("sha") != facts.sha
+            or pr.get("base", {}).get("repo", {}).get("id") != 1448986421):
+            raise HostingError("public_report_pr_mismatch")
+        rows = client.pages(root + f"/issues/{facts.pr}/comments")
+        marker = publication_marker(facts)
+        matches = [row for row in rows if marker in str(row.get("body") or "")]
+        if len(matches) > 1:
+            raise HostingError("public_report_ambiguous")
+
+        def confirm(row):
+            if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0
+                or row.get("body") != body
+                or row.get("issue_url") != client.config.api_url + root + f"/issues/{facts.pr}"):
+                raise HostingError("public_report_confirmation_mismatch")
+            return row["id"]
+
+        if matches:
+            ident = confirm(matches[0])
+            if claim.comment_id and claim.comment_id != ident:
+                raise HostingError("public_report_mapping_mismatch")
+        else:
+            if claim.state != "ready" or claim.comment_id:
+                raise HostingError("public_report_response_uncertain")
+            claim.check_current()
+            claim.intent()
+            claim.check_current()
+            ident = confirm(client.request("POST", root + f"/issues/{facts.pr}/comments",
+                                           {"body": body})[0])
+        claim.check_current()
+        claim.bind(ident)
+        return ident
 
 
 # ── 动作 ──────────────────────────────────────────────────────────────────
@@ -563,7 +765,7 @@ def _assess(pr: int, repo: str, sha: str, rc: int, stage: str, tail: str,
     return tr, align, fetch_error
 
 
-def cmd_write(args: argparse.Namespace) -> int:
+def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | None = None) -> int:
     if _env("DAILYCHECK_DEPLOY_REPORT", "1") == "0":
         return 0
     if args.dry_run:
@@ -580,31 +782,58 @@ def cmd_write(args: argparse.Namespace) -> int:
         args.pr, args.repo, args.sha, args.rc, args.stage, tail, None, args.base
     )
     nxt = next_action(tr, align, autofix_count(args.pr) if args.pr else 0)
-    body = render(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
-
     comment_id = 0
-    try:
-        existing = find_same_sha_comment(args.pr, args.sha) if args.sha else 0
-    except HostingError:
-        print("[deploy-report] hosting comment lookup failed", file=sys.stderr)
-        return 1
-    if existing:
-        status, resp = gitea("PATCH", f"/repos/{_repo()}/issues/comments/{existing}",
-                             {"body": body})
-        verb = "更新"
-        comment_id = existing
-    else:
-        status, resp = gitea("POST", f"/repos/{_repo()}/issues/{args.pr}/comments",
-                             {"body": body})
-        verb = "写回"
+    write_rc = 0
+    if provider() is Provider.GITHUB:
         try:
-            comment_id = int(json.loads(resp).get("id") or 0)
-        except (ValueError, AttributeError):
-            comment_id = 0
-    if status not in (200, 201):
-        print(f"[deploy-report] WARN {verb} PR 失败 HTTP {status}", file=sys.stderr)
+            # This is private diagnostic storage, not a deployment/attempt receipt.
+            private_dir = event_log_path().parent / "reports"
+            require_shadow_path(private_dir)
+            private_dir.mkdir(parents=True, exist_ok=True)
+            private_body = render_private(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
+            private_file = private_dir / f"{uuid.uuid4()}.md"
+            fd = os.open(private_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(private_body)
+            if authority is None:
+                raise HostingError("trusted_fencing_adapter_not_wired")
+            path = getattr(args, "publication_context", "")
+            if not path:
+                raise HostingError("private_publication_context_required")
+            context = PublicationContext.parse(parse_json_object(Path(path).read_bytes()))
+            stage = tr["stage"]
+            if stage == "verify-drift":
+                stage = "verify"
+            elif stage == "unknown" and args.rc == 0:
+                stage = "complete"
+            facts = PublicDeployFacts(args.pr, args.sha, context.public_receipt, context.outcome_at,
+                                      tr["rc"], stage, tr["kind"], tr["scope"], align["verdict"], nxt)
+            comment_id = publish_public(facts, context, authority=authority)
+        except (HostingError, OSError, ValueError, TypeError) as exc:
+            print(f"[deploy-report] public publication blocked: {type(exc).__name__}", file=sys.stderr)
+            write_rc = 1
     else:
-        print(f"[deploy-report] 已{verb} PR #{args.pr}", file=sys.stderr)
+        body = render(args.pr, args.sha, tr, align, tail, fetch_error, nxt)
+        try:
+            existing = find_same_sha_comment(args.pr, args.sha) if args.sha else 0
+        except HostingError:
+            print("[deploy-report] hosting comment lookup failed", file=sys.stderr)
+            return 1
+        if existing:
+            status, resp = gitea("PATCH", f"/repos/{_repo()}/issues/comments/{existing}",
+                                 {"body": body})
+            verb, comment_id = "更新", existing
+        else:
+            status, resp = gitea("POST", f"/repos/{_repo()}/issues/{args.pr}/comments", {"body": body})
+            verb = "写回"
+            try:
+                comment_id = int(json.loads(resp).get("id") or 0)
+            except (ValueError, AttributeError):
+                comment_id = 0
+        if status not in (200, 201):
+            print(f"[deploy-report] WARN {verb} PR 失败 HTTP {status}", file=sys.stderr)
+        else:
+            print(f"[deploy-report] 已{verb} PR #{args.pr}", file=sys.stderr)
 
     # 评论写失败也照样投事件：事件是 agent 唯一的入口，Gitea 抖动不该让一次
     # 部署失败凭空消失。agent 拿到 next 后能自己回拉 PR 状态补齐上下文。
@@ -636,7 +865,7 @@ def cmd_write(args: argparse.Namespace) -> int:
     )
     if pushed:
         print(f"[deploy-report] 已唤醒 prod-agent next={nxt}", file=sys.stderr)
-    return 0
+    return write_rc
 
 
 def cmd_assess(args: argparse.Namespace) -> int:
@@ -677,6 +906,8 @@ def main(argv: list[str] | None = None) -> int:
     w = sub.add_parser("write", help="写回 PR 评论并投递 agent 事件")
     common(w)
     w.add_argument("--dry-run", action="store_true")
+    w.add_argument("--publication-context", default="",
+                   help="Private context ABI; GitHub still requires a trusted code-supplied fencing adapter (NOT WIRED)")
     w.set_defaults(func=cmd_write)
 
     a = sub.add_parser("assess", help="只输出对齐判定（供 agent 动手前调用）")
@@ -690,9 +921,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except Exception as exc:  # noqa: BLE001 — 收尾路径绝不能让异常冒泡
-        print(f"[deploy-report] WARN 内部异常已忽略: {type(exc).__name__}: {exc}",
+        print(f"[deploy-report] WARN 内部异常: {type(exc).__name__}",
               file=sys.stderr)
-        return 0
+        return 1 if provider() is Provider.GITHUB else 0
 
 
 if __name__ == "__main__":

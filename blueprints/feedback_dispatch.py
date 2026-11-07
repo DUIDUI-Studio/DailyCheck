@@ -4,8 +4,8 @@
 - **绝不抛异常**。派发失败时路由必须能降级（保留评论、提示人工建单），
   不能因为外部 API 故障丢掉管理员已经写好的处理意见。
 - **绝不把 token 写进日志**。所有失败原因只记 HTTP 状态码或异常类型名。
-- 幂等由调用方保证：``feedback_pure.attach_issue`` 只在
-  ``issue_number IS NULL`` 时更新，重复点「发送」不会造出第二张单。
+- Gitea 保留既有 ``attach_issue`` / label ID 接口。
+- GitHub 仅 ``deliver_private`` 接受持久 claim：丢响应只恢复，不盲目重发。
 - 纯标准库（``urllib``），与 wecom_notify_pure 的口径一致。
 - **正文渲染不在本模块**：见 ``feedback_issue_body``。这里 re-export 是为了让
   调用方（路由与测试）继续按 ``feedback_dispatch.build_issue_body`` 访问，
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import urllib.error
 import urllib.request
 from typing import Any
@@ -39,6 +40,12 @@ from .feedback_issue_body import (  # noqa: F401 - 对外 re-export
     build_issue_body,
     build_issue_title,
     detect_gaps,
+)
+from .feedback_pure import (
+    begin_private_creation,
+    claim_private_delivery,
+    finalize_private_delivery,
+    release_private_delivery,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,21 +109,8 @@ def create_issue(
     """
     try:
         if provider() is Provider.GITHUB:
-            client = HostingClient(HostingConfig.from_environment(AccessRole.FEEDBACK))
-            client.verify_repository()
-            payload = {"title": title, "body": body}
-            if label:
-                # GitHub Issue labels are names. A failed lookup is not an empty list.
-                labels = client.pages(f"/repos/{client.config.repo}/labels")
-                if not any(row.get("name") == label for row in labels):
-                    client.request("POST", f"/repos/{client.config.repo}/labels", {
-                        "name": label, "color": FEEDBACK_LABEL_COLOR, "description": FEEDBACK_LABEL_DESC,
-                    })
-                payload["labels"] = [label]
-            data = client.request("POST", f"/repos/{client.config.repo}/issues", payload)[0]
-            if not isinstance(data, dict) or type(data.get("number")) is not int or data["number"] <= 0:
-                raise HostingError("invalid_created_issue")
-            return {"number": data["number"], "url": issue_url(data["number"], data)}
+            # Private creation requires the saved draft and durable claim below.
+            raise HostingError("private_delivery_receipt_required")
     except HostingError as exc:
         logger.warning("feedback_dispatch_hosting_error: type=%s status=%s", type(exc).__name__, exc.status)
         return None
@@ -146,6 +140,70 @@ def create_issue(
         logger.warning("feedback_dispatch_failed: reason=no_issue_number")
         return None
     return {"number": number, "url": issue_url(number, data)}
+
+
+def _confirmed_private_issue(client: HostingClient, data: object, payload: dict) -> dict:
+    c = client.config
+    if (
+        not isinstance(data, dict)
+        or type(data.get("id")) is not int or data["id"] <= 0
+        or type(data.get("number")) is not int or data["number"] <= 0
+        or "pull_request" in data
+        or data.get("repository_url") != f"{c.api_url}/repos/{c.repo}"
+        or data.get("url") != f"{c.api_url}/repos/{c.repo}/issues/{data['number']}"
+        or data.get("html_url") != f"{c.web_url}/{c.repo}/issues/{data['number']}"
+        or data.get("title") != payload["title"] or data.get("body") != payload["body"]
+    ):
+        raise HostingError("private_issue_confirmation_mismatch")
+    return {"id": data["id"], "number": data["number"], "url": data["html_url"]}
+
+
+def deliver_private(db, ticket_id: int, admin_id: int,
+                    comment_id: int | None = None) -> dict | None:
+    """Only this caller can create GitHub feedback; uncertainty never re-POSTs."""
+    claim = None
+    try:
+        client = HostingClient(HostingConfig.from_environment(AccessRole.FEEDBACK))
+        if client.config.provider is not Provider.GITHUB:
+            raise HostingError("private_github_destination_required")
+        client.verify_repository()
+        claim = claim_private_delivery(db, ticket_id, admin_id, comment_id)
+        if claim is None:
+            return None
+        payload = json.loads(claim.payload_json)
+        root = f"/repos/{client.config.repo}"
+        if claim.action == "create":
+            labels = client.pages(root + "/labels")
+            if not any(row.get("name") == FEEDBACK_LABEL for row in labels):
+                client.request("POST", root + "/labels", {
+                    "name": FEEDBACK_LABEL, "color": FEEDBACK_LABEL_COLOR,
+                    "description": FEEDBACK_LABEL_DESC,
+                })
+            if not begin_private_creation(db, claim):
+                return None
+            data = client.request("POST", root + "/issues", payload)[0]
+        else:
+            # No search-index lag or open-only lookup: enumerate the complete destination.
+            rows = client.pages(root + "/issues", params={"state": "all"})
+            marker = f"<!-- dailycheck-private-request:v1 {claim.request_id} -->"
+            matches = [row for row in rows if marker in str(row.get("body") or "")]
+            if len(matches) != 1:
+                raise HostingError("private_creation_uncertain")
+            data = matches[0]
+        issue = _confirmed_private_issue(client, data, payload)
+        # Recheck privacy during recovery as well as before every mutation.
+        client.verify_repository()
+        return issue if finalize_private_delivery(db, claim, issue) else None
+    except (HostingError, sqlite3.Error, ValueError, TypeError, KeyError) as exc:
+        logger.warning("feedback_private_delivery_blocked: type=%s status=%s",
+                       type(exc).__name__, getattr(exc, "status", 0))
+        return None
+    finally:
+        if claim is not None:
+            try:
+                release_private_delivery(db, claim)
+            except sqlite3.Error as exc:
+                logger.warning("feedback_private_release_failed: type=%s", type(exc).__name__)
 
 
 def _ensure_label(token: str, repo: str, name: str) -> int | None:

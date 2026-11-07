@@ -215,6 +215,7 @@
 </p>
 
 <form method="post" action="{{ url_for('feedback.dispatch_feedback', ticket_id=ticket.id) }}" class="grid">
+  <input type="hidden" name="draft_version" value="{{ draft_version }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <label>Issue 标题
     <input type="text" name="draft_title" maxlength="120" required

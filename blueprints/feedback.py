@@ -38,6 +38,7 @@ from flask import (
 import config
 from db import get_master_db
 from permissions import require_login, require_platform_admin
+from scripts.hosting import HostingError, Provider, provider
 
 from . import feedback_dispatch as dispatch
 from . import feedback_introspect as introspect
@@ -61,6 +62,7 @@ from .feedback_pure import (
     build_admin_user_ids,
     count_open,
     create_ticket,
+    draft_version,
     fail_analysis,
     get_ticket,
     list_comments,
@@ -73,6 +75,7 @@ from .feedback_pure import (
     normalize_draft,
     save_analysis,
     save_draft,
+    save_private_draft,
     summarize,
 )
 from .notifications_pure import SUMMARY_MAX_LEN, emit_event
@@ -317,6 +320,7 @@ def admin_feedback_detail(ticket_id: int):
     return render_template(
         "admin/feedback_detail.html",
         ticket=ticket,
+        draft_version=draft_version(ticket.get("draft_title"), ticket.get("draft_body")),
         comments=comments,
         is_admin_view=True,
         dispatch_enabled=dispatch.dispatch_enabled(),
@@ -456,20 +460,38 @@ def dispatch_feedback(ticket_id: int):
                 return redirect(url_for(
                     "feedback.admin_feedback_detail", ticket_id=ticket_id))
 
-        save_draft(db, ticket_id, title, body)
+        try:
+            private_github = provider() is Provider.GITHUB
+        except HostingError:
+            save_draft(db, ticket_id, title, body)
+            flash("草稿已保存，但派发配置无效。")
+            return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+        if private_github:
+            if not save_private_draft(db, ticket, title, body, request.form.get("draft_version", "")):
+                flash("草稿已有更新，未覆盖；请刷新后复核。原有私有记录仍保留。")
+                return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
+        else:
+            save_draft(db, ticket_id, title, body)
 
         if not dispatch.dispatch_enabled():
             flash("草稿已保存，但派发通道未配置，请手动建 Issue。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
-        issue = dispatch.create_issue(title, body)
+        if private_github:
+            issue = dispatch.deliver_private(db, ticket_id, g.user["id"], comment_id)
+        else:
+            issue = dispatch.create_issue(title, body)
         if issue is None:
-            flash("草稿已保存，但创建 Issue 失败（详见服务端日志），请手动建单。")
+            if private_github:
+                flash("私有草稿和评论已保存；送达尚未确认或被阻止，请复核私有回执，勿重复建单。")
+            else:
+                flash("草稿已保存，但创建 Issue 失败（详见服务端日志），请手动建单。")
             return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
 
-        attach_issue(db, ticket_id, issue["number"], issue["url"], g.user["id"])
-        if comment_id is not None:
-            mark_comment_dispatched(db, comment_id)
+        if not private_github:
+            attach_issue(db, ticket_id, issue["number"], issue["url"], g.user["id"])
+            if comment_id is not None:
+                mark_comment_dispatched(db, comment_id)
 
     flash(f"已派发为 Issue #{issue['number']}，开发闭环已启动。")
     return redirect(url_for("feedback.admin_feedback_detail", ticket_id=ticket_id))
