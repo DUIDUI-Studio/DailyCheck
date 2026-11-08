@@ -1054,6 +1054,8 @@ def _capture_commands(monkeypatch, tmp_path, *, kind, argv, plugin=None):
         return b""
 
     monkeypatch.setattr(capture, "call", call)
+    monkeypatch.setattr(producer.shutil, "disk_usage", lambda _: SimpleNamespace(
+        free=producer.SCRATCH_RESERVE + producer.HOST_FREE_MARGIN))
     monkeypatch.setattr(
         producer.subprocess, "run",
         lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"1 passed\n", stderr=b""))

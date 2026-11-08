@@ -1546,6 +1546,8 @@ hosted pytest 使用 Docker `--init` 回收 Git auto-maintenance 及 reporter �
 固定 256 pids/2 CPU/2 GiB/2700s 等限制不变；低 UID owned fixture 的合成 app UID 必须
 与 fixture owner 不同且非 root，合成 runtime record 同步该身份，InstalledPolicy 与真实
 kernel UID/root 控制保持不变。Linux65532 小探针验证上述差异，不等同 hosted 全仓验收。
+只构造 Docker argv 的 synthetic capture fixture 自带容量事实，不依赖测试宿主的 tmpfs
+大小；真实 capture 的磁盘预检与 low-disk 拒绝控制不变。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找
