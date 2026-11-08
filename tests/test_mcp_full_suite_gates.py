@@ -39,7 +39,6 @@ def test_full_suite_entrypoint_includes_mcp(entrypoint):
 def test_verify_full_suite_uses_isolated_db_and_preserves_failure_gate(tmp_path, new_failure):
     source = (ROOT / "scripts/blue_green/verify.sh").read_text()
     function = source.split("_verify_check1_pytest() {", 1)[1].split("\n}\n", 1)[0]
-    function = function.replace("/tmp/verify-1-pytest.log", str(tmp_path / "pytest.log"))
     record = tmp_path / "invocation.json"
     fake_python = tmp_path / "python"
     known = next(
@@ -63,7 +62,8 @@ def test_verify_full_suite_uses_isolated_db_and_preserves_failure_gate(tmp_path,
     )
     fake_python.chmod(0o755)
     env = dict(os.environ, REPO_ROOT=str(ROOT), DC_PYTHON_BIN=str(fake_python),
-               DAILYCHECK_DB_DIR=str(tmp_path / "host-db"), TMPDIR=str(tmp_path))
+               DAILYCHECK_DB_DIR=str(tmp_path / "host-db"), TMPDIR=str(tmp_path),
+               VERIFY_TMP_DIR=str(tmp_path))
     proc = subprocess.run(
         ["bash", "-c", "_verify_check1_pytest() {" + function + "\n}\n_verify_check1_pytest"],
         env=env, text=True, capture_output=True, timeout=30,
