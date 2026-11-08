@@ -6,6 +6,7 @@ import multiprocessing
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from db import warehouse_migrate as runner
 from mcp_server.data.unit_of_work import warehouse_connection
 from migrations import MIGRATIONS
 from migrations.warehouse import WAREHOUSE_MIGRATIONS
+from tests.conftest import candidate_python_env
 
 
 def legacy(path, version=6):
@@ -198,6 +200,7 @@ def test_migration_backup_restore_and_down_refusal(tmp_path):
     after = snapshot(path)
     result = subprocess.run(
         [sys.executable, "-m", "db.warehouse_migrate", "--db", str(path), "down", "--target", "6"],
+        env=candidate_python_env(Path(__file__).resolve().parents[1]),
         capture_output=True,
         text=True,
     )
