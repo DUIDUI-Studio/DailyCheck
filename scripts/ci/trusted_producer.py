@@ -731,6 +731,143 @@ class _CaptureTimeout(Exception):
     pass
 
 
+# Failure-only pytest diagnostics. These are opaque, bounded copies of
+# untrusted candidate data for human diagnosis; they never feed the gate and
+# never create or change an attestation.
+PYTEST_JUNIT_NAME = ".dc-junit.xml"
+PYTEST_DIAGNOSTIC_DIR = "native-diagnostics"
+MAX_JUNIT_BYTES = 8 * 1024 * 1024
+MAX_RAW_TAIL_BYTES = 1024 * 1024
+MAX_METADATA_BYTES = 256 * 1024
+JUNIT_PREFIXES = (b"<?xml", b"<testsuites", b"<testsuite")
+
+
+def clear_pytest_junit(candidate: Path) -> None:
+    """Remove any candidate-preseeded JUnit path before the child runs."""
+    target = candidate / PYTEST_JUNIT_NAME
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+    except OSError:
+        # A directory or race leaves the path; pytest then writes nothing.
+        pass
+
+
+def _unlink_diagnostic(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _read_candidate_diagnostic(path: Path, root: Path, limit: int):
+    """Opaque bounded read; never follow a symlink out of the candidate root."""
+    if path.is_symlink():
+        return "unsafe", None, 0
+    try:
+        resolved, root_resolved = path.resolve(), root.resolve()
+    except OSError:
+        return "error", None, 0
+    if not resolved.is_relative_to(root_resolved):
+        return "unsafe", None, 0
+    if not path.exists():
+        return "missing", None, 0
+    if not path.is_file():
+        return "unsafe", None, 0
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            raw = handle.read(limit + 1)
+    except OSError:
+        return "error", None, 0
+    if len(raw) > limit:
+        return "oversized", None, size
+    return "present", raw, len(raw)
+
+
+def _write_diagnostic(path: Path, raw: bytes) -> None:
+    path.write_bytes(raw)
+    path.chmod(0o644)
+
+
+def _safe_metadata(name: str, value, directory: Path):
+    if value is None:
+        return "missing", 0, None
+    try:
+        payload = (json.dumps(value, sort_keys=True) + "\n").encode()
+    except (TypeError, ValueError):
+        return "invalid", 0, None
+    if len(payload) > MAX_METADATA_BYTES:
+        return "oversized", len(payload), hashlib.sha256(payload).hexdigest()
+    try:
+        _write_diagnostic(directory / name, payload)
+    except OSError:
+        return "error", len(payload), None
+    return "present", len(payload), hashlib.sha256(payload).hexdigest()
+
+
+def retain_pytest_diagnostics(candidate: Path, work: Path, capture: dict,
+                              session, raw: bytes) -> dict:
+    """Best-effort bounded copies; diagnostic problems never fail the gate."""
+    directory = work / PYTEST_DIAGNOSTIC_DIR
+    status = {"schema_version": 1, "kind": "pytest", "junit": "missing",
+              "junit_bytes": 0, "junit_sha256": None,
+              "raw_tail": "missing", "raw_tail_bytes": 0,
+              "raw_tail_sha256": None, "raw_total_bytes": len(raw or b""),
+              "raw_tail_trimmed": 0, "session": "missing", "session_bytes": 0,
+              "session_sha256": None, "capture": "missing", "capture_bytes": 0,
+              "capture_sha256": None}
+    try:
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            directory.unlink()
+        directory.mkdir(mode=0o755, exist_ok=True)
+        directory.chmod(0o755)
+    except OSError:
+        return status
+
+    state, data, size = _read_candidate_diagnostic(
+        candidate / PYTEST_JUNIT_NAME, candidate, MAX_JUNIT_BYTES)
+    if state == "present" and not data.lstrip().startswith(JUNIT_PREFIXES):
+        state = "malformed"
+    if state == "present":
+        try:
+            _write_diagnostic(directory / PYTEST_JUNIT_NAME, data)
+        except OSError:
+            state = "error"
+        else:
+            status.update(junit="present", junit_bytes=len(data),
+                          junit_sha256=hashlib.sha256(data).hexdigest())
+    if status["junit"] != "present":
+        status.update(junit=state, junit_bytes=size)
+        _unlink_diagnostic(directory / PYTEST_JUNIT_NAME)
+
+    tail = (raw or b"")[-MAX_RAW_TAIL_BYTES:]
+    if tail:
+        try:
+            _write_diagnostic(directory / "pytest-output-tail.txt", tail)
+            status.update(raw_tail="present", raw_tail_bytes=len(tail),
+                          raw_tail_sha256=hashlib.sha256(tail).hexdigest(),
+                          raw_tail_trimmed=int(len(tail) < len(raw or b"")))
+        except OSError:
+            status["raw_tail"] = "error"
+    else:
+        _unlink_diagnostic(directory / "pytest-output-tail.txt")
+
+    for key, name, value in (("session", "session.json", session),
+                             ("capture", "capture.json", capture)):
+        state, size, sha = _safe_metadata(name, value, directory)
+        status.update({key: state, key + "_bytes": size, key + "_sha256": sha})
+        if state != "present":
+            _unlink_diagnostic(directory / name)
+
+    try:
+        _write_diagnostic(directory / "status.json",
+                          (json.dumps(status, sort_keys=True) + "\n").encode())
+    except OSError:
+        return status
+    return status
+
+
 class DockerCapture:
     """Only this trusted host process can reach the daemon or publish evidence.
 
@@ -1044,9 +1181,13 @@ def job(args):
         if lint["native_exit"] != 0:
             raise ValueError("actual changed-file Ruff gate failed")
         _stage("pytest-capture")
+        clear_pytest_junit(candidate)
         capture, output, session = runner.capture(candidate, binding, "pytest", "test",
             ["python3", "-P", "-m", "pytest", "--basetemp=/tmp/pytest", "-q", "--tb=no", "-rfE", "--color=no",
-             "-p", "dc_approved_evidence", "--dc-evidence=/candidate/.dc-session.json"], {})
+             "-p", "dc_approved_evidence", "--dc-evidence=/candidate/.dc-session.json",
+             "--junitxml=/candidate/" + PYTEST_JUNIT_NAME], {})
+        # Bounded opaque copies for failure diagnosis; never part of the proof.
+        retain_pytest_diagnostics(candidate, work, capture, session, output)
         _stage("evidence")
         envelope = make_test_envelope(output, session, capture, binding)
         producer = {"identity": identity(manifest, manifest_blob), "lint_capture": lint,

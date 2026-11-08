@@ -9,7 +9,9 @@ import copy
 import hashlib
 import inspect
 import json
+import os
 import subprocess
+import sys
 from http.client import IncompleteRead
 from pathlib import Path
 from types import SimpleNamespace
@@ -1096,3 +1098,192 @@ def test_pytest_capture_rejects_a_changed_evidence_plugin(monkeypatch, tmp_path)
         _capture_commands(monkeypatch, tmp_path, kind="pytest",
                           argv=["python3", "-P", "-m", "pytest"],
                           plugin=b"# candidate-controlled plugin\n")
+
+
+UPLOAD_ARTIFACT_ACTION = (
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+EVIDENCE_PLUGIN = ROOT / "scripts/ci/pytest_evidence.py"
+
+
+def _run_native_pytest(tmp_path, *, include_error):
+    """Real pytest child with the pinned evidence plugin; no Docker."""
+    candidate = tmp_path / "candidate"
+    (candidate / "tests").mkdir(parents=True)
+    (candidate / "tests/test_ok.py").write_text("def test_ok():\n    assert True\n")
+    if include_error:
+        (candidate / "tests/test_error.py").write_text(
+            "import pytest\n\n"
+            "@pytest.fixture\n"
+            "def broken():\n"
+            "    raise RuntimeError('setup boom from fixture')\n\n"
+            "def test_uses_broken(broken):\n"
+            "    assert True\n")
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "dc_approved_evidence.py").write_bytes(EVIDENCE_PLUGIN.read_bytes())
+    junit = candidate / producer.PYTEST_JUNIT_NAME
+    session_path = candidate / ".dc-session.json"
+    env = {**os.environ, "PYTHONPATH": str(plugin_dir),
+           "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+    env.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--basetemp=" + str(tmp_path / "pytest-tmp"),
+         "-q", "--tb=no", "-rfE", "--color=no", "-p", "dc_approved_evidence",
+         "--dc-evidence=" + str(session_path), "--junitxml=" + str(junit),
+         "tests" if include_error else "tests/test_ok.py"],
+        cwd=candidate, env=env, capture_output=True, text=True, timeout=120)
+    raw = result.stdout.encode() + result.stderr.encode()
+    session = json.loads(session_path.read_text())
+    capture = {"version": 1, "kind": "pytest", "context": "test",
+               "native_exit": result.returncode,
+               "stdout_sha256": hashlib.sha256(raw).hexdigest(),
+               "session_sha256": producer.digest(session), "exited": True,
+               "removed": True, "oom_killed": False}
+    return candidate, junit, raw, session, capture
+
+
+def test_native_pytest_junit_keeps_traceback_and_copy_is_exact(tmp_path):
+    candidate, junit, raw, session, capture = _run_native_pytest(tmp_path, include_error=True)
+    xml = junit.read_bytes()
+    assert b"<error" in xml
+    assert b"tests.test_error" in xml and b'name="test_uses_broken"' in xml
+    assert b"setup boom from fixture" in xml
+    work = tmp_path / "work"
+    work.mkdir()
+    status = producer.retain_pytest_diagnostics(candidate, work, capture, session, raw)
+    directory = work / producer.PYTEST_DIAGNOSTIC_DIR
+    assert (directory / producer.PYTEST_JUNIT_NAME).read_bytes() == xml
+    assert (directory / "pytest-output-tail.txt").read_bytes() == raw[-producer.MAX_RAW_TAIL_BYTES:]
+    session_bytes = (json.dumps(session, sort_keys=True) + "\n").encode()
+    assert (directory / "session.json").read_bytes() == session_bytes
+    assert (directory / "capture.json").read_bytes() == (
+        json.dumps(capture, sort_keys=True) + "\n").encode()
+    assert status["junit"] == "present" and status["junit_bytes"] == len(xml)
+    assert status["junit_sha256"] == hashlib.sha256(xml).hexdigest()
+    assert status["session_sha256"] == hashlib.sha256(session_bytes).hexdigest()
+    # Raw/session gate semantics are unchanged: the H6 ERROR signature remains.
+    with pytest.raises(producer.EvidenceValidationError) as caught:
+        producer.make_test_envelope(raw, session, capture, {"version": 3, "phase": "H"})
+    assert (caught.value.reason, caught.value.subreason) == ("raw-session-invalid", "errors")
+
+
+def test_native_pytest_positive_control_envelope_is_unchanged(tmp_path):
+    candidate, junit, raw, session, capture = _run_native_pytest(tmp_path, include_error=False)
+    assert capture["native_exit"] == 0
+    assert b"<testsuite" in junit.read_bytes() and b"test_ok" in junit.read_bytes()
+    work = tmp_path / "work"
+    work.mkdir()
+    binding = {"version": 3, "phase": "H"}
+    envelope = producer.make_test_envelope(raw, session, capture, binding)
+    status = producer.retain_pytest_diagnostics(candidate, work, capture, session, raw)
+    assert status["junit"] == "present"
+    directory = work / producer.PYTEST_DIAGNOSTIC_DIR
+    (directory / producer.PYTEST_JUNIT_NAME).write_bytes(b"mutated diagnostic")
+    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"mutated candidate diagnostic")
+    assert producer.make_test_envelope(raw, session, capture, binding) == envelope
+    assert not (work / "attestation.json").exists()
+
+
+def test_diagnostic_retention_negative_controls(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    directory = work / producer.PYTEST_DIAGNOSTIC_DIR
+    raw = b"candidate raw output with ::error::MARKER"
+    capture = {"native_exit": 1}
+
+    status = producer.retain_pytest_diagnostics(candidate, work, capture, None, raw)
+    assert status["junit"] == "missing" and not (directory / producer.PYTEST_JUNIT_NAME).exists()
+
+    canary = tmp_path / "host-canary.txt"
+    canary.write_text("HOST-CANARY-SECRET")
+    (candidate / producer.PYTEST_JUNIT_NAME).symlink_to(canary)
+    status = producer.retain_pytest_diagnostics(candidate, work, capture, None, raw)
+    assert status["junit"] == "unsafe"
+    assert not (directory / producer.PYTEST_JUNIT_NAME).exists()
+    assert all("HOST-CANARY-SECRET" not in path.read_text(errors="replace")
+               for path in directory.iterdir() if path.is_file())
+    (candidate / producer.PYTEST_JUNIT_NAME).unlink()
+
+    outside = tmp_path / "outside.xml"
+    outside.write_text("<?xml version='1.0'?><testsuites/>")
+    assert producer._read_candidate_diagnostic(outside, candidate, 1024) == ("unsafe", None, 0)
+
+    monkeypatch.setattr(producer, "MAX_JUNIT_BYTES", 16)
+    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"<?xml " + b"x" * 20)
+    assert producer.retain_pytest_diagnostics(
+        candidate, work, capture, None, raw)["junit"] == "oversized"
+    monkeypatch.setattr(producer, "MAX_JUNIT_BYTES", 8 * 1024 * 1024)
+    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"not xml")
+    assert producer.retain_pytest_diagnostics(
+        candidate, work, capture, None, raw)["junit"] == "malformed"
+    assert not (directory / producer.PYTEST_JUNIT_NAME).exists()
+
+    (candidate / "secret.txt").write_text("candidate-secret")
+    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(
+        b"<?xml version='1.0'?><testsuites/>")
+    status = producer.retain_pytest_diagnostics(
+        candidate, work, capture, {"a": 1}, raw)
+    assert status["junit"] == "present"
+    assert {path.name for path in directory.iterdir()} == {
+        producer.PYTEST_JUNIT_NAME, "pytest-output-tail.txt", "status.json",
+        "session.json", "capture.json"}
+    assert all("candidate-secret" not in path.read_text(errors="replace")
+               for path in directory.iterdir() if path.is_file())
+
+
+def test_retention_never_prints_candidate_text(tmp_path, capsys):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(
+        b"<?xml version='1.0'?><testsuites><error>candidate-secret</error></testsuites>")
+    work = tmp_path / "work"
+    work.mkdir()
+    producer.retain_pytest_diagnostics(
+        candidate, work, {"native_exit": 1}, None,
+        b"::error::CANDIDATE-MARKER candidate-secret\n1 error in 1s\n")
+    captured = capsys.readouterr()
+    assert "candidate-secret" not in captured.out + captured.err
+    assert "::error::" not in captured.out + captured.err
+
+
+def test_failure_diagnostics_upload_is_narrow_pinned_and_failure_only():
+    workflow = _workflow()
+    uploads = {}
+    for job_name, job in workflow["jobs"].items():
+        steps = job["steps"]
+        native = next(index for index, step in enumerate(steps)
+                      if step.get("name") == "Execute approved isolated native producer")
+        step = steps[native + 1]
+        assert step.get("name") == "Upload native failure diagnostics"
+        assert step["uses"] == UPLOAD_ARTIFACT_ACTION
+        assert "failure()" in step["if"]
+        assert "env.CI_NATIVE_PRODUCER == 'true'" in step["if"]
+        assert step["with"]["path"] == "${{ env.CI_ROOT }}/native-diagnostics"
+        assert step["with"]["retention-days"] == "2"
+        assert step["with"]["if-no-files-found"] == "ignore"
+        assert "github.run_id" in step["with"]["name"]
+        assert "github.run_attempt" in step["with"]["name"]
+        uploads[job_name] = step["with"]["name"]
+    assert set(uploads) == {"test", "agent-framework-reports"}
+    assert uploads["test"] != uploads["agent-framework-reports"]
+    assert "test" in uploads["test"] and "reports" in uploads["agent-framework-reports"]
+    assert sum(1 for job in workflow["jobs"].values() for step in job["steps"]
+               if step.get("uses", "").startswith("actions/upload-artifact@")) == 2
+    assert workflow["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert set(workflow["jobs"]) == {"test", "agent-framework-reports"}
+    assert workflow["on"]["push"]["branches"] == ["main"]
+
+
+def test_job_pytest_command_keeps_full_selection_and_one_junit():
+    source = inspect.getsource(producer.job)
+    assert '"-q", "--tb=no", "-rfE", "--color=no"' in source
+    assert '"-p", "dc_approved_evidence"' in source
+    assert source.count("--junitxml=/candidate/") == 1
+    for forbidden in ("-k ", "--deselect", "--ignore"):
+        assert forbidden not in source
+    assert source.index("clear_pytest_junit(candidate)") < source.index(
+        "runner.capture(candidate, binding, \"pytest\"")
+    assert source.index("retain_pytest_diagnostics(candidate") < source.index(
+        '_stage("evidence")')

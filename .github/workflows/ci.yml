@@ -114,7 +114,7 @@ jobs:
         id: native_producer
         if: env.CI_NATIVE_PRODUCER == 'true'
         env:
-          CI_PRODUCER_MANIFEST_BLOB: 11cc44b91e1803186813cc61317d362532a28ddc
+          CI_PRODUCER_MANIFEST_BLOB: 2b0122b211b8cb3fcdc1a211221946f1b6da00b1
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           NATIVE_CONTEXT: test
         run: |
@@ -154,6 +154,14 @@ jobs:
           else
             python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
           fi
+      - name: Upload native failure diagnostics
+        if: failure() && github.server_url == 'https://github.com' && env.CI_NATIVE_PRODUCER == 'true' && steps.native_producer.conclusion == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-diagnostics-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_ROOT }}/native-diagnostics
+          if-no-files-found: ignore
+          retention-days: 2
       - name: Resolve authenticated merge-group members
         id: member_manifest
         if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')
@@ -311,7 +319,7 @@ jobs:
         id: native_producer
         if: env.CI_NATIVE_PRODUCER == 'true'
         env:
-          CI_PRODUCER_MANIFEST_BLOB: 11cc44b91e1803186813cc61317d362532a28ddc
+          CI_PRODUCER_MANIFEST_BLOB: 2b0122b211b8cb3fcdc1a211221946f1b6da00b1
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           NATIVE_CONTEXT: agent-framework-reports
           UPSTREAM_RESULT: ${{ needs.test.result }}
@@ -354,6 +362,14 @@ jobs:
           else
             python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
           fi
+      - name: Upload native failure diagnostics
+        if: failure() && github.server_url == 'https://github.com' && env.CI_NATIVE_PRODUCER == 'true' && steps.native_producer.conclusion == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-diagnostics-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_ROOT }}/native-diagnostics
+          if-no-files-found: ignore
+          retention-days: 2
       - name: Resolve authenticated merge-group members
         id: member_manifest
         if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')

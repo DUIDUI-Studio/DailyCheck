@@ -1589,6 +1589,16 @@ attestation。native capture 只在退出
 不成立时追加已验证的 `native_exit`（0–255，否则 unknown）与 timeout/OOM/error/image 标志。
 异常文本、candidate 输出、URL/签名参数、响应 body、环境值、traceback 均不输出；成功路径与
 no-attestation 语义不变。
+
+hosted pytest 捕获额外以固定 `--junitxml=/candidate/.dc-junit.xml` 生成 JUnit（`-q/--tb=no`
+与完整选择不变），执行前删除候选预置的该文件。proven child exit 后由 controller 把 JUnit
+（≤8 MiB）、raw tail（≤1 MiB）、session/capture metadata（≤256 KiB）复制到固定
+`$CI_ROOT/native-diagnostics`；只允许这些固定文件名，缺失/超大/畸形/符号链接逃逸记为
+controller-owned `status.json` 的固定状态、大小与 SHA256。这些副本是 untrusted diagnostic
+data，不参与 gate/attestation，也不能把有效 native proof 变成失败。GitHub 的 test/
+agent-framework-reports job 各自只在 native producer 失败时，用固定 SHA 的
+`actions/upload-artifact` 上传该目录（retention 2 天、唯一 run/attempt/job 名、
+`if-no-files-found: ignore`）；权限、job/event/runner/runtime 与 Gitea 路径不变。
 coordinator-owned `local_fixture_only` image 仍可解析；它不提供 hosted/Prod runtime
 或隔离 signer 的安装证明。GitHub runner/platform Python/daemon 属于平台信任根，candidate
 不能在该主机执行；runtime 自身恶意或任意 malicious pytest/test intent 不在本次证明内，仍需

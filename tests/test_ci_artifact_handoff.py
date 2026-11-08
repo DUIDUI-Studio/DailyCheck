@@ -1,4 +1,4 @@
-"""Static contracts for the artifact-v4-free CI pytest handoff."""
+"""Static contracts: no artifact-based pytest handoff; failure-only diagnostics only."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -42,10 +43,101 @@ def _job(workflow: str, name: str) -> str:
     return match.group("body")
 
 
-def test_artifact_v4_actions_are_entirely_removed(workflow):
-    assert "upload-artifact" not in workflow
-    assert "download-artifact" not in workflow
-    assert "artifact@v4" not in workflow
+UPLOAD_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
+UPLOAD_ACTION = "actions/upload-artifact@" + UPLOAD_SHA
+DIAGNOSTIC_PATH = "${{ env.CI_ROOT }}/native-diagnostics"
+UPLOAD_IF = ("failure() && github.server_url == 'https://github.com' "
+             "&& env.CI_NATIVE_PRODUCER == 'true' "
+             "&& steps.native_producer.conclusion == 'failure'")
+
+
+def _require(condition, detail="diagnostic upload contract violated"):
+    if not condition:
+        raise AssertionError(detail)
+
+
+def _upload_step(context: str) -> str:
+    return (
+        "      - name: Upload native failure diagnostics\n"
+        f"        if: {UPLOAD_IF}\n"
+        f"        uses: {UPLOAD_ACTION}\n"
+        "        with:\n"
+        f"          name: native-diagnostics-{context}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}\n"
+        f"          path: {DIAGNOSTIC_PATH}\n"
+        "          if-no-files-found: ignore\n"
+        "          retention-days: 2\n")
+
+
+def _assert_diagnostic_upload_contract(workflow: str) -> None:
+    """No artifact handoff; exactly two narrow failure-only diagnostic uploads."""
+    document = yaml.load(workflow, Loader=yaml.BaseLoader)
+    _require("download-artifact" not in workflow)
+    _require("artifact@v4" not in workflow)
+    _require(set(document["jobs"]) == {"test", "agent-framework-reports"})
+    _require(document["permissions"] == {"contents": "read", "pull-requests": "read"})
+    _require(document["on"]["push"]["branches"] == ["main"])
+    uploads = []
+    for job_name, job in document["jobs"].items():
+        for index, step in enumerate(job["steps"]):
+            if "upload-artifact" in step.get("uses", ""):
+                uploads.append((job_name, step, job["steps"][index - 1]))
+    _require(len(uploads) == 2)
+    _require({job_name for job_name, _, _ in uploads}
+             == {"test", "agent-framework-reports"})
+    names = set()
+    for _job_name, step, previous in uploads:
+        _require(step.get("uses") == UPLOAD_ACTION)
+        _require(previous.get("name") == "Execute approved isolated native producer")
+        for condition in ("failure()", "github.server_url == 'https://github.com'",
+                          "env.CI_NATIVE_PRODUCER == 'true'",
+                          "steps.native_producer.conclusion == 'failure'"):
+            _require(condition in step.get("if", ""))
+        with_ = step.get("with", {})
+        _require(with_.get("path") == DIAGNOSTIC_PATH)
+        _require(with_.get("retention-days") == "2")
+        _require(with_.get("if-no-files-found") == "ignore")
+        _require("github.run_id" in with_.get("name", ""))
+        _require("github.run_attempt" in with_.get("name", ""))
+        names.add(with_.get("name", ""))
+    _require(len(names) == 2)
+    _require(any("test" in name for name in names))
+    _require(any("reports" in name for name in names))
+
+
+def test_only_failure_diagnostic_uploads_remain(workflow):
+    _assert_diagnostic_upload_contract(workflow)
+
+
+@pytest.mark.parametrize("mutation", [
+    "handoff-upload", "download", "third-upload", "unpinned", "not-failure", "wide-path",
+])
+def test_diagnostic_upload_contract_rejects_forbidden_variants(workflow, mutation):
+    test_step = _upload_step("test")
+    _require(workflow.count(test_step) == 1)
+    if mutation == "handoff-upload":
+        replacement = (
+            "      - name: Handoff pytest summary\n"
+            f"        uses: {UPLOAD_ACTION}\n"
+            "        with:\n"
+            "          name: pytest-summary\n"
+            "          path: ${{ env.CI_ROOT }}/pytest-output.txt\n")
+    elif mutation == "download":
+        replacement = (
+            "      - name: Restore pytest summary\n"
+            "        uses: actions/download-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02\n"
+            "        with:\n          name: pytest-summary\n")
+    elif mutation == "third-upload":
+        replacement = test_step + test_step.replace(
+            "native-diagnostics-test-", "native-diagnostics-extra-")
+    elif mutation == "unpinned":
+        replacement = test_step.replace(UPLOAD_ACTION, "actions/upload-artifact@v4")
+    elif mutation == "not-failure":
+        replacement = test_step.replace("failure() && ", "", 1)
+    else:
+        replacement = test_step.replace(DIAGNOSTIC_PATH, "${{ env.CI_ROOT }}")
+    mutated = workflow.replace(test_step, replacement, 1)
+    with pytest.raises(AssertionError):
+        _assert_diagnostic_upload_contract(mutated)
 
 
 def test_two_required_repository_check_jobs_remain(workflow):
