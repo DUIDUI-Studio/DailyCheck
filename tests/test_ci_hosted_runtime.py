@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import subprocess
+from http.client import IncompleteRead
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
@@ -59,7 +60,10 @@ class _Response:
         self._chunks, self.status = iter(chunks), status
 
     def read(self, size=-1):
-        return next(self._chunks, b"")
+        item = next(self._chunks, b"")
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def __enter__(self):
         return self
@@ -76,6 +80,34 @@ def _opener(chunks=(), *, status=200, error=None):
             return _Response(chunks, status)
 
     return Opener()
+
+
+class _SequenceOpener:
+    """Repeat the last controlled effect for every attempt."""
+
+    def __init__(self, effects):
+        self.effects = list(effects)
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        effect = self.effects[min(len(self.requests) - 1, len(self.effects) - 1)]
+        if isinstance(effect, BaseException):
+            raise effect
+        return effect
+
+
+def _runtime_for(payload):
+    runtime = copy.deepcopy(RUNTIME)
+    runtime["archive"].update(bytes=len(payload),
+                              sha256=hashlib.sha256(payload).hexdigest())
+    return runtime
+
+
+def _record_sleeps(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(producer.time, "sleep", sleeps.append)
+    return sleeps
 
 
 def _inspection(ident, *, architecture="arm64", os_name="linux", layers=None):
@@ -258,7 +290,8 @@ def test_download_revalidates_the_route_at_its_own_boundary(tmp_path):
 
 @pytest.mark.parametrize("damage", ["long", "partial", "hash", "status", "missing",
                                     "network", "foreign-url", "json"])
-def test_download_rejects_bad_bytes_before_any_load(tmp_path, damage):
+def test_download_rejects_bad_bytes_before_any_load(tmp_path, monkeypatch, damage):
+    _record_sleeps(monkeypatch)
     payload = b"pinned-bytes" * 100
     runtime = copy.deepcopy(RUNTIME)
     runtime["archive"].update(bytes=len(payload),
@@ -288,6 +321,172 @@ def test_download_rejects_bad_bytes_before_any_load(tmp_path, damage):
     with pytest.raises(ValueError):
         producer.download_archive(runtime, destination, opener=opener)
     assert not destination.exists()
+
+
+def test_transient_transport_retries_then_streams_exact_bytes(tmp_path, monkeypatch):
+    payload = b"retry-payload" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([URLError("transient"),
+                              _Response([payload[:7000], payload[7000:]])])
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert destination.read_bytes() == payload
+    assert len(opener.requests) == 2
+    assert sleeps == [producer.ARCHIVE_BACKOFF_SECONDS[0]]
+    assert all(request.full_url == API_ARCHIVE_URL for request in opener.requests)
+
+
+def test_transport_retry_budget_is_finite_and_leaves_no_file(tmp_path, monkeypatch):
+    payload = b"retry-exhausted" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([URLError("offline")])
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(producer.ArchiveTransportError) as caught:
+        producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert producer.ARCHIVE_ATTEMPTS == 3
+    assert len(opener.requests) == producer.ARCHIVE_ATTEMPTS
+    assert caught.value.attempts == producer.ARCHIVE_ATTEMPTS
+    assert sleeps == list(producer.ARCHIVE_BACKOFF_SECONDS)
+    assert not destination.exists()
+    assert ("[ci-producer] operation=startup category=transport attempts=3"
+            in producer._failure_diagnostic(caught.value))
+
+
+@pytest.mark.parametrize("status", sorted(producer.TRANSIENT_HTTP_STATUSES))
+def test_transient_http_statuses_retry_then_succeed(status, tmp_path, monkeypatch):
+    payload = b"transient-http" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([
+        HTTPError(API_ARCHIVE_URL, status, "transient", {}, None),
+        _Response([payload])])
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert destination.read_bytes() == payload
+    assert len(opener.requests) == 2
+    assert sleeps == [producer.ARCHIVE_BACKOFF_SECONDS[0]]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 416, 501, 505])
+def test_permanent_http_statuses_fail_without_retry(status, tmp_path, monkeypatch):
+    payload = b"permanent-http" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([
+        HTTPError(API_ARCHIVE_URL, status, "permanent", {}, None)])
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(producer.ArchiveHTTPError) as caught:
+        producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert len(opener.requests) == 1
+    assert caught.value.attempts == 1 and caught.value.http_status == status
+    assert sleeps == [] and not destination.exists()
+    assert (f"category=http http_status={status} attempts=1"
+            in producer._failure_diagnostic(caught.value))
+
+
+@pytest.mark.parametrize("damage", ["hash", "size"])
+def test_integrity_mismatch_is_never_retried(tmp_path, monkeypatch, damage):
+    payload = b"integrity" * 4096
+    runtime = _runtime_for(payload)
+    if damage == "hash":
+        runtime["archive"]["sha256"] = "0" * 64
+    else:
+        runtime["archive"]["bytes"] = len(payload) + 1
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([_Response([payload])])
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(producer.ArchiveIntegrityError) as caught:
+        producer.download_archive(runtime, destination, opener=opener)
+    assert len(opener.requests) == 1
+    assert caught.value.attempts == 1
+    assert sleeps == [] and not destination.exists()
+    assert "category=integrity attempts=1" in producer._failure_diagnostic(caught.value)
+
+
+def test_incomplete_read_is_retried_and_partial_file_removed(tmp_path, monkeypatch):
+    payload = b"partial-read" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    destination = tmp_path / "archive.tar.gz"
+
+    class Opener:
+        def __init__(self):
+            self.calls = 0
+
+        def open(self, request, timeout=None):
+            self.calls += 1
+            # Every attempt starts clean: no partial file from the prior one.
+            assert not destination.exists()
+            if self.calls == 1:
+                return _Response([payload[:512], IncompleteRead(payload[:512])])
+            return _Response([payload[:3000], payload[3000:]])
+
+    opener = Opener()
+    producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert opener.calls == 2
+    assert destination.read_bytes() == payload
+    assert sleeps == [producer.ARCHIVE_BACKOFF_SECONDS[0]]
+
+
+def test_retry_delay_ignores_untrusted_retry_after(tmp_path, monkeypatch):
+    payload = b"retry-after" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([
+        HTTPError(API_ARCHIVE_URL, 503, "busy", {"Retry-After": "999999"}, None),
+        _Response([payload])])
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert sleeps == [producer.ARCHIVE_BACKOFF_SECONDS[0]]
+    assert 999999 not in sleeps
+
+
+def test_redirect_and_route_policy_failures_are_not_retried(tmp_path, monkeypatch):
+    payload = b"policy" * 4096
+    sleeps = _record_sleeps(monkeypatch)
+    opener = _SequenceOpener([ValueError("unapproved runtime archive redirect")])
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(ValueError) as caught:
+        producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert type(caught.value) is ValueError
+    assert len(opener.requests) == 1
+    assert sleeps == [] and not destination.exists()
+    assert "category=invalid_data" in producer._failure_diagnostic(caught.value)
+
+    route = _runtime_for(payload)
+    route["archive"]["url"] = API_ARCHIVE_URL.replace("DUIDUI-Studio", "other")
+    destination.write_bytes(b"stale-partial")
+    unopened = _SequenceOpener([_Response([payload])])
+    with pytest.raises(ValueError):
+        producer.download_archive(route, destination, opener=unopened)
+    assert unopened.requests == [] and not destination.exists()
+
+
+def test_disk_preflight_is_a_distinct_stage_and_category(monkeypatch, tmp_path):
+    monkeypatch.setattr(producer, "OPERATION", "startup")
+    monkeypatch.setattr(producer.shutil, "disk_usage",
+                        lambda path: SimpleNamespace(free=0))
+    monkeypatch.setattr(producer, "inspect_image", lambda docker, ref: None)
+    downloads = []
+    monkeypatch.setattr(producer, "download_archive",
+                        lambda *args, **kwargs: downloads.append(args))
+    with pytest.raises(producer.ArchivePreflightError) as caught:
+        producer.ensure_approved_runtime(["docker"], MANIFEST, tmp_path)
+    assert producer.OPERATION == "runtime-preflight"
+    assert producer._failure_diagnostic(caught.value) == (
+        "[ci-producer] operation=runtime-preflight category=preflight")
+    assert downloads == []
+    assert not (tmp_path / "runtime/approved-runtime.tar.gz").exists()
+
+
+@pytest.mark.parametrize("error,expected", [
+    (producer.ArchiveTransportError(3), "category=transport attempts=3"),
+    (producer.ArchiveHTTPError(503, 3), "category=http http_status=503 attempts=3"),
+    (producer.ArchiveIntegrityError(1), "category=integrity attempts=1"),
+    (producer.ArchivePreflightError(), "category=preflight"),
+])
+def test_archive_diagnostics_use_only_fixed_tokens(monkeypatch, error, expected):
+    secret = "https://release-assets.githubusercontent.com/x?X-Amz-Signature=SECRET"
+    error.args = (secret,)
+    diagnostic = producer._failure_diagnostic(error)
+    assert expected in diagnostic
+    assert "SECRET" not in diagnostic and "release-assets" not in diagnostic
 
 
 def test_redirects_are_public_https_and_credential_free():
@@ -431,6 +630,20 @@ def test_failure_reports_fixed_operation_without_error_detail(monkeypatch, capsy
     assert "[ci-producer] operation=runtime-archive category=invalid_data" in error
     assert "trusted native producer failed; no success attestation" in error
     assert "secret" not in error and "abc123" not in error
+    assert "DAILYCHECK_NATIVE_EVIDENCE=" not in error
+
+
+def test_entrypoint_reports_bounded_archive_attempts(monkeypatch, capsys):
+    def explode():
+        producer._stage("runtime-archive")
+        raise producer.ArchiveTransportError(producer.ARCHIVE_ATTEMPTS)
+
+    monkeypatch.setattr(producer, "main", explode)
+    assert producer.entrypoint() == 1
+    error = capsys.readouterr().err
+    assert ("[ci-producer] operation=runtime-archive category=transport attempts=3"
+            in error)
+    assert "trusted native producer failed; no success attestation" in error
     assert "DAILYCHECK_NATIVE_EVIDENCE=" not in error
 
 

@@ -22,7 +22,9 @@ import sys
 import time
 import traceback
 import uuid
+from http.client import BadStatusLine, IncompleteRead
 from pathlib import Path, PurePosixPath
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -52,11 +54,58 @@ HOSTED_PYTEST_SECONDS = 2700
 SCRATCH_RESERVE = 4 * 1024 ** 3
 HOST_FREE_MARGIN = 2 * 1024 ** 3
 
+# Bounded retrieval retry. Only classified transient transport/HTTP failures
+# are retried; integrity, route and redirect-policy failures never are. Backoff
+# is fixed, so an untrusted Retry-After header can never set the wait time.
+ARCHIVE_HTTP_TIMEOUT = 120
+ARCHIVE_CHUNK = 1024 * 1024
+ARCHIVE_ATTEMPTS = 3
+ARCHIVE_RETRY_SECONDS = 300.0
+ARCHIVE_BACKOFF_SECONDS = (1.0, 2.0)
+TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+class ArchivePreflightError(ValueError):
+    """Disk preflight failed before any retrieval attempt; never retried."""
+
+
+class ArchiveTransportError(ValueError):
+    """Transport failure during open/read; retried within the bounded budget."""
+
+    retryable = True
+
+    def __init__(self, attempts: int = 1):
+        self.attempts = attempts
+        super().__init__("approved runtime archive transport failure")
+
+
+class ArchiveHTTPError(ValueError):
+    """HTTP status failure; only transient statuses are retried."""
+
+    def __init__(self, http_status: int | None, attempts: int = 1):
+        self.http_status = http_status
+        self.attempts = attempts
+        self.retryable = http_status in TRANSIENT_HTTP_STATUSES
+        super().__init__("approved runtime archive HTTP failure")
+
+
+class ArchiveIntegrityError(ValueError):
+    """Size/digest mismatch; a corrupt body is never retried as transient."""
+
+    def __init__(self, attempts: int = 1):
+        self.attempts = attempts
+        super().__init__("approved runtime archive integrity failure")
+
+
 # The only failure detail this fixed controller prints: an approved operation
 # label and fixed category. Exception text, candidate output, URLs, env values
 # and tracebacks never reach this line.
 OPERATION = "startup"
 ERROR_CATEGORIES = (
+    (ArchivePreflightError, "preflight"),
+    (ArchiveTransportError, "transport"),
+    (ArchiveHTTPError, "http"),
+    (ArchiveIntegrityError, "integrity"),
     (subprocess.SubprocessError, "subprocess"),
     (OSError, "io"),
     (ValueError, "invalid_data"),
@@ -64,6 +113,8 @@ ERROR_CATEGORIES = (
     (TypeError, "invalid_type"),
     (RuntimeError, "runtime"),
 )
+# Fixed archive categories that carry bounded integer diagnostics only.
+ARCHIVE_CATEGORIES = frozenset({"transport", "http", "integrity"})
 
 
 def _stage(name: str) -> None:
@@ -76,6 +127,19 @@ def _failure_category(error: BaseException) -> str:
         if isinstance(error, kind):
             return category
     return "unknown"
+
+
+def _failure_diagnostic(error: BaseException) -> str:
+    category = _failure_category(error)
+    detail = f"operation={OPERATION} category={category}"
+    status = getattr(error, "http_status", None)
+    if category == "http" and type(status) is int and 100 <= status <= 599:
+        detail += f" http_status={status}"
+    attempts = getattr(error, "attempts", None)
+    if category in ARCHIVE_CATEGORIES and type(attempts) is int \
+            and 1 <= attempts <= ARCHIVE_ATTEMPTS:
+        detail += f" attempts={attempts}"
+    return "[ci-producer] " + detail
 
 
 def _native_code(value) -> str:
@@ -373,36 +437,88 @@ def _public_opener():
     return build_opener(_PublicRedirect())
 
 
-def download_archive(runtime: dict, destination: Path, *, opener=None) -> None:
-    """Stream only the pinned public bytes; nothing is extracted or executed."""
+def _read_chunk(response, attempt: int) -> bytes:
+    """Read one chunk; socket/protocol failures become transport errors only."""
+    try:
+        return response.read(ARCHIVE_CHUNK)
+    except (IncompleteRead, BadStatusLine):
+        raise ArchiveTransportError(attempt) from None
+    except OSError:
+        raise ArchiveTransportError(attempt) from None
+
+
+def _http_status(value) -> int | None:
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+
+def _download_once(runtime: dict, destination: Path, opener, attempt: int) -> None:
+    """One retrieval attempt. Integrity and policy failures stay non-retryable."""
     archive = runtime["archive"]
-    validate_archive_route(archive["url"])
-    opener = opener or _public_opener()
     request = Request(archive["url"], method="GET",
                       headers={"Accept": "application/octet-stream"})
-    hasher, total = hashlib.sha256(), 0
     try:
-        with opener.open(request, timeout=120) as response, destination.open("wb") as output:
-            if getattr(response, "status", None) != 200:
-                raise ValueError("approved runtime archive unavailable")
+        response = opener.open(request, timeout=ARCHIVE_HTTP_TIMEOUT)
+    except HTTPError as error:
+        # A synthetic HTTPError may carry no body handle; never let cleanup
+        # turn a classified HTTP failure into an unknown exception.
+        if getattr(error, "fp", None) is not None:
+            error.close()
+        raise ArchiveHTTPError(_http_status(error.code), attempt) from None
+    except (IncompleteRead, BadStatusLine):
+        raise ArchiveTransportError(attempt) from None
+    except OSError:
+        raise ArchiveTransportError(attempt) from None
+    # Route/redirect policy ValueError from the opener deliberately propagates.
+    with response:
+        status = getattr(response, "status", None)
+        if status != 200:
+            raise ArchiveHTTPError(_http_status(status), attempt)
+        hasher, total = hashlib.sha256(), 0
+        # Local destination I/O is outside the transport classification: a disk
+        # write failure is reported as io and never retried.
+        with destination.open("wb") as output:
             while True:
-                chunk = response.read(1024 * 1024)
+                chunk = _read_chunk(response, attempt)
                 if not chunk:
                     break
                 total += len(chunk)
                 if total > archive["bytes"]:
-                    raise ValueError("approved runtime archive size mismatch")
+                    raise ArchiveIntegrityError(attempt)
                 hasher.update(chunk)
                 output.write(chunk)
-    except ValueError:
+    if total != archive["bytes"] or hasher.hexdigest() != archive["sha256"]:
+        raise ArchiveIntegrityError(attempt)
+
+
+def download_archive(runtime: dict, destination: Path, *, opener=None) -> None:
+    """Stream only the pinned public bytes; nothing is extracted or executed.
+
+    Transient transport/HTTP failures are retried a fixed number of times inside
+    a finite budget. Digest/size mismatches, route and redirect-policy failures
+    fail on the first attempt. A failed attempt never leaves a partial file.
+    """
+    archive = runtime["archive"]
+    opener = opener or _public_opener()
+    deadline = time.monotonic() + ARCHIVE_RETRY_SECONDS
+    attempt = 0
+    try:
+        validate_archive_route(archive["url"])
+        while True:
+            attempt += 1
+            try:
+                _download_once(runtime, destination, opener, attempt)
+                return
+            except (ArchiveTransportError, ArchiveHTTPError) as error:
+                error.attempts = attempt
+                destination.unlink(missing_ok=True)
+                if (not error.retryable or attempt >= ARCHIVE_ATTEMPTS
+                        or time.monotonic() >= deadline):
+                    raise
+                time.sleep(ARCHIVE_BACKOFF_SECONDS[
+                    min(attempt - 1, len(ARCHIVE_BACKOFF_SECONDS) - 1)])
+    except BaseException:
         destination.unlink(missing_ok=True)
         raise
-    except OSError:
-        destination.unlink(missing_ok=True)
-        raise ValueError("approved runtime archive unavailable") from None
-    if total != archive["bytes"] or hasher.hexdigest() != archive["sha256"]:
-        destination.unlink(missing_ok=True)
-        raise ValueError("approved runtime archive digest mismatch")
 
 
 def inspect_image(docker: list[str], reference: str) -> dict | None:
@@ -448,8 +564,12 @@ def ensure_approved_runtime(docker: list[str], manifest: dict, work: Path, *,
         return reference
     archive_dir = work / "runtime"
     archive_dir.mkdir(mode=0o700, exist_ok=True)
+    _stage("runtime-preflight")
+    try:
+        _require_free(archive_dir, runtime["archive"]["bytes"] + HOST_FREE_MARGIN)
+    except ValueError:
+        raise ArchivePreflightError() from None
     _stage("runtime-archive")
-    _require_free(archive_dir, runtime["archive"]["bytes"] + HOST_FREE_MARGIN)
     archive_path = archive_dir / "approved-runtime.tar.gz"
     download_archive(runtime, archive_path, opener=opener)
     _stage("runtime-load")
@@ -847,8 +967,7 @@ def entrypoint() -> int:
         main()
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError,
             RuntimeError) as error:
-        print(f"[ci-producer] operation={OPERATION} category={_failure_category(error)}",
-              file=sys.stderr)
+        print(_failure_diagnostic(error), file=sys.stderr)
         print("trusted native producer failed; no success attestation", file=sys.stderr)
         return 1
     return 0

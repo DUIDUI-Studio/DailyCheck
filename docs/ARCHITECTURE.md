@@ -1561,13 +1561,21 @@ URL/bytes/SHA256、OCI index/platform manifest/config 三个不可变 digest、p
 manifest 解析与下载边界复用同一个纯 route validator：固定 repository、非零数字 asset ID，
 拒绝 userinfo/query/fragment/编码穿越/其他 host。精确
 size/SHA 校验通过后才 `docker load`；redirect 仅限有界公开资产 host，不转发凭据或记录签名
-URL，missing/corrupt asset fail closed。加载后只解析已批准 graph 的 daemon 表示（index/
-platform/config 之一），并核验 linux/arm64 与完整 rootfs；capture/attestation 记录实际
+URL，missing/corrupt asset fail closed。磁盘预检使用独立 stage `runtime-preflight`
+（失败 `category=preflight`），与下载 stage `runtime-archive` 分开，避免把磁盘不足误判成
+下载失败。仅对分类为瞬态的 transport/HTTP 失败做有界重试：最多 3 次尝试、300s 重试预算、
+固定 1s/2s 退避；HTTP 只重试 408/429/500/502/503/504，永久 4xx 与其他 5xx 不重试；绝不
+采用服务端 `Retry-After`。size/digest mismatch（`category=integrity`）、route/redirect
+策略失败立即失败、从不重试；每次失败都删除部分文件，重试耗尽不伪造成功。加载后只解析已批准
+graph 的 daemon 表示（index/platform/config 之一），并核验 linux/arm64 与完整 rootfs；
+capture/attestation 记录实际
 daemon image 且必须落在同一 graph，不按 backend 改写 manifest。测试 opener 只是函数参数，
 没有 CLI/env 运行时覆盖。producer 失败时只在 stderr 增加固定
-`[ci-producer] operation=<固定阶段标签> category=<固定错误类别>`；native capture 只在退出
+`[ci-producer] operation=<固定阶段标签> category=<固定错误类别>`；archive 失败可按类别追加
+固定整数 `http_status=<100–599>` 与 `attempts=<1–3>`（区分 preflight/transport/http/
+integrity 与重试耗尽）。native capture 只在退出
 不成立时追加已验证的 `native_exit`（0–255，否则 unknown）与 timeout/OOM/error/image 标志。
-异常文本、candidate 输出、URL/签名参数、环境值、traceback 均不输出；成功路径与
+异常文本、candidate 输出、URL/签名参数、响应 body、环境值、traceback 均不输出；成功路径与
 no-attestation 语义不变。
 coordinator-owned `local_fixture_only` image 仍可解析；它不提供 hosted/Prod runtime
 或隔离 signer 的安装证明。GitHub runner/platform Python/daemon 属于平台信任根，candidate
