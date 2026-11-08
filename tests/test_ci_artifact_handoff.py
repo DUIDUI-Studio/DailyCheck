@@ -96,6 +96,9 @@ def _assert_diagnostic_upload_contract(workflow: str) -> None:
         _require(with_.get("path") == DIAGNOSTIC_PATH)
         _require(with_.get("retention-days") == "2")
         _require(with_.get("if-no-files-found") == "ignore")
+        # Default upload-artifact settings must include the visible junit.xml;
+        # no hidden-file opt-in is allowed.
+        _require("include-hidden-files" not in with_)
         _require("github.run_id" in with_.get("name", ""))
         _require("github.run_attempt" in with_.get("name", ""))
         names.add(with_.get("name", ""))

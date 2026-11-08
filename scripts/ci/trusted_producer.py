@@ -733,8 +733,11 @@ class _CaptureTimeout(Exception):
 
 # Failure-only pytest diagnostics. These are opaque, bounded copies of
 # untrusted candidate data for human diagnosis; they never feed the gate and
-# never create or change an attestation.
+# never create or change an attestation. The candidate input stays hidden at
+# .dc-junit.xml, but the retained copy is visible junit.xml because the pinned
+# upload-artifact v4 default (include-hidden-files=false) omits dot files.
 PYTEST_JUNIT_NAME = ".dc-junit.xml"
+DIAGNOSTIC_JUNIT_NAME = "junit.xml"
 PYTEST_DIAGNOSTIC_DIR = "native-diagnostics"
 MAX_JUNIT_BYTES = 8 * 1024 * 1024
 MAX_RAW_TAIL_BYTES = 1024 * 1024
@@ -811,6 +814,7 @@ def retain_pytest_diagnostics(candidate: Path, work: Path, capture: dict,
     """Best-effort bounded copies; diagnostic problems never fail the gate."""
     directory = work / PYTEST_DIAGNOSTIC_DIR
     status = {"schema_version": 1, "kind": "pytest", "junit": "missing",
+              "junit_name": DIAGNOSTIC_JUNIT_NAME,
               "junit_bytes": 0, "junit_sha256": None,
               "raw_tail": "missing", "raw_tail_bytes": 0,
               "raw_tail_sha256": None, "raw_total_bytes": len(raw or b""),
@@ -831,7 +835,7 @@ def retain_pytest_diagnostics(candidate: Path, work: Path, capture: dict,
         state = "malformed"
     if state == "present":
         try:
-            _write_diagnostic(directory / PYTEST_JUNIT_NAME, data)
+            _write_diagnostic(directory / DIAGNOSTIC_JUNIT_NAME, data)
         except OSError:
             state = "error"
         else:
@@ -839,7 +843,7 @@ def retain_pytest_diagnostics(candidate: Path, work: Path, capture: dict,
                           junit_sha256=hashlib.sha256(data).hexdigest())
     if status["junit"] != "present":
         status.update(junit=state, junit_bytes=size)
-        _unlink_diagnostic(directory / PYTEST_JUNIT_NAME)
+        _unlink_diagnostic(directory / DIAGNOSTIC_JUNIT_NAME)
 
     tail = (raw or b"")[-MAX_RAW_TAIL_BYTES:]
     if tail:

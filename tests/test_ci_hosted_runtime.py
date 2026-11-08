@@ -1152,7 +1152,10 @@ def test_native_pytest_junit_keeps_traceback_and_copy_is_exact(tmp_path):
     work.mkdir()
     status = producer.retain_pytest_diagnostics(candidate, work, capture, session, raw)
     directory = work / producer.PYTEST_DIAGNOSTIC_DIR
-    assert (directory / producer.PYTEST_JUNIT_NAME).read_bytes() == xml
+    assert (directory / producer.DIAGNOSTIC_JUNIT_NAME).read_bytes() == xml
+    assert not (directory / producer.PYTEST_JUNIT_NAME).exists()
+    assert status["junit_name"] == producer.DIAGNOSTIC_JUNIT_NAME
+    assert not producer.DIAGNOSTIC_JUNIT_NAME.startswith(".")
     assert (directory / "pytest-output-tail.txt").read_bytes() == raw[-producer.MAX_RAW_TAIL_BYTES:]
     session_bytes = (json.dumps(session, sort_keys=True) + "\n").encode()
     assert (directory / "session.json").read_bytes() == session_bytes
@@ -1178,7 +1181,7 @@ def test_native_pytest_positive_control_envelope_is_unchanged(tmp_path):
     status = producer.retain_pytest_diagnostics(candidate, work, capture, session, raw)
     assert status["junit"] == "present"
     directory = work / producer.PYTEST_DIAGNOSTIC_DIR
-    (directory / producer.PYTEST_JUNIT_NAME).write_bytes(b"mutated diagnostic")
+    (directory / producer.DIAGNOSTIC_JUNIT_NAME).write_bytes(b"mutated diagnostic")
     (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"mutated candidate diagnostic")
     assert producer.make_test_envelope(raw, session, capture, binding) == envelope
     assert not (work / "attestation.json").exists()
@@ -1194,14 +1197,15 @@ def test_diagnostic_retention_negative_controls(tmp_path, monkeypatch):
     capture = {"native_exit": 1}
 
     status = producer.retain_pytest_diagnostics(candidate, work, capture, None, raw)
-    assert status["junit"] == "missing" and not (directory / producer.PYTEST_JUNIT_NAME).exists()
+    assert status["junit"] == "missing" and not (
+        directory / producer.DIAGNOSTIC_JUNIT_NAME).exists()
 
     canary = tmp_path / "host-canary.txt"
     canary.write_text("HOST-CANARY-SECRET")
     (candidate / producer.PYTEST_JUNIT_NAME).symlink_to(canary)
     status = producer.retain_pytest_diagnostics(candidate, work, capture, None, raw)
     assert status["junit"] == "unsafe"
-    assert not (directory / producer.PYTEST_JUNIT_NAME).exists()
+    assert not (directory / producer.DIAGNOSTIC_JUNIT_NAME).exists()
     assert all("HOST-CANARY-SECRET" not in path.read_text(errors="replace")
                for path in directory.iterdir() if path.is_file())
     (candidate / producer.PYTEST_JUNIT_NAME).unlink()
@@ -1218,7 +1222,7 @@ def test_diagnostic_retention_negative_controls(tmp_path, monkeypatch):
     (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"not xml")
     assert producer.retain_pytest_diagnostics(
         candidate, work, capture, None, raw)["junit"] == "malformed"
-    assert not (directory / producer.PYTEST_JUNIT_NAME).exists()
+    assert not (directory / producer.DIAGNOSTIC_JUNIT_NAME).exists()
 
     (candidate / "secret.txt").write_text("candidate-secret")
     (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(
@@ -1227,7 +1231,7 @@ def test_diagnostic_retention_negative_controls(tmp_path, monkeypatch):
         candidate, work, capture, {"a": 1}, raw)
     assert status["junit"] == "present"
     assert {path.name for path in directory.iterdir()} == {
-        producer.PYTEST_JUNIT_NAME, "pytest-output-tail.txt", "status.json",
+        producer.DIAGNOSTIC_JUNIT_NAME, "pytest-output-tail.txt", "status.json",
         "session.json", "capture.json"}
     assert all("candidate-secret" not in path.read_text(errors="replace")
                for path in directory.iterdir() if path.is_file())
@@ -1246,6 +1250,24 @@ def test_retention_never_prints_candidate_text(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "candidate-secret" not in captured.out + captured.err
     assert "::error::" not in captured.out + captured.err
+
+
+def test_retained_junit_name_is_visible_for_default_upload():
+    # The candidate input stays hidden, but the retained artifact file must be
+    # visible: upload-artifact v4 defaults include-hidden-files=false.
+    assert producer.PYTEST_JUNIT_NAME.startswith(".")
+    assert producer.DIAGNOSTIC_JUNIT_NAME == "junit.xml"
+    assert not producer.DIAGNOSTIC_JUNIT_NAME.startswith(".")
+    for retained in (producer.DIAGNOSTIC_JUNIT_NAME, "pytest-output-tail.txt",
+                     "session.json", "capture.json", "status.json"):
+        assert not retained.startswith(".")
+    workflow = _workflow()
+    uploads = [step for job in workflow["jobs"].values() for step in job["steps"]
+               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
+    assert len(uploads) == 2
+    for step in uploads:
+        assert "include-hidden-files" not in step["with"]
+        assert step["with"]["path"] == "${{ env.CI_ROOT }}/native-diagnostics"
 
 
 def test_failure_diagnostics_upload_is_narrow_pinned_and_failure_only():

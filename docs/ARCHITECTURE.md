@@ -1592,7 +1592,9 @@ no-attestation 语义不变。
 
 hosted pytest 捕获额外以固定 `--junitxml=/candidate/.dc-junit.xml` 生成 JUnit（`-q/--tb=no`
 与完整选择不变），执行前删除候选预置的该文件。proven child exit 后由 controller 把 JUnit
-（≤8 MiB）、raw tail（≤1 MiB）、session/capture metadata（≤256 KiB）复制到固定
+以可见名 `junit.xml`（候选输入仍为隐藏 `.dc-junit.xml`；upload-artifact v4 默认
+`include-hidden-files=false`，不启用 hidden 文件上传）、raw tail（≤1 MiB）、
+session/capture metadata（≤256 KiB）复制到固定
 `$CI_ROOT/native-diagnostics`；只允许这些固定文件名，缺失/超大/畸形/符号链接逃逸记为
 controller-owned `status.json` 的固定状态、大小与 SHA256。这些副本是 untrusted diagnostic
 data，不参与 gate/attestation，也不能把有效 native proof 变成失败。GitHub 的 test/
