@@ -1448,6 +1448,7 @@ baseline preflight 边界：复用真实 `NativeGitHubFacts` 与原 H/core/state
 HostingClient 写拒绝不变。真正的 runtime/review/baseline publisher 是受保护安装前提，
 缺失即失败；checksum、PR/CI JSON、旧 source/public map 都不能自授部署锚点。
 App HTTP 子进程持继承 flock 到真实请求退出，key/token 不传应用或 argv。
+signer 使用固定 Python `-I -B`，既隔离导入路径，也不向 authority/venv 写 bytecode cache。
 受控容器的 PID1 在 reporter 死亡后按具体子 PID 收集 orphan exit，不能把仍存在的
 zombie 当成活跃 mutator，也不能在尚无退出证据时清理 fixture。便携 loopback /
 JWT/parser 控制不证明跨 UID 隔离；真实 Linux UID 内核控制与 hosted/Prod 验收单列，

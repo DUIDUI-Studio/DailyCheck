@@ -64,7 +64,7 @@ class GitHubProdGate:
                "DAILYCHECK_DEPLOY_STATE_DIR": str(policy.location("directory")),
                deploy_state.ATTEMPT_FD_ENV: str(guard_fd)}
         try:
-            child = subprocess.Popen([str(policy.python), "-I", "-c", bootstrap,
+            child = subprocess.Popen([str(policy.python), "-I", "-B", "-c", bootstrap,
                 str(policy.authority), "--sign-h-child", str(key_fd)], env=env,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, pass_fds=(key_fd, guard_fd))
