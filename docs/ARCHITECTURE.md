@@ -1448,6 +1448,14 @@ baseline preflight 边界：复用真实 `NativeGitHubFacts` 与原 H/core/state
 HostingClient 写拒绝不变。真正的 runtime/review/baseline publisher 是受保护安装前提，
 缺失即失败；checksum、PR/CI JSON、旧 source/public map 都不能自授部署锚点。
 App HTTP 子进程持继承 flock 到真实请求退出，key/token 不传应用或 argv。
+runtime 的固定 loopback MCP `/health` 单独使用 protected policy 的
+`mcp_health_token_file`（私有文件，不能复用 GitHub read token 或 App key 路径）；
+仅 MCP 请求携带 Bearer，应用健康请求仍公开。MCP 原 AuthMiddleware 不变，凭据缺失、
+错误或文件保护不符即拒绝 H admission。完成初始化后，在同一 fence/state transaction
+中核对保存的原始 receipt/source anchor/policy/epoch 以及当前 runtime/main/deployed 一致性，
+直接返回原 initialization ID，不重写 guard、receipt、outcomes 或部署记录；publisher 的
+观察时间与 runtime digest 刷新不构成新 epoch。只有首次转换读取新鲜 bootstrap receipt；
+partial/corrupt/active/uncertain state 仍拒绝，不自动修复 guard。
 signer 使用固定 Python `-I -B`，既隔离导入路径，也不向 authority/venv 写 bytecode cache。
 受控容器的 PID1 在 reporter 死亡后按具体子 PID 收集 orphan exit，不能把仍存在的
 zombie 当成活跃 mutator，也不能在尚无退出证据时清理 fixture。便携 loopback /

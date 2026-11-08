@@ -125,7 +125,7 @@ class InstalledPolicy:
         value = json.loads(self.raw)
         keys = {"version", "repository", "repository_id", "repository_node_id", "producer",
                 "authority", "python", "closure", "app_uid", "epoch", "repo", "directory",
-                "key_file", "read_token_file", "runtime_file", "bootstrap_file",
+                "key_file", "read_token_file", "mcp_health_token_file", "runtime_file", "bootstrap_file",
                 "review_directory", "reviewers", "writer", "release_root", "units", "runtime"}
         if (set(value) != keys or value["version"] != 1
                 or (value["repository"], value["repository_id"], value["repository_node_id"])
@@ -214,6 +214,16 @@ class InstalledPolicy:
                                anchor=self.anchor).decode().strip()
         if not token or any(ord(c) < 33 or ord(c) == 127 for c in token):
             raise ValueError("invalid read credential")
+        return token
+
+    def mcp_health_token(self):
+        path = self.location("mcp_health_token_file")
+        if path in {self.location("key_file"), self.location("read_token_file")}:
+            raise ValueError("separate MCP health credential required")
+        token = read_protected(path, self.owner, anchor=self.anchor).decode("ascii").strip()
+        if (not token or any(not 33 <= ord(c) <= 126 for c in token)
+                or token == self.read_token()):
+            raise ValueError("invalid MCP health credential")
         return token
 
 
@@ -364,7 +374,8 @@ class ProtectedRuntime:
                 raise ValueError("invalid fixed runtime probe")
             connection = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
             try:
-                connection.request("GET", "/health")
+                headers = {"Authorization": "Bearer " + policy.mcp_health_token()} if role == "mcp" else {}
+                connection.request("GET", "/health", headers=headers)
                 response = connection.getresponse()
                 if response.status != 200 or len(response.read(65537)) > 65536:
                     raise ValueError("runtime route unhealthy")
@@ -429,11 +440,36 @@ class ProtectedInitializer:
             state = deploy_state.load_state(directory)
             if not deploy_state.native_consistent(directory, state):
                 raise ValueError("partial native initialization; operator reconciliation required")
-            receipt = policy.record("bootstrap_file")
             expected_keys = {"version", "policy", "epoch", "source_sha", "public_sha", "tree_sha",
                              "map_sha256", "source_outcome_sha256", "runtime_sha256", "observed_at"}
             runtime = self.runtime.snapshot()
             main = self.client.get(f"/repos/{REPOSITORY}/branches/main")["commit"]["sha"]
+            if "native_queue" in state:
+                bootstrap = state.get("native_bootstrap")
+                anchor = state.get("native_source_anchor")
+                if (not isinstance(bootstrap, dict) or set(bootstrap) != expected_keys
+                        or bootstrap["version"] != 1 or bootstrap["policy"] != policy.fingerprint
+                        or bootstrap["epoch"] != policy.value["epoch"]
+                        or bootstrap["public_sha"] != main or runtime["sha"] != main
+                        or bootstrap["tree_sha"] != runtime["tree"]
+                        or not isinstance(anchor, dict) or anchor.get("sha") != bootstrap["source_sha"]
+                        or digest(anchor) != bootstrap["source_outcome_sha256"]
+                        or type(bootstrap["observed_at"]) not in {int, float}
+                        or not 0 <= bootstrap["observed_at"] <= time.time()
+                        or state.get("lock") is not None or state["native_queue"]["active"] is not None
+                        or not isinstance(state.get("deployed"), dict)
+                        or (state.get("deployed") or {}).get("sha") != main
+                        or any(not isinstance(bootstrap[k], str)
+                               or not re.fullmatch(r"[0-9a-f]{64}", bootstrap[k])
+                               for k in ("map_sha256", "source_outcome_sha256", "runtime_sha256"))):
+                    raise ValueError("different/active initialized epoch")
+                sha(bootstrap["source_sha"])
+                sha(bootstrap["public_sha"])
+                sha(bootstrap["tree_sha"])
+                return state["native_queue"]["initialization_id"]
+            if "native_bootstrap" in state or "native_source_anchor" in state:
+                raise ValueError("partial native initialization; operator reconciliation required")
+            receipt = policy.record("bootstrap_file")
             if (set(receipt) != expected_keys or receipt["version"] != 1
                     or receipt["policy"] != policy.fingerprint or receipt["epoch"] != policy.value["epoch"]
                     or receipt["public_sha"] != main or runtime["sha"] != main
@@ -444,12 +480,6 @@ class ProtectedInitializer:
             sha(receipt["source_sha"])
             sha(receipt["public_sha"])
             sha(receipt["tree_sha"])
-            bootstrap = state.get("native_bootstrap")
-            if "native_queue" in state:
-                if (bootstrap != receipt or state["native_queue"]["active"] is not None
-                        or (state.get("deployed") or {}).get("sha") != main):
-                    raise ValueError("different/active initialized epoch")
-                return state["native_queue"]["initialization_id"]
             if (state.get("lock") is not None or not isinstance(state.get("deployed"), dict)
                     or state["deployed"].get("sha") != receipt["source_sha"]
                     or digest(state["deployed"]) != receipt["source_outcome_sha256"]):

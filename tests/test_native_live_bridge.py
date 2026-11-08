@@ -63,6 +63,8 @@ class AppHTTP:
         self.damage = None
         self.routes = {}
         self.posts = []
+        self.health_headers = []
+        self.health_handler = None
         self.jwt_verified = 0
         self.arrived = threading.Event()
         self.release = threading.Event()
@@ -80,6 +82,16 @@ class AppHTTP:
                 self.handle_request()
 
             def handle_request(self):
+                if self.path == "/health":
+                    auth = self.headers.get("Authorization")
+                    owner.health_headers.append(auth)
+                    if owner.health_handler is not None:
+                        status, raw = owner.health_handler(auth)
+                        self.send_response(status)
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
                 token = self.headers.get("Authorization", "").removeprefix("Bearer ")
                 if self.path.startswith("/app"):
                     claims = jwt.decode(token, owner.public_key, algorithms=["RS256"], issuer="801")
@@ -175,13 +187,16 @@ def bridge(tmp_path, monkeypatch):
         private(tmp_path / "key.pem", key.private_bytes(serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
         private(tmp_path / "read-token", "synthetic-read-token")
+        private(tmp_path / "mcp-health-token", os.urandom(24).hex())
         value = {"version": 1, "repository": REPOSITORY, "repository_id": 1448986421,
                  "repository_node_id": "R_kgDOVl3HNQ", "producer": asdict(producer),
                  "authority": str(ROOT), "python": str(Path(sys.executable)),
                  "closure": {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in AUTHORITY_FILES},
                  "app_uid": 65532, "epoch": "synthetic-epoch", "repo": str(repo),
                  "directory": str(tmp_path / "state"), "key_file": str(tmp_path / "key.pem"),
-                 "read_token_file": str(tmp_path / "read-token"), "runtime_file": str(tmp_path / "runtime.json"),
+                 "read_token_file": str(tmp_path / "read-token"),
+                 "mcp_health_token_file": str(tmp_path / "mcp-health-token"),
+                 "runtime_file": str(tmp_path / "runtime.json"),
                  "bootstrap_file": str(tmp_path / "bootstrap.json"), "review_directory": str(tmp_path / "reviews"),
                  "reviewers": {str(os.geteuid()): "synthetic-independent"}, "writer": "synthetic-writer",
                  "release_root": str(tmp_path / "releases"), "units": ["dailycheck.service", "dailycheck-mcp.service"],
@@ -399,7 +414,8 @@ def test_actual_check_response_cannot_be_relabelled_success(bridge, damage):
     assert deploy_state.load_state(bridge["root"] / "state")["outcomes"] == {}
 
 
-@pytest.mark.parametrize("damage", ["mapping-only", "stale", "runtime", "live-writer", "partial"])
+@pytest.mark.parametrize("damage", ["mapping-only", "stale", "runtime", "live-writer", "partial",
+                                     "orphan-receipt", "orphan-anchor", "runtime-digest", "source-outcome"])
 def test_protected_bootstrap_denies_incomplete_transition(bridge, damage):
     b = bridge
     if damage == "mapping-only":
@@ -412,6 +428,13 @@ def test_protected_bootstrap_denies_incomplete_transition(bridge, damage):
         state = deploy_state.load_state(b["root"] / "state")
         state["lock"] = {"active": "synthetic old writer"}
         deploy_state.save_state(b["root"] / "state", state)
+    elif damage in {"orphan-receipt", "orphan-anchor"}:
+        state = deploy_state.load_state(b["root"] / "state")
+        state["native_bootstrap" if damage == "orphan-receipt" else "native_source_anchor"] = b["receipt"]
+        deploy_state.save_state(b["root"] / "state", state)
+    elif damage in {"runtime-digest", "source-outcome"}:
+        key = "runtime_sha256" if damage == "runtime-digest" else "source_outcome_sha256"
+        private(b["root"] / "bootstrap.json", {**b["receipt"], key: "f" * 64})
     else:
         deploy_state.native_guard(b["root"] / "state", {"version": 1, "initialization_id": "partial", "intent_id": None})
     with pytest.raises((ValueError, FileNotFoundError)):
@@ -427,6 +450,173 @@ def test_protected_bootstrap_idempotence_preserves_original_anchor(bridge):
     assert b["controller"].initialize() == first
     assert state["native_source_anchor"]["sha"] == "e" * 40
     assert state["deployed"]["sha"] == b["base"] and state["outcomes"] == {}
+
+
+def test_completed_bootstrap_survives_observation_refresh(bridge):
+    b = bridge
+    first = b["controller"].initialize()
+    state = deploy_state.load_state(b["root"] / "state")
+    guard = (b["root"] / "state" / deploy_state.NATIVE_GUARD_FILENAME).read_bytes()
+    refreshed = {**b["runtime_record"], "observed_at": time.time()}
+    assert refreshed != b["runtime_record"]
+    private(b["root"] / "runtime.json", refreshed)
+    assert b["runtime"].read()["sha"] == b["base"]
+    assert b["controller"].initialize() == first
+    receipt = {**b["receipt"], "runtime_sha256": digest(refreshed), "observed_at": time.time()}
+    private(b["root"] / "bootstrap.json", receipt)
+    assert b["controller"].initialize() == first
+    # Completion consumes the original protected proof once; it is not a new installation.
+    (b["root"] / "bootstrap.json").unlink()
+    assert b["controller"].initialize() == first
+    assert deploy_state.load_state(b["root"] / "state") == state
+    assert (b["root"] / "state" / deploy_state.NATIVE_GUARD_FILENAME).read_bytes() == guard
+    assert state["native_bootstrap"] == b["receipt"]
+    assert state["native_source_anchor"]["sha"] == "e" * 40
+    assert state["outcomes"] == {} and b["server"].posts == []
+
+
+@pytest.mark.parametrize("damage", ["policy", "epoch", "source", "public", "tree", "anchor",
+                                     "missing-receipt", "timestamp", "guard", "active", "lock", "deployed", "main", "runtime"])
+def test_completed_bootstrap_rechecks_stable_identity_and_current_state(bridge, damage):
+    b = bridge
+    b["controller"].initialize()
+    directory = b["root"] / "state"
+    state = deploy_state.load_state(directory)
+    if damage in {"policy", "epoch", "source", "public", "tree"}:
+        key = {"source": "source_sha", "public": "public_sha", "tree": "tree_sha"}.get(damage, damage)
+        state["native_bootstrap"][key] = "f" * (40 if damage in {"source", "public", "tree"} else 64)
+    elif damage == "anchor":
+        state["native_source_anchor"]["pr"] = 999
+    elif damage == "missing-receipt":
+        state.pop("native_bootstrap")
+    elif damage == "timestamp":
+        state["native_bootstrap"]["observed_at"] = "corrupt"
+    elif damage == "guard":
+        (directory / deploy_state.NATIVE_GUARD_FILENAME).unlink()
+    elif damage == "active":
+        state["native_queue"]["active"] = {"phase": "grant_uncertain"}
+    elif damage == "lock":
+        state["lock"] = {"synthetic": "active legacy writer"}
+    elif damage == "deployed":
+        state["deployed"]["sha"] = "f" * 40
+    elif damage == "main":
+        b["server"].routes[f"/repos/{REPOSITORY}/branches/main"] = {"commit": {"sha": "f" * 40}}
+    else:
+        private(b["root"] / "runtime.json", {**b["runtime_record"], "observed_at": 1})
+    deploy_state.save_state(directory, state)
+    before = (directory / deploy_state.STATE_FILENAME).read_bytes()
+    with pytest.raises(ValueError):
+        ProtectedInitializer(b["policy"], b["runtime"], b["controller"].client).initialize()
+    assert (directory / deploy_state.STATE_FILENAME).read_bytes() == before
+    assert b["server"].posts == []
+
+
+@pytest.fixture
+def mcp_health(bridge, monkeypatch):
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from mcp_server import main as actual
+    from mcp_server.data import unit_of_work
+
+    b = bridge
+    token = (b["root"] / "mcp-health-token").read_text()
+    monkeypatch.setenv("DAILYCHECK_MCP_TOKEN", token)
+    # Wrong-token fallback can only open this disposable empty DB, never business data.
+    monkeypatch.setattr(unit_of_work, "MASTER_DB", b["root"] / "synthetic-auth.db")
+    with TestClient(actual._build_app()) as actual_app:
+        assert actual_app.get("/health").status_code == 401
+    leaf = Starlette(routes=[Route("/health", lambda _: JSONResponse({"synthetic_DB_free_healthy_leaf": True}))],
+                     middleware=[Middleware(actual.AuthMiddleware)])
+    with TestClient(leaf) as client:
+        assert client.get("/health").status_code == 401
+        assert client.get("/health", headers={"Authorization": "Bearer " + token}).status_code == 200
+
+        def health(auth):
+            # OwnedFixture has one loopback port: multiplex the public app probe
+            # and authenticated MCP probe here, then run the real MCP middleware.
+            if auth is None:
+                return 200, b'{"public_app_health":true}'
+            response = client.get("/health", headers={"Authorization": auth})
+            return response.status_code, response.content
+
+        b["server"].health_handler = health
+        yield b
+
+
+def test_runtime_health_uses_separate_mcp_bearer_only(mcp_health):
+    b = mcp_health
+    b["server"].health_headers.clear()
+    assert b["runtime"].snapshot()["sha"] == b["base"]
+    token = (b["root"] / "mcp-health-token").read_text()
+    if b["server"].health_headers != [None, "Bearer " + token]:
+        pytest.fail("Expected anonymous app probe followed by MCP-only Bearer probe")
+    assert b["policy"].read_token() != token
+
+
+def test_mcp_health_credential_never_leaves_fixed_route(bridge):
+    b = bridge
+    routes = {**b["runtime_record"]["routes"], "mcp": "http://foreign.invalid/health"}
+    private(b["root"] / "runtime.json", {**b["runtime_record"], "routes": routes})
+    with pytest.raises(ValueError, match="invalid fixed runtime probe"):
+        b["runtime"].snapshot()
+    assert b["server"].health_headers == [None]
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong", "symlink", "public-mode", "reused-read-token", "read-path", "key-path"])
+def test_failed_mcp_health_never_sends_H_success(mcp_health, damage):
+    b = mcp_health
+    b["controller"].initialize()
+    path = b["root"] / "mcp-health-token"
+    if damage == "missing":
+        path.unlink()
+    elif damage == "wrong":
+        private(path, os.urandom(24).hex())
+    elif damage == "symlink":
+        path.unlink()
+        path.symlink_to(b["root"] / "read-token")
+    elif damage == "public-mode":
+        path.chmod(0o644)
+    elif damage == "reused-read-token":
+        private(path, b["policy"].read_token())
+    else:
+        # Explicit fixture-only config mutation; installed policy remains protected.
+        b["policy"].value["mcp_health_token_file"] = str(b["root"] / ("read-token" if damage == "read-path" else "key.pem"))
+    before = deploy_state.load_state(b["root"] / "state")
+    with pytest.raises((ValueError, OSError)):
+        b["controller"].admit_head(1)
+    assert b["server"].posts == []
+    assert deploy_state.load_state(b["root"] / "state") == before
+
+
+def mcp_credential_owner_boundary(root):
+    """Tiny separately granted Linux control: genuine credential inode ownership only."""
+    if sys.platform != "linux" or os.geteuid() != 0:
+        raise RuntimeError("BLOCKED: separately authorized root Linux fixture required")
+    patch = pytest.MonkeyPatch()
+    generator = bridge.__wrapped__(root, patch)
+    try:
+        b = next(generator)
+        path = b["policy"].location("mcp_health_token_file")
+        assert path.stat().st_uid == 0 and b["policy"].mcp_health_token()
+        assert b["runtime"].snapshot()["sha"] == b["base"]
+        os.chown(path, 65532, 65532)
+        assert path.stat().st_uid == 65532
+        with pytest.raises(ValueError, match="ownership/mode"):
+            b["policy"].mcp_health_token()
+        with pytest.raises(ValueError, match="ownership/mode"):
+            b["controller"].admit_head(1)
+        assert b["server"].posts == []
+        os.chown(path, 0, 0)
+        assert b["policy"].mcp_health_token()
+        return {"trusted_uid": 0, "foreign_credential_uid": 65532, "foreign_owner_denied": True,
+                "no_H_success": True, "restored_owner_positive": True}
+    finally:
+        generator.close()
+        patch.undo()
 
 
 def test_review_origin_and_policy_closure_denial(bridge):
