@@ -1535,6 +1535,8 @@ package，而 authority 导出带空 `__init__` 的常规 `scripts` package 会�
 collection ERROR）。capture 只把 pinned `dc_approved_evidence.py`（blob 必须等于 manifest 的
 `scripts/ci/pytest_evidence.py`）放入独立只读 `/trusted-evidence`，`PYTHONPATH` 只指向它；
 candidate 根仍由 pytest 按 prepend 规则插入，lint/report capture 继续使用 `/authority`。
+便宜回归另验证 safe-path 父环境下被测 Python 子进程的显式导入根，以及 source 无 main
+branch 时 snapshot 对绑定 public base 的保留；这些控制不运行全仓或 600 秒 observation。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找

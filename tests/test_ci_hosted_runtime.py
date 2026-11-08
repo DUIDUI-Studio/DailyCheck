@@ -1093,6 +1093,61 @@ def test_non_pytest_capture_keeps_the_authority_helper_root(monkeypatch, tmp_pat
     assert not any("/trusted-evidence" in value for value in create)
 
 
+def test_candidate_import_environment_is_scoped_to_the_tested_child(monkeypatch, tmp_path):
+    from tests.conftest import candidate_python_env
+
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "config.py").write_text("VALUE = 'candidate under test'\n")
+    plugin = tmp_path / "trusted-evidence"
+    plugin.mkdir()
+    (plugin / "approved_probe.py").write_text("VALUE = 'approved plugin'\n")
+    monkeypatch.setenv("PYTHONPATH", str(plugin))
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    original = dict(os.environ)
+    argv = [sys.executable, "-P", "-c",
+            "import config, approved_probe; print(config.VALUE, approved_probe.VALUE)"]
+    unscoped = subprocess.run(argv, cwd=candidate, capture_output=True, text=True, timeout=10)
+    assert unscoped.returncode != 0 and "No module named 'config'" in unscoped.stderr
+    scoped = subprocess.run(argv, cwd=candidate, env=candidate_python_env(candidate),
+                            capture_output=True, text=True, timeout=10)
+    assert scoped.returncode == 0, scoped.stderr
+    assert scoped.stdout.strip() == "candidate under test approved plugin"
+    assert dict(os.environ) == original
+
+
+def test_snapshot_keeps_the_bound_base_when_the_source_has_no_main_branch(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(source), *args], text=True).strip()
+
+    git("init", "-q", "-b", "fixture-head")
+    git("config", "user.name", "Snapshot fixture")
+    git("config", "user.email", "snapshot@example.invalid")
+    (source / "legacy.py").write_text("print('bound public baseline')\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (source / "legacy.py").write_text("print('candidate')\n")
+    git("add", ".")
+    git("commit", "-qm", "head")
+    head = git("rev-parse", "HEAD")
+    git("config", "fixture.source_only", "not copied")
+    candidate = tmp_path / "candidate"
+    producer.snapshot(source, candidate, head, base)
+    actual = subprocess.check_output(
+        ["git", "-C", str(candidate), "show", "origin/main:legacy.py"], text=True)
+    assert actual == "print('bound public baseline')\n"
+    assert subprocess.check_output(
+        ["git", "-C", str(candidate), "rev-parse", "HEAD"], text=True).strip() == head
+    assert subprocess.check_output(
+        ["git", "-C", str(candidate), "rev-parse", "origin/main"], text=True).strip() == base
+    config = (candidate / ".git/config").read_text()
+    assert "source_only" not in config
+
+
 def test_pytest_capture_rejects_a_changed_evidence_plugin(monkeypatch, tmp_path):
     with pytest.raises(ValueError):
         _capture_commands(monkeypatch, tmp_path, kind="pytest",
