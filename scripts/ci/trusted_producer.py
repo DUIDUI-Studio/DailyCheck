@@ -110,6 +110,27 @@ class ArchiveIntegrityError(ValueError):
         super().__init__("approved runtime archive integrity failure")
 
 
+# Fixed, safe reasons for make_test_envelope failures. They name the gate that
+# rejected the evidence without exposing candidate text or exception detail.
+EVIDENCE_RAW_SESSION = "raw-session-invalid"
+EVIDENCE_NEW_FAILURES = "new-failures"
+EVIDENCE_SUMMARY = "summary-extraction"
+EVIDENCE_COMPACT = "compact-evidence-invalid"
+EVIDENCE_REASONS = frozenset({EVIDENCE_RAW_SESSION, EVIDENCE_NEW_FAILURES,
+                              EVIDENCE_SUMMARY, EVIDENCE_COMPACT})
+
+
+class EvidenceValidationError(ValueError):
+    """Gate failure with a fixed reason; category stays invalid_data."""
+
+    def __init__(self, reason: str, new_failures: int | None = None):
+        if reason not in EVIDENCE_REASONS:
+            raise ValueError("unapproved evidence reason")
+        self.reason = reason
+        self.new_failures = new_failures
+        super().__init__("approved native evidence validation failed")
+
+
 # The only failure detail this fixed controller prints: an approved operation
 # label and fixed category. Exception text, candidate output, URLs, env values
 # and tracebacks never reach this line.
@@ -153,6 +174,11 @@ def _failure_diagnostic(error: BaseException) -> str:
     if category in ARCHIVE_CATEGORIES and type(attempts) is int \
             and 1 <= attempts <= ARCHIVE_ATTEMPTS:
         detail += f" attempts={attempts}"
+    if isinstance(error, EvidenceValidationError):
+        detail += f" reason={error.reason}"
+        count = error.new_failures
+        if error.reason == EVIDENCE_NEW_FAILURES and type(count) is int and count >= 1:
+            detail += f" new_failures={count}"
     return "[ci-producer] " + detail
 
 
@@ -775,12 +801,22 @@ def make_test_envelope(raw: bytes, session: dict, capture: dict, binding: dict) 
     from scripts.check_known_failures import load_known_ids, make_evidence, unexpected_failures
     from scripts.ci.pytest_summary import extract_pytest_summary
 
-    text = raw.decode("utf-8")
-    original = make_evidence(text, capture["native_exit"], session)
-    if unexpected_failures(session["failed_nodeids"], load_known_ids()):
-        raise ValueError("actual native pytest has new failures")
-    compact = extract_pytest_summary(text)
-    evidence = make_evidence(compact, capture["native_exit"], session)
+    try:
+        text = raw.decode("utf-8")
+        original = make_evidence(text, capture["native_exit"], session)
+    except ValueError:
+        raise EvidenceValidationError(EVIDENCE_RAW_SESSION) from None
+    new = unexpected_failures(session["failed_nodeids"], load_known_ids())
+    if new:
+        raise EvidenceValidationError(EVIDENCE_NEW_FAILURES, len(new))
+    try:
+        compact = extract_pytest_summary(text)
+    except ValueError:
+        raise EvidenceValidationError(EVIDENCE_SUMMARY) from None
+    try:
+        evidence = make_evidence(compact, capture["native_exit"], session)
+    except ValueError:
+        raise EvidenceValidationError(EVIDENCE_COMPACT) from None
     evidence["raw_output_sha256"] = original["output_sha256"]
     return {"schema_version": 2, "text": compact, "evidence": evidence, "binding": binding}
 

@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from scripts.ci import trusted_producer as producer
+from scripts.ci.pytest_summary import MAX_SUMMARY_BYTES, extract_pytest_summary
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_RAW = (ROOT / "scripts/ci/producer_manifest.json").read_bytes()
@@ -108,6 +109,35 @@ def _record_sleeps(monkeypatch):
     sleeps = []
     monkeypatch.setattr(producer.time, "sleep", sleeps.append)
     return sleeps
+
+
+KNOWN_IDS = [line.strip() for line in
+             (ROOT / "tests/known_failures.txt").read_text(encoding="utf-8").splitlines()
+             if line.strip() and not line.lstrip().startswith("#")]
+KNOWN_ID = KNOWN_IDS[0]
+NEW_FAILURE_ID = "tests/definitely_new.py::test_x"
+
+
+def _evidence_fixture(*, raw=None, failed_ids=None):
+    """Realistic completed-pytest raw/session/capture for make_test_envelope."""
+    failed_ids = [KNOWN_ID] if failed_ids is None else list(failed_ids)
+    passed = 100
+    counts = {"passed": passed, "failed": len(failed_ids), "skipped": 0,
+              "xfailed": 0, "xpassed": 0, "error": 0}
+    selected = passed + len(failed_ids)
+    session = {"schema_version": 1, "pytest_exit": 1, "selected": selected,
+               "selected_unique": selected, "completed": selected, "uncompleted": [],
+               "unexpected": [], "failed_nodeids": failed_ids, "error_nodeids": [],
+               "counts": counts}
+    if raw is None:
+        raw = ("".join(f"FAILED {node} - old baseline\n" for node in failed_ids)
+               + f"{len(failed_ids)} failed, {passed} passed in 1s\n").encode()
+    capture = {"version": 1, "container_id": "5" * 64, "image": "sha256:" + "a" * 64,
+               "kind": "pytest", "context": "test", "binding_sha256": "b" * 64,
+               "native_exit": 1, "stdout_sha256": hashlib.sha256(raw).hexdigest(),
+               "session_sha256": "c" * 64, "exited": True, "removed": True,
+               "oom_killed": False}
+    return raw, session, capture, {"version": 3, "phase": "H"}
 
 
 class _Clock:
@@ -626,6 +656,85 @@ def test_archive_diagnostics_use_only_fixed_tokens(monkeypatch, error, expected)
     diagnostic = producer._failure_diagnostic(error)
     assert expected in diagnostic
     assert "SECRET" not in diagnostic and "release-assets" not in diagnostic
+
+
+def test_valid_known14_evidence_envelope_is_unchanged():
+    raw, session, capture, binding = _evidence_fixture()
+    envelope = producer.make_test_envelope(raw, session, capture, binding)
+    assert envelope["schema_version"] == 2 and envelope["binding"] == binding
+    assert envelope["text"] == extract_pytest_summary(raw.decode("utf-8"))
+    assert envelope["evidence"]["native_exit"] == 1
+    assert envelope["evidence"]["session"] == session
+    assert envelope["evidence"]["raw_output_sha256"] == hashlib.sha256(raw).hexdigest()
+    # Digest captured from the pristine producer at HEAD 1e8c0f4.
+    assert (hashlib.sha256(json.dumps(envelope, sort_keys=True).encode()).hexdigest()
+            == "b7d9c69b0461ad55340cc978c992489c00b8702115cd2cd68457573f8a17166d")
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("session", "raw-session-invalid"),
+    ("decode", "raw-session-invalid"),
+    ("new-failure", "new-failures"),
+    ("summary", "summary-extraction"),
+    ("compact", "compact-evidence-invalid"),
+])
+def test_evidence_failure_surfaces_have_distinct_fixed_reasons(monkeypatch, case, reason):
+    monkeypatch.setattr(producer, "OPERATION", "startup")
+    if case == "new-failure":
+        raw, session, capture, binding = _evidence_fixture(failed_ids=[NEW_FAILURE_ID])
+    elif case == "summary":
+        raw = (f"FAILED {KNOWN_ID} - old baseline\n"
+               + "x" * (MAX_SUMMARY_BYTES + 1) + "\n1 failed, 100 passed in 1s\n").encode()
+        raw, session, capture, binding = _evidence_fixture(raw=raw)
+    elif case == "compact":
+        raw = (f"FAILED {KNOWN_ID} - old baseline\n1 failed, 100 passed in 1s\n"
+               + "\n" * 6).encode()
+        raw, session, capture, binding = _evidence_fixture(raw=raw)
+    else:
+        raw, session, capture, binding = _evidence_fixture()
+        if case == "session":
+            session["completed"] = session["selected"] - 1
+        else:
+            raw = b"\xff\xfe"
+    producer._stage("evidence")
+    with pytest.raises(producer.EvidenceValidationError) as caught:
+        producer.make_test_envelope(raw, session, capture, binding)
+    error = caught.value
+    assert error.reason == reason
+    assert producer._failure_category(error) == "invalid_data"
+    diagnostic = producer._failure_diagnostic(error)
+    assert f"reason={reason}" in diagnostic
+    assert ("new_failures=1" in diagnostic) == (case == "new-failure")
+
+
+def test_evidence_diagnostic_never_prints_candidate_text(monkeypatch):
+    monkeypatch.setattr(producer, "OPERATION", "startup")
+    raw, session, capture, binding = _evidence_fixture(failed_ids=[NEW_FAILURE_ID])
+    producer._stage("evidence")
+    with pytest.raises(producer.EvidenceValidationError) as caught:
+        producer.make_test_envelope(raw, session, capture, binding)
+    diagnostic = producer._failure_diagnostic(caught.value)
+    assert "reason=new-failures new_failures=1" in diagnostic
+    assert NEW_FAILURE_ID not in diagnostic and "definitely_new" not in diagnostic
+
+
+def test_evidence_reason_rejects_unapproved_tokens():
+    with pytest.raises(ValueError):
+        producer.EvidenceValidationError("candidate-controlled-reason")
+
+
+def test_entrypoint_reports_evidence_reason_without_success_marker(monkeypatch, capsys):
+    def explode():
+        producer._stage("evidence")
+        raise producer.EvidenceValidationError(producer.EVIDENCE_NEW_FAILURES, 2)
+
+    monkeypatch.setattr(producer, "main", explode)
+    assert producer.entrypoint() == 1
+    error = capsys.readouterr().err
+    assert ("[ci-producer] operation=evidence category=invalid_data "
+            "reason=new-failures new_failures=2" in error)
+    assert "trusted native producer failed; no success attestation" in error
+    assert "DAILYCHECK_NATIVE_EVIDENCE=" not in error
 
 
 def test_redirects_are_public_https_and_credential_free():
