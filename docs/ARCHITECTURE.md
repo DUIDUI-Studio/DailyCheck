@@ -1548,6 +1548,9 @@ hosted pytest 使用 Docker `--init` 回收 Git auto-maintenance 及 reporter �
 kernel UID/root 控制保持不变。Linux65532 小探针验证上述差异，不等同 hosted 全仓验收。
 只构造 Docker argv 的 synthetic capture fixture 自带容量事实，不依赖测试宿主的 tmpfs
 大小；真实 capture 的磁盘预检与 low-disk 拒绝控制不变。
+Linux 的两个 killed-reporter fixture 从实际 `/proc/<pid>/task/<pid>/children` 读取唯一
+HTTP child，避免固定 runtime 中不存在的 `pgrep` 依赖；非 Linux 保留原查询方式，
+真实 SIGKILL、HTTP 到达、锁保留和 child exit 断言不变。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找

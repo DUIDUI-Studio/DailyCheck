@@ -39,6 +39,7 @@ from scripts.prod_agent.native_queue import (
     head_admission,
     publication_authority,
 )
+from tests.conftest import only_child_pid
 
 ROOT = Path(__file__).resolve().parents[1]
 CODE = "DUIDUI-Studio/DailyCheck"
@@ -845,7 +846,7 @@ def test_bounded_real_http_child_holds_fence_after_reporter_sigkill(bounded_http
     http_pid = None
     try:
         assert host.arrived.wait(15), "HTTP child never arrived"
-        http_pid = int(subprocess.check_output(["pgrep", "-P", str(proc.pid)], text=True).strip())
+        http_pid = only_child_pid(proc.pid)
         proc.kill()
         proc.wait(10)
         assert proc.returncode == -signal.SIGKILL

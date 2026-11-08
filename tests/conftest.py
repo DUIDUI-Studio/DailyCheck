@@ -5,6 +5,8 @@
 """
 import os
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,16 @@ def candidate_python_env(root: Path) -> dict[str, str]:
         path for path in (str(root), env.get("PYTHONPATH", "")) if path
     )
     return env
+
+
+def only_child_pid(pid: int) -> int:
+    """Read the actual child without requiring procps in the Linux runtime."""
+    if sys.platform == "linux":
+        children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+    else:
+        children = subprocess.check_output(["pgrep", "-P", str(pid)], text=True).split()
+    assert len(children) == 1, children
+    return int(children[0])
 
 
 @pytest.fixture

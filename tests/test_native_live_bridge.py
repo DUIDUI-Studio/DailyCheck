@@ -44,6 +44,7 @@ from scripts.prod_agent.native_ports import (
     runtime_identity,
 )
 from scripts.prod_agent.native_queue import NativeQueue, ProducerPolicy, deploy_state
+from tests.conftest import only_child_pid
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -709,7 +710,7 @@ def test_delayed_real_signer_child_retains_fence_after_parent_kill(bridge):
     child_pid = None
     try:
         assert server.arrived.wait(15)
-        child_pid = int(subprocess.check_output(["pgrep", "-P", str(proc.pid)], text=True).strip())
+        child_pid = only_child_pid(proc.pid)
         proc.kill()
         proc.wait(10)
         assert proc.returncode == -signal.SIGKILL
