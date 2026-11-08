@@ -1134,7 +1134,7 @@ def test_snapshot_keeps_the_bound_base_when_the_source_has_no_main_branch(tmp_pa
     git("add", ".")
     git("commit", "-qm", "head")
     head = git("rev-parse", "HEAD")
-    git("config", "fixture.source_only", "not copied")
+    git("config", "fixture.sourceonly", "not copied")
     candidate = tmp_path / "candidate"
     producer.snapshot(source, candidate, head, base)
     actual = subprocess.check_output(
@@ -1145,7 +1145,7 @@ def test_snapshot_keeps_the_bound_base_when_the_source_has_no_main_branch(tmp_pa
     assert subprocess.check_output(
         ["git", "-C", str(candidate), "rev-parse", "origin/main"], text=True).strip() == base
     config = (candidate / ".git/config").read_text()
-    assert "source_only" not in config
+    assert "sourceonly" not in config
 
 
 def test_pytest_capture_rejects_a_changed_evidence_plugin(monkeypatch, tmp_path):
