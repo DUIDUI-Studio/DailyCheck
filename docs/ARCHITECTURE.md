@@ -1441,6 +1441,16 @@ runtime、independent review 和 signer identity 必须来自受保护 port；�
 默认 signer 缺失即拒绝，shadow reducer/HostingClient 写权限不扩张。
 
 **Issue164 producer ownership 修复（local fixture only，真实激活仍关闭）**：protected
+新增 `native_ports.py` / `native_gate.py` / `native_controller.py` 是独立安装的 H admission /
+baseline preflight 边界：复用真实 `NativeGitHubFacts` 与原 H/core/state 算法，保护 policy、
+执行闭包/Python/crypto pin、runtime/review/baseline publisher 记录及专用 App key。固定 CLI
+只支持 H/初始化/只读恢复诊断；G executor/release 明确拒绝，普通 shadow reducer 与
+HostingClient 写拒绝不变。真正的 runtime/review/baseline publisher 是受保护安装前提，
+缺失即失败；checksum、PR/CI JSON、旧 source/public map 都不能自授部署锚点。
+App HTTP 子进程持继承 flock 到真实请求退出，key/token 不传应用或 argv。便携 loopback /
+JWT/parser 控制不证明跨 UID 隔离；真实 Linux UID 内核控制与 hosted/Prod 验收单列，
+未取得对应证据前不能声明激活或完整 bridge 通过。应用 root UID 与 candidate checkout
+脚本执行仍须未来 protected G pipeline 安装修复，本次没有接通 G 部署或放行。
 bc77 独立 review 证实原 preview 的 candidate venv 查找与 native0 成功判据可跳过 T11。
 full-native 验收夹具从 YAML 的 `run` 字段执行 legacy capture/gate；HTTP reporter 子进程
 按完整 `ProducerPolicy` 传递 producer pin。便宜的同 helper policy 正反例和真实 HTTP/fence
