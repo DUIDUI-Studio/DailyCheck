@@ -16,14 +16,34 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 import traceback
 import uuid
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 AUTHORITY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTHORITY))
+
+LOCAL_SCOPE = "local_fixture_only"
+HOSTED_SCOPE = "approved_hosted_archive"
+HOSTED_PLATFORM = "linux/arm64"
+RELEASE_PREFIX = "https://github.com/DUIDUI-Studio/DailyCheck/releases/download/"
+# Only the public GitHub release route and its bounded asset redirects.
+PUBLIC_REDIRECT_HOSTS = frozenset({"github.com", "objects.githubusercontent.com",
+                                   "release-assets.githubusercontent.com"})
+MAX_REDIRECTS = 5
+ARCHIVE_LIMIT = 2 * 1024 ** 3
+SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+DEFAULT_SECONDS = 180
+HOSTED_PYTEST_SECONDS = 2700
+# Measured full suite retained 3.5 GiB; never run it on an in-memory tmpfs.
+SCRATCH_RESERVE = 4 * 1024 ** 3
+HOST_FREE_MARGIN = 2 * 1024 ** 3
 
 # A fixed set of approved CI entrypoints, not candidate-selected executable paths.
 PYTHON_GATES = {
@@ -118,17 +138,61 @@ def read_data(path: Path, root: Path) -> bytes:
     return raw
 
 
+def _validate_hosted_runtime(runtime: dict) -> None:
+    """The only hosted profile. Every field is fixed by the approved manifest."""
+    if (set(runtime) != {"image", "platform", "scope", "controller", "archive", "image_graph"}
+            or runtime["platform"] != HOSTED_PLATFORM
+            or runtime["controller"] != "approved_workflow_platform_python_I"):
+        raise ValueError("invalid approved hosted runtime")
+    archive, graph = runtime["archive"], runtime["image_graph"]
+    if (not isinstance(archive, dict) or set(archive) != {"url", "bytes", "sha256"}
+            or not isinstance(graph, dict)
+            or set(graph) != {"index_digest", "platform_manifest_digest", "config_digest",
+                              "rootfs_diff_ids", "rootfs_diff_ids_sha256"}):
+        raise ValueError("invalid approved hosted runtime identity")
+    url = archive["url"]
+    if (not isinstance(url, str)
+            or re.fullmatch(re.escape(RELEASE_PREFIX) + r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.tar\.gz",
+                            url) is None):
+        raise ValueError("unapproved hosted runtime archive url")
+    if (type(archive["bytes"]) is not int or not 0 < archive["bytes"] <= ARCHIVE_LIMIT
+            or not isinstance(archive["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", archive["sha256"]) is None):
+        raise ValueError("invalid approved hosted runtime archive")
+    for key in ("index_digest", "platform_manifest_digest", "config_digest"):
+        if not isinstance(graph[key], str) or SHA256_DIGEST.fullmatch(graph[key]) is None:
+            raise ValueError("invalid approved hosted runtime graph")
+    if (graph["index_digest"] != runtime["image"]
+            or len({graph["index_digest"], graph["platform_manifest_digest"],
+                    graph["config_digest"]}) != 3):
+        raise ValueError("contradictory approved hosted runtime graph")
+    diff_ids = graph["rootfs_diff_ids"]
+    if (not isinstance(diff_ids, list) or not diff_ids
+            or not all(isinstance(item, str) and SHA256_DIGEST.fullmatch(item)
+                       for item in diff_ids)
+            or len(set(diff_ids)) != len(diff_ids)
+            or graph["rootfs_diff_ids_sha256"] != digest(diff_ids)):
+        raise ValueError("invalid approved hosted runtime rootfs")
+
+
 def parse_manifest(raw: bytes, expected_blob: str) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", expected_blob or "") or blob_id(raw) != expected_blob:
         raise ValueError("unapproved producer manifest blob")
     value = json.loads(raw)
-    if (set(value) != {"version", "runtime", "files"} or value["version"] != 1
-            or set(value["runtime"]) != {"image", "platform", "scope", "controller"}
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["runtime"]["image"])
-            or value["runtime"]["platform"] not in {"linux/arm64", "linux/amd64"}
-            or value["runtime"]["scope"] != "local_fixture_only"
-            or value["runtime"]["controller"] != "approved_workflow_platform_python_I"):
+    if set(value) != {"version", "runtime", "files"} or value["version"] != 1:
         raise ValueError("invalid approved producer runtime")
+    runtime = value["runtime"]
+    if not isinstance(runtime, dict) or runtime.get("scope") not in {LOCAL_SCOPE, HOSTED_SCOPE}:
+        raise ValueError("invalid approved producer runtime")
+    if runtime["scope"] == LOCAL_SCOPE:
+        if (set(runtime) != {"image", "platform", "scope", "controller"}
+                or not isinstance(runtime["image"], str)
+                or SHA256_DIGEST.fullmatch(runtime["image"]) is None
+                or runtime["platform"] not in {"linux/arm64", "linux/amd64"}
+                or runtime["controller"] != "approved_workflow_platform_python_I"):
+            raise ValueError("invalid approved producer runtime")
+    else:
+        _validate_hosted_runtime(runtime)
     files = value["files"]
     required = {"scripts/ci/trusted_producer.py", "scripts/ci/pytest_evidence.py",
                 "scripts/ci/merge_group.py", "scripts/ci/candidate_binding.py",
@@ -144,6 +208,23 @@ def parse_manifest(raw: bytes, expected_blob: str) -> dict:
            or not re.fullmatch(r"[0-9a-f]{40}", sha) for p, sha in files.items()):
         raise ValueError("invalid producer closure blob")
     return value
+
+
+def approved_images(manifest: dict) -> frozenset[str]:
+    """Exact daemon representations bound by this immutable manifest graph."""
+    runtime = manifest["runtime"]
+    if runtime["scope"] == LOCAL_SCOPE:
+        return frozenset({runtime["image"]})
+    graph = runtime["image_graph"]
+    return frozenset({graph["index_digest"], graph["platform_manifest_digest"],
+                      graph["config_digest"]})
+
+
+def capture_budget(manifest: dict, kind: str) -> tuple[int, bool]:
+    """(wall seconds, disk-backed untrusted scratch) for the approved runtime."""
+    if manifest["runtime"]["scope"] == HOSTED_SCOPE and kind == "pytest":
+        return HOSTED_PYTEST_SECONDS, True
+    return DEFAULT_SECONDS, False
 
 
 def identity(manifest: dict, manifest_blob: str) -> dict:
@@ -190,7 +271,8 @@ def validate_capture(capture: dict, manifest: dict, binding: dict, kind: str, co
     keys = {"version", "container_id", "image", "kind", "context", "binding_sha256",
             "native_exit", "stdout_sha256", "session_sha256", "exited", "removed", "oom_killed"}
     if (not isinstance(capture, dict) or set(capture) != keys or capture["version"] != 1
-            or capture["image"] != manifest["runtime"]["image"]
+            or not isinstance(capture["image"], str)
+            or capture["image"] not in approved_images(manifest)
             or capture["kind"] != kind or capture["context"] != context
             or capture["binding_sha256"] != digest(binding)
             or capture["exited"] is not True or capture["removed"] is not True
@@ -203,6 +285,129 @@ def validate_capture(capture: dict, manifest: dict, binding: dict, kind: str, co
         raise ValueError("invalid external native capture/run/attempt")
 
 
+def _require_free(path: Path, required: int) -> int:
+    free = shutil.disk_usage(path).free
+    if free < required:
+        raise ValueError("insufficient disk for approved native capture")
+    return free
+
+
+class _PublicRedirect(HTTPRedirectHandler):
+    """Bounded, credential-free redirects for a public release asset only."""
+    def __init__(self):
+        self.count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.count += 1
+        parsed = urlsplit(newurl)
+        if (self.count > MAX_REDIRECTS or parsed.scheme != "https"
+                or parsed.hostname not in PUBLIC_REDIRECT_HOSTS
+                or parsed.username or parsed.password):
+            raise ValueError("unapproved runtime archive redirect")
+        # Build fresh: no credential or signed query state is forwarded.
+        return Request(newurl, method="GET", headers={"Accept": "application/octet-stream"})
+
+
+def _public_opener():
+    return build_opener(_PublicRedirect())
+
+
+def download_archive(runtime: dict, destination: Path, *, opener=None) -> None:
+    """Stream only the pinned public bytes; nothing is extracted or executed."""
+    archive = runtime["archive"]
+    if (not archive["url"].startswith(RELEASE_PREFIX)
+            or urlsplit(archive["url"]).scheme != "https"):
+        raise ValueError("unapproved runtime archive url")
+    opener = opener or _public_opener()
+    request = Request(archive["url"], method="GET",
+                      headers={"Accept": "application/octet-stream"})
+    hasher, total = hashlib.sha256(), 0
+    try:
+        with opener.open(request, timeout=120) as response, destination.open("wb") as output:
+            if getattr(response, "status", None) != 200:
+                raise ValueError("approved runtime archive unavailable")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > archive["bytes"]:
+                    raise ValueError("approved runtime archive size mismatch")
+                hasher.update(chunk)
+                output.write(chunk)
+    except ValueError:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError:
+        destination.unlink(missing_ok=True)
+        raise ValueError("approved runtime archive unavailable") from None
+    if total != archive["bytes"] or hasher.hexdigest() != archive["sha256"]:
+        destination.unlink(missing_ok=True)
+        raise ValueError("approved runtime archive digest mismatch")
+
+
+def inspect_image(docker: list[str], reference: str) -> dict | None:
+    result = subprocess.run([*docker, "image", "inspect", reference],
+                            capture_output=True, timeout=120)
+    if result.returncode:
+        return None
+    data = json.loads(result.stdout)
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        raise ValueError("ambiguous approved runtime image")
+    return data[0]
+
+
+def resolve_approved_image(docker: list[str], runtime: dict) -> str | None:
+    """Return a verified daemon reference from the immutable approved graph."""
+    graph = runtime["image_graph"]
+    references = (graph["index_digest"], graph["platform_manifest_digest"],
+                  graph["config_digest"])
+    approved = set(references)
+    for reference in references:
+        inspection = inspect_image(docker, reference)
+        if inspection is None:
+            continue
+        if (inspection.get("Os"), inspection.get("Architecture")) != ("linux", "arm64"):
+            raise ValueError("approved runtime platform mismatch")
+        if (inspection.get("RootFS") or {}).get("Layers") != graph["rootfs_diff_ids"]:
+            raise ValueError("approved runtime rootfs mismatch")
+        if inspection.get("Id") not in approved:
+            raise ValueError("daemon image identity is outside the approved graph")
+        return reference
+    return None
+
+
+def ensure_approved_runtime(docker: list[str], manifest: dict, work: Path, *,
+                            opener=None) -> str:
+    """Resolve the approved image, loading the pinned archive once if needed."""
+    runtime = manifest["runtime"]
+    if runtime["scope"] == LOCAL_SCOPE:
+        return runtime["image"]
+    reference = resolve_approved_image(docker, runtime)
+    if reference is not None:
+        return reference
+    archive_dir = work / "runtime"
+    archive_dir.mkdir(mode=0o700, exist_ok=True)
+    _require_free(archive_dir, runtime["archive"]["bytes"] + HOST_FREE_MARGIN)
+    archive_path = archive_dir / "approved-runtime.tar.gz"
+    download_archive(runtime, archive_path, opener=opener)
+    try:
+        load = subprocess.run([*docker, "load", "-i", str(archive_path)],
+                              capture_output=True, timeout=1800)
+    finally:
+        archive_path.unlink(missing_ok=True)
+    if load.returncode:
+        raise ValueError("approved runtime image load failed")
+    reference = resolve_approved_image(docker, runtime)
+    if reference is None:
+        raise ValueError("approved runtime image unresolved")
+    return reference
+
+
+class _CaptureTimeout(Exception):
+    pass
+
+
 class DockerCapture:
     """Only this trusted host process can reach the daemon or publish evidence.
 
@@ -210,8 +415,10 @@ class DockerCapture:
     A lost controller produces no marker. Timeout kills the owned container and
     is always a failure; uncertain exit/cleanup also forbids an attestation.
     """
-    def __init__(self, docker: list[str], manifest: dict, authority: Path, output: Path):
+    def __init__(self, docker: list[str], manifest: dict, authority: Path, output: Path, *,
+                 image: str | None = None):
         self.docker, self.manifest, self.authority, self.output = docker, manifest, authority, output
+        self.image = image or manifest["runtime"]["image"]
 
     def call(self, *args, timeout=30):
         result = subprocess.run([*self.docker, *args], capture_output=True, timeout=timeout)
@@ -219,16 +426,42 @@ class DockerCapture:
             raise RuntimeError("owned Docker operation failed: " + args[0])
         return result.stdout
 
+    def _wait(self, cid: str, timeout: int, scratch: Path | None) -> int:
+        if scratch is None:
+            return int(self.call("wait", cid, timeout=timeout).decode().strip())
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _CaptureTimeout
+            try:
+                return int(self.call("wait", cid, timeout=min(30, remaining)).decode().strip())
+            except subprocess.TimeoutExpired:
+                if shutil.disk_usage(scratch).free < HOST_FREE_MARGIN:
+                    self.call("kill", cid)
+                    raise ValueError("insufficient disk during approved native capture") from None
+
     def capture(self, candidate: Path, binding: dict, kind: str, context: str,
                 argv: list[str], env: dict[str, str], *, trusted_scripts=False, readonly=False,
                 inputs: Path | None = None):
         name = "dc-native-ci-b2-" + uuid.uuid4().hex
         runtime = self.manifest["runtime"]
+        timeout, disk_scratch = capture_budget(self.manifest, kind)
+        scratch = None
+        if disk_scratch:
+            # Untrusted per-capture scratch lives outside authority/evidence.
+            scratch = self.output / "scratch" / name
+            scratch.mkdir(parents=True, mode=0o700)
+            scratch.chmod(0o777)
+            _require_free(scratch, SCRATCH_RESERVE + HOST_FREE_MARGIN)
+            scratch_args = ["--mount", f"type=bind,src={scratch},dst=/tmp"]
+        else:
+            scratch_args = ["--tmpfs", "/tmp:rw,nosuid,nodev,size=512m,mode=1777"]
         args = ["create", "--name", name, "--label", "org.duidui.scope=dc-native-ci-b2",
                 "--pull=never", "--platform", runtime["platform"], "--network=none",
                 "--user=65532:65532", "--read-only", "--cap-drop=ALL",
                 "--security-opt=no-new-privileges", "--cpus=2", "--memory=2g", "--pids-limit=256",
-                "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m,mode=1777", "--workdir=/candidate",
+                *scratch_args, "--workdir=/candidate",
                 "--mount", f"type=bind,src={candidate},dst=/candidate" + (",readonly" if readonly else ""),
                 "--mount", f"type=bind,src={self.authority},dst=/authority,readonly"]
         if trusted_scripts:
@@ -246,7 +479,7 @@ class DockerCapture:
                      "GIT_CONFIG_VALUE_1": "/dev/null", **env}
         for key, value in clean_env.items():
             args += ["--env", key + "=" + value]
-        args += [runtime["image"], *argv]
+        args += [self.image, *argv]
         # The create result is not candidate stdout.
         cid = self.call(*args).decode().strip()
         if not re.fullmatch(r"[0-9a-f]{64}", cid):
@@ -258,8 +491,8 @@ class DockerCapture:
         try:
             self.call("start", cid)
             try:
-                native = int(self.call("wait", cid, timeout=180).decode().strip())
-            except subprocess.TimeoutExpired:
+                native = self._wait(cid, timeout, scratch)
+            except (_CaptureTimeout, subprocess.TimeoutExpired):
                 timed_out = True
                 self.call("kill", cid)
                 native = int(self.call("wait", cid).decode().strip())
@@ -268,6 +501,8 @@ class DockerCapture:
             state = inspection["State"]
             if state["Running"] or state["Status"] != "exited":
                 raise ValueError("candidate exit unproven; preserve owned container")
+            if scratch is not None:
+                _require_free(scratch, HOST_FREE_MARGIN)
             # Docker merges stderr on the client stderr stream. Obtain BOTH
             # streams verbatim; never print candidate Actions commands/markers.
             logs = subprocess.run([*self.docker, "logs", cid], capture_output=True, timeout=30)
@@ -276,8 +511,12 @@ class DockerCapture:
             raw = logs.stdout + logs.stderr
             (run_dir / "stdout.bin").write_bytes(raw)
             self.call("rm", cid)
+            # Only a proven exited and removed owned capture may delete scratch.
+            if scratch is not None:
+                shutil.rmtree(scratch)
             if (timed_out or native != state["ExitCode"] or state["OOMKilled"]
-                    or state["Error"] or inspection["Image"] != runtime["image"]):
+                    or state["Error"]
+                    or inspection["Image"] not in approved_images(self.manifest)):
                 raise ValueError("candidate timeout/runtime/native capture failure")
             session = None
             if kind == "pytest":
@@ -385,6 +624,12 @@ def job(args):
     manifest_blob = os.environ["CI_PRODUCER_MANIFEST_BLOB"]
     raw = (AUTHORITY / "scripts/ci/producer_manifest.json").read_bytes()
     manifest = parse_manifest(raw, manifest_blob)
+    hosted = manifest["runtime"]["scope"] == HOSTED_SCOPE
+    if hosted:
+        # The fixed trusted producer runs as root on a hosted standard VM. The
+        # runner-owned checkout must stay readable without a Git ownership stop.
+        os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
+                           "GIT_CONFIG_VALUE_0": "*"})
     # Verify executed bytes before any candidate process exists. This is a
     # trusted export check, not a candidate helper approving its own code.
     for name, expected in manifest["files"].items():
@@ -421,7 +666,9 @@ def job(args):
         docker += ["--config", args.docker_config]
     if args.docker_host:
         docker += ["-H", args.docker_host]
-    runner = DockerCapture(docker, manifest, AUTHORITY, work)
+    image = (ensure_approved_runtime(docker, manifest, work) if hosted
+             else manifest["runtime"]["image"])
+    runner = DockerCapture(docker, manifest, AUTHORITY, work, image=image)
     if args.context == "test":
         base = binding["CI_BASE_SHA"]
         changed = subprocess.check_output(["git", "diff", "--name-only", "--diff-filter=d", "-z",

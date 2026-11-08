@@ -11,17 +11,38 @@
     "scripts/ci/merge_group.py": "7a9fd1368f3fda144006308637ef4d58e5fce66d",
     "scripts/ci/pytest_evidence.py": "ea1b5d5dddc42d1f9ee3a06b670da89fe248319b",
     "scripts/ci/pytest_summary.py": "4a5abc5d1a174c697508688103cddefdd049e5b9",
-    "scripts/ci/trusted_producer.py": "85d814b156cd24af2670d7967e25e820982a4770",
+    "scripts/ci/trusted_producer.py": "b31df36fbeda18e8353742a85a57b7cbd1eda48a",
     "scripts/dev_smoke_t11_e2e.py": "e80d043734a9dc78acc82033c61fd7791498cca9",
     "scripts/hosting.py": "e9f45c0014c0404e05ea110ad68748f29acde43e",
     "scripts/mcp_contracts.py": "6482e136fd74265ffa1bfc591dc2138b6e275ee3",
     "tests/known_failures.txt": "9acc4ec1ea23c7418475c3046b9d248b184691b6"
   },
   "runtime": {
+    "archive": {
+      "bytes": 120584124,
+      "sha256": "09e4269f8e35cc6f7101102159cb8785a9db962e6be256a63bd15b991b645c48",
+      "url": "https://github.com/DUIDUI-Studio/DailyCheck/releases/download/ci-runtime-20261108-arm64-2ab572f1/dailycheck-ci-linux-arm64-2ab572f1.tar.gz"
+    },
     "controller": "approved_workflow_platform_python_I",
     "image": "sha256:2ab572f136f740a807ba74dcaa52cc2815ac39b17f039c20708ef9dc1d3b52d8",
+    "image_graph": {
+      "config_digest": "sha256:f3a8ad9c466e412c0b3c0f9ae5f8717a992a284427993edccbc217e212be7566",
+      "index_digest": "sha256:2ab572f136f740a807ba74dcaa52cc2815ac39b17f039c20708ef9dc1d3b52d8",
+      "platform_manifest_digest": "sha256:d257262e724668fe101e9e467bed876ed689946e17d3bc4f74780aaff1045da7",
+      "rootfs_diff_ids": [
+        "sha256:e5593b7179d10a64cfe451e886e3ab13ccd476f906dc670865322ae1dbdf969f",
+        "sha256:51845050c33a3b243e4f3a49123a4fe0bef0d1deb2d49147e3baec3f40aab666",
+        "sha256:16ee41ffc3d9037abbd088c94fff9bda90929c827b0199392a35f79d6060bbcb",
+        "sha256:3b70d47819cb20692c6880c6320fdf1d2f2a69147dd1ac9930d8f8dbb5c3bae6",
+        "sha256:1ae22a7ae9e5db6f30f550f95a221d8cd7024d5d90c15f3253e626ded7d74c7f",
+        "sha256:4d723955d3b9f2b6dbaf2feb4dca9a652fc07fae4686393faf79e736855c115a",
+        "sha256:67b05464fa048c7fce42da9eb967697d1c68226c6735ef25545456a4bfc5fd8f",
+        "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+      ],
+      "rootfs_diff_ids_sha256": "59309909e679ad06e50f0bf144db0989ab4669a4afe048109965efc1fc1fce69"
+    },
     "platform": "linux/arm64",
-    "scope": "local_fixture_only"
+    "scope": "approved_hosted_archive"
   },
   "version": 1
 }

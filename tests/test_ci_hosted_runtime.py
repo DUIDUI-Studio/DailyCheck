@@ -1,0 +1,332 @@
+"""Hosted runtime profile, transport and workflow contracts.
+
+Everything here is synthetic: fake openers and fake image inspections test
+parsing and fail-closed behavior, never an actual hosted runner or asset.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import inspect
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
+
+import pytest
+import yaml
+
+from scripts.ci import trusted_producer as producer
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST_RAW = (ROOT / "scripts/ci/producer_manifest.json").read_bytes()
+MANIFEST = json.loads(MANIFEST_RAW)
+MANIFEST_BLOB = producer.blob_id(MANIFEST_RAW)
+RUNTIME = MANIFEST["runtime"]
+GRAPH = RUNTIME["image_graph"]
+LAYERS = GRAPH["rootfs_diff_ids"]
+
+
+def _raw(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, indent=2).encode() + b"\n"
+
+
+def _parse(value: dict) -> dict:
+    raw = _raw(value)
+    return producer.parse_manifest(raw, producer.blob_id(raw))
+
+
+def _local_manifest() -> dict:
+    value = copy.deepcopy(MANIFEST)
+    value["runtime"] = {"controller": "approved_workflow_platform_python_I",
+                        "image": "sha256:" + "a" * 64, "platform": "linux/arm64",
+                        "scope": "local_fixture_only"}
+    return value
+
+
+def _workflow() -> dict:
+    return yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+
+
+class _Response:
+    def __init__(self, chunks, status=200):
+        self._chunks, self.status = iter(chunks), status
+
+    def read(self, size=-1):
+        return next(self._chunks, b"")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _opener(chunks=(), *, status=200, error=None):
+    class Opener:
+        def open(self, request, timeout=None):
+            if error is not None:
+                raise error
+            return _Response(chunks, status)
+
+    return Opener()
+
+
+def _inspection(ident, *, architecture="arm64", os_name="linux", layers=None):
+    return {"Id": ident, "Architecture": architecture, "Os": os_name,
+            "RootFS": {"Layers": LAYERS if layers is None else layers}}
+
+
+def test_repository_manifest_pins_the_prepared_public_runtime():
+    manifest = producer.parse_manifest(MANIFEST_RAW, MANIFEST_BLOB)
+    runtime = manifest["runtime"]
+    assert runtime["scope"] == "approved_hosted_archive"
+    assert runtime["platform"] == "linux/arm64"
+    assert runtime["image"] == GRAPH["index_digest"]
+    assert len({GRAPH["index_digest"], GRAPH["platform_manifest_digest"],
+                GRAPH["config_digest"]}) == 3
+    assert runtime["archive"] == {
+        "bytes": 120584124,
+        "sha256": "09e4269f8e35cc6f7101102159cb8785a9db962e6be256a63bd15b991b645c48",
+        "url": ("https://github.com/DUIDUI-Studio/DailyCheck/releases/download/"
+                "ci-runtime-20261108-arm64-2ab572f1/dailycheck-ci-linux-arm64-2ab572f1.tar.gz")}
+    assert GRAPH["rootfs_diff_ids_sha256"] == producer.digest(LAYERS)
+    for name, blob in manifest["files"].items():
+        assert producer.blob_id((ROOT / name).read_bytes()) == blob, name
+    assert manifest["files"]["scripts/ci/trusted_producer.py"] == producer.blob_id(
+        (ROOT / "scripts/ci/trusted_producer.py").read_bytes())
+    assert producer.approved_images(manifest) == {
+        GRAPH["index_digest"], GRAPH["platform_manifest_digest"], GRAPH["config_digest"]}
+
+
+def test_local_fixture_profile_and_budget_remain_exact():
+    manifest = _parse(_local_manifest())
+    image = manifest["runtime"]["image"]
+    assert manifest["runtime"]["scope"] == "local_fixture_only"
+    assert producer.approved_images(manifest) == {image}
+    assert producer.capture_budget(manifest, "pytest") == (180, False)
+    assert producer.capture_budget(manifest, "lint") == (180, False)
+
+
+def test_hosted_pytest_owns_disk_scratch_and_long_budget():
+    assert producer.capture_budget(MANIFEST, "pytest") == (2700, True)
+    assert producer.capture_budget(MANIFEST, "lint") == (180, False)
+    assert producer.capture_budget(MANIFEST, "report-generate") == (180, False)
+
+
+@pytest.mark.parametrize("damage", [
+    "extra", "missing", "version", "image-index", "duplicate-digest", "rootfs-hash",
+    "rootfs-duplicate", "http-url", "foreign-url", "query-url", "zero-bytes",
+    "oversize-bytes", "platform", "unknown-scope",
+])
+def test_hosted_profile_rejects_unknown_missing_or_contradictory_fields(damage):
+    value = copy.deepcopy(MANIFEST)
+    runtime, graph, archive = value["runtime"], value["runtime"]["image_graph"], value["runtime"]["archive"]
+    if damage == "extra":
+        runtime["extra"] = "x"
+    elif damage == "missing":
+        archive.pop("sha256")
+    elif damage == "version":
+        value["version"] = 2
+    elif damage == "image-index":
+        runtime["image"] = "sha256:" + "b" * 64
+    elif damage == "duplicate-digest":
+        graph["platform_manifest_digest"] = graph["config_digest"]
+    elif damage == "rootfs-hash":
+        graph["rootfs_diff_ids_sha256"] = "0" * 64
+    elif damage == "rootfs-duplicate":
+        graph["rootfs_diff_ids"][1] = graph["rootfs_diff_ids"][0]
+    elif damage == "http-url":
+        archive["url"] = archive["url"].replace("https:", "http:")
+    elif damage == "foreign-url":
+        archive["url"] = "https://github.com/other/repo/releases/download/t/a.tar.gz"
+    elif damage == "query-url":
+        archive["url"] += "?signed=1"
+    elif damage == "zero-bytes":
+        archive["bytes"] = 0
+    elif damage == "oversize-bytes":
+        archive["bytes"] = producer.ARCHIVE_LIMIT + 1
+    elif damage == "platform":
+        runtime["platform"] = "linux/amd64"
+    else:
+        runtime["scope"] = "candidate_choice"
+    with pytest.raises(ValueError):
+        _parse(value)
+
+
+@pytest.mark.parametrize("damage", ["image", "platform", "identity"])
+def test_capture_accepts_only_the_approved_image_graph(damage):
+    binding = {"version": 3}
+    for image in (GRAPH["index_digest"], GRAPH["platform_manifest_digest"],
+                  GRAPH["config_digest"]):
+        producer.validate_capture(
+            {"version": 1, "container_id": "5" * 64, "image": image, "kind": "lint",
+             "context": "test", "binding_sha256": producer.digest(binding), "native_exit": 0,
+             "stdout_sha256": "6" * 64, "session_sha256": None, "exited": True,
+             "removed": True, "oom_killed": False}, MANIFEST, binding, "lint", "test")
+    image = {"image": "sha256:" + "f" * 64, "platform": "amd64",
+             "identity": "sha256:" + "e" * 64}[damage]
+    with pytest.raises(ValueError):
+        producer.validate_capture(
+            {"version": 1, "container_id": "5" * 64, "image": image, "kind": "lint",
+             "context": "test", "binding_sha256": producer.digest(binding), "native_exit": 0,
+             "stdout_sha256": "6" * 64, "session_sha256": None, "exited": True,
+             "removed": True, "oom_killed": False}, MANIFEST, binding, "lint", "test")
+
+
+def test_download_streams_exact_size_and_hash(tmp_path):
+    payload = b"approved-runtime-archive" * 4096
+    runtime = copy.deepcopy(RUNTIME)
+    runtime["archive"].update(bytes=len(payload),
+                              sha256=hashlib.sha256(payload).hexdigest())
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(runtime, destination,
+                              opener=_opener([payload[:1000], payload[1000:9000], payload[9000:]]))
+    assert destination.read_bytes() == payload
+
+
+@pytest.mark.parametrize("damage", ["long", "partial", "hash", "status", "missing",
+                                    "network", "foreign-url"])
+def test_download_rejects_bad_bytes_before_any_load(tmp_path, damage):
+    payload = b"pinned-bytes" * 100
+    runtime = copy.deepcopy(RUNTIME)
+    runtime["archive"].update(bytes=len(payload),
+                              sha256=hashlib.sha256(payload).hexdigest())
+    destination = tmp_path / "archive.tar.gz"
+    if damage == "long":
+        runtime["archive"]["bytes"] = len(payload) - 1
+        opener = _opener([payload])
+    elif damage == "partial":
+        runtime["archive"]["bytes"] = len(payload) + 1
+        opener = _opener([payload])
+    elif damage == "hash":
+        runtime["archive"]["sha256"] = "0" * 64
+        opener = _opener([payload])
+    elif damage == "status":
+        opener = _opener([payload], status=302)
+    elif damage == "missing":
+        opener = _opener(error=HTTPError("https://github.com/approved", 404, "missing", {}, None))
+    elif damage == "network":
+        opener = _opener(error=URLError("offline"))
+    else:
+        runtime["archive"]["url"] = "https://example.invalid/runtime.tar.gz"
+        opener = _opener([payload])
+    with pytest.raises(ValueError):
+        producer.download_archive(runtime, destination, opener=opener)
+    assert not destination.exists()
+
+
+def test_redirects_are_public_https_and_credential_free():
+    handler = producer._PublicRedirect()
+    request = producer.Request("https://github.com/approved")
+    allowed = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://release-assets.githubusercontent.com/a")
+    assert allowed.get_header("Authorization") is None
+    assert allowed.full_url.endswith("/a")
+    for url in ("http://release-assets.githubusercontent.com/a",
+                "https://example.invalid/a",
+                "https://user:pass@release-assets.githubusercontent.com/a"):
+        with pytest.raises(ValueError):
+            producer._PublicRedirect().redirect_request(request, None, 302, "Found", {}, url)
+    looping = producer._PublicRedirect()
+    for _ in range(producer.MAX_REDIRECTS):
+        looping.redirect_request(request, None, 302, "Found", {},
+                                 "https://objects.githubusercontent.com/a")
+    with pytest.raises(ValueError):
+        looping.redirect_request(request, None, 302, "Found", {},
+                                 "https://objects.githubusercontent.com/a")
+
+
+def test_image_resolution_binds_platform_and_rootfs(monkeypatch):
+    def resolve(mapping):
+        monkeypatch.setattr(producer, "inspect_image", lambda docker, ref: mapping.get(ref))
+        return producer.resolve_approved_image(["docker"], RUNTIME)
+
+    assert resolve({}) is None
+    assert resolve({GRAPH["config_digest"]:
+                    _inspection(GRAPH["config_digest"])}) == GRAPH["config_digest"]
+    for mapping in (
+            {GRAPH["index_digest"]: _inspection(GRAPH["index_digest"], architecture="amd64")},
+            {GRAPH["index_digest"]: _inspection(GRAPH["index_digest"], os_name="windows")},
+            {GRAPH["index_digest"]: _inspection(GRAPH["index_digest"], layers=LAYERS[:-1])},
+            {GRAPH["index_digest"]: _inspection("sha256:" + "f" * 64)}):
+        with pytest.raises(ValueError):
+            resolve(mapping)
+
+
+def test_unavailable_or_corrupt_archive_never_reaches_docker(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(producer, "inspect_image", lambda docker, ref: None)
+    monkeypatch.setattr(producer.subprocess, "run",
+                        lambda *a, **k: calls.append(a) or pytest.fail("docker ran"))
+
+    def missing(runtime, destination, *, opener=None):
+        raise ValueError("approved runtime archive unavailable")
+
+    monkeypatch.setattr(producer, "download_archive", missing)
+    with pytest.raises(ValueError):
+        producer.ensure_approved_runtime(["docker"], MANIFEST, tmp_path)
+    assert calls == []
+    assert not (tmp_path / "attestation.json").exists()
+
+
+def test_low_disk_blocks_capture_and_load(monkeypatch, tmp_path):
+    monkeypatch.setattr(producer.shutil, "disk_usage", lambda path: SimpleNamespace(free=0))
+    with pytest.raises(ValueError):
+        producer._require_free(tmp_path, 1)
+
+    calls = []
+    monkeypatch.setattr(producer, "inspect_image", lambda docker, ref: None)
+    monkeypatch.setattr(producer.subprocess, "run", lambda *a, **k: calls.append(a))
+    with pytest.raises(ValueError):
+        producer.ensure_approved_runtime(["docker"], MANIFEST, tmp_path)
+    assert calls == []
+
+
+def test_workflow_uses_arm_runner_and_skips_only_github_push():
+    workflow = _workflow()
+    test, reports = workflow["jobs"]["test"], workflow["jobs"]["agent-framework-reports"]
+    assert "ubuntu-24.04-arm" in test["runs-on"] and "ubuntu-latest" in test["runs-on"]
+    assert "github.server_url != 'https://github.com'" in test["if"]
+    assert "github.event_name != 'push'" in test["if"]
+    assert reports["if"].startswith("always()")
+    assert "pull_request" in reports["if"] and "merge_group" in reports["if"]
+    assert test["timeout-minutes"] == "60" and reports["timeout-minutes"] == "60"
+    native_env = workflow["env"]["CI_NATIVE_PRODUCER"]
+    assert "github.server_url == 'https://github.com'" in native_env
+    assert "pull_request" in native_env and "merge_group" in native_env
+    assert workflow["on"]["push"]["branches"] == ["main"]
+
+
+def test_native_steps_use_literal_pins_sudo_and_keep_full_pytest():
+    workflow = _workflow()
+    native = [step for job in workflow["jobs"].values() for step in job["steps"]
+              if step["name"] == "Execute approved isolated native producer"]
+    assert len(native) == 2
+    assert sorted(step["env"]["NATIVE_CONTEXT"] for step in native) == [
+        "agent-framework-reports", "test"]
+    for step in native:
+        assert step["env"]["CI_PRODUCER_MANIFEST_BLOB"] == MANIFEST_BLOB
+        assert "${{" not in step["env"]["CI_PRODUCER_MANIFEST_BLOB"]
+        assert "sudo -n --preserve-env=" in step["run"]
+        assert "python3 -I" in step["run"]
+        assert "PYTHONPATH" not in step["run"]
+        assert "CI_ROOT" in step["run"] and "NATIVE_QUEUE_READ_TOKEN" in step["run"]
+    assert MANIFEST_BLOB in (ROOT / ".github/workflows/ci.yml").read_text()
+    pytest_step = next(step for step in workflow["jobs"]["test"]["steps"]
+                       if step["name"] == "Pytest (full suite, including MCP)")
+    assert "-m pytest" in pytest_step["run"]
+    assert "--basetemp=${CI_ROOT}/pytest-dc" in pytest_step["run"]
+    for forbidden in ("-k ", "--deselect", "--ignore", "skip"):
+        assert forbidden not in pytest_step["run"]
+    assert "-m pytest" not in "".join(
+        step.get("run", "") for step in workflow["jobs"]["agent-framework-reports"]["steps"])
+
+
+def test_no_cli_or_environment_runtime_override():
+    source = inspect.getsource(producer.main)
+    for forbidden in ("--runtime", "--archive", "--image", "--url", "RUNTIME_URL"):
+        assert forbidden not in source
+    parameters = inspect.signature(producer.ensure_approved_runtime).parameters
+    assert parameters["opener"].default is None
+    assert "DAILYCHECK_CI_RUNTIME" not in inspect.getsource(producer)

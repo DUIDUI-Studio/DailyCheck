@@ -1521,6 +1521,13 @@ daemon socket/credentials/host PID 的固定 image 容器运行一次完整 pyte
 和 tmp 可写。controller 从 daemon wait/inspect/logs 捕获实际 exit/output，session 文件仍是
 待核验数据；容器退出并删除后才验证/发布。candidate 日志绝不原样进入 Actions log command
 或 attestation channel。timeout/OOM/不明 exit/缺 session/logs 均失败，controller 死亡无 proof。
+hosted pytest 每次 capture 使用独立 disk-backed untrusted scratch（与 authority/evidence 分开），
+预算 2700s（job timeout 60min）；create 前、wait 中、退出后都要求 host 至少保留 2GiB free。
+capture 只删除已证明 exited+removed 的 owned container 与 owned scratch，不 prune。GitHub
+standard VM 上固定 trusted producer 以 passwordless sudo 运行，仅保留显式 required CI/event/
+upstream/read-token 变量（值不进 argv），使用 `python3 -I` 且不继承 PYTHONPATH/venv，以便
+清理 UID65532 私有 scratch；candidate 容器仍为 uid65532、caps none、NoNewPrivileges、无网络/
+daemon socket/host PID/凭据。低磁盘/不确定 exit 一律不产生 attestation。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找
@@ -1536,8 +1543,18 @@ context 的 capture 必须相等，不能靠新 envelope hash 接受另一次实
 Git blob API 的 base64 只去除传输换行 CR/LF，再严格解码并核验不可变 blob SHA；不能将
 合法换行误判为 producer 内容变化，也不能忽略其他非法编码字符。
 
-manifest 中 image 是 Coordinator 预加载的 **linux/arm64 local image ID**，scope 明确为
-`local_fixture_only`；不是已发布 registry reference，也不提供 hosted amd64/Prod runtime
+manifest runtime 有两个严格 profile：旧的 `local_fixture_only`（version 1，本地 fixture image，
+180s/tmpfs/精确 image 行为不变）与 `approved_hosted_archive`。后者固定公开 release archive 的
+URL/bytes/SHA256、OCI index/platform manifest/config 三个不可变 digest、platform=
+`linux/arm64` 与完整 rootfs diff IDs（及其 digest）；缺字段、未知字段、index≠image 或 digest
+互相矛盾一律拒绝。hosted producer 只从字面 HTTPS
+`https://github.com/DUIDUI-Studio/DailyCheck/releases/download/...` 路由流式下载，精确
+size/SHA 校验通过后才 `docker load`；redirect 仅限有界公开资产 host，不转发凭据或记录签名
+URL，missing/corrupt asset fail closed。加载后只解析已批准 graph 的 daemon 表示（index/
+platform/config 之一），并核验 linux/arm64 与完整 rootfs；capture/attestation 记录实际
+daemon image 且必须落在同一 graph，不按 backend 改写 manifest。测试 opener 只是函数参数，
+没有 CLI/env 运行时覆盖。
+coordinator-owned `local_fixture_only` image 仍可解析；它不提供 hosted/Prod runtime
 或隔离 signer 的安装证明。GitHub runner/platform Python/daemon 属于平台信任根，candidate
 不能在该主机执行；runtime 自身恶意或任意 malicious pytest/test intent 不在本次证明内，仍需
 独立语义 review。`tests/test_trusted_ci_producer.py` 的普通 parser fixtures 明确标记 synthetic；
@@ -1564,7 +1581,8 @@ SIGKILL 后 HTTP child 持 fence，丢响应/TTL/clear-lock/corruption 保留 ba
 shadow / publication / fencing 兼容回归保留；全仓测试由 Coordinator 在独立 Review PASS 后
 另行决定，没有 full-suite lease，也没有把 6b 基线重标成新源码结果。CI reuse 修复仅跑
 便宜 CI/readiness/handoff 回归，不重跑这次 600 秒证明，也不把旧 fixture 重标成修复 pin 的执行。
-现有 main push/workflow_dispatch 仍各可触发 test；本修复没有改变触发器或消除所有可能重跑。
+GitHub main push 跳过冗余的 full test job；H/G 两个 required context 与 reports 复用、Gitea
+push 行为不变，workflow_dispatch 仍可手动触发。本次未改分支保护、发布或部署设置。
 
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。
@@ -1583,7 +1601,9 @@ Gitea 继续只查既有 inbox 的 delivery IDs，不改变其 processed 文件�
 `DAILYCHECK_SOURCE_DIR` 指定源码目录，缺省 `/root/DailyCheck` 不变。
 
 **CI 共存**（workflow 红线，准备不等于获准落地）：同一两个 required jobs 和现有报告、redline、
-hygiene、MCP contracts/impact、零新增失败门禁保留。GitHub 用官方 checkout/setup-python v7，
+hygiene、MCP contracts/impact、零新增失败门禁保留。GitHub native job 用标准
+`ubuntu-24.04-arm`（`runs-on` 表达式在 Gitea 保持原 `ubuntu-latest`），两个 job timeout 60min；
+GitHub main push 跳过冗余 full test，Gitea push 不变。GitHub 用官方 checkout/setup-python v7，
 Gitea 用原生 Git 和 runner 自带 Python；绝对 `uses: http://...` 即使条件不成立也不合法，
 因此源 checkout 用 transient Git config 的 scoped auth，既不落 config 也不入 argv。
 两端均显式 checkout PR head H，fetch main/base 与完整历史。每个 job 用 `mktemp` 根目录隔离

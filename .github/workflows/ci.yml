@@ -36,7 +36,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # GitHub native H/G runs on the standard arm64 VM that matches the tested
+    # runtime. Gitea keeps its original runner and push behavior; only the
+    # redundant full GitHub main-push run is skipped.
+    if: github.server_url != 'https://github.com' || github.event_name != 'push'
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 60
     outputs:
       pytest_summary_b64: ${{ steps.pytest_summary.outputs.pytest_summary_b64 }}
       pytest_envelope_sha256: ${{ steps.pytest_summary.outputs.pytest_envelope_sha256 }}
@@ -109,7 +114,7 @@ jobs:
         id: native_producer
         if: env.CI_NATIVE_PRODUCER == 'true'
         env:
-          CI_PRODUCER_MANIFEST_BLOB: 40fe930d95d486ac06f1aae18c5ed397b18627ff
+          CI_PRODUCER_MANIFEST_BLOB: 1e9d2cd2ab8f5f76054b6078511798b22aa3d0cc
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           NATIVE_CONTEXT: test
         run: |
@@ -139,7 +144,16 @@ jobs:
           for package in ("scripts", "scripts/ci", "scripts/agent_framework"):
               (root / package / "__init__.py").write_bytes(b"")
           PYCODE
-          python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
+          # GitHub standard VM: the fixed trusted producer runs with passwordless
+          # sudo only so it can own/remove UID65532 private scratch. Only the
+          # explicit required CI/event/upstream/read-token variables are kept;
+          # no import path or candidate venv is inherited and Python runs with -I.
+          if [ "${{ github.server_url }}" = "https://github.com" ]; then
+            sudo -n --preserve-env=CI_ROOT,CI_PRODUCER_MANIFEST_BLOB,NATIVE_CONTEXT,NATIVE_QUEUE_READ_TOKEN,NATIVE_TEST_B64,UPSTREAM_RESULT,UPSTREAM_MEMBER_MANIFEST_B64,CI_REPOSITORY,CI_RUN_ID,CI_RUN_ATTEMPT,CI_EVENT,CI_HEAD_SHA,CI_BASE_SHA,CI_GROUP_SHA,CI_EVENT_SHA,GITHUB_EVENT_PATH,GITHUB_OUTPUT,GITHUB_SERVER_URL \
+              python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
+          else
+            python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
+          fi
       - name: Resolve authenticated merge-group members
         id: member_manifest
         if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')
@@ -223,7 +237,8 @@ jobs:
     # 详见 docs/agent-framework/v0.1.md §三
     # Always settle the required report context; missing/failed upstream is an explicit failure.
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 60
     if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     steps:
       - name: Require successful complete upstream
@@ -296,7 +311,7 @@ jobs:
         id: native_producer
         if: env.CI_NATIVE_PRODUCER == 'true'
         env:
-          CI_PRODUCER_MANIFEST_BLOB: 40fe930d95d486ac06f1aae18c5ed397b18627ff
+          CI_PRODUCER_MANIFEST_BLOB: 1e9d2cd2ab8f5f76054b6078511798b22aa3d0cc
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           NATIVE_CONTEXT: agent-framework-reports
           UPSTREAM_RESULT: ${{ needs.test.result }}
@@ -329,7 +344,16 @@ jobs:
           for package in ("scripts", "scripts/ci", "scripts/agent_framework"):
               (root / package / "__init__.py").write_bytes(b"")
           PYCODE
-          python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
+          # GitHub standard VM: the fixed trusted producer runs with passwordless
+          # sudo only so it can own/remove UID65532 private scratch. Only the
+          # explicit required CI/event/upstream/read-token variables are kept;
+          # no import path or candidate venv is inherited and Python runs with -I.
+          if [ "${{ github.server_url }}" = "https://github.com" ]; then
+            sudo -n --preserve-env=CI_ROOT,CI_PRODUCER_MANIFEST_BLOB,NATIVE_CONTEXT,NATIVE_QUEUE_READ_TOKEN,NATIVE_TEST_B64,UPSTREAM_RESULT,UPSTREAM_MEMBER_MANIFEST_B64,CI_REPOSITORY,CI_RUN_ID,CI_RUN_ATTEMPT,CI_EVENT,CI_HEAD_SHA,CI_BASE_SHA,CI_GROUP_SHA,CI_EVENT_SHA,GITHUB_EVENT_PATH,GITHUB_OUTPUT,GITHUB_SERVER_URL \
+              python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
+          else
+            python3 -I "${CI_ROOT}/authority/scripts/ci/trusted_producer.py" job --context "${NATIVE_CONTEXT}"
+          fi
       - name: Resolve authenticated merge-group members
         id: member_manifest
         if: env.CI_NATIVE_PRODUCER != 'true' && (github.event_name == 'merge_group')
