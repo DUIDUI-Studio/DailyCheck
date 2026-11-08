@@ -1442,6 +1442,9 @@ runtime、independent review 和 signer identity 必须来自受保护 port；�
 
 **Issue164 producer ownership 修复（local fixture only，真实激活仍关闭）**：protected
 bc77 独立 review 证实原 preview 的 candidate venv 查找与 native0 成功判据可跳过 T11。
+full-native 验收夹具从 YAML 的 `run` 字段执行 legacy capture/gate；HTTP reporter 子进程
+按完整 `ProducerPolicy` 传递 producer pin。便宜的同 helper policy 正反例和真实 HTTP/fence
+控制不替代原场景的 genuine >=600 秒 observation、grant intent 与 reconcile 验收。
 修复后 trusted CI 的固定 Python gate supervisor 只在子进程正常返回 pinned entrypoint 后
 成功；通过独立 IPC 接收正常返回，且同时检查子进程 exit，而非依赖 stdout token/native0。
 SystemExit0、os._exit0、异常、缺失返回均失败。该机制不是任意恶意 Python app 的密码学证明。

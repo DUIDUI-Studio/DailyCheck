@@ -8,10 +8,10 @@ import os
 import shutil
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts.check_known_failures import validate_evidence
 
@@ -199,10 +199,10 @@ def test_compact_export_requires_valid_provenance(run_pytest, tmp_path):
 ])
 def test_actual_ci_capture_and_gate_steps_keep_native_exit(run_pytest, tmp_path, source, native, expected):
     run = run_pytest(source)
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-    capture = workflow.split("      - name: Pytest (full suite, including MCP)\n", 1)[1].split("      - name:", 1)[0]
-    capture = textwrap.dedent(capture.split("        run: |\n", 1)[1])
-    check = workflow.split("      - name: Zero-new-failure gate\n", 1)[1].split("\n", 1)[0].strip().removeprefix("run: ")
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    steps = {step.get("name"): step for step in workflow["jobs"]["test"]["steps"]}
+    capture = steps["Pytest (full suite, including MCP)"]["run"]
+    check = steps["Zero-new-failure gate"]["run"]
     artifacts = tmp_path / "ci"
     artifacts.mkdir()
     def local(command):

@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -776,25 +777,114 @@ def test_lost_response_reentry_ttl_clear_and_corruption_barriers(native_base, ve
         assert deploy_state.load_state(runner.directory)["deployed"]["sha"] == base["base"]
 
 
+def native_child_command(base, directory, body):
+    """Use the complete parent policy in both the grant and bounded child controls."""
+    code = '''import json,sys
+from pathlib import Path
+from scripts.prod_agent.native_queue import NativeQueue,ProducerPolicy,LoopbackFixtureScope,LoopbackFacts,LoopbackGate
+root,repo,directory,endpoint,policy_json=sys.argv[1:]
+scope=LoopbackFixtureScope(Path(root),endpoint)
+runner=NativeQueue(Path(repo),Path(directory),ProducerPolicy(**json.loads(policy_json)),LoopbackFacts(scope),LoopbackGate(scope))
+'''
+    return [sys.executable, "-c", code + body, str(base["root"]), str(base["repo"]),
+            str(directory), base["scope"].endpoint, json.dumps(asdict(base["policy"]))]
+
+
+@pytest.fixture
+def bounded_http(tmp_path):
+    """Only a real HTTP mutator/fence fixture; no deployment or observation proof."""
+    (tmp_path / ".native-queue-fixture").write_text("synthetic-owned-fixture\n")
+    host = Host()
+    scope = LoopbackFixtureScope(tmp_path, f"http://127.0.0.1:{host.server.server_port}")
+    policy = ProducerPolicy(101, 102, "a" * 40, 76543, 65432,
+                            minimum_observation_seconds=900, producer_manifest_blob_sha="b" * 40)
+    try:
+        yield {"root": tmp_path, "repo": tmp_path, "host": host, "scope": scope, "policy": policy}
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("changed", [None, *ProducerPolicy.__dataclass_fields__])
+def test_native_child_preserves_complete_policy(bounded_http, changed):
+    base = bounded_http
+    expected = asdict(base["policy"])
+    body = f"assert runner.policy.sha256 == {base['policy'].sha256!r}, 'child policy changed'\n"
+    body += "from dataclasses import asdict\nprint(json.dumps(asdict(runner.policy)))\n"
+    argv = native_child_command(base, base["root"] / "state", body)
+    if changed is not None:
+        damaged = dict(expected)
+        value = damaged[changed]
+        damaged[changed] = value + 1 if type(value) is int else "c" * 40
+        if changed == "producer_manifest_blob_sha":
+            damaged.pop(changed)  # The original omission must fail too.
+        argv[-1] = json.dumps(damaged)
+    result = command(argv, env={**os.environ, "PYTHONPATH": str(ROOT)})
+    if changed is None:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout) == expected
+    else:
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "child policy changed" in result.stderr or "native policy pins missing" in result.stderr
+    assert base["host"].posts == []
+
+
+def test_bounded_real_http_child_holds_fence_after_reporter_sigkill(bounded_http):
+    base = bounded_http
+    host = base["host"]
+    host.delay.clear()
+    directory = base["root"] / "state"
+    runner = NativeQueue(base["repo"], directory, base["policy"], LoopbackFacts(base["scope"]))
+    runner.initialize_fixture(base["scope"])
+    # Exercise only the actual HTTP mutator with a synthetic payload, not grant().
+    body = '''with runner.fence() as fd:
+ runner.gate.success({"head_sha":"synthetic-fence-control"},guard_fd=fd)
+'''
+    proc = subprocess.Popen(native_child_command(base, directory, body),
+                            env={**os.environ, "PYTHONPATH": str(ROOT)},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    http_pid = None
+    try:
+        assert host.arrived.wait(15), "HTTP child never arrived"
+        http_pid = int(subprocess.check_output(["pgrep", "-P", str(proc.pid)], text=True).strip())
+        proc.kill()
+        proc.wait(10)
+        assert proc.returncode == -signal.SIGKILL
+        os.kill(http_pid, 0)
+        with (directory / ".attempt.lock").open("a+") as lock, pytest.raises(BlockingIOError):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert ds(runner, "acquire", "--pr", "2", "--sha", "d" * 40).returncode == 10
+    finally:
+        host.delay.set()
+        if proc.poll() is None:
+            proc.kill()
+        stdout, stderr = proc.communicate(timeout=10)
+        if http_pid is not None:
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    os.kill(http_pid, 0)
+                except ProcessLookupError:
+                    break
+                assert time.monotonic() < deadline, f"HTTP child {http_pid} has not exited"
+                time.sleep(0.05)
+    assert proc.returncode == -signal.SIGKILL, stdout + stderr
+    with (directory / ".attempt.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert host.posts == [{"head_sha": "synthetic-fence-control"}]
+    assert deploy_state.load_state(directory)["native_queue"]["active"] is None
+
+
 def test_http_child_holds_fence_after_reporter_sigkill(native_base, verified):
     base = native_base
     with resumed(base, verified, "kill") as (runner, facts):
         host = base["host"]
         host.delay.clear()
         host.arrived.clear()
-        script = base["root"] / "grant-child.py"
-        script.write_text('''import json,sys
-from pathlib import Path
-from scripts.prod_agent.native_queue import NativeQueue,ProducerPolicy,LoopbackFixtureScope,LoopbackFacts,LoopbackGate
-root,repo,directory,endpoint,blob=sys.argv[1:]
-scope=LoopbackFixtureScope(Path(root),endpoint)
-runner=NativeQueue(Path(repo),Path(directory),ProducerPolicy(15368,51,blob,76543,65432),LoopbackFacts(scope),LoopbackGate(scope))
-with runner.fence():
+        body = '''with runner.fence():
  value=runner.resume_verified()
  runner.grant(value)
-''')
-        proc = subprocess.Popen([sys.executable, str(script), str(base["root"]), str(base["repo"]),
-                                 str(runner.directory), base["scope"].endpoint, base["policy"].workflow_blob_sha],
+'''
+        proc = subprocess.Popen(native_child_command(base, runner.directory, body),
                                 env={**os.environ, "PYTHONPATH": str(ROOT)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
         try:
