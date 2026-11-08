@@ -139,7 +139,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   _DS_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   # Pipeline children must prove the original attempt even for the same PR.
   if [[ -n "${DAILYCHECK_DEPLOY_ATTEMPT+x}" ]]; then
-    if ! python3 "${_DS_SCRIPT_DIR}/deploy_state.py" assert-owner --pr "${PR_NUM}" --sha "${COMMIT_SHA}"; then
+    if ! "${DC_CONTROL_PYTHON:-python3}" "${_DS_SCRIPT_DIR}/deploy_state.py" assert-owner --pr "${PR_NUM}" --sha "${COMMIT_SHA}"; then
       echo "[up] ERROR: attempt ownership lost" >&2
       exit 10
     fi
@@ -152,7 +152,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
     echo "[up] WARN: deploy_state.py / python3 不可用 —— 跳过部署锁校验" >&2
   else
     _ds_rc=0
-    _ds_out="$(python3 "${_DS_SCRIPT_DIR}/deploy_state.py" check --pr "${PR_NUM}" 2>&1)" || _ds_rc=$?
+    _ds_out="$("${DC_CONTROL_PYTHON:-python3}" "${_DS_SCRIPT_DIR}/deploy_state.py" check --pr "${PR_NUM}" 2>&1)" || _ds_rc=$?
     if [[ ${_ds_rc} -eq 10 ]]; then
       { printf '%s up.sh pr=%s %s\n' "$(date -u +%FT%TZ)" "${PR_NUM}" "${_ds_out}"; } \
         >> "${_DS_DIR}/audit.log" 2>/dev/null || true
@@ -519,7 +519,7 @@ fi
 # 接受 full SHA 输入：--short 会截断到 7 chars 比较（SHA 唯一性保证安全）。
 if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   cd "${APP_DIR}"
-  ACTUAL_HEAD="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  ACTUAL_HEAD="$(git -C "${DC_NATIVE_REPO:-${APP_DIR}}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   COMMIT_SHA_SHORT="${COMMIT_SHA:0:7}"
   if [[ "${ACTUAL_HEAD}" != "${COMMIT_SHA_SHORT}" ]]; then
     echo "[up] ERROR: APP_DIR HEAD (${ACTUAL_HEAD}) != COMMIT_SHA (${COMMIT_SHA_SHORT})" >&2
@@ -584,6 +584,12 @@ fi
 #
 # 幂等：已是静息态 → 只打印 already resting，**不写文件、不 daemon-reload**
 # （重复 reload 会让正在跑的 unit 重新读配置，是没必要的不确定态来源）。
+if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+  "${DC_CONTROL_PYTHON:?}" -I -B -c \
+    'import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module("scripts.prod_agent.native_pipeline",run_name="__main__")' \
+    "${DC_NATIVE_AUTHORITY:?}" --operation prepare-services || exit 1
+fi
+
 if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
   echo "[up] [DRY-RUN] would reset green units to resting:"
   echo "[up] [DRY-RUN]   ${GREEN_UNIT_PATH}: DRY_RUN=true, DAILYCHECK_DB_DIR=${GREEN_DB}"
@@ -642,9 +648,15 @@ fi
 # 且要求绿 unit 用 DAILYCHECK_DB_DIR 指向该副本（下方步骤 3.5 守卫）。
 if [[ ${SKIP_DB_COPY} -eq 0 ]]; then
   echo "[up] copying real db tree ${SRC_DB_DIR} -> ${GREEN_DB} (dereference symlinks) ..."
+  if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+    "${DC_CONTROL_PYTHON:?}" -I -B -c \
+      'import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module("scripts.prod_agent.native_pipeline",run_name="__main__")' \
+      "${DC_NATIVE_AUTHORITY:?}" --operation copy-db || exit 1
+  else
   _run rm -rf "${GREEN_DB}"
   _run cp -aL "${SRC_DB_DIR}" "${GREEN_DB}"
   _run chmod -R u+rw "${GREEN_DB}"
+  fi
 else
   echo "[up] --skip-db-copy: using existing ${GREEN_DB}"
   if [[ ${DRY_RUN_FLAG} -eq 0 && ! -d "${GREEN_DB}" ]]; then
@@ -695,9 +707,17 @@ else
   echo "[up] [DRY-RUN] would query systemctl is-active ${GREEN_UNIT}"
 fi
 echo "[up] restarting ${GREEN_UNIT} on :${GREEN_PORT} ..."
-_run systemctl restart "${GREEN_UNIT}" || true
+if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+  _run systemctl restart "${GREEN_UNIT}" || exit 1
+else
+  _run systemctl restart "${GREEN_UNIT}" || true
+fi
 echo "[up] restarting ${GREEN_MCP_UNIT} on :${GREEN_MCP_PORT} ..."
-_run systemctl restart "${GREEN_MCP_UNIT}" || true
+if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+  _run systemctl restart "${GREEN_MCP_UNIT}" || exit 1
+else
+  _run systemctl restart "${GREEN_MCP_UNIT}" || true
+fi
 
 # 5. 健康检查（30 × 2s = 60s 超时）
 HEALTH_OK=0

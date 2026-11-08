@@ -62,6 +62,7 @@ done
 # 配置
 # ============================================================
 REPORT_DIR="${REPORT_DIR:-backups/prod-verifications}"
+VERIFY_TMP_DIR="${DC_NATIVE_LOG_DIR:-/tmp}"
 BLUE_URL="${BLUE_URL:-http://127.0.0.1:8090}"
 GREEN_URL="${GREEN_URL:-http://127.0.0.1:8091}"
 BLUE_PORT="${BLUE_PORT:-8090}"
@@ -110,7 +111,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   _DS_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   # Pipeline children must prove the original attempt even for the same PR.
   if [[ -n "${DAILYCHECK_DEPLOY_ATTEMPT+x}" ]]; then
-    if ! python3 "${_DS_SCRIPT_DIR}/deploy_state.py" assert-owner --pr "${PR_NUM}"; then
+    if ! "${DC_CONTROL_PYTHON:-python3}" "${_DS_SCRIPT_DIR}/deploy_state.py" assert-owner --pr "${PR_NUM}"; then
       echo "[verify] ERROR: attempt ownership lost" >&2
       exit 10
     fi
@@ -123,7 +124,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
     echo "[verify] WARN: deploy_state.py / python3 不可用 —— 跳过部署锁校验" >&2
   else
     _ds_rc=0
-    _ds_out="$(python3 "${_DS_SCRIPT_DIR}/deploy_state.py" check --pr "${PR_NUM}" 2>&1)" || _ds_rc=$?
+    _ds_out="$("${DC_CONTROL_PYTHON:-python3}" "${_DS_SCRIPT_DIR}/deploy_state.py" check --pr "${PR_NUM}" 2>&1)" || _ds_rc=$?
     if [[ ${_ds_rc} -eq 10 ]]; then
       # 审计属 best-effort 边车能力：写失败只告警、不中断流程。
       # ⚠️ 本文件禁用恒真兜底后缀（历史事故：兜底把 pytest 失败吞成 PASS，
@@ -227,20 +228,27 @@ trap _write_report EXIT
 # prod 首演发现 check1 曾把任何失败兜成 PASS——失败集必须
 # ⊆ tests/known_failures.txt，否则 FAIL。
 # ============================================================
+_native_operation() {
+  "${DC_CONTROL_PYTHON:?}" -I -B -c \
+    'import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module("scripts.prod_agent.native_pipeline",run_name="__main__")' \
+    "${DC_NATIVE_AUTHORITY:?}" --operation "$1"
+}
+
 _verify_check1_pytest() {
+  if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then _native_operation pytest; return $?; fi
   cd "${REPO_ROOT}" || return 1
   local test_db_dir
   test_db_dir="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")" || return 1
   DAILYCHECK_DB_DIR="${test_db_dir}" \
     "${DC_PYTHON_BIN}" -m pytest tests/ --basetemp="${test_db_dir}/pytest" -q --tb=line -rfE --color=no \
     -p scripts.ci.pytest_evidence --dc-evidence="${test_db_dir}/session.json" \
-    > /tmp/verify-1-pytest.log 2>&1
+    > ${VERIFY_TMP_DIR}/verify-1-pytest.log 2>&1
   local rc=$?
   echo "pytest native exit=${rc}（必须完整退出0/1，且零新增门禁通过）"
-  tail -2 /tmp/verify-1-pytest.log
+  tail -2 ${VERIFY_TMP_DIR}/verify-1-pytest.log
   "${DC_PYTHON_BIN}" "${REPO_ROOT}/scripts/check_known_failures.py" \
-    /tmp/verify-1-pytest.log --pytest-exit "${rc}" --session-file "${test_db_dir}/session.json" \
-    --write-evidence /tmp/verify-1-pytest-evidence.json
+    ${VERIFY_TMP_DIR}/verify-1-pytest.log --pytest-exit "${rc}" --session-file "${test_db_dir}/session.json" \
+    --write-evidence ${VERIFY_TMP_DIR}/verify-1-pytest-evidence.json
   local gate_rc=$?
   rm -rf "${test_db_dir}"
   return "${gate_rc}"
@@ -274,7 +282,7 @@ _verify_check1_pytest() {
 #     并在切完流量后按 `down.sh --keep-blue` / 账号停用流程处置。
 #   * 密码会短暂出现在子进程 argv（`ps aux` / `/proc/*/cmdline` 同机可见）。
 #     这是 create-user CLI 的既有形态（Issue #34 正文同样用法），且仅限
-#     root-only 单机运维场景；密码不会进 /tmp/verify-2.log 或报告（CLI 只
+#     root-only 单机运维场景；密码不会进 ${VERIFY_TMP_DIR}/verify-2.log 或报告（CLI 只
 #     echo 用户名）。
 # ------------------------------------------------------------
 # 以下 start/end 标记供 tests/test_blue_green_implementation.py 抽取函数体
@@ -377,6 +385,7 @@ PY
 # <<< ensure-sim-user:end >>>
 
 _verify_check2_sim_user() {
+  if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then _native_operation sim-user; return $?; fi
   if [[ -z "${SIM_USER_USER:-}" || -z "${SIM_USER_PASSWORD:-}" ]]; then
     echo "❌ 缺凭据：请 export SIM_USER_USER=<用户名> SIM_USER_PASSWORD=<密码> 后重跑" >&2
     return 1
@@ -408,28 +417,28 @@ _run_check() {
     esac
     return 0
   fi
-  if eval "${cmd}" >/tmp/verify-${num}.log 2>&1; then
+  if eval "${cmd}" >${VERIFY_TMP_DIR}/verify-${num}.log 2>&1; then
     case "${num}" in
-      1) R1="✅ PASS" ; N1="$(tail -3 /tmp/verify-1.log | head -1)" ;;
-      2) R2="✅ PASS" ; N2="$(tail -3 /tmp/verify-2.log | head -1)" ;;
-      3) R3="✅ PASS" ; N3="$(tail -3 /tmp/verify-3.log | head -1)" ;;
-      4) R4="✅ PASS" ; N4="$(tail -3 /tmp/verify-4.log | head -1)" ;;
-      5) R5="✅ PASS" ; N5="$(tail -3 /tmp/verify-5.log | head -1)" ;;
-      6) R6="✅ PASS" ; N6="$(tail -3 /tmp/verify-6.log | head -1)" ;;
-      7) R7="✅ PASS" ; N7="$(tail -3 /tmp/verify-7.log | head -1)" ;;
-      8) R8="✅ PASS" ; N8="$(tail -3 /tmp/verify-8.log | head -1)" ;;
+      1) R1="✅ PASS" ; N1="$(tail -3 ${VERIFY_TMP_DIR}/verify-1.log | head -1)" ;;
+      2) R2="✅ PASS" ; N2="$(tail -3 ${VERIFY_TMP_DIR}/verify-2.log | head -1)" ;;
+      3) R3="✅ PASS" ; N3="$(tail -3 ${VERIFY_TMP_DIR}/verify-3.log | head -1)" ;;
+      4) R4="✅ PASS" ; N4="$(tail -3 ${VERIFY_TMP_DIR}/verify-4.log | head -1)" ;;
+      5) R5="✅ PASS" ; N5="$(tail -3 ${VERIFY_TMP_DIR}/verify-5.log | head -1)" ;;
+      6) R6="✅ PASS" ; N6="$(tail -3 ${VERIFY_TMP_DIR}/verify-6.log | head -1)" ;;
+      7) R7="✅ PASS" ; N7="$(tail -3 ${VERIFY_TMP_DIR}/verify-7.log | head -1)" ;;
+      8) R8="✅ PASS" ; N8="$(tail -3 ${VERIFY_TMP_DIR}/verify-8.log | head -1)" ;;
     esac
     return 0
   else
     case "${num}" in
-      1) R1="❌ FAIL" ; N1="$(tail -5 /tmp/verify-1.log)" ;;
-      2) R2="❌ FAIL" ; N2="$(tail -5 /tmp/verify-2.log)" ;;
-      3) R3="❌ FAIL" ; N3="$(tail -5 /tmp/verify-3.log)" ;;
-      4) R4="❌ FAIL" ; N4="$(tail -5 /tmp/verify-4.log)" ;;
-      5) R5="❌ FAIL" ; N5="$(tail -5 /tmp/verify-5.log)" ;;
-      6) R6="❌ FAIL" ; N6="$(tail -5 /tmp/verify-6.log)" ;;
-      7) R7="❌ FAIL" ; N7="$(tail -5 /tmp/verify-7.log)" ;;
-      8) R8="❌ FAIL" ; N8="$(tail -5 /tmp/verify-8.log)" ;;
+      1) R1="❌ FAIL" ; N1="$(tail -5 ${VERIFY_TMP_DIR}/verify-1.log)" ;;
+      2) R2="❌ FAIL" ; N2="$(tail -5 ${VERIFY_TMP_DIR}/verify-2.log)" ;;
+      3) R3="❌ FAIL" ; N3="$(tail -5 ${VERIFY_TMP_DIR}/verify-3.log)" ;;
+      4) R4="❌ FAIL" ; N4="$(tail -5 ${VERIFY_TMP_DIR}/verify-4.log)" ;;
+      5) R5="❌ FAIL" ; N5="$(tail -5 ${VERIFY_TMP_DIR}/verify-5.log)" ;;
+      6) R6="❌ FAIL" ; N6="$(tail -5 ${VERIFY_TMP_DIR}/verify-6.log)" ;;
+      7) R7="❌ FAIL" ; N7="$(tail -5 ${VERIFY_TMP_DIR}/verify-7.log)" ;;
+      8) R8="❌ FAIL" ; N8="$(tail -5 ${VERIFY_TMP_DIR}/verify-8.log)" ;;
     esac
     OVERALL_PASS=0
     return 1
@@ -489,11 +498,21 @@ _run_check "1" "集成测试 (pytest tests/ 全量含 MCP + check_known_failures
 _run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存→健康报表)" \
   "_verify_check2_sim_user"
 
+_verify_check3_performance() {
+  if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+    command -v ab >/dev/null &&
+      ab -n 100 -c 10 -q "${BLUE_URL}/health" > ${VERIFY_TMP_DIR}/verify-3-blue.log 2>&1 &&
+      ab -n 100 -c 10 -q "${GREEN_URL}/health" > ${VERIFY_TMP_DIR}/verify-3-green.log 2>&1
+  else
+    command -v ab >/dev/null && (ab -n 100 -c 10 -q "${BLUE_URL}/health" >${VERIFY_TMP_DIR}/verify-3-blue.log 2>&1; ab -n 100 -c 10 -q "${GREEN_URL}/health" >${VERIFY_TMP_DIR}/verify-3-green.log 2>&1) || echo 'ab 未装，跳过（取日志大小比对）'
+  fi
+}
+
 # ============================================================
 # 3. 绿 vs 蓝比对（ab / wrk）
 # ============================================================
 _run_check "3" "绿 vs 蓝 性能比对 (ab -n 100 -c 10)" \
-  "command -v ab >/dev/null && (ab -n 100 -c 10 -q '${BLUE_URL}/health' >/tmp/verify-3-blue.log 2>&1; ab -n 100 -c 10 -q '${GREEN_URL}/health' >/tmp/verify-3-green.log 2>&1) || echo 'ab 未装，跳过（取日志大小比对）'"
+  "_verify_check3_performance"
 
 # ============================================================
 # 4. 回滚演练
@@ -504,14 +523,31 @@ _run_check "4" "回滚演练 (switch.sh blue 100 → health → switch.sh green 
 # ============================================================
 # 5. 资源与依赖
 # ============================================================
+_verify_check5_resources() {
+  if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+    systemctl status dailycheck-green.service dailycheck-green-mcp.service --no-pager >"${VERIFY_TMP_DIR}/verify-5-status.log" 2>&1 &&
+      journalctl -u dailycheck-green.service -n 50 >"${VERIFY_TMP_DIR}/verify-5-journal.log" 2>&1 &&
+      ss -ltn >"${VERIFY_TMP_DIR}/verify-5-ss.log" 2>&1 &&
+      grep -q ':8091 ' "${VERIFY_TMP_DIR}/verify-5-ss.log" &&
+      grep -q ':5101 ' "${VERIFY_TMP_DIR}/verify-5-ss.log"
+  else
+    systemctl status dailycheck-green.service dailycheck-green-mcp.service --no-pager >"${VERIFY_TMP_DIR}/verify-5-status.log" 2>&1 && journalctl -u dailycheck-green.service -n 50 >"${VERIFY_TMP_DIR}/verify-5-journal.log" 2>&1 && (ss -tn | grep -E ':(8091|5101)' >"${VERIFY_TMP_DIR}/verify-5-ss.log" 2>&1; true)
+  fi
+}
+
 _run_check "5" "资源与依赖 (systemctl status + journalctl + ss -tn)" \
-  "systemctl status dailycheck-green.service dailycheck-green-mcp.service --no-pager >/tmp/verify-5-status.log 2>&1 && journalctl -u dailycheck-green.service -n 50 >/tmp/verify-5-journal.log 2>&1 && (ss -tn | grep -E ':(8091|5101)' >/tmp/verify-5-ss.log 2>&1; true)"
+  "_verify_check5_resources"
 
 # ============================================================
 # 6. dry_run 隔离证据（调 prod_dryrun_evidence.sh）
 # ============================================================
+if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+  _run_check "6" "dry_run 隔离证据 (protected intended green UPDATE)" \
+    "bash '${DC_NATIVE_AUTHORITY}/scripts/agent_framework/prod_dryrun_evidence.sh'"
+else
 _run_check "6" "dry_run 隔离证据 (prod_dryrun_evidence.sh)" \
   "test -f '${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh' && bash '${REPO_ROOT}/scripts/agent_framework/prod_dryrun_evidence.sh' || echo 'prod_dryrun_evidence.sh 未实装，跳过'"
+fi
 
 # ============================================================
 # check 7 实现：DB 隔离证据（Issue #28）
@@ -546,7 +582,7 @@ _verify_check7_db_isolation() {
     echo "FAIL: ${master_green} 不存在（up.sh db-copy 未跑或目标不符）"
     return 1
   fi
-  master_blue="${REPO_ROOT}/db/master.db"
+  master_blue="${BLUE_MASTER:-${REPO_ROOT}/db/master.db}"
   ino_g="$(stat -c %i "${master_green}" 2>/dev/null || echo na)"
   ino_b="$(stat -c %i "${master_blue}" 2>/dev/null || echo na)"
   if [[ "${ino_g}" != "na" && "${ino_g}" == "${ino_b}" ]]; then

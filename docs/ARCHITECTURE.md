@@ -501,10 +501,12 @@ B（原始事件创建基线）、G（实际测试/部署的 merge group）、P�
 GitHub 自行排集成顺序，允许当前 + 一个 speculative CI；生产只接受 live front/main/
 deployed=P，已合并并锚定的前驱证据不可省。B 不要求等于 admission 时的 main。
 
-`native_queue.NativeQueue` 复用本节的 state.json/.state.lock/.attempt.lock；受保护的
-初始化和 signer 安装没有实现，具体传输仅支持明确 TEST ONLY 的 owned loopback scope。
-`--native-candidate` 仅接受已持有描述符/attempt/native state 的调用，checkout G 并运行
-原有 up→verify→promote→switch→观察窗。阶段 journal 由真实 shell 在同一 attempt 下记录，
+`native_queue.NativeQueue` 复用本节的 state.json/.state.lock/.attempt.lock；单一 dispatch
+可注入 `PipelinePort.execute(candidate, guard_fd, attempt)`。真实 GitHub G 必须提供独立安装的
+`ProtectedPipeline`，缺失不退回 candidate shell；旧 owned-loopback fixture 显式保留原
+`--native-candidate` shell 路径，普通 Gitea pipeline 入口不变。保护 executor 运行原有
+candidate→up→verify→promote→switch→观察窗，只有 trusted parent 在实际子进程退出0后
+写已有阶段 journal；候选不接触 attempt token/FD、state/journal 或 signer/read/report 凭据。
 完整验证和 ≥600 **真实 monotonic 秒**后先 seal verified evidence，再写 durable intent，
 不能调用普通 release 来提前拿 receipt。HTTP 子进程显式继承 fence；保留到异步 merge 和
 exact-G reconciliation。intent 后超时、进程死亡、出队/同 G 再入队、TTL 不代表撤销或释放。
@@ -1444,10 +1446,46 @@ runtime、independent review 和 signer identity 必须来自受保护 port；�
 新增 `native_ports.py` / `native_gate.py` / `native_controller.py` 是独立安装的 H admission /
 baseline preflight 边界：复用真实 `NativeGitHubFacts` 与原 H/core/state 算法，保护 policy、
 执行闭包/Python/crypto pin、runtime/review/baseline publisher 记录及专用 App key。固定 CLI
-只支持 H/初始化/只读恢复诊断；G executor/release 明确拒绝，普通 shadow reducer 与
+支持 H/初始化、`deploy-front` 和只读 `recover`；不提供独立 grant/release 成功接口。
+`deploy-front` 先对账已有 active/uncertain intent，绝不重新部署或重发 grant，再从实际
+authenticated queue、approved reports job 的 upstream manifest（双 context digest 绑定）
+及私有 binding 重建候选，复用原 start→seal→grant→reconcile。原始 B 和已合并前驱
+membership 保留，不以当前 main 或分支拼写重建 lookahead。普通 shadow reducer 与
 HostingClient 写拒绝不变。真正的 runtime/review/baseline publisher 是受保护安装前提，
 缺失即失败；checksum、PR/CI JSON、旧 source/public map 都不能自授部署锚点。
 App HTTP 子进程持继承 flock 到真实请求退出，key/token 不传应用或 argv。
+
+`native_pipeline.py` 的 G 配置是 installed policy 的可选扩展（旧 H policy 仍兼容，缺少扩展
+不能部署 G）：固定 helper/OS tool/app venv pins、app UID/GID、外置 source/green DB、只读
+release、root 私有日志与备份、systemd/nginx 路径和独立应用环境。控制 Python/helper
+闭包在候选树外；按 literal Git blob 导出 root-owned 只读 release，不执行 candidate
+checkout hook/filter/export attribute；原 repo 只在既有 fence/state transaction 内移动
+脱离分支的 HEAD identity cursor 供原 seal 校验。所有 pytest/plugin、Flask 初始化/迁移、
+dependency check、模拟用户和应用启动均使用外置 app Python、低 UID/GID、清空 groups/
+capabilities 与净化环境；固定 setpriv launcher 不继承 attempt FD。DB 副本解引用仍保留，
+但复制在 app 权限下进行，不能用 root 解引用 app 可写 DB 树；无 privileged 任意命令 RPC。
+绿 unit 由固定 env -i/setpriv startup recipe 在任何 Python import 前清空环境、groups 和
+capabilities 并切换低身份；可信 launcher 仅暂留 SETUID/SETGID/SETPCAP，candidate 的
+实际 CapEff/Groups 必须为空。固定 recipe 同时绑定 G release、NoNewPrivileges 与
+受限写路径；原 unit 另存私有备份，up/promote 的 DB 隔离、备份/恢复及 switch 回滚继续执行。
+真实 runtime 观察按 active/已锚定 native G 选择固定绿 app/MCP pair，并要求实际完整
+stage journal 与 ≥600 秒 observation，独立 publisher 缺失/过期时不 seal/grant。
+
+native verify 仍执行八项检查：trusted parser 校验低身份全量 pytest 的真实 exit/session；
+模拟账号只落 green 副本；ab、service/socket、dry-run helper 缺失或失败都不算成功。
+check6 的固定 collector 在低身份下真正 HTTP 登录并尝试重置一次性 green 验证用户密码，
+要求成功业务响应、窗口内对应 middleware BLOCKED UPDATE 和前后全部 SQLite logical
+content digest 相等；noop/错误/更新泄漏（即使行数未变）/缺日志均失败。日志落 root 私有目录。
+旧 Gitea 参数/defaults、原 stub 的非 native exit78 及原有 legacy skip 行为保持；严格失败传播
+只在 installed native 路径生效。观察窗用真实 monotonic 时间，不能从调用参数缩短。
+专用 `GitHubGProdGate` 在父进程和实际 HTTP child 中再次验证既有 durable intent、候选/
+proof/request digest、policy epoch 和 App/install identity；H/G child 上下文分离并共用原
+响应校验/fence 生命周期。只有原 reconcile 的实际 main/runtime/PR merge=G 可写锚点。
+
+以上是 source implementation；没有安装/激活或实际生产验证。portable seam tests 使用
+owned HTTP/crypto/小型 Git/子进程及测试 stage 命令；不证明 Linux 降权、实际八检查或新
+600秒观察成功。真实 executor/publisher、外置 app runtime、UID/文件权限、服务依赖、App/
+hosted policy、baseline-first receipt 和独立审查仍须另外证明；当前 activation 保持 OFF。
 runtime 的固定 loopback MCP `/health` 单独使用 protected policy 的
 `mcp_health_token_file`（私有文件，不能复用 GitHub read token 或 App key 路径）；
 仅 MCP 请求携带 Bearer，应用健康请求仍公开。MCP 原 AuthMiddleware 不变，凭据缺失、

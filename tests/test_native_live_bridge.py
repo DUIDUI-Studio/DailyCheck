@@ -642,7 +642,7 @@ def test_review_origin_and_policy_closure_denial(bridge):
         InstalledPolicy(b["root"] / "policy.json", fixture=b["policy"].fixture)
 
 
-@pytest.mark.parametrize("operation", ["deploy-front", "grant", "release"])
+@pytest.mark.parametrize("operation", ["grant", "release"])
 def test_G_cli_hard_denies_before_any_policy_or_network(operation):
     assert main([operation]) == 2
 

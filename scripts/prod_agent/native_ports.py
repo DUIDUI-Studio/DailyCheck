@@ -1,4 +1,4 @@
-"""Protected installed inputs for native H admission; no candidate execution.
+"""Protected installed H/G inputs; application execution lives in native_pipeline.
 
 Publishers are privileged, external prerequisites. This module cannot turn caller
 JSON into a review, observation, or baseline receipt. Missing records deny use.
@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import time
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,6 +25,7 @@ from scripts.prod_agent.native_queue import NativeQueue, ProducerPolicy, deploy_
 MAX_INPUT = 1024 * 1024
 AUTHORITY_FILES = (
     "scripts/prod_agent/native_ports.py", "scripts/prod_agent/native_gate.py",
+    "scripts/prod_agent/native_pipeline.py",
     "scripts/prod_agent/native_controller.py", "scripts/prod_agent/native_queue.py",
     "scripts/prod_agent/github_readiness.py", "scripts/hosting.py",
     "scripts/ci/merge_group.py", "scripts/ci/candidate_binding.py",
@@ -127,7 +129,7 @@ class InstalledPolicy:
                 "authority", "python", "closure", "app_uid", "epoch", "repo", "directory",
                 "key_file", "read_token_file", "mcp_health_token_file", "runtime_file", "bootstrap_file",
                 "review_directory", "reviewers", "writer", "release_root", "units", "runtime"}
-        if (set(value) != keys or value["version"] != 1
+        if (set(value) not in (keys, keys | {"pipeline"}) or value["version"] != 1
                 or (value["repository"], value["repository_id"], value["repository_node_id"])
                     != (REPOSITORY, REPOSITORY_ID, REPOSITORY_NODE)
                 or set(value["producer"]) != set(ProducerPolicy.__dataclass_fields__)
@@ -142,7 +144,12 @@ class InstalledPolicy:
         if self.producer.producer_manifest_blob_sha is None:
             raise ValueError("approved producer pin required")
         self.authority = Path(value["authority"])
-        code_owner = os.geteuid() if fixture else 0
+        # Lower-UID pytest reads an immutable root-owned release/control copy.
+        # This fixture capability still confines every credential/record to its
+        # owned synthetic root and every HTTP request to its owned loopback.
+        code_owner = self.authority.stat().st_uid if fixture else 0
+        if code_owner not in {0, self.owner}:
+            raise ValueError("untrusted fixture code owner")
         for name, expected in value["closure"].items():
             if not re.fullmatch(r"[0-9a-f]{64}", expected):
                 raise ValueError("invalid installed code pin")
@@ -170,7 +177,10 @@ class InstalledPolicy:
         executable = Path(value["python"])
         protected_path(executable.resolve(), python_owner,
                        anchor=executable.resolve() if fixture else None)
-        protected_path(executable.parent, self.owner if fixture else 0,
+        parent_owner = executable.parent.stat().st_uid if fixture else 0
+        if parent_owner not in {0, self.owner}:
+            raise ValueError("untrusted interpreter directory owner")
+        protected_path(executable.parent, parent_owner,
                        anchor=executable.parent if fixture else None)
         self.python = executable
         if self.python != Path(sys.executable):
@@ -324,6 +334,7 @@ class SystemdObserver:
                     or fields.get("NoNewPrivileges") != "yes"
                     or not re.search(r"^NoNewPrivs:\s+1$", status, re.M)
                     or not re.search(r"^CapEff:\s+0+$", status, re.M)
+                    or not re.search(r"^Groups:[ \t]*$", status, re.M)
                     or not any(row.endswith(":" + fields["ControlGroup"]) for row in cgroup)):
                 raise ValueError("runtime UID/cgroup/checkout mismatch")
             result.append({"unit": unit, "pid": pid, "uid": uids[0], "cwd": cwd,
@@ -350,7 +361,15 @@ class ProtectedRuntime:
             raise ValueError("protected runtime publisher unavailable/stale")
         sha(record["sha"])
         sha(record["tree"])
-        processes = self.observer.observe(policy)
+        state = deploy_state.load_state(policy.location("directory"))
+        active = (state.get("native_queue") or {}).get("active")
+        native_runtime = (active and active["candidate"]["manifest"]["group_sha"] == record["sha"]
+                          or any(o.get("sha") == record["sha"] and o.get("native_evidence_sha256")
+                                 and o.get("result") == "success" for o in state.get("outcomes", {}).values()))
+        observed_policy = copy(policy)
+        if native_runtime:
+            observed_policy.value = {**policy.value, "units": ["dailycheck-green.service", "dailycheck-green-mcp.service"]}
+        processes = self.observer.observe(observed_policy)
         if processes != record["processes"] or len(processes) != 2:
             raise ValueError("runtime process identity changed")
         release = policy.location("release_root") / record["sha"]
@@ -381,8 +400,18 @@ class ProtectedRuntime:
                     raise ValueError("runtime route unhealthy")
             finally:
                 connection.close()
-        if self.observer.observe(policy) != processes:
+        if self.observer.observe(observed_policy) != processes:
             raise ValueError("runtime drift during collection")
+        if active and active["candidate"]["manifest"]["group_sha"] == record["sha"]:
+            journal = active["journal"]
+            if (len(journal) != len(deploy_state.NATIVE_STAGES)
+                    or [row["stage"] for row in journal] != list(deploy_state.NATIVE_STAGES)
+                    or any(row.get("completed") is not True or row.get("rc") != 0 for row in journal)
+                    or journal[-1]["completed_monotonic"] - journal[-1]["started_monotonic"]
+                        < policy.producer.minimum_observation_seconds
+                    or record["observed_at"] < journal[-1]["completed_at"]
+                    or record["tree"] != active["candidate"]["manifest"]["tree_sha"]):
+                raise ValueError("G runtime publisher is not bound to completed actual stages")
         return record
 
     def read(self):

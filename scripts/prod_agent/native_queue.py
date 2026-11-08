@@ -74,6 +74,10 @@ class GatePort(Protocol):
     def success(self, payload: dict, *, guard_fd: int) -> dict: ...
 
 
+class PipelinePort(Protocol):
+    def execute(self, candidate: dict, *, guard_fd: int, attempt: dict) -> None: ...
+
+
 class DisabledGate:
     def success(self, payload: dict, *, guard_fd: int) -> dict:
         raise RuntimeError("native Prod signer is not installed; activation is off")
@@ -172,9 +176,11 @@ def head_admission(repo: Path, head: str, checks: list[dict], policy: ProducerPo
 class NativeQueue:
     """One production attempt; GitHub alone owns queue ordering and merge."""
     def __init__(self, repo: Path, directory: Path, policy: ProducerPolicy,
-                 facts: FactsPort, gate: GatePort | None = None):
+                 facts: FactsPort, gate: GatePort | None = None,
+                 pipeline: PipelinePort | None = None):
         self.repo, self.directory = repo.resolve(), directory.resolve()
         self.policy, self.facts, self.gate = policy, facts, gate or DisabledGate()
+        self.pipeline = pipeline
 
     @contextmanager
     def fence(self):
@@ -344,10 +350,19 @@ class NativeQueue:
                 "origin_generation": lock["generation"], "phase": "deploy", "journal": [],
                 "verified_evidence": None, "release_grant": None}
             deploy_state.save_state(self.directory, state)
-        subprocess.run(["bash", str(self.repo / "scripts/blue_green/deploy_pipeline.sh"),
-                        str(manifest["subject_pr_number"]), manifest["group_sha"],
-                        "--native-candidate", *pipeline_args], cwd=self.repo, env=os.environ.copy(),
-                       pass_fds=(deploy_state.process_lock_fd(),), check=True)
+        if self.pipeline is not None:
+            if pipeline_args:
+                raise ValueError("protected pipeline does not accept caller commands/options")
+            self.pipeline.execute(value, guard_fd=deploy_state.process_lock_fd(), attempt=identity)
+        elif isinstance(self.facts, LoopbackFacts):
+            # Explicit owned-fixture dispatch. Ordinary Gitea runs its existing
+            # pipeline directly; real GitHub G never falls back to this shell.
+            subprocess.run(["bash", str(self.repo / "scripts/blue_green/deploy_pipeline.sh"),
+                            str(manifest["subject_pr_number"]), manifest["group_sha"],
+                            "--native-candidate", *pipeline_args], cwd=self.repo, env=os.environ.copy(),
+                           pass_fds=(deploy_state.process_lock_fd(),), check=True)
+        else:
+            raise RuntimeError("installed protected G pipeline required; no checkout-shell fallback")
 
     def _validate_proof(self, active: dict, value: dict) -> dict:
         proof = active["verified_evidence"]

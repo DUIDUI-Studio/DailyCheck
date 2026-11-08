@@ -18,6 +18,16 @@
 
 set -uo pipefail
 
+# The native path is installed/pinned outside the candidate. Its trusted parent
+# captures a real lower-UID green UPDATE and full logical DB comparison; no
+# absence, stub exit or command failure can be converted into a passing verdict.
+if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+  exec "${DC_CONTROL_PYTHON:?}" -I -B -c \
+    'import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module("scripts.prod_agent.native_pipeline",run_name="__main__")' \
+    "${DC_NATIVE_AUTHORITY:?}" --operation dryrun
+fi
+
+
 # ============================================================
 # 骨架阶段：禁止执行，待 DRY_RUN 中间件 PoC 通过后实装
 # ============================================================

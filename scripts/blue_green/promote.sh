@@ -81,6 +81,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="${DAILYCHECK_APP_DIR:-/root/DailyCheck}"
 TARGET_DB_DIR="${APP_DIR}/db"
+if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then TARGET_DB_DIR="${DAILYCHECK_SRC_DB_DIR:?}"; fi
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 GREEN_UNIT_NAME="${GREEN_SERVICE_UNIT:-dailycheck-green.service}"
 GREEN_MCP_UNIT_NAME="${GREEN_MCP_SERVICE_UNIT:-dailycheck-green-mcp.service}"
@@ -288,7 +289,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   _DS_DIR="${DAILYCHECK_DEPLOY_STATE_DIR:-/var/lib/dailycheck-deploy}"
   # Pipeline children must prove the original attempt even for the same PR.
   if [[ -n "${DAILYCHECK_DEPLOY_ATTEMPT+x}" ]]; then
-    if ! python3 "${SCRIPT_DIR}/deploy_state.py" assert-owner ; then
+    if ! "${DC_CONTROL_PYTHON:-python3}" "${SCRIPT_DIR}/deploy_state.py" assert-owner ; then
       echo "[promote] ERROR: attempt ownership lost" >&2
       exit 10
     fi
@@ -301,7 +302,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
     echo "[promote] WARN: deploy_state.py / python3 不可用 —— 跳过部署锁校验" >&2
   else
     _ds_rc=0
-    _ds_out="$(python3 "${SCRIPT_DIR}/deploy_state.py" check 2>&1)" || _ds_rc=$?
+    _ds_out="$("${DC_CONTROL_PYTHON:-python3}" "${SCRIPT_DIR}/deploy_state.py" check 2>&1)" || _ds_rc=$?
     if [[ ${_ds_rc} -eq 10 ]]; then
       if ! { printf '%s promote.sh %s\n' "$(date -u +%FT%TZ)" "${_ds_out}"; } \
              >> "${_DS_DIR}/audit.log" 2>/dev/null; then

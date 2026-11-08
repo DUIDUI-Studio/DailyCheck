@@ -116,7 +116,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   if [[ "${TARGET}" == "green" ]]; then
     # Pipeline children must prove the original attempt even for the same PR.
     if [[ -n "${DAILYCHECK_DEPLOY_ATTEMPT+x}" ]]; then
-      if ! python3 "${_DS_SCRIPT_DIR}/deploy_state.py" assert-owner ; then
+      if ! "${DC_CONTROL_PYTHON:-python3}" "${_DS_SCRIPT_DIR}/deploy_state.py" assert-owner ; then
         echo "[switch] ERROR: attempt ownership lost" >&2
         exit 10
       fi
@@ -129,7 +129,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
       echo "[switch] WARN: deploy_state.py / python3 不可用 —— 跳过部署锁校验" >&2
     else
       _ds_rc=0
-      _ds_out="$(python3 "${_DS_SCRIPT_DIR}/deploy_state.py" check 2>&1)" || _ds_rc=$?
+      _ds_out="$("${DC_CONTROL_PYTHON:-python3}" "${_DS_SCRIPT_DIR}/deploy_state.py" check 2>&1)" || _ds_rc=$?
       if [[ ${_ds_rc} -eq 10 ]]; then
         { printf '%s switch.sh target=green %s\n' "$(date -u +%FT%TZ)" "${_ds_out}"; } \
           >> "${_DS_DIR}/audit.log" 2>/dev/null || true

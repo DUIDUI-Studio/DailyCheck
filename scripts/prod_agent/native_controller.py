@@ -1,16 +1,20 @@
-"""Installed protected H/bootstrap CLI. No G executor or activation switch."""
+"""Installed protected H/G controller. Installation/activation remains separate."""
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
-from scripts.ci.merge_group import REPOSITORY, QueueReader, digest
+from scripts.ci.merge_group import REPOSITORY, QueueReader, digest, sha, validate_manifest
 from scripts.hosting import AccessRole, HostingClient, HostingConfig, Provider
 from scripts.prod_agent.github_readiness import NativeGitHubFacts
-from scripts.prod_agent.native_gate import GitHubProdGate
+from scripts.prod_agent.native_gate import GitHubGProdGate, GitHubProdGate
+from scripts.prod_agent.native_pipeline import ProtectedPipeline
 from scripts.prod_agent.native_ports import (
     AppSignerIdentity,
     InstalledPolicy,
@@ -18,7 +22,12 @@ from scripts.prod_agent.native_ports import (
     ProtectedReview,
     ProtectedRuntime,
 )
-from scripts.prod_agent.native_queue import NativeQueue, deploy_state
+from scripts.prod_agent.native_queue import (
+    NativeQueue,
+    candidate,
+    deploy_state,
+    publication_authority,
+)
 
 POLICY_PATH = Path("/etc/dailycheck-native/policy.json")
 
@@ -42,18 +51,21 @@ class NativeController:
     def status(self):
         directory = self.policy.location("directory")
         state = deploy_state.load_state(directory)
-        if not deploy_state.native_consistent(directory, state) or (state.get("native_queue") or {}).get("active"):
-            raise ValueError("native recovery requires the future protected G controller")
+        if not deploy_state.native_consistent(directory, state):
+            raise ValueError("native state/guard mismatch; operator reconciliation required")
         if "native_queue" in state:
             bootstrap = state.get("native_bootstrap")
             if (not isinstance(bootstrap, dict) or bootstrap.get("policy") != self.policy.fingerprint
                     or bootstrap.get("epoch") != self.policy.value["epoch"]):
                 raise ValueError("installed policy/authority epoch changed")
-        return {"state": "idle" if "native_queue" in state else "uninitialized",
-                "activation": "OFF", "G_executor": "unavailable"}
+        active = (state.get("native_queue") or {}).get("active")
+        return {"state": active["phase"] if active else "idle" if "native_queue" in state else "uninitialized",
+                "activation": "OFF", "G_executor": "configured" if "pipeline" in self.policy.value else "unavailable"}
 
     def preflight(self):
         status = self.status()
+        if status["state"] not in {"idle", "uninitialized"}:
+            raise ValueError("active native attempt must reconcile before admission")
         runtime = self.runtime.read()
         repo = self.client.verify_repository()
         main = self.client.get(f"/repos/{REPOSITORY}/branches/main")["commit"]["sha"]
@@ -82,8 +94,104 @@ class NativeController:
         runner = NativeQueue(self.policy.location("repo"), directory, self.policy.producer,
                             self.facts, GitHubProdGate(self.policy, member, self.facts))
         with runner.fence():
-            self.status()
+            if self.status()["state"] != "idle":
+                raise ValueError("reconcile active native attempt before H admission")
+            self.preflight()
             return runner.admit_head(member)
+
+    def _candidate(self, group):
+        """Recover the original public manifest from the approved reports run.
+
+        The fixed workflow exposes this upstream job output in its step env log.
+        Its digest is bound by both authenticated producer envelopes, not by a
+        webhook or caller JSON. Revalidation retains already merged lookahead.
+        """
+        run = self.facts._run("G", group, None)
+        reports = [job for job in run["jobs"] if job["name"] == "agent-framework-reports"]
+        if len(reports) != 1:
+            raise ValueError("authenticated reports job required")
+        log = self.facts.job_log(reports[0]["id"])
+        encoded = set(re.findall(r"UPSTREAM_MEMBER_MANIFEST_B64: ([A-Za-z0-9+/=]+)(?:\s|$)", log))
+        if len(encoded) != 1:
+            raise ValueError("original authenticated queue manifest unavailable/ambiguous")
+        manifest = validate_manifest(self.policy.location("repo"),
+                                     json.loads(base64.b64decode(encoded.pop(), validate=True)))
+        binding = reports[0]["envelope"]["binding"]
+        if (manifest["group_sha"] != group or manifest["creation_base_sha"] != binding["CI_BASE_SHA"]
+                or digest(manifest) != binding["member_manifest_sha256"]
+                or manifest["event_delivery_id"] != str(run["run"]["id"])):
+            raise ValueError("original G manifest/run digest mismatch")
+        raw = self.client.get(f"/repos/{REPOSITORY}/actions/runs/{run['run']['id']}")
+        if (raw.get("head_sha") != group or raw.get("head_branch") != manifest["group_ref"].removeprefix("refs/heads/")
+                or raw.get("run_attempt") != run["run"]["attempt"]):
+            raise ValueError("G event ref/run changed")
+        event = {"action": "checks_requested", "repository": {"id": 1448986421,
+            "node_id": "R_kgDOVl3HNQ", "full_name": REPOSITORY}, "merge_group": {
+                "base_ref": "refs/heads/main", "base_sha": manifest["creation_base_sha"],
+                "head_sha": group, "head_ref": manifest["group_ref"]}}
+        self.queue_reader.revalidate(self.policy.location("repo"), manifest, event, manifest["event_delivery_id"])
+        from scripts.prod_agent.native_ports import read_protected
+
+        directory = self.policy.location("directory")
+        read_protected(directory / "bindings.json", self.policy.owner, anchor=self.policy.anchor)
+        members = []
+        for member in manifest["members"]:
+            binding = publication_authority.resolve_source_binding(directory, member["number"])
+            members.append({"pr": member["number"], "source_revision": binding.source_revision,
+                "source": dict(zip(publication_authority.SOURCE_KEYS, binding.source, strict=True)),
+                "binding_sha256": binding.binding_sha256})
+        return candidate(self.policy.location("repo"), manifest, members, self.policy.producer)
+
+    def recover(self):
+        runner = NativeQueue(self.policy.location("repo"), self.policy.location("directory"),
+                             self.policy.producer, self.facts)
+        with runner.fence():
+            self._initialized()
+            return {"result": runner.reconcile(), "activation": "OFF"}
+
+    def _initialized(self):
+        self.status()  # epoch and guard validation also apply during recovery
+        state = deploy_state.load_state(self.policy.location("directory"))
+        if ("native_bootstrap" not in state or "native_source_anchor" not in state
+                or "native_queue" not in state):
+            raise ValueError("protected baseline/source initialization required")
+        return state
+
+    def deploy_front(self, group=None):
+        # Mandatory dependency check precedes candidate work or attempt admission.
+        runner = NativeQueue(self.policy.location("repo"), self.policy.location("directory"),
+                             self.policy.producer, self.facts)
+        with runner.fence():
+            state = self._initialized()
+            if state["native_queue"]["active"] is not None:
+                return {"result": runner.reconcile(), "activation": "OFF"}
+            runner.pipeline = ProtectedPipeline(self.policy)
+            self.preflight()
+            _, entries = self.queue_reader.entries()
+            if not entries or entries[0]["headCommit"] is None:
+                raise ValueError("built live front required")
+            actual = sha(entries[0]["headCommit"]["oid"])
+            if group is not None and sha(group) != actual:
+                raise ValueError("event hint is not current live G")
+            value = self._candidate(actual)
+            runner.gate = GitHubGProdGate(self.policy, value)
+            runner.start(value)
+            # The independent publisher observes the completed real journal;
+            # this wait can neither manufacture a record nor re-run deployment.
+            deadline = time.monotonic() + 120
+            while True:
+                try:
+                    runtime = self.runtime.read()
+                    if runtime == {"sha": actual, "incident": False, "observation_complete": True}:
+                        break
+                except ValueError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise ValueError("independent G runtime publisher unavailable; reconcile required")
+                time.sleep(5)
+            runner.seal(value)
+            runner.grant(value)
+            return {"result": runner.reconcile(), "activation": "OFF"}
 
 
 def main(argv=None):
@@ -92,8 +200,8 @@ def main(argv=None):
                                               "recover", "deploy-front", "grant", "release"))
     parser.add_argument("--pr", type=int)
     args = parser.parse_args(argv)
-    if args.operation in {"deploy-front", "grant", "release"}:
-        print("G executor/release unavailable; activation remains OFF", file=sys.stderr)
+    if args.operation in {"grant", "release"}:
+        print("standalone grant/release unavailable; use protected deploy-front/recover", file=sys.stderr)
         return 2
     try:
         # The installed launcher uses isolated Python and this protected module;
@@ -104,11 +212,11 @@ def main(argv=None):
         if args.operation == "admit-head":
             value = controller.admit_head(args.pr)
         else:
-            value = getattr(controller, "status" if args.operation == "recover" else args.operation)()
+            value = getattr(controller, args.operation.replace("-", "_"))()
         print(json.dumps(value))
         return 0
     except Exception:
-        print("protected H/bootstrap prerequisites unavailable or inconsistent", file=sys.stderr)
+        print("protected H/G prerequisites unavailable or inconsistent; reconcile active attempts", file=sys.stderr)
         return 1
 
 
