@@ -33,12 +33,19 @@ LOCAL_SCOPE = "local_fixture_only"
 HOSTED_SCOPE = "approved_hosted_archive"
 HOSTED_PLATFORM = "linux/arm64"
 RELEASE_PREFIX = "https://github.com/DUIDUI-Studio/DailyCheck/releases/download/"
+# Official release-asset API identity; immutable nonzero numeric asset ID.
+ASSET_API_PREFIX = ("https://api.github.com/repos/DUIDUI-Studio/DailyCheck/"
+                    "releases/assets/")
 # Only the public GitHub release route and its bounded asset redirects.
 PUBLIC_REDIRECT_HOSTS = frozenset({"github.com", "objects.githubusercontent.com",
                                    "release-assets.githubusercontent.com"})
 MAX_REDIRECTS = 5
 ARCHIVE_LIMIT = 2 * 1024 ** 3
 SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+ARCHIVE_ROUTES = (
+    re.compile(re.escape(RELEASE_PREFIX) + r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.tar\.gz"),
+    re.compile(re.escape(ASSET_API_PREFIX) + r"[1-9][0-9]{0,18}"),
+)
 DEFAULT_SECONDS = 180
 HOSTED_PYTEST_SECONDS = 2700
 # Measured full suite retained 3.5 GiB; never run it on an in-memory tmpfs.
@@ -177,6 +184,25 @@ def read_data(path: Path, root: Path) -> bytes:
     return raw
 
 
+def validate_archive_route(url: str) -> None:
+    """The one route profile shared by manifest parsing and download.
+
+    v1 still accepts the historical public browser download route; hosted now
+    pins the official release-asset API identity so retrieval no longer
+    depends on the browser redirect endpoint.
+    """
+    if not isinstance(url, str):
+        raise ValueError("unapproved runtime archive route")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        raise ValueError("unapproved runtime archive route") from None
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or parsed.query or parsed.fragment
+            or not any(route.fullmatch(url) for route in ARCHIVE_ROUTES)):
+        raise ValueError("unapproved runtime archive route")
+
+
 def _validate_hosted_runtime(runtime: dict) -> None:
     """The only hosted profile. Every field is fixed by the approved manifest."""
     if (set(runtime) != {"image", "platform", "scope", "controller", "archive", "image_graph"}
@@ -189,11 +215,7 @@ def _validate_hosted_runtime(runtime: dict) -> None:
             or set(graph) != {"index_digest", "platform_manifest_digest", "config_digest",
                               "rootfs_diff_ids", "rootfs_diff_ids_sha256"}):
         raise ValueError("invalid approved hosted runtime identity")
-    url = archive["url"]
-    if (not isinstance(url, str)
-            or re.fullmatch(re.escape(RELEASE_PREFIX) + r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.tar\.gz",
-                            url) is None):
-        raise ValueError("unapproved hosted runtime archive url")
+    validate_archive_route(archive["url"])
     if (type(archive["bytes"]) is not int or not 0 < archive["bytes"] <= ARCHIVE_LIMIT
             or not isinstance(archive["sha256"], str)
             or re.fullmatch(r"[0-9a-f]{64}", archive["sha256"]) is None):
@@ -354,9 +376,7 @@ def _public_opener():
 def download_archive(runtime: dict, destination: Path, *, opener=None) -> None:
     """Stream only the pinned public bytes; nothing is extracted or executed."""
     archive = runtime["archive"]
-    if (not archive["url"].startswith(RELEASE_PREFIX)
-            or urlsplit(archive["url"]).scheme != "https"):
-        raise ValueError("unapproved runtime archive url")
+    validate_archive_route(archive["url"])
     opener = opener or _public_opener()
     request = Request(archive["url"], method="GET",
                       headers={"Accept": "application/octet-stream"})

@@ -26,6 +26,11 @@ MANIFEST_BLOB = producer.blob_id(MANIFEST_RAW)
 RUNTIME = MANIFEST["runtime"]
 GRAPH = RUNTIME["image_graph"]
 LAYERS = GRAPH["rootfs_diff_ids"]
+API_ARCHIVE_URL = ("https://api.github.com/repos/DUIDUI-Studio/DailyCheck/"
+                   "releases/assets/723434734")
+BROWSER_ARCHIVE_URL = (
+    "https://github.com/DUIDUI-Studio/DailyCheck/releases/download/"
+    "ci-runtime-20261108-arm64-2ab572f1/dailycheck-ci-linux-arm64-2ab572f1.tar.gz")
 
 
 def _raw(value: dict) -> bytes:
@@ -89,8 +94,7 @@ def test_repository_manifest_pins_the_prepared_public_runtime():
     assert runtime["archive"] == {
         "bytes": 120584124,
         "sha256": "09e4269f8e35cc6f7101102159cb8785a9db962e6be256a63bd15b991b645c48",
-        "url": ("https://github.com/DUIDUI-Studio/DailyCheck/releases/download/"
-                "ci-runtime-20261108-arm64-2ab572f1/dailycheck-ci-linux-arm64-2ab572f1.tar.gz")}
+        "url": API_ARCHIVE_URL}
     assert GRAPH["rootfs_diff_ids_sha256"] == producer.digest(LAYERS)
     for name, blob in manifest["files"].items():
         assert producer.blob_id((ROOT / name).read_bytes()) == blob, name
@@ -118,7 +122,8 @@ def test_hosted_pytest_owns_disk_scratch_and_long_budget():
 @pytest.mark.parametrize("damage", [
     "extra", "missing", "version", "image-index", "duplicate-digest", "rootfs-hash",
     "rootfs-duplicate", "http-url", "foreign-url", "query-url", "zero-bytes",
-    "oversize-bytes", "platform", "unknown-scope",
+    "oversize-bytes", "platform", "unknown-scope", "api-other-owner", "api-zero-asset",
+    "api-traversal",
 ])
 def test_hosted_profile_rejects_unknown_missing_or_contradictory_fields(damage):
     value = copy.deepcopy(MANIFEST)
@@ -149,10 +154,46 @@ def test_hosted_profile_rejects_unknown_missing_or_contradictory_fields(damage):
         archive["bytes"] = producer.ARCHIVE_LIMIT + 1
     elif damage == "platform":
         runtime["platform"] = "linux/amd64"
+    elif damage == "api-other-owner":
+        archive["url"] = API_ARCHIVE_URL.replace("DUIDUI-Studio", "other")
+    elif damage == "api-zero-asset":
+        archive["url"] = API_ARCHIVE_URL.rsplit("/", 1)[0] + "/0"
+    elif damage == "api-traversal":
+        archive["url"] = API_ARCHIVE_URL.rsplit("/", 1)[0] + "/%2e%2e/723434734"
     else:
         runtime["scope"] = "candidate_choice"
     with pytest.raises(ValueError):
         _parse(value)
+
+
+def test_archive_route_profile_accepts_api_and_v1_browser_routes():
+    producer.validate_archive_route(API_ARCHIVE_URL)
+    producer.validate_archive_route(BROWSER_ARCHIVE_URL)
+
+
+@pytest.mark.parametrize("url", [
+    "http://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/723434734",
+    "https://api.github.com/repos/other/DailyCheck/releases/assets/723434734",
+    "https://api.github.com/repos/DUIDUI-Studio/other/releases/assets/723434734",
+    "https://example.invalid/repos/DUIDUI-Studio/DailyCheck/releases/assets/723434734",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/0",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/-1",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/023",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/id",
+    API_ARCHIVE_URL + "?token=1",
+    API_ARCHIVE_URL + "#fragment",
+    "https://user:pass@api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/723434734",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/..%2F723434734",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/%2e%2e/723434734",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/723434734/",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/723434734/extra",
+    "https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/download/t/a.tar.gz",
+])
+def test_archive_route_profile_rejects_unapproved_routes(url):
+    with pytest.raises(ValueError):
+        producer.validate_archive_route(url)
+    with pytest.raises(ValueError):
+        producer.validate_archive_route(None)
 
 
 @pytest.mark.parametrize("damage", ["image", "platform", "identity"])
@@ -186,8 +227,37 @@ def test_download_streams_exact_size_and_hash(tmp_path):
     assert destination.read_bytes() == payload
 
 
+def test_download_accepts_api_asset_route_and_never_forwards_auth(tmp_path):
+    payload = b"pinned-api-asset" * 4096
+    runtime = copy.deepcopy(RUNTIME)
+    runtime["archive"].update(url=API_ARCHIVE_URL, bytes=len(payload),
+                              sha256=hashlib.sha256(payload).hexdigest())
+    seen = []
+
+    class Opener:
+        def open(self, request, timeout=None):
+            seen.append(request)
+            return _Response([payload[:8000], payload[8000:]])
+
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(runtime, destination, opener=Opener())
+    assert destination.read_bytes() == payload
+    assert [request.full_url for request in seen] == [API_ARCHIVE_URL]
+    assert seen[0].get_header("Authorization") is None
+    assert seen[0].get_header("Accept") == "application/octet-stream"
+
+
+def test_download_revalidates_the_route_at_its_own_boundary(tmp_path):
+    runtime = copy.deepcopy(RUNTIME)
+    runtime["archive"]["url"] = API_ARCHIVE_URL.replace("DUIDUI-Studio", "other")
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(ValueError):
+        producer.download_archive(runtime, destination, opener=_opener([b"bytes"]))
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("damage", ["long", "partial", "hash", "status", "missing",
-                                    "network", "foreign-url"])
+                                    "network", "foreign-url", "json"])
 def test_download_rejects_bad_bytes_before_any_load(tmp_path, damage):
     payload = b"pinned-bytes" * 100
     runtime = copy.deepcopy(RUNTIME)
@@ -209,6 +279,9 @@ def test_download_rejects_bad_bytes_before_any_load(tmp_path, damage):
         opener = _opener(error=HTTPError("https://github.com/approved", 404, "missing", {}, None))
     elif damage == "network":
         opener = _opener(error=URLError("offline"))
+    elif damage == "json":
+        runtime = copy.deepcopy(RUNTIME)
+        opener = _opener([b'{"message":"Not Found"}'])
     else:
         runtime["archive"]["url"] = "https://example.invalid/runtime.tar.gz"
         opener = _opener([payload])
@@ -236,6 +309,18 @@ def test_redirects_are_public_https_and_credential_free():
     with pytest.raises(ValueError):
         looping.redirect_request(request, None, 302, "Found", {},
                                  "https://objects.githubusercontent.com/a")
+
+
+def test_redirect_drops_any_forwarded_authorization_header():
+    request = producer.Request("https://api.github.com/approved",
+                               headers={"Authorization": "Bearer secret",
+                                        "Accept": "application/octet-stream"})
+    allowed = producer._PublicRedirect().redirect_request(
+        request, None, 302, "Found", {},
+        "https://release-assets.githubusercontent.com/a?X-Amz-Signature=1")
+    assert allowed.get_header("Authorization") is None
+    assert allowed.get_header("Accept") == "application/octet-stream"
+    assert allowed.full_url.endswith("?X-Amz-Signature=1")
 
 
 def test_image_resolution_binds_platform_and_rootfs(monkeypatch):

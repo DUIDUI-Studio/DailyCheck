@@ -1547,8 +1547,12 @@ manifest runtime 有两个严格 profile：旧的 `local_fixture_only`（version
 180s/tmpfs/精确 image 行为不变）与 `approved_hosted_archive`。后者固定公开 release archive 的
 URL/bytes/SHA256、OCI index/platform manifest/config 三个不可变 digest、platform=
 `linux/arm64` 与完整 rootfs diff IDs（及其 digest）；缺字段、未知字段、index≠image 或 digest
-互相矛盾一律拒绝。hosted producer 只从字面 HTTPS
-`https://github.com/DUIDUI-Studio/DailyCheck/releases/download/...` 路由流式下载，精确
+互相矛盾一律拒绝。hosted producer 只从字面 HTTPS 官方 release asset API
+`https://api.github.com/repos/DUIDUI-Studio/DailyCheck/releases/assets/<数字ID>` 路由流式下载
+（默认 `Accept: application/octet-stream`；v1 兼容仍接受旧的字面
+`https://github.com/DUIDUI-Studio/DailyCheck/releases/download/...` browser route），
+manifest 解析与下载边界复用同一个纯 route validator：固定 repository、非零数字 asset ID，
+拒绝 userinfo/query/fragment/编码穿越/其他 host。精确
 size/SHA 校验通过后才 `docker load`；redirect 仅限有界公开资产 host，不转发凭据或记录签名
 URL，missing/corrupt asset fail closed。加载后只解析已批准 graph 的 daemon 表示（index/
 platform/config 之一），并核验 linux/arm64 与完整 rootfs；capture/attestation 记录实际
