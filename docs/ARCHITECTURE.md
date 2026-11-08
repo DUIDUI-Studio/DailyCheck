@@ -1578,10 +1578,14 @@ daemon image 且必须落在同一 graph，不按 backend 改写 manifest。测�
 `[ci-producer] operation=<固定阶段标签> category=<固定错误类别>`；archive 失败可按类别追加
 固定整数 `http_status=<100–599>` 与 `attempts=<1–3>`（区分 preflight/transport/http/
 integrity 与重试耗尽）。`make_test_envelope` 失败追加固定
-`reason=<raw-session-invalid|new-failures|summary-extraction|compact-evidence-invalid>`，
-分别区分原始输出/session 校验、新增失败拒绝、compact 摘要提取与 compact evidence 复核；
-`new-failures` 另追加已验证的整数 `new_failures=<n>`，不输出 nodeid、候选 stdout 或异常
-文本，失败仍不产生 success attestation。native capture 只在退出
+`reason=<raw-session-invalid|new-failures|summary-extraction|compact-evidence-invalid>` 与
+`session_validated=0|1`；raw/compact checker 拒绝再追加闭合映射的
+`subreason=<native-exit|session-shape|completion|raw-summary|raw-output|summary-counts|...
+|unknown>`（未知固定 `unknown`，绝不输出异常文本）。`new-failures` 在 raw/session 校验
+通过后追加已验证整数 `new_failures=<n>` 与最多 5 个、每个 ≤120 字符的
+`new_tests=tests/...py::test[::Class]`（剥离参数括号/值并做严格字符/路径校验）；
+raw-session 诊断标记 `session_validated=0`，不认证 native 成功，失败仍不产生 success
+attestation。native capture 只在退出
 不成立时追加已验证的 `native_exit`（0–255，否则 unknown）与 timeout/OOM/error/image 标志。
 异常文本、candidate 输出、URL/签名参数、响应 body、环境值、traceback 均不输出；成功路径与
 no-attestation 语义不变。

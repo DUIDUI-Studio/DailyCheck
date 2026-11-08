@@ -119,15 +119,90 @@ EVIDENCE_COMPACT = "compact-evidence-invalid"
 EVIDENCE_REASONS = frozenset({EVIDENCE_RAW_SESSION, EVIDENCE_NEW_FAILURES,
                               EVIDENCE_SUMMARY, EVIDENCE_COMPACT})
 
+# Closed mapping from the protected checker's fixed messages to controller
+# tokens. Only the fixed prefix is matched; any unrecognised message becomes
+# "unknown" and the message itself is never printed or stored.
+CHECKER_SUBREASON_PREFIXES = (
+    ("pytest native exit must be 0/1", "native-exit"),
+    ("missing/invalid pytest session evidence", "session-shape"),
+    ("native exit disagrees with pytest session exit", "session-exit"),
+    ("duplicate/inconsistent collected nodeids", "selected-unique"),
+    ("pytest did not complete every selected test", "completion"),
+    ("missing/incomplete outcome counts", "counts-shape"),
+    ("pytest collection/setup/teardown errors cannot be known failures", "errors"),
+    ("outcome enumeration does not match selected/completed count", "count-sum"),
+    ("native exit disagrees with test outcomes", "outcome-exit"),
+    ("pytest output is empty/interrupted/internal/collection/incomplete", "raw-output"),
+    ("missing/truncated/ambiguous terminal pytest summary", "raw-summary"),
+    ("unsupported pytest summary outcome", "summary-outcome"),
+    ("duplicate pytest summary outcome", "summary-outcome-duplicate"),
+    ("terminal summary counts disagree with pytest report enumeration", "summary-counts"),
+    ("invalid failed-node enumeration", "failed-ids"),
+    ("raw output contains pytest ERROR", "raw-error"),
+    ("unrecognized FAILED line", "raw-failed"),
+    ("FAILED enumeration missing/duplicated/inconsistent", "failed-enumeration"),
+    ("invalid ", "counts-invalid"),
+)
+EVIDENCE_SUBREASONS = frozenset(
+    token for _, token in CHECKER_SUBREASON_PREFIXES) | {"decode", "unknown"}
+# A diagnostic test location is only the base module::test[/::Class] form from
+# a validated session. Parameters are stripped and the shape is restrictive.
+TEST_LOCATION_PATTERN = re.compile(
+    r"tests/[A-Za-z0-9_./-]+\.py::[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)?")
+MAX_DIAGNOSTIC_LOCATIONS = 5
+MAX_DIAGNOSTIC_LOCATION = 120
+
+
+def _safe_test_location(nodeid) -> str | None:
+    """Return the parameter-free base nodeid only if it is safe to print."""
+    if not isinstance(nodeid, str):
+        return None
+    base = nodeid.split("[", 1)[0]
+    if len(base) > MAX_DIAGNOSTIC_LOCATION:
+        return None
+    if TEST_LOCATION_PATTERN.fullmatch(base) is None:
+        return None
+    path = base.split("::", 1)[0]
+    if any(part in ("", ".", "..") for part in path.split("/")):
+        return None
+    return base
+
+
+def _diagnostic_test_locations(nodeids: list) -> tuple[str, ...]:
+    safe = {_safe_test_location(nodeid) for nodeid in nodeids}
+    return tuple(sorted(location for location in safe if location))[
+        :MAX_DIAGNOSTIC_LOCATIONS]
+
+
+def _checker_subreason(error: BaseException) -> str:
+    message = str(error)
+    for prefix, token in CHECKER_SUBREASON_PREFIXES:
+        if message.startswith(prefix):
+            return token
+    return "unknown"
+
 
 class EvidenceValidationError(ValueError):
-    """Gate failure with a fixed reason; category stays invalid_data."""
+    """Gate failure with fixed reason/subreason; category stays invalid_data."""
 
-    def __init__(self, reason: str, new_failures: int | None = None):
+    def __init__(self, reason: str, new_failures: int | None = None,
+                 subreason: str | None = None, new_tests=()):
         if reason not in EVIDENCE_REASONS:
             raise ValueError("unapproved evidence reason")
+        if subreason is not None and subreason not in EVIDENCE_SUBREASONS:
+            raise ValueError("unapproved evidence subreason")
+        if reason in (EVIDENCE_RAW_SESSION, EVIDENCE_COMPACT) and subreason is None:
+            raise ValueError("evidence reason requires subreason")
+        if reason in (EVIDENCE_NEW_FAILURES, EVIDENCE_SUMMARY) and subreason is not None:
+            raise ValueError("evidence reason forbids subreason")
+        locations = tuple(new_tests)
+        if (len(locations) > MAX_DIAGNOSTIC_LOCATIONS
+                or any(_safe_test_location(item) != item for item in locations)):
+            raise ValueError("unapproved diagnostic location")
         self.reason = reason
         self.new_failures = new_failures
+        self.subreason = subreason
+        self.new_tests = locations
         super().__init__("approved native evidence validation failed")
 
 
@@ -176,9 +251,16 @@ def _failure_diagnostic(error: BaseException) -> str:
         detail += f" attempts={attempts}"
     if isinstance(error, EvidenceValidationError):
         detail += f" reason={error.reason}"
-        count = error.new_failures
-        if error.reason == EVIDENCE_NEW_FAILURES and type(count) is int and count >= 1:
-            detail += f" new_failures={count}"
+        detail += " session_validated=" + (
+            "0" if error.reason == EVIDENCE_RAW_SESSION else "1")
+        if error.subreason is not None:
+            detail += f" subreason={error.subreason}"
+        if error.reason == EVIDENCE_NEW_FAILURES:
+            count = error.new_failures
+            if type(count) is int and count >= 1:
+                detail += f" new_failures={count}"
+            if error.new_tests:
+                detail += " new_tests=" + ",".join(error.new_tests)
     return "[ci-producer] " + detail
 
 
@@ -803,20 +885,26 @@ def make_test_envelope(raw: bytes, session: dict, capture: dict, binding: dict) 
 
     try:
         text = raw.decode("utf-8")
+    except UnicodeError:
+        raise EvidenceValidationError(EVIDENCE_RAW_SESSION, subreason="decode") from None
+    try:
         original = make_evidence(text, capture["native_exit"], session)
-    except ValueError:
-        raise EvidenceValidationError(EVIDENCE_RAW_SESSION) from None
+    except ValueError as error:
+        raise EvidenceValidationError(
+            EVIDENCE_RAW_SESSION, subreason=_checker_subreason(error)) from None
     new = unexpected_failures(session["failed_nodeids"], load_known_ids())
     if new:
-        raise EvidenceValidationError(EVIDENCE_NEW_FAILURES, len(new))
+        raise EvidenceValidationError(EVIDENCE_NEW_FAILURES, len(new),
+                                      new_tests=_diagnostic_test_locations(new))
     try:
         compact = extract_pytest_summary(text)
     except ValueError:
         raise EvidenceValidationError(EVIDENCE_SUMMARY) from None
     try:
         evidence = make_evidence(compact, capture["native_exit"], session)
-    except ValueError:
-        raise EvidenceValidationError(EVIDENCE_COMPACT) from None
+    except ValueError as error:
+        raise EvidenceValidationError(
+            EVIDENCE_COMPACT, subreason=_checker_subreason(error)) from None
     evidence["raw_output_sha256"] = original["output_sha256"]
     return {"schema_version": 2, "text": compact, "evidence": evidence, "binding": binding}
 

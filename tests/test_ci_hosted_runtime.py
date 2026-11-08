@@ -118,14 +118,13 @@ KNOWN_ID = KNOWN_IDS[0]
 NEW_FAILURE_ID = "tests/definitely_new.py::test_x"
 
 
-def _evidence_fixture(*, raw=None, failed_ids=None):
+def _evidence_fixture(*, raw=None, failed_ids=None, native=1, passed=100):
     """Realistic completed-pytest raw/session/capture for make_test_envelope."""
     failed_ids = [KNOWN_ID] if failed_ids is None else list(failed_ids)
-    passed = 100
     counts = {"passed": passed, "failed": len(failed_ids), "skipped": 0,
               "xfailed": 0, "xpassed": 0, "error": 0}
     selected = passed + len(failed_ids)
-    session = {"schema_version": 1, "pytest_exit": 1, "selected": selected,
+    session = {"schema_version": 1, "pytest_exit": native, "selected": selected,
                "selected_unique": selected, "completed": selected, "uncompleted": [],
                "unexpected": [], "failed_nodeids": failed_ids, "error_nodeids": [],
                "counts": counts}
@@ -134,7 +133,7 @@ def _evidence_fixture(*, raw=None, failed_ids=None):
                + f"{len(failed_ids)} failed, {passed} passed in 1s\n").encode()
     capture = {"version": 1, "container_id": "5" * 64, "image": "sha256:" + "a" * 64,
                "kind": "pytest", "context": "test", "binding_sha256": "b" * 64,
-               "native_exit": 1, "stdout_sha256": hashlib.sha256(raw).hexdigest(),
+               "native_exit": native, "stdout_sha256": hashlib.sha256(raw).hexdigest(),
                "session_sha256": "c" * 64, "exited": True, "removed": True,
                "oom_killed": False}
     return raw, session, capture, {"version": 3, "phase": "H"}
@@ -671,14 +670,19 @@ def test_valid_known14_evidence_envelope_is_unchanged():
             == "b7d9c69b0461ad55340cc978c992489c00b8702115cd2cd68457573f8a17166d")
 
 
-@pytest.mark.parametrize("case,reason", [
-    ("session", "raw-session-invalid"),
-    ("decode", "raw-session-invalid"),
-    ("new-failure", "new-failures"),
-    ("summary", "summary-extraction"),
-    ("compact", "compact-evidence-invalid"),
+@pytest.mark.parametrize("case,reason,subreason,validated", [
+    ("session", "raw-session-invalid", "completion", "0"),
+    ("decode", "raw-session-invalid", "decode", "0"),
+    ("native-exit", "raw-session-invalid", "native-exit", "0"),
+    ("counts-shape", "raw-session-invalid", "counts-shape", "0"),
+    ("raw-summary", "raw-session-invalid", "raw-summary", "0"),
+    ("raw-error", "raw-session-invalid", "raw-error", "0"),
+    ("new-failure", "new-failures", None, "1"),
+    ("summary", "summary-extraction", None, "1"),
+    ("compact", "compact-evidence-invalid", "raw-summary", "1"),
 ])
-def test_evidence_failure_surfaces_have_distinct_fixed_reasons(monkeypatch, case, reason):
+def test_evidence_failure_surfaces_have_fixed_reasons_and_subreasons(
+        monkeypatch, case, reason, subreason, validated):
     monkeypatch.setattr(producer, "OPERATION", "startup")
     if case == "new-failure":
         raw, session, capture, binding = _evidence_fixture(failed_ids=[NEW_FAILURE_ID])
@@ -690,6 +694,19 @@ def test_evidence_failure_surfaces_have_distinct_fixed_reasons(monkeypatch, case
         raw = (f"FAILED {KNOWN_ID} - old baseline\n1 failed, 100 passed in 1s\n"
                + "\n" * 6).encode()
         raw, session, capture, binding = _evidence_fixture(raw=raw)
+    elif case == "raw-summary":
+        raw = f"FAILED {KNOWN_ID} - old baseline\n".encode()
+        raw, session, capture, binding = _evidence_fixture(raw=raw)
+    elif case == "raw-error":
+        raw = b"ERROR tests/broken.py - ImportError\n0 failed, 101 passed in 1s\n"
+        raw, session, capture, binding = _evidence_fixture(
+            raw=raw, failed_ids=[], native=0, passed=101)
+    elif case == "native-exit":
+        raw, session, capture, binding = _evidence_fixture()
+        capture["native_exit"] = 2
+    elif case == "counts-shape":
+        raw, session, capture, binding = _evidence_fixture()
+        session["counts"].pop("xfailed")
     else:
         raw, session, capture, binding = _evidence_fixture()
         if case == "session":
@@ -700,39 +717,114 @@ def test_evidence_failure_surfaces_have_distinct_fixed_reasons(monkeypatch, case
     with pytest.raises(producer.EvidenceValidationError) as caught:
         producer.make_test_envelope(raw, session, capture, binding)
     error = caught.value
-    assert error.reason == reason
+    assert error.reason == reason and error.subreason == subreason
     assert producer._failure_category(error) == "invalid_data"
     diagnostic = producer._failure_diagnostic(error)
     assert f"reason={reason}" in diagnostic
-    assert ("new_failures=1" in diagnostic) == (case == "new-failure")
+    assert f"session_validated={validated}" in diagnostic
+    if subreason is None:
+        assert "subreason=" not in diagnostic
+    else:
+        assert f"subreason={subreason}" in diagnostic
+    if case == "new-failure":
+        assert "new_failures=1" in diagnostic
+        assert "new_tests=tests/definitely_new.py::test_x" in diagnostic
+    else:
+        assert "new_failures=" not in diagnostic
 
 
-def test_evidence_diagnostic_never_prints_candidate_text(monkeypatch):
+def test_evidence_diagnostic_strips_parameters_and_candidate_text(monkeypatch):
     monkeypatch.setattr(producer, "OPERATION", "startup")
-    raw, session, capture, binding = _evidence_fixture(failed_ids=[NEW_FAILURE_ID])
+    injected = "EXCEPTION-TEXT-SECRET"
+    nodeid = f"tests/definitely_new.py::test_x[{injected}]"
+    raw, session, capture, binding = _evidence_fixture(failed_ids=[nodeid])
     producer._stage("evidence")
     with pytest.raises(producer.EvidenceValidationError) as caught:
         producer.make_test_envelope(raw, session, capture, binding)
     diagnostic = producer._failure_diagnostic(caught.value)
-    assert "reason=new-failures new_failures=1" in diagnostic
-    assert NEW_FAILURE_ID not in diagnostic and "definitely_new" not in diagnostic
+    assert "reason=new-failures" in diagnostic and "new_failures=1" in diagnostic
+    assert "new_tests=tests/definitely_new.py::test_x" in diagnostic
+    assert injected not in diagnostic and "actual native pytest" not in diagnostic
 
 
-def test_evidence_reason_rejects_unapproved_tokens():
+@pytest.mark.parametrize("message,token", [
+    ("pytest native exit must be 0/1, got 2", "native-exit"),
+    ("missing/invalid pytest session evidence", "session-shape"),
+    ("native exit disagrees with pytest session exit", "session-exit"),
+    ("duplicate/inconsistent collected nodeids", "selected-unique"),
+    ("pytest did not complete every selected test", "completion"),
+    ("missing/incomplete outcome counts", "counts-shape"),
+    ("pytest collection/setup/teardown errors cannot be known failures", "errors"),
+    ("outcome enumeration does not match selected/completed count", "count-sum"),
+    ("native exit disagrees with test outcomes", "outcome-exit"),
+    ("pytest output is empty/interrupted/internal/collection/incomplete", "raw-output"),
+    ("missing/truncated/ambiguous terminal pytest summary (原始输出 required)", "raw-summary"),
+    ("unsupported pytest summary outcome: weird", "summary-outcome"),
+    ("duplicate pytest summary outcome: failed", "summary-outcome-duplicate"),
+    ("terminal summary counts disagree with pytest report enumeration; 原始输出/evidence required",
+     "summary-counts"),
+    ("invalid failed-node enumeration", "failed-ids"),
+    ("raw output contains pytest ERROR", "raw-error"),
+    ("unrecognized FAILED line; gate requires pytest 原始输出", "raw-failed"),
+    ("FAILED enumeration missing/duplicated/inconsistent with terminal counts", "failed-enumeration"),
+    ("invalid selected", "counts-invalid"),
+])
+def test_checker_subreasons_are_a_closed_fixed_mapping(message, token):
+    assert producer._checker_subreason(ValueError(message)) == token
+    assert token in producer.EVIDENCE_SUBREASONS
+
+
+def test_checker_subreason_unknown_is_fixed_and_does_not_leak():
+    secret = "candidate-secret-and-exception-detail"
+    assert producer._checker_subreason(ValueError(secret)) == "unknown"
+    assert ({token for _, token in producer.CHECKER_SUBREASON_PREFIXES}
+            | {"decode", "unknown"} == producer.EVIDENCE_SUBREASONS)
+    error = producer.EvidenceValidationError(
+        producer.EVIDENCE_RAW_SESSION, subreason="unknown")
+    assert secret not in producer._failure_diagnostic(error)
+
+
+def test_diagnostic_test_locations_are_bounded_and_safe():
+    assert producer._safe_test_location("tests/a.py::test_x[param-1]") == "tests/a.py::test_x"
+    assert (producer._safe_test_location("tests/a.py::test_x[" + "z" * 200 + "]")
+            == "tests/a.py::test_x")
+    assert (producer._safe_test_location("tests/pkg/mod.py::TestC::test_y")
+            == "tests/pkg/mod.py::TestC::test_y")
+    for bad in ("scripts/a.py::test_x", "tests/../a.py::test_x", "tests/a.py::test x",
+                "tests/a.py::test_x;rm", "tests/" + "a" * 130 + ".py::test_x", None):
+        assert producer._safe_test_location(bad) is None
+    many = [f"tests/test_{index}.py::test_{index}" for index in range(10)]
+    assert len(producer._diagnostic_test_locations(many)) == producer.MAX_DIAGNOSTIC_LOCATIONS
+    assert producer._diagnostic_test_locations(
+        ["tests/a.py::test_x[1]", "tests/a.py::test_x[2]"]) == ("tests/a.py::test_x",)
+
+
+def test_evidence_reason_and_metadata_reject_unapproved_tokens():
     with pytest.raises(ValueError):
         producer.EvidenceValidationError("candidate-controlled-reason")
+    with pytest.raises(ValueError):
+        producer.EvidenceValidationError(producer.EVIDENCE_RAW_SESSION)
+    with pytest.raises(ValueError):
+        producer.EvidenceValidationError(producer.EVIDENCE_RAW_SESSION,
+                                         subreason="candidate-controlled")
+    with pytest.raises(ValueError):
+        producer.EvidenceValidationError(producer.EVIDENCE_NEW_FAILURES, 1,
+                                         new_tests=("scripts/a.py::test_x",))
 
 
 def test_entrypoint_reports_evidence_reason_without_success_marker(monkeypatch, capsys):
     def explode():
         producer._stage("evidence")
-        raise producer.EvidenceValidationError(producer.EVIDENCE_NEW_FAILURES, 2)
+        raise producer.EvidenceValidationError(
+            producer.EVIDENCE_NEW_FAILURES, 2,
+            new_tests=("tests/a.py::test_x", "tests/b.py::test_y"))
 
     monkeypatch.setattr(producer, "main", explode)
     assert producer.entrypoint() == 1
     error = capsys.readouterr().err
     assert ("[ci-producer] operation=evidence category=invalid_data "
-            "reason=new-failures new_failures=2" in error)
+            "reason=new-failures session_validated=1 new_failures=2 "
+            "new_tests=tests/a.py::test_x,tests/b.py::test_y" in error)
     assert "trusted native producer failed; no success attestation" in error
     assert "DAILYCHECK_NATIVE_EVIDENCE=" not in error
 
