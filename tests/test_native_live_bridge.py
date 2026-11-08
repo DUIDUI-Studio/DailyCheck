@@ -481,6 +481,24 @@ with runner.fence() as fd:
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
+def wait_for_signer_exit(pid, timeout=10):
+    """Reap this exact orphan when PID1 adopts it; otherwise prove disappearance."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                return {"proof": "waitpid", "native_exit": os.waitstatus_to_exitcode(status)}
+        except ChildProcessError:
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return {"proof": "ProcessLookupError", "native_exit": None}
+        assert time.monotonic() < deadline, "actual signer child exit not proven"
+        time.sleep(0.05)
+
+
 def test_delayed_real_signer_child_retains_fence_after_parent_kill(bridge):
     b = bridge
     b["controller"].initialize()
@@ -507,14 +525,7 @@ def test_delayed_real_signer_child_retains_fence_after_parent_kill(bridge):
             proc.kill()
         proc.communicate(timeout=10)
         if child_pid is not None:
-            deadline = time.monotonic() + 10
-            while True:
-                try:
-                    os.kill(child_pid, 0)
-                except ProcessLookupError:
-                    break
-                assert time.monotonic() < deadline, "actual signer child exit not proven"
-                time.sleep(0.05)
+            wait_for_signer_exit(child_pid)
     assert len(server.posts) == 1
 
 
@@ -645,17 +656,11 @@ print(json.dumps(denied));assert all(denied.values())
                 reporter.kill()
             reporter.communicate(timeout=10)
         if signer_pid is not None:
-            deadline = time.monotonic() + 10
-            while True:
-                try:
-                    os.kill(signer_pid, 0)
-                except ProcessLookupError:
-                    break
-                assert time.monotonic() < deadline, "real signer exit not proven"
-                time.sleep(0.05)
+            signer_exit = wait_for_signer_exit(signer_pid)
         generator.close()
         patch.undo()
         shutil.rmtree(root)
+    outcome["signer_exit"] = signer_exit
     outcome["actual_signer_exited"] = True
     outcome["scratch_removed"] = not root.exists()
     return outcome
