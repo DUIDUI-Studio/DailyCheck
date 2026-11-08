@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -1108,17 +1109,42 @@ def report_inner(candidate: Path, context: str):
         run(["bash", "scripts/agent_framework/preview.sh", str(member["number"]), "--trusted-ci"], extra)
 
 
-def snapshot(repo: Path, destination: Path, head: str, base: str):
+def _hosted_snapshot_permissions(destination: Path):
+    root_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for _, _, files, directory_fd in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
+            for name in files:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("unexpected snapshot file type")
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    os.fchown(fd, 65532, 65532)
+                    os.fchmod(fd, 0o644 | (info.st_mode & 0o111))
+                finally:
+                    os.close(fd)
+            os.fchown(directory_fd, 65532, 65532)
+            os.fchmod(directory_fd, 0o755)
+    finally:
+        os.close(root_fd)
+
+
+def snapshot(repo: Path, destination: Path, head: str, base: str, *, hosted=False):
     env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
     for argv in (["git", "-c", "core.hooksPath=/dev/null", "clone", "-q", "--no-hardlinks", "--no-checkout", str(repo), str(destination)],
                  ["git", "-C", str(destination), "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", head],
                  ["git", "-C", str(destination), "update-ref", "refs/remotes/origin/main", base]):
         subprocess.run(argv, env=env, check=True, capture_output=True)
     # No runner credentials or source checkout config is copied into this clone.
-    for p in destination.rglob("*"):
-        if not p.is_symlink():
-            p.chmod(0o777 if p.is_dir() else 0o666 | (p.stat().st_mode & 0o111))
-    destination.chmod(0o777)
+    if hosted:
+        _hosted_snapshot_permissions(destination)
+    else:
+        for p in destination.rglob("*"):
+            if not p.is_symlink():
+                p.chmod(0o777 if p.is_dir() else 0o666 | (p.stat().st_mode & 0o111))
+        destination.chmod(0o777)
 
 
 def job(args):
@@ -1166,7 +1192,7 @@ def job(args):
     binding = make_binding()
     _stage("snapshot")
     candidate = work / "candidate"
-    snapshot(repo, candidate, binding["tested_sha"], binding["CI_BASE_SHA"])
+    snapshot(repo, candidate, binding["tested_sha"], binding["CI_BASE_SHA"], hosted=hosted)
     (candidate / ".dc-session.json").unlink(missing_ok=True)
     docker = [args.docker]
     if args.docker_config:

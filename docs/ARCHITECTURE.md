@@ -1555,6 +1555,10 @@ warehouse migration 的 down-refusal 子进程也显式接收 candidate 导入�
 `db.warehouse_migrate` 并检查 verified-backup 拒绝；恢复校验与原备份/库内容断言不变。
 hosted snapshot 的权限回归检查实际文件模式、执行位/Git tree、外部 symlink target 与
 ancestor 不变，以及 candidate 内 JUnit/session 可写；独立 local profile 保留原权限行为。
+只有解析并批准的 `approved_hosted_archive` profile 才将新 clone 设为固定 UID/GID65532、
+目录0755/文件0644（保留执行位）；fd-relative walk 不跟随 symlink 或修改 destination 外部。
+修复 producer 原0666/0777模式与 native fixture 真实 source-policy 检查的冲突，不修改
+InstalledPolicy/protected_path 或 import provenance，也不改变 installed root authority。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找

@@ -1203,7 +1203,11 @@ def test_snapshot_permissions_preserve_profiles_git_modes_and_external_paths(
     assert stat.S_IMODE(candidate.stat().st_mode) == (0o755 if hosted else 0o777)
     assert stat.S_IMODE((candidate / "code.py").stat().st_mode) == (0o644 if hosted else 0o666)
     assert stat.S_IMODE((candidate / "tool.sh").stat().st_mode) == (0o755 if hosted else 0o777)
+    assert candidate.stat().st_uid == owner
     assert (candidate / "code.py").stat().st_uid == owner
+    if hosted:
+        gid = 65532 if os.geteuid() in {0, 65532} else os.getegid()
+        assert candidate.stat().st_gid == (candidate / "code.py").stat().st_gid == gid
     assert git(candidate, "ls-tree", "-r", "HEAD") == git(source, "ls-tree", "-r", "HEAD")
     assert (candidate / "code.py").read_bytes() == (source / "code.py").read_bytes()
     assert (candidate / "file-link").is_symlink() and (candidate / "directory-link").is_symlink()
