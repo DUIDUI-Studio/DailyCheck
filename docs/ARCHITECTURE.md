@@ -1553,7 +1553,11 @@ size/SHA 校验通过后才 `docker load`；redirect 仅限有界公开资产 ho
 URL，missing/corrupt asset fail closed。加载后只解析已批准 graph 的 daemon 表示（index/
 platform/config 之一），并核验 linux/arm64 与完整 rootfs；capture/attestation 记录实际
 daemon image 且必须落在同一 graph，不按 backend 改写 manifest。测试 opener 只是函数参数，
-没有 CLI/env 运行时覆盖。
+没有 CLI/env 运行时覆盖。producer 失败时只在 stderr 增加固定
+`[ci-producer] operation=<固定阶段标签> category=<固定错误类别>`；native capture 只在退出
+不成立时追加已验证的 `native_exit`（0–255，否则 unknown）与 timeout/OOM/error/image 标志。
+异常文本、candidate 输出、URL/签名参数、环境值、traceback 均不输出；成功路径与
+no-attestation 语义不变。
 coordinator-owned `local_fixture_only` image 仍可解析；它不提供 hosted/Prod runtime
 或隔离 signer 的安装证明。GitHub runner/platform Python/daemon 属于平台信任根，candidate
 不能在该主机执行；runtime 自身恶意或任意 malicious pytest/test intent 不在本次证明内，仍需

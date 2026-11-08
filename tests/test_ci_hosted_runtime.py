@@ -9,6 +9,7 @@ import copy
 import hashlib
 import inspect
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
@@ -330,3 +331,53 @@ def test_no_cli_or_environment_runtime_override():
     parameters = inspect.signature(producer.ensure_approved_runtime).parameters
     assert parameters["opener"].default is None
     assert "DAILYCHECK_CI_RUNTIME" not in inspect.getsource(producer)
+
+
+def test_failure_reports_fixed_operation_without_error_detail(monkeypatch, capsys):
+    secret = "https://release-assets.githubusercontent.com/secret?token=abc123"
+
+    def explode():
+        producer._stage("runtime-archive")
+        raise ValueError(secret)
+
+    monkeypatch.setattr(producer, "main", explode)
+    assert producer.entrypoint() == 1
+    error = capsys.readouterr().err
+    assert "[ci-producer] operation=runtime-archive category=invalid_data" in error
+    assert "trusted native producer failed; no success attestation" in error
+    assert "secret" not in error and "abc123" not in error
+    assert "DAILYCHECK_NATIVE_EVIDENCE=" not in error
+
+
+def test_success_reports_no_failure_diagnostic(monkeypatch, capsys):
+    monkeypatch.setattr(producer, "main", lambda: None)
+    assert producer.entrypoint() == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("error,category", [
+    (ValueError("x"), "invalid_data"),
+    (KeyError("CI_ROOT"), "missing_input"),
+    (TypeError("x"), "invalid_type"),
+    (RuntimeError("x"), "runtime"),
+    (OSError("x"), "io"),
+    (subprocess.CalledProcessError(1, ["docker"]), "subprocess"),
+    (subprocess.TimeoutExpired(["docker"], 1), "subprocess"),
+])
+def test_failure_category_uses_fixed_tokens(error, category):
+    assert producer._failure_category(error) == category
+
+
+def test_native_failure_details_keep_only_validated_codes():
+    state = {"OOMKilled": True, "Error": "untrusted daemon text"}
+    details = producer._native_failure_details("pytest", False, 137, state, True)
+    assert details == ("native_kind=pytest native_exit=137 timed_out=0 "
+                       "oom_killed=1 runtime_error=1 image_approved=1")
+    assert producer._native_failure_details(
+        "lint", True, "attacker-text", state, False).startswith(
+        "native_kind=lint native_exit=unknown timed_out=1 ")
+    assert "attacker-text" not in producer._native_failure_details(
+        "lint", True, "attacker-text", state, False)
+    assert "untrusted daemon text" not in details

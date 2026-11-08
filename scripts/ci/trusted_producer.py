@@ -45,6 +45,45 @@ HOSTED_PYTEST_SECONDS = 2700
 SCRATCH_RESERVE = 4 * 1024 ** 3
 HOST_FREE_MARGIN = 2 * 1024 ** 3
 
+# The only failure detail this fixed controller prints: an approved operation
+# label and fixed category. Exception text, candidate output, URLs, env values
+# and tracebacks never reach this line.
+OPERATION = "startup"
+ERROR_CATEGORIES = (
+    (subprocess.SubprocessError, "subprocess"),
+    (OSError, "io"),
+    (ValueError, "invalid_data"),
+    (KeyError, "missing_input"),
+    (TypeError, "invalid_type"),
+    (RuntimeError, "runtime"),
+)
+
+
+def _stage(name: str) -> None:
+    global OPERATION
+    OPERATION = name
+
+
+def _failure_category(error: BaseException) -> str:
+    for kind, category in ERROR_CATEGORIES:
+        if isinstance(error, kind):
+            return category
+    return "unknown"
+
+
+def _native_code(value) -> str:
+    return str(value) if type(value) is int and 0 <= value <= 255 else "unknown"
+
+
+def _native_failure_details(kind: str, timed_out: bool, native, state: dict,
+                            image_approved: bool) -> str:
+    return ("native_kind={} native_exit={} timed_out={} oom_killed={} "
+            "runtime_error={} image_approved={}").format(
+                kind, _native_code(native), int(bool(timed_out)),
+                int(bool(state.get("OOMKilled"))), int(bool(state.get("Error"))),
+                int(bool(image_approved)))
+
+
 # A fixed set of approved CI entrypoints, not candidate-selected executable paths.
 PYTHON_GATES = {
     "preview": ("scripts/dev_smoke_t11_e2e.py", "e2e_smoke"),
@@ -383,14 +422,17 @@ def ensure_approved_runtime(docker: list[str], manifest: dict, work: Path, *,
     runtime = manifest["runtime"]
     if runtime["scope"] == LOCAL_SCOPE:
         return runtime["image"]
+    _stage("runtime-resolve")
     reference = resolve_approved_image(docker, runtime)
     if reference is not None:
         return reference
     archive_dir = work / "runtime"
     archive_dir.mkdir(mode=0o700, exist_ok=True)
+    _stage("runtime-archive")
     _require_free(archive_dir, runtime["archive"]["bytes"] + HOST_FREE_MARGIN)
     archive_path = archive_dir / "approved-runtime.tar.gz"
     download_archive(runtime, archive_path, opener=opener)
+    _stage("runtime-load")
     try:
         load = subprocess.run([*docker, "load", "-i", str(archive_path)],
                               capture_output=True, timeout=1800)
@@ -398,6 +440,7 @@ def ensure_approved_runtime(docker: list[str], manifest: dict, work: Path, *,
         archive_path.unlink(missing_ok=True)
     if load.returncode:
         raise ValueError("approved runtime image load failed")
+    _stage("runtime-verify")
     reference = resolve_approved_image(docker, runtime)
     if reference is None:
         raise ValueError("approved runtime image unresolved")
@@ -514,9 +557,12 @@ class DockerCapture:
             # Only a proven exited and removed owned capture may delete scratch.
             if scratch is not None:
                 shutil.rmtree(scratch)
+            image_approved = inspection["Image"] in approved_images(self.manifest)
             if (timed_out or native != state["ExitCode"] or state["OOMKilled"]
-                    or state["Error"]
-                    or inspection["Image"] not in approved_images(self.manifest)):
+                    or state["Error"] or not image_approved):
+                print(f"[ci-producer] operation={OPERATION} "
+                      + _native_failure_details(kind, timed_out, native, state,
+                                                image_approved), file=sys.stderr)
                 raise ValueError("candidate timeout/runtime/native capture failure")
             session = None
             if kind == "pytest":
@@ -621,6 +667,7 @@ def job(args):
     from scripts.ci.candidate_binding import binding as make_binding
     from scripts.ci.merge_group import QueueReader
 
+    _stage("manifest")
     manifest_blob = os.environ["CI_PRODUCER_MANIFEST_BLOB"]
     raw = (AUTHORITY / "scripts/ci/producer_manifest.json").read_bytes()
     manifest = parse_manifest(raw, manifest_blob)
@@ -639,6 +686,7 @@ def job(args):
         if (AUTHORITY / package / "__init__.py").read_bytes() != b"":
             raise ValueError("approved namespace export changed")
     work = Path(os.environ["CI_ROOT"]).resolve()
+    _stage("event")
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     repo = Path.cwd()
     members_manifest = None
@@ -658,6 +706,7 @@ def job(args):
         members = [{"number": pr["number"], "head_sha": pr["head"]["sha"],
                     "head_ref": pr["head"]["ref"], "body": pr["body"], "body_sha256": digest(pr["body"])}]
     binding = make_binding()
+    _stage("snapshot")
     candidate = work / "candidate"
     snapshot(repo, candidate, binding["tested_sha"])
     (candidate / ".dc-session.json").unlink(missing_ok=True)
@@ -674,17 +723,22 @@ def job(args):
         changed = subprocess.check_output(["git", "diff", "--name-only", "--diff-filter=d", "-z",
                                            base + "..." + binding["tested_sha"], "--", "*.py"], cwd=repo).decode().split("\0")
         files = [p for p in changed if p]
+        _stage("lint-capture")
         lint, _, _ = runner.capture(candidate, binding, "lint", "test",
                                     ["ruff", "check", "--", *files] if files else ["ruff", "--version"], {}, readonly=True)
+        _stage("lint-gate")
         if lint["native_exit"] != 0:
             raise ValueError("actual changed-file Ruff gate failed")
+        _stage("pytest-capture")
         capture, output, session = runner.capture(candidate, binding, "pytest", "test",
             ["python3", "-P", "-m", "pytest", "--basetemp=/tmp/pytest", "-q", "--tb=no", "-rfE", "--color=no",
              "-p", "dc_approved_evidence", "--dc-evidence=/candidate/.dc-session.json"], {})
+        _stage("evidence")
         envelope = make_test_envelope(output, session, capture, binding)
         producer = {"identity": identity(manifest, manifest_blob), "lint_capture": lint,
                     "test_capture": capture, "gates": []}
     else:
+        _stage("upstream")
         upstream = json.loads(base64.b64decode(os.environ["NATIVE_TEST_B64"], validate=True))
         envelope, producer = upstream["envelope"], upstream["producer"]
         if (envelope["binding"] != binding or upstream != attest(envelope, members, "test", producer)
@@ -700,6 +754,7 @@ def job(args):
         (proof / "data.json").write_text(json.dumps({"members": members, "binding": binding, "manifest": members_manifest}))
         gates = []
         for kind in ("report-generate", "report-verify"):
+            _stage(kind)
             captured, _, _ = runner.capture(candidate, binding, kind, args.context,
                 ["python3", "-I", "/authority/scripts/ci/trusted_producer.py", kind], {},
                 trusted_scripts=True, readonly=kind == "report-verify", inputs=proof)
@@ -712,6 +767,7 @@ def job(args):
                 or read_data(candidate / "reports/pytest-output.txt", candidate).decode() != envelope["text"]):
             raise ValueError("reports replaced trusted native proof")
         producer = {**producer, "gates": gates}
+    _stage("attest")
     validate_producer(producer, manifest, manifest_blob, envelope, args.context)
     record = attest(envelope, members, args.context, producer)
     (work / "attestation.json").write_text(json.dumps(record, sort_keys=True))
@@ -748,9 +804,17 @@ def main():
         report_inner(Path("/candidate"), args.command)
 
 
-if __name__ == "__main__":
+def entrypoint() -> int:
     try:
         main()
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, RuntimeError):
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError,
+            RuntimeError) as error:
+        print(f"[ci-producer] operation={OPERATION} category={_failure_category(error)}",
+              file=sys.stderr)
         print("trusted native producer failed; no success attestation", file=sys.stderr)
-        raise SystemExit(1) from None
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(entrypoint())
