@@ -57,16 +57,29 @@ HOST_FREE_MARGIN = 2 * 1024 ** 3
 # Bounded retrieval retry. Only classified transient transport/HTTP failures
 # are retried; integrity, route and redirect-policy failures never are. Backoff
 # is fixed, so an untrusted Retry-After header can never set the wait time.
+# The deadline gates every blocking open/read, so continuous slow progress
+# cannot extend the stream indefinitely. Per-I/O timeout still bounds a single
+# in-flight open/read, so the conservative wall bound is
+# ARCHIVE_DEADLINE_SECONDS + ARCHIVE_HTTP_TIMEOUT plus local processing, not a
+# strict ARCHIVE_DEADLINE_SECONDS guarantee.
 ARCHIVE_HTTP_TIMEOUT = 120
 ARCHIVE_CHUNK = 1024 * 1024
 ARCHIVE_ATTEMPTS = 3
-ARCHIVE_RETRY_SECONDS = 300.0
+ARCHIVE_DEADLINE_SECONDS = 300.0
 ARCHIVE_BACKOFF_SECONDS = (1.0, 2.0)
 TRANSIENT_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class ArchivePreflightError(ValueError):
     """Disk preflight failed before any retrieval attempt; never retried."""
+
+
+class ArchiveTimeoutError(ValueError):
+    """The stream/retry deadline expired during open/read; never retried."""
+
+    def __init__(self, attempts: int = 1):
+        self.attempts = attempts
+        super().__init__("approved runtime archive deadline exceeded")
 
 
 class ArchiveTransportError(ValueError):
@@ -103,6 +116,7 @@ class ArchiveIntegrityError(ValueError):
 OPERATION = "startup"
 ERROR_CATEGORIES = (
     (ArchivePreflightError, "preflight"),
+    (ArchiveTimeoutError, "timeout"),
     (ArchiveTransportError, "transport"),
     (ArchiveHTTPError, "http"),
     (ArchiveIntegrityError, "integrity"),
@@ -114,7 +128,7 @@ ERROR_CATEGORIES = (
     (RuntimeError, "runtime"),
 )
 # Fixed archive categories that carry bounded integer diagnostics only.
-ARCHIVE_CATEGORIES = frozenset({"transport", "http", "integrity"})
+ARCHIVE_CATEGORIES = frozenset({"transport", "http", "integrity", "timeout"})
 
 
 def _stage(name: str) -> None:
@@ -437,6 +451,11 @@ def _public_opener():
     return build_opener(_PublicRedirect())
 
 
+def _check_deadline(deadline: float, attempt: int) -> None:
+    if time.monotonic() >= deadline:
+        raise ArchiveTimeoutError(attempt)
+
+
 def _read_chunk(response, attempt: int) -> bytes:
     """Read one chunk; socket/protocol failures become transport errors only."""
     try:
@@ -451,11 +470,13 @@ def _http_status(value) -> int | None:
     return value if type(value) is int and 100 <= value <= 599 else None
 
 
-def _download_once(runtime: dict, destination: Path, opener, attempt: int) -> None:
+def _download_once(runtime: dict, destination: Path, opener, attempt: int,
+                   deadline: float) -> None:
     """One retrieval attempt. Integrity and policy failures stay non-retryable."""
     archive = runtime["archive"]
     request = Request(archive["url"], method="GET",
                       headers={"Accept": "application/octet-stream"})
+    _check_deadline(deadline, attempt)
     try:
         response = opener.open(request, timeout=ARCHIVE_HTTP_TIMEOUT)
     except HTTPError as error:
@@ -468,6 +489,7 @@ def _download_once(runtime: dict, destination: Path, opener, attempt: int) -> No
         raise ArchiveTransportError(attempt) from None
     except OSError:
         raise ArchiveTransportError(attempt) from None
+    _check_deadline(deadline, attempt)
     # Route/redirect policy ValueError from the opener deliberately propagates.
     with response:
         status = getattr(response, "status", None)
@@ -478,7 +500,9 @@ def _download_once(runtime: dict, destination: Path, opener, attempt: int) -> No
         # write failure is reported as io and never retried.
         with destination.open("wb") as output:
             while True:
+                _check_deadline(deadline, attempt)
                 chunk = _read_chunk(response, attempt)
+                _check_deadline(deadline, attempt)
                 if not chunk:
                     break
                 total += len(chunk)
@@ -493,29 +517,37 @@ def _download_once(runtime: dict, destination: Path, opener, attempt: int) -> No
 def download_archive(runtime: dict, destination: Path, *, opener=None) -> None:
     """Stream only the pinned public bytes; nothing is extracted or executed.
 
-    Transient transport/HTTP failures are retried a fixed number of times inside
-    a finite budget. Digest/size mismatches, route and redirect-policy failures
-    fail on the first attempt. A failed attempt never leaves a partial file.
+    Transient transport/HTTP failures are retried a fixed number of times. The
+    stream/retry deadline is checked before and after every blocking open/read,
+    so continuous slow progress cannot extend the stream indefinitely. A single
+    in-flight open/read is separately bounded by ARCHIVE_HTTP_TIMEOUT, which is
+    why the conservative wall bound is ARCHIVE_DEADLINE_SECONDS plus that
+    timeout plus local processing, not a strict deadline. Digest/size
+    mismatches, route/redirect-policy failures and deadline expiry fail on the
+    first attempt. A failed attempt never leaves a partial file. A default
+    opener is rebuilt for every attempt so the redirect budget starts fresh;
+    an injected opener stays caller-owned across attempts.
     """
     archive = runtime["archive"]
-    opener = opener or _public_opener()
-    deadline = time.monotonic() + ARCHIVE_RETRY_SECONDS
+    deadline = time.monotonic() + ARCHIVE_DEADLINE_SECONDS
     attempt = 0
     try:
         validate_archive_route(archive["url"])
         while True:
             attempt += 1
+            attempt_opener = opener if opener is not None else _public_opener()
             try:
-                _download_once(runtime, destination, opener, attempt)
+                _download_once(runtime, destination, attempt_opener, attempt, deadline)
                 return
             except (ArchiveTransportError, ArchiveHTTPError) as error:
                 error.attempts = attempt
                 destination.unlink(missing_ok=True)
+                delay = ARCHIVE_BACKOFF_SECONDS[
+                    min(attempt - 1, len(ARCHIVE_BACKOFF_SECONDS) - 1)]
                 if (not error.retryable or attempt >= ARCHIVE_ATTEMPTS
-                        or time.monotonic() >= deadline):
+                        or time.monotonic() + delay >= deadline):
                     raise
-                time.sleep(ARCHIVE_BACKOFF_SECONDS[
-                    min(attempt - 1, len(ARCHIVE_BACKOFF_SECONDS) - 1)])
+                time.sleep(delay)
     except BaseException:
         destination.unlink(missing_ok=True)
         raise

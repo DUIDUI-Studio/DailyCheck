@@ -110,6 +110,48 @@ def _record_sleeps(monkeypatch):
     return sleeps
 
 
+class _Clock:
+    """Controlled monotonic clock; reads advance it by a fixed step."""
+
+    def __init__(self, step):
+        self.step, self.now = step, 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class _TrickleResponse:
+    status = 200
+
+    def __init__(self, payload, clock):
+        self.chunks = [payload[index:index + 1] for index in range(len(payload))]
+        self.chunks.append(b"")
+        self.clock = clock
+
+    def read(self, size=-1):
+        self.clock.now += self.clock.step
+        return self.chunks.pop(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _TrickleOpener:
+    """One valid byte per read, then EOF; every read advances the clock."""
+
+    def __init__(self, payload, clock):
+        self.payload, self.clock = payload, clock
+        self.opens, self.timeout = 0, None
+
+    def open(self, request, timeout=None):
+        self.opens += 1
+        self.timeout = timeout
+        return _TrickleResponse(self.payload, self.clock)
+
+
 def _inspection(ident, *, architecture="arm64", os_name="linux", layers=None):
     return {"Id": ident, "Architecture": architecture, "Os": os_name,
             "RootFS": {"Layers": LAYERS if layers is None else layers}}
@@ -437,6 +479,102 @@ def test_retry_delay_ignores_untrusted_retry_after(tmp_path, monkeypatch):
     assert 999999 not in sleeps
 
 
+def test_slow_but_valid_stream_aborts_at_the_deadline(tmp_path, monkeypatch):
+    # Root counterexample: every read returns valid bytes while the clock jumps
+    # 200s. A pre-deadline-only check would succeed after 600s.
+    payload = b"ab"
+    clock = _Clock(step=200.0)
+    monkeypatch.setattr(producer.time, "monotonic", clock)
+    opener = _TrickleOpener(payload, clock)
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(producer.ArchiveTimeoutError) as caught:
+        producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert opener.opens == 1
+    assert opener.timeout == producer.ARCHIVE_HTTP_TIMEOUT
+    assert caught.value.attempts == 1
+    assert clock.now == 400.0  # stopped after the first post-deadline read
+    assert not destination.exists()
+    assert "category=timeout attempts=1" in producer._failure_diagnostic(caught.value)
+
+
+def test_fast_stream_still_downloads_exactly(tmp_path, monkeypatch):
+    payload = b"ab"
+    clock = _Clock(step=1.0)
+    monkeypatch.setattr(producer.time, "monotonic", clock)
+    opener = _TrickleOpener(payload, clock)
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert destination.read_bytes() == payload
+    assert clock.now == 3.0
+
+
+def test_slow_failed_open_cannot_retry_past_the_deadline(tmp_path, monkeypatch):
+    payload = b"ab"
+    clock = _Clock(step=0.0)
+    monkeypatch.setattr(producer.time, "monotonic", clock)
+    sleeps = _record_sleeps(monkeypatch)
+
+    class Opener:
+        def __init__(self):
+            self.opens = 0
+
+        def open(self, request, timeout=None):
+            self.opens += 1
+            clock.now += producer.ARCHIVE_DEADLINE_SECONDS + 1
+            raise URLError("slow failure")
+
+    opener = Opener()
+    destination = tmp_path / "archive.tar.gz"
+    with pytest.raises(producer.ArchiveTransportError) as caught:
+        producer.download_archive(_runtime_for(payload), destination, opener=opener)
+    assert opener.opens == 1 and caught.value.attempts == 1
+    assert sleeps == [] and not destination.exists()
+
+
+def test_default_opener_is_rebuilt_for_each_attempt(tmp_path, monkeypatch):
+    payload = b"opener-fresh" * 128
+    made = []
+
+    class Opener:
+        def __init__(self, index):
+            self.index, self.opens = index, 0
+
+        def open(self, request, timeout=None):
+            self.opens += 1
+            if self.index == 0:
+                raise URLError("transient")
+            return _Response([payload])
+
+    def factory():
+        made.append(Opener(len(made)))
+        return made[-1]
+
+    monkeypatch.setattr(producer, "_public_opener", factory)
+    sleeps = _record_sleeps(monkeypatch)
+    destination = tmp_path / "archive.tar.gz"
+    producer.download_archive(_runtime_for(payload), destination)
+    assert len(made) == 2
+    assert [opener.opens for opener in made] == [1, 1]
+    assert destination.read_bytes() == payload
+    assert sleeps == [producer.ARCHIVE_BACKOFF_SECONDS[0]]
+
+
+def test_redirect_budget_is_fresh_per_opener_instance():
+    request = producer.Request("https://github.com/approved")
+
+    def redirect(handler):
+        return handler.redirect_request(
+            request, None, 302, "Found", {},
+            "https://objects.githubusercontent.com/a")
+
+    exhausted = producer._PublicRedirect()
+    for _ in range(producer.MAX_REDIRECTS):
+        redirect(exhausted)
+    with pytest.raises(ValueError):
+        redirect(exhausted)
+    assert redirect(producer._PublicRedirect()).full_url.endswith("/a")
+
+
 def test_redirect_and_route_policy_failures_are_not_retried(tmp_path, monkeypatch):
     payload = b"policy" * 4096
     sleeps = _record_sleeps(monkeypatch)
@@ -479,6 +617,7 @@ def test_disk_preflight_is_a_distinct_stage_and_category(monkeypatch, tmp_path):
     (producer.ArchiveTransportError(3), "category=transport attempts=3"),
     (producer.ArchiveHTTPError(503, 3), "category=http http_status=503 attempts=3"),
     (producer.ArchiveIntegrityError(1), "category=integrity attempts=1"),
+    (producer.ArchiveTimeoutError(2), "category=timeout attempts=2"),
     (producer.ArchivePreflightError(), "category=preflight"),
 ])
 def test_archive_diagnostics_use_only_fixed_tokens(monkeypatch, error, expected):

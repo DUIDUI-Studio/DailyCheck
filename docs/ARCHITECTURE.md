@@ -1563,10 +1563,14 @@ manifest 解析与下载边界复用同一个纯 route validator：固定 reposi
 size/SHA 校验通过后才 `docker load`；redirect 仅限有界公开资产 host，不转发凭据或记录签名
 URL，missing/corrupt asset fail closed。磁盘预检使用独立 stage `runtime-preflight`
 （失败 `category=preflight`），与下载 stage `runtime-archive` 分开，避免把磁盘不足误判成
-下载失败。仅对分类为瞬态的 transport/HTTP 失败做有界重试：最多 3 次尝试、300s 重试预算、
-固定 1s/2s 退避；HTTP 只重试 408/429/500/502/503/504，永久 4xx 与其他 5xx 不重试；绝不
-采用服务端 `Retry-After`。size/digest mismatch（`category=integrity`）、route/redirect
-策略失败立即失败、从不重试；每次失败都删除部分文件，重试耗尽不伪造成功。加载后只解析已批准
+下载失败。仅对分类为瞬态的 transport/HTTP 失败做有界重试：最多 3 次尝试；300s 的流/重试
+截止时间在每次 blocking open/read 前后都检查，持续慢速推进也会在截止后中止（`category=
+timeout`，不重试），单次在途 I/O 另受 120s 超时约束，固定 1s/2s 退避；因此保守最坏墙钟约
+300s+120s（另加本地处理开销），而非严格 300s 上限。HTTP 只重试 408/429/500/502/503/504，永久 4xx 与其他
+5xx 不重试；绝不采用服务端 `Retry-After`。size/digest mismatch（`category=integrity`）、
+route/redirect 策略失败立即失败、从不重试；每次失败都删除部分文件，重试耗尽不伪造成功。
+默认 opener 每次尝试新建，redirect 计数按 attempt 从 0 开始；注入的 opener 由调用方持有并
+在尝试间复用（测试显式控制）。加载后只解析已批准
 graph 的 daemon 表示（index/platform/config 之一），并核验 linux/arm64 与完整 rootfs；
 capture/attestation 记录实际
 daemon image 且必须落在同一 graph，不按 backend 改写 manifest。测试 opener 只是函数参数，
