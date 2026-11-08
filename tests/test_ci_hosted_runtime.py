@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import json
 import os
+import stat
 import subprocess
 import sys
 from http.client import IncompleteRead
@@ -1150,6 +1151,94 @@ def test_snapshot_keeps_the_bound_base_when_the_source_has_no_main_branch(tmp_pa
         ["git", "-C", str(candidate), "rev-parse", "origin/main"], text=True).strip() == base
     config = (candidate / ".git/config").read_text()
     assert "sourceonly" not in config
+
+
+@pytest.mark.parametrize("hosted", [False, True])
+def test_snapshot_permissions_preserve_profiles_git_modes_and_external_paths(
+    tmp_path, monkeypatch, hosted
+):
+    from scripts.prod_agent.native_ports import protected_path
+
+    # Other local callers exercise real mode/link behavior with their own UID;
+    # the separately granted Linux65532 run exercises the actual fixed identity.
+    owner = 65532 if hosted and os.geteuid() in {0, 65532} else os.geteuid()
+    if hosted and owner != 65532:
+        fchown = os.fchown
+
+        def portable_chown(fd, uid, gid):
+            assert (uid, gid) == (65532, 65532)
+            fchown(fd, os.geteuid(), os.getegid())
+
+        monkeypatch.setattr(producer.os, "fchown", portable_chown)
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(repo, *args):
+        return subprocess.check_output(
+            ["git", "-c", "safe.directory=*", "-C", str(repo), *args], text=True
+        ).strip()
+
+    git(source, "init", "-q", "-b", "main")
+    git(source, "config", "user.name", "Snapshot modes fixture")
+    git(source, "config", "user.email", "snapshot-modes@example.invalid")
+    (source / "code.py").write_text("print('source bytes')\n")
+    (source / "tool.sh").write_text("#!/bin/sh\nexit 0\n")
+    (source / "tool.sh").chmod(0o755)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("outside destination")
+    sentinel.chmod(0o666)
+    (source / "file-link").symlink_to(sentinel)
+    (source / "directory-link").symlink_to(outside, target_is_directory=True)
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "snapshot fixture")
+    head = git(source, "rev-parse", "HEAD")
+    ancestor = tmp_path / "unprotected-parent"
+    ancestor.mkdir()
+    ancestor.chmod(0o777)
+    untouched = {p: p.stat() for p in (ancestor, outside, sentinel)}
+    candidate = ancestor / "candidate"
+    producer.snapshot(source, candidate, head, head, hosted=hosted)
+    assert stat.S_IMODE(candidate.stat().st_mode) == (0o755 if hosted else 0o777)
+    assert stat.S_IMODE((candidate / "code.py").stat().st_mode) == (0o644 if hosted else 0o666)
+    assert stat.S_IMODE((candidate / "tool.sh").stat().st_mode) == (0o755 if hosted else 0o777)
+    assert (candidate / "code.py").stat().st_uid == owner
+    assert git(candidate, "ls-tree", "-r", "HEAD") == git(source, "ls-tree", "-r", "HEAD")
+    assert (candidate / "code.py").read_bytes() == (source / "code.py").read_bytes()
+    assert (candidate / "file-link").is_symlink() and (candidate / "directory-link").is_symlink()
+    for path, before in untouched.items():
+        after = path.stat()
+        assert (after.st_uid, after.st_gid, after.st_mode) == (
+            before.st_uid, before.st_gid, before.st_mode
+        )
+    assert sentinel.read_text() == "outside destination"
+    (candidate / ".dc-session.json").write_text("{}\n")
+    (candidate / ".dc-junit.xml").write_text("<testsuites/>\n")
+    if hosted:
+        assert protected_path(candidate / "code.py", owner, anchor=candidate)
+        with pytest.raises(ValueError, match="ownership/mode"):
+            protected_path(candidate / "code.py", owner, anchor=tmp_path)
+        with pytest.raises(ValueError, match="ownership/mode"):
+            protected_path(candidate / "file-link", owner, anchor=candidate)
+
+
+def test_hosted_snapshot_normalization_refuses_a_symlink_root(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("unchanged outside bytes")
+    before = (outside.stat(), sentinel.stat())
+    link = tmp_path / "candidate-link"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        producer._hosted_snapshot_permissions(link)
+    for path, old in zip((outside, sentinel), before, strict=True):
+        current = path.stat()
+        assert (current.st_uid, current.st_gid, current.st_mode) == (
+            old.st_uid, old.st_gid, old.st_mode
+        )
+    assert sentinel.read_text() == "unchanged outside bytes"
 
 
 def test_pytest_capture_rejects_a_changed_evidence_plugin(monkeypatch, tmp_path):

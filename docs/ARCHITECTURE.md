@@ -1553,6 +1553,8 @@ HTTP child，避免固定 runtime 中不存在的 `pgrep` 依赖；非 Linux 保
 真实 SIGKILL、HTTP 到达、锁保留和 child exit 断言不变。
 warehouse migration 的 down-refusal 子进程也显式接收 candidate 导入根，确保真正执行
 `db.warehouse_migrate` 并检查 verified-backup 拒绝；恢复校验与原备份/库内容断言不变。
+hosted snapshot 的权限回归检查实际文件模式、执行位/Git tree、外部 symlink target 与
+ancestor 不变，以及 candidate 内 JUnit/session 可写；独立 local profile 保留原权限行为。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找
