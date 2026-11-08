@@ -930,8 +930,10 @@ class DockerCapture:
                 "--mount", f"type=bind,src={candidate},dst=/candidate" + (",readonly" if readonly else ""),
                 "--mount", f"type=bind,src={self.authority},dst=/authority,readonly"]
         if trusted_scripts:
-            args += ["--mount", f"type=bind,src={self.authority / 'scripts'},dst=/candidate/scripts,readonly",
-                     "--mount", f"type=bind,src={self.authority / 'tests/known_failures.txt'},dst=/candidate/tests/known_failures.txt,readonly"]
+            # Pin helper files without hiding candidate scripts that the real
+            # changed-file Ruff gate must still inspect (including packages).
+            for path in self.manifest["files"]:
+                args += ["--mount", f"type=bind,src={self.authority / path},dst=/candidate/{path},readonly"]
         if inputs is not None:
             args += ["--mount", f"type=bind,src={inputs},dst=/input,readonly"]
         if kind == "pytest" and runtime["scope"] == HOSTED_SCOPE:

@@ -143,24 +143,57 @@ if [[ -n "${BASE_SHA}" ]]; then
   # 三点 diff（merge-base）：只算本分支引入的改动。两点会把 base 之后 main 上
   # 别人合入的改动也列进来（据此跑 ruff 会报已删除文件的 E902）。
   # --diff-filter=d 排除本分支自己删掉的 .py。
-  CHANGED_PY=$(git diff --name-only --diff-filter=d "${BASE_SHA}"...HEAD -- '*.py' 2>/dev/null || true)
+  DIFF_RANGE=("${BASE_SHA}"...HEAD)
 else
-  CHANGED_PY=$(git diff --name-only --diff-filter=d HEAD~1 -- '*.py' 2>/dev/null || true)
+  DIFF_RANGE=(HEAD~1)
 fi
 
-RUFF_BASELINE_LINES=0
-if [[ -n "${CHANGED_PY}" ]]; then
-  ruff check "${CHANGED_PY}" > "${RUFF_OUTPUT}" 2>&1 || true
-  # ruff 输出形如 `path/file.py:11:5: E401 Module imported but unused`，
-  # wc -l 数的是行数（含空行/进度条），不是告警数。改用 grep -c 数真正告警。
-  # 注意：grep -c 找不到匹配时 exit 1 + 输出 "0"，不能用 `|| echo 0`（会双 0）。
-  RUFF_WARNINGS=$(grep -cE '^[^:]+:[0-9]+:[0-9]+: [A-Z][0-9]+ ' "${RUFF_OUTPUT}" 2>/dev/null || true)
-  RUFF_WARNINGS=${RUFF_WARNINGS:-0}
-  # 去掉末尾换行（grep -c 有时含 trailing newline）
-  RUFF_WARNINGS=$(echo "${RUFF_WARNINGS}" | tr -d '\n' | head -c 16)
-else
-  echo "no python files changed" > "${RUFF_OUTPUT}"
-  RUFF_WARNINGS=0
+CHANGED_PY=()
+RUFF_FILES="${DAILYCHECK_CI_TMP:-/tmp}/ruff-files-af.txt"
+RUFF_EXIT=2
+RUFF_WARNINGS=null
+if git diff --name-only -z --diff-filter=d "${DIFF_RANGE[@]}" -- '*.py' > "${RUFF_FILES}" 2> "${RUFF_OUTPUT}"; then
+  # read -d works on macOS Bash 3.2; NUL separators preserve spaces/newlines.
+  while IFS= read -r -d '' path; do
+    CHANGED_PY+=("${path}")
+  done < "${RUFF_FILES}"
+  if [[ ${#CHANGED_PY[@]} -gt 0 ]]; then
+    ruff check --output-format=json -- "${CHANGED_PY[@]}" > "${RUFF_OUTPUT}" 2>&1
+    RUFF_EXIT=$?
+    if [[ ${RUFF_EXIT} -le 1 ]]; then
+      if ! RUFF_WARNINGS=$(python3 - "${RUFF_OUTPUT}" "${RUFF_EXIT}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as handle:
+        diagnostics = json.load(handle)
+    if not isinstance(diagnostics, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("code"), str)
+        for item in diagnostics
+    ):
+        raise ValueError("invalid Ruff diagnostics")
+    if bool(diagnostics) != (int(sys.argv[2]) == 1):
+        raise ValueError("Ruff exit disagrees with diagnostics")
+except (OSError, ValueError, TypeError):
+    sys.exit(1)
+print(len(diagnostics))
+PY
+      ); then
+        RUFF_EXIT=2
+        RUFF_WARNINGS=null
+      fi
+    fi
+  else
+    echo "no python files changed" > "${RUFF_OUTPUT}"
+    RUFF_EXIT=0
+    RUFF_WARNINGS=0
+  fi
+fi
+rm -f "${RUFF_FILES}"
+RUFF_STATUS="⚠️"
+if [[ ${RUFF_EXIT} -eq 0 && "${RUFF_WARNINGS}" == 0 ]]; then
+  RUFF_STATUS="✅"
 fi
 
 # 复杂度（radon，CD/CC > 10 视为警示）
@@ -206,7 +239,7 @@ cat > "${OUT_DIR}/03-code-quality.md" <<EOF
 
 | 工具 | 命令 | 当前告警 | 状态 |
 |------|------|---------|------|
-| ruff | ruff check 改动 .py 文件 | ${RUFF_WARNINGS} | $([ "${RUFF_WARNINGS}" -eq 0 ] && echo "✅" || echo "⚠️") |
+| ruff | ruff check --output-format=json 改动 .py 文件（exit=${RUFF_EXIT}） | ${RUFF_WARNINGS} | ${RUFF_STATUS} |
 
 \`\`\`
 $(cat "${RUFF_OUTPUT}")
@@ -269,8 +302,10 @@ EOF
 echo "[generate_reports] reports written to ${OUT_DIR}/"
 echo "[generate_reports] pytest exit=${PYTEST_EXIT}, known_failures gate=${GATE_EXIT}"
 
-# 整体退出码：known_failures 门禁过了就 0；否则 1
-if [[ ${GATE_EXIT} -eq 0 && ${RUFF_WARNINGS} -eq 0 ]]; then
+# 工具/输入错误不能被零告警掩盖；失败仍保留 02/03 与 summary。
+if [[ ${RUFF_EXIT} -gt 1 ]]; then
+  exit 2
+elif [[ ${GATE_EXIT} -eq 0 && ${RUFF_EXIT} -eq 0 && "${RUFF_WARNINGS}" == 0 ]]; then
   exit 0
 else
   exit 1

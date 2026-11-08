@@ -1,6 +1,7 @@
 """T11 端到端冒烟：模拟 storefront → DC → storefront 三角色流。"""
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -81,9 +82,16 @@ def e2e_smoke():
     from app import create_app
 
     tmp, master_path = _make_test_env()
-    app = create_app()
-    app.config["TESTING"] = True
-    client = app.test_client()
+    try:
+        app = create_app()
+        app.config["TESTING"] = True
+        _exercise_flow(app.test_client(), master_path)
+    finally:
+        shutil.rmtree(tmp)
+
+
+def _exercise_flow(client, master_path):
+    from blueprints.store_ordering import _tomorrow
 
     # 1. storefront 用户加购 + 提交
     with client.session_transaction() as s:
@@ -99,7 +107,7 @@ def e2e_smoke():
 
     r = client.post(
         "/store-ordering/cart/submit",
-        data={"expected_delivery_date": "2026-10-07", "note": "T11 冒烟"},
+        data={"expected_delivery_date": _tomorrow().isoformat(), "note": "T11 冒烟"},
         follow_redirects=True,
     )
     assert r.status_code == 200
@@ -211,12 +219,11 @@ def e2e_smoke():
         r = client.get(f"/store-ordering/orders/{order_id}")
         assert r.status_code == 200
         body = r.data.decode()
-        assert "订单总金额" in body
+        assert '<span class="info-card-total-label">订单总计</span>' in body
         assert "info-card-total-value" in body
+        assert '<span class="info-card-total-value">¥ 55.00</span>' in body
         print(f"[8] {label} 视图 order_detail OK: 含 info-card + 总金额")
 
-    import shutil
-    shutil.rmtree(tmp)
     print("\n=== T11 E2E SMOKE PASSED ===")
 
 

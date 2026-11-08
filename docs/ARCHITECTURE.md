@@ -3442,6 +3442,15 @@ Issue #111 的 `tests/test_order_detail_source_resilience.py` 复用 #109 的真
 CI 继续把原生 pytest 摘要交给 reports job 复用，不重复全量执行。
 `generate_reports.sh` 保留 known-failure checker 的真实退出码，即使失败仍生成报告，
 `ci-summary.json` 的 `gate_exit` 与最终退出码不得被恒真后缀覆盖；已知失败清单只许收缩。
+报告03保留三点 diff 与删除过滤，以 NUL 分隔的 Git 路径构造 Bash 数组，逐文件传给
+Ruff；告警数取真实 JSON diagnostics，不从终端排版猜测。Git 输入、Ruff 执行/配置或
+输出解析错误仍产报告，但告警记 null、生成退出2；实际 lint 告警退出1，不能报零告警绿。
+trusted reports 按 manifest 逐文件只读覆盖 helper/baseline，保留其余 candidate scripts 的
+可见性，避免整目录覆盖使实际改动文件变成 E902 或改变 Ruff 的本地包识别；authority
+导入优先级、固定 Python gate supervisor 与 fresh 只读 verifier 保持不变。
+报告04的 T11 冒烟用订货路由同一 `_tomorrow()` 时钟生成到货日，完整保留加购、提交、
+审批、两次发货/收货和详情断言；详情核对现行「订单总计」标签及固定夹具的 ¥55.00 金额，
+流程成功或断言失败均在 finally 清理隔离临时数据库。
 
 **完整 pytest 结果证据（Issue #114）**：`scripts/ci/pytest_evidence.py` 是显式启用的
 只读观察插件，sessionfinish 写出 selected/completed、真实 outcome 统计及失败 nodeid。

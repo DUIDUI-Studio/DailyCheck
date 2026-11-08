@@ -1024,7 +1024,7 @@ def test_native_failure_details_keep_only_validated_codes():
     assert "untrusted daemon text" not in details
 
 
-def _capture_commands(monkeypatch, tmp_path, *, kind, argv, plugin=None):
+def _capture_commands(monkeypatch, tmp_path, *, kind, argv, plugin=None, trusted_scripts=False):
     """Run one synthetic capture and return the docker argv it built."""
     repo_plugin = (ROOT / "scripts/ci/pytest_evidence.py").read_bytes()
     plugin = repo_plugin if plugin is None else plugin
@@ -1060,7 +1060,8 @@ def _capture_commands(monkeypatch, tmp_path, *, kind, argv, plugin=None):
     monkeypatch.setattr(
         producer.subprocess, "run",
         lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"1 passed\n", stderr=b""))
-    capture.capture(candidate, {"version": 3}, kind, "test", argv, {})
+    capture.capture(candidate, {"version": 3}, kind, "test", argv, {},
+                    trusted_scripts=trusted_scripts)
     return commands, output
 
 
@@ -1096,6 +1097,20 @@ def test_non_pytest_capture_keeps_the_authority_helper_root(monkeypatch, tmp_pat
     assert "PYTHONPATH=/trusted-evidence" not in _env(create)
     assert not (output / "evidence-plugin").exists()
     assert not any("/trusted-evidence" in value for value in create)
+
+
+def test_report_helpers_are_pinned_without_hiding_candidate_scripts(monkeypatch, tmp_path):
+    commands, _ = _capture_commands(monkeypatch, tmp_path, kind="report-generate",
+                                    argv=["python3", "-I", "/authority/scripts/ci/trusted_producer.py"],
+                                    trusted_scripts=True)
+    create = next(command for command in commands if command[0] == "create")
+    mounts = [create[index + 1] for index, arg in enumerate(create) if arg == "--mount"]
+    overlays = {mount.split(",dst=/candidate/", 1)[1] for mount in mounts
+                if ",dst=/candidate/" in mount}
+    assert overlays == {path + ",readonly" for path in MANIFEST["files"]}
+    assert "scripts,readonly" not in overlays
+    assert not any(path.startswith("scripts/prod_agent/") for path in overlays)
+    assert "PYTHONPATH=/authority" in _env(create)
 
 
 def test_candidate_import_environment_is_scoped_to_the_tested_child(monkeypatch, tmp_path):
