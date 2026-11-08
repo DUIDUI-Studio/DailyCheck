@@ -532,8 +532,26 @@ class DockerCapture:
                      "--mount", f"type=bind,src={self.authority / 'tests/known_failures.txt'},dst=/candidate/tests/known_failures.txt,readonly"]
         if inputs is not None:
             args += ["--mount", f"type=bind,src={inputs},dst=/input,readonly"]
+        plugin_dir = None
+        if kind == "pytest":
+            # The candidate checkout's scripts/ is a namespace package, so the
+            # authority's regular scripts package (empty __init__) wins wherever
+            # it appears on sys.path and hides every candidate subpackage
+            # (scripts.prod_agent, scripts.dailycheck_dashboard, ...). Mount the
+            # pinned evidence plugin on its own root instead of the helper root.
+            plugin_dir = self.output / "evidence-plugin"
+            plugin_dir.mkdir(exist_ok=True)
+            plugin_dir.chmod(0o755)
+            raw_plugin = (self.authority / "dc_approved_evidence.py").read_bytes()
+            if blob_id(raw_plugin) != self.manifest["files"]["scripts/ci/pytest_evidence.py"]:
+                raise ValueError("approved evidence plugin changed")
+            plugin_file = plugin_dir / "dc_approved_evidence.py"
+            plugin_file.write_bytes(raw_plugin)
+            plugin_file.chmod(0o644)
+            args += ["--mount", f"type=bind,src={plugin_dir},dst=/trusted-evidence,readonly"]
         clean_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp",
-                     "PYTHONPATH": "/authority", "PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1",
+                     "PYTHONPATH": "/trusted-evidence" if plugin_dir else "/authority",
+                     "PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1",
                      "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONDONTWRITEBYTECODE": "1",
                      "RUFF_CACHE_DIR": "/tmp/ruff",
                      "DAILYCHECK_DB_DIR": "/tmp/db", "TMPDIR": "/tmp",

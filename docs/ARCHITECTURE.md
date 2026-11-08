@@ -1529,6 +1529,13 @@ upstream/read-token 变量（值不进 argv），使用 `python3 -I` 且不继�
 清理 UID65532 私有 scratch；candidate 容器仍为 uid65532、caps none、NoNewPrivileges、无网络/
 daemon socket/host PID/凭据。低磁盘/不确定 exit 一律不产生 attestation。
 
+pytest capture 不把 authority 根放进容器 `PYTHONPATH`：candidate 的 `scripts/` 是 namespace
+package，而 authority 导出带空 `__init__` 的常规 `scripts` package 会在任意 sys.path 位置
+优先并遮蔽 `scripts.prod_agent`/`scripts.dailycheck_dashboard` 等 candidate 子包（实测 14 个
+collection ERROR）。capture 只把 pinned `dc_approved_evidence.py`（blob 必须等于 manifest 的
+`scripts/ci/pytest_evidence.py`）放入独立只读 `/trusted-evidence`，`PYTHONPATH` 只指向它；
+candidate 根仍由 pytest 按 prepend 规则插入，lint/report capture 继续使用 `/authority`。
+
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找
 优先于显式 candidate application-under-test 路径。preview 的 `--trusted-ci` 调用 supervised

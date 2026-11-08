@@ -466,3 +466,80 @@ def test_native_failure_details_keep_only_validated_codes():
     assert "attacker-text" not in producer._native_failure_details(
         "lint", True, "attacker-text", state, False)
     assert "untrusted daemon text" not in details
+
+
+def _capture_commands(monkeypatch, tmp_path, *, kind, argv, plugin=None):
+    """Run one synthetic capture and return the docker argv it built."""
+    repo_plugin = (ROOT / "scripts/ci/pytest_evidence.py").read_bytes()
+    plugin = repo_plugin if plugin is None else plugin
+    authority = tmp_path / "authority"
+    (authority / "scripts/ci").mkdir(parents=True)
+    (authority / "scripts/ci/pytest_evidence.py").write_bytes(repo_plugin)
+    (authority / "dc_approved_evidence.py").write_bytes(plugin)
+    output = tmp_path / "output"
+    output.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / ".dc-session.json").write_text(json.dumps({"schema_version": 1,
+                                                            "pytest_exit": 0}))
+    capture = producer.DockerCapture(["docker"], MANIFEST, authority, output)
+    commands = []
+
+    def call(*args, timeout=30):
+        commands.append(args)
+        if args[0] == "create":
+            return b"a" * 64
+        if args[0] == "wait":
+            return b"0"
+        if args[0] == "inspect":
+            return json.dumps([{
+                "Image": GRAPH["index_digest"],
+                "State": {"Running": False, "Status": "exited", "ExitCode": 0,
+                          "OOMKilled": False, "Error": ""}}]).encode()
+        return b""
+
+    monkeypatch.setattr(capture, "call", call)
+    monkeypatch.setattr(
+        producer.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"1 passed\n", stderr=b""))
+    capture.capture(candidate, {"version": 3}, kind, "test", argv, {})
+    return commands, output
+
+
+def _env(command):
+    return {command[index + 1] for index, value in enumerate(command) if value == "--env"}
+
+
+def test_pytest_capture_mounts_trusted_plugin_outside_the_scripts_package(monkeypatch, tmp_path):
+    # The candidate repo's scripts/ is a namespace package; the authority's
+    # regular scripts package would otherwise shadow every candidate subpackage.
+    commands, output = _capture_commands(
+        monkeypatch, tmp_path, kind="pytest",
+        argv=["python3", "-P", "-m", "pytest", "-p", "dc_approved_evidence"])
+    create = next(command for command in commands if command[0] == "create")
+    plugin_dir = output / "evidence-plugin"
+    assert (plugin_dir / "dc_approved_evidence.py").read_bytes() == (
+        ROOT / "scripts/ci/pytest_evidence.py").read_bytes()
+    assert (f"type=bind,src={plugin_dir},dst=/trusted-evidence,readonly"
+            in create)
+    assert "PYTHONPATH=/trusted-evidence" in _env(create)
+    assert "PYTHONPATH=/authority" not in _env(create)
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in _env(create)
+    assert f"type=bind,src={tmp_path / 'candidate'},dst=/candidate" in create
+
+
+def test_non_pytest_capture_keeps_the_authority_helper_root(monkeypatch, tmp_path):
+    commands, output = _capture_commands(monkeypatch, tmp_path, kind="lint",
+                                         argv=["ruff", "--version"])
+    create = next(command for command in commands if command[0] == "create")
+    assert "PYTHONPATH=/authority" in _env(create)
+    assert "PYTHONPATH=/trusted-evidence" not in _env(create)
+    assert not (output / "evidence-plugin").exists()
+    assert not any("/trusted-evidence" in value for value in create)
+
+
+def test_pytest_capture_rejects_a_changed_evidence_plugin(monkeypatch, tmp_path):
+    with pytest.raises(ValueError):
+        _capture_commands(monkeypatch, tmp_path, kind="pytest",
+                          argv=["python3", "-P", "-m", "pytest"],
+                          plugin=b"# candidate-controlled plugin\n")
