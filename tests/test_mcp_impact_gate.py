@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from scripts.agent_framework import check_mcp_impact as gate
+from tests.conftest import candidate_python_env
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/agent_framework/check_mcp_impact.py"
@@ -239,7 +240,9 @@ from scripts.mcp_contracts import main
 REGISTRY[0].tool.inputSchema['properties']['hidden_new_input'] = {'type': 'string'}
 raise SystemExit(main(['--check']))
 """
-    result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, text=True, capture_output=True, check=False)
+    result = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                            env=candidate_python_env(ROOT), text=True,
+                            capture_output=True, check=False)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "registry.json" in result.stdout
 

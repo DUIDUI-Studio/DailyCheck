@@ -114,7 +114,7 @@ jobs:
         id: native_producer
         if: env.CI_NATIVE_PRODUCER == 'true'
         env:
-          CI_PRODUCER_MANIFEST_BLOB: 2ecd4d48c0edf9528d6a7b0b902204a68a80f8ae
+          CI_PRODUCER_MANIFEST_BLOB: f0686627dabaf32648eaee84d73371c20e3c3413
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           NATIVE_CONTEXT: test
         run: |
@@ -319,7 +319,7 @@ jobs:
         id: native_producer
         if: env.CI_NATIVE_PRODUCER == 'true'
         env:
-          CI_PRODUCER_MANIFEST_BLOB: 2ecd4d48c0edf9528d6a7b0b902204a68a80f8ae
+          CI_PRODUCER_MANIFEST_BLOB: f0686627dabaf32648eaee84d73371c20e3c3413
           NATIVE_QUEUE_READ_TOKEN: ${{ github.token }}
           NATIVE_CONTEXT: agent-framework-reports
           UPSTREAM_RESULT: ${{ needs.test.result }}

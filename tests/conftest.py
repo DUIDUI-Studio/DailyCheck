@@ -3,10 +3,21 @@
 绕过密码校验（直接写 session），规避 Python 3.9 无 hashlib.scrypt
 导致 werkzeug 默认 hash 不可用的问题。
 """
+import os
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 import pytest
+
+
+def candidate_python_env(root: Path) -> dict[str, str]:
+    """Give only an explicitly tested child its candidate application imports."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(root), env.get("PYTHONPATH", "")) if path
+    )
+    return env
 
 
 @pytest.fixture

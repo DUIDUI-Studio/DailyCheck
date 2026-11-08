@@ -1080,6 +1080,8 @@ def test_pytest_capture_mounts_trusted_plugin_outside_the_scripts_package(monkey
     assert "PYTHONPATH=/trusted-evidence" in _env(create)
     assert "PYTHONPATH=/authority" not in _env(create)
     assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in _env(create)
+    assert "--init" in create
+    assert "--pids-limit=256" in create
     assert f"type=bind,src={tmp_path / 'candidate'},dst=/candidate" in create
 
 

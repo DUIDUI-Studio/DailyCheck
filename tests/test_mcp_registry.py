@@ -22,6 +22,7 @@ from mcp_server.service.auth import AuthContext, set_current_auth
 from scripts import mcp_contracts
 from tests.bot.test_mcp_integration import ARGS
 from tests.bot.test_mcp_integration import setup_db as bot_setup_db
+from tests.conftest import candidate_python_env
 from tests.test_mcp_access_log import CapturingServer
 
 registry_db = bot_setup_db
@@ -215,7 +216,8 @@ def test_contract_check_rejects_noncanonical_json_text(generated_contract_tree, 
 
 def test_contract_cli_runs_from_repository():
     result = subprocess.run([sys.executable, '-m', 'scripts.mcp_contracts', '--check'],
-                            cwd=ROOT, capture_output=True, text=True, timeout=30)
+                            cwd=ROOT, env=candidate_python_env(ROOT),
+                            capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

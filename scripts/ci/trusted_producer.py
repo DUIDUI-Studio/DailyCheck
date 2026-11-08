@@ -933,6 +933,8 @@ class DockerCapture:
                      "--mount", f"type=bind,src={self.authority / 'tests/known_failures.txt'},dst=/candidate/tests/known_failures.txt,readonly"]
         if inputs is not None:
             args += ["--mount", f"type=bind,src={inputs},dst=/input,readonly"]
+        if kind == "pytest" and runtime["scope"] == HOSTED_SCOPE:
+            args += ["--init"]
         plugin_dir = None
         if kind == "pytest":
             # The candidate checkout's scripts/ is a namespace package, so the
@@ -1106,10 +1108,11 @@ def report_inner(candidate: Path, context: str):
         run(["bash", "scripts/agent_framework/preview.sh", str(member["number"]), "--trusted-ci"], extra)
 
 
-def snapshot(repo: Path, destination: Path, head: str):
+def snapshot(repo: Path, destination: Path, head: str, base: str):
     env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
     for argv in (["git", "-c", "core.hooksPath=/dev/null", "clone", "-q", "--no-hardlinks", "--no-checkout", str(repo), str(destination)],
-                 ["git", "-C", str(destination), "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", head]):
+                 ["git", "-C", str(destination), "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", head],
+                 ["git", "-C", str(destination), "update-ref", "refs/remotes/origin/main", base]):
         subprocess.run(argv, env=env, check=True, capture_output=True)
     # No runner credentials or source checkout config is copied into this clone.
     for p in destination.rglob("*"):
@@ -1163,7 +1166,7 @@ def job(args):
     binding = make_binding()
     _stage("snapshot")
     candidate = work / "candidate"
-    snapshot(repo, candidate, binding["tested_sha"])
+    snapshot(repo, candidate, binding["tested_sha"], binding["CI_BASE_SHA"])
     (candidate / ".dc-session.json").unlink(missing_ok=True)
     docker = [args.docker]
     if args.docker_config:

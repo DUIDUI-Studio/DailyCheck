@@ -188,11 +188,12 @@ def bridge(tmp_path, monkeypatch):
             serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
         private(tmp_path / "read-token", "synthetic-read-token")
         private(tmp_path / "mcp-health-token", os.urandom(24).hex())
+        app_uid = 65531 if os.geteuid() == 65532 else 65532
         value = {"version": 1, "repository": REPOSITORY, "repository_id": 1448986421,
                  "repository_node_id": "R_kgDOVl3HNQ", "producer": asdict(producer),
                  "authority": str(ROOT), "python": str(Path(sys.executable)),
                  "closure": {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in AUTHORITY_FILES},
-                 "app_uid": 65532, "epoch": "synthetic-epoch", "repo": str(repo),
+                 "app_uid": app_uid, "epoch": "synthetic-epoch", "repo": str(repo),
                  "directory": str(tmp_path / "state"), "key_file": str(tmp_path / "key.pem"),
                  "read_token_file": str(tmp_path / "read-token"),
                  "mcp_health_token_file": str(tmp_path / "mcp-health-token"),
@@ -207,7 +208,7 @@ def bridge(tmp_path, monkeypatch):
         release.mkdir()
         (release / "release.json").write_text(json.dumps({"sha": base, "tree": git(repo, "rev-parse", base + "^{tree}")}))
         # Explicit synthetic parser input, not a kernel PID/UID/observation claim.
-        processes = [{"unit": u, "uid": 65532, "cwd": str(release), "pid": i + 100,
+        processes = [{"unit": u, "uid": app_uid, "cwd": str(release), "pid": i + 100,
                       "exe": "/synthetic/python", "start_ticks": "1", "cgroup": "/synthetic"}
                      for i, u in enumerate(value["units"])]
 
@@ -648,6 +649,13 @@ def test_G_cli_hard_denies_before_any_policy_or_network(operation):
 
 
 def test_installed_policy_has_no_portable_UID_bypass(bridge):
+    b = bridge
+    assert b["policy"].value["app_uid"] > 0
+    assert b["policy"].value["app_uid"] != os.geteuid()
+    value = {**b["value"], "app_uid": os.geteuid()}
+    private(b["policy"].path, value)
+    with pytest.raises(ValueError, match="invalid installed H policy"):
+        InstalledPolicy(b["policy"].path, fixture=b["policy"].fixture)
     with pytest.raises(ValueError, match="root isolated"):
         InstalledPolicy(bridge["root"] / "policy.json")
     if sys.platform != "linux":

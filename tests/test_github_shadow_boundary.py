@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import candidate_python_env
+
 ROOT = Path(os.environ.get("DAILYCHECK_TRANSPORT_TEST_ROOT", Path(__file__).resolve().parents[1]))
 SHA = "a" * 40
 REPO = "DUIDUI-Studio/DailyCheck"
@@ -63,7 +65,7 @@ def lane(tmp_path, request):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     env = {
-        **os.environ,
+        **candidate_python_env(ROOT),
         "PYTHONDONTWRITEBYTECODE": "1",
         "DAILYCHECK_HOSTING_PROVIDER": "github",
         "DAILYCHECK_GITHUB_SHADOW_DIR": str(shadow),

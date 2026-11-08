@@ -1538,6 +1538,14 @@ candidate 根仍由 pytest 按 prepend 规则插入，lint/report capture 继续
 便宜回归另验证 safe-path 父环境下被测 Python 子进程的显式导入根，以及 source 无 main
 branch 时 snapshot 对绑定 public base 的保留（独立 tiny Git repo）；这些控制不运行全仓或
 600 秒 observation。
+被测 config/shadow/MCP 子进程各自显式接收 candidate 导入根，保留父 safe-path 与只读
+evidence plugin 路径；不改变 producer/verifier 的启动环境，也不把 `/authority/scripts`
+加入 candidate imports。snapshot 的 `origin/main` 固定为已验证 binding 的 `CI_BASE_SHA`，
+不依赖 source checkout 是否有 main branch，不额外导入任何 source/private history。
+hosted pytest 使用 Docker `--init` 回收 Git auto-maintenance 及 reporter 死亡后的孤儿，
+固定 256 pids/2 CPU/2 GiB/2700s 等限制不变；低 UID owned fixture 的合成 app UID 必须
+与 fixture owner 不同且非 root，合成 runtime record 同步该身份，InstalledPolicy 与真实
+kernel UID/root 控制保持不变。Linux65532 小探针验证上述差异，不等同 hosted 全仓验收。
 
 reports 复用相同 test capture/envelope；完整报告/成员门禁在 isolated generation 容器执行，
 该容器的 authority helper 以 `/authority` 为唯一 helper 根；runtime/approved package 查找

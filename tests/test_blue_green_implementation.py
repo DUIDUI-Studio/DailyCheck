@@ -40,6 +40,7 @@ import pytest
 from werkzeug.security import generate_password_hash
 
 from tests import blue_green_testenv
+from tests.conftest import candidate_python_env
 
 # 脚本路径
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts" / "blue_green"
@@ -1206,7 +1207,7 @@ def _import_config_with(env: dict[str, str]) -> str:
     r = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True, text=True, timeout=30,
-        env={**os.environ, **env},
+        env={**candidate_python_env(REPO_ROOT), **env},
         cwd=str(Path(__file__).resolve().parent.parent),
     )
     assert r.returncode == 0, r.stderr
