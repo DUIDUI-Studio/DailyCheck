@@ -93,17 +93,28 @@ _OPTIONAL_VALUE_FORMATS = {
 def parse_application_environment(raw: bytes) -> dict[str, str]:
     """Parse the one fixed application EnvironmentFile contract.
 
-    The required keys stay unquoted tokens. Optional measured business keys use
-    a single explicit representation: one printable ASCII value wrapped in
-    single quotes, which systemd preserves verbatim with no escape processing.
-    Missing optional keys stay missing so application source defaults hold.
-    Unknown, duplicate, malformed or quoted required assignments are rejected
-    without echoing any value.
+    Records are LF-delimited; CRLF is accepted as the same terminator. Bare CR,
+    VT, FF, FS, GS, RS, TAB, DEL and every other ASCII control byte are rejected
+    before any assignment or key presence is derived, so a control byte can
+    never act as a hidden record boundary. The required keys stay unquoted
+    tokens. Optional measured business keys use a single explicit
+    representation: one printable ASCII value wrapped in single quotes, which
+    systemd preserves verbatim with no escape processing. Missing optional keys
+    stay missing so application source defaults hold. Unknown, duplicate,
+    malformed or quoted required assignments are rejected without echoing any
+    value.
     """
     try:
-        lines = raw.decode("ascii").splitlines()
+        text = raw.decode("ascii")
     except UnicodeDecodeError:
         raise ValueError("application environment must be ASCII") from None
+    text = text.replace("\r\n", "\n")
+    if (any(ord(character) < 0x20 and character != "\n" for character in text)
+            or "\x7f" in text):
+        raise ValueError("unsupported application environment control character")
+    if text.endswith("\n"):
+        text = text[:-1]
+    lines = text.split("\n")
     if not lines or len(lines) > len(APPLICATION_ENVIRONMENT_KEYS):
         raise ValueError("invalid application environment line count")
     values: dict[str, str] = {}

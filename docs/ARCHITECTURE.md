@@ -1473,7 +1473,9 @@ capabilities 并切换低身份；可信 launcher 仅暂留 SETUID/SETGID/SETPCA
 MCP token 必须等于 protected health token 且不同于 GitHub read token；仅允许十三个已测量
 业务键（`DAILYCHECK_MULTI_WAREHOUSE`、六个 `DAILYCHECK_WMS_*`、`FEEDBACK_GITEA_TOKEN`、
 `FEEDBACK_LLM_*` 三项与 `WECOM_*_WEBHOOK` 两项），以 `KEY='value'` 单引号形式逐字传递
-（无转义处理）。角色投影固定不可由调用方选择：app unit 得到十三项，MCP unit 只得到实测
+（无转义处理）。记录仅按 LF 或 CRLF 分隔；裸 CR、VT、FF、FS、GS、RS 及其他 ASCII
+控制字节在推导键存在性前拒绝，不能充当隐藏记录边界。角色投影固定不可由调用方选择：app unit
+得到十三项，MCP unit 只得到实测
 六个 WMS 名；feedback/LLM/webhook 与多仓键不进入 MCP/controller/helper/test 环境。
 `FEEDBACK_GITEA_TOKEN` 仅为应用建单凭据，不放行任何 Gitea Prod/merge、GitHub/App、read 或
 MCP health token 的复用。缺失的可选键不会写入 `env -i` 固定词表，因此应用源码默认值
@@ -3457,7 +3459,7 @@ controller 路由与未知命令/选项拒绝。真实 Linux UID 降权、device
 `tests/test_native_application_environment.py` 锁定 native application EnvironmentFile
 契约：原始两键文件仍可用；十三个已测量可选键以单引号逐字传递，缺失时不进入 `env -i`
 词表；app 得到全部十三项而 MCP 只得到六个 WMS 名（feedback/LLM/webhook/多仓键不跨角色）；
-未知/重复/控制键、畸形与非 ASCII、端口/长度边界及值诊断不泄漏均拒绝；真实 lower child
+未知/重复/控制键、畸形与非 ASCII、非 LF/CRLF 分隔符、端口/长度边界及值诊断不泄漏均拒绝；真实 lower child
 观察（setpriv 在 macOS 移除）保留合成口令/URL 标点与空格，并确认 control env/fence FD
 不继承。该 fixture 只模拟文档化的 `${FOO}` 单参数展开，不证明 systemd 执行。
 

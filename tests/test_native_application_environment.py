@@ -59,6 +59,8 @@ CONTROL_ENVIRONMENT = ("PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "BASH_E
                        "DAILYCHECK_APP_PRIVATE_KEY", "DAILYCHECK_DEPLOY_ATTEMPT",
                        "DC_NATIVE_POLICY", "LLM_API_KEY", "PUBLIC_BASE_URL",
                        "FEEDBACK_GITHUB_TOKEN", "DAILYCHECK_WMS_TDS_VERSION")
+NON_LF_RECORD_SEPARATORS = {"CR": b"\r", "VT": b"\x0b", "FF": b"\x0c",
+                            "FS": b"\x1c", "GS": b"\x1d", "RS": b"\x1e"}
 
 
 def environment_bytes(optional: dict[str, str] | None = None, *,
@@ -69,6 +71,35 @@ def environment_bytes(optional: dict[str, str] | None = None, *,
         lines.extend((f"DAILYCHECK_SECRET_KEY={SECRET}", f"DAILYCHECK_MCP_TOKEN={TOKEN}"))
     lines.extend(f"{key}='{value}'" for key, value in selected.items())
     return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def test_lf_and_crlf_records_are_supported():
+    lf = environment_bytes()
+    crlf = lf.replace(b"\n", b"\r\n")
+    assert parse_application_environment(lf) == parse_application_environment(crlf)
+    assert validate_application_environment(crlf, mcp_health_token=TOKEN,
+                                            read_token="r" * 40)["DAILYCHECK_WMS_PASSWORD"] == \
+        SYNTHETIC["DAILYCHECK_WMS_PASSWORD"]
+
+
+@pytest.mark.parametrize("separator", NON_LF_RECORD_SEPARATORS.values(),
+                         ids=NON_LF_RECORD_SEPARATORS)
+def test_non_lf_record_separators_are_denied_between_and_within(separator):
+    valid = environment_bytes()
+    broken = valid.replace(b"DAILYCHECK_WMS_USER='dc_reader'\nDAILYCHECK_WMS_PASSWORD=",
+                           b"DAILYCHECK_WMS_USER='dc_reader'" + separator
+                           + b"DAILYCHECK_WMS_PASSWORD=")
+    assert not any(line.startswith(b"DAILYCHECK_WMS_PASSWORD=") for line in broken.split(b"\n"))
+    with pytest.raises(ValueError) as raised:
+        parse_application_environment(broken)
+    assert SYNTHETIC["DAILYCHECK_WMS_PASSWORD"] not in str(raised.value)
+    with pytest.raises(ValueError):
+        validate_application_environment(broken, mcp_health_token=TOKEN,
+                                         read_token="r" * 40)
+    within = environment_bytes({**SYNTHETIC, "DAILYCHECK_WMS_PASSWORD":
+                                "synthetic" + separator.decode("ascii") + "pass"})
+    with pytest.raises(ValueError):
+        parse_application_environment(within)
 
 
 def _render(*, role: str = "app", optional: tuple[str, ...] | None = None) -> str:
