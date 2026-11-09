@@ -1508,6 +1508,15 @@ result，root/app 不能提供 reviewer 字符串或 verdict。同一固定 laun
 真实 Linux 降权、实际 ≥600 秒窗口、UID/device/inode、安装、App/Prod/baseline/review
 验收保持 NOT_RUN，activation 保持 OFF。
 
+baseline runtime 发布在 health probe 之后用现有 `deploy_state.state_transaction`
+（`.state.lock`）重验完整 baseline binding，并核对初始 queue/bootstrap/anchor/deployed
+identity 未变；最终校验与 runtime 原子 `os.replace` 在同一短事务中，后者为线性化点。
+这与 `NativeQueue.start` 的 `_acquire`/active 写入及 `ProtectedInitializer.initialize`
+复用同一 state lock：writer 先提交则 publisher 拒绝并保留旧 runtime，publisher 先提交则
+writer 等待短事务结束。observer 只获取 state lock，不获取/继承 attempt fence，不写
+deployment state/guard；probe、连续观察、consumer 读回与 child wait 均在该事务之外。
+G controller 持有原 attempt fence 等待独立 observer，未跨 child wait 持有 state lock。
+
 以上是 source implementation；没有安装/激活或实际生产验证。portable seam tests 使用
 owned HTTP/crypto/小型 Git/子进程及测试 stage 命令；不证明 Linux 降权、实际八检查或新
 600秒观察成功。真实 executor/publisher、外置 app runtime、UID/文件权限、服务依赖、App/
@@ -3426,13 +3435,14 @@ symlink/part 拒绝，baseline ledger 的 monotonic 时长/进程/route/epoch/ou
 的 UID/candidate/CI 绑定与二次发布拒绝，replace 中断不覆盖旧记录；repair-1 另覆盖
 baseline CLI 自行获取原 fence 与 competing-holder 拒绝、observer 子进程无 fence/env 泄漏、
 真实 initializer 后 matching idle-P 的 retained-ledger/fresh-observation 刷新及
-anchor/policy/epoch/deployed/tree/active/partial 拒绝、渲染 launcher 的五项 lifecycle
+anchor/policy/epoch/map/source/public/deployed/tree/active/partial 拒绝、渲染 launcher 的五项 lifecycle
 controller 路由与未知命令/选项拒绝。真实 Linux UID 降权、device/inode、实际 ≥600 秒
 窗口与 Prod 安装仍是 NOT_RUN。
 
 repair-2 的 R1 caller 回归复用独立审查的 distinct source/P initializer 和 owned HTTP
 health-peer，在实际 isolated baseline publisher 子进程中要求 active/policy/guard
 中途失效与入口失效均 native1、旧 runtime 字节不变，并配对 unchanged native0。
+真正 initializer 在 probe 中完成初始化也会使原 binding 失效，保留已初始化状态与旧 runtime。
 另在最终校验到 runtime `os.replace` 的精确间隙启动真实 `cmd_acquire` writer，要求
 同一 state lock 对发布与 lease 写入排序；这些回归不代表真实部署或 ≥600 秒验收。
 

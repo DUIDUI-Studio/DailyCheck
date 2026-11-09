@@ -705,7 +705,8 @@ def test_initialized_matching_p_runtime_refresh(bridge):
         b["runtime"].read()
 
 
-@pytest.mark.parametrize("damage", ["anchor-digest", "anchor-sha", "policy", "epoch",
+@pytest.mark.parametrize("damage", ["anchor-digest", "anchor-sha", "policy", "epoch", "map",
+                                     "source", "public",
                                      "deployed", "tree", "active", "partial", "missing-queue",
                                      "guard"])
 def test_initialized_mismatch_still_denies_refresh(bridge, damage):
@@ -722,6 +723,9 @@ def test_initialized_mismatch_still_denies_refresh(bridge, damage):
         state["native_bootstrap"]["policy"] = "f" * 64
     elif damage == "epoch":
         state["native_bootstrap"]["epoch"] = "foreign-epoch"
+    elif damage in {"map", "source", "public"}:
+        key = {"map": "map_sha256", "source": "source_sha", "public": "public_sha"}[damage]
+        state["native_bootstrap"][key] = "f" * (64 if damage == "map" else 40)
     elif damage == "deployed":
         state["deployed"]["sha"] = "f" * 40
     elif damage == "tree":
@@ -836,6 +840,40 @@ def test_uninitialized_distinct_p_runtime_child(bridge):
     assert b["runtime"].read()["sha"] == b["base"]
     assert (directory / deploy_state.STATE_FILENAME).read_bytes() == state_before
     assert not (directory / deploy_state.NATIVE_GUARD_FILENAME).exists()
+
+
+def test_baseline_runtime_child_rejects_initialization_during_probe(bridge):
+    b = bridge
+    policy = b["policy"]
+    obj, _ = _distinct_source_baseline(b, initialize=False)
+    directory = policy.location("directory")
+    runner = NativeQueue(policy.location("repo"), directory, policy.producer, None)
+    with runner.fence():
+        obj.publish_baseline()
+    before = policy.location("runtime_file").read_bytes()
+    initialized = []
+
+    def health(_auth):
+        # The genuine initializer probes health itself; subsequent requests use
+        # the normal owned handler while it holds its existing state transaction.
+        b["server"].health_handler = None
+        initialized.append(ProtectedInitializer(
+            policy, b["runtime"], b["controller"].client).initialize())
+        return 200, b'{"ok":true}'
+
+    b["server"].health_handler = health
+    try:
+        result = _runtime_child(b)
+    finally:
+        b["server"].health_handler = None
+    assert initialized and result.returncode == 1
+    assert policy.location("runtime_file").read_bytes() == before
+    state = deploy_state.load_state(directory)
+    assert state["native_queue"]["initialization_id"] == initialized[0]
+    assert state["native_queue"]["active"] is None
+    assert deploy_state.native_consistent(directory, state)
+    print(json.dumps({"schedule": "real-initializer-during-probe", "native_exit": result.returncode,
+                      "old_runtime_preserved": True, "initialized": True}))
 
 
 @pytest.mark.parametrize("damage", ["active", "policy", "guard"])

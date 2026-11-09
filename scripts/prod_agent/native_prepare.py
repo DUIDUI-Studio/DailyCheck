@@ -744,28 +744,32 @@ class NativePreparer:
                 or active["candidate"]["manifest"]["tree_sha"] != ledger["tree"]):
             raise ValueError("active G identity/journal changed during observation")
 
-    def _assert_baseline_unchanged(self, ledger: dict) -> None:
+    def _assert_baseline_unchanged(self, ledger: dict, evidence: BaselineEvidence,
+                                   initial: dict) -> None:
         state = deploy_state.load_state(self.policy.location("directory"))
-        outcome = (state.get("native_source_anchor") if state.get("native_queue") is not None
-                   else state.get("deployed"))
-        if not isinstance(outcome, dict) or digest(outcome) != ledger["source_outcome_sha256"]:
-            raise ValueError("original source outcome changed during observation")
+        outcome, _ = self._baseline_outcome(state, evidence)
+        if (digest(outcome) != ledger["source_outcome_sha256"]
+                or any(state.get(key) != initial.get(key) for key in (
+                    "native_queue", "native_bootstrap", "native_source_anchor", "deployed"))):
+            raise ValueError("baseline identity changed during observation")
 
     def _write_runtime(self, ledger: dict, *, verify_state) -> dict:
         processes = observe_processes(self.policy, self.observer, ledger["sha"])
         if processes != ledger["processes"]:
             raise ValueError("runtime identity changed; new observation window required")
         routes = self._probe(ledger["routes"])
-        # Brief before/after snapshots: a changed journal/outcome during the
-        # observation invalidates the record; timestamps alone cannot renew it.
-        verify_state(ledger)
         record = {"version": 1, "policy": self.policy.fingerprint,
                   "epoch": self.policy.value["epoch"], "sha": ledger["sha"],
                   "tree": ledger["tree"], "processes": processes,
                   "observed_at": self.clock(),
                   "observation_seconds": ledger["observation_seconds"],
                   "incident": False, "routes": routes}
-        self._write_record(self.policy.location("runtime_file"), record)
+        # Same short lock as NativeQueue.start/_acquire and the initializer.
+        # os.replace inside _write_record is the publication linearization point.
+        # The observer never takes the attempt fence; probes/readback stay outside.
+        with deploy_state.state_transaction(self.policy.location("directory")):
+            verify_state(ledger)
+            self._write_record(self.policy.location("runtime_file"), record)
         ProtectedRuntime(self.policy, observer=self.observer
                          if self.policy.fixture else None).read()
         return record
@@ -790,7 +794,8 @@ class NativePreparer:
         for row in ledger["processes"]:
             if row.get("cwd") != str(release) or row.get("uid") != self.policy.value["app_uid"]:
                 raise ValueError("runtime process is not the immutable protected release")
-        verify_state = (self._assert_baseline_unchanged if kind == "baseline"
+        verify_state = ((lambda ledger: self._assert_baseline_unchanged(ledger, evidence, state))
+                        if kind == "baseline"
                         else self._assert_green_unchanged)
         return self._write_runtime(ledger, verify_state=verify_state)
 

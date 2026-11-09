@@ -59,6 +59,17 @@ environment or command selector; `grant`/`release` remain rejected.
   unchanged initializer completes on the same idle P, a matching baseline
   runtime may be refreshed using the preserved `native_source_anchor` and
   initialized identity; missing/partial/active/mismatched state still denies.
+  After health probing, the publisher takes the existing short
+  `deploy_state.state_transaction` (`.state.lock`), revalidates the complete
+  baseline binding and its unchanged queue/bootstrap/anchor/deployed identity,
+  and atomically replaces runtime within that transaction. That `os.replace`
+  is the publication linearization point: a lifecycle writer that commits
+  first invalidates publication; a later writer waits until publication commits.
+  `NativeQueue.start`/`_acquire` and `ProtectedInitializer.initialize` use this
+  same state lock under their parent attempt fence. The observer takes only
+  the state lock, writes neither deployment state nor guard, and holds no state
+  lock across health probes, continuity observation, consumer readback or child
+  waits; the G controller retains its own attempt fence while its observer runs.
   Reuse of a baseline ledger is only valid while its process/route identity
   still matches live observation; on drift, remove the ledger so a new >=600 s
   window is recorded.
