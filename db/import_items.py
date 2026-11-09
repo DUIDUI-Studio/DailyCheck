@@ -20,9 +20,10 @@ import sqlite3
 import sys
 from contextlib import closing
 from datetime import datetime
-from pathlib import Path
 
+import config
 from config import BASE_DIR
+from warehouse_paths import resolve_warehouse_path
 
 
 def now() -> str:
@@ -36,14 +37,14 @@ def import_items(xlsx_path: str, warehouse_code: str) -> None:
         sys.exit("openpyxl is required: pip install openpyxl")
 
     # Locate the warehouse db via master.db.
-    master = sqlite3.connect(BASE_DIR / "db" / "master.db")
+    master = sqlite3.connect(config.MASTER_DB)
     master.row_factory = sqlite3.Row
     wh = master.execute(
         "SELECT db_path FROM warehouses WHERE code = ?", (warehouse_code,)
     ).fetchone()
     if wh is None:
         sys.exit(f"Warehouse '{warehouse_code}' not found in master.db")
-    db_path = BASE_DIR / wh["db_path"]
+    db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=config.DB_DIR)
     master.close()
 
     if not db_path.exists():

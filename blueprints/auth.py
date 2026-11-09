@@ -27,9 +27,11 @@ from flask import (
 )
 from werkzeug.security import check_password_hash
 
+import config
 from config import BASE_DIR
 from db import get_master_db
 from permissions import current_relative_path, require_login
+from warehouse_paths import resolve_warehouse_path
 
 bp = Blueprint("auth", __name__)
 pwa_bp = Blueprint("pwa", __name__)
@@ -188,7 +190,8 @@ def load_user_and_warehouse():
         # 也可能来自「登录恢复」，不能只信租户匹配。
         if _warehouse_visible_to(master, g.user, row):
             g.warehouse = row
-            g.warehouse_db_path = str(BASE_DIR / row["db_path"])
+            g.warehouse_db_path = str(resolve_warehouse_path(
+                row["db_path"], BASE_DIR, db_dir=config.DB_DIR))
             g.role = master.execute(
                 """SELECT role FROM warehouse_users
                    WHERE user_id=? AND warehouse_id=?""",

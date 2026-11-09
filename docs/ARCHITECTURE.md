@@ -962,6 +962,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 1. `bot/tools.py` 仍只有查询，SQLite 连接仍 `file:...?mode=ro`；MCP 查询显式传 `AuthContext(allowed_write_paths=[], read_only=True)`，UoW 也以 `mode=ro` 打开，禁止查询触发迁移/缓存写入。库初始化和迁移归应用生命周期；缺库不创建。
    `warehouse_paths.resolve_warehouse_path` 是仓库元数据路径的共享解析器：bot 读/最小写上下文显式携带 `warehouse_base_dir=db_dir().parent`，UoW、无缓存采购与 canonical bindings 都用此根解析相对路径，和旧 bot 工具一致，不依赖进程 CWD 或代码根。绝对路径保持原值；HTTP/stdio 未传根时保留原有行为。canonical 只读详情遇到缺失仓库库明确失败，不静默返回零绑定。
+   配置数据根时（`DAILYCHECK_DB_DIR`），共享解析器新增 `db_dir` 模式：只有 legacy `db/...` 注册前缀映射到 `db_dir`（如 `db/warehouses/x.db` → `<DB_DIR>/warehouses/x.db`），显式 `base_dir` 继续作为其他相对形式的 legacy 回退，Bot 显式 `base_dir` 仍优先且只传 `base_dir`。未设置 `DAILYCHECK_DB_DIR` 时行为与旧 `BASE_DIR/db` 完全一致。应用/MCP 的 auth、canonical、procurement、replenishment、recipe、import、UoW、migration 与 CLI 都走这一契约；仓库创建写入现有 portable `db/...` 形式，不重写已存元数据。`canonical_pure.guard_real_db` 同时保护代码根和配置数据根的 `warehouses` 目录（含未穿透 alias）。已知限制：`blueprints/item_routing_pure.routing_warehouse_connections` 不在本次允许路径内，仍按 `BASE_DIR` 解析，Prod 若使用该 selector 需另行评审。
 2. `bot/mcp_tools.py` 只允许固定批准池；原三写须先通过消息快照开关、可信 frame userid 白名单、部署策略路径/仓范围检查，然后才构造仅含本次路径与单仓的写上下文。无 MCP 进程 token/遗留 ContextVar 继承，不 patch `resolve_ctx`。
 3. 每次写调用先落审计 attempt（日志不可写则不执行），完成或拒绝后记录 who/tool/args/result/duration；最终回复追加真实结果回执，模型摘要不能省略。七项 canonical 写始终无 bot schema/adapter。
 

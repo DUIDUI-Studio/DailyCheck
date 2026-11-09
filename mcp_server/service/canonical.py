@@ -22,7 +22,7 @@ import sqlite3
 from pathlib import Path
 
 import blueprints.canonical_pure as cp
-from config import BASE_DIR
+import config
 from db import migrate_warehouse_db_columns
 from mcp_server.data.master import resolve_warehouse
 from mcp_server.data.unit_of_work import master_connection
@@ -32,6 +32,7 @@ from mcp_server.infra.errors import (
     ValidationError,
 )
 from mcp_server.service.auth import AuthContext, check_warehouse
+from warehouse_paths import resolve_warehouse_path
 
 # ─────────────────────────────────────────────────────────────────────
 # 内部 helpers
@@ -43,9 +44,7 @@ def _open_warehouse(db_path: str | Path) -> sqlite3.Connection:
     直连前先 migrate_warehouse_db_columns() 跑一次幂等列迁移，避免旧库
     撞 `no such column: is_active`。
     """
-    p = Path(db_path)
-    if not p.is_absolute():
-        p = BASE_DIR / p
+    p = resolve_warehouse_path(db_path, config.BASE_DIR, db_dir=config.DB_DIR)
     migrate_warehouse_db_columns(p)
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row

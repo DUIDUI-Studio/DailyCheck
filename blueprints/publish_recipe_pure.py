@@ -655,30 +655,23 @@ def _resolve_warehouse_db_path(master_conn, warehouse_code: str) -> str | None:
     """Resolve a warehouse db path from master.db.
 
     master.db stores paths like 'db/warehouses/wh_001.db' (relative to
-    the repo, BASE_DIR). Try resolving against:
-      1. BASE_DIR + raw  (production: e.g. /opt/dailycheck/db/warehouses/wh_001.db)
-      2. cwd + raw        (tests where path is relative to test cwd)
-      3. absolute path    (already absolute → return as-is)
+    the repo, BASE_DIR). Resolve through the shared data-root contract:
+    the configured DB_DIR replaces the legacy ``db/`` prefix, other
+    relative forms keep their legacy BASE_DIR fallback, and absolute
+    paths are returned unchanged.
 
-    Returns the first candidate that exists on disk. If none match,
-    returns the BASE_DIR-relative one (so the FileNotFoundError message
-    points at the production-expected location).
+    Returns the resolved path; a missing file is reported by the caller.
     """
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path
+
     master_conn.row_factory = sqlite3.Row
     row = master_conn.execute(
         "SELECT db_path FROM warehouses WHERE code = ?", (warehouse_code,)
     ).fetchone()
     if row is None:
         return None
-    raw = row["db_path"]
-    if Path(raw).is_absolute() and Path(raw).exists():
-        return raw
-    for base in (Path(BASE_DIR), Path.cwd()):
-        cand = base / raw
-        if cand.exists():
-            return str(cand)
-    return str(Path(BASE_DIR) / raw)
+    return str(resolve_warehouse_path(row["db_path"], BASE_DIR, db_dir=DB_DIR))
 
 
 def list_item_publish_events(master_conn, limit: int = 50) -> list[dict]:

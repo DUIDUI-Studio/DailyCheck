@@ -36,10 +36,12 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash
 
+import config
 from config import BASE_DIR, WAREHOUSE_DB_DIR
 from db import get_master_db, init_warehouse_db
 from permissions import require_platform_admin
 from permissions_manifest import BUILTIN_ROLE_CODES, ROLE_META
+from warehouse_paths import resolve_warehouse_path, warehouse_registration_path
 
 bp = Blueprint("users", __name__)
 
@@ -722,7 +724,8 @@ def create_warehouse():
             return redirect(url_for("users.list_users"))
         counts = _clone_catalog_from(src_path, db_path)
 
-    rel_path = str(db_path.relative_to(BASE_DIR))
+    rel_path = warehouse_registration_path(
+        db_path, base_dir=BASE_DIR, db_dir=config.DB_DIR)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.execute(
         """INSERT INTO warehouses (code, name, db_path, warehouse_type, created_at)
@@ -776,7 +779,7 @@ def init_warehouse(warehouse_id: int):
         flash(f"确认口令不匹配:请输入仓库编码 '{wh['code']}' 二次确认")
         return redirect(url_for("users.list_users"))
 
-    db_path = BASE_DIR / wh["db_path"]
+    db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=config.DB_DIR)
     target_tables = [
         "stock_movements",
         "stocktakes",

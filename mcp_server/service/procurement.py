@@ -1,6 +1,7 @@
 """Procurement 服务，复用 procurement_pure.py。"""
 from __future__ import annotations
 
+import config
 from blueprints.procurement_pure import aggregate_hub
 from mcp_server.data.master import list_all_warehouses, resolve_warehouse
 from mcp_server.data.unit_of_work import master_connection
@@ -71,7 +72,10 @@ def _readonly_store(warehouse_code: str, ctx: AuthContext) -> dict | None:
         ).fetchone()
     values = (int(row["cover_days"]), float(row["min_absolute"])) if row else (14, 0.0)
     items = compute_store_procurement(
-        warehouse_code, str(resolve_warehouse_path(wh["db_path"], ctx.warehouse_base_dir)),
+        warehouse_code,
+        str(resolve_warehouse_path(
+            wh["db_path"], ctx.warehouse_base_dir,
+            db_dir=config.DB_DIR if ctx.warehouse_base_dir is None else None)),
         config_values=values, read_only=True,
     )
     for item in items:

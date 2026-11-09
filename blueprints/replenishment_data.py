@@ -29,10 +29,10 @@ import sqlite3
 from collections import defaultdict
 from contextlib import closing
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
 import config
 from db import init_master_db
+from warehouse_paths import resolve_warehouse_path
 
 from . import replenishment_pure as R
 from .canonical_pure import store_selectable_clause
@@ -172,9 +172,8 @@ def _scan_warehouses() -> dict:
         if wh_type in _EXCLUDED_TYPES:
             excluded.append(label)
             continue
-        path = Path(r["db_path"] or "")
-        if not path.is_absolute():
-            path = config.BASE_DIR / path
+        path = resolve_warehouse_path(r["db_path"] or "", config.BASE_DIR,
+                                      db_dir=config.DB_DIR)
         if not path.exists():
             # 登记了但库文件缺失（蓝绿切换窗口 / 误删）——跳过而不是崩。
             missing.append(label)

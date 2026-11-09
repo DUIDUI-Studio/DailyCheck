@@ -3,16 +3,23 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from pathlib import Path
 from typing import IO
 
 from flask import (
-    Blueprint, abort, current_app, flash, g, redirect, render_template, request, session, url_for,
+    Blueprint,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
 )
+from werkzeug.datastructures import FileStorage
 
 from db import get_master_db
 from permissions import require_login, require_role
-from werkzeug.datastructures import FileStorage
 
 
 def parse_xlsx(file_stream: IO[bytes]) -> dict:
@@ -135,7 +142,9 @@ def upload_parse():
 @require_role("admin")
 def preview():
     """渲染预览页。逐行标注是否已匹配到本仓现有品项（未匹配不会写入）。"""
+    import config
     from config import BASE_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     pv = session.get("import_preview")
     if not pv:
@@ -150,7 +159,7 @@ def preview():
 
     matched_keys: set[tuple[str, str]] = set()
     if wh is not None and wh["db_path"]:
-        wh_path = Path(BASE_DIR) / wh["db_path"]
+        wh_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=config.DB_DIR)
         if wh_path.exists():
             with closing(sqlite3.connect(wh_path)) as conn:
                 matched_keys = {
@@ -194,8 +203,10 @@ def commit():
       未纳管的门店自建行仍写本仓 items.unit_cost。
     匹配键：(品类名, 品项名) —— 与 xlsx 的两列一一对应。
     """
+    import config
     from blueprints._helpers import now
     from config import BASE_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     pv = session.pop("import_preview", None)
     if not pv:
@@ -214,7 +225,7 @@ def commit():
         flash(f"仓库 {warehouse_code} 不存在")
         return redirect(url_for("import_items.upload_form"))
 
-    db_path = Path(BASE_DIR) / wh_row["db_path"]
+    db_path = resolve_warehouse_path(wh_row["db_path"], BASE_DIR, db_dir=config.DB_DIR)
 
     from blueprints import canonical_pure as cp
     price_managed = cp.is_syncable_field("unit_cost")

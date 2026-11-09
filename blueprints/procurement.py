@@ -27,6 +27,7 @@ from flask import (
 import config  # use config.MASTER_DB at call time so monkeypatch works
 from db import init_master_db
 from permissions import require_platform_admin, require_role
+from warehouse_paths import resolve_warehouse_path
 
 from .procurement_pure import (
     aggregate_hub,
@@ -273,7 +274,7 @@ def _store_procurement_json(wh_code: str) -> dict:
     wh = _resolve_warehouse(wh_code)
     if wh is None:
         return None
-    wh_path = wh["db_path"]
+    wh_path = resolve_warehouse_path(wh["db_path"], db_dir=config.DB_DIR)
     cache = _read_cache(wh_code)
     items: list[dict] = []
     any_invalid = any(row.get("invalid") for row in cache.values())
@@ -408,7 +409,8 @@ def procurement_accept():
 
     # Fetch unit + note for each item from the warehouse db
     wh = _resolve_warehouse(wh_code)
-    with closing(sqlite3.connect(wh["db_path"])) as w:
+    with closing(sqlite3.connect(
+            resolve_warehouse_path(wh["db_path"], db_dir=config.DB_DIR))) as w:
         w.row_factory = sqlite3.Row
         meta = {
             r["id"]: {"unit": r["unit"], "note": ""}

@@ -43,9 +43,10 @@ from flask import (
 from werkzeug.exceptions import BadRequest
 
 import blueprints.canonical_pure as cp
-from config import BASE_DIR
+import config
 from db import get_master_db
 from permissions import require_login, require_platform_admin, require_role
+from warehouse_paths import resolve_warehouse_path
 
 bp = Blueprint("canonical", __name__, url_prefix="/canonical")
 
@@ -105,9 +106,7 @@ def _fallback_list_url(args) -> str:
 #  Helper — open a per-warehouse connection (Spec §6.4)
 # ─────────────────────────────────────────────────────────────────────
 def _open_warehouse(db_path: str | Path) -> sqlite3.Connection:
-    p = Path(db_path)
-    if not p.is_absolute():
-        p = BASE_DIR / p
+    p = resolve_warehouse_path(db_path, config.BASE_DIR, db_dir=config.DB_DIR)
     conn = sqlite3.connect(p)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -124,9 +123,7 @@ def _all_warehouse_conns(master_conn) -> dict[str, sqlite3.Connection]:
     for r in rows:
         if not r["db_path"]:
             continue
-        p = Path(r["db_path"])
-        if not p.is_absolute():
-            p = BASE_DIR / p
+        p = resolve_warehouse_path(r["db_path"], config.BASE_DIR, db_dir=config.DB_DIR)
         if not p.exists():
             continue
         try:
@@ -302,9 +299,7 @@ def canonical_binding_active():
     if wh is None or not wh["db_path"]:
         flash(f"仓库 {warehouse_code} 不存在或未配置文件")
         return back
-    path = Path(wh["db_path"])
-    if not path.is_absolute():
-        path = BASE_DIR / path
+    path = resolve_warehouse_path(wh["db_path"], config.BASE_DIR, db_dir=config.DB_DIR)
     if not path.exists():
         flash(f"仓库 {warehouse_code} 的数据文件不存在")
         return back

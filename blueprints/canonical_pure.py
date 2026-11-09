@@ -751,16 +751,19 @@ def guard_real_db(path: str | Path) -> None:
         return
 
     p = Path(path).resolve()
-    real = (BASE_DIR / "db" / "warehouses").resolve()
+    from config import DB_DIR
+
+    real_dirs = {(BASE_DIR / "db" / "warehouses").resolve(),
+                 (DB_DIR / "warehouses").resolve()}
 
     # 软链穿透防护（2026-10-15 prod 实测）：部署布局常把 db/warehouses/*.db
     # 做成指向数据目录的软链，resolve() 穿透后 parent 比较失配 → guard 放行。
-    # 对未穿透的 absolute 路径再比一次，任一命中即拒。
+    # 对未穿透的 absolute 路径再比一次，任一命中即拒。配置的数据根也必须受保护。
     p_abs = Path(path).absolute()
-    real_abs = BASE_DIR / "db" / "warehouses"
+    real_abs_dirs = {BASE_DIR / "db" / "warehouses", DB_DIR / "warehouses"}
 
     # 注意：用 parent 比较而不是完整路径，确保不论传入相对/绝对都能拦截
-    if p.parent == real or p_abs.parent == real_abs:
+    if p.parent in real_dirs or p_abs.parent in real_abs_dirs:
         raise RealDatabaseForbidden(
             f"禁止对真实仓库 {p} 写入。预演请先复制副本到 "
             f"{DRYRUN_COPY_DIR}/{{ts}}/（每个 dry-run 用独立 ts 子目录隔离）。"
@@ -1274,7 +1277,10 @@ def list_missing_category_mappings(
 
     wh_code=None → 遍历所有仓库返回合并视图。
     """
-    from config import BASE_DIR  # local import to avoid circular at module load
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import (
+        resolve_warehouse_path,  # local import to avoid circular at module load
+    )
 
     master_conn.row_factory = sqlite3.Row
     missing: list[dict] = []
@@ -1284,9 +1290,7 @@ def list_missing_category_mappings(
     for wh in wh_rows:
         if wh_code is not None and wh["code"] != wh_code:
             continue
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             continue
         with sqlite3.connect(db_path) as conn:
@@ -1454,7 +1458,8 @@ def detect_similar_items(rows_per_wh: dict[str, list[dict[str, Any]]]) -> list[d
 
 def collect_all_items(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
     """T6 —— 跨仓收集 items 用于强信号检测。只 SELECT 必要列。"""
-    from config import BASE_DIR  # 避免循环 import
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path  # 避免循环 import
 
     master_conn.row_factory = sqlite3.Row
     out: dict[str, list[dict]] = {}
@@ -1464,9 +1469,7 @@ def collect_all_items(master_conn: sqlite3.Connection) -> dict[str, list[dict]]:
            WHERE warehouse_type='storefront'"""
     ).fetchall()
     for wh in wh_rows:
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             continue
         with sqlite3.connect(db_path) as conn:
@@ -2394,7 +2397,7 @@ def collect_bindings(
     v3：加 `warehouse_types` 参数 + 每行带 warehouse_type。
         默认 storefront —— diff_summary() 依赖该默认值衡量「跨门店差异」。
     """
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
     from db import migrate_warehouse_db_columns
     from warehouse_paths import resolve_warehouse_path
 
@@ -2408,7 +2411,9 @@ def collect_bindings(
         list(warehouse_types),
     ).fetchall()
     for wh in wh_rows:
-        db_path = resolve_warehouse_path(wh["db_path"], base_dir if base_dir is not None else BASE_DIR)
+        db_path = (resolve_warehouse_path(wh["db_path"], base_dir)
+                   if base_dir is not None else
+                   resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR))
         if not db_path.exists():
             if read_only:
                 raise FileNotFoundError(f"warehouse database missing: {wh['code']}")
@@ -2579,7 +2584,8 @@ def backfill_prices_from_warehouses(
 
 def diff_summary(master_conn: sqlite3.Connection) -> dict:
     """T9 —— 跨仓差异看板 4 类统计。"""
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     master_conn.row_factory = sqlite3.Row
     out = {
@@ -2606,9 +2612,7 @@ def diff_summary(master_conn: sqlite3.Connection) -> dict:
     unbound = 0
     store_exclusive = 0
     for wh in wh_rows:
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             continue
         with sqlite3.connect(db_path) as conn:
@@ -2635,7 +2639,8 @@ def diff_summary(master_conn: sqlite3.Connection) -> dict:
 
 def list_unbound_storefront_items(master_conn: sqlite3.Connection) -> list[dict]:
     """T9 —— 列出所有仓中 canonical_id IS NULL 的品项。"""
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     master_conn.row_factory = sqlite3.Row
     out: list[dict] = []
@@ -2644,9 +2649,7 @@ def list_unbound_storefront_items(master_conn: sqlite3.Connection) -> list[dict]
            WHERE warehouse_type='storefront'"""
     ).fetchall()
     for wh in wh_rows:
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             continue
         with sqlite3.connect(db_path) as conn:
@@ -2669,6 +2672,9 @@ def find_orphan_bindings(master_conn: sqlite3.Connection) -> list[dict]:
     所以"孤儿"**不会**由 Q3 产生(原 canonical_items 行还在)。
     本函数仍提供,用于发现手工改库造成的问题,不误报为缺主数据。
     """
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path
+
     master_conn.row_factory = sqlite3.Row
     out: list[dict] = []
     wh_rows = master_conn.execute(
@@ -2676,9 +2682,7 @@ def find_orphan_bindings(master_conn: sqlite3.Connection) -> list[dict]:
            WHERE warehouse_type='storefront'"""
     ).fetchall()
     for wh in wh_rows:
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             continue
         with sqlite3.connect(db_path) as conn:
@@ -2706,7 +2710,8 @@ def find_orphan_bindings(master_conn: sqlite3.Connection) -> list[dict]:
 
 def list_store_exclusive_items(master_conn: sqlite3.Connection) -> list[dict]:
     """T9 —— 列出所有 is_store_exclusive=1 的行(总部巡检输入)。"""
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     master_conn.row_factory = sqlite3.Row
     out: list[dict] = []
@@ -2715,9 +2720,7 @@ def list_store_exclusive_items(master_conn: sqlite3.Connection) -> list[dict]:
            WHERE warehouse_type='storefront'"""
     ).fetchall()
     for wh in wh_rows:
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             continue
         with sqlite3.connect(db_path) as conn:
@@ -3100,7 +3103,8 @@ def dry_run_report(
 
     返回 str——不直接 print,让 CLI 命令决定 stdout / --out <file>。
     """
-    from config import BASE_DIR  # call-time import：测试 monkeypatch 生效
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path  # call-time import：测试 monkeypatch 生效
 
     scope = tuple(target_wh_codes) if target_wh_codes else ALIGN_SCOPE_WAREHOUSES
     master_conn.row_factory = sqlite3.Row
@@ -3123,9 +3127,7 @@ def dry_run_report(
         code = wh["code"]
         if code not in scope:
             continue
-        db_path = Path(wh["db_path"])
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
+        db_path = resolve_warehouse_path(wh["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not db_path.exists():
             lines.append(f"[{code}] db 缺失({db_path}),跳过")
             continue

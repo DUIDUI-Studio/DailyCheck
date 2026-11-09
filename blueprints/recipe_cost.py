@@ -1272,6 +1272,9 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
     from contextlib import closing
 
     from blueprints.publish_recipe_pure import apply_item_to_warehouse
+    from config import BASE_DIR as _BASE_DIR
+    from config import DB_DIR as _DB_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     master_conn.row_factory = _sq.Row
     row = master_conn.execute(
@@ -1286,10 +1289,7 @@ def _apply_recipe_snapshot_to_warehouse(master_conn, target_code: str, snapshot:
             f"{target_code} is an R&D warehouse; cannot publish into it"
         )
 
-    target_path = Path(row["db_path"])
-    if not target_path.is_absolute():
-        from config import BASE_DIR as _BASE_DIR
-        target_path = Path(_BASE_DIR) / target_path
+    target_path = resolve_warehouse_path(row["db_path"], _BASE_DIR, db_dir=_DB_DIR)
     if not target_path.exists():
         raise FileNotFoundError(f"warehouse db not found: {target_path}")
 

@@ -35,12 +35,14 @@ from werkzeug.security import generate_password_hash
 from config import (
     AGENT_TOKEN_PREFIX_LEN,
     BASE_DIR,
+    DB_DIR,
     MASTER_DB,
     SAFETY_STOCK_FACTOR,
     SAFETY_STOCK_WINDOW_DAYS,
 )
 from db import init_master_db, migrate_warehouse_db_columns
 from db.migrate import migrate_legacy_inventory
+from warehouse_paths import resolve_warehouse_path, warehouse_registration_path
 
 
 def register_cli(app: Flask) -> None:
@@ -205,11 +207,11 @@ def create_warehouse_cmd(
     if tenant_id == 1:
         db_path = WAREHOUSE_DB_DIR / f"{code}.db"
     else:
-        db_path = BASE_DIR / "db" / "tenants" / str(tenant_id) / "warehouses" / f"{code}.db"
+        db_path = DB_DIR / "tenants" / str(tenant_id) / "warehouses" / f"{code}.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_warehouse_db(db_path)
 
-    rel_path = str(db_path.relative_to(BASE_DIR))
+    rel_path = warehouse_registration_path(db_path, base_dir=BASE_DIR, db_dir=DB_DIR)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         try:
@@ -443,7 +445,7 @@ def bootstrap_cmd(
         db_path = WAREHOUSE_DB_DIR / f"{warehouse_code}.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         init_warehouse_db(db_path)
-        rel_path = str(db_path.relative_to(BASE_DIR))
+        rel_path = warehouse_registration_path(db_path, base_dir=BASE_DIR, db_dir=DB_DIR)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with closing(sqlite3.connect(MASTER_DB)) as conn:
             conn.execute(
@@ -674,11 +676,9 @@ def align_apply_cmd(
             f"如需扩范围请先改 canonical_pure.ALIGN_SCOPE_WAREHOUSES 并同步设计文档。"
         )
 
-    from config import BASE_DIR  # call-time import:测试 monkeypatch 生效
-
     with closing(sqlite3.connect(MASTER_DB)) as master_conn:
         master_conn.row_factory = sqlite3.Row
-        # 解析各仓 db 路径(master.warehouses.db_path,相对路径按 BASE_DIR)
+        # 解析各仓 db 路径(master.warehouses.db_path,相对路径先按数据根再按 BASE_DIR)
         wh_conns: dict[str, sqlite3.Connection] = {}
         backup_paths: list[str] = []
         for code in whs:
@@ -687,9 +687,7 @@ def align_apply_cmd(
             ).fetchone()
             if row is None:
                 raise click.UsageError(f"仓库 {code} 未注册于 master.db")
-            db_path = Path(row["db_path"])
-            if not db_path.is_absolute():
-                db_path = BASE_DIR / db_path
+            db_path = resolve_warehouse_path(row["db_path"], BASE_DIR, db_dir=DB_DIR)
             if not db_path.exists():
                 raise click.UsageError(f"仓库 {code} 的 db 不存在: {db_path}")
             migrate_warehouse_db_columns(db_path)
@@ -780,7 +778,6 @@ def bulk_publish_canonical_cmd(
     Pre-flight 备份 master.db + wh_XXX.db 到 backups/warehouses/。
     """
     import blueprints.canonical_pure as cp
-    from config import BASE_DIR
 
     if not dry_run:
         init_master_db()  # 保险:确保 master schema 新
@@ -794,9 +791,7 @@ def bulk_publish_canonical_cmd(
     if wh_row is None:
         click.echo(f"No warehouse {dc_code}", err=True)
         raise click.exceptions.Exit(1)
-    wh_path = Path(wh_row["db_path"])
-    if not wh_path.is_absolute():
-        wh_path = BASE_DIR / wh_path
+    wh_path = resolve_warehouse_path(wh_row["db_path"], BASE_DIR, db_dir=DB_DIR)
     if not wh_path.exists():
         click.echo(f"Warehouse db not found: {wh_path}", err=True)
         raise click.exceptions.Exit(1)
@@ -907,9 +902,7 @@ def recompute_safety_stock_cmd(
         raise click.exceptions.Exit(1)
 
     for row in rows:
-        wh_path = Path(row["db_path"])
-        if not wh_path.is_absolute():
-            wh_path = BASE_DIR / wh_path
+        wh_path = resolve_warehouse_path(row["db_path"], BASE_DIR, db_dir=DB_DIR)
         if not wh_path.exists():
             click.echo(f"[{row['code']}] db 不存在: {wh_path}", err=True)
             continue
@@ -955,9 +948,7 @@ def backfill_prices_cmd(overwrite: bool, dry_run: bool) -> None:
         for row in rows:
             if not row["db_path"]:
                 continue
-            wh_path = Path(row["db_path"])
-            if not wh_path.is_absolute():
-                wh_path = BASE_DIR / wh_path
+            wh_path = resolve_warehouse_path(row["db_path"], BASE_DIR, db_dir=DB_DIR)
             if not wh_path.exists():
                 continue
             migrate_warehouse_db_columns(wh_path)

@@ -175,14 +175,15 @@ def migrate_multi_warehouse_fulfillment(
 
 def registered_up(conn: sqlite3.Connection) -> None:
     """注册表适配：master 由 runner 备份/提交，仓文件以原路径打开并幂等升级。"""
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
+    from warehouse_paths import resolve_warehouse_path
 
     with ExitStack() as stack:
         warehouses = {}
         paths = {}
         if "db_path" in _columns(conn, "warehouses"):
             for code, db_path in conn.execute("SELECT code, db_path FROM warehouses"):
-                path = (BASE_DIR / db_path).resolve()
+                path = resolve_warehouse_path(db_path, BASE_DIR, db_dir=DB_DIR).resolve()
                 if not path.is_file():
                     raise FileNotFoundError(f"仓库 {code} 数据库不存在: {path}")
                 if path not in paths:
