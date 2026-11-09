@@ -1487,21 +1487,26 @@ proof/request digest、policy epoch 和 App/install identity；H/G child 上下�
 authority set 变为 15；H10 workflow/producer 与旧 installed-packet 保持冻结）。它只补齐
 消费者已要求、但源码缺失的可执行前置，不安装/不启用：`render-preparation` 从受保护的
 `PreparationPlan` 生成四份固定 unit recipe、removal targets 与固定 launcher（无副作用、
-不写 host）；`export-baseline` 仅在原 attempt fence 下、legacy writer drain 已证明且
-`state.deployed` 源成功 outcome 未变时，从 approved map 推导 public P，按 literal blob
-导出/校验不可变 release（不 update-ref、不改 main/anchor/state、不 import 应用）；共享
-`native_pipeline.literal_tree/write_literal_release/render_unit`，G 路径仍要求原 owned
-candidate、attempt FD/journal 与不可变 identity。`publish-runtime` 是独立 observer 进程：
-不接收 attempt descriptor/identity、key 或应用环境；初始 P 要求真实 ≥600 秒 continuity
-ledger 加 fresh re-observation，active G 要求实际完成 stage journal（含真实 ≥600 秒
-observation）；原子写入后仍经未改动的 `ProtectedRuntime` 读回。`publish-baseline` 只在
-实际 P runtime 证明后，重读 approved outcome/map/tree 与真实 remote main，仅原子写出
-fresh transition（不 initialize、不 sign、不 grant）。`prepare-review-request` 只生成
-root 受保护的 binding 请求；`dc-native-review` UID 下的独立进程校验 euid 后才写自己的
-0600 result，root/app 不能提供 reviewer 字符串或 verdict。固定 launcher 模板与最小 Prod
-操作契约见 `deploy/native/`。以上仍是本地 source/fixture evidence：真实 Linux 降权、
-实际 ≥600 秒窗口、UID/device/inode、安装、App/Prod/baseline/review 验收保持 NOT_RUN，
-activation 保持 OFF。
+不写 host）；`export-baseline` 在 trusted CLI 分支自行获取原 attempt fence，仅在 legacy
+writer drain 已证明且 `state.deployed` 源成功 outcome 未变时，从 approved map 推导
+public P，按 literal blob 导出/校验不可变 release（不 update-ref、不改 main/anchor/state、
+不 import 应用）；共享 `native_pipeline.literal_tree/write_literal_release/render_unit`，
+G 路径仍要求原 owned candidate、attempt FD/journal 与不可变 identity。`publish-runtime`
+是独立 observer 进程：不接收 attempt descriptor/identity、key 或应用环境；初始 P 要求
+真实 ≥600 秒 monotonic continuity ledger 加 fresh re-observation（UTC 仅作 freshness
+metadata），active G 要求实际完成 stage journal（含真实 ≥600 秒 observation）；原子写入
+后仍经未改动的 `ProtectedRuntime` 读回。initializer 在同一 idle P 上完成后，可用保留的
+`native_source_anchor`/初始化 identity 刷新 matching baseline runtime；缺失、partial、
+active、policy/epoch/anchor/deployed/tree 不匹配仍拒绝。`publish-baseline` 只在实际 P
+runtime 证明后，重读 approved outcome/map/tree 与真实 remote main，仅原子写出 fresh
+transition（不 initialize、不 sign、不 grant）。`prepare-review-request` 只生成 root
+受保护的 binding 请求；`dc-native-review` UID 下的独立进程校验 euid 后才写自己的 0600
+result，root/app 不能提供 reviewer 字符串或 verdict。同一固定 launcher 的 allowlist 还把
+`status/initialize/admit-head/deploy-front/recover` 路由到固定 controller dispatch
+（`grant/release` 仍拒绝），无任意 module/path/policy/env/command 选择。固定 launcher
+模板与最小 Prod 操作契约见 `deploy/native/`。以上仍是本地 source/fixture evidence：
+真实 Linux 降权、实际 ≥600 秒窗口、UID/device/inode、安装、App/Prod/baseline/review
+验收保持 NOT_RUN，activation 保持 OFF。
 
 以上是 source implementation；没有安装/激活或实际生产验证。portable seam tests 使用
 owned HTTP/crypto/小型 Git/子进程及测试 stage 命令；不证明 Linux 降权、实际八检查或新
@@ -3416,10 +3421,14 @@ Issue #108 的 `tests/test_canonical_unclaim_portability.py` 在真实临时mast
 
 Issue #164 的 `tests/test_native_preparation.py` 用 owned fixture 覆盖准备/发布 adapter：
 固定四 unit/launcher 的无副作用渲染，literal P release 的创建/逐字节校验与
-symlink/part 拒绝，baseline ledger 的时长/进程/route/epoch/outcome/样本漂移拒绝，
-active-G 完整 journal 绑定，fresh transition 只写 bootstrap，review request/result 的
-UID/candidate/CI 绑定与二次发布拒绝，以及 replace 中断不覆盖旧记录。真实 Linux UID
-降权、device/inode、实际 ≥600 秒窗口与 Prod 安装仍是 NOT_RUN。
+symlink/part 拒绝，baseline ledger 的 monotonic 时长/进程/route/epoch/outcome/样本漂移
+拒绝，active-G 完整 journal 绑定，fresh transition 只写 bootstrap，review request/result
+的 UID/candidate/CI 绑定与二次发布拒绝，replace 中断不覆盖旧记录；repair-1 另覆盖
+baseline CLI 自行获取原 fence 与 competing-holder 拒绝、observer 子进程无 fence/env 泄漏、
+真实 initializer 后 matching idle-P 的 retained-ledger/fresh-observation 刷新及
+anchor/policy/epoch/deployed/tree/active/partial 拒绝、渲染 launcher 的五项 lifecycle
+controller 路由与未知命令/选项拒绝。真实 Linux UID 降权、device/inode、实际 ≥600 秒
+窗口与 Prod 安装仍是 NOT_RUN。
 
 Issue #105 的 `tests/test_mcp_impact_gate.py` 用独立临时 Git 仓库验证 main 前进时的
 merge-base、新增工具（含 SDK 合法的大小写/前导下划线名称）、schema 变化、删除/重命名、

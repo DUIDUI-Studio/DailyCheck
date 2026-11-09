@@ -35,7 +35,7 @@ from scripts.prod_agent.native_ports import (
     protected_path,
     read_protected,
 )
-from scripts.prod_agent.native_queue import deploy_state
+from scripts.prod_agent.native_queue import NativeQueue, deploy_state
 
 POLICY_PATH = Path("/etc/dailycheck-native/policy.json")
 RECORDS_ROOT = Path("/var/lib/dailycheck-native-records")
@@ -56,6 +56,10 @@ RECORD_PLAN = "preparation-plan.json"
 RECORD_EVIDENCE = "baseline-evidence.json"
 RECORD_MAP = "source-public-map.json"
 RECORD_LEDGER = "observation-ledger.json"
+CONTROLLER_OPERATIONS = ("status", "initialize", "admit-head", "deploy-front", "recover",
+                         "grant", "release")
+INITIALIZED_KEYS = {"version", "policy", "epoch", "source_sha", "public_sha", "tree_sha",
+                    "map_sha256", "source_outcome_sha256", "runtime_sha256", "observed_at"}
 
 
 def _text(value: object, name: str) -> str:
@@ -464,12 +468,32 @@ def _reject_fence() -> None:
         raise ValueError("observer must not inherit the attempt fence")
 
 
+class _FixtureProcessObserver:
+    """TEST ONLY: replay an owned synthetic process list, never a kernel claim.
+
+    The installed path cannot construct this class (``NativePreparer`` rejects a
+    replaced observer when ``policy.fixture is None``). The list lives in a
+    0600 file inside the owned fixture root and cannot authorize a live record.
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root).resolve()
+        self.path = self.root / "fixture-processes.json"
+
+    def observe(self, _policy) -> list[dict]:
+        raw = read_protected(self.path, os.geteuid(), anchor=self.root)
+        value = json.loads(raw)
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError("invalid owned fixture process list")
+        return value
+
+
 class NativePreparer:
     """Fixed protected operations; installed mode cannot replace observers/clients."""
 
     def __init__(self, policy: InstalledPolicy, *, records: Path | None = None,
                  repo: Path | None = None, client=None, observer=None,
-                 clock=time.time, sleep=time.sleep):
+                 clock=time.time, monotonic=time.monotonic, sleep=time.sleep):
         if policy.fixture is None and any(x is not None for x in (records, repo, client, observer)):
             raise ValueError("installed preparation inputs cannot be replaced")
         self.policy = policy
@@ -479,18 +503,31 @@ class NativePreparer:
         self.repo = Path(repo) if repo is not None else policy.location("repo")
         self._client = client
         if observer is None:
-            from scripts.prod_agent.native_ports import SystemdObserver
-            observer = SystemdObserver()
+            if policy.fixture is not None:
+                observer = _FixtureProcessObserver(policy.fixture.root)
+            else:
+                from scripts.prod_agent.native_ports import SystemdObserver
+                observer = SystemdObserver()
         self.observer = observer
-        self.clock, self.sleep = clock, sleep
+        self.clock, self.monotonic, self.sleep = clock, monotonic, sleep
 
     @property
     def client(self):
         """Read credentials only for the operations that need remote main."""
         if self._client is None:
+            if self.policy.fixture is not None:
+                # TEST ONLY: the owned fixture supplies a curl shim for its
+                # loopback server; never fall back to a real network target.
+                shim = self.policy.fixture.root.resolve() / "curl"
+                if not shim.is_file():
+                    raise ValueError("owned fixture read transport required")
+                curl = str(shim)
+            else:
+                curl = "/usr/bin/curl"
             self._client = HostingClient(HostingConfig(
                 Provider.GITHUB, "https://api.github.com", REPOSITORY, AccessRole.READ,
-                self.policy.read_token(), actions_app_id=self.policy.producer.actions_app_id))
+                self.policy.read_token(), actions_app_id=self.policy.producer.actions_app_id,
+                curl=curl))
         return self._client
 
     def _record(self, name: str) -> dict:
@@ -550,6 +587,54 @@ class NativePreparer:
             raise ValueError("original successful source outcome changed")
         return deployed
 
+    def _baseline_outcome(self, state: dict, evidence: BaselineEvidence) -> tuple[dict, bool]:
+        """Return the preserved original source outcome and whether native is initialized.
+
+        Initial export/transition remain uninitialized-only. A runtime refresh is
+        also allowed after the unchanged initializer completed on the same P, but
+        only while idle and while every preserved identity fact still matches.
+        """
+        directory = self.policy.location("directory")
+        if not deploy_state.native_consistent(directory, state):
+            raise ValueError("native state/guard mismatch; operator reconciliation required")
+        if state.get("lock") is not None:
+            raise ValueError("legacy writer drain not proved")
+        queue = state.get("native_queue")
+        if queue is None:
+            if "native_bootstrap" in state or "native_source_anchor" in state:
+                raise ValueError("partial native initialization; operator reconciliation required")
+            deployed = state.get("deployed")
+            if (not isinstance(deployed, dict)
+                    or digest(deployed) != evidence.source_outcome_sha256
+                    or deployed.get("sha") != evidence.source_sha):
+                raise ValueError("original successful source outcome changed")
+            return deployed, False
+        if (not isinstance(queue, dict) or queue.get("version") != 1
+                or queue.get("active") is not None):
+            raise ValueError("baseline refresh requires an idle initialized native state")
+        bootstrap = state.get("native_bootstrap")
+        anchor = state.get("native_source_anchor")
+        deployed = state.get("deployed")
+        if (not isinstance(bootstrap, dict) or set(bootstrap) != INITIALIZED_KEYS
+                or bootstrap["version"] != 1
+                or bootstrap["policy"] != self.policy.fingerprint
+                or bootstrap["epoch"] != self.policy.value["epoch"]
+                or bootstrap["source_sha"] != evidence.source_sha
+                or bootstrap["public_sha"] != evidence.public_sha
+                or bootstrap["tree_sha"] != evidence.tree_sha
+                or bootstrap["source_outcome_sha256"] != evidence.source_outcome_sha256
+                or bootstrap["map_sha256"] != evidence.map_sha256
+                or not isinstance(anchor, dict)
+                or anchor.get("sha") != bootstrap["source_sha"]
+                or digest(anchor) != bootstrap["source_outcome_sha256"]
+                or not isinstance(deployed, dict)
+                or deployed.get("sha") != bootstrap["public_sha"]):
+            raise ValueError("initialized baseline identity mismatch")
+        _sha64(bootstrap["runtime_sha256"], "initialized runtime digest")
+        if type(bootstrap["observed_at"]) not in {int, float}:
+            raise ValueError("initialized baseline identity mismatch")
+        return anchor, True
+
     def export_baseline(self) -> dict:
         """Create or verify the immutable literal P release under the original fence."""
         if deploy_state.process_lock_fd() is None:
@@ -596,8 +681,8 @@ class NativePreparer:
 
     def _validate_ledger(self, ledger: object, kind: str) -> dict:
         shared = {"version", "policy", "epoch", "kind", "sha", "tree", "processes",
-                  "routes", "started_at", "finished_at", "observation_seconds",
-                  "samples", "incident"}
+                  "routes", "started_at", "finished_at", "started_monotonic",
+                  "finished_monotonic", "observation_seconds", "samples", "incident"}
         outcome_key = "source_outcome_sha256" if kind == "baseline" else "journal_sha256"
         if (not isinstance(ledger, dict) or set(ledger) != shared | {outcome_key}
                 or ledger["version"] != 1 or ledger["policy"] != self.policy.fingerprint
@@ -610,11 +695,15 @@ class NativePreparer:
                 or set(ledger["routes"]) != {"app", "mcp"}):
             raise ValueError("invalid protected observation identity")
         minimum = self.policy.producer.minimum_observation_seconds
-        duration = ledger["finished_at"] - ledger["started_at"]
-        if (type(ledger["observation_seconds"]) not in {int, float}
-                or ledger["observation_seconds"] < minimum or duration < minimum
-                or ledger["finished_at"] > self.clock() + 1):
+        started = ledger["started_monotonic"]
+        finished = ledger["finished_monotonic"]
+        if (type(started) not in {int, float} or type(finished) not in {int, float}
+                or type(ledger["observation_seconds"]) not in {int, float}
+                or finished < started or ledger["observation_seconds"] < minimum
+                or finished - started < minimum):
             raise ValueError("observation window too short or not actual")
+        if ledger["finished_at"] > self.clock() + 1:
+            raise ValueError("observation freshness metadata is in the future")
         samples = ledger["samples"]
         if not isinstance(samples, list) or len(samples) < 2:
             raise ValueError("continuity samples required")
@@ -657,7 +746,9 @@ class NativePreparer:
 
     def _assert_baseline_unchanged(self, ledger: dict) -> None:
         state = deploy_state.load_state(self.policy.location("directory"))
-        if digest(state.get("deployed")) != ledger["source_outcome_sha256"]:
+        outcome = (state.get("native_source_anchor") if state.get("native_queue") is not None
+                   else state.get("deployed"))
+        if not isinstance(outcome, dict) or digest(outcome) != ledger["source_outcome_sha256"]:
             raise ValueError("original source outcome changed during observation")
 
     def _write_runtime(self, ledger: dict, *, verify_state) -> dict:
@@ -687,8 +778,8 @@ class NativePreparer:
         state = deploy_state.load_state(self.policy.location("directory"))
         if kind == "baseline":
             evidence = BaselineEvidence.from_dict(self._record(RECORD_EVIDENCE))
-            self._validate_uninitialized(state, evidence)
-            if ledger["source_outcome_sha256"] != digest(state["deployed"]):
+            outcome, _ = self._baseline_outcome(state, evidence)
+            if ledger["source_outcome_sha256"] != digest(outcome):
                 raise ValueError("original successful source outcome changed")
             if ledger["sha"] != evidence.public_sha or ledger["tree"] != evidence.tree_sha:
                 raise ValueError("baseline runtime is not the approved public P")
@@ -708,11 +799,11 @@ class NativePreparer:
         _reject_fence()
         evidence = BaselineEvidence.from_dict(self._record(RECORD_EVIDENCE))
         state = deploy_state.load_state(self.policy.location("directory"))
-        self._validate_uninitialized(state, evidence)
+        outcome, _ = self._baseline_outcome(state, evidence)
         minimum = self.policy.producer.minimum_observation_seconds
         processes = observe_processes(self.policy, self.observer, evidence.public_sha)
         routes = self.default_routes("baseline")
-        started = self.clock()
+        started_monotonic, started_at = self.monotonic(), self.clock()
         samples = []
         while True:
             current = observe_processes(self.policy, self.observer, evidence.public_sha)
@@ -721,18 +812,20 @@ class NativePreparer:
             self._probe(routes)
             samples.append({"at": self.clock(), "processes_sha256": digest(current),
                             "routes_sha256": digest(routes)})
-            elapsed = self.clock() - started
+            elapsed = self.monotonic() - started_monotonic
             if elapsed >= minimum:
                 break
             self.sleep(min(30, max(0, minimum - elapsed)))
-        finished = self.clock()
+        finished_monotonic, finished_at = self.monotonic(), self.clock()
         ledger = {"version": 1, "policy": self.policy.fingerprint,
                   "epoch": self.policy.value["epoch"], "kind": "baseline",
                   "sha": evidence.public_sha, "tree": evidence.tree_sha,
                   "processes": processes, "routes": routes,
-                  "source_outcome_sha256": digest(state["deployed"]),
-                  "started_at": started, "finished_at": finished,
-                  "observation_seconds": finished - started,
+                  "source_outcome_sha256": digest(outcome),
+                  "started_at": started_at, "finished_at": finished_at,
+                  "started_monotonic": started_monotonic,
+                  "finished_monotonic": finished_monotonic,
+                  "observation_seconds": finished_monotonic - started_monotonic,
                   "samples": samples, "incident": False}
         self._write_record(self.records / RECORD_LEDGER, ledger)
         return self._validate_ledger(ledger, "baseline")
@@ -769,6 +862,8 @@ class NativePreparer:
                   "journal_sha256": digest(journal),
                   "started_at": journal[-1]["started_at"],
                   "finished_at": max(self.clock(), journal[-1]["completed_at"]),
+                  "started_monotonic": journal[-1]["started_monotonic"],
+                  "finished_monotonic": journal[-1]["completed_monotonic"],
                   "observation_seconds": duration, "samples": [], "incident": False}
         # The real journal is the continuity proof; it already spans >=600s.
         ledger["samples"] = [{"at": journal[-1]["completed_at"],
@@ -950,14 +1045,46 @@ def _fixture_policy(args) -> InstalledPolicy:
     return InstalledPolicy(policy_path, fixture=OwnedFixture(root, args.fixture_endpoint))
 
 
+def _controller_main(args) -> int:
+    """Fixed H/G lifecycle routing behind the same allowlisted launcher."""
+    if args.operation in {"grant", "release"}:
+        print("standalone grant/release unavailable; use protected deploy-front/recover",
+              file=sys.stderr)
+        return 2
+    try:
+        policy = _fixture_policy(args)
+    except (FileNotFoundError, ValueError):
+        print("installed native controller policy unavailable", file=sys.stderr)
+        return 1
+    except Exception:
+        print("protected H/G prerequisites unavailable or inconsistent; reconcile active attempts",
+              file=sys.stderr)
+        return 1
+    try:
+        from scripts.prod_agent.native_controller import NativeController
+
+        controller = NativeController(policy)
+        if args.operation == "admit-head":
+            value = controller.admit_head(args.pr)
+        else:
+            value = getattr(controller, args.operation.replace("-", "_"))()
+        print(json.dumps(value))
+        return 0
+    except Exception:
+        print("protected H/G prerequisites unavailable or inconsistent; reconcile active attempts",
+              file=sys.stderr)
+        return 1
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("render-preparation", "export-baseline",
-                                              "publish-runtime", "publish-baseline",
-                                              "prepare-review-request", "publish-review"))
+    parser.add_argument("operation", choices=(
+        "render-preparation", "export-baseline", "publish-runtime", "publish-baseline",
+        "prepare-review-request", "publish-review", *CONTROLLER_OPERATIONS))
     parser.add_argument("--kind", choices=("baseline", "green"))
     parser.add_argument("--candidate-digest")
     parser.add_argument("--decision", choices=("pass",))
+    parser.add_argument("--pr", type=int)
     parser.add_argument("--fixture-root")
     parser.add_argument("--fixture-endpoint")
     parser.add_argument("--fixture-policy")
@@ -970,12 +1097,23 @@ def main(argv=None) -> int:
             return 0
         os.environ.clear()
         os.environ.update(PATH="/usr/bin:/bin", LANG="C.UTF-8")
+        if args.operation in CONTROLLER_OPERATIONS:
+            return _controller_main(args)
         policy = _fixture_policy(args)
         preparer = NativePreparer(policy)
         if args.operation == "render-preparation":
             value = render_preparation(preparer.plan())
-        elif args.operation == "export-baseline":
-            value = preparer.export_baseline()
+        elif args.operation in {"export-baseline", "publish-baseline"}:
+            # The trusted baseline branches self-acquire the original attempt
+            # fence. The observer path never enters this branch, never receives
+            # this descriptor and never inherits the application environment.
+            runner = NativeQueue(policy.location("repo"), policy.location("directory"),
+                                 policy.producer, None)
+            with runner.fence():
+                if args.operation == "export-baseline":
+                    value = preparer.export_baseline()
+                else:
+                    value = preparer.publish_baseline()
         elif args.operation == "publish-runtime":
             if args.kind == "green":
                 value = preparer.publish_runtime_green()
@@ -983,8 +1121,6 @@ def main(argv=None) -> int:
                 value = preparer.publish_runtime_baseline()
             else:
                 raise ValueError("baseline or green runtime kind required")
-        elif args.operation == "publish-baseline":
-            value = preparer.publish_baseline()
         else:
             from scripts.prod_agent.native_controller import NativeController
             controller = NativeController(policy)

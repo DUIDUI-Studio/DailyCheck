@@ -6,6 +6,7 @@ acceptance; every synthetic record is explicitly owned-fixture input.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import pwd
@@ -18,12 +19,18 @@ import pytest
 
 from scripts.ci.merge_group import digest
 from scripts.prod_agent.native_pipeline import literal_tree
-from scripts.prod_agent.native_ports import InstalledPolicy, ProtectedReview, ProtectedRuntime
+from scripts.prod_agent.native_ports import (
+    InstalledPolicy,
+    ProtectedInitializer,
+    ProtectedReview,
+    ProtectedRuntime,
+)
 from scripts.prod_agent.native_prepare import (
     NativePreparer,
     PreparationPlan,
     _atomic_write,
     publish_review_result,
+    render_launcher,
     render_preparation,
 )
 from scripts.prod_agent.native_queue import NativeQueue, deploy_state
@@ -327,6 +334,7 @@ def _baseline_ledger(b, ledger_override=None):
               "processes": record["processes"], "routes": record["routes"],
               "source_outcome_sha256": digest({"sha": b["base"], "pr": 1, "at": 1}),
               "started_at": now - 600, "finished_at": now,
+              "started_monotonic": 0.0, "finished_monotonic": 600.0,
               "observation_seconds": 600, "samples": samples, "incident": False}
     ledger.update(ledger_override or {})
     return ledger
@@ -347,8 +355,8 @@ def test_publish_runtime_baseline_writes_unchanged_consumer_record(bridge):
     assert ProtectedRuntime(policy, observer=b["runtime"].observer).read()["sha"] == b["base"]
 
 
-@pytest.mark.parametrize("damage", ["short", "drift", "route", "fence", "outcome", "epoch",
-                                     "sample"])
+@pytest.mark.parametrize("damage", ["short", "wall-clock-only", "drift", "route", "fence",
+                                     "outcome", "epoch", "sample"])
 def test_publish_runtime_baseline_rejects_unproven_continuity(bridge, damage):
     b = bridge
     policy = b["policy"]
@@ -360,7 +368,12 @@ def test_publish_runtime_baseline_rejects_unproven_continuity(bridge, damage):
     deploy_state.save_state(state_dir, state)
     override = {}
     if damage == "short":
-        override = {"observation_seconds": 599}
+        override = {"observation_seconds": 599, "finished_monotonic": 599.0}
+    elif damage == "wall-clock-only":
+        now = time.time()
+        override = {"started_at": now - 600, "finished_at": now,
+                    "started_monotonic": 0.0, "finished_monotonic": 1.0,
+                    "observation_seconds": 1}
     elif damage == "drift":
         processes = [dict(row) for row in b["runtime_record"]["processes"]]
         processes[0]["pid"] += 1
@@ -570,3 +583,199 @@ def test_atomic_record_publication_keeps_previous_bytes_on_interruption(tmp_path
                       anchor=tmp_path)
     assert target.read_bytes() == before
     assert not list(tmp_path.glob(".record.json.tmp-*"))
+
+
+# ── repair-1: CLI fence, initialized-P refresh, launcher controller routing ──
+
+def _setup_baseline(b):
+    policy = b["policy"]
+    records = records_dir(b)
+    _, _, deployed = evidence_and_map(b, records, policy.location("repo"))
+    state = deploy_state.load_state(policy.location("directory"))
+    state["deployed"] = deployed
+    deploy_state.save_state(policy.location("directory"), state)
+    return preparer(b)
+
+
+def _fixture_child_command(b, operation, *extra):
+    policy = b["policy"]
+    return [str(policy.python), "-I", "-B", "-c",
+            "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); "
+            "runpy.run_module('scripts.prod_agent.native_prepare',run_name='__main__')",
+            str(policy.authority), operation, "--fixture-root", str(b["root"]),
+            "--fixture-endpoint", policy.fixture.endpoint,
+            "--fixture-policy", str(policy.path), *extra]
+
+
+def _write_fixture_processes(b):
+    private(b["root"] / "fixture-processes.json", b["runtime_record"]["processes"])
+
+
+def _initialized_baseline(b):
+    """Positive setup: runtime + transition + the unchanged real initializer."""
+    policy = b["policy"]
+    preparer_obj = _setup_baseline(b)
+    _write_fixture_processes(b)
+    private(preparer_obj.records / "observation-ledger.json", _baseline_ledger(b))
+    preparer_obj.publish_runtime_baseline()
+    runner = NativeQueue(policy.location("repo"), policy.location("directory"),
+                         policy.producer, None)
+    with runner.fence():
+        preparer_obj.publish_baseline()
+    assert ProtectedInitializer(policy, b["runtime"], b["controller"].client).initialize()
+    return preparer_obj
+
+
+def test_baseline_cli_self_acquires_original_fence(bridge):
+    b = bridge
+    policy = b["policy"]
+    preparer_obj = _setup_baseline(b)
+    _write_fixture_processes(b)
+    release = policy.location("release_root") / b["base"]
+    shutil.rmtree(release, ignore_errors=True)
+    result = subprocess.run(_fixture_child_command(b, "export-baseline"),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["result"] == "created"
+    assert (release / "release.json").is_file()
+    result = subprocess.run(_fixture_child_command(b, "publish-baseline"),
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    transition = json.loads(result.stdout)
+    assert transition["public_sha"] == b["base"]
+    assert policy.record("bootstrap_file") == transition
+    # The existing non-blocking attempt contract rejects a competing holder.
+    runner = NativeQueue(policy.location("repo"), policy.location("directory"),
+                         policy.producer, None)
+    with runner.fence():
+        release_before = (release / "release.json").read_bytes()
+        bootstrap_before = policy.location("bootstrap_file").read_bytes()
+        for operation in ("export-baseline", "publish-baseline"):
+            result = subprocess.run(_fixture_child_command(b, operation),
+                                    capture_output=True, text=True, timeout=30)
+            assert result.returncode == 1
+        assert (release / "release.json").read_bytes() == release_before
+        assert policy.location("bootstrap_file").read_bytes() == bootstrap_before
+    # The owned observer child never receives the fence or application env.
+    captured = {}
+
+    class FakeChild:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return ('{"sha": "synthetic"}', "")
+
+        def kill(self):
+            pass
+
+    def fake_popen(command, **kwargs):
+        captured.update(command=command, options=kwargs)
+        return FakeChild()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(subprocess, "Popen", fake_popen)
+        assert preparer_obj.publish_runtime_process("green") == {"sha": "synthetic"}
+    assert captured["options"]["env"] == {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    assert captured["options"]["close_fds"] is True
+    assert "pass_fds" not in captured["options"]
+    assert "DAILYCHECK_DEPLOY_ATTEMPT" not in captured["options"]["env"]
+    assert "DAILYCHECK_DEPLOY_ATTEMPT_FD" not in captured["options"]["env"]
+
+
+def test_initialized_matching_p_runtime_refresh(bridge):
+    b = bridge
+    policy = b["policy"]
+    preparer_obj = _initialized_baseline(b)
+    refreshed = preparer_obj.publish_runtime_baseline()
+    assert refreshed["sha"] == b["base"]
+    assert b["runtime"].read()["sha"] == b["base"]
+    # Fresh-observation authorization path without a real 600s loop.
+    (preparer_obj.records / "observation-ledger.json").unlink()
+    observed = preparer_obj.publish_runtime_from_ledger(_baseline_ledger(b), kind="baseline")
+    assert observed["sha"] == b["base"]
+    state = deploy_state.load_state(policy.location("directory"))
+    assert state["native_queue"]["active"] is None
+    assert state["native_source_anchor"]["sha"] == b["base"]
+    # True stale-record rejection remains in the unchanged consumer.
+    current = policy.record("runtime_file")
+    private(policy.location("runtime_file"), {**current, "observed_at": time.time() - 121})
+    with pytest.raises(ValueError, match="unavailable/stale"):
+        b["runtime"].read()
+
+
+@pytest.mark.parametrize("damage", ["anchor-digest", "anchor-sha", "policy", "epoch",
+                                     "deployed", "tree", "active", "partial", "missing-queue",
+                                     "guard"])
+def test_initialized_mismatch_still_denies_refresh(bridge, damage):
+    b = bridge
+    policy = b["policy"]
+    preparer_obj = _initialized_baseline(b)
+    state_dir = policy.location("directory")
+    state = deploy_state.load_state(state_dir)
+    if damage == "anchor-digest":
+        state["native_source_anchor"]["pr"] = 999
+    elif damage == "anchor-sha":
+        state["native_source_anchor"]["sha"] = "f" * 40
+    elif damage == "policy":
+        state["native_bootstrap"]["policy"] = "f" * 64
+    elif damage == "epoch":
+        state["native_bootstrap"]["epoch"] = "foreign-epoch"
+    elif damage == "deployed":
+        state["deployed"]["sha"] = "f" * 40
+    elif damage == "tree":
+        state["native_bootstrap"]["tree_sha"] = "f" * 40
+    elif damage == "active":
+        state["native_queue"]["active"] = {"phase": "deploy", "origin_attempt_id": "x",
+                                           "origin_generation": 0, "candidate": {},
+                                           "journal": [], "verified_evidence": None,
+                                           "release_grant": None}
+    elif damage == "partial":
+        state.pop("native_bootstrap")
+    elif damage == "missing-queue":
+        state.pop("native_queue")
+    else:
+        (state_dir / deploy_state.NATIVE_GUARD_FILENAME).unlink()
+    deploy_state.save_state(state_dir, state)
+    before = policy.location("runtime_file").read_bytes()
+    with pytest.raises(ValueError):
+        preparer_obj.publish_runtime_from_ledger(_baseline_ledger(b), kind="baseline")
+    assert policy.location("runtime_file").read_bytes() == before
+
+
+def test_rendered_launcher_routes_fixed_controller_lifecycle(bridge):
+    b = bridge
+    policy = b["policy"]
+    plan = dataclasses.replace(
+        PreparationPlan.from_dict(plan_document(b, policy, records_dir(b))),
+        python=policy.python, authority=policy.authority)
+    launcher = b["root"] / "fixture-native-launcher"
+    launcher.write_text(render_launcher(plan))
+    launcher.chmod(0o700)
+    for operation, extra in (("status", []), ("initialize", []),
+                             ("admit-head", ["--pr", "1"]), ("deploy-front", []),
+                             ("recover", [])):
+        result = subprocess.run(["/bin/sh", str(launcher), operation, *extra],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 1, (operation, result.stderr)
+        assert "controller policy unavailable" in result.stderr
+        assert "invalid choice" not in result.stderr
+    fixture_args = ["--fixture-root", str(b["root"]),
+                    "--fixture-endpoint", policy.fixture.endpoint,
+                    "--fixture-policy", str(policy.path)]
+    result = subprocess.run(["/bin/sh", str(launcher), "status", *fixture_args],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["state"] == "uninitialized"
+    result = subprocess.run(["/bin/sh", str(launcher), "recover", *fixture_args],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 1 and "invalid choice" not in result.stderr
+    result = subprocess.run(["/bin/sh", str(launcher), "bogus"],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and "invalid choice" in result.stderr
+    result = subprocess.run(["/bin/sh", str(launcher), "status", "--policy", "/tmp/evil"],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2 and "unrecognized arguments" in result.stderr
+    result = subprocess.run(["/bin/sh", str(launcher), "--help"],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0
+    assert "publish-runtime" in result.stdout and "deploy-front" in result.stdout
