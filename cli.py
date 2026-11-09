@@ -304,7 +304,7 @@ def clone_warehouse_cmd(src_code: str, new_code: str, name: str) -> None:
     init_warehouse_db(dst_path)
     counts = clone_warehouse_catalog(src_path, dst_path)
 
-    rel_path = str(dst_path.relative_to(BASE_DIR))
+    rel_path = warehouse_registration_path(dst_path, base_dir=BASE_DIR, db_dir=DB_DIR)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         try:

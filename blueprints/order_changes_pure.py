@@ -593,13 +593,13 @@ def can_decide(conn, order: dict, proposal: dict, actor_id: int,
 
 
 def _readonly_warehouse(conn, code: str):
-    from pathlib import Path
-
     import config
+    from warehouse_paths import resolve_warehouse_path
+
     row = conn.execute('SELECT db_path FROM warehouses WHERE code=?', (code,)).fetchone()
     if row is None:
         raise ValueError('仓库不存在')
-    path = (Path(config.BASE_DIR) / row[0]).resolve()
+    path = resolve_warehouse_path(row[0], config.BASE_DIR, db_dir=config.DB_DIR).resolve()
     wh = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
     wh.row_factory = sqlite3.Row
     wh.execute('BEGIN')

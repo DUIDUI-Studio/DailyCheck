@@ -962,7 +962,7 @@ ctx-bar 的「反馈」原先是整页跳转，用户在填单途中点它，**�
 
 1. `bot/tools.py` 仍只有查询，SQLite 连接仍 `file:...?mode=ro`；MCP 查询显式传 `AuthContext(allowed_write_paths=[], read_only=True)`，UoW 也以 `mode=ro` 打开，禁止查询触发迁移/缓存写入。库初始化和迁移归应用生命周期；缺库不创建。
    `warehouse_paths.resolve_warehouse_path` 是仓库元数据路径的共享解析器：bot 读/最小写上下文显式携带 `warehouse_base_dir=db_dir().parent`，UoW、无缓存采购与 canonical bindings 都用此根解析相对路径，和旧 bot 工具一致，不依赖进程 CWD 或代码根。绝对路径保持原值；HTTP/stdio 未传根时保留原有行为。canonical 只读详情遇到缺失仓库库明确失败，不静默返回零绑定。
-   配置数据根时（`DAILYCHECK_DB_DIR`），共享解析器新增 `db_dir` 模式：只有 legacy `db/...` 注册前缀映射到 `db_dir`（如 `db/warehouses/x.db` → `<DB_DIR>/warehouses/x.db`），显式 `base_dir` 继续作为其他相对形式的 legacy 回退，Bot 显式 `base_dir` 仍优先且只传 `base_dir`。未设置 `DAILYCHECK_DB_DIR` 时行为与旧 `BASE_DIR/db` 完全一致。应用/MCP 的 auth、canonical、procurement、replenishment、recipe、import、item-routing、UoW、migration 与 CLI 都走这一契约；仓库创建写入现有 portable `db/...` 形式，不重写已存元数据。`canonical_pure.guard_real_db` 同时保护代码根和配置数据根的 `warehouses` 目录（含未穿透 alias）。`blueprints/item_routing_pure.routing_warehouse_connections` 也走同一契约（tenant1/distribution_center 过滤、`mode=ro` 只读、缺库/坏库显式失败不变）。
+   配置数据根时（`DAILYCHECK_DB_DIR`），共享解析器新增 `db_dir` 模式：只有 legacy `db/...` 注册前缀映射到 `db_dir`（如 `db/warehouses/x.db` → `<DB_DIR>/warehouses/x.db`），显式 `base_dir` 继续作为其他相对形式的 legacy 回退，Bot 显式 `base_dir` 仍优先且只传 `base_dir`。未设置 `DAILYCHECK_DB_DIR` 时行为与旧 `BASE_DIR/db` 完全一致。应用/MCP 的 auth、canonical、procurement、replenishment、recipe、import、item-routing、order-change、UoW、migration 与 CLI 都走这一契约。配置数据根在代码根内部时，匹配其完整代码相对前缀的旧注册（如 `db/custom-data/warehouses/x.db`）先保留代码相对语义，再处理其余 portable `db/...`；不按文件存在与否选择路径。create、clone、bootstrap 与旧库初始化共用注册 helper：代码根内保留原相对形式，外部根使用 portable `db/...`，不重写已存元数据。UoW 与只读采购默认同时传代码根和配置根；显式 Bot 根仍只传该根。`canonical_pure.guard_real_db` 同时保护代码根和配置数据根的 `warehouses` 目录（含未穿透 alias）。`blueprints/item_routing_pure.routing_warehouse_connections` 也走同一契约（tenant1/distribution_center 过滤、`mode=ro` 只读、缺库/坏库显式失败不变）。
 2. `bot/mcp_tools.py` 只允许固定批准池；原三写须先通过消息快照开关、可信 frame userid 白名单、部署策略路径/仓范围检查，然后才构造仅含本次路径与单仓的写上下文。无 MCP 进程 token/遗留 ContextVar 继承，不 patch `resolve_ctx`。
 3. 每次写调用先落审计 attempt（日志不可写则不执行），完成或拒绝后记录 who/tool/args/result/duration；最终回复追加真实结果回执，模型摘要不能省略。七项 canonical 写始终无 bot schema/adapter。
 
@@ -1754,6 +1754,10 @@ malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/tes
 
 ### 4.1 整体形态
 
+仓库 CLI 创建/克隆和 `db.migrate.migrate_legacy_inventory` 共用路径注册契约，
+配置目录嵌套于代码根时保留已支持的代码相对注册；外部数据根使用 portable `db/...`。
+注册与实际 UoW 打开须指向同一文件，不迁移 master 行或自动认领已有孤立文件。
+
 ```
 db/
 ├── master.db                          # 单文件，全局（含 tenants 注册表）
@@ -2539,6 +2543,9 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 
 ## 9. MCP 架构
 
+UoW 与无缓存采购在默认应用分支显式提供代码根和配置数据根，使已有嵌套目录的
+代码相对注册可逆；显式 Bot 根仍关闭配置根映射，SQLite 只读和 ACL 边界不变。
+
 > **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（32 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
@@ -3062,6 +3069,8 @@ GET/旧 MCP 仅投影摘要、历史和暂停原因。撤回不依赖 ORDER_CHAN
 BEGIN IMMEDIATE 内重读同租户活跃身份/角色包、全部原来源与新来源审批权、
 目标店原下单人或经理/管理员的决定权、商业/受影响行基线与占用及 master 准备指纹。
 平台管理员仍须明确目标店并记录代确认，提议人不能自确认；按钮共用 fresh 策略。
+替换候选仓库通过共享配置数据根解析器打开，保持 `mode=ro`、BEGIN 读事务与连接关闭；
+相对与绝对注册的报价、预览和持久方案快照使用同一真实来源仓库。
 当前候选同时验证租户路由、canonical active、门店停用/专属、唯一 active 非 alias
 履约行、单位/冲突、可订、倍数及服务端报价。跨库配置无法原子锁定，仅记录观测
 指纹/时间及边界；接受后库存仍只在实际发货时扣减、冻结 item/unit 仍由原协议复核。
@@ -3394,6 +3403,12 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+`test_external_warehouse_paths.py` 以真实 SQLite 验证相对注册的替换候选、预览及
+持久方案快照均取配置价 7（代码根诱饵价 99 保持不变）。独立子进程覆盖默认
+`code/db`、嵌套 `code/db/custom-data`、不同名子目录与外部根的 create/clone/
+旧库初始化 → master 注册 → 实际 UoW 打开，并保留旧注册、绝对行和显式 Bot
+根在实际 inventory/只读 procurement 调用中的优先级。仅夹具打开既有 rollout。
 
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/

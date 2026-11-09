@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -257,3 +260,190 @@ def test_actual_app_mcp_cli_migration_select_external_data_root(tmp_path):
     assert observed["import"]["after"]["external"] == observed["import"]["before"]["external"] + 1
     assert observed["import"]["after"]["legacy"] == observed["import"]["before"]["legacy"]
     assert observed["decoys"] == {"legacy": "legacy", "cwd": "cwd"}
+
+
+def test_order_change_relative_quote_preview_and_persisted_price(tmp_path, monkeypatch):
+    import config
+    from blueprints import order_changes_pure as changes
+    from tests.test_order_changes_pure import (
+        change_env,
+        new_order,
+        publish,
+        replacement_intent,
+    )
+
+    external = tmp_path / "external-not-db"
+    external.mkdir()
+    fixture = change_env.__wrapped__(external, monkeypatch)
+    env = next(fixture)
+    try:
+        monkeypatch.setattr(config, "DB_DIR", external)
+        legacy = tmp_path / "code"
+        monkeypatch.setattr(config, "BASE_DIR", legacy)
+        master = env["master"]
+        order = new_order(env)
+        intent = replacement_intent(order)
+
+        def quote(snapshot):
+            return next(line["unit_price_snapshot"] for line in snapshot["after"]["lines"]
+                        if line.get("canonical_id") == 207)
+
+        absolute = changes.preview_proposal(
+            master, order_id=order["id"], actor_id=4,
+            current_warehouse_code="dc_alpha", intent=intent,
+        )
+        assert quote(absolute["snapshot"]) == "7.0"
+        decoys = []
+        for code, path in env["paths"].items():
+            decoy = legacy / "db/warehouses" / path.name
+            decoy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, decoy)
+            with closing(sqlite3.connect(decoy)) as conn:
+                conn.execute("UPDATE items SET selling_price=99")
+                conn.commit()
+            decoys.append(decoy)
+            master.execute("UPDATE warehouses SET db_path=? WHERE code=?",
+                           ("db/warehouses/" + path.name, code))
+        master.commit()
+        hashes = {path: sha256(path.read_bytes()).hexdigest() for path in decoys}
+        candidates = changes.list_replacement_candidates(master, order)
+        assert next(row for row in candidates if row["canonical_id"] == 207)[
+            "unit_price_snapshot"] == "7.0"
+        proposal, preview = publish(env, order, intent=intent)
+        assert quote(preview["snapshot"]) == "7.0"
+        stored = master.execute(
+            "SELECT snapshot_json FROM store_order_change_proposals WHERE id=?",
+            (proposal["id"],),
+        ).fetchone()[0]
+        assert proposal["status"] == "pending"
+        assert quote(json.loads(stored)) == "7.0"
+        assert {path: sha256(path.read_bytes()).hexdigest() for path in decoys} == hashes
+        with closing(sqlite3.connect(env["paths"]["dc_beta"])) as conn:
+            assert conn.execute("SELECT selling_price FROM items WHERE canonical_id=207").fetchone()[0] == 7
+        wh = changes._readonly_warehouse(master, "dc_beta")
+        try:
+            assert wh.in_transaction
+            with pytest.raises(sqlite3.OperationalError):
+                wh.execute("UPDATE items SET selling_price=0")
+        finally:
+            wh.close()
+        with pytest.raises(sqlite3.ProgrammingError):
+            wh.execute("SELECT 1")
+        for decoy in decoys:
+            decoy.unlink()
+        assert next(row for row in changes.list_replacement_candidates(master, order)
+                    if row["canonical_id"] == 207)["unit_price_snapshot"] == "7.0"
+    finally:
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+
+REGISTRATION_CHILD = r'''
+import hashlib, json, os, shutil, sqlite3, sys
+from contextlib import closing
+from pathlib import Path
+repo, root, layout = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+base = root / "code"
+data = {"default": base/"db", "nested": base/"db/custom-data",
+        "child": base/"custom-data", "external": root/"external-not-db"}[layout]
+os.environ["DAILYCHECK_DB_DIR"] = str(data)
+sys.path.insert(0, str(repo))
+import config
+config.BASE_DIR = base
+import db, cli
+from warehouse_paths import resolve_warehouse_path, warehouse_registration_path
+from mcp_server.data.unit_of_work import warehouse_connection
+from mcp_server.service.inventory import get_item
+from mcp_server.service.auth import AuthContext
+from mcp_server.service.procurement import procurement_store
+db.init_master_db()
+cli.create_warehouse_cmd.main(args=["wh_new", "New"], standalone_mode=False)
+actual = data/"warehouses/wh_new.db"
+with closing(sqlite3.connect(actual)) as c:
+    category = c.execute("SELECT id FROM categories LIMIT 1").fetchone()[0]
+    c.execute("INSERT INTO items(sku,name,category_id,quantity,unit,selling_price,updated_at) "
+              "VALUES ('owned','Owned',?,12,'件',7,'2026-01-01')", (category,))
+    c.commit()
+source_hash = hashlib.sha256(actual.read_bytes()).hexdigest()
+cli.clone_warehouse_cmd.main(args=["wh_new", "wh_clone", "Clone"], standalone_mode=False)
+assert hashlib.sha256(actual.read_bytes()).hexdigest() == source_hash
+with closing(sqlite3.connect(config.MASTER_DB)) as master:
+    rows = dict(master.execute("SELECT code,db_path FROM warehouses"))
+    for code, stored in rows.items():
+        target = data/"warehouses"/(code+".db")
+        assert warehouse_registration_path(target, base_dir=base, db_dir=data) == stored
+        assert resolve_warehouse_path(stored, base, db_dir=data) == target
+        with warehouse_connection(stored, read_only=True) as c:
+            assert Path(c.execute("PRAGMA database_list").fetchone()[2]) == target.resolve()
+            item = c.execute("SELECT quantity,name FROM items WHERE sku='owned'").fetchone()
+            assert tuple(item) == (12 if code == 'wh_new' else 0, 'Owned')
+    # Already supported metadata: code-relative in-code layouts, portable external, and absolute.
+    old = str(actual.relative_to(base)) if actual.is_relative_to(base) else 'db/warehouses/wh_new.db'
+    for code, stored in [('legacy', old), ('absolute', str(actual)), ('portable', 'db/warehouses/wh_new.db')]:
+        master.execute("INSERT INTO warehouses(code,name,db_path,created_at) VALUES (?,?,?,'2026-01-01')",
+                       (code, code, stored))
+    master.commit()
+    for code in ('legacy', 'absolute', 'portable'):
+        stored = master.execute("SELECT db_path FROM warehouses WHERE code=?", (code,)).fetchone()[0]
+        with warehouse_connection(stored, read_only=True) as c:
+            assert Path(c.execute("PRAGMA database_list").fetchone()[2]) == actual.resolve()
+        assert master.execute("SELECT db_path FROM warehouses WHERE code=?", (code,)).fetchone()[0] == stored
+# The legacy initializer is another creation/registration caller, with owned input only.
+from db.migrate import migrate_legacy_inventory
+base.mkdir(parents=True, exist_ok=True)
+legacy_input = base/'inventory.db'
+db.init_warehouse_db(legacy_input)
+legacy_hash = hashlib.sha256(legacy_input.read_bytes()).hexdigest()
+migrated = migrate_legacy_inventory()
+assert hashlib.sha256(legacy_input.read_bytes()).hexdigest() == legacy_hash
+with closing(sqlite3.connect(config.MASTER_DB)) as master:
+    stored = master.execute("SELECT db_path FROM warehouses WHERE code='wh_001'").fetchone()[0]
+with warehouse_connection(stored, read_only=True) as c:
+    assert Path(c.execute("PRAGMA database_list").fetchone()[2]) == migrated.resolve()
+# Actual default/explicit-root MCP inventory and readonly procurement adapter.
+bot_base = root/'bot-base'
+bot_file = bot_base/rows['wh_new']
+bot_file.parent.mkdir(parents=True)
+shutil.copyfile(actual, bot_file)
+with closing(sqlite3.connect(bot_file)) as c:
+    c.execute("UPDATE items SET quantity=900"); c.commit()
+default = AuthContext(1, [], [], ['wh_new'], read_only=True)
+override = AuthContext(1, [], [], ['wh_new'], read_only=True, warehouse_base_dir=str(bot_base))
+assert get_item(1, 'wh_new', default)['current_stock'] == 12
+assert get_item(1, 'wh_new', override)['current_stock'] == 900
+real_connect = sqlite3.connect
+opened = []
+def observe(path, *args, **kwargs):
+    opened.append(str(path)); return real_connect(path, *args, **kwargs)
+sqlite3.connect = observe
+try:
+    for ctx, target in [(default, actual), (override, bot_file)]:
+        opened.clear()
+        assert procurement_store('wh_new', ctx)['warehouse_code'] == 'wh_new'
+        assert any(str(target) in path for path in opened), opened
+finally:
+    sqlite3.connect = real_connect
+assert hashlib.sha256(actual.read_bytes()).hexdigest() == source_hash
+print(json.dumps(dict(registrations=rows, roundtrip=True, legacy=True, absolute=True,
+                     portable=True, initializer=True, bot_override=True, procurement=True,
+                     source_unchanged=True)))
+'''
+
+
+@pytest.mark.parametrize("layout", ["default", "nested", "child", "external"])
+def test_actual_create_clone_legacy_and_bot_roundtrip(tmp_path, layout):
+    script = tmp_path / "registration_control.py"
+    script.write_text(REGISTRATION_CHILD)
+    result = subprocess.run(
+        [sys.executable, "-B", "-I", str(script), str(ROOT), str(tmp_path / "fixture"), layout],
+        cwd=tmp_path, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(result.stdout.splitlines()[-1])
+    assert all(observed[key] for key in ("roundtrip", "legacy", "absolute", "portable", "initializer",
+                                        "bot_override", "procurement", "source_unchanged"))
+    prefix = {"default": "db", "nested": "db/custom-data", "child": "custom-data",
+              "external": "db"}[layout]
+    assert observed["registrations"] == {
+        code: f"{prefix}/warehouses/{code}.db" for code in ("wh_new", "wh_clone")}

@@ -30,7 +30,8 @@ def warehouse_connection(
     from db.warehouse_migrate import connect_existing
 
     path = resolve_warehouse_path(
-        db_path, base_dir, db_dir=config.DB_DIR if base_dir is None else None).resolve()
+        db_path, config.BASE_DIR if base_dir is None else base_dir,
+        db_dir=config.DB_DIR if base_dir is None else None).resolve()
     if read_only:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     else:

@@ -74,7 +74,7 @@ def _readonly_store(warehouse_code: str, ctx: AuthContext) -> dict | None:
     items = compute_store_procurement(
         warehouse_code,
         str(resolve_warehouse_path(
-            wh["db_path"], ctx.warehouse_base_dir,
+            wh["db_path"], config.BASE_DIR if ctx.warehouse_base_dir is None else ctx.warehouse_base_dir,
             db_dir=config.DB_DIR if ctx.warehouse_base_dir is None else None)),
         config_values=values, read_only=True,
     )

@@ -12,15 +12,15 @@ multi-warehouse model each warehouse owns its own db file. We:
 """
 from __future__ import annotations
 
-import sqlite3
 import shutil
+import sqlite3
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
-from config import BASE_DIR, MASTER_DB, WAREHOUSE_DB_DIR
+from config import BASE_DIR, DB_DIR, MASTER_DB, WAREHOUSE_DB_DIR
 from db import WAREHOUSE_SCHEMA, init_master_db, init_warehouse_db
-
+from warehouse_paths import warehouse_registration_path
 
 LEGACY_DB = BASE_DIR / "inventory.db"
 SEED_WAREHOUSE_CODE = "wh_001"
@@ -62,7 +62,7 @@ def migrate_legacy_inventory() -> Path:
 
     # Register in master.db.
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rel_path = str(target.relative_to(BASE_DIR))
+    rel_path = warehouse_registration_path(target, base_dir=BASE_DIR, db_dir=DB_DIR)
     with closing(sqlite3.connect(MASTER_DB)) as conn:
         existing = conn.execute(
             "SELECT id FROM warehouses WHERE code=?", (SEED_WAREHOUSE_CODE,)

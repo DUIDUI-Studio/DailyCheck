@@ -3,10 +3,12 @@
 Absolute metadata paths are retained. When ``db_dir`` is supplied, the legacy
 ``db/...`` registration prefix maps onto that configured directory (for example
 ``db/warehouses/x.db`` becomes ``<db_dir>/warehouses/x.db``) even when the
-configured directory is not named ``db``. An explicit ``base_dir`` then keeps
-its documented application fallback and Bot precedence for all other relative
-forms; Bot callers pass only ``db_dir().parent``. Without either argument the
-raw stored path is returned, preserving the legacy CWD-relative behavior.
+configured directory is not named ``db``. When the configured directory is
+inside ``base_dir``, its exact code-relative prefix takes precedence, retaining
+existing registrations such as ``db/custom-data/warehouses/x.db``. Other
+relative forms retain the application base fallback. Bot callers pass only
+their explicit base, suppressing configured remapping. Without either argument
+the raw stored path is returned, preserving legacy CWD-relative behavior.
 """
 from __future__ import annotations
 
@@ -19,7 +21,12 @@ def resolve_warehouse_path(stored: str | Path, base_dir: str | Path | None = Non
     if path.is_absolute():
         return path
     if db_dir is not None and path.parts and path.parts[0] == "db":
-        return Path(db_dir).joinpath(*path.parts[1:])
+        data = Path(db_dir)
+        if base_dir is not None and data.is_relative_to(Path(base_dir)):
+            prefix = data.relative_to(Path(base_dir))
+            if prefix != Path(".") and path.is_relative_to(prefix):
+                return Path(base_dir) / path
+        return data.joinpath(*path.parts[1:])
     if base_dir is not None:
         return Path(base_dir) / path
     return path
@@ -30,7 +37,9 @@ def warehouse_registration_path(db_path: str | Path, *, base_dir: str | Path,
     """Return the existing portable registration form for a newly created DB.
 
     Files under the code root keep the exact legacy ``relative_to(base_dir)``
-    form. Files under a configured external data root are stored as the legacy
+    form, including nested data roots such as ``db/custom-data``. The resolver
+    recognizes that configured prefix before portable ``db/`` remapping.
+    Files under a configured external data root are stored as the legacy
     ``db/...`` form so the same resolver maps them back without a metadata
     rewrite.
     """
