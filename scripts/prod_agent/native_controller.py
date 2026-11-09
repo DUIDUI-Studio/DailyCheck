@@ -7,7 +7,6 @@ import json
 import os
 import re
 import sys
-import time
 from pathlib import Path
 
 from scripts.ci.merge_group import REPOSITORY, QueueReader, digest, sha, validate_manifest
@@ -22,6 +21,7 @@ from scripts.prod_agent.native_ports import (
     ProtectedReview,
     ProtectedRuntime,
 )
+from scripts.prod_agent.native_prepare import NativePreparer
 from scripts.prod_agent.native_queue import (
     NativeQueue,
     candidate,
@@ -157,6 +157,28 @@ class NativeController:
             raise ValueError("protected baseline/source initialization required")
         return state
 
+    def review_ci(self, value):
+        """Authenticated CI facts, exactly the ones the protected review consumer rebinds."""
+        from scripts.prod_agent.github_readiness import validate_native_ci
+
+        manifest = value["manifest"]
+        runs = [self.facts._run("G", manifest["group_sha"], None)]
+        runs += [self.facts._run("H", m["head_sha"], m["number"]) for m in manifest["members"]]
+        return validate_native_ci(self.policy.location("repo"), manifest,
+                                  self.policy.producer, runs)
+
+    def prepare_review_request(self, value):
+        """Authenticated root side only binds request facts; it never decides a pass."""
+        return NativePreparer(self.policy).prepare_review_request(value, self.review_ci(value))
+
+    def publish_g_runtime(self, value):
+        """One bounded independent publisher; fixture mode uses the injected observer."""
+        preparer = NativePreparer(self.policy, observer=self.runtime.observer
+                                  if self.policy.fixture else None)
+        if self.policy.fixture:
+            return preparer.publish_runtime_green()
+        return preparer.publish_runtime_process("green")
+
     def deploy_front(self, group=None):
         # Mandatory dependency check precedes candidate work or attempt admission.
         runner = NativeQueue(self.policy.location("repo"), self.policy.location("directory"),
@@ -174,21 +196,18 @@ class NativeController:
             if group is not None and sha(group) != actual:
                 raise ValueError("event hint is not current live G")
             value = self._candidate(actual)
+            self.prepare_review_request(value)
             runner.gate = GitHubGProdGate(self.policy, value)
             runner.start(value)
-            # The independent publisher observes the completed real journal;
-            # this wait can neither manufacture a record nor re-run deployment.
-            deadline = time.monotonic() + 120
-            while True:
-                try:
-                    runtime = self.runtime.read()
-                    if runtime == {"sha": actual, "incident": False, "observation_complete": True}:
-                        break
-                except ValueError:
-                    pass
-                if time.monotonic() >= deadline:
-                    raise ValueError("independent G runtime publisher unavailable; reconcile required")
-                time.sleep(5)
+            # start() returns only after the actual stage journal (including its
+            # >=600s observation) is complete. The bounded independent publisher
+            # reads that journal and writes the runtime record; it never re-runs
+            # deployment or owns the attempt fence. Positive child exit is the only
+            # completion proof.
+            self.publish_g_runtime(value)
+            runtime = self.runtime.read()
+            if runtime != {"sha": actual, "incident": False, "observation_complete": True}:
+                raise ValueError("independent G runtime publisher unavailable; reconcile required")
             runner.seal(value)
             runner.grant(value)
             return {"result": runner.reconcile(), "activation": "OFF"}

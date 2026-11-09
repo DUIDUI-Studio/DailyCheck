@@ -25,7 +25,7 @@ from scripts.prod_agent.native_queue import NativeQueue, ProducerPolicy, deploy_
 MAX_INPUT = 1024 * 1024
 AUTHORITY_FILES = (
     "scripts/prod_agent/native_ports.py", "scripts/prod_agent/native_gate.py",
-    "scripts/prod_agent/native_pipeline.py",
+    "scripts/prod_agent/native_pipeline.py", "scripts/prod_agent/native_prepare.py",
     "scripts/prod_agent/native_controller.py", "scripts/prod_agent/native_queue.py",
     "scripts/prod_agent/github_readiness.py", "scripts/hosting.py",
     "scripts/ci/merge_group.py", "scripts/ci/candidate_binding.py",
@@ -311,6 +311,44 @@ class AppSignerIdentity:
         return identity
 
 
+def observed_units(policy, sha_value: str) -> list[str]:
+    """Fixed app/MCP pair selected from the actual protected state, never caller JSON."""
+    state = deploy_state.load_state(policy.location("directory"))
+    active = (state.get("native_queue") or {}).get("active")
+    native_runtime = (active and active["candidate"]["manifest"]["group_sha"] == sha_value
+                      or any(o.get("sha") == sha_value and o.get("native_evidence_sha256")
+                             and o.get("result") == "success" for o in state.get("outcomes", {}).values()))
+    if native_runtime:
+        return ["dailycheck-green.service", "dailycheck-green-mcp.service"]
+    return list(policy.value["units"])
+
+
+def observe_processes(policy, observer, sha_value: str) -> list[dict]:
+    observed = copy(policy)
+    observed.value = {**policy.value, "units": observed_units(policy, sha_value)}
+    return observer.observe(observed)
+
+
+def probe_health(policy, role: str, url: str) -> None:
+    """Exact fixed loopback health probe; production target cannot come from a caller."""
+    u = urlsplit(url)
+    ports = {8090, 8091} if role == "app" else {5100, 5101}
+    if policy.fixture:
+        ports = {urlsplit(policy.fixture.endpoint).port}
+    if (u.scheme != "http" or u.hostname != "127.0.0.1" or u.port not in ports
+            or u.path != "/health" or u.username or u.password or u.query or u.fragment):
+        raise ValueError("invalid fixed runtime probe")
+    connection = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
+    try:
+        headers = {"Authorization": "Bearer " + policy.mcp_health_token()} if role == "mcp" else {}
+        connection.request("GET", "/health", headers=headers)
+        response = connection.getresponse()
+        if response.status != 200 or len(response.read(65537)) > 65536:
+            raise ValueError("runtime route unhealthy")
+    finally:
+        connection.close()
+
+
 class SystemdObserver:
     def observe(self, policy):
         if sys.platform != "linux":
@@ -363,13 +401,7 @@ class ProtectedRuntime:
         sha(record["tree"])
         state = deploy_state.load_state(policy.location("directory"))
         active = (state.get("native_queue") or {}).get("active")
-        native_runtime = (active and active["candidate"]["manifest"]["group_sha"] == record["sha"]
-                          or any(o.get("sha") == record["sha"] and o.get("native_evidence_sha256")
-                                 and o.get("result") == "success" for o in state.get("outcomes", {}).values()))
-        observed_policy = copy(policy)
-        if native_runtime:
-            observed_policy.value = {**policy.value, "units": ["dailycheck-green.service", "dailycheck-green-mcp.service"]}
-        processes = self.observer.observe(observed_policy)
+        processes = observe_processes(policy, self.observer, record["sha"])
         if processes != record["processes"] or len(processes) != 2:
             raise ValueError("runtime process identity changed")
         release = policy.location("release_root") / record["sha"]
@@ -384,23 +416,8 @@ class ProtectedRuntime:
         if set(record["routes"]) != {"app", "mcp"}:
             raise ValueError("protected route observations required")
         for role, url in record["routes"].items():
-            u = urlsplit(url)
-            ports = {8090, 8091} if role == "app" else {5100, 5101}
-            if policy.fixture:
-                ports = {urlsplit(policy.fixture.endpoint).port}
-            if (u.scheme != "http" or u.hostname != "127.0.0.1" or u.port not in ports
-                    or u.path != "/health" or u.username or u.password or u.query or u.fragment):
-                raise ValueError("invalid fixed runtime probe")
-            connection = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
-            try:
-                headers = {"Authorization": "Bearer " + policy.mcp_health_token()} if role == "mcp" else {}
-                connection.request("GET", "/health", headers=headers)
-                response = connection.getresponse()
-                if response.status != 200 or len(response.read(65537)) > 65536:
-                    raise ValueError("runtime route unhealthy")
-            finally:
-                connection.close()
-        if self.observer.observe(observed_policy) != processes:
+            probe_health(policy, role, url)
+        if observe_processes(policy, self.observer, record["sha"]) != processes:
             raise ValueError("runtime drift during collection")
         if active and active["candidate"]["manifest"]["group_sha"] == record["sha"]:
             journal = active["journal"]

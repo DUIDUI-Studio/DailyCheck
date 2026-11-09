@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,11 @@ BOOTSTRAP = ("import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); "
              "runpy.run_module('scripts.prod_agent.native_pipeline',run_name='__main__')")
 
 
+RELEASE_MODES = {"100644": 0o444, "100755": 0o555}
+RELEASE_EXCLUDED_PARTS = frozenset({".git", ".venv"})
+CAPABILITY_BOUNDING_SET = "CAP_SETUID CAP_SETGID CAP_SETPCAP"
+
+
 def application_runtime(python: Path) -> dict:
     """Non-importing fingerprint of a separately provisioned application venv."""
     root = python.parent.parent
@@ -50,6 +56,144 @@ def application_runtime(python: Path) -> dict:
              and p.suffix in {".py", ".so", ".pyd", ".pth"}}
     return {"python_sha256": hashlib.sha256(python.resolve().read_bytes()).hexdigest(),
             "files_sha256": digest(files)}
+
+
+def literal_tree(repo: Path, sha_value: str) -> tuple[str, list[dict]]:
+    """Return the complete literal tree as (tree, entries).
+
+    Only regular executable/non-executable blobs are accepted. Symlinks,
+    gitlinks, submodules, hooks/filters, ``.git``/``.venv`` aliases and the
+    generated ``release.json`` name are rejected so an export can never
+    execute or transform candidate-controlled bytes.
+    """
+    tree, _ = commit(repo, sha_value)
+    raw = subprocess.check_output(["/usr/bin/git", "-C", str(repo), "ls-tree", "-rz",
+                                   "--full-tree", sha_value],
+                                  env={"PATH": "/usr/bin:/bin", "LANG": "C"})
+    entries = []
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        meta, filename = item.split(b"\t", 1)
+        mode, kind, oid = meta.decode("ascii").split()
+        name = Path(filename.decode("utf-8"))
+        if (name.is_absolute() or ".." in name.parts or name.parts[0] in RELEASE_EXCLUDED_PARTS
+                or kind != "blob" or mode not in RELEASE_MODES or str(name) == "release.json"):
+            raise ValueError("unsupported release tree entry")
+        entries.append({"path": str(name), "mode": mode, "oid": oid})
+    return tree, entries
+
+
+def _release_blob(repo: Path, oid: str) -> bytes:
+    return subprocess.check_output(["/usr/bin/git", "-C", str(repo), "cat-file", "blob", oid],
+                                   env={"PATH": "/usr/bin:/bin", "LANG": "C"})
+
+
+def verify_literal_release(repo: Path, sha_value: str, tree: str, destination: Path,
+                           entries: list[dict]) -> None:
+    """Prove an existing release is exactly the approved immutable literal tree."""
+    if destination.is_symlink() or not destination.is_dir():
+        raise ValueError("existing release is not an immutable directory")
+    expected = {row["path"]: row for row in entries}
+    found = set()
+    for path in destination.rglob("*"):
+        relative = str(path.relative_to(destination))
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_mode & 0o222:
+            raise ValueError("existing release is mutable/aliased")
+        if path.is_dir():
+            if info.st_mode & 0o222:
+                raise ValueError("existing release directory is writable")
+            continue
+        if relative == "release.json":
+            continue
+        if relative not in expected:
+            raise ValueError("existing release has unexpected files")
+        row = expected[relative]
+        if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != RELEASE_MODES[row["mode"]]
+                or path.read_bytes() != _release_blob(repo, row["oid"])):
+            raise ValueError("existing release blob/mode mismatch")
+        found.add(relative)
+    if found != set(expected):
+        raise ValueError("existing release is incomplete")
+    manifest = destination / "release.json"
+    info = manifest.lstat()
+    if (manifest.is_symlink() or not stat.S_ISREG(info.st_mode)
+            or info.st_mode & 0o777 != 0o444 or info.st_uid != destination.stat().st_uid
+            or manifest.read_bytes() != json.dumps({"sha": sha_value, "tree": tree}).encode()):
+        raise ValueError("existing release manifest mismatch")
+
+
+def write_literal_release(repo: Path, sha_value: str, tree: str, destination: Path,
+                          entries: list[dict], *, existing: str = "reject") -> bool:
+    """Create or verify one immutable literal-blob release.
+
+    Returns ``True`` when a new release was written and ``False`` when an
+    existing release was verified byte-for-byte. A mismatched/partial existing
+    destination is never overwritten.
+    """
+    if existing not in {"reject", "verify"}:
+        raise ValueError("invalid release destination policy")
+    if destination.exists() or destination.is_symlink():
+        if existing == "reject":
+            raise ValueError("release already exists; reconcile instead of redeploy")
+        verify_literal_release(repo, sha_value, tree, destination, entries)
+        return False
+    destination.mkdir(mode=0o755)
+    for row in entries:
+        target = destination / row["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(_release_blob(repo, row["oid"]))
+        target.chmod(RELEASE_MODES[row["mode"]])
+    (destination / "release.json").write_text(json.dumps({"sha": sha_value, "tree": tree}))
+    (destination / "release.json").chmod(0o444)
+    for path in sorted(destination.rglob("*"), reverse=True):
+        if path.is_dir():
+            path.chmod(0o555)
+    destination.chmod(0o555)
+    return True
+
+
+def render_unit(*, description: str, working_directory: str, environment_file: str,
+                environment_lines: list[tuple[str, str]], read_write_paths: str,
+                inaccessible_paths: str, module: str, python: str, app_uid: int, app_gid: int,
+                exec_start_pre: tuple[str, ...] = (), unit_conditions: tuple[str, ...] = (),
+                user: int = 0, group: int = 0,
+                capability_bounding_set: str = CAPABILITY_BOUNDING_SET,
+                protect_home: str = "yes", protect_system: str = "strict",
+                private_tmp: str = "yes", restart: str = "on-failure") -> str:
+    """Fixed protected unit recipe; no caller-supplied unit/command is consumed."""
+    conditions = "".join(f"{line}\n" for line in unit_conditions)
+    pretests = "".join(f"ExecStartPre={line}\n" for line in exec_start_pre)
+    environment = "".join(f"Environment={key}={value}\n" for key, value in environment_lines)
+    exec_environment = ("PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 "
+                        "DAILYCHECK_ENV=production DRY_RUN=${DRY_RUN} "
+                        "DAILYCHECK_DB_DIR=${DAILYCHECK_DB_DIR} "
+                        "DAILYCHECK_SECRET_KEY=${DAILYCHECK_SECRET_KEY} "
+                        "DAILYCHECK_MCP_TOKEN=${DAILYCHECK_MCP_TOKEN}")
+    return f"""[Unit]
+Description={description}
+{conditions}After=network.target
+[Service]
+Type=simple
+User={user}
+Group={group}
+SupplementaryGroups=
+NoNewPrivileges=yes
+CapabilityBoundingSet={capability_bounding_set}
+AmbientCapabilities=
+ProtectSystem={protect_system}
+ProtectHome={protect_home}
+PrivateTmp={private_tmp}
+InaccessiblePaths={inaccessible_paths}
+ReadWritePaths={read_write_paths}
+WorkingDirectory={working_directory}
+{environment}EnvironmentFile={environment_file}
+{pretests}ExecStart=/usr/bin/env -i {exec_environment} /usr/bin/setpriv --reuid={app_uid} --regid={app_gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs {python} -B -m {module}
+Restart={restart}
+[Install]
+WantedBy=multi-user.target
+"""
 
 
 def database_snapshot(directory: Path) -> dict:
@@ -264,35 +408,13 @@ class ProtectedPipeline:
         release = self._release(candidate)
         if release.exists():
             raise ValueError("release already exists; reconcile instead of redeploy")
-        tree, _ = commit(p.location("repo"), manifest["group_sha"])
+        tree, entries = literal_tree(p.location("repo"), manifest["group_sha"])
         if tree != manifest["tree_sha"]:
             raise ValueError("release tree changed")
-        release.mkdir(mode=0o755)
-        raw = subprocess.check_output(["/usr/bin/git", "-C", str(p.location("repo")),
-                                       "ls-tree", "-rz", "--full-tree", manifest["group_sha"]],
-                                      env={"PATH": "/usr/bin:/bin", "LANG": "C"})
-        for entry in raw.split(b"\0"):
-            if not entry:
-                continue
-            meta, filename = entry.split(b"\t", 1)
-            mode, kind, oid = meta.decode("ascii").split()
-            name = Path(filename.decode("utf-8"))
-            if (name.is_absolute() or ".." in name.parts or name.parts[0] in {".git", ".venv"}
-                    or kind != "blob" or mode not in {"100644", "100755"} or str(name) == "release.json"):
-                raise ValueError("unsupported release tree entry")
-            target = release / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            # Read literal blobs: archive/checkout attributes, filters and hooks
-            # must never transform or execute candidate-controlled bytes as root.
-            target.write_bytes(subprocess.check_output(["/usr/bin/git", "-C", str(p.location("repo")),
-                "cat-file", "blob", oid], env={"PATH": "/usr/bin:/bin", "LANG": "C"}))
-            target.chmod(0o555 if mode == "100755" else 0o444)
-        (release / "release.json").write_text(json.dumps({"sha": manifest["group_sha"], "tree": tree}))
-        (release / "release.json").chmod(0o444)
-        for path in sorted(release.rglob("*"), reverse=True):
-            if path.is_dir():
-                path.chmod(0o555)
-        release.chmod(0o555)
+        # Read literal blobs: archive/checkout attributes, filters and hooks
+        # must never transform or execute candidate-controlled bytes as root.
+        write_literal_release(p.location("repo"), manifest["group_sha"], tree, release,
+                              entries, existing="reject")
         # The object-store checkout is never executed. Move only its detached
         # identity cursor under the existing state/attempt fences for core seal;
         # application bytes come from the immutable literal-blob release above.
@@ -337,34 +459,20 @@ class ProtectedPipeline:
                 raise ValueError("unreviewed service drop-ins require installation reconciliation")
             private = " ".join(str(p.location(k)) for k in ("directory", "review_directory"))
             private += " " + " ".join(str(p.location(k)) for k in ("key_file", "read_token_file", "runtime_file", "bootstrap_file"))
-            content = f"""[Unit]
-Description=DailyCheck protected native candidate
-After=network.target
-[Service]
-Type=simple
-User=0
-Group=0
-SupplementaryGroups=
-NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP
-AmbientCapabilities=
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-InaccessiblePaths={private}
-ReadWritePaths={self.path('green_db')} {self.path('source_db')} {access}
-WorkingDirectory={release}
-Environment=PATH=/usr/bin:/bin
-Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=DAILYCHECK_ENV=production
-Environment=DRY_RUN=true
-Environment=DAILYCHECK_DB_DIR={self.path('green_db')}
-EnvironmentFile={self.path('app_environment_file')}
-ExecStart=/usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 DAILYCHECK_ENV=production DRY_RUN=${{DRY_RUN}} DAILYCHECK_DB_DIR=${{DAILYCHECK_DB_DIR}} DAILYCHECK_SECRET_KEY=${{DAILYCHECK_SECRET_KEY}} DAILYCHECK_MCP_TOKEN=${{DAILYCHECK_MCP_TOKEN}} /usr/bin/setpriv --reuid={p.value['app_uid']} --regid={self.value['app_gid']} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs {self.python} -B -m {module}
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-"""
+            content = render_unit(
+                description="DailyCheck protected native candidate",
+                working_directory=str(release),
+                environment_file=str(self.path("app_environment_file")),
+                environment_lines=[("PATH", "/usr/bin:/bin"), ("PYTHONDONTWRITEBYTECODE", "1"),
+                                   ("DAILYCHECK_ENV", "production"), ("DRY_RUN", "true"),
+                                   ("DAILYCHECK_DB_DIR", str(self.path("green_db")))],
+                read_write_paths=f"{self.path('green_db')} {self.path('source_db')} {access}",
+                inaccessible_paths=private,
+                module=module,
+                python=str(self.python),
+                app_uid=p.value["app_uid"],
+                app_gid=self.value["app_gid"],
+            )
             path.write_text(content)
             path.chmod(0o644)
         subprocess.run(["/usr/bin/systemctl", "daemon-reload"],

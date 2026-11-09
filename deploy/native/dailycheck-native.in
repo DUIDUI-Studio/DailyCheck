@@ -1,0 +1,16 @@
+#!/bin/sh
+# Fixed installed DailyCheck native entrypoint.
+#
+# This inert template is rendered by `render-preparation` with the approved
+# control interpreter and the offline source authority, then installed later
+# by Prod as:
+#
+#   /usr/local/sbin/dailycheck-native   root:root 0755
+#
+# No inherited environment, PYTHONPATH, descriptor or arbitrary path/command is
+# passed through. The adapter's fixed operation list is the only reachable
+# surface, and isolated mode (-I) ignores user site/PYTHON* inputs.
+set -eu
+umask 077
+exec /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
+  @PYTHON@ -I -B -c 'import runpy,sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("scripts.prod_agent.native_prepare", run_name="__main__")' @AUTHORITY@ "$@"
