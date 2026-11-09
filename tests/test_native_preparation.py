@@ -66,6 +66,24 @@ def plan_document(b, policy: InstalledPolicy, records: Path) -> dict:
         reviewer_gid = pwd.getpwuid(reviewer_uid).pw_gid
     except KeyError:
         reviewer_gid = 65531
+    application_environment = records / "application.env"
+    private(application_environment, "\n".join((
+        "DAILYCHECK_SECRET_KEY=" + "s" * 40,
+        "DAILYCHECK_MCP_TOKEN=" + "t" * 40,
+        "DAILYCHECK_MULTI_WAREHOUSE='1'",
+        "DAILYCHECK_WMS_HOST='wms.internal'",
+        "DAILYCHECK_WMS_PORT='1433'",
+        "DAILYCHECK_WMS_USER='dc_reader'",
+        "DAILYCHECK_WMS_PASSWORD='synthetic pass!'",
+        "DAILYCHECK_WMS_DATABASE='DailyCheck'",
+        "DAILYCHECK_WMS_CUSTOMER_ID='42'",
+        "FEEDBACK_GITEA_TOKEN='gitea-synthetic-token'",
+        "FEEDBACK_LLM_API_KEY='sk-synthetic-key'",
+        "FEEDBACK_LLM_BASE_URL='https://llm.example.invalid'",
+        "FEEDBACK_LLM_MODEL='synthetic-model'",
+        "WECOM_FEEDBACK_WEBHOOK='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=synthetic-feedback'",
+        "WECOM_STORE_ORDER_WEBHOOK='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=synthetic-order'",
+    )) + "\n")
     return {
         "version": 1,
         "source_pin": base,
@@ -94,7 +112,7 @@ def plan_document(b, policy: InstalledPolicy, records: Path) -> dict:
             "green_db": "/var/lib/dailycheck-green/db",
             "blue_access_log": "/var/log/dailycheck-native-access/blue-access.log",
             "green_access_log": "/var/log/dailycheck-native-access/green-access.log",
-            "app_environment_file": "/etc/dailycheck-native/application.env",
+            "app_environment_file": str(application_environment),
             "unit_directory": "/etc/systemd/system",
             "release_root": str(policy.location("release_root")),
             "records_directory": str(records),
@@ -171,7 +189,16 @@ def test_render_preparation_is_inert_and_complete(tmp_path, bridge):
             "--no-new-privs") in blue
     assert "NoNewPrivileges=yes" in blue and "ProtectHome=yes" in blue
     assert "ProtectSystem=strict" in blue and "PrivateTmp=yes" in blue
-    assert "EnvironmentFile=/etc/dailycheck-native/application.env" in blue
+    assert f"EnvironmentFile={document['paths']['app_environment_file']}" in blue
+    assert "DAILYCHECK_WMS_PASSWORD=${DAILYCHECK_WMS_PASSWORD}" in blue
+    assert "DAILYCHECK_MULTI_WAREHOUSE=${DAILYCHECK_MULTI_WAREHOUSE}" in blue
+    assert "FEEDBACK_GITEA_TOKEN=${FEEDBACK_GITEA_TOKEN}" in blue
+    mcp = units["dailycheck-mcp.service"]["content"]
+    assert "DAILYCHECK_WMS_PASSWORD=${DAILYCHECK_WMS_PASSWORD}" in mcp
+    for key in ("FEEDBACK_GITEA_TOKEN", "FEEDBACK_LLM_API_KEY", "FEEDBACK_LLM_BASE_URL",
+                "FEEDBACK_LLM_MODEL", "WECOM_FEEDBACK_WEBHOOK", "WECOM_STORE_ORDER_WEBHOOK",
+                "DAILYCHECK_MULTI_WAREHOUSE"):
+        assert key not in mcp
     assert "DAILYCHECK_DEPLOY_ATTEMPT" not in blue
     assert rendered["launcher"]["path"] == "/usr/local/sbin/dailycheck-native"
     launcher = rendered["launcher"]["content"]

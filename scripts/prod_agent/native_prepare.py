@@ -26,7 +26,13 @@ from pathlib import Path
 
 from scripts.ci.merge_group import REPOSITORY, digest, sha
 from scripts.hosting import AccessRole, HostingClient, HostingConfig, Provider
-from scripts.prod_agent.native_pipeline import literal_tree, render_unit, write_literal_release
+from scripts.prod_agent.native_pipeline import (
+    APPLICATION_ROLE_KEYS,
+    literal_tree,
+    parse_application_environment,
+    render_unit,
+    write_literal_release,
+)
 from scripts.prod_agent.native_ports import (
     InstalledPolicy,
     ProtectedRuntime,
@@ -320,6 +326,8 @@ def _stat_check(plan: PreparationPlan) -> str:
 def _baseline_units(plan: PreparationPlan) -> list[dict]:
     release = str(plan.release_root / plan.baseline.public_sha)
     private = " ".join(str(path) for path in plan.private_paths)
+    application_environment = parse_application_environment(
+        read_protected(plan.app_environment_file, os.geteuid()))
     recipes = (
         ("dailycheck.service", "DailyCheck production app (protected baseline)",
          8090, plan.source_db, "false", plan.blue_access_log, True, False),
@@ -332,6 +340,7 @@ def _baseline_units(plan: PreparationPlan) -> list[dict]:
     )
     units = []
     for name, description, port, database, dry_run, access_log, is_app, green in recipes:
+        role = "app" if is_app else "mcp"
         module = (f"gunicorn --workers 2 --bind 127.0.0.1:{port} "
                   f"--access-logfile {access_log} app:create_app()") if is_app else (
             f"mcp_server --transport http --host 127.0.0.1 --port {port}")
@@ -346,6 +355,9 @@ def _baseline_units(plan: PreparationPlan) -> list[dict]:
             read_write_paths=str(database) + (f" {access_log}" if access_log else ""),
             inaccessible_paths=private, module=module, python=str(plan.app_python),
             app_uid=plan.app_uid, app_gid=plan.app_gid,
+            application_role=role,
+            application_inputs=tuple(
+                key for key in APPLICATION_ROLE_KEYS[role] if key in application_environment),
             exec_start_pre=() if green else (_stat_check(plan),),
             unit_conditions=() if green else (f"ConditionPathIsMountPoint={plan.source_db}",),
         )

@@ -1468,7 +1468,20 @@ capabilities 与净化环境；固定 setpriv launcher 不继承 attempt FD。DB
 capabilities 并切换低身份；可信 launcher 仅暂留 SETUID/SETGID/SETPCAP，candidate 的
 实际 CapEff/Groups 必须为空。固定 recipe 同时绑定 G release、NoNewPrivileges 与
 受限写路径；原 unit 另存私有备份，up/promote 的 DB 隔离、备份/恢复及 switch 回滚继续执行。
-真实 runtime 观察按 active/已锚定 native G 选择固定绿 app/MCP pair，并要求实际完整
+应用环境边界由 `render_unit` 与 G EnvironmentFile validator 共用同一固定契约：必填
+`DAILYCHECK_SECRET_KEY`/`DAILYCHECK_MCP_TOKEN` 保持未加引号的 `[A-Za-z0-9_-]{32,200}`，
+MCP token 必须等于 protected health token 且不同于 GitHub read token；仅允许十三个已测量
+业务键（`DAILYCHECK_MULTI_WAREHOUSE`、六个 `DAILYCHECK_WMS_*`、`FEEDBACK_GITEA_TOKEN`、
+`FEEDBACK_LLM_*` 三项与 `WECOM_*_WEBHOOK` 两项），以 `KEY='value'` 单引号形式逐字传递
+（无转义处理）。角色投影固定不可由调用方选择：app unit 得到十三项，MCP unit 只得到实测
+六个 WMS 名；feedback/LLM/webhook 与多仓键不进入 MCP/controller/helper/test 环境。
+`FEEDBACK_GITEA_TOKEN` 仅为应用建单凭据，不放行任何 Gitea Prod/merge、GitHub/App、read 或
+MCP health token 的复用。缺失的可选键不会写入 `env -i` 固定词表，因此应用源码默认值
+（含数值 WMS 默认、关闭的 feedback/webhook 通道与多仓关闭）保持不变；未知/重复/畸形键、
+控制凭据键和越界值一律拒绝，诊断不输出值，unit 只含固定键名与 `${KEY}` 引用。baseline 与
+G 渲染器都从同一解析器与角色投影推导存在的键；本地 fixture 只模拟文档化的 `${FOO}`
+单参数展开，不证明真实 systemd 执行。真实 runtime 观察按 active/已锚定 native G 选择固定绿
+app/MCP pair，并要求实际完整
 stage journal 与 ≥600 秒 observation，独立 publisher 缺失/过期时不 seal/grant。
 
 native verify 仍执行八项检查：trusted parser 校验低身份全量 pytest 的真实 exit/session；
@@ -3440,6 +3453,13 @@ baseline CLI 自行获取原 fence 与 competing-holder 拒绝、observer 子进
 anchor/policy/epoch/map/source/public/deployed/tree/active/partial 拒绝、渲染 launcher 的五项 lifecycle
 controller 路由与未知命令/选项拒绝。真实 Linux UID 降权、device/inode、实际 ≥600 秒
 窗口与 Prod 安装仍是 NOT_RUN。
+
+`tests/test_native_application_environment.py` 锁定 native application EnvironmentFile
+契约：原始两键文件仍可用；十三个已测量可选键以单引号逐字传递，缺失时不进入 `env -i`
+词表；app 得到全部十三项而 MCP 只得到六个 WMS 名（feedback/LLM/webhook/多仓键不跨角色）；
+未知/重复/控制键、畸形与非 ASCII、端口/长度边界及值诊断不泄漏均拒绝；真实 lower child
+观察（setpriv 在 macOS 移除）保留合成口令/URL 标点与空格，并确认 control env/fence FD
+不继承。该 fixture 只模拟文档化的 `${FOO}` 单参数展开，不证明 systemd 执行。
 
 repair-2 的 R1 caller 回归复用独立审查的 distinct source/P initializer 和 owned HTTP
 health-peer，在实际 isolated baseline publisher 子进程中要求 active/policy/guard

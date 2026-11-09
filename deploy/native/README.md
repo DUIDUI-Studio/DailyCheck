@@ -86,6 +86,46 @@ environment or command selector; `grant`/`release` remain rejected.
   the controller's existing preflight/admit/seal/grant/reconcile semantics;
   `grant`/`release` stay rejected.
 
+## Application input boundary
+
+`render_unit` (shared by baseline preparation and the G executor) and the G
+`EnvironmentFile` validator use one explicit contract:
+
+- `DAILYCHECK_SECRET_KEY` and `DAILYCHECK_MCP_TOKEN` are required and stay
+  unquoted `[A-Za-z0-9_-]{32,200}` tokens. The MCP token must equal the
+  protected health token and must differ from the GitHub read token.
+- Thirteen optional measured business keys may follow, each written as
+  `KEY='value'` with a printable ASCII value containing no single quote:
+  `DAILYCHECK_MULTI_WAREHOUSE`, the six `DAILYCHECK_WMS_*` names, and
+  `FEEDBACK_GITEA_TOKEN`, `FEEDBACK_LLM_API_KEY`, `FEEDBACK_LLM_BASE_URL`,
+  `FEEDBACK_LLM_MODEL`, `WECOM_FEEDBACK_WEBHOOK`,
+  `WECOM_STORE_ORDER_WEBHOOK`. systemd preserves single-quoted bytes verbatim
+  (no escape processing), so spaces and punctuation reach the application
+  unchanged.
+- Projection is fixed by role, never caller-selected: app units receive all
+  thirteen measured names; MCP units receive only the six observed
+  `DAILYCHECK_WMS_*` names. `DAILYCHECK_MULTI_WAREHOUSE` and the feedback/LLM/
+  webhook names are app-only and are never forwarded to MCP, controller,
+  helper or test environments. `FEEDBACK_GITEA_TOKEN` is a dedicated
+  application issue-writing credential only; allowing the name does not
+  authorize reuse or transfer of any Gitea Prod/merge, GitHub, App, read or MCP
+  health token, and credential-shaped values must not equal the latter two.
+- A missing optional key is omitted from the fixed `env -i` word list instead
+  of being passed as an empty value, so application source defaults (including
+  numeric WMS defaults, disabled feedback/webhook channels and disabled
+  multi-warehouse behavior) still hold.
+- Unknown keys, duplicates, malformed lines, non-ASCII bytes, unquoted optional
+  values, out-of-range ports and values containing a single quote are denied.
+  In particular `PATH`, `PYTHONPATH`, `PYTHONHOME`, `LD_*`, `BASH_ENV`, GitHub/
+  Gitea/App authority credentials, fence/controller/policy/command keys and any
+  unmeasured application key cannot enter through this file. Diagnostics never
+  echo a value, and unit text contains only fixed key names and `${KEY}`
+  references.
+
+This is a source contract only. A local fixture emulates the documented
+`${FOO}` single-argument expansion; it does not prove systemd execution.
+Production must create the file in this representation and keep it root:0600.
+
 ## Prod operations contract (minimum)
 
 1. Provision the separate control/app runtimes, accounts, bind-mounted DB and

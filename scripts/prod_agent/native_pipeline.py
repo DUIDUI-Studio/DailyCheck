@@ -46,6 +46,100 @@ BOOTSTRAP = ("import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); "
 RELEASE_MODES = {"100644": 0o444, "100755": 0o555}
 RELEASE_EXCLUDED_PARTS = frozenset({".git", ".venv"})
 CAPABILITY_BOUNDING_SET = "CAP_SETUID CAP_SETGID CAP_SETPCAP"
+REQUIRED_APPLICATION_KEYS = ("DAILYCHECK_SECRET_KEY", "DAILYCHECK_MCP_TOKEN")
+WMS_APPLICATION_KEYS = (
+    "DAILYCHECK_WMS_HOST",
+    "DAILYCHECK_WMS_PORT",
+    "DAILYCHECK_WMS_USER",
+    "DAILYCHECK_WMS_PASSWORD",
+    "DAILYCHECK_WMS_DATABASE",
+    "DAILYCHECK_WMS_CUSTOMER_ID",
+)
+APP_APPLICATION_KEYS = (
+    "DAILYCHECK_MULTI_WAREHOUSE",
+    *WMS_APPLICATION_KEYS,
+    "FEEDBACK_GITEA_TOKEN",
+    "FEEDBACK_LLM_API_KEY",
+    "FEEDBACK_LLM_BASE_URL",
+    "FEEDBACK_LLM_MODEL",
+    "WECOM_FEEDBACK_WEBHOOK",
+    "WECOM_STORE_ORDER_WEBHOOK",
+)
+MCP_APPLICATION_KEYS = WMS_APPLICATION_KEYS
+OPTIONAL_APPLICATION_KEYS = APP_APPLICATION_KEYS
+APPLICATION_ROLE_KEYS = {"app": APP_APPLICATION_KEYS, "mcp": MCP_APPLICATION_KEYS}
+APPLICATION_CREDENTIAL_KEYS = ("FEEDBACK_GITEA_TOKEN", "FEEDBACK_LLM_API_KEY")
+APPLICATION_ENVIRONMENT_KEYS = frozenset(REQUIRED_APPLICATION_KEYS + OPTIONAL_APPLICATION_KEYS)
+_APPLICATION_TOKEN = re.compile(r"[a-zA-Z0-9_-]{32,200}")
+_APPLICATION_CREDENTIAL = re.compile(r"[A-Za-z0-9_.:@+/=-]{8,256}")
+_APPLICATION_URL = re.compile(r"[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,512}")
+_OPTIONAL_VALUE_FORMATS = {
+    "DAILYCHECK_MULTI_WAREHOUSE": re.compile(r"(?i:1|true|yes|on|0|false|no|off)"),
+    "DAILYCHECK_WMS_HOST": re.compile(r"[A-Za-z0-9._:-]{1,255}"),
+    "DAILYCHECK_WMS_PORT": re.compile(r"[0-9]{1,5}"),
+    "DAILYCHECK_WMS_USER": re.compile(r"[A-Za-z0-9_.@/\\-]{1,128}"),
+    "DAILYCHECK_WMS_PASSWORD": re.compile(r"[ -~]{1,256}"),
+    "DAILYCHECK_WMS_DATABASE": re.compile(r"[A-Za-z0-9_.$-]{1,128}"),
+    "DAILYCHECK_WMS_CUSTOMER_ID": re.compile(r"[0-9]{1,10}"),
+    "FEEDBACK_GITEA_TOKEN": _APPLICATION_CREDENTIAL,
+    "FEEDBACK_LLM_API_KEY": _APPLICATION_CREDENTIAL,
+    "FEEDBACK_LLM_BASE_URL": _APPLICATION_URL,
+    "FEEDBACK_LLM_MODEL": re.compile(r"[A-Za-z0-9._:/-]{1,128}"),
+    "WECOM_FEEDBACK_WEBHOOK": _APPLICATION_URL,
+    "WECOM_STORE_ORDER_WEBHOOK": _APPLICATION_URL,
+}
+
+
+def parse_application_environment(raw: bytes) -> dict[str, str]:
+    """Parse the one fixed application EnvironmentFile contract.
+
+    The required keys stay unquoted tokens. Optional measured business keys use
+    a single explicit representation: one printable ASCII value wrapped in
+    single quotes, which systemd preserves verbatim with no escape processing.
+    Missing optional keys stay missing so application source defaults hold.
+    Unknown, duplicate, malformed or quoted required assignments are rejected
+    without echoing any value.
+    """
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("application environment must be ASCII") from None
+    if not lines or len(lines) > len(APPLICATION_ENVIRONMENT_KEYS):
+        raise ValueError("invalid application environment line count")
+    values: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or key not in APPLICATION_ENVIRONMENT_KEYS or key in values:
+            raise ValueError("invalid application environment assignment")
+        if key in REQUIRED_APPLICATION_KEYS:
+            if _APPLICATION_TOKEN.fullmatch(value) is None:
+                raise ValueError("invalid application environment token")
+            values[key] = value
+            continue
+        if len(value) < 2 or value[0] != "'" or value[-1] != "'":
+            raise ValueError("optional application input must be single-quoted")
+        body = value[1:-1]
+        if (not body or "'" in body
+                or _OPTIONAL_VALUE_FORMATS[key].fullmatch(body) is None):
+            raise ValueError("invalid optional application input")
+        if key == "DAILYCHECK_WMS_PORT" and not 1 <= int(body) <= 65535:
+            raise ValueError("invalid optional application input")
+        values[key] = body
+    if any(key not in values for key in REQUIRED_APPLICATION_KEYS):
+        raise ValueError("required application environment keys absent")
+    return values
+
+
+def validate_application_environment(raw: bytes, *, mcp_health_token: str,
+                                    read_token: str) -> dict[str, str]:
+    """Apply the application-input contract and the credential separations."""
+    values = parse_application_environment(raw)
+    if (values["DAILYCHECK_MCP_TOKEN"] != mcp_health_token
+            or read_token in values.values()
+            or any(values.get(key) == mcp_health_token
+                   for key in APPLICATION_CREDENTIAL_KEYS)):
+        raise ValueError("separate application environment required")
+    return values
 
 
 def application_runtime(python: Path) -> dict:
@@ -157,20 +251,31 @@ def write_literal_release(repo: Path, sha_value: str, tree: str, destination: Pa
 def render_unit(*, description: str, working_directory: str, environment_file: str,
                 environment_lines: list[tuple[str, str]], read_write_paths: str,
                 inaccessible_paths: str, module: str, python: str, app_uid: int, app_gid: int,
+                application_role: str, application_inputs: tuple[str, ...] = (),
                 exec_start_pre: tuple[str, ...] = (), unit_conditions: tuple[str, ...] = (),
                 user: int = 0, group: int = 0,
                 capability_bounding_set: str = CAPABILITY_BOUNDING_SET,
                 protect_home: str = "yes", protect_system: str = "strict",
                 private_tmp: str = "yes", restart: str = "on-failure") -> str:
     """Fixed protected unit recipe; no caller-supplied unit/command is consumed."""
+    allowed = APPLICATION_ROLE_KEYS.get(application_role)
+    if (allowed is None or len(set(application_inputs)) != len(application_inputs)
+            or not set(application_inputs) <= set(allowed)):
+        raise ValueError("invalid application input selection")
     conditions = "".join(f"{line}\n" for line in unit_conditions)
     pretests = "".join(f"ExecStartPre={line}\n" for line in exec_start_pre)
     environment = "".join(f"Environment={key}={value}\n" for key, value in environment_lines)
+    # Only present optional inputs get a ${KEY} word: an absent word keeps the
+    # application source default, while an empty value would alter it. The role
+    # projection keeps app-only feedback/webhook credentials out of MCP units.
+    application_environment = "".join(
+        f" {key}=${{{key}}}" for key in allowed if key in application_inputs)
     exec_environment = ("PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 "
                         "DAILYCHECK_ENV=production DRY_RUN=${DRY_RUN} "
                         "DAILYCHECK_DB_DIR=${DAILYCHECK_DB_DIR} "
                         "DAILYCHECK_SECRET_KEY=${DAILYCHECK_SECRET_KEY} "
-                        "DAILYCHECK_MCP_TOKEN=${DAILYCHECK_MCP_TOKEN}")
+                        "DAILYCHECK_MCP_TOKEN=${DAILYCHECK_MCP_TOKEN}"
+                        + application_environment)
     return f"""[Unit]
 Description={description}
 {conditions}After=network.target
@@ -329,17 +434,9 @@ class ProtectedPipeline:
         for mutable in (self.path(k) for k in ("source_db", "green_db", "scratch_root", "green_access_log")):
             if any(mutable == path or mutable.is_relative_to(path) or path.is_relative_to(mutable) for path in private):
                 raise ValueError("application write path overlaps protected control inputs")
-        lines = read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor).decode("ascii").splitlines()
-        if len(lines) != 2 or any(not re.fullmatch(r"[A-Z_]+=[a-zA-Z0-9_-]{32,200}", line) for line in lines):
-            raise ValueError("fixed two-key application EnvironmentFile required")
-        app_env = dict(line.split("=", 1) for line in lines)
-        if (set(app_env) != {"DAILYCHECK_SECRET_KEY", "DAILYCHECK_MCP_TOKEN"}
-                or any(not isinstance(v, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{32,200}", v)
-                       for v in app_env.values())
-                or app_env["DAILYCHECK_MCP_TOKEN"] != p.mcp_health_token()
-                or p.read_token() in app_env.values()):
-            raise ValueError("separate application environment required")
-        self.app_env = app_env
+        self.app_env = validate_application_environment(
+            read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor),
+            mcp_health_token=p.mcp_health_token(), read_token=p.read_token())
 
     def _owned(self, candidate=None):
         active = deploy_state._native_owned(deploy_state.load_state(self.policy.location("directory")))
@@ -444,8 +541,9 @@ class ProtectedPipeline:
             os.fchown(fd, p.value["app_uid"], self.value["app_gid"])
         finally:
             os.close(fd)
-        for unit, module in (("dailycheck-green.service", "gunicorn --workers 2 --bind 127.0.0.1:8091 --access-logfile " + str(access) + " app:create_app()"),
-                             ("dailycheck-green-mcp.service", "mcp_server --transport http --host 127.0.0.1 --port 5101")):
+        for unit, module, role in (
+                ("dailycheck-green.service", "gunicorn --workers 2 --bind 127.0.0.1:8091 --access-logfile " + str(access) + " app:create_app()", "app"),
+                ("dailycheck-green-mcp.service", "mcp_server --transport http --host 127.0.0.1 --port 5101", "mcp")):
             path = self.path("unit_directory") / unit
             previous = read_protected(path, p.owner, anchor=p.anchor, private=False)
             # Existing backup semantics remain; this extra copy preserves the
@@ -472,6 +570,10 @@ class ProtectedPipeline:
                 python=str(self.python),
                 app_uid=p.value["app_uid"],
                 app_gid=self.value["app_gid"],
+                application_role=role,
+                application_inputs=tuple(
+                    key for key in APPLICATION_ROLE_KEYS[role]
+                    if key in getattr(self, "app_env", {})),
             )
             path.write_text(content)
             path.chmod(0o644)
