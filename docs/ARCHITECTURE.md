@@ -1757,6 +1757,10 @@ malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/tes
 仓库 CLI 创建/克隆和 `db.migrate.migrate_legacy_inventory` 共用路径注册契约，
 配置目录嵌套于代码根时保留已支持的代码相对注册；外部数据根使用 portable `db/...`。
 注册与实际 UoW 打开须指向同一文件，不迁移 master 行或自动认领已有孤立文件。
+共享解析器的配置模式必须同时提供 `BASE_DIR` 和 `DB_DIR`；仅传 `db_dir` 时，
+在路径解析前抛出明确指出缺少 `base_dir` 的 `ValueError`，绝对路径也不豁免。
+Web 采购的缓存读取、重算与验收 CSV 元数据读取均传完整配置，保证嵌套目录注册的
+词法优先级一致；未传 `db_dir` 的 raw/CWD 与显式 Bot 根语义保持不变。
 
 ```
 db/

@@ -7,6 +7,8 @@ synthetic and owned by pytest.
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import shutil
@@ -147,6 +149,8 @@ def test_resolver_modes_preserve_absolute_default_and_bot_semantics(tmp_path):
         external / "warehouses" / "x.db"
     assert resolve_warehouse_path("/absolute/x.db", legacy, db_dir=external) == \
         Path("/absolute/x.db")
+    assert resolve_warehouse_path("/absolute/x.db") == Path("/absolute/x.db")
+    assert resolve_warehouse_path("/absolute/x.db", legacy) == Path("/absolute/x.db")
     assert resolve_warehouse_path("db/warehouses/x.db") == Path("db/warehouses/x.db")
     assert resolve_warehouse_path("other/x.db", legacy, db_dir=external) == legacy / "other/x.db"
     assert resolve_warehouse_path("db/warehouses/x.db", legacy) == legacy / "db/warehouses/x.db"
@@ -160,6 +164,122 @@ def test_resolver_modes_preserve_absolute_default_and_bot_semantics(tmp_path):
     missing = resolve_warehouse_path("db/warehouses/missing.db", legacy, db_dir=external)
     assert missing == external / "warehouses" / "missing.db"
     assert not missing.exists() and not (legacy / "db/warehouses/missing.db").exists()
+
+
+def test_configured_resolver_requires_base_even_for_unambiguous_paths(tmp_path):
+    data = tmp_path / "not-created"
+    for stored in ("db/warehouses/x.db", "db/custom-data/warehouses/x.db",
+                   "other/x.db", "", tmp_path / "absolute.db"):
+        for db_dir in (data, str(data)):
+            with pytest.raises(ValueError, match="base_dir.*db_dir"):
+                resolve_warehouse_path(stored, db_dir=db_dir)
+    assert not data.exists()
+
+
+@pytest.mark.parametrize("layout,registration", [
+    ("nested", "relative"), ("nested", "absolute"), ("nested", "portable"),
+    ("default", "relative"), ("child", "relative"), ("external", "portable"),
+])
+def test_actual_procurement_http_and_csv_use_registered_root(
+    tmp_path, monkeypatch, layout, registration,
+):
+    import tempfile
+
+    from flask import Flask, g
+
+    import config
+    import db
+
+    base, cwd = tmp_path / "code", tmp_path / "cwd"
+    data = {"default": base / "db", "nested": base / "db/custom-data",
+            "child": base / "custom-data", "external": tmp_path / "external-not-db"}[layout]
+    for path in (base, cwd):
+        path.mkdir()
+    for module in (config, db):
+        monkeypatch.setattr(module, "MASTER_DB", data / "master.db")
+        monkeypatch.setattr(module, "WAREHOUSE_DB_DIR", data / "warehouses")
+    monkeypatch.setattr(config, "BASE_DIR", base)
+    monkeypatch.setattr(config, "DB_DIR", data)
+    import cli
+    from blueprints.procurement import bp
+
+    for key, value in (("BASE_DIR", base), ("DB_DIR", data),
+                       ("MASTER_DB", data / "master.db")):
+        monkeypatch.setattr(cli, key, value)
+    db.init_master_db()
+    cli.create_warehouse_cmd.main(args=["wh_source", "Source"], standalone_mode=False)
+    actual = data / "warehouses/wh_source.db"
+    from tests.conftest import _seed_item, _seed_outbound
+    item_id, _ = _seed_item(actual, "Configured item", qty=0, unit_cost=7)
+    for _ in range(7):
+        _seed_outbound(actual, item_id, 3)
+    with closing(sqlite3.connect(actual)) as conn:
+        conn.execute("UPDATE items SET unit='configured-unit' WHERE id=?", (item_id,))
+        conn.commit()
+
+    decoys = {}
+    for root in (base / "db", cwd / "db"):
+        decoy = root / "warehouses/wh_source.db"
+        if decoy == actual:
+            continue
+        decoy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(actual, decoy)
+        with closing(sqlite3.connect(decoy)) as conn:
+            conn.execute("UPDATE items SET name='Decoy', unit='wrong-unit', quantity=99")
+            conn.commit()
+        decoys[decoy] = sha256(decoy.read_bytes()).hexdigest()
+    with closing(sqlite3.connect(config.MASTER_DB)) as master:
+        if registration != "relative":
+            stored = str(actual) if registration == "absolute" else "db/warehouses/wh_source.db"
+            master.execute("UPDATE warehouses SET db_path=? WHERE code='wh_source'", (stored,))
+            master.commit()
+        registrations = master.execute("SELECT code, db_path FROM warehouses").fetchall()
+    source_hash = sha256(actual.read_bytes()).hexdigest()
+    monkeypatch.chdir(base if layout == "nested" else cwd)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    app = Flask(__name__)
+    app.secret_key = "owned-procurement-control"
+    app.testing = True
+    app.register_blueprint(bp)
+
+    @app.before_request
+    def owned_admin():
+        g.user = {"id": 1, "is_admin": 1}
+        g.warehouse = {"code": "wh_source"}
+
+    client = app.test_client()
+    response = client.get("/procurement/store?warehouse_code=wh_source")
+    assert response.status_code == 200
+    item, = response.json["items"]
+    assert (item["item_id"], item["item_name"], item["current_qty"]) == (
+        item_id, "Configured item", 0,
+    )
+    assert item["daily_avg"] == 3 and item["suggested_qty"] == 42
+    # The cache-hit path enriches names, and acceptance separately selects CSV units.
+    cached = client.get("/procurement/store?warehouse_code=wh_source")
+    assert cached.status_code == 200 and cached.json["items"] == response.json["items"]
+    accepted = client.post("/procurement/store/accept", json={"warehouse_code": "wh_source"})
+    assert accepted.status_code == 200 and accepted.json["item_count"] == 1
+    exported = tmp_path / accepted.json["filename"]
+    try:
+        download = client.get(accepted.json["download_url"])
+        assert download.status_code == 200 and download.data.startswith(b"\xef\xbb\xbf")
+        assert list(csv.reader(io.StringIO(download.data.decode("utf-8-sig")))) == [
+            ["item_id", "item_name", "suggested_qty", "unit", "note"],
+            [str(item_id), "Configured item", "42", "configured-unit", ""],
+        ]
+        download.close()
+    finally:
+        exported.unlink(missing_ok=True)
+    with closing(sqlite3.connect(config.MASTER_DB)) as master:
+        assert master.execute("SELECT code, db_path FROM warehouses").fetchall() == registrations
+    assert sha256(actual.read_bytes()).hexdigest() == source_hash
+    assert {p: sha256(p.read_bytes()).hexdigest() for p in decoys} == decoys
+    print(json.dumps({"layout": layout, "registration": registration, "http": 200,
+                      "cached": 200, "csv_accept": 200, "csv_download": 200,
+                      "configured_item": item_id, "quantity": 42,
+                      "unit": "configured-unit", "registrations_unchanged": True,
+                      "source_and_decoys_unchanged": True}))
 
 
 def test_item_routing_selector_uses_configured_root_and_stays_readonly(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
 """Resolve stored warehouse paths against an explicitly selected data root.
 
-Absolute metadata paths are retained. When ``db_dir`` is supplied, the legacy
+Configured resolution requires both ``db_dir`` and ``base_dir``, even for
+absolute metadata paths. Absolute metadata paths are retained. The legacy
 ``db/...`` registration prefix maps onto that configured directory (for example
 ``db/warehouses/x.db`` becomes ``<db_dir>/warehouses/x.db``) even when the
 configured directory is not named ``db``. When the configured directory is
@@ -17,6 +18,8 @@ from pathlib import Path
 
 def resolve_warehouse_path(stored: str | Path, base_dir: str | Path | None = None,
                            *, db_dir: str | Path | None = None) -> Path:
+    if db_dir is not None and base_dir is None:
+        raise ValueError("base_dir is required when db_dir is supplied")
     path = Path(stored)
     if path.is_absolute():
         return path
