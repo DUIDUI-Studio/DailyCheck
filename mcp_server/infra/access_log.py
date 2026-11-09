@@ -2,12 +2,21 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp_server.config import BASE_DIR
+from mcp_server.config import BASE_DIR, MASTER_DB
 
-_ACCESS_LOG_PATH: Path = BASE_DIR / "access.log"
+# 配置了非空 DAILYCHECK_DB_DIR 时，审计写进与 master.db 同一个中央
+# `config.DB_DIR`（不可变代码发布下 BASE_DIR 只读）；未设置或显式空串时
+# 保持旧位置 BASE_DIR/access.log。中央 config 定义
+# MASTER_DB = DB_DIR / "master.db"，故其父目录就是同一份已选定的 DB 根；
+# import 期选择，env 判空语义与 central config 相同，不引入第二个解析器。
+_DB_DIR: Path = MASTER_DB.parent
+_ACCESS_LOG_PATH: Path = (
+    _DB_DIR / "access.log" if os.environ.get("DAILYCHECK_DB_DIR") else BASE_DIR / "access.log"
+)
 
 
 def write_mcp_access_log(

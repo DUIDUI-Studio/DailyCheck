@@ -8,13 +8,18 @@
   - 写日志失败不改变响应，也不重复执行 handler。
 
 日志文件用临时路径（monkeypatch access_log._ACCESS_LOG_PATH），不碰生产
-BASE_DIR/access.log。
+BASE_DIR/access.log。路径选择（配置数据根 vs 旧代码根）另用独立解释器
+验证，不依赖 monkeypatch 绑定。
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -320,3 +325,106 @@ class TestLogHygiene:
         assert json.loads(result[0].text) == {"ok": True}
         assert calls["count"] == 1
         assert _entries(mcp_env["log_path"]) == []
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_PROBE = """
+import json
+from pathlib import Path
+import mcp_server.infra.access_log as al
+selected = Path(al._ACCESS_LOG_PATH)
+out = {"selected": str(selected), "is_file_before": selected.is_file()}
+if __import__("os").environ.get("PROBE_WRITE") == "1":
+    al.write_mcp_access_log(11, "tools/call", "/api/mcp/", 200, 3, tool_name="restock_list")
+    out["is_file_after"] = selected.is_file()
+    out["bytes"] = selected.read_text(encoding="utf-8") if selected.is_file() else None
+print(json.dumps(out, sort_keys=True))
+"""
+
+
+def _probe(*, db_dir: str | None, write: bool) -> dict:
+    """Run the real module in a fresh interpreter without patching its path."""
+    env = os.environ.copy()
+    env.pop("DAILYCHECK_DB_DIR", None)
+    if db_dir is not None:
+        env["DAILYCHECK_DB_DIR"] = db_dir
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PROBE_WRITE"] = "1" if write else "0"
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", _PROBE],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    return json.loads(proc.stdout)
+
+
+class TestConfiguredAccessLogPath:
+    """`DAILYCHECK_DB_DIR` 非空时审计写入配置数据根，否则保持旧代码根位置。"""
+
+    def test_nonempty_db_dir_writes_exact_record_to_configured_root(self, tmp_path):
+        data_root = tmp_path / "data"
+        data_root.mkdir()
+        root_log = REPO_ROOT / "access.log"
+        before = root_log.read_bytes() if root_log.exists() else None
+
+        result = _probe(db_dir=str(data_root), write=True)
+
+        log_path = data_root / "access.log"
+        assert result["selected"] == str(log_path)
+        assert result["is_file_after"] is True
+        entries = _entries(log_path)
+        assert len(entries) == 1
+        assert entries[0] == {
+            "ts": entries[0]["ts"],
+            "agent_token_id": 11,
+            "path": "/api/mcp/",
+            "method": "tools/call",
+            "status": 200,
+            "duration_ms": 3,
+            "tool_name": "restock_list",
+        }
+        assert entries[0]["ts"]
+        # 只读代码根不得新增或改动文件。
+        if before is None:
+            assert not root_log.exists()
+        else:
+            assert root_log.read_bytes() == before
+
+    @pytest.mark.parametrize("env_value", [None, ""])
+    def test_unset_or_empty_db_dir_keeps_legacy_location(self, env_value):
+        root_log = REPO_ROOT / "access.log"
+        before = root_log.read_bytes() if root_log.exists() else None
+
+        result = _probe(db_dir=env_value, write=False)
+
+        assert result["selected"] == str(root_log)
+        if before is None:
+            assert not root_log.exists()
+        else:
+            assert root_log.read_bytes() == before
+
+    def test_configured_root_write_failure_is_best_effort(self, tmp_path):
+        data_root = tmp_path / "data"
+        data_root.mkdir()
+        (data_root / "access.log").mkdir()  # append fails: IsADirectoryError
+        root_log = REPO_ROOT / "access.log"
+        before = root_log.read_bytes() if root_log.exists() else None
+
+        result = _probe(db_dir=str(data_root), write=True)
+
+        assert result["selected"] == str(data_root / "access.log")
+        assert result["is_file_after"] is False
+        assert "Traceback" not in json.dumps(result)
+        # 失败不产生旧位置回退写。
+        if before is None:
+            assert not root_log.exists()
+        else:
+            assert root_log.read_bytes() == before

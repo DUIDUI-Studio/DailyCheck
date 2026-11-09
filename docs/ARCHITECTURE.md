@@ -2757,7 +2757,7 @@ flowchart TB
 
 ### 9.5 工具调用审计（access.log，Issue #85）
 
-`mcp_server/protocol/server.py::call_tool` 已接通既有的 `infra/access_log.py::write_mcp_access_log`。每次**实际进入** `call_tool` 的调用在 `finally` 中追加恰好一条 JSONL 记录到 `BASE_DIR/access.log`；handler 只执行一次。
+`mcp_server/protocol/server.py::call_tool` 已接通既有的 `infra/access_log.py::write_mcp_access_log`。每次**实际进入** `call_tool` 的调用在 `finally` 中追加恰好一条 JSONL 记录；handler 只执行一次。落点由中央 `config.py` 的数据根选择决定（import 期绑定，与 `MASTER_DB` 同源）：未设置或显式空 `DAILYCHECK_DB_DIR` 时保持旧位置 `BASE_DIR/access.log`；非空时写同一已选定 DB 根下的 `access.log`（即 `MASTER_DB.parent/access.log`），使不可变只读代码发布仍能在外部数据根保留审计。
 
 | 字段 | 值 / 语义 |
 |------|-----------|
@@ -2774,7 +2774,8 @@ flowchart TB
 - 只覆盖进入工具层的 `tools/call`。401/429 在 `AuthMiddleware` 提前返回、SDK 参数校验拒绝、`initialize` / `tools/list` 均**不**产生该记录，仍走既有 uvicorn/传输日志。
 - 记录只含上述元数据；不写 raw token、token hash、`Authorization`、arguments、`reason`、异常堆栈或响应内容。未知工具名经 `json.dumps` 转义并限长，不会注入多条物理日志行。
 - `write_mcp_access_log` 内部吞掉所有异常；`call_tool` 再兜一层，日志失败不会改变既有响应、不会重放业务。
-- 回归：`tests/test_mcp_access_log.py`（根目录，CI 可收集）。真实生产文件路径不在测试中写入，测试用临时路径替换 `_ACCESS_LOG_PATH`。
+- 落点只来自上述中央配置选择：不接受调用方传入日志路径，不 `mkdir`/迁移/复制/截断旧日志。配置根写入失败仍是 best-effort，不回退写旧代码根，也不改变响应或请求结果。
+- 回归：`tests/test_mcp_access_log.py`（根目录，CI 可收集）。真实生产文件路径不在测试中写入，测试用临时路径替换 `_ACCESS_LOG_PATH`；落点选择另用独立解释器 + 真实 `DAILYCHECK_DB_DIR` env 验证，不 monkeypatch 路径绑定。
 
 ---
 
@@ -3634,6 +3635,9 @@ Issue #85 的工具调用审计回归放在根目录 `tests/test_mcp_access_log.
 `status=200`，以及日志不含 token/`Authorization`/arguments/reason。测试用临时路径替换
 `_ACCESS_LOG_PATH`，不写生产 `access.log`。变异验证：临时去掉 writer 调用后 10/12 用例转红
 （保留的 2 例分别是直接调用 writer 的兼容性用例与「写日志失败不影响响应」用例，符合预期）。
+落点新增控制用独立解释器导入真实模块（不替换 `_ACCESS_LOG_PATH`）：非空
+`DAILYCHECK_DB_DIR` 时记录写入该数据根且只读代码根不变；未设置/显式空串保持
+`BASE_DIR/access.log`；配置根不可写时仍 best-effort 且不回退旧位置。
 
 ```mermaid
 flowchart TB
