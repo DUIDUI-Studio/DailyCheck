@@ -3432,7 +3432,9 @@ Issue #164 的 `tests/test_native_preparation.py` 用 owned fixture 覆盖准备
 固定四 unit/launcher 的无副作用渲染，literal P release 的创建/逐字节校验与
 symlink/part 拒绝，baseline ledger 的 monotonic 时长/进程/route/epoch/outcome/样本漂移
 拒绝，active-G 完整 journal 绑定，fresh transition 只写 bootstrap，review request/result
-的 UID/candidate/CI 绑定与二次发布拒绝，replace 中断不覆盖旧记录；repair-1 另覆盖
+的 UID/candidate/CI 绑定与二次发布拒绝（reviewer 用例以 pytest monkeypatch 提供显式
+synthetic NSS 账号记录，另含缺失账号拒绝控制；产品真实账号 guard 不变），replace 中断
+不覆盖旧记录；repair-1 另覆盖
 baseline CLI 自行获取原 fence 与 competing-holder 拒绝、observer 子进程无 fence/env 泄漏、
 真实 initializer 后 matching idle-P 的 retained-ledger/fresh-observation 刷新及
 anchor/policy/epoch/map/source/public/deployed/tree/active/partial 拒绝、渲染 launcher 的五项 lifecycle

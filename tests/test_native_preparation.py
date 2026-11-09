@@ -514,7 +514,33 @@ def test_publish_baseline_rejects_changed_evidence(bridge, damage):
         preparer(b).publish_baseline()
 
 
-def test_review_request_and_result_are_exactly_bound(bridge):
+SYNTHETIC_REVIEWER_GID = 65531
+
+
+@pytest.fixture
+def synthetic_reviewer_account(monkeypatch):
+    """Explicitly synthetic owned NSS record for the approved reviewer UID.
+
+    CI runs as a UID with no /etc/passwd entry while the unchanged product
+    guard correctly requires an account. This supplies an owned synthetic
+    record only for the current approved reviewer UID; every other lookup uses
+    the real NSS. It is not a kernel identity or production-account claim.
+    """
+    reviewer_uid = os.geteuid()
+    original = pwd.getpwuid
+    record = pwd.struct_passwd(("synthetic-reviewer", "x", reviewer_uid,
+                                 SYNTHETIC_REVIEWER_GID, "Synthetic owned reviewer",
+                                 "/nonexistent", "/bin/false"))
+
+    def getpwuid(uid):
+        if uid == reviewer_uid:
+            return record
+        return original(uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", getpwuid)
+
+
+def test_review_request_and_result_are_exactly_bound(bridge, synthetic_reviewer_account):
     b = bridge
     policy = b["policy"]
     preparer_for_review = preparer(b)
@@ -542,7 +568,8 @@ def stat_mode(path: Path) -> int:
 
 @pytest.mark.parametrize("damage", ["no-request", "wrong-digest", "fail", "root",
                                      "tamper-ci", "already"])
-def test_review_result_rejects_unsafe_or_second_publication(bridge, monkeypatch, damage):
+def test_review_result_rejects_unsafe_or_second_publication(
+        bridge, monkeypatch, synthetic_reviewer_account, damage):
     b = bridge
     policy = b["policy"]
     candidate = {"synthetic": "candidate"}
@@ -569,6 +596,33 @@ def test_review_result_rejects_unsafe_or_second_publication(bridge, monkeypatch,
         publish_review_result(directory, digest_value, decision="pass")
     with pytest.raises(ValueError):
         publish_review_result(directory, digest_value, decision="pass")
+
+
+def test_review_request_denies_missing_approved_account(bridge, monkeypatch):
+    """The unchanged product denies an absent approved reviewer account."""
+    b = bridge
+    policy = b["policy"]
+    reviewer_uid = int(next(iter(policy.value["reviewers"])))
+    original = pwd.getpwuid
+
+    def missing(uid):
+        if uid == reviewer_uid:
+            raise KeyError(f"getpwuid(): uid not found: {uid}")
+        return original(uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", missing)
+    directory = policy.location("review_directory")
+    (directory / str(os.geteuid())).mkdir(mode=0o700)
+    before = sorted(path.relative_to(directory).as_posix()
+                    for path in directory.rglob("*"))
+    candidate = {"synthetic": "candidate"}
+    with pytest.raises(ValueError, match="reviewer account does not exist"):
+        preparer(b).prepare_review_request(candidate, {"synthetic": "ci"})
+    with pytest.raises(ValueError, match="protected review request unavailable"):
+        publish_review_result(directory, digest(candidate), decision="pass")
+    after = sorted(path.relative_to(directory).as_posix()
+                   for path in directory.rglob("*"))
+    assert after == before
 
 
 def test_atomic_record_publication_keeps_previous_bytes_on_interruption(tmp_path, monkeypatch):
