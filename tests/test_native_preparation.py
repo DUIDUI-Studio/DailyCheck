@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ci.merge_group import digest
+from scripts.prod_agent import native_prepare
 from scripts.prod_agent.native_pipeline import literal_tree
 from scripts.prod_agent.native_ports import (
     InstalledPolicy,
@@ -152,6 +153,27 @@ def records_dir(b) -> Path:
     return records
 
 
+def bind_fixture_reader(monkeypatch, root: Path):
+    """Bind the unchanged protected reader to this test's owned fixture root.
+
+    Production keeps ``read_protected(path, owner)`` without an anchor, so a
+    world-writable ancestor such as CI's /tmp is intentionally rejected. This
+    adapter supplies the legitimate OwnedFixture root; the real reader still
+    validates every path component and the 0600 file ownership within it.
+    """
+    root = Path(root).resolve()
+    real_read = native_prepare.read_protected
+
+    def read_protected(path, owner, *, anchor=None, private=True):
+        path = Path(path)
+        if not path.is_relative_to(root):
+            raise ValueError("fixture read outside owned root")
+        return real_read(path, owner, anchor=root, private=private)
+
+    monkeypatch.setattr(native_prepare, "read_protected", read_protected)
+    return read_protected
+
+
 def preparer(b, *, policy=None, records=None, client=None):
     policy = policy or b["policy"]
     return NativePreparer(policy, records=records or records_dir(b),
@@ -160,10 +182,11 @@ def preparer(b, *, policy=None, records=None, client=None):
                           observer=b["runtime"].observer)
 
 
-def test_render_preparation_is_inert_and_complete(tmp_path, bridge):
+def test_render_preparation_is_inert_and_complete(tmp_path, bridge, monkeypatch):
     b = bridge
     policy = render_policy(b, tmp_path)
     records = records_dir(b)
+    bind_fixture_reader(monkeypatch, records)
     document = plan_document(b, policy, records)
     private(records / "preparation-plan.json", document)
     planned = NativePreparer(policy, records=records, repo=policy.location("repo"),
@@ -210,6 +233,29 @@ def test_render_preparation_is_inert_and_complete(tmp_path, bridge):
     assert rendered["generated_manifest"][rendered["launcher"]["path"]]["mode"] == "0755"
     for row in rendered["units"]:
         assert rendered["generated_manifest"][row["path"]]["sha256"] == row["sha256"]
+
+
+def test_fixture_reader_rejects_writable_component_without_manifest(tmp_path, bridge, monkeypatch):
+    b = bridge
+    policy = render_policy(b, tmp_path)
+    records = records_dir(b)
+    document = plan_document(b, policy, records)
+    private(records / "preparation-plan.json", document)
+    planned = NativePreparer(policy, records=records, repo=policy.location("repo"),
+                             observer=b["runtime"].observer).plan()
+    writable = records / "writable"
+    writable.mkdir(mode=0o777)
+    writable.chmod(0o777)
+    target = writable / "application.env"
+    private(target, "synthetic")
+    bind_fixture_reader(monkeypatch, records)
+    replaced = dataclasses.replace(planned, app_environment_file=target)
+    with pytest.raises(ValueError, match="unprotected path ownership/mode"):
+        render_preparation(replaced)
+    outside = tmp_path / "outside.env"
+    private(outside, "synthetic")
+    with pytest.raises(ValueError, match="fixture read outside owned root"):
+        native_prepare.read_protected(outside, os.geteuid())
 
 
 @pytest.mark.parametrize("damage", ["python", "authority", "epoch", "reviewer", "app_id",

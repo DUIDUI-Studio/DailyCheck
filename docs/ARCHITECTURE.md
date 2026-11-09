@@ -3476,6 +3476,11 @@ anchor/policy/epoch/map/source/public/deployed/tree/active/partial 拒绝、渲�
 controller 路由与未知命令/选项拒绝。真实 Linux UID 降权、device/inode、实际 ≥600 秒
 窗口与 Prod 安装仍是 NOT_RUN。
 
+H13 的 CI 世界可写祖先不是产品缺陷：`render-preparation` 测试为合成的
+`application.env` 显式绑定自己的 OwnedFixture 根，适配器仍调用未改动的
+`protected_path`/`read_protected`，并在该根内校验每个组件与 0600 文件所有权；生产调用
+不带 anchor 的既有拒绝行为不变，另有一条根内可写组件拒绝控制。
+
 `tests/test_native_application_environment.py` 锁定 native application EnvironmentFile
 契约：原始两键文件仍可用；十三个已测量可选键以单引号逐字传递，缺失时不进入 `env -i`
 词表；app 得到全部十三项而 MCP 只得到六个 WMS 名（feedback/LLM/webhook/多仓键不跨角色）；
