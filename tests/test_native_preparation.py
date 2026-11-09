@@ -7,9 +7,11 @@ acceptance; every synthetic record is explicitly owned-fixture input.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import pwd
+import select
 import shutil
 import subprocess
 import time
@@ -779,3 +781,205 @@ def test_rendered_launcher_routes_fixed_controller_lifecycle(bridge):
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0
     assert "publish-runtime" in result.stdout and "deploy-front" in result.stdout
+
+
+# ── repair-2: baseline publication binding and commit ordering ────────────
+
+def _distinct_source_baseline(b, *, initialize=True):
+    """Adapt the R1 review's real initializer with original source != public P."""
+    policy = b["policy"]
+    obj = _setup_baseline(b)
+    _write_fixture_processes(b)
+    source = {"sha": "e" * 40, "pr": 158, "at": 1}
+    evidence = obj._record("baseline-evidence.json")
+    mapping = obj._record("source-public-map.json")
+    mapping["rows"][0]["source_sha"] = source["sha"]
+    evidence.update(source_sha=source["sha"], source_outcome_sha256=digest(source),
+                    map_sha256=digest(mapping), map_row=mapping["rows"][0])
+    private(obj.records / "source-public-map.json", mapping)
+    private(obj.records / "baseline-evidence.json", evidence)
+    directory = policy.location("directory")
+    with deploy_state.state_transaction(directory):
+        state = deploy_state.load_state(directory)
+        state["deployed"] = source
+        deploy_state.save_state(directory, state)
+    ledger = _baseline_ledger(b, {"source_outcome_sha256": digest(source)})
+    private(obj.records / "observation-ledger.json", ledger)
+    obj.publish_runtime_baseline()
+    if initialize:
+        runner = NativeQueue(policy.location("repo"), directory, policy.producer, None)
+        with runner.fence():
+            obj.publish_baseline()
+        assert ProtectedInitializer(policy, b["runtime"], b["controller"].client).initialize()
+        state = deploy_state.load_state(directory)
+        assert state["native_source_anchor"] == source
+        assert state["deployed"]["sha"] == b["base"] != source["sha"]
+    return obj, ledger
+
+
+def _runtime_child(b):
+    result = subprocess.run(_fixture_child_command(b, "publish-runtime", "--kind", "baseline"),
+                            capture_output=True, text=True, timeout=30)
+    print(json.dumps({"operation": "publish-runtime --kind baseline",
+                      "native_exit": result.returncode, "stderr": result.stderr.strip()}))
+    return result
+
+
+def test_uninitialized_distinct_p_runtime_child(bridge):
+    b = bridge
+    _distinct_source_baseline(b, initialize=False)
+    directory = b["policy"].location("directory")
+    state_before = (directory / deploy_state.STATE_FILENAME).read_bytes()
+    result = _runtime_child(b)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["sha"] == b["base"]
+    assert b["runtime"].read()["sha"] == b["base"]
+    assert (directory / deploy_state.STATE_FILENAME).read_bytes() == state_before
+    assert not (directory / deploy_state.NATIVE_GUARD_FILENAME).exists()
+
+
+@pytest.mark.parametrize("damage", ["active", "policy", "guard"])
+def test_baseline_runtime_child_rejects_mid_probe_invalidation(bridge, damage):
+    """Same owned health-peer schedules as R1, asserting the desired native effects."""
+    b = bridge
+    policy = b["policy"]
+    _distinct_source_baseline(b)
+    directory = policy.location("directory")
+    initial = deploy_state.load_state(directory)
+    state_before = (directory / deploy_state.STATE_FILENAME).read_bytes()
+    guard = directory / deploy_state.NATIVE_GUARD_FILENAME
+    guard_before = guard.read_bytes()
+    valid = _runtime_child(b)
+    assert valid.returncode == 0 and json.loads(valid.stdout)["sha"] == b["base"]
+    assert b["runtime"].read()["sha"] == b["base"]
+    assert (directory / deploy_state.STATE_FILENAME).read_bytes() == state_before
+    assert guard.read_bytes() == guard_before
+    before = policy.location("runtime_file").read_bytes()
+
+    def invalidate():
+        with deploy_state.state_transaction(directory):
+            state = deploy_state.load_state(directory)
+            if damage == "active":
+                # The accepted R1 control models the coherent native-start write;
+                # no deployment stages or state-machine success are manufactured.
+                state["native_queue"]["active"] = {
+                    "phase": "deploy", "origin_attempt_id": "owned-race", "origin_generation": 0,
+                    "candidate": {"manifest": {"group_sha": b["head"], "tree_sha": git(
+                        policy.location("repo"), "rev-parse", b["head"] + "^{tree}")}},
+                    "journal": [], "verified_evidence": None, "release_grant": None}
+            elif damage == "policy":
+                state["native_bootstrap"]["policy"] = "f" * 64
+            else:
+                guard.unlink()
+            deploy_state.save_state(directory, state)
+
+    invalidate()
+    entry = _runtime_child(b)
+    assert entry.returncode == 1
+    assert policy.location("runtime_file").read_bytes() == before
+    with deploy_state.state_transaction(directory):
+        deploy_state.save_state(directory, initial)
+        deploy_state.native_guard(directory, {"version": 1,
+            "initialization_id": initial["native_queue"]["initialization_id"], "intent_id": None})
+    fired = []
+
+    def health(_auth):
+        if not fired:
+            invalidate()
+            fired.append(True)
+        return 200, b'{"ok":true}'
+
+    b["server"].health_handler = health
+    try:
+        result = _runtime_child(b)
+    finally:
+        b["server"].health_handler = None
+    unchanged = policy.location("runtime_file").read_bytes() == before
+    print(json.dumps({"schedule": damage, "valid_native_exit": valid.returncode,
+                      "entry_native_exit": entry.returncode, "mid_probe_native_exit": result.returncode,
+                      "old_runtime_preserved": unchanged, "health_writer_completed": bool(fired)}))
+    assert fired and result.returncode == 1
+    assert unchanged
+    final = deploy_state.load_state(directory)
+    assert final["native_source_anchor"] == initial["native_source_anchor"]
+    if damage == "active":
+        assert deploy_state.native_consistent(directory, final)
+        assert final["native_queue"]["active"]["phase"] == "deploy"
+
+
+def test_baseline_runtime_replace_orders_real_lease_writer(bridge, monkeypatch):
+    """Start the actual acquire caller in the final check-to-os.replace interval."""
+    b = bridge
+    policy = b["policy"]
+    obj, ledger = _distinct_source_baseline(b)
+    directory = policy.location("directory")
+    target = policy.location("runtime_file")
+    before = target.read_bytes()
+    generation = deploy_state.load_state(directory)["generation"]
+    # Only the child's flock is instrumented: try the same kernel lock without
+    # blocking first, then retain the real blocking semantics of _write_lock.
+    script = r'''
+import argparse, contextlib, fcntl, hashlib, io, json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from scripts.prod_agent.native_queue import deploy_state
+directory, runtime, candidate = map(Path, sys.argv[2:])
+os.environ['DAILYCHECK_DEPLOY_STATE_DIR'] = str(directory)
+original = fcntl.flock
+def emit(value):
+    print(json.dumps(value), file=sys.__stdout__, flush=True)
+def flock(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        try:
+            original(fd, operation | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit({'event': 'blocked-at-state-lock'})
+            original(fd, operation)
+        emit({'event': 'acquired-state-lock',
+              'runtime_sha256': hashlib.sha256(runtime.read_bytes()).hexdigest()})
+        return
+    return original(fd, operation)
+fcntl.flock = flock
+args = argparse.Namespace(pr=1, sha=str(candidate), session='owned-commit-order', phase='native-deploy')
+with contextlib.redirect_stdout(io.StringIO()):
+    # Keep flock events visible while suppressing the fixture lease token.
+    rc = deploy_state.cmd_acquire(args)
+print(json.dumps({'event': 'lease-result', 'native_exit': rc}), flush=True)
+raise SystemExit(rc)
+'''
+    original_replace = os.replace
+    captured = {}
+    child = None
+
+    def replace(source, destination):
+        nonlocal child
+        if Path(destination) == target:
+            captured["published_sha256"] = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+            child = subprocess.Popen(
+                [str(policy.python), "-I", "-B", "-c", script, str(policy.authority),
+                 str(directory), str(target), b["head"]],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, close_fds=True)
+            assert select.select([child.stdout], [], [], 10)[0], "writer did not reach state lock"
+            captured["first_event"] = json.loads(child.stdout.readline())
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    try:
+        result = obj.publish_runtime_from_ledger(ledger, kind="baseline")
+    finally:
+        if child is not None:
+            stdout, stderr = child.communicate(timeout=30)
+    assert child is not None and child.returncode == 0, stderr
+    events = [captured["first_event"], *[json.loads(row) for row in stdout.splitlines()]]
+    print(json.dumps({"linearization": "runtime os.replace", "writer_native_exit": child.returncode,
+                      "events": events, "published_sha256": captured["published_sha256"]}))
+    assert events[0] == {"event": "blocked-at-state-lock"}
+    assert events[1] == {"event": "acquired-state-lock",
+                         "runtime_sha256": captured["published_sha256"]}
+    assert events[2] == {"event": "lease-result", "native_exit": 0}
+    assert target.read_bytes() != before
+    assert result["sha"] == b["base"] == b["runtime"].read()["sha"]
+    state = deploy_state.load_state(directory)
+    assert state["generation"] == generation + 1 and state["lock"]["sha"] == b["head"]
+    assert deploy_state.native_consistent(directory, state)

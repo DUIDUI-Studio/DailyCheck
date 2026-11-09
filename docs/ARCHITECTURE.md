@@ -3430,6 +3430,12 @@ anchor/policy/epoch/deployed/tree/active/partial 拒绝、渲染 launcher 的五
 controller 路由与未知命令/选项拒绝。真实 Linux UID 降权、device/inode、实际 ≥600 秒
 窗口与 Prod 安装仍是 NOT_RUN。
 
+repair-2 的 R1 caller 回归复用独立审查的 distinct source/P initializer 和 owned HTTP
+health-peer，在实际 isolated baseline publisher 子进程中要求 active/policy/guard
+中途失效与入口失效均 native1、旧 runtime 字节不变，并配对 unchanged native0。
+另在最终校验到 runtime `os.replace` 的精确间隙启动真实 `cmd_acquire` writer，要求
+同一 state lock 对发布与 lease 写入排序；这些回归不代表真实部署或 ≥600 秒验收。
+
 Issue #105 的 `tests/test_mcp_impact_gate.py` 用独立临时 Git 仓库验证 main 前进时的
 merge-base、新增工具（含 SDK 合法的大小写/前导下划线名称）、schema 变化、删除/重命名、
 仅 requirements/pyproject 依赖变化、非法/缺失声明及失败关闭；另验证模板占位
