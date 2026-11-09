@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -156,6 +157,52 @@ def test_resolver_modes_preserve_absolute_default_and_bot_semantics(tmp_path):
     missing = resolve_warehouse_path("db/warehouses/missing.db", legacy, db_dir=external)
     assert missing == external / "warehouses" / "missing.db"
     assert not missing.exists() and not (legacy / "db/warehouses/missing.db").exists()
+
+
+def test_item_routing_selector_uses_configured_root_and_stays_readonly(tmp_path, monkeypatch):
+    import config
+    from blueprints.item_routing_pure import routing_warehouse_connections
+
+    external = tmp_path / "external-not-db"
+    legacy = tmp_path / "legacy-root"
+    for root, label in ((external, "external"), (legacy / "db", "legacy")):
+        (root / "warehouses").mkdir(parents=True)
+        with sqlite3.connect(root / "warehouses" / "dc.db") as conn:
+            conn.execute("CREATE TABLE sentinel(value TEXT)")
+            conn.execute("INSERT INTO sentinel VALUES (?)", (label,))
+    monkeypatch.setattr(config, "BASE_DIR", legacy)
+    monkeypatch.setattr(config, "DB_DIR", external)
+    master = sqlite3.connect(":memory:")
+    master.execute("CREATE TABLE warehouses(code TEXT, db_path TEXT, tenant_id INTEGER, "
+                   "warehouse_type TEXT)")
+    master.execute("INSERT INTO warehouses VALUES ('dc','db/warehouses/dc.db',1,"
+                   "'distribution_center')")
+    master.execute("INSERT INTO warehouses VALUES ('store','db/warehouses/dc.db',1,'storefront')")
+    master.execute("INSERT INTO warehouses VALUES ('other','db/warehouses/dc.db',2,"
+                   "'distribution_center')")
+    with routing_warehouse_connections(master) as conns:
+        assert set(conns) == {"dc"}
+        assert conns["dc"].execute("SELECT value FROM sentinel").fetchone()[0] == "external"
+        with pytest.raises(sqlite3.OperationalError):
+            conns["dc"].execute("INSERT INTO sentinel VALUES ('unexpected')")
+    with sqlite3.connect(legacy / "db/warehouses/dc.db") as conn:
+        assert conn.execute("SELECT value FROM sentinel").fetchone()[0] == "legacy"
+
+    absolute = external / "warehouses" / "absolute.db"
+    with sqlite3.connect(absolute) as conn:
+        conn.execute("CREATE TABLE sentinel(value TEXT)")
+        conn.execute("INSERT INTO sentinel VALUES ('absolute')")
+    master.execute("UPDATE warehouses SET db_path=? WHERE code='dc'", (str(absolute),))
+    with routing_warehouse_connections(master) as conns:
+        assert conns["dc"].execute("SELECT value FROM sentinel").fetchone()[0] == "absolute"
+
+    master.execute("UPDATE warehouses SET db_path='db/warehouses/missing.db' WHERE code='dc'")
+    missing_legacy = legacy / "db/warehouses/missing.db"
+    with pytest.raises(sqlite3.OperationalError):
+        with routing_warehouse_connections(master):
+            pass
+    assert not missing_legacy.exists()
+    master.close()
 
 
 def test_guard_real_db_still_refuses_legacy_code_root(tmp_path, monkeypatch):

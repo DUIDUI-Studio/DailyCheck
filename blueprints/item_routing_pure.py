@@ -4,7 +4,8 @@ from __future__ import annotations
 import sqlite3
 from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime
-from pathlib import Path
+
+from warehouse_paths import resolve_warehouse_path
 
 
 def _dc_rows(master_conn):
@@ -17,14 +18,12 @@ def _dc_rows(master_conn):
 @contextmanager
 def routing_warehouse_connections(master_conn):
     """只读打开所有合格 DC；缺库/坏库须显式失败，不能把不完整扫描当唯一候选。"""
-    from config import BASE_DIR
+    from config import BASE_DIR, DB_DIR
 
     with ExitStack() as stack:
         result = {}
         for code, db_path in _dc_rows(master_conn):
-            path = Path(db_path)
-            if not path.is_absolute():
-                path = BASE_DIR / path
+            path = resolve_warehouse_path(db_path, BASE_DIR, db_dir=DB_DIR)
             conn = stack.enter_context(closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
                                                              uri=True)))
             result[code] = conn
