@@ -883,6 +883,9 @@ else: os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
     (sb["dir"] / "deploy_report.py").write_text(
         'import json\nprint(json.dumps({"provider":"github", "host":"github.com", '
         '"repository":"DUIDUI-Studio/DailyCheck"}))\n')
+    for name in ("deploy_triage_pure.py", "publication_authority.py"):
+        shutil.copy2(BG_DIR / name, sb["dir"] / name)
+    shutil.copy2(BG_DIR.parent / "hosting.py", sb["tmp"] / "scripts/hosting.py")
     extra, _ = _observe_tools(sb)
     sb["ordinary_env"] = {**_cand_env(sb), **extra,
         "PATH": str(tools) + os.pathsep + os.environ["PATH"], "PYTHON": str(python),
@@ -939,6 +942,11 @@ def test_verified_candidate_continuity_with_actual_finalizer(ordinary_candidate,
     from tests import test_github_transport as t
 
     sb = ordinary_candidate
+    for name in ("deploy_merge.py", "deploy_report.py"):
+        shutil.copy2(BG_DIR / name, sb["dir"] / name)
+    reader = sb["tmp"] / "scripts/prod_agent"
+    reader.mkdir()
+    shutil.copy2(BG_DIR.parent / "prod_agent/github_readiness.py", reader / "github_readiness.py")
     fake = sb["tmp"] / "fake-api"
     fake.mkdir()
     with pytest.MonkeyPatch.context() as m:
@@ -980,7 +988,7 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
         (sb["dir"] / "switch.sh").write_text(
             f'#!/bin/sh\necho "switch.sh $*" >> \'{sb["calls"]}\'\n'
             + 'if [ "$1" = green ]; then\n' + drift + "fi\n")
-    extra = {**sb["ordinary_env"], "DAILYCHECK_DEPLOY_MERGE_BIN": str(BG_DIR / "deploy_merge.py"),
+    extra = {**sb["ordinary_env"], "DAILYCHECK_DEPLOY_MERGE_BIN": str(sb["dir"] / "deploy_merge.py"),
         "DAILYCHECK_CURL": str(curl), "DAILYCHECK_GITHUB_READ_TOKEN": "synthetic-read",
         "DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE": str(fake / "finalize-token"),
         "FAKE_TABLE": str(fake / "table"), "FAKE_STATE": str(fake / "api-state"),

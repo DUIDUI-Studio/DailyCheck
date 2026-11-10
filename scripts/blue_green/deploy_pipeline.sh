@@ -83,6 +83,9 @@ TREE_MOVED=0
 ORIG_REF=""
 GITHUB_ORDINARY=0
 FROZEN_BASE=""
+HELPER_ROOT=""
+REPORTER="${SCRIPT_DIR}/deploy_report.py"
+MERGER="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
 
 log()  { printf '[pipeline] %s\n' "$*"; }
 die()  { local code=$1; shift; log "ERROR: $*"; exit "${code}"; }
@@ -237,7 +240,7 @@ _writeback_pr() {
   local rc=$1
   [[ "${DAILYCHECK_DEPLOY_REPORT:-1}" == "0" ]] && return 0
   [[ -n "${PR}" && -n "${SHA}" ]] || return 0
-  local reporter="${SCRIPT_DIR}/deploy_report.py"
+  local reporter="${REPORTER}"
   if [[ ! -f "${reporter}" ]]; then
     log "WARN: deploy_report.py 缺失，跳过 PR 回写（不影响部署结果）"
     return 0
@@ -267,8 +270,8 @@ _writeback_pr() {
 
 cleanup() {
   local rc=$?
-  if [[ -n "${HB_PID}" ]] && kill -0 "${HB_PID}" 2>/dev/null; then
-    kill -TERM "${HB_PID}" 2>/dev/null || true
+  if [[ -n "${HB_PID}" ]]; then
+    if kill -0 "${HB_PID}" 2>/dev/null; then kill -TERM "${HB_PID}" 2>/dev/null || true; fi
     wait "${HB_PID}" 2>/dev/null || true
   fi
   if [[ "${NATIVE_CANDIDATE}" -eq 0 && "${TREE_MOVED}" -eq 1 && ${rc} -ne 0 ]] && _owns_attempt; then
@@ -285,12 +288,65 @@ cleanup() {
   # 放最后：release 会再写几行日志，先回写就漏掉它们。且 _writeback_pr 内部
   # 全程 best-effort —— 回写失败绝不能把一次成功部署变成红。
   if [[ "${NATIVE_CANDIDATE}" -eq 0 ]]; then _writeback_pr "${rc}"; fi
+  if [[ -n "${HELPER_ROOT}" ]] && ! rm -rf -- "${HELPER_ROOT}"; then
+    log "ERROR: helper runtime cleanup failed: ${HELPER_ROOT}"
+    _audit_event "helper-cleanup-failed" "owned helper material retained: ${HELPER_ROOT}"
+    [[ "${rc}" -ne 0 ]] || rc=27
+  fi
   trap - EXIT
   exit "${rc}"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Ordinary checkout/restore must not replace this attempt's release/report ABI.
+# Keep the finite import closure private until heartbeat, release and report exit.
+if [[ "${NATIVE_CANDIDATE}" -eq 0 ]]; then
+  REPORTER=""
+  if ! HELPER_ROOT="$("${PY}" - "${REPO_ROOT}" <<'PY'
+import os, pathlib, tempfile
+os.umask(0o077)
+source = pathlib.Path(__import__('sys').argv[1])
+root = pathlib.Path(tempfile.mkdtemp(prefix="dailycheck-pipeline-helpers-"))
+print(root, flush=True)
+bg = "scripts/blue_green/"
+paths = [bg + name for name in ("deploy_state.py", "deploy_report.py", "deploy_merge.py",
+                               "deploy_triage_pure.py", "publication_authority.py")]
+paths += ["scripts/hosting.py", "scripts/prod_agent/github_readiness.py"]
+required = {bg + "deploy_state.py"}
+if (source / (bg + "deploy_report.py")).is_file():
+    required.update([bg + "deploy_report.py", bg + "deploy_triage_pure.py",
+                     bg + "publication_authority.py", "scripts/hosting.py"])
+if (source / (bg + "deploy_merge.py")).is_file():
+    required.update(paths)
+total = 0
+for name in paths:
+    path = source / name
+    if name not in required and not path.exists():
+        continue
+    data = path.read_bytes()
+    total += len(data)
+    if total > 1024 * 1024:
+        raise ValueError("ordinary helper closure exceeds 1 MiB")
+    target = root / name
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target.write_bytes(data)
+    target.chmod(0o600)
+# Regular packages prevent ambient/restored namespace portions from supplying code.
+for name in ("scripts/__init__.py", "scripts/prod_agent/__init__.py"):
+    target = root / name
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target.write_bytes(b"")
+PY
+)"; then die 11 "cannot preserve ordinary helper closure"; fi
+  DS="${HELPER_ROOT}/scripts/blue_green/deploy_state.py"
+  REPORTER="${HELPER_ROOT}/scripts/blue_green/deploy_report.py"
+  if [[ "${MERGER}" == "${SCRIPT_DIR}/deploy_merge.py" ]]; then
+    MERGER="${HELPER_ROOT}/scripts/blue_green/deploy_merge.py"
+  fi
+  log "ordinary helper runtime=${HELPER_ROOT}"
+fi
 
 # ---------------------------------------------------------------- 幂等
 if [[ "${DRY_RUN}" -eq 0 && "${NATIVE_CANDIDATE}" -eq 0 ]]; then
@@ -317,12 +373,12 @@ else
   _DEPLOYMENT_PROVIDER=""
   _DEPLOYMENT_HOST=""
   _DEPLOYMENT_REPO=""
-  if [[ -f "${SCRIPT_DIR}/deploy_report.py" ]]; then
+  if [[ -f "${REPORTER}" ]]; then
     {
       read -r _DEPLOYMENT_PROVIDER || true
       read -r _DEPLOYMENT_HOST || true
       read -r _DEPLOYMENT_REPO || true
-    } < <("${PY}" "${SCRIPT_DIR}/deploy_report.py" target 2>>"${LOG}" \
+    } < <("${PY}" "${REPORTER}" target 2>>"${LOG}" \
           | "${PY}" -c 'import json,sys; d=json.load(sys.stdin); print(d["provider"]); print(d["host"]); print(d["repository"])' 2>/dev/null)
   fi
   if [[ ! "${_DEPLOYMENT_PROVIDER}" =~ ^(github|gitea)$ \
@@ -438,7 +494,7 @@ run_stage() {
 
 # ---------------------------------------------------------------- 候选模式
 _merge_helper() {
-  local merger="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
+  local merger="${MERGER}"
   if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
     DAILYCHECK_PROD_REPO="${REPO_ROOT}" "${PY}" "${merger}" "$@" --base "${FROZEN_BASE}"
   else

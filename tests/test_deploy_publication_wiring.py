@@ -118,7 +118,7 @@ class Loopback:
                             "url": API + path, "html_url": WEB + "/" + repo}
                 elif path == f"/repos/{CODE}/pulls/{PR}":
                     data = {"number": PR, "html_url": WEB + f"/{CODE}/pull/{PR}",
-                            "head": {"sha": SHA},
+                            "head": {"sha": getattr(loop, "head", SHA)},
                             "base": {"repo": {"id": 1448986421}},
                             "body": loop.pr_body}
                 elif path == f"/repos/{CODE}/issues/{PR}/comments":
@@ -180,6 +180,7 @@ def sandbox(tmp_path, loopback):
                  "deploy_triage_pure.py", "publication_authority.py"):
         shutil.copy2(BG_DIR / name, sb / name)
         (sb / name).chmod(0o755)
+    shutil.copy2(REPO_ROOT / "scripts/hosting.py", tmp_path / "scripts/hosting.py")
     calls = tmp_path / "calls.txt"
     for name in ("up.sh", "verify.sh", "promote.sh", "switch.sh"):
         path = sb / name
@@ -742,15 +743,19 @@ def test_identity_without_owned_process_descriptor_cannot_release_or_mint(sandbo
 
 
 def test_release_state_io_failure_mints_no_outcome(sandbox):
-    target = sandbox["dir"] / "deploy_state.py"
-    target.rename(sandbox["dir"] / "real_state.py")
+    # Fault the actual release process through its existing interpreter port.
+    # The production helper/import closure itself remains unchanged.
+    python = sandbox["env"]["PYTHON"]
+    target = sandbox["tmp"] / "release-io-python"
     target.write_text(
-        "import os, runpy, sys\n"
+        f"#!{sys.executable}\nimport os, sys\n"
         "from pathlib import Path\n"
-        "if len(sys.argv) > 1 and sys.argv[1] == 'release':\n"
+        "if len(sys.argv) > 2 and Path(sys.argv[1]).name == 'deploy_state.py' and sys.argv[2] == 'release':\n"
         "    (Path(os.environ['DAILYCHECK_DEPLOY_STATE_DIR']) / "
         "f'.state.json.tmp-{os.getpid()}').mkdir()\n"
-        "runpy.run_path(str(Path(__file__).with_name('real_state.py')), run_name='__main__')\n")
+        f"os.execv({python!r}, [{python!r}, *sys.argv[1:]])\n")
+    target.chmod(0o700)
+    sandbox["env"]["PYTHON"] = str(target)
     proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0")
     assert proc.returncode == 27, proc.stdout + proc.stderr
     state = _state(sandbox)
@@ -1184,3 +1189,123 @@ def test_clear_lock_then_successor_keeps_old_attempt_unable_to_publish(sandbox):
     assert retry.returncode == 1
     assert len(sandbox["api"].posts) == 1
     assert json.loads((sandbox["state"] / "state.json").read_text())["lock"] == before["lock"]
+
+
+@pytest.mark.parametrize("fault", ["none", "restore", "owner", "cleanup"])
+def test_failed_candidate_restore_keeps_original_helper_contract(sandbox, fault):
+    """Real two-revision checkout: base release/report are genuinely incompatible."""
+    sb = sandbox
+    repo, bg = sb["repo"], sb["dir"]
+    real_git = shutil.which("git")
+
+    def git(*args):
+        return subprocess.check_output([real_git, "-C", str(repo), *args], text=True).strip()
+
+    current_ds = (bg / "deploy_state.py").read_text()
+    current_report = (bg / "deploy_report.py").read_text()
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "owned fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    (bg / "legacy_state_core.py").write_text(current_ds)
+    (bg / "deploy_state.py").write_text('''import argparse, runpy, sys
+from pathlib import Path
+if sys.argv[1:2] == ["release"]:
+    p = argparse.ArgumentParser()
+    p.add_argument("command"); p.add_argument("--token"); p.add_argument("--result")
+    p.add_argument("--sha"); p.add_argument("--note")
+    p.parse_args()
+runpy.run_path(str(Path(__file__).with_name("legacy_state_core.py")), run_name="__main__")
+''')
+    wrong = sb["tmp"] / "wrong-provider.json"
+    (bg / "deploy_report.py").write_text(f'''import argparse, json
+from pathlib import Path
+p = argparse.ArgumentParser(); p.add_argument("command", choices=["write"])
+for key in ("pr", "sha", "rc", "stage", "log", "repo"): p.add_argument("--" + key)
+p.add_argument("--dry-run", action="store_true")
+a = p.parse_args()
+Path({str(wrong)!r}).write_text(json.dumps({{"method":"POST", "provider":"gitea", "pr":a.pr}}))
+''')
+    git("add", "scripts")
+    git("commit", "-qm", "old strict release CLI and legacy Gitea report")
+    base = git("rev-parse", "HEAD")
+    (bg / "deploy_state.py").write_text(current_ds)
+    (bg / "deploy_report.py").write_text(current_report)
+    git("commit", "-qam", "current deployment helpers")
+    head = git("rev-parse", "HEAD")
+    origin = sb["tmp"] / "origin.git"
+    subprocess.run([real_git, "init", "--bare", "-q", str(origin)], check=True)
+    git("remote", "add", "origin", str(origin))
+    git("push", "-q", "origin", base + ":refs/heads/main")
+    git("push", "-q", "origin", head + ":refs/pull/42/head")
+    # HEAD remains the approved current revision at launch, as in H17.
+    git("checkout", "-q", "--detach", head)
+    sb["api"].head = head
+    tools = sb["tmp"] / "bin"
+    (tools / "git").write_text(f'''#!{sys.executable}
+import os, sys
+args = sys.argv[1:]
+if args[-3:] == ["remote", "get-url", "origin"]: print("https://github.com/{CODE}.git")
+elif {fault == 'restore'!r} and "checkout" in args and "-B" in args: sys.exit(1)
+else: os.execv({real_git!r}, [{real_git!r}, *args])
+''')
+    verify = "#!/bin/sh\n"
+    if fault == "owner":
+        verify += f'''"{sys.executable}" - <<'OWN'
+import json
+from pathlib import Path
+p=Path({str(sb['state'] / 'state.json')!r}); s=json.loads(p.read_text())
+s["lock"]["token"]="revoked-owned-fixture"
+p.write_text(json.dumps(s))
+OWN
+'''
+    (bg / "verify.sh").write_text(verify + "exit 1\n")
+    if fault == "cleanup":
+        rm = tools / "rm"
+        rm.write_text("#!/bin/sh\nexit 1\n")
+        rm.chmod(0o700)
+    helper_tmp = sb["tmp"] / "helper-temp"
+    helper_tmp.mkdir()
+    (sb["state"] / "state.json").write_text(json.dumps({
+        "deployed": {"sha": OTHER_SHA, "pr": 41, "at": 1}}))
+    env = dict(sb["env"], TMPDIR=str(helper_tmp))
+    proc = _pipe(sb, str(PR), head, env=env)
+    state = json.loads((sb["state"] / "state.json").read_text())
+    from tests.test_github_transport import proof
+
+    proof("cleanup-contract-" + fault, {
+        "native_exit": proc.returncode, "stdout": proc.stdout,
+        "log": (sb["tmp"] / "pipeline.log").read_text(),
+        "base": base, "head": head, "checkout": git("rev-parse", "HEAD"),
+        "deployed": state.get("deployed"), "lock": state.get("lock"),
+        "outcomes": [{k: v for k, v in x.items() if k in {
+            "sha", "rc", "stage", "result", "verification", "deployment"}}
+            for x in state.get("outcomes", {}).values()],
+        "legacy_provider_write": json.loads(wrong.read_text()) if wrong.exists() else None,
+        "typed_posts": sb["api"].posts,
+        "helper_material_remaining": [str(p) for p in helper_tmp.iterdir()],
+    })
+    assert proc.returncode == 21, proc.stdout + proc.stderr
+    assert state["deployed"]["sha"] == OTHER_SHA
+    assert not wrong.exists(), "restored legacy reporter selected Gitea"
+    if fault == "owner":
+        assert state["lock"] and not state.get("outcomes") and not sb["api"].posts
+        assert "release(failed) 失败" in proc.stdout
+    else:
+        assert state["lock"] is None, "restored legacy release CLI left the attempt locked"
+        outcomes = list(state["outcomes"].values())
+        assert len(outcomes) == 1 and outcomes[0]["result"] == "failed"
+        assert outcomes[0]["rc"] == 21 and outcomes[0]["stage"] == "verify"
+        assert outcomes[0]["sha"] == head
+        assert len(sb["api"].posts) == 1
+        assert sb["api"].posts[0]["path"] == f"/repos/{CODE}/issues/{PR}/comments"
+        assert "| RC | 21 |" in sb["api"].posts[0]["payload"]["body"]
+    assert git("rev-parse", "HEAD") == (base if fault in {"none", "cleanup"} else head)
+    if fault == "restore":
+        assert "恢复 origin/main 失败" in proc.stdout
+    if fault == "cleanup":
+        assert "helper runtime cleanup failed" in proc.stdout
+        assert list(helper_tmp.iterdir())
+        # Pipeline is positively exited: only this fixture's retained helper material is ours.
+        for path in helper_tmp.iterdir():
+            shutil.rmtree(path)
+    assert not list(helper_tmp.iterdir())

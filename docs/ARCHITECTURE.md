@@ -1230,6 +1230,10 @@ typed projection；lane flag、CLI success、report HTTP 均不产生 outcome au
 ordinary GitHub catchup 复用当前 `sys.executable`，兼容既有 hosted executor 的解释器路径；
 Gitea 仍使用 `/usr/bin/python3`，解释器不可用仍告警。CI manifest 只同步已审查 hosting
 blob 与两个 workflow manifest identity，执行器、runtime、其余十五个成员及门禁不变。
+ordinary pipeline 在候选 checkout 前于既有 process fence 内保存当前 state/report/默认
+finalizer 的有限 helper import closure（私有临时目录、代码上限 1MiB），恢复 main 后仍用
+同一 ABI 与 hosting 实现收锁和 typed 回写；先持锁恢复再 release，不以旧树 helper 回退。
+心跳和同步子进程退出后清理副本；清理失败显式告警，原失败码与未确认结果仍保留。
 
 候选准备冻结 main B，check/finalize 都传 B，H 必须包含 B。普通 GitHub pipeline
 拒绝 skip-verify、短观察和非 candidate/merge 入口；观察以 monotonic 实际时间计。
