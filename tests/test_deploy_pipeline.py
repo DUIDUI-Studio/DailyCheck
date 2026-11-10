@@ -931,3 +931,89 @@ def test_github_pipeline_rejects_disabled_or_incomplete_lane(sandbox, lane, args
                  DAILYCHECK_GITHUB_LANE=lane, PYTHONPATH=str(BG_DIR.parents[1]))
     assert proc.returncode in {25, 64}, proc.stdout + proc.stderr
     assert not _calls(sandbox) and not _state(sandbox)
+
+
+@pytest.mark.parametrize("case", ["stable", "promote", "switch", "observe", "tree",
+                                   "before_write", "after_write", "lost_response"])
+def test_verified_candidate_continuity_with_actual_finalizer(ordinary_candidate, case):
+    from tests import test_github_transport as t
+
+    sb = ordinary_candidate
+    fake = sb["tmp"] / "fake-api"
+    fake.mkdir()
+    with pytest.MonkeyPatch.context() as m:
+        table = t.ordinary(None, fake, m)
+    table = json.loads(json.dumps(table).replace(t.SHA, sb["sha"]).replace(t.BASE, sb["base"])
+                       .replace("/160", "/42").replace('"number": 160', '"number": 42'))
+    key = t.ROOT + "/pulls/42"
+    before = table[key]
+    after = json.loads(json.dumps(before))
+    after["data"].update(state="closed", merged=True, merge_commit_sha=sb["sha"])
+    table[key] = [before] * 12 + [after]
+    main = table[t.ROOT + "/git/ref/heads/main"]
+    table[t.ROOT + "/git/ref/heads/main"] = [main] * 3 + [t.response({
+        "ref": "refs/heads/main", "object": {"sha": sb["sha"]}})]
+    if case == "lost_response":
+        table["/graphql"]["exit"] = 28
+    (fake / "table").write_text(json.dumps(table))
+    effect = '''import subprocess
+def drift():
+    subprocess.run(['/usr/bin/git','-C',os.environ['CANDIDATE_REPO'],'checkout','-q',
+                    '--detach',os.environ['CANDIDATE_BASE']],check=True)
+if url.path == '/graphql':
+    subprocess.run(['/usr/bin/git','-C',os.environ['CANDIDATE_ORIGIN'],'update-ref',
+                    'refs/heads/main',os.environ['CANDIDATE_H']],check=True)
+    if os.environ['CANDIDATE_CASE'] == 'after_write': drift()
+if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
+        and os.environ['CANDIDATE_CASE'] == 'before_write'): drift()
+'''
+    curl = fake / "curl"
+    curl.write_text(t.FAKE_CURL.replace("PYTHON", sys.executable).replace("log = {", effect + "log = {"))
+    curl.chmod(0o700)
+    (sb["state"] / "state.json").write_text(json.dumps({
+        "deployed": {"sha": sb["base"], "pr": 41, "at": 1}}))
+    drift = f"git -C '{sb['repo']}' checkout -q --detach '{sb['base']}'\n"
+    if case == "promote":
+        (sb["dir"] / "promote.sh").write_text(
+            "#!/bin/sh\n" + drift + f"echo promote.sh >> '{sb['calls']}'\n")
+    if case == "switch":
+        (sb["dir"] / "switch.sh").write_text(
+            f'#!/bin/sh\necho "switch.sh $*" >> \'{sb["calls"]}\'\n'
+            + 'if [ "$1" = green ]; then\n' + drift + "fi\n")
+    extra = {**sb["ordinary_env"], "DAILYCHECK_DEPLOY_MERGE_BIN": str(BG_DIR / "deploy_merge.py"),
+        "DAILYCHECK_CURL": str(curl), "DAILYCHECK_GITHUB_READ_TOKEN": "synthetic-read",
+        "DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE": str(fake / "finalize-token"),
+        "FAKE_TABLE": str(fake / "table"), "FAKE_STATE": str(fake / "api-state"),
+        "FAKE_LOG": str(fake / "log"), "CANDIDATE_REPO": str(sb["repo"]),
+        "CANDIDATE_ORIGIN": str(sb["origin"]), "CANDIDATE_H": sb["sha"],
+        "CANDIDATE_BASE": sb["base"], "CANDIDATE_CASE": case, "DAILYCHECK_DASHBOARD_HOOK": "0"}
+    if case in {"observe", "tree"}:
+        journal = Path(extra["DAILYCHECK_PIPELINE_JOURNALCTL"])
+        journal.write_text("#!/bin/sh\n" + (drift if case == "observe" else
+            f"echo changed >> '{sb['repo'] / 'app.py'}'\n"))
+    result = _pipe(sb, "42", sb["sha"], "--candidate", "--merge-pr", **extra)
+    state = _state(sb)
+    actual_main = _git(["rev-parse", "main"], sb["origin"])
+    catchup = _ds(sb, "catchup", "--main-sha", actual_main)
+    posts = [r for r in map(json.loads, (fake / "log").read_text().splitlines())
+             if r["method"] == "POST"]
+    t.proof("continuity-" + case, {"native_exit": result.returncode, "stdout": result.stdout,
+        "base": sb["base"], "head": sb["sha"], "actual_main": actual_main,
+        "deployed": state.get("deployed"), "last_attempt": state.get("last_attempt"),
+        "outcomes": [{k: v for k, v in o.items() if k in {"sha", "result", "rc", "verification"}}
+                     for o in state.get("outcomes", {}).values()], "post_count": len(posts),
+        "catchup_exit": catchup.returncode, "catchup_stdout": catchup.stdout,
+        "fences": [r["retained_fences"] for r in posts]})
+    if case == "stable":
+        assert result.returncode == 0 and state["deployed"]["sha"] == sb["sha"]
+        assert len(posts) == 1 and actual_main == sb["sha"] and catchup.returncode == 0
+        assert next(iter(state["outcomes"].values()))["verification"] == "normal"
+    else:
+        written = case in {"after_write", "lost_response"}
+        assert result.returncode != 0 and state["deployed"]["sha"] == sb["base"]
+        assert len(posts) == int(written)
+        assert actual_main == (sb["sha"] if written else sb["base"])
+        assert catchup.returncode == (2 if written else 0)
+        assert state["last_attempt"]["result"] == "failed"
+        assert not any(o["result"] == "success" for o in state["outcomes"].values())
+        assert "switch.sh blue 100" in _calls(sb)

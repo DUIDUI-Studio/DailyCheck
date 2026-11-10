@@ -579,7 +579,77 @@ else:
         cli = [sys.executable, "-B", str(wrapper)]
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
                DAILYCHECK_DEPLOY_STATE_DIR=str(tmp_path / "deploy-state"))
+    # Standalone finalizer ports model a held exact candidate; coupled pipeline tests use real Git.
+    tools = tmp_path / "candidate-tools"
+    tools.mkdir(exist_ok=True)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(exist_ok=True)
+    git = tools / "git"
+    git.write_text(f'''#!{sys.executable}
+import sys
+args = sys.argv[1:]
+if args == ["-C", {str(candidate)!r}, "rev-parse", "HEAD"]: print({SHA!r})
+elif args != ["-C", {str(candidate)!r}, "diff-index", "--quiet", {SHA!r}, "--"]: sys.exit(128)
+''')
+    git.chmod(0o700)
+    env.update(DAILYCHECK_PROD_REPO=str(candidate), PATH=str(tools) + os.pathsep + env["PATH"])
     return subprocess.run(cli, env=env, text=True, capture_output=True, timeout=30)
+
+
+@pytest.mark.parametrize("field", ["head_repo", "base_repo", "number", "pr_id",
+                                   "required_app", "approval_count", "check_app"])
+@pytest.mark.parametrize("kind", ["float", "bool"])
+def test_finalizer_strict_numeric_preconditions(api, tmp_path, monkeypatch, field, kind):
+    table = merged_table(ordinary(api, tmp_path, monkeypatch))
+    def bad(value):
+        return float(value) if kind == "float" else True
+    if field in {"required_app", "approval_count"}:
+        protection = table[ROOT + "/branches/main/protection"]["data"]
+        if field == "required_app":
+            for check in protection["required_status_checks"]["checks"]:
+                check["app_id"] = bad(check["app_id"])
+        else:
+            protection["required_pull_request_reviews"]["required_approving_review_count"] = bad(1)
+    elif field == "check_app":
+        for check in table[ROOT + f"/commits/{SHA}/check-runs?page=1"]["data"]["check_runs"]:
+            check["app"]["id"] = bad(check["app"]["id"])
+    else:
+        for row in table[ROOT + "/pulls/160"]:
+            pr = row["data"]
+            if field.endswith("_repo"):
+                repo = pr[field.split("_")[0]]["repo"]
+                repo["id"] = bad(repo["id"])
+            else:
+                key = "id" if field == "pr_id" else "number"
+                pr[key] = bad(pr[key])
+    api.write(table)
+    result = merge_cli(tmp_path)
+    assert result.returncode == 32, result.stdout + result.stderr
+    assert not [r for r in api.log() if r["method"] == "POST"]
+    proof(f"strict-pre-{field}-{kind}", {"native_exit": result.returncode,
+          "stdout": json.loads(result.stdout), "post_count": 0})
+
+
+@pytest.mark.parametrize("field", ["head_repo", "base_repo", "number", "pr_id"])
+@pytest.mark.parametrize("kind", ["float", "bool"])
+@pytest.mark.parametrize("phase", ["reread", "post"])
+def test_finalizer_strict_numeric_confirmation(api, tmp_path, monkeypatch, field, kind, phase):
+    table = merged_table(ordinary(api, tmp_path, monkeypatch))
+    rows = table[ROOT + "/pulls/160"]
+    index = 7 if phase == "reread" else 8
+    rows[index] = json.loads(json.dumps(rows[index]))
+    pr = rows[index]["data"]
+    target = pr[field.split("_")[0]]["repo"] if field.endswith("_repo") else pr
+    key = "id" if field != "number" else "number"
+    target[key] = float(target[key]) if kind == "float" else True
+    api.write(table)
+    result = merge_cli(tmp_path)
+    posts = [r for r in api.log() if r["method"] == "POST"]
+    assert result.returncode == 32, result.stdout + result.stderr
+    assert len(posts) == (1 if phase == "post" else 0)
+    assert json.loads(result.stdout)["merged"] is False
+    proof(f"strict-{phase}-{field}-{kind}", {"native_exit": result.returncode,
+          "stdout": json.loads(result.stdout), "post_count": len(posts)})
 
 
 def merged_table(table):

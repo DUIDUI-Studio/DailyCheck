@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,19 +49,42 @@ RC_PRECONDITION = 31
 RC_API = 32
 
 
+def _integer(value: object, expected: int | None = None) -> bool:
+    return type(value) is int and value > 0 and (expected is None or value == expected)
+
+
+def _candidate_intact(sha: str) -> None:
+    repo = os.environ.get("DAILYCHECK_PROD_REPO", "")
+    if not Path(repo).is_absolute():
+        raise HostingError("github_candidate_checkout_required")
+    head = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=False)
+    tree = subprocess.run(["git", "-C", repo, "diff-index", "--quiet", sha, "--"],
+                          capture_output=True, check=False)
+    if head.returncode or head.stdout.strip() != sha or tree.returncode:
+        raise HostingError("github_verified_candidate_changed")
+
+
 def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -> dict:
     readiness = GitHubReadinessClient(client).check(pr, sha, expected_base_sha=base)
     if not readiness["ready"]:
         raise HostingError("github_not_ready:" + readiness["reason"])
+    if (any(not _integer(readiness.get(key)) for key in ("workflow_id", "run_id", "run_attempt"))
+            or any(not _integer(c.get(key)) for c in readiness["check_evidence"]
+                   for key in ("job_id", "check_run_id", "run_attempt"))
+            or any(not _integer(c.get("app_id"), client.config.actions_app_id)
+                   for c in readiness["check_evidence"])):
+        raise HostingError("github_invalid_ci_identity")
     root = f"/repos/{client.config.repo}"
     repo = client.verify_repository()
     data = client.get(f"{root}/pulls/{pr}")
     if (repo.get("node_id") != GITHUB_REPOSITORY_NODE
-            or data.get("number") != pr or not isinstance(data.get("node_id"), str)
+            or not _integer(data.get("number"), pr) or not _integer(data.get("id"))
+            or not isinstance(data.get("node_id"), str)
             or not data["node_id"] or data.get("merged") is not False
             or data.get("draft") is not False or _validate(data, pr, sha)
             or data["base"].get("sha") != base
-            or any(data[side].get("repo", {}).get("id") != client.config.repo_id
+            or any(not _integer(data[side].get("repo", {}).get("id"), client.config.repo_id)
                    or data[side]["repo"].get("full_name") != client.config.repo
                    for side in ("head", "base"))):
         raise HostingError("github_target_changed")
@@ -78,10 +103,11 @@ def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -
     # An indirect merge is not evidence that review/check protections were met.
     # Fail closed until Prod aligns classic protection, including administrators.
     if (protection.get("enforce_admins", {}).get("enabled") is not True
-            or type(count) is not int or count < 1
+            or not _integer(count)
             or reviews_policy.get("dismiss_stale_reviews") is not True
+            or any(not _integer(c.get("app_id")) for c in checks)
             or any(not any(c.get("context") == name
-                           and c.get("app_id") == client.config.actions_app_id for c in checks)
+                           and _integer(c.get("app_id"), client.config.actions_app_id) for c in checks)
                    for name in ("test", "agent-framework-reports"))):
         raise HostingError("github_required_protection_unproven")
     reviews = client.pages(f"{root}/pulls/{pr}/reviews")
@@ -90,7 +116,7 @@ def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -
         state = review.get("state")
         if state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
             user = review.get("user", {}).get("id")
-            if type(user) is not int or user <= 0:
+            if not _integer(user):
                 raise HostingError("github_invalid_review")
             latest[user] = (state, review.get("commit_id"), review["id"])
     if (any(r[0] == "CHANGES_REQUESTED" for r in latest.values())
@@ -99,10 +125,15 @@ def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -
     # Re-read refs after collecting review/protection facts; the mutation also CASes both refs.
     after = client.get(f"{root}/pulls/{pr}")
     main = client.get(f"{root}/git/ref/heads/main")
-    if (after != data or main.get("ref") != "refs/heads/main"
+    if (after != data or not _integer(after.get("number"), pr)
+            or not _integer(after.get("id"), data["id"])
+            or any(not _integer(after[side].get("repo", {}).get("id"), client.config.repo_id)
+                   for side in ("head", "base"))
+            or main.get("ref") != "refs/heads/main"
             or main.get("object", {}).get("sha") != base):
         raise HostingError("github_target_changed")
-    return {"pr_node": data["node_id"], "head_ref": head_ref, "base": base, "head": sha,
+    return {"pr_node": data["node_id"], "pr_id": data["id"],
+            "head_ref": head_ref, "base": base, "head": sha,
             "protection": protection, "reviews": latest,
             "ci": {k: readiness[k] for k in ("run_id", "run_attempt", "check_evidence")}}
 
@@ -136,6 +167,7 @@ def _github(pr: int, sha: str, base: str | None, *, merge: bool, dry_run: bool =
             current = _github_preconditions(client, pr, sha, base)
             if current != before:
                 raise HostingError("github_finalization_facts_changed")
+            _candidate_intact(sha)
             payload = github_ff_payload(base, sha, current["head_ref"], lock["attempt_id"])
             # Exactly one atomic non-forced batch. No retries, including response loss.
             mutated = True
@@ -149,18 +181,21 @@ def _github(pr: int, sha: str, base: str | None, *, merge: bool, dry_run: bool =
             after = client.get(f"{root}/pulls/{pr}")
             main = client.get(f"{root}/git/ref/heads/main")
             client.verify_repository()
-            if (after.get("node_id") != current["pr_node"] or after.get("number") != pr
+            if (after.get("node_id") != current["pr_node"]
+                    or not _integer(after.get("number"), pr)
+                    or not _integer(after.get("id"), current["pr_id"])
                     or after.get("state") != "closed" or after.get("merged") is not True
                     or after.get("merge_commit_sha") != sha
                     or after.get("head", {}).get("sha") != sha
                     or after.get("head", {}).get("ref") != current["head_ref"][11:]
                     or after.get("base", {}).get("ref") != "main"
-                    or any(after.get(side, {}).get("repo", {}).get("id") != client.config.repo_id
+                    or any(not _integer(after.get(side, {}).get("repo", {}).get("id"), client.config.repo_id)
                            or after[side]["repo"].get("full_name") != client.config.repo
                            for side in ("head", "base"))
                     or main.get("ref") != "refs/heads/main"
                     or main.get("object", {}).get("sha") != sha):
                 raise HostingError("github_finalization_postfacts_unconfirmed")
+            _candidate_intact(sha)
             return RC_OK, {**_payload(pr, sha, True, "", sha), "base": base,
                            "main_sha": sha, "pr_node": current["pr_node"]}
     except (HostingError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:

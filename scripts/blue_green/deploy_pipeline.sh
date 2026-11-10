@@ -194,9 +194,15 @@ log "log=${LOG}"
 # ---------------------------------------------------------------- 收锁
 _release() {
   local result=$1 note="${2:-}" rc="${3:-0}" stage="${4:-complete}"
+  local drift=0
   if [[ "${result}" == "success" ]]; then
     rc=0
     stage="complete"
+    if ! _verified_candidate "release"; then
+      result=failed; rc=27; stage=candidate-drift
+      note="verified candidate changed before success release; reconcile remote facts"
+      drift=27
+    fi
   fi
   # Honest private classification: a success that skipped verify or used a
   # shortened observation window must not be recorded as normal verification.
@@ -217,6 +223,7 @@ _release() {
     _audit_event "release-failed" "result=${result}; deployed anchor unknown; merge facts remain in log"
     return 27
   fi
+  return "${drift}"
 }
 
 # 部署结果写回 PR + 投递 agent 事件（2026-10-25）。
@@ -367,6 +374,25 @@ _require_candidate_owner() {
   _candidate_owner "$1" || exit 28
 }
 
+_verified_candidate() {
+  [[ "${GITHUB_ORDINARY}" -eq 1 && "${DRY_RUN}" -eq 0 ]] || return 0
+  _require_candidate_owner "verified-candidate $1"
+  local head
+  head="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"
+  if [[ "${head}" == "${SHA}" ]] \
+      && git -C "${REPO_ROOT}" diff-index --quiet "${SHA}" --; then return 0; fi
+  FAIL_STAGE="candidate-drift"
+  log "ERROR: verified candidate changed at $1; no successful H outcome"
+  _audit_event "worktree-drift" "verified candidate changed at $1; remote facts require reconciliation"
+  bash "${SCRIPT_DIR}/switch.sh" blue 100 >>"${LOG}" 2>&1 \
+    || log "WARN: candidate drift blue rollback failed"
+  return 26
+}
+
+_require_verified_candidate() {
+  _verified_candidate "$1" || exit 26
+}
+
 _owned_checkout() {
   "${PY}" "${DS}" owned-checkout --repo "${REPO_ROOT}" "$@" >>"${LOG}" 2>&1
 }
@@ -392,6 +418,7 @@ run_stage() {
   log "→ ${name}"
   _hb "${name}-start"
   _native_stage "${name}" start
+  case "${name}" in promote|switch|merge) _require_verified_candidate "${name}-before" ;; esac
   local rc
   "$@" >>"${LOG}" 2>&1
   rc=$?
@@ -402,6 +429,7 @@ run_stage() {
     tail -n 20 "${LOG}" 2>/dev/null | sed 's/^/    /'
     exit "${code}"
   fi
+  case "${name}" in promote|switch|merge) _require_verified_candidate "${name}-after" ;; esac
   _hb "${name}-done"
   _native_stage "${name}" done
   log "✓ ${name}"
@@ -412,7 +440,7 @@ run_stage() {
 _merge_helper() {
   local merger="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
   if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
-    "${PY}" "${merger}" "$@" --base "${FROZEN_BASE}"
+    DAILYCHECK_PROD_REPO="${REPO_ROOT}" "${PY}" "${merger}" "$@" --base "${FROZEN_BASE}"
   else
     "${PY}" "${merger}" "$@"
   fi
@@ -501,6 +529,7 @@ _merge_candidate() {
   # Record the completed remote fact before checking ownership of local recovery.
   log "✓ FF 合并完成：${out}"
   _require_candidate_owner "merge-return; remote merge confirmed sha=${SHA}"
+  _require_verified_candidate "merge-return-before-restore"
   _restore_main || true
   _require_candidate_owner "merge-restore-return; remote merge confirmed sha=${SHA}"
   local head
@@ -536,6 +565,7 @@ observe_window() {
     started="$("${PY}" -c 'import time; print(int(time.monotonic()))')" || exit 24
   fi
   for (( i=1; i<=rounds || (GITHUB_ORDINARY == 1 && elapsed_sec < minutes * 60); i++ )); do
+    _require_verified_candidate "observe-before-wait"
     sleep "${tick}"
     elapsed_sec=$(( elapsed_sec + tick ))
     if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
@@ -550,6 +580,7 @@ observe_window() {
     blocked="$("${jctl_bin}" -u "${green_unit}" --since "${since_ts}" 2>/dev/null \
                | grep -c '\[dry_run\] BLOCKED' || true)"
     blocked="${blocked:-0}"
+    _require_verified_candidate "observe-after-probes"
     log "观察 +${elapsed_min}min: probe=${code} blocked=${blocked}（BLOCKED 统计自 ${since_ts}）"
     if [[ "${blocked}" -gt 0 || ( "${code}" != "302" && "${code}" != "200" ) ]]; then
       log "✗ 观察窗异常 —— 回滚蓝"
@@ -664,7 +695,9 @@ if [[ "${OBSERVE_MIN}" -lt "${OBSERVE_MIN_REQUIRED}" ]]; then
 fi
 
 _native_stage observe start
+_require_verified_candidate "observe-start"
 observe_window "${OBSERVE_MIN}"
+_require_verified_candidate "observe-complete"
 _native_stage observe done
 
 if [[ "${NATIVE_CANDIDATE}" -eq 1 ]]; then

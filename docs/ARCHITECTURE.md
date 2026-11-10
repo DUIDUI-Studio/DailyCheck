@@ -1230,6 +1230,11 @@ typed projection；lane flag、CLI success、report HTTP 均不产生 outcome au
 
 候选准备冻结 main B，check/finalize 都传 B，H 必须包含 B。普通 GitHub pipeline
 拒绝 skip-verify、短观察和非 candidate/merge 入口；观察以 monotonic 实际时间计。
+verify 后每个 promote/switch/观察/finalize/release 边界复核 HEAD=H 与 tracked tree
+未变；finalizer 复用 pipeline 绑定的既有 `DAILYCHECK_PROD_REPO`，在持锁写前/后再次
+检查候选。漂移只回滚/记失败，保留实际 remote main 与旧 deployed 锚点，不重置远端。
+外部 PR/repository/check/review 数字 identity 与审批数量只接受 exact int，拒绝 float/bool；
+重新采样与 post-confirmation 同样执行类型检查，不能借 Python 数值相等通过。
 finalizer 在既有 process/state fence 下重读精确 repo ID/node、PR node/ref/H/B、最新
 两必需 CI producer/run/attempt、review 和 protection；要求 classic main protection
 enforce-admins、stale-review dismissal、至少一项当前 H approval 和两个 Actions App

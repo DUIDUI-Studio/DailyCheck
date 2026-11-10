@@ -233,7 +233,7 @@ if args[:1] == ["-C"]: args = args[2:]
 if args == ["remote", "get-url", "origin"]:
     print("https://github.com/{CODE}.git")
 elif args and args[0] == "rev-parse": print({OTHER_SHA!r} if args[-1] == "origin/main" else {SHA!r})
-elif args and args[0] in {{"fetch", "checkout", "merge-base"}}: pass
+elif args and args[0] in {{"fetch", "checkout", "merge-base", "diff-index"}}: pass
 else: sys.exit(128)
 ''')
     git.chmod(0o755)
