@@ -64,6 +64,25 @@ def _replace_owner(sb):
         return state["lock"]
 
 
+def _report_closure(sb):
+    """Supply the real finite import closure even when the reporter is a port."""
+    for name in ("deploy_triage_pure.py", "publication_authority.py"):
+        shutil.copy2(BG_DIR / name, sb["dir"] / name)
+    shutil.copy2(BG_DIR.parent / "hosting.py", sb["tmp"] / "scripts/hosting.py")
+
+
+def _interpreter_port(sb, code):
+    """Fault/gate the actual helper process, keeping its snapshot bytes intact."""
+    port = sb["tmp"] / "interpreter-port"
+    port.write_text(
+        f"#!{sys.executable}\nimport os, sys\nfrom pathlib import Path\n"
+        + code
+        + f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    port.chmod(0o700)
+    return str(port)
+
+
 @contextmanager
 def held_pipeline(sb, stage="up.sh", observe_min="0", **extra):
     """A real stage emits READY then blocks in read(2), with no timing guesses."""
@@ -141,21 +160,20 @@ def test_same_pr_successor_token_cannot_be_adopted(sandbox):
 
 
 def test_authoritative_release_failure_never_reports_success(sandbox):
-    ds = sandbox["dir"] / "deploy_state.py"
-    ds.rename(sandbox["dir"] / "real_state.py")
-    ds.write_text(
-        'import runpy, sys\n'
-        'from pathlib import Path\n'
-        'if len(sys.argv) > 1 and sys.argv[1] == "release": sys.exit(11)\n'
-        'runpy.run_path(str(Path(__file__).with_name("real_state.py")), run_name="__main__")\n'
+    python = _interpreter_port(
+        sandbox,
+        'if len(sys.argv) > 2 and Path(sys.argv[1]).name == "deploy_state.py" '
+        'and sys.argv[2] == "release": sys.exit(11)\n',
     )
+    _report_closure(sandbox)
     reporter = sandbox["dir"] / "deploy_report.py"
     reporter.write_text(
         'import json, sys\n'
         'from pathlib import Path\n'
         f'Path({str(sandbox["tmp"] / "report-args")!r}).write_text(json.dumps(sys.argv))\n'
     )
-    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0", DAILYCHECK_DEPLOY_REPORT="1")
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0", DAILYCHECK_DEPLOY_REPORT="1",
+                 PYTHON=python)
     assert proc.returncode != 0, proc.stdout + proc.stderr
     args = json.loads((sandbox["tmp"] / "report-args").read_text())
     assert args[args.index("--rc") + 1] != "0"
@@ -234,17 +252,14 @@ def test_process_tree_exit_allows_stale_recovery(sandbox):
 
 
 def test_release_real_anchor_io_error_is_failure(sandbox):
-    ds = sandbox["dir"] / "deploy_state.py"
-    ds.rename(sandbox["dir"] / "real_state.py")
-    ds.write_text(
-        'import os, runpy, sys\n'
-        'from pathlib import Path\n'
-        'if len(sys.argv) > 1 and sys.argv[1] == "release":\n'
+    python = _interpreter_port(
+        sandbox,
+        'if len(sys.argv) > 2 and Path(sys.argv[1]).name == "deploy_state.py" '
+        'and sys.argv[2] == "release":\n'
         '    (Path(os.environ["DAILYCHECK_DEPLOY_STATE_DIR"]) / '
-        'f".state.json.tmp-{os.getpid()}").mkdir()\n'
-        'runpy.run_path(str(Path(__file__).with_name("real_state.py")), run_name="__main__")\n'
+        'f".state.json.tmp-{os.getpid()}").mkdir()\n',
     )
-    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0")
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0", PYTHON=python)
     assert proc.returncode == 27, proc.stdout + proc.stderr
     assert "IsADirectoryError" in (sandbox["tmp"] / "pipeline.log").read_text()
     assert _state(sandbox)["lock"]["pr"] == 42
@@ -300,23 +315,23 @@ def test_process_fence_spans_setup_release_and_writeback(sandbox, phase):
     if phase == "writeback":
         target = sandbox["dir"] / "deploy_report.py"
         target.write_text("import sys\n")
+        _report_closure(sandbox)
     else:
         target = sandbox["dir"] / "deploy_state.py"
-    original = target.with_name("real_" + target.name)
-    target.rename(original)
-    target.write_text(
-        'import os, runpy, sys\n'
-        f'if sys.argv[1] == {("write" if phase == "writeback" else phase)!r} '
+    python = _interpreter_port(
+        sandbox,
+        f'if len(sys.argv) > 2 and Path(sys.argv[1]).name == {target.name!r} '
+        f'and sys.argv[2] == {("write" if phase == "writeback" else phase)!r} '
         'and os.environ.get("READY_FD"):\n'
         '    os.write(int(os.environ["READY_FD"]), b"R")\n'
-        '    assert os.read(int(os.environ["GATE_FD"]), 1) == b"G"\n'
-        f'runpy.run_path({str(original)!r}, run_name="__main__")\n'
+        '    assert os.read(int(os.environ["GATE_FD"]), 1) == b"G"\n',
     )
     # Use a no-op held stage to share the pipe/process cleanup harness; only the
     # chosen state CLI or reporter consumes the gate in this test.
     placeholder = sandbox["dir"] / "unused.sh"
     placeholder.write_text("#!/bin/sh\nexit 0\n")
-    with held_pipeline(sandbox, "unused.sh", DAILYCHECK_DEPLOY_REPORT="1") as (proc, gate):
+    with held_pipeline(sandbox, "unused.sh", DAILYCHECK_DEPLOY_REPORT="1",
+                       PYTHON=python) as (proc, gate):
         if phase == "status":
             assert _state(sandbox) == {}
         if phase == "writeback":
@@ -352,17 +367,14 @@ def test_process_fence_covers_observation(sandbox):
 
 def test_release_failure_keeps_successful_local_merge_facts(candidate_sandbox):
     sb = candidate_sandbox
-    ds = sb["dir"] / "deploy_state.py"
-    ds.rename(sb["dir"] / "real_state.py")
-    ds.write_text(
-        'import runpy, sys\n'
-        'from pathlib import Path\n'
-        'if len(sys.argv) > 1 and sys.argv[1] == "release": sys.exit(11)\n'
-        'runpy.run_path(str(Path(__file__).with_name("real_state.py")), run_name="__main__")\n'
+    python = _interpreter_port(
+        sb,
+        'if len(sys.argv) > 2 and Path(sys.argv[1]).name == "deploy_state.py" '
+        'and sys.argv[2] == "release": sys.exit(11)\n',
     )
     proc = _pipe(
         sb, "42", sb["sha"], "--candidate", "--merge-pr", "--observe-min", "0",
-        **_cand_env(sb),
+        **_cand_env(sb, PYTHON=python),
     )
     assert proc.returncode == 27, proc.stdout + proc.stderr
     assert _head(sb) == sb["sha"]

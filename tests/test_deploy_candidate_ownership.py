@@ -13,6 +13,7 @@ from contextlib import contextmanager, suppress
 
 import pytest
 
+from tests.test_deploy_attempt_fencing import _report_closure
 from tests.test_deploy_attempt_fencing import isolated as isolated
 from tests.test_deploy_pipeline import _calls, _cand_env, _ds, _env, _head, _state
 from tests.test_deploy_pipeline import candidate_sandbox as candidate_sandbox
@@ -124,6 +125,7 @@ def _revoke_and_move(sb, successor, replacement):
 def test_revoked_candidate_preserves_successor_checkout(candidate_sandbox, phase, replacement):
     sb = candidate_sandbox
     successor = _successor_tree(sb)
+    _report_closure(sb)
     report_args = sb["tmp"] / "report-args"
     (sb["dir"] / "deploy_report.py").write_text(
         'import json, sys\nfrom pathlib import Path\n'

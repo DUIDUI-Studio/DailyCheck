@@ -621,12 +621,13 @@ def test_assess_reports_drifted_exit_one(tmp_path, fake_curl):
 @pytest.fixture()
 def pipeline_sandbox(tmp_path, monkeypatch):
     """真 pipeline + 真 deploy_report/triage + 假四阶段脚本。"""
-    sb = tmp_path / "bg"
-    sb.mkdir()
+    sb = tmp_path / "scripts" / "blue_green"
+    sb.mkdir(parents=True)
     for name in ("deploy_state.py", "deploy_pipeline.sh",
-                 "deploy_report.py", "deploy_triage_pure.py"):
+                 "deploy_report.py", "deploy_triage_pure.py", "publication_authority.py"):
         shutil.copy2(BG_DIR / name, sb / name)
         (sb / name).chmod(0o755)
+    shutil.copy2(BG_DIR.parent / "hosting.py", tmp_path / "scripts/hosting.py")
     # The report now imports the shared hosting boundary from its repository root.
     monkeypatch.setenv("PYTHONPATH", str(BG_DIR.parents[1]))
     calls = tmp_path / "calls.txt"
