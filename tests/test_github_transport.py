@@ -902,6 +902,44 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
     assert "report publication failed or unconfirmed" in result.stdout
     proof("poll-catchup", {"native_exit": result.returncode, "stdout": result.stdout,
                            "deployed": deployed, "main": main})
+    # Relocate the current interpreter port while running the real catchup helper.
+    from scripts.prod_agent import pr_poll
+
+    interpreter = tools / "relocated-python"
+    receipt = tmp_path / "interpreter.json"
+    interpreter.write_text(f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+Path({str(receipt)!r}).write_text(json.dumps(sys.argv[1:]))
+os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+''')
+    interpreter.chmod(0o700)
+    with monkeypatch.context() as selected:
+        selected.setattr(pr_poll, "PROD_REPO", str(repo))
+        selected.setattr(pr_poll, "DEPLOY_STATE", str(bg / "deploy_state.py"))
+        selected.setattr(pr_poll.sys, "executable", str(interpreter))
+        relocated = pr_poll._catchup_block()
+        assert '"status": "behind"' in relocated and main in relocated
+        assert receipt.exists(), "ordinary catchup did not use the current interpreter"
+        assert json.loads(receipt.read_text()) == [str(bg / "deploy_state.py"), "catchup"]
+        selected.setattr(pr_poll.sys, "executable", str(tools / "unavailable-python"))
+        unavailable = pr_poll._catchup_block()
+        assert "catchup 调用失败" in unavailable and "caught-up" not in unavailable
+        # Gitea still invokes its original interpreter, independently of sys.executable.
+        selected.setenv("DAILYCHECK_HOSTING_PROVIDER", "gitea")
+        attempted = []
+        real_run = subprocess.run
+
+        def observed_run(args, **kwargs):
+            attempted.append(args)
+            return real_run(args, **kwargs)
+
+        selected.setattr(pr_poll.subprocess, "run", observed_run)
+        gitea = pr_poll._catchup_block()
+        assert attempted[-1] == ["/usr/bin/python3", str(bg / "deploy_state.py"), "catchup"]
+        proof("poll-interpreter", {"selected": str(interpreter), "relocated_stdout": relocated,
+              "unavailable_stdout": unavailable, "gitea_stdout": gitea,
+              "gitea_command": attempted[-1], "helper_args": json.loads(receipt.read_text())})
     # A broken schedule helper can exit zero without producing its required facts.
     (bg / "deploy_state.py").write_text("raise SystemExit(0)\n")
     missing = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],

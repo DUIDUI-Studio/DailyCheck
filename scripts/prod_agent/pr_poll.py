@@ -147,7 +147,8 @@ def _catchup_block() -> str:
             return _alert("GitHub ordinary main fetch unavailable")
     try:
         proc = subprocess.run(
-            ["/usr/bin/python3", DEPLOY_STATE, "catchup"],
+            [sys.executable if github_ordinary_enabled() else "/usr/bin/python3",
+             DEPLOY_STATE, "catchup"],
             capture_output=True, text=True, timeout=30,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
