@@ -38,7 +38,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.hosting import HostingClient, HostingConfig, Provider, provider  # noqa: E402
+from scripts.hosting import (  # noqa: E402
+    AccessRole,
+    HostingClient,
+    HostingConfig,
+    HostingError,
+    Provider,
+    github_ordinary_enabled,
+    parse_json_object,
+    provider,
+)
 from scripts.prod_agent.github_readiness import GitHubReadinessClient  # noqa: E402
 
 CURL = os.environ.get("DAILYCHECK_CURL", "/usr/bin/curl")
@@ -106,19 +115,36 @@ def _gitea_get(path: str, token: str) -> tuple[int, object]:
 def _catchup_block() -> str:
     """检查 A：部署追平。返回输出块（空串 = 已追平/未激活，静默）。"""
     if provider() is Provider.GITHUB:
-        return ""  # Shadow transport cannot inspect/mutate the production deployment lane.
-    if os.environ.get("DCPOLL_REPO"):
+        if not github_ordinary_enabled():
+            return ""  # Shadow transport cannot inspect production deployment state.
+        client = HostingClient(HostingConfig.from_environment())
+        client.verify_repository()
+        HostingConfig.from_environment(AccessRole.FINALIZE)
+        remote = subprocess.run(["git", "-C", PROD_REPO, "remote", "get-url", "origin"],
+                                capture_output=True, text=True, timeout=10)
+        if remote.returncode or remote.stdout.strip() not in {
+            f"https://github.com/{client.config.repo}.git",
+            f"https://github.com/{client.config.repo}",
+            f"git@github.com:{client.config.repo}.git",
+        }:
+            raise HostingError("production_origin_mismatch")
+        if not os.path.exists(DEPLOY_STATE):
+            return _alert("GitHub ordinary catchup unavailable: deploy_state missing")
+    elif os.environ.get("DCPOLL_REPO"):
         return ""  # 测试借用模式：仅验证 PR 输出格式
     if not os.path.exists(DEPLOY_STATE):
         return ""  # 单飞机制文件不在（旧版生产/已回滚）→ 未激活，静默
     # 先刷新 origin/main ref（失败不阻断：catchup 自带 no-main 兜底）
     try:
-        subprocess.run(
+        fetched = subprocess.run(
             ["git", "-C", PROD_REPO, "fetch", "--quiet", "origin", "main"],
             capture_output=True, text=True, timeout=30,
         )
+        if github_ordinary_enabled() and fetched.returncode:
+            return _alert("GitHub ordinary main fetch failed")
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        if github_ordinary_enabled():
+            return _alert("GitHub ordinary main fetch unavailable")
     try:
         proc = subprocess.run(
             ["/usr/bin/python3", DEPLOY_STATE, "catchup"],
@@ -128,9 +154,25 @@ def _catchup_block() -> str:
         return _alert(f"catchup 调用失败（{exc}）")
     rc = proc.returncode
     out = (proc.stdout or "").strip()
+    if github_ordinary_enabled():
+        try:
+            facts = parse_json_object(out)
+            expected = {0: "caught-up", 1: "behind", 2: "failed-pending", 3: "uninitialized"}
+            if rc in expected and facts.get("status") != expected[rc]:
+                raise ValueError("catchup status mismatch")
+            if rc in {0, 1, 2}:
+                main, deployed = facts.get("main", ""), facts.get("deployed", "")
+                if (len(main) != 40 or len(deployed) != 40
+                        or any(c not in "0123456789abcdef" for c in main + deployed)
+                        or (main == deployed) != (rc == 0)):
+                    raise ValueError("catchup facts missing")
+        except (ValueError, TypeError):
+            return _alert("GitHub ordinary catchup returned invalid or absent facts")
     if rc == 0:
         return ""  # 已追平 — 静默
     if rc == 3:
+        if github_ordinary_enabled():
+            return _alert("GitHub ordinary deployment state uninitialized")
         return ""  # 未初始化 — 机制未激活（向后兼容窗口），静默
     if rc == 1:
         return (
@@ -210,12 +252,15 @@ def _pr_block() -> str:
 
 
 def _github_pr_block() -> str:
+    ordinary = github_ordinary_enabled()
+    if ordinary:
+        HostingConfig.from_environment(AccessRole.FINALIZE)
     client = HostingClient(HostingConfig.from_environment())
     client.verify_repository()
     prs = client.pages(f"/repos/{client.config.repo}/pulls", params={"state": "open"})
     if not prs:
         return ""
-    lines = [f"{client.config.repo} open PRs (GitHub shadow-only):"]
+    lines = [f"{client.config.repo} open PRs (GitHub {'ordinary Prod' if ordinary else 'shadow-only'}):"]
     for pr in prs:
         number = pr.get("number")
         head = pr.get("head")
@@ -223,19 +268,50 @@ def _github_pr_block() -> str:
             raise ValueError("invalid_pr_response")
         evidence = GitHubReadinessClient(client).check(number, head["sha"])
         lines.append(f"- PR #{number} {client.config.pr_url(number)} head={head['sha']} base={evidence.get('base_sha')} checks={evidence['reason']}")
-    lines.append("Shadow evidence only; GitHub finalization is unsupported.")
+    lines.append(
+        "Prod must independently review and run the exact-H deploy-first candidate pipeline; "
+        "freeze B and confirm finalization before delivery. Readiness is not deployment success."
+        if ordinary else "Shadow evidence only; GitHub finalization is unsupported.")
     return "\n".join(lines)
+
+
+def _report_block() -> str:
+    if not github_ordinary_enabled():
+        return ""
+    from scripts.blue_green import deploy_state
+    from scripts.blue_green.deploy_report import read_events
+
+    latest = {}
+    for event in read_events():
+        if event.get("hosting_provider") == "github":
+            latest[(event.get("pr"), event.get("sha"))] = event
+    failed = {(e.get("pr"), e.get("sha")) for e in latest.values() if e.get("publication_rc")}
+    # Cleanup is best-effort: even a missing event/inbox must not hide an unlinked receipt.
+    state = deploy_state.load_state(deploy_state.state_dir())
+    for anchor in (state.get("deployed") or {}, state.get("last_attempt") or {}):
+        outcome_id = anchor.get("outcome_id")
+        outcome = state.get("outcomes", {}).get(outcome_id) or {}
+        if (outcome.get("hosting") == {
+                "provider": "github", "host": "github.com", "repository_id": 1448986421,
+                "repository": "DUIDUI-Studio/DailyCheck"}
+                and state.get("publications", {}).get(outcome_id, {}).get("state") != "linked"):
+            failed.add((outcome.get("pr"), outcome.get("sha")))
+    if failed:
+        return _alert("GitHub report publication failed or unconfirmed; Prod must reconcile: "
+                      + ", ".join(f"PR #{pr} head={sha}" for pr, sha in failed))
+    return ""
 
 
 def main() -> int:
     blocks = []
-    for fn in (_catchup_block, _pr_block):
+    for fn in (_catchup_block, _pr_block, _report_block):
         try:
             block = fn()
             if block:
                 blocks.append(block)
         except Exception as exc:  # 保底通道：任何异常都必须可见
-            detail = str(exc) if os.environ.get("DAILYCHECK_HOSTING_PROVIDER", "gitea") == "gitea" else type(exc).__name__
+            detail = str(exc) if (os.environ.get("DAILYCHECK_HOSTING_PROVIDER", "gitea") == "gitea"
+                                  or isinstance(exc, HostingError)) else type(exc).__name__
             blocks.append(_alert(f"{fn.__name__} 未捕获异常（{detail}）"))
     if blocks:
         print("\n".join(blocks))

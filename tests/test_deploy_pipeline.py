@@ -682,7 +682,7 @@ def candidate_sandbox(sandbox):
     helper = repo / "fake_merge.py"
     helper.write_text(
         f"""#!{sys.executable}
-import os, subprocess, sys
+import json, os, subprocess, sys
 args = sys.argv[1:]
 with open(os.environ["CALLS"], "a", encoding="utf-8") as fh:
     fh.write("merge_helper " + " ".join(args) + "\\n")
@@ -696,6 +696,11 @@ if args and args[0] == "merge":
         ["git", "-C", os.environ["FAKE_ORIGIN"], "update-ref", "refs/heads/main", sha],
         check=True,
     )
+    if "--base" in args:
+        base = args[args.index("--base") + 1]
+        print(json.dumps({{"merged": True, "sha": sha, "merged_sha": sha,
+                          "main_sha": sha, "base": base}})
+              if not os.environ.get("FAKE_UNCONFIRMED") else "{{}}")
 sys.exit(0)
 """,
         encoding="utf-8",
@@ -841,3 +846,88 @@ def test_merge_failure_rolls_back_blue(candidate_sandbox):
 def test_merge_pr_without_candidate_is_usage_error(sandbox):
     proc = _pipe(sandbox, "42", SHA, "--merge-pr")
     assert proc.returncode == 64
+
+
+@pytest.fixture
+def ordinary_candidate(candidate_sandbox):
+    sb = candidate_sandbox
+    tools = sb["tmp"] / "bin"
+    tools.mkdir()
+    real_git = shutil.which("git")
+    git = tools / "git"
+    git.write_text(f'''#!{sys.executable}
+import os, sys
+args = sys.argv[1:]
+if args[-3:] == ["remote", "get-url", "origin"]:
+    print("https://github.com/DUIDUI-Studio/DailyCheck.git")
+else: os.execv({real_git!r}, [{real_git!r}, *args])
+''')
+    git.chmod(0o755)
+    sleeper = tools / "sleep"
+    sleeper.write_text("#!/bin/sh\nexit 0\n")
+    sleeper.chmod(0o755)
+    clock = sb["tmp"] / "monotonic"
+    python = tools / "python"
+    python.write_text(f'''#!{sys.executable}
+import os, sys
+from pathlib import Path
+if sys.argv[1:] == ["-c", "import time; print(int(time.monotonic()))"]:
+    p = Path({str(clock)!r})
+    n = int(p.read_text()) if p.exists() else 0
+    print(n)
+    p.write_text(str(n + 300))
+else: os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+''')
+    python.chmod(0o755)
+    # Existing target resolver contract; report publication is tested separately.
+    (sb["dir"] / "deploy_report.py").write_text(
+        'import json\nprint(json.dumps({"provider":"github", "host":"github.com", '
+        '"repository":"DUIDUI-Studio/DailyCheck"}))\n')
+    extra, _ = _observe_tools(sb)
+    sb["ordinary_env"] = {**_cand_env(sb), **extra,
+        "PATH": str(tools) + os.pathsep + os.environ["PATH"], "PYTHON": str(python),
+        "PYTHONPATH": str(BG_DIR.parents[1]), "DAILYCHECK_HOSTING_PROVIDER": "github",
+        "DAILYCHECK_GITHUB_LANE": "ordinary", "DAILYCHECK_DEPLOY_REPORT": "0"}
+    return sb
+
+
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_ordinary_candidate_frozen_base_and_confirmed_release(ordinary_candidate, unconfirmed):
+    from tests.test_github_transport import proof
+
+    sb = ordinary_candidate
+    extra = dict(sb["ordinary_env"])
+    if unconfirmed:
+        extra["FAKE_UNCONFIRMED"] = "1"
+        extra["PYTHONOPTIMIZE"] = "1"
+    proc = _pipe(sb, "42", sb["sha"], "--candidate", "--merge-pr", **extra)
+    assert proc.returncode == (26 if unconfirmed else 0), proc.stdout + proc.stderr
+    calls = _calls(sb)
+    assert f"--base {sb['base']}" in calls[0]
+    assert f"--base {sb['base']}" in next(c for c in calls if c.startswith("merge_helper merge"))
+    names = [line.split()[0] for line in calls]
+    assert names[:6] == ["merge_helper", "up.sh", "verify.sh", "promote.sh", "switch.sh", "merge_helper"]
+    assert "观察 +5min" in proc.stdout and "观察 +10min" in proc.stdout
+    state = _state(sb)
+    if unconfirmed:
+        assert not state.get("deployed")
+        assert state["last_attempt"]["result"] == "failed"
+        assert any(c == "switch.sh blue 100" for c in calls)
+        assert "release(success)" not in proc.stdout
+    else:
+        assert state["deployed"]["sha"] == sb["sha"]
+        assert _head(sb) == sb["sha"] and "release(success)" in proc.stdout
+    proof("pipeline-" + ("unconfirmed" if unconfirmed else "confirmed"), {
+        "native_exit": proc.returncode, "stdout": proc.stdout, "calls": calls,
+        "base": sb["base"], "head": sb["sha"], "deployed": state.get("deployed"),
+        "clock": "owned simulated monotonic port; no elapsed Prod-time claim"})
+
+
+@pytest.mark.parametrize("lane,args", [("shadow", []), ("ordinary", []),
+    ("ordinary", ["--candidate", "--merge-pr", "--skip-verify"]),
+    ("ordinary", ["--candidate", "--merge-pr", "--observe-min", "0"])])
+def test_github_pipeline_rejects_disabled_or_incomplete_lane(sandbox, lane, args):
+    proc = _pipe(sandbox, "42", SHA, *args, DAILYCHECK_HOSTING_PROVIDER="github",
+                 DAILYCHECK_GITHUB_LANE=lane, PYTHONPATH=str(BG_DIR.parents[1]))
+    assert proc.returncode in {25, 64}, proc.stdout + proc.stderr
+    assert not _calls(sandbox) and not _state(sandbox)

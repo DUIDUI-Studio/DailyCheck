@@ -81,6 +81,8 @@ MERGE_PR=0
 NATIVE_CANDIDATE=0
 TREE_MOVED=0
 ORIG_REF=""
+GITHUB_ORDINARY=0
+FROZEN_BASE=""
 
 log()  { printf '[pipeline] %s\n' "$*"; }
 die()  { local code=$1; shift; log "ERROR: $*"; exit "${code}"; }
@@ -156,6 +158,21 @@ elif [[ ! "${SHA}" =~ ^[0-9a-f]{7,40}$ ]]; then
 fi
 [[ -n "${SESSION}" ]] || SESSION="pipeline-${PR}"
 [[ "${MERGE_PR}" -eq 1 && "${CANDIDATE}" -eq 0 ]] && die 64 "--merge-pr 需要同时给 --candidate"
+
+# Only this ordinary entrypoint opts in. Webhook/reducer production guards stay closed.
+if [[ "${DAILYCHECK_HOSTING_PROVIDER:-gitea}" == "github" && "${NATIVE_CANDIDATE}" -eq 0 ]]; then
+  "${PY}" -c 'import sys; sys.path.insert(0,sys.argv[1]); from scripts.hosting import github_ordinary_enabled; sys.exit(0 if github_ordinary_enabled() else 1)' "${REPO_ROOT}" \
+    || die 25 "GitHub ordinary lane is disabled"
+  GITHUB_ORDINARY=1
+  [[ "${CANDIDATE}" -eq 1 && "${MERGE_PR}" -eq 1 && "${SKIP_VERIFY}" -eq 0 \
+     && "${OBSERVE_MIN}" -ge "${OBSERVE_MIN_REQUIRED}" ]] \
+    || die 64 "GitHub ordinary requires candidate, merge, full verify and observation"
+  _origin="$(git -C "${REPO_ROOT}" remote get-url origin 2>/dev/null)"
+  case "${_origin}" in
+    https://github.com/DUIDUI-Studio/DailyCheck|https://github.com/DUIDUI-Studio/DailyCheck.git|git@github.com:DUIDUI-Studio/DailyCheck.git) ;;
+    *) die 25 "GitHub production origin mismatch" ;;
+  esac
+fi
 
 # Re-exec once under Python's POSIX flock (also available on macOS without flock CLI).
 # A descriptor is inherited across stages; heartbeat age never proves process exit.
@@ -394,7 +411,11 @@ run_stage() {
 # ---------------------------------------------------------------- 候选模式
 _merge_helper() {
   local merger="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
-  "${PY}" "${merger}" "$@"
+  if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
+    "${PY}" "${merger}" "$@" --base "${FROZEN_BASE}"
+  else
+    "${PY}" "${merger}" "$@"
+  fi
 }
 
 _restore_main() {
@@ -430,7 +451,8 @@ _prepare_candidate() {
     return 1
   fi
   _require_candidate_owner "candidate-main-fetch-return"
-  if ! git -C "${REPO_ROOT}" merge-base --is-ancestor origin/main "${SHA}"; then
+  FROZEN_BASE="$(git -C "${REPO_ROOT}" rev-parse origin/main)" || return 1
+  if ! git -C "${REPO_ROOT}" merge-base --is-ancestor "${FROZEN_BASE}" "${SHA}"; then
     log "✗ 候选分支未包含 origin/main —— 先 rebase/merge main 再部署"
     return 1
   fi
@@ -462,6 +484,11 @@ _merge_candidate() {
   out="$(_merge_helper merge --pr "${PR}" --sha "${SHA}" 2>&1)"
   rc=$?
   printf '%s\n' "${out}" >>"${LOG}"
+  if [[ ${rc} -eq 0 && "${GITHUB_ORDINARY}" -eq 1 ]]; then
+    if ! printf '%s' "${out}" | "${PY}" -c \
+      'import json,sys; d=json.load(sys.stdin); valid=d.get("merged") is True and d.get("sha") == d.get("merged_sha") == d.get("main_sha") == sys.argv[1] and d.get("base") == sys.argv[2]; sys.exit(0 if valid else 1)' \
+      "${SHA}" "${FROZEN_BASE}"; then rc=32; fi
+  fi
   if [[ ${rc} -ne 0 ]]; then
     log "✗ FF 合并失败 rc=${rc}：${out}"
     # Preserve the merge failure code, but never recover over a successor.
@@ -504,10 +531,17 @@ observe_window() {
   # PR #101 首次完整跑观察窗即命中（rc 24，回滚后新代码没上线）。
   local since_ts
   since_ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  local i code blocked elapsed_sec=0 elapsed_min
-  for (( i=1; i<=rounds; i++ )); do
+  local i code blocked elapsed_sec=0 elapsed_min started=0 current=0
+  if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
+    started="$("${PY}" -c 'import time; print(int(time.monotonic()))')" || exit 24
+  fi
+  for (( i=1; i<=rounds || (GITHUB_ORDINARY == 1 && elapsed_sec < minutes * 60); i++ )); do
     sleep "${tick}"
     elapsed_sec=$(( elapsed_sec + tick ))
+    if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
+      current="$("${PY}" -c 'import time; print(int(time.monotonic()))')" || exit 24
+      elapsed_sec=$(( current - started ))
+    fi
     elapsed_min=$(( elapsed_sec / 60 ))
     [[ ${elapsed_min} -lt 1 ]] && elapsed_min=1
     _hb "observe-${elapsed_min}m"
@@ -585,8 +619,10 @@ else
   _verify_rc=$?
   _head_after="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
-  if [[ "${_head_before}" != "${_head_after}" \
-        && "${_head_before}" != "unknown" && "${_head_after}" != "unknown" ]]; then
+  if [[ ( "${_head_before}" != "${_head_after}" \
+        && "${_head_before}" != "unknown" && "${_head_after}" != "unknown" ) \
+        || ( "${GITHUB_ORDINARY}" -eq 1 \
+        && ( "${_head_before}" != "${SHA}" || "${_head_after}" != "${SHA}" ) ) ]]; then
     # 漂移优先归因：无论 verify 红绿，工作树被换都让结果不可信。
     log "✗ 工作树在 verify 期间被改动（HEAD ${_head_before:0:12} → ${_head_after:0:12}）"
     log "  verify 结果不可信：check1 pytest / check2 绿实例都可能读到混合态"

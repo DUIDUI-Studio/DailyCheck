@@ -211,6 +211,7 @@ def sandbox(tmp_path, loopback):
         "DAILYCHECK_DASHBOARD_HOOK": "0",
         "DAILYCHECK_BG_LOCK_FILE": str(tmp_path / "bg.lock"),
         "DAILYCHECK_HOSTING_PROVIDER": "github",
+        "DAILYCHECK_GITHUB_LANE": "ordinary",
         "DAILYCHECK_GITHUB_REPO": CODE,
         "DAILYCHECK_GITHUB_SHADOW_DIR": str(shadow),
         "DAILYCHECK_DEPLOY_EVENT_LOG": str(shadow / "events.jsonl"),
@@ -220,14 +221,70 @@ def sandbox(tmp_path, loopback):
         "DAILYCHECK_GITHUB_REPORT_TOKEN": "synthetic-report-token",
         "DAILYCHECK_GITEA_TOKEN_FILE": str(tmp_path / "absent-token"),
     })
+    # Report tests exercise the real fenced pipeline with owned Git/clock/merge ports.
+    # Exact Git ancestry and atomic hosting finalization have separate real-caller tests.
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    git = tools / "git"
+    git.write_text(f'''#!{sys.executable}
+import sys
+args = sys.argv[1:]
+if args[:1] == ["-C"]: args = args[2:]
+if args == ["remote", "get-url", "origin"]:
+    print("https://github.com/{CODE}.git")
+elif args and args[0] == "rev-parse": print({OTHER_SHA!r} if args[-1] == "origin/main" else {SHA!r})
+elif args and args[0] in {{"fetch", "checkout", "merge-base"}}: pass
+else: sys.exit(128)
+''')
+    git.chmod(0o755)
+    sleeper = tools / "sleep"
+    sleeper.write_text("#!/bin/sh\nexit 0\n")
+    sleeper.chmod(0o755)
+    clock = tmp_path / "clock"
+    python = tools / "python"
+    python.write_text(f'''#!{sys.executable}
+import os, sys
+from pathlib import Path
+if sys.argv[1:] == ["-c", "import time; print(int(time.monotonic()))"]:
+    p = Path({str(clock)!r})
+    value = int(p.read_text()) if p.exists() else 0
+    print(value)
+    p.write_text(str(value + 300))
+else: os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+''')
+    python.chmod(0o755)
+    helper = tools / "merge"
+    helper.write_text(f'''#!{sys.executable}
+import json, sys
+args = sys.argv[1:]
+base = args[args.index("--base") + 1]
+print(json.dumps({{"merged": args[0] == "merge", "sha": {SHA!r}, "merged_sha": {SHA!r},
+                  "main_sha": {SHA!r}, "base": base}}))
+''')
+    helper.chmod(0o755)
+    journal = tools / "journalctl"
+    journal.write_text("#!/bin/sh\nexit 0\n")
+    journal.chmod(0o755)
+    probe = tools / "probe"
+    probe.write_text("#!/bin/sh\nprintf 200\n")
+    probe.chmod(0o755)
+    env.update(PATH=str(tools) + os.pathsep + env["PATH"], PYTHON=str(python),
+               DAILYCHECK_DEPLOY_MERGE_BIN=str(helper),
+               DAILYCHECK_PIPELINE_JOURNALCTL=str(journal), DAILYCHECK_PIPELINE_CURL=str(probe))
     return {"dir": sb, "repo": tmp_path, "state": state_dir, "shadow": shadow,
             "env": env, "calls": calls, "tmp": tmp_path, "api": api}
 
 
 def _pipe(sb, *args: str, env: dict | None = None):
+    selected = env or sb["env"]
+    if selected.get("DAILYCHECK_HOSTING_PROVIDER") == "github":
+        args = list(args)
+        if "--observe-min" in args:
+            args[args.index("--observe-min") + 1] = "10"
+        args += ["--candidate", "--merge-pr"]
     return subprocess.run(
         ["bash", str(sb["dir"] / "deploy_pipeline.sh"), *args],
-        capture_output=True, text=True, env=env or sb["env"], timeout=120)
+        capture_output=True, text=True, env=selected, timeout=120)
 
 
 def _report(sb, *args: str, env: dict | None = None):
@@ -356,7 +413,7 @@ def test_pipeline_owned_release_mints_receipt_and_publishes_typed_payload(sandbo
     assert outcome["result"] == "success" and outcome["rc"] == 0
     assert outcome["stage"] == "complete"
     assert outcome["sha"] == SHA and outcome["pr"] == PR
-    assert outcome["verification"] == "short-observe"
+    assert outcome["verification"] == "normal"
     assert uuid.UUID(outcome["public_receipt"])
     assert outcome["public_receipt"] != outcome_id
     assert outcome["public_receipt"] != outcome["attempt_token"]
@@ -408,6 +465,47 @@ def test_idempotent_skip_reuses_receipt_without_new_outcome_or_post(sandbox):
     assert json.dumps(same["facts"], sort_keys=True) == frozen
     assert same["public_receipt"] == outcome["public_receipt"]
     assert len(sandbox["api"].posts) == 1, "idempotent skip must not re-POST"
+
+
+def test_ordinary_report_cli_private_sinks_and_durable_public_projection(sandbox):
+    from tests.test_github_transport import proof
+
+    sb = sandbox
+    _prepare(sb)
+    private = sb["tmp"] / "ordinary-private"
+    env = dict(sb["env"], DAILYCHECK_DEPLOY_EVENT_LOG=str(private / "events.jsonl"),
+               DAILYCHECK_PROD_AGENT_INBOX=str(private / "inbox.jsonl"))
+    result = _report(sb, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                     "--log", env["DAILYCHECK_PIPELINE_LOG"], "--repo", str(sb["repo"]), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(sb["api"].posts) == 1
+    body = sb["api"].posts[0]["payload"]["body"]
+    assert PRIVATE_CANARY not in body and str(sb["tmp"]) not in body
+    assert "synthetic" not in body and "| RC | 0 |" in body
+    assert PRIVATE_CANARY in "".join(p.read_text() for p in (private / "reports").glob("*.md"))
+    event = json.loads((private / "events.jsonl").read_text())
+    inbox = json.loads((private / "inbox.jsonl").read_text())
+    assert event["publication_rc"] == 0 and inbox["hosting_provider"] == "github"
+    assert inbox["intake_mode"] == "shadow"
+    proof("ordinary-report", {"native_exit": result.returncode,
+          "stderr": result.stderr.replace(str(sb["tmp"]), "<owned-fixture>"),
+          "post_path": sb["api"].posts[0]["path"], "public_body": body,
+          "private_diagnostic_retained": True, "inbox_keeps_shadow_provenance": True})
+
+
+def test_ordinary_unlinked_receipt_is_polled_even_without_event_or_inbox(sandbox):
+    from tests.test_github_transport import proof
+
+    sb = sandbox
+    _prepare(sb)
+    assert not (sb["shadow"] / "events.jsonl").exists()
+    poll = subprocess.run([sys.executable, "-B", str(REPO_ROOT / "scripts/prod_agent/pr_poll.py")],
+                          capture_output=True, text=True, env=sb["env"], timeout=30)
+    assert poll.returncode == 0 and "report publication failed or unconfirmed" in poll.stdout
+    assert f"PR #{PR} head={SHA}" in poll.stdout
+    assert not sb["api"].posts
+    proof("poll-unlinked-receipt", {"native_exit": poll.returncode, "stdout": poll.stdout,
+                                   "post_count": 0, "event_file_absent": True})
 
 
 def test_live_reporter_fence_blocks_successor_then_links_once(sandbox):

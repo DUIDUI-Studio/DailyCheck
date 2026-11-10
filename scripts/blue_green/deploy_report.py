@@ -93,6 +93,7 @@ from scripts.hosting import (  # noqa: E402
     HostingConfig,
     HostingError,
     Provider,
+    github_ordinary_enabled,
     parse_json_object,
     provider,
     require_shadow_path,
@@ -395,7 +396,8 @@ def append_event(event: dict[str, Any]) -> bool:
     p = event_log_path()
     if provider() is Provider.GITHUB:
         try:
-            require_shadow_path(p)
+            if not github_ordinary_enabled():
+                require_shadow_path(p)
         except HostingError:
             print("[deploy-report] GitHub event log requires shadow isolation", file=sys.stderr)
             return False
@@ -467,7 +469,8 @@ def push_inbox_event(
     if provider() is Provider.GITHUB:
         payload.update(hosting_provider="github", intake_mode="shadow")
         try:
-            require_shadow_path(p)
+            if not github_ordinary_enabled():
+                require_shadow_path(p)
         except HostingError:
             print("[deploy-report] GitHub production intake unsupported", file=sys.stderr)
             return False
@@ -838,7 +841,8 @@ def _cmd_write_github(args, tail: str, authority):
     import publication_authority
 
     private_dir = event_log_path().parent / "reports"
-    require_shadow_path(private_dir)
+    if not github_ordinary_enabled():
+        require_shadow_path(private_dir)
     private_dir.mkdir(parents=True, exist_ok=True)
 
     outcome_info = None
@@ -927,8 +931,9 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
     write_rc = 0
     if provider() is Provider.GITHUB:
         try:
-            require_shadow_path(event_log_path())
-            require_shadow_path(inbox_path())
+            if not github_ordinary_enabled():
+                require_shadow_path(event_log_path())
+                require_shadow_path(inbox_path())
         except HostingError:
             print("[deploy-report] GitHub requires isolated shadow report paths", file=sys.stderr)
             return 1
@@ -976,6 +981,7 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
         "reason": tr.get("reason", ""),
         "action": align.get("action", ""),
         "report_comment": comment_id,
+        "publication_rc": write_rc,
         "log": str(Path(args.log).resolve()) if args.log else "",
     })
     if appended:
@@ -989,7 +995,9 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
         str(Path(args.log).resolve()) if args.log else "",
     )
     if pushed:
-        print(f"[deploy-report] 已唤醒 prod-agent next={nxt}", file=sys.stderr)
+        message = "GitHub private inbox recorded; poll reconciliation required" \
+            if provider() is Provider.GITHUB else "已唤醒 prod-agent"
+        print(f"[deploy-report] {message} next={nxt}", file=sys.stderr)
     return write_rc
 
 

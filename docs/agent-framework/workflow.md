@@ -383,6 +383,16 @@ fetch refs/pull/<N>/head → 校验 sha 包含 origin/main → checkout --detach
 
 ### GitHub native-only Prod 生命周期（Issue164，本地 seam；未激活）
 
+**2026-11-10 Owner 定向 ordinary cutover（D1，本地实现，默认 OFF）**：保留现有 Prod
+Agent、部署主机和 §五 deploy-first exact-H FF-only 蓝绿链路；本次窄范围 hosting
+切换不以以下未激活 native/controller 架构为必经路径。仅显式 ordinary lane 可通过
+既有定时 poll 发现 PR/H/B；Prod 独立审查、两必需 CI、完整 verify 与真实 ≥10min
+观察、原 attempt fence 均保留。最终仅允许 Prod 专用显式 finalization 凭据执行单次
+GraphQL `updateRefs` 原子 batch：main B→H、同仓 head ref H→H，均 expected OID /
+force=false；还须实际重读 PR merged 且 main=H 才收成功。间接 merged 不替代 review /
+checks；当前 GitHub main 保护未证明激活，生产切换前须独立对齐保护，不得绕过。
+这只授权本地 adapter 与本段说明，不授权安装凭据、修改保护、push、merge 或部署。
+
 Prod 独立 review → 在既有 attempt fence 下 checkout G → 全部现有蓝绿 verification /
 切流量 / ≥10min 真实观察 → durable verified journal → 最终 live 重读 → durable grant_intent
 → dedicated isolated Prod check transport → GitHub 异步 merge → exact-G 对账 → 原子锚点/outcome

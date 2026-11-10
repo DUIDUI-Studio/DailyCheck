@@ -1218,6 +1218,32 @@ Issue #155 的历史合并回归断言 fresh / archived / fallback 组合的事�
 
 ### 3.17 Hosting transport 共存准备（Issue #160）
 
+**ordinary hosting cutover（2026-11-10 D1，本地实现，默认关闭）**：
+`DAILYCHECK_GITHUB_LANE=ordinary` 仅选择既有 poll / exact-H deploy-first pipeline /
+finalizer / typed report 链路，缺省仍为 `shadow`，provider 缺省仍为 Gitea。
+不改变 webhook/reducer/sender 的 `require_production_work`：GitHub 与延迟 shadow
+事件始终不唤醒生产。显式 ordinary report 可使用既有私有 event/diagnostic/inbox sinks，
+事件仍带 shadow provenance，被原守卫阻断；poll 显示 publication failure，并从既有
+durable state 检查当前 outcome 的未 linked receipt，即使事件/收件箱缺失也交 Prod 对账。
+公开报告仍必须经原 `DurablePublicationAuthority`、deployment/source binding、immutable
+typed projection；lane flag、CLI success、report HTTP 均不产生 outcome authority。
+
+候选准备冻结 main B，check/finalize 都传 B，H 必须包含 B。普通 GitHub pipeline
+拒绝 skip-verify、短观察和非 candidate/merge 入口；观察以 monotonic 实际时间计。
+finalizer 在既有 process/state fence 下重读精确 repo ID/node、PR node/ref/H/B、最新
+两必需 CI producer/run/attempt、review 和 protection；要求 classic main protection
+enforce-admins、stale-review dismissal、至少一项当前 H approval 和两个 Actions App
+绑定 context。缺失/其他未证明保护形状一律拒绝，Prod 需先独立完成保护对齐。
+当前 main 保护**未证明激活**，本实现不改保护，也不提供 bypass。
+仅 `FINALIZE` 角色读取显式 `DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE`，不得复用
+read/report/ambient 凭据；唯一新写操作是固定 GraphQL `updateRefs`，原子校验并
+非强制写 main B→H 与同仓 head H→H。HTTP child 继承两个 fence；单次无重试，
+异常/失联/保护拒绝/PR 未 merged/main 非 H 均不得 release success，须 Prod 对账。
+[GitHub updateRefs](https://docs.github.com/en/graphql/reference/git) 定义 atomic /
+beforeOid / 非 force FF；[indirect merges](https://docs.github.com/en/pull-requests/reference/pull-request-merges)
+说明相同 head 进入 base 可标 merged，但该标记不证明保护条件。故保留独立前置和
+真实 post-read，文档不替代平台验收。安全禁用配置见 `deploy/github-production.env.example`。
+
 `DAILYCHECK_HOSTING_PROVIDER` 缺省为 `gitea`，现有生产地址、凭据路径、部署阶段与
 队列不变。`scripts/hosting.py` 定义显式 `Provider` / `AccessRole` / `HostingConfig`，
 集中 GitHub REST 认证、JSON 响应、分页与错误边界。未知 provider、缺凭据、错误 host/repo、
@@ -1231,7 +1257,8 @@ GitHub 只接受 `https://api.github.com`；代码角色固定 `DUIDUI-Studio/Da
 | read | `DAILYCHECK_GITHUB_READ_TOKEN` / `_TOKEN_FILE` | 无，代码仓只读 |
 | ops_read | `DAILYCHECK_GITHUB_OPS_READ_TOKEN` / `_TOKEN_FILE` | 无，私有运维仓只读 |
 | feedback | `DAILYCHECK_GITHUB_FEEDBACK_TOKEN` / `_TOKEN_FILE` | 私有运维 Issue / 固定 label 创建 |
-| report | `DAILYCHECK_GITHUB_REPORT_TOKEN` / `_TOKEN_FILE` | 代码仓 PR comment；真实 fencing adapter 尚未接线 |
+| report | `DAILYCHECK_GITHUB_REPORT_TOKEN` / `_TOKEN_FILE` | 代码仓 typed PR comment，经 durable fencing adapter |
+| finalize | 仅 `DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE` | 仅显式 ordinary lane 的固定 atomic FF batch |
 
 显式文件不可读或显式凭据非法即拒绝；所有 GitHub 角色均不回退 ambient
 `GH_TOKEN` / `GITHUB_TOKEN`、其他角色、Gitea 或当前 `gh` 登录。
@@ -1249,7 +1276,8 @@ Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置
 再次读取最新 workflow run 和当前 PR/main，变化即拒绝。输出 H/B、run/attempt/check IDs、
 采样时间与 freshness 标签；这是可复核快照，不是部署租约，后续 admission/finalization 必须重验。
 `merge_readiness.py` 保留 Gitea 入口；现有 reducer 对 GitHub 证据强制 `ready=false`，
-`deploy_merge.py` 明确拒绝 GitHub finalization，不引入 merge queue / group delivery。
+`deploy_merge.py` 在缺省 shadow lane 明确拒绝 GitHub finalization；ordinary opt-in 见上，
+不引入 merge queue / group delivery。
 Shadow 边界不依赖 readiness helper：`hosting.py` 统一严格 JSON object 解析与 policy 分类。
 raw sender、shell ingress/output guard、reducer 和存储行共用重复键、finite number、UTF-8、
 1 MiB、深度 100 保护；body 错误与 hosting config 错误分离，不能把解析失败当成缺省输入。
@@ -1277,7 +1305,8 @@ CLI 的 SQLite 路径在构造和每次连接前检查，DB 以及 `-wal/-shm/-j
 symlink 后位于 shadow root；缺 root 或越界在任何 mkdir/SQLite 写入前失败。
 GitHub 配置的 drain 不启用 provider work，Gitea 正常路由/租约/输出继续兼容。
 
-**调用方**：poller 的 GitHub 分支只输出 shadow readiness，不运行生产 catchup；dashboard 使用
+**调用方**：poller 的缺省 GitHub 分支只输出 shadow readiness，不运行生产 catchup；仅上述
+ordinary opt-in 对已核验 origin 运行原 catchup。dashboard 使用
 GitHub sort/pagination、状态形状与 `git:github.com/` identity。反馈 label 传固定名字；
 GitHub 报告禁止同 SHA 查找/任意正文 PATCH，只接受下述 typed projection 与真实 attempt claim。
 GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`，保留原同 SHA comment 更新路径。

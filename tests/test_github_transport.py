@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -37,9 +39,26 @@ if isinstance(row, list):
     state[key] = index + 1
     row = row[min(index, len(row)-1)]
 state_path.write_text(json.dumps(state))
+if key == "/graphql" and row.get("echo_mutation"):
+    line = next(line for line in config.splitlines() if line.startswith("data = "))
+    payload = json.loads(json.loads(line[7:]))
+    row["data"] = {"data": {"updateRefs": {
+        "clientMutationId": payload["variables"]["input"]["clientMutationId"]}}}
 log = {"path": url.path, "query": query, "method": args[args.index("--request")+1],
        "bearer": "Authorization: Bearer " in config, "argv_has_token": "test-credential" in str(args),
        "config": config}
+if url.path == "/graphql":
+    retained = {}
+    for name in (".attempt.lock", ".state.lock"):
+        expected = (Path(os.environ["DAILYCHECK_DEPLOY_STATE_DIR"]) / name).stat()
+        retained[name] = False
+        for fd in range(3, 64):
+            try:
+                observed = os.fstat(fd)
+                retained[name] |= ((expected.st_dev, expected.st_ino)
+                                   == (observed.st_dev, observed.st_ino))
+            except OSError: pass
+    log["retained_fences"] = retained
 with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(json.dumps(log) + "\n")
 headers = "HTTP/1.1 " + str(row.get("status", 200)) + "\r\n" + row.get("headers", "") + "\r\n"
@@ -60,6 +79,8 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("DAILYCHECK_HOSTING_PROVIDER", "github")
     monkeypatch.setenv("DAILYCHECK_CURL", str(fake))
     monkeypatch.setenv("DAILYCHECK_GITHUB_READ_TOKEN", "test-credential")
+    monkeypatch.delenv("DAILYCHECK_GITHUB_LANE", raising=False)
+    monkeypatch.delenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE", raising=False)
     monkeypatch.delenv("DAILYCHECK_GITHUB_READ_TOKEN_FILE", raising=False)
     monkeypatch.delenv("DAILYCHECK_GITHUB_FEEDBACK_TOKEN", raising=False)
     monkeypatch.delenv("DAILYCHECK_GITHUB_REPORT_TOKEN", raising=False)
@@ -494,6 +515,271 @@ def test_github_finalization_is_rejected_without_transport(api):
     assert code == deploy_merge.RC_API
     assert payload["reason"] == "github_finalization_unsupported"
     assert not api.log()
+
+
+def ordinary(api, tmp_path, monkeypatch):
+    token = tmp_path / "finalize-token"
+    token.write_text("synthetic-prod-finalize")
+    token.chmod(0o600)
+    monkeypatch.setenv("DAILYCHECK_GITHUB_LANE", "ordinary")
+    monkeypatch.setenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE", str(token))
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_STATE_DIR", str(tmp_path / "deploy-state"))
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_EVENT_LOG", str(tmp_path / "private-events.jsonl"))
+    table = evidence()
+    table[ROOT]["data"]["node_id"] = "R_kgDOVl3HNQ"
+    before = pr()
+    before.update(node_id="PR_synthetic_160", merged=False)
+    before["head"]["repo"]["id"] = REPO_ID
+    table[ROOT + "/pulls/160"] = response(before)
+    table[ROOT + "/compare/" + BASE + "..." + SHA] = response({
+        "status": "ahead", "base_commit": {"sha": BASE}, "merge_base_commit": {"sha": BASE}})
+    table[ROOT + "/git/ref/heads/main"] = response({
+        "ref": "refs/heads/main", "object": {"sha": BASE}})
+    table[ROOT + "/branches/main/protection"] = response({
+        "enforce_admins": {"enabled": True},
+        "required_status_checks": {"checks": [
+            {"context": n, "app_id": 15368} for n in ("test", "agent-framework-reports")]},
+        "required_pull_request_reviews": {
+            "required_approving_review_count": 1, "dismiss_stale_reviews": True}})
+    table[ROOT + "/pulls/160/reviews?page=1"] = response([
+        {"id": 91, "user": {"id": 11}, "state": "APPROVED", "commit_id": SHA}])
+    table["/graphql"] = {"echo_mutation": True}
+    return table
+
+
+def proof(name, data):
+    destination = os.environ.get("DAILYCHECK_HOSTING_PROOF_DIR")
+    if destination:
+        path = Path(destination) / (name + ".json")
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        path.chmod(0o600)
+
+
+def merge_cli(tmp_path, *, command="merge", owned=True, base=BASE):
+    root = Path(__file__).resolve().parents[1]
+    cli = [sys.executable, "-B", str(root / "scripts/blue_green/deploy_merge.py"),
+           command, "--pr", "160", "--sha", SHA, "--base", base]
+    if owned and command == "merge":
+        wrapper = tmp_path / "owned-finalize.py"
+        wrapper.write_text(f'''import argparse, contextlib, io, json, os, sys
+sys.path.insert(0, {str(root / "scripts/blue_green")!r})
+import deploy_state as ds
+if len(sys.argv) == 1:
+    ds.cmd_run(argparse.Namespace(exec=[sys.executable, "-B", __file__, "held"]))
+else:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = ds.cmd_acquire(argparse.Namespace(pr=160, sha={SHA!r}, session="test-finalize",
+            phase="merge-start", deployment_provider="github", deployment_host="github.com",
+            deployment_repository={REPO!r}))
+    assert rc == 0, out.getvalue()
+    os.environ[ds.ATTEMPT_ENV] = out.getvalue()
+    os.execv(sys.executable, {cli!r})
+''')
+        cli = [sys.executable, "-B", str(wrapper)]
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+               DAILYCHECK_DEPLOY_STATE_DIR=str(tmp_path / "deploy-state"))
+    return subprocess.run(cli, env=env, text=True, capture_output=True, timeout=30)
+
+
+def merged_table(table):
+    before = table[ROOT + "/pulls/160"]
+    after = json.loads(json.dumps(before))
+    after["data"].update(merged=True, state="closed", merge_commit_sha=SHA)
+    # Two full precondition reads, each readiness reads H/B twice plus target twice.
+    table[ROOT + "/pulls/160"] = [before] * 8 + [after]
+    main = table[ROOT + "/git/ref/heads/main"]
+    table[ROOT + "/git/ref/heads/main"] = [main] * 2 + [response({
+        "ref": "refs/heads/main", "object": {"sha": SHA}})]
+    return table
+
+
+def test_ordinary_finalization_cli_checks_and_atomic_exact_h_postfacts(api, tmp_path, monkeypatch):
+    table = ordinary(api, tmp_path, monkeypatch)
+    api.write(table)
+    checked = merge_cli(tmp_path, command="check")
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert not [r for r in api.log() if r["method"] == "POST"]
+    api.write(merged_table(table))
+    result = merge_cli(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = json.loads(result.stdout)
+    assert out["merged"] is True and out["merged_sha"] == out["main_sha"] == SHA
+    posts = [r for r in api.log() if r["method"] == "POST"]
+    assert len(posts) == 1 and posts[0]["path"] == "/graphql"
+    assert posts[0]["retained_fences"] == {".attempt.lock": True, ".state.lock": True}
+    payload = json.loads(json.loads(next(
+        line[7:] for line in posts[0]["config"].splitlines() if line.startswith("data = "))))
+    updates = payload["variables"]["input"]["refUpdates"]
+    assert updates == [
+        {"name": "refs/heads/main", "beforeOid": BASE, "afterOid": SHA, "force": False},
+        {"name": "refs/heads/chore/issue-160-test", "beforeOid": SHA,
+         "afterOid": SHA, "force": False}]
+    proof("finalization-positive", {"check_native_exit": checked.returncode,
+          "check_stdout": checked.stdout, "merge_native_exit": result.returncode,
+          "merge_stdout": out, "operation": payload,
+          "http_child_retained_fences": posts[0]["retained_fences"],
+          "post_read_paths": [r["path"] for r in api.log()[-3:]]})
+
+
+@pytest.mark.parametrize("failure", ["head", "base", "foreign", "ancestry", "protection",
+                                     "review", "stale_review", "ci", "no_fence", "absent_auth"])
+def test_ordinary_finalization_bad_preconditions_never_write(api, tmp_path, monkeypatch, failure):
+    table = ordinary(api, tmp_path, monkeypatch)
+    if failure in {"head", "base", "foreign"}:
+        p = table[ROOT + "/pulls/160"]["data"]
+        if failure == "head":
+            p["head"]["sha"] = "f" * 40
+        elif failure == "base":
+            p["base"]["sha"] = "f" * 40
+        else:
+            p["head"]["repo"]["id"] = 1
+    if failure == "ancestry":
+        table[ROOT + f"/compare/{BASE}...{SHA}"]["data"]["status"] = "diverged"
+    if failure == "protection":
+        table[ROOT + "/branches/main/protection"] = response({}, status=404)
+    if failure in {"review", "stale_review"}:
+        r = table[ROOT + "/pulls/160/reviews?page=1"]["data"][0]
+        r.update(state="CHANGES_REQUESTED" if failure == "review" else "APPROVED",
+                 commit_id=BASE)
+    if failure == "ci":
+        table[ROOT + "/actions/runs/40/jobs?page=1"]["data"]["jobs"][0]["conclusion"] = "failure"
+    if failure == "absent_auth":
+        monkeypatch.delenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE")
+    api.write(table)
+    result = merge_cli(tmp_path, owned=failure != "no_fence")
+    assert result.returncode == 32, result.stdout + result.stderr
+    expected = {"head": "github_not_ready:head_changed", "base": "github_not_ready:base_changed",
+        "foreign": "github_target_changed", "ancestry": "github_not_fast_forward",
+        "protection": "hosting_http_error", "review": "github_review_required",
+        "stale_review": "github_review_required", "ci": "github_not_ready:",
+        "no_fence": "github_owned_verified_pipeline_required",
+        "absent_auth": "explicit_finalization_credential_required"}
+    assert json.loads(result.stdout)["reason"].startswith(expected[failure]), result.stdout
+    assert not [r for r in api.log() if r["method"] == "POST"]
+    proof("precondition-" + failure, {"native_exit": result.returncode,
+          "stdout": json.loads(result.stdout), "post_count": 0})
+
+
+@pytest.mark.parametrize("failure", ["permission", "graphql_error", "response_loss",
+                                     "open_pr", "wrong_main", "changed_head_after", "duplicate"])
+def test_ordinary_finalization_uncertain_result_never_succeeds(api, tmp_path, monkeypatch, failure):
+    table = merged_table(ordinary(api, tmp_path, monkeypatch))
+    if failure == "permission":
+        table["/graphql"] = response({}, status=403)
+    if failure == "graphql_error":
+        table["/graphql"] = response({"errors": [{"message": "protected"}]})
+    if failure == "response_loss":
+        table["/graphql"]["exit"] = 28
+    if failure == "open_pr":
+        table[ROOT + "/pulls/160"][-1]["data"].update(state="open", merged=False)
+    if failure == "wrong_main":
+        table[ROOT + "/git/ref/heads/main"][-1]["data"]["object"]["sha"] = BASE
+    if failure == "changed_head_after":
+        table[ROOT + "/pulls/160"][-1]["data"]["head"]["sha"] = "f" * 40
+    if failure == "duplicate":
+        table[ROOT + "/pulls/160"] = table[ROOT + "/pulls/160"][-1]
+    api.write(table)
+    result = merge_cli(tmp_path)
+    assert result.returncode == 32, result.stdout + result.stderr
+    out = json.loads(result.stdout)
+    assert out["merged"] is False and out["reconcile_required"] == (failure != "duplicate")
+    posts = [r for r in api.log() if r["method"] == "POST"]
+    assert len(posts) == (0 if failure == "duplicate" else 1)
+    proof("finalization-" + failure, {"native_exit": result.returncode,
+          "stdout": out, "post_count": len(posts)})
+
+
+def test_ordinary_credential_is_file_only_separate_and_transport_is_finite(api, tmp_path, monkeypatch):
+    ordinary(api, tmp_path, monkeypatch)
+    token = Path(os.environ["DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE"])
+    token.write_text("test-credential")
+    with pytest.raises(HostingError, match="separate_finalization"):
+        HostingConfig.from_environment(AccessRole.FINALIZE)
+    token.write_text("synthetic-prod-finalize")
+    client = api.client(AccessRole.FINALIZE)
+    for path, body in (("/graphql", {"query": "mutation arbitrary"}),
+                       (ROOT + "/git/refs/heads/main", {"sha": SHA}),
+                       (ROOT + "/pulls/160/merge", {})):
+        with pytest.raises(HostingError, match="unsupported_finalization"):
+            client.request("POST", path, body)
+    assert not api.log()
+
+
+def test_ordinary_poller_cli_uses_readiness_and_missing_auth_alerts(api, tmp_path, monkeypatch):
+    api.write(ordinary(api, tmp_path, monkeypatch))
+    root = Path(__file__).resolve().parents[1]
+    # No production checkout: unavailable catchup must alert, never silently mean zero work.
+    monkeypatch.setenv("DAILYCHECK_PROD_REPO", str(tmp_path / "absent-prod"))
+    command = [sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and "GitHub ordinary Prod" in result.stdout
+    assert f"head={SHA} base={BASE} checks=ready" in result.stdout
+    assert "_catchup_block" in result.stdout and "异常" in result.stdout
+    monkeypatch.delenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE")
+    missing = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    assert missing.returncode == 0 and "异常" in missing.stdout and "checks=ready" not in missing.stdout
+    proof("poll-cli", {"native_exit": result.returncode, "stdout": result.stdout,
+                       "missing_auth_stdout": missing.stdout})
+
+
+def test_ordinary_poll_real_catchup_and_private_report_failure(api, tmp_path, monkeypatch):
+    table = ordinary(api, tmp_path, monkeypatch)
+    root = Path(__file__).resolve().parents[1]
+    repo = tmp_path / "prod"
+    repo.mkdir()
+    bg = repo / "scripts/blue_green"
+    bg.mkdir(parents=True)
+    shutil.copy2(root / "scripts/blue_green/deploy_state.py", bg / "deploy_state.py")
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    git("add", "scripts/blue_green/deploy_state.py")
+    git("commit", "-qm", "base")
+    deployed = git("rev-parse", "HEAD")
+    (repo / "tiny").write_text("candidate")
+    git("add", "tiny")
+    git("commit", "-qm", "main")
+    main = git("rev-parse", "HEAD")
+    git("update-ref", "refs/remotes/origin/main", main)
+    git("remote", "add", "origin", f"https://github.com/{REPO}.git")
+    state = tmp_path / "deployment-state"
+    state.mkdir()
+    (state / "state.json").write_text(json.dumps({"deployed": {"sha": deployed}}))
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    real_git = shutil.which("git")
+    fake = tools / "git"
+    fake.write_text(f'''#!{sys.executable}
+import os, sys
+if "fetch" in sys.argv: sys.exit(0)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("DAILYCHECK_PROD_REPO", str(repo))
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_STATE_DIR", str(state))
+    events = state / "events.jsonl"
+    events.write_text(json.dumps({"hosting_provider": "github", "pr": 160, "sha": SHA,
+                                 "publication_rc": 1}) + "\n")
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_EVENT_LOG", str(events))
+    api.write(table)
+    result = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert '"status": "behind"' in result.stdout and main in result.stdout
+    assert f"head={SHA} base={BASE} checks=ready" in result.stdout
+    assert "report publication failed or unconfirmed" in result.stdout
+    proof("poll-catchup", {"native_exit": result.returncode, "stdout": result.stdout,
+                           "deployed": deployed, "main": main})
+    # A broken schedule helper can exit zero without producing its required facts.
+    (bg / "deploy_state.py").write_text("raise SystemExit(0)\n")
+    missing = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],
+                             capture_output=True, text=True, timeout=30)
+    assert missing.returncode == 0 and "invalid or absent facts" in missing.stdout
+    proof("poll-no-output", {"native_exit": missing.returncode, "stdout": missing.stdout})
 
 
 @pytest.fixture

@@ -149,6 +149,10 @@ def test_merge_uses_fast_forward_only(fake):
     posts = [c for c in fake["calls"]() if c["method"] == "POST"]
     assert len(posts) == 1
     assert json.loads(posts[0]["payload"]) == {"do": "fast-forward-only"}
+    from tests.test_github_transport import proof
+
+    proof("gitea-control", {"native_exit": proc.returncode, "stdout": json.loads(proc.stdout),
+                            "posts": posts})
 
 
 def test_merge_non_fast_forward_returns_30(fake):

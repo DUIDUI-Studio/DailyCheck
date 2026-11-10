@@ -26,6 +26,7 @@ class AccessRole(str, Enum):
     OPS_READ = "ops_read"
     FEEDBACK = "feedback"
     REPORT = "report"
+    FINALIZE = "finalize"
 
 
 class HostingError(RuntimeError):
@@ -113,6 +114,43 @@ def provider(environ: Mapping[str, str] | None = None) -> Provider:
         return Provider(env.get("DAILYCHECK_HOSTING_PROVIDER", "gitea"))
     except ValueError as exc:
         raise HostingError("invalid_hosting_provider") from exc
+
+
+def github_ordinary_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    env = os.environ if environ is None else environ
+    if provider(env) is not Provider.GITHUB:
+        return False
+    lane = env.get("DAILYCHECK_GITHUB_LANE", "shadow")
+    if lane not in {"shadow", "ordinary"}:
+        raise HostingError("invalid_github_lane")
+    return lane == "ordinary"
+
+
+GITHUB_REPOSITORY_NODE = "R_kgDOVl3HNQ"
+GITHUB_FF_MUTATION = (
+    "mutation DailyCheckFinalize($input: UpdateRefsInput!) { "
+    "updateRefs(input: $input) { clientMutationId } }"
+)
+
+
+def github_ff_payload(base: str, head: str, head_ref: str, attempt_id: str) -> dict:
+    if (any(not isinstance(s, str) or not re.fullmatch(r"[0-9a-f]{40}", s)
+            or s == "0" * 40 for s in (base, head)) or base == head
+            or not isinstance(head_ref, str)
+            or not re.fullmatch(r"refs/heads/[A-Za-z0-9_/-][A-Za-z0-9_./-]*", head_ref)
+            or head_ref == "refs/heads/main"
+            or any(x in head_ref for x in ("..", "//", "/.", ".lock"))
+            or head_ref.endswith(("/", "."))
+            or not isinstance(attempt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt_id)):
+        raise HostingError("invalid_finalization_binding")
+    return {"query": GITHUB_FF_MUTATION, "variables": {"input": {
+        "repositoryId": GITHUB_REPOSITORY_NODE,
+        "clientMutationId": attempt_id,
+        "refUpdates": [
+            {"name": "refs/heads/main", "beforeOid": base, "afterOid": head, "force": False},
+            {"name": head_ref, "beforeOid": head, "afterOid": head, "force": False},
+        ],
+    }}}
 
 
 def _token(env: Mapping[str, str], names: tuple[str, ...], file_key: str) -> str:
@@ -241,7 +279,20 @@ class HostingConfig:
             AccessRole.OPS_READ: ("DAILYCHECK_GITHUB_OPS_READ_TOKEN",),
             AccessRole.FEEDBACK: ("DAILYCHECK_GITHUB_FEEDBACK_TOKEN",),
             AccessRole.REPORT: ("DAILYCHECK_GITHUB_REPORT_TOKEN",),
+            AccessRole.FINALIZE: (),
         }[role]
+        if role is AccessRole.FINALIZE:
+            if not github_ordinary_enabled(env):
+                raise HostingError("github_finalization_unsupported")
+            if not env.get("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE"):
+                raise HostingError("explicit_finalization_credential_required")
+            final_token = _token(env, (), "DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE")
+            shared = [env.get(k, "") for k in ("GH_TOKEN", "GITHUB_TOKEN", "GITEA_TOKEN")]
+            for other in (AccessRole.READ, AccessRole.REPORT, AccessRole.FEEDBACK, AccessRole.OPS_READ):
+                prefix = f"DAILYCHECK_GITHUB_{other.value.upper()}_TOKEN"
+                shared.append(_token(env, (prefix,), prefix + "_FILE"))
+            if not final_token or final_token in shared:
+                raise HostingError("separate_finalization_credential_required")
         private = role in {AccessRole.FEEDBACK, AccessRole.OPS_READ}
         repo = env.get("DAILYCHECK_GITHUB_REPO", "DUIDUI-Studio/DailyCheck")
         repo_id = 1448986421
@@ -257,6 +308,7 @@ class HostingConfig:
             env.get("DAILYCHECK_GITHUB_API", "https://api.github.com"),
             repo,
             role,
+            final_token if role is AccessRole.FINALIZE else
             _token(env, names, f"DAILYCHECK_GITHUB_{role.value.upper()}_TOKEN_FILE"),
             repo_id=repo_id,
             curl=env.get("DAILYCHECK_CURL", "/usr/bin/curl"),
@@ -278,14 +330,14 @@ class HostingClient:
         self.config = config
 
     def request(self, method: str, path: str, payload: dict | None = None, *,
-                guard_fd: int | None = None) -> tuple[object, str]:
+                guard_fd: int | None = None, attempt_fd: int | None = None) -> tuple[object, str]:
         c = self.config
         if not c.token:
             raise HostingError("credentials_unavailable")
         if method != "GET" and c.role in {AccessRole.READ, AccessRole.OPS_READ}:
             raise HostingError("read_role_cannot_write")
-        # Issue163: only the trusted publication mutator may hand one explicit
-        # deployment-fence descriptor to its HTTP child. Read/feedback/Gitea
+        # Only trusted publication/finalization mutators hand explicit
+        # deployment-fence descriptors to their HTTP child. Read/feedback/Gitea
         # requests keep the ordinary close_fds default and inherit nothing.
         if guard_fd is not None:
             if type(guard_fd) is not int or guard_fd < 3 or method == "GET":
@@ -294,17 +346,41 @@ class HostingClient:
                 os.fstat(guard_fd)
             except OSError as exc:
                 raise HostingError("invalid_transport_guard") from exc
-        # This transport deliberately has no GitHub finalization primitive.
+        finalization = c.provider is Provider.GITHUB and c.role is AccessRole.FINALIZE
+        if finalization and method != "GET":
+            try:
+                data = payload["variables"]["input"]
+                main, head = data["refUpdates"]
+                expected = github_ff_payload(main["beforeOid"], main["afterOid"],
+                                             head["name"], data["clientMutationId"])
+                valid = payload == expected
+            except (KeyError, TypeError, ValueError, HostingError):
+                valid = False
+            if (not github_ordinary_enabled() or method != "POST" or path != "/graphql"
+                    or not valid or guard_fd is None or attempt_fd is None):
+                raise HostingError("unsupported_finalization_write")
+        if attempt_fd is not None:
+            if (not finalization or method == "GET" or type(attempt_fd) is not int
+                    or attempt_fd < 3 or attempt_fd == guard_fd):
+                raise HostingError("invalid_transport_attempt")
+            try:
+                os.fstat(attempt_fd)
+            except OSError as exc:
+                raise HostingError("invalid_transport_attempt") from exc
         routes = {
             AccessRole.FEEDBACK: rf"/repos/{re.escape(c.repo)}/(?:issues|labels)",
             AccessRole.REPORT: rf"/repos/{re.escape(c.repo)}/issues/(?:[1-9][0-9]*/comments|comments/[1-9][0-9]*)",
         }
         allowed = re.fullmatch(routes.get(c.role, r"(?!)"), path)
-        if method != "GET" and (not allowed or method not in {"POST", "PATCH"}):
+        if method != "GET" and not finalization and (not allowed or method not in {"POST", "PATCH"}):
             raise HostingError("unsupported_hosting_write")
-        if (path != f"/repos/{c.repo}" and not path.startswith(f"/repos/{c.repo}/")) or any(
-            x in path for x in ("\r", "\n", "#", "..")
-        ):
+        compare = re.fullmatch(
+            rf"/repos/{re.escape(c.repo)}/compare/[0-9a-f]{{40}}\.\.\.[0-9a-f]{{40}}", path
+        )
+        if (not (finalization and path == "/graphql")
+                and path != f"/repos/{c.repo}" and not path.startswith(f"/repos/{c.repo}/")) or any(
+            x in path for x in ("\r", "\n", "#")
+        ) or ".." in path and not compare:
             raise HostingError("invalid_api_path")
         if c.provider is Provider.GITHUB and c.role is AccessRole.FEEDBACK and method != "GET":
             if method != "POST":
@@ -368,14 +444,15 @@ class HostingClient:
                     capture_output=True,
                     timeout=c.timeout + 5,
                     check=False,
-                    **({"pass_fds": (guard_fd,)} if guard_fd is not None else {}),
+                    **({"pass_fds": (guard_fd,) + ((attempt_fd,) if attempt_fd is not None else ())}
+                       if guard_fd is not None else {}),
                 )
                 raw_headers = Path(dump.name).read_bytes().decode("latin1")
             raw, sep, status = proc.stdout.rpartition("\n")
             if proc.returncode or not sep or len(raw.encode()) > self.MAX_BYTES:
                 raise HostingError("hosting_network_error")
             code = int(status)
-            expected = {"GET": 200, "POST": 201, "PATCH": 200}
+            expected = {"GET": 200, "POST": 200 if finalization else 201, "PATCH": 200}
             if not 200 <= code < 300 or (
                 c.provider is Provider.GITHUB and code != expected.get(method)
             ):

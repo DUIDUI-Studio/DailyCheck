@@ -133,6 +133,18 @@ def invoke(args, env, payload=None):
     )
 
 
+def test_ordinary_lane_cannot_open_sender_or_delayed_shadow_ingress(lane):
+    env, posts, shadow = lane
+    env["DAILYCHECK_GITHUB_LANE"] = "ordinary"
+    sender = invoke([sys.executable, str(ROOT / "scripts/prod_agent/hermes_webhook_sender.py"),
+                     "--production-guard"], env, {})
+    assert sender.returncode == 5
+    assert json.loads(sender.stdout) == {"decision": "suppress", "reason": "github_shadow_only"}
+    queued = cli(env, payload=event())
+    assert queued.returncode != 0 or "shadow" in queued.stdout
+    assert not posts
+
+
 def cli(env, command="ingest", payload=None, db=None):
     return invoke(
         [
