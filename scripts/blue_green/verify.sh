@@ -239,8 +239,8 @@ _verify_check1_pytest() {
   cd "${REPO_ROOT}" || return 1
   local test_db_dir
   test_db_dir="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")" || return 1
-  DAILYCHECK_DB_DIR="${test_db_dir}" \
-    "${DC_PYTHON_BIN}" -m pytest tests/ --basetemp="${test_db_dir}/pytest" -q --tb=line -rfE --color=no \
+  "${DC_PYTHON_BIN}" -I -B "${REPO_ROOT}/scripts/blue_green/verify_pytest.py" "${test_db_dir}" \
+    tests/ --basetemp="${test_db_dir}/pytest" -q --tb=line -rfE --color=no \
     -p scripts.ci.pytest_evidence --dc-evidence="${test_db_dir}/session.json" \
     > ${VERIFY_TMP_DIR}/verify-1-pytest.log 2>&1
   local rc=$?
