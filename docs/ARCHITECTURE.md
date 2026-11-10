@@ -1235,6 +1235,9 @@ verify 后每个 promote/switch/观察/finalize/release 边界复核 HEAD=H 与 
 检查候选。漂移只回滚/记失败，保留实际 remote main 与旧 deployed 锚点，不重置远端。
 外部 PR/repository/check/review 数字 identity 与审批数量只接受 exact int，拒绝 float/bool；
 重新采样与 post-confirmation 同样执行类型检查，不能借 Python 数值相等通过。
+普通 readiness 在原始 API 边界用既有 exact-positive-int 检查 workflow/run/suite/attempt、
+关联 PR/repository、job 与 check/app 数字绑定，先校验再选择、比较或构建快照；
+最新 run 重读也执行同一检查，metadata ID 不能替代对原始 producer ID 的校验。
 finalizer 在既有 process/state fence 下重读精确 repo ID/node、PR node/ref/H/B、最新
 两必需 CI producer/run/attempt、review 和 protection；要求 classic main protection
 enforce-admins、stale-review dismissal、至少一项当前 H approval 和两个 Actions App

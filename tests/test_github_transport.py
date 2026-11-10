@@ -116,7 +116,7 @@ def pr(number=160):
         "mergeable": True,
         "mergeable_state": "clean",
         "html_url": f"https://github.com/{REPO}/pull/{number}",
-        "head": {"sha": SHA, "ref": "chore/issue-160-test", "repo": {"full_name": REPO}},
+        "head": {"sha": SHA, "ref": "chore/issue-160-test", "repo": {"id": REPO_ID, "full_name": REPO}},
         "base": {"sha": BASE, "ref": "main", "repo": {"id": REPO_ID, "full_name": REPO}},
     }
 
@@ -662,6 +662,64 @@ def merged_table(table):
     table[ROOT + "/git/ref/heads/main"] = [main] * 2 + [response({
         "ref": "refs/heads/main", "object": {"sha": SHA}})]
     return table
+
+
+@pytest.mark.parametrize("field", [
+    "workflow_id", "run_id", "suite_id", "run_number", "run_attempt", "run_repo",
+    "associated_pr", "candidate_pr", "head_repo", "base_repo", "job_id", "job_run",
+    "job_attempt", "check_id", "check_app", "check_suite",
+])
+@pytest.mark.parametrize("kind", ["float", "bool"])
+@pytest.mark.parametrize("phase", ["initial", "reread"])
+def test_finalizer_rejects_raw_readiness_numeric_bindings(
+    api, tmp_path, monkeypatch, field, kind, phase
+):
+    table = merged_table(ordinary(api, tmp_path, monkeypatch))
+    if field in {"candidate_pr", "head_repo", "base_repo"}:
+        key = ROOT + "/pulls/160"
+        index = 0 if phase == "initial" else 1
+        row = json.loads(json.dumps(table[key][index]))
+        table[key][index] = row
+        candidate = row["data"]
+        target, attr = ((candidate, "number") if field == "candidate_pr"
+                        else (candidate[field.split("_")[0]]["repo"], "id"))
+    else:
+        if field.startswith("job_"):
+            key = ROOT + "/actions/runs/40/jobs?page=1"
+            row = json.loads(json.dumps(table[key]))
+            target = row["data"]["jobs"][0]
+            attr = {"job_id": "id", "job_run": "run_id", "job_attempt": "run_attempt"}[field]
+        elif field.startswith("check_"):
+            key = ROOT + f"/commits/{SHA}/check-runs?page=1"
+            row = json.loads(json.dumps(table[key]))
+            check = row["data"]["check_runs"][0]
+            target, attr = ((check, "id") if field == "check_id" else
+                            (check["app" if field == "check_app" else "check_suite"], "id"))
+        else:
+            key = ROOT + "/actions/workflows/12/runs?page=1"
+            row = json.loads(json.dumps(table[key]))
+            run = row["data"]["workflow_runs"][0]
+            if field in {"run_repo", "associated_pr"}:
+                target, attr = ((run["repository"], "id") if field == "run_repo"
+                                else (run["pull_requests"][0], "number"))
+            else:
+                target, attr = run, {"run_id": "id", "suite_id": "check_suite_id"}.get(field, field)
+        table[key] = row if phase == "initial" else [table[key], row]
+    original = target[attr]
+    target[attr] = float(original) if kind == "float" else True
+    api.write(table)
+    result = merge_cli(tmp_path)
+    posts = [r for r in api.log() if r["method"] == "POST"]
+    out = json.loads(result.stdout)
+    proof(f"raw-{phase}-{field}-{kind}", {
+        "original": original, "malformed": target[attr], "native_exit": result.returncode,
+        "stdout": out, "post_count": len(posts), "observed_paths": [r["path"] for r in api.log()],
+    })
+    assert result.returncode == 32 and out["merged"] is False, result.stdout + result.stderr
+    reason = ("invalid_or_repeated_page_item" if field in {"run_id", "job_id", "check_id"}
+              else "invalid_response")
+    assert out["reason"] == "github_not_ready:" + reason
+    assert not posts
 
 
 def test_ordinary_finalization_cli_checks_and_atomic_exact_h_postfacts(api, tmp_path, monkeypatch):

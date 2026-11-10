@@ -43,12 +43,13 @@ class GitHubReadinessClient:
 
     def _candidate(self, number: int, expected: str) -> Candidate:
         pr = _object(self.client.get(f"{self.root}/pulls/{number}"))
-        if pr.get("number") != number or pr.get("state") != "open" or pr.get("draft") is not False:
+        if _positive(pr.get("number")) != number or pr.get("state") != "open" or pr.get("draft") is not False:
             raise HostingError("pr_not_open_or_not_ready")
         head, base = _object(pr.get("head")), _object(pr.get("base"))
+        _positive(_object(head.get("repo")).get("id"))
         if (
             base.get("ref") != self.config.base_ref
-            or _object(base.get("repo")).get("id") != self.config.repo_id
+            or _positive(_object(base.get("repo")).get("id")) != self.config.repo_id
             or _object(base.get("repo")).get("full_name") != self.config.repo
             or _object(head.get("repo")).get("full_name") != self.config.repo
         ):
@@ -81,12 +82,14 @@ class GitHubReadinessClient:
         )
         eligible = []
         for run in runs:
+            for key in ("workflow_id", "id", "check_suite_id", "run_number", "run_attempt"):
+                _positive(run.get(key))
             if (
                 run.get("workflow_id") != workflow_id
                 or run.get("path") != self.config.workflow_path
                 or run.get("event") != "pull_request"
                 or run.get("head_sha") != candidate.head
-                or _object(run.get("repository")).get("id") != self.config.repo_id
+                or _positive(_object(run.get("repository")).get("id")) != self.config.repo_id
                 or _object(run.get("head_repository")).get("full_name") != self.config.repo
             ):
                 raise HostingError("untrusted_workflow_run")
@@ -95,12 +98,11 @@ class GitHubReadinessClient:
                 not isinstance(pr, dict) for pr in associations
             ):
                 raise HostingError("invalid_pr_association")
+            for pr in associations:
+                _positive(pr.get("number"))
             if any(
                 isinstance(pr, dict) and pr.get("number") == candidate.pr for pr in associations
             ):
-                _positive(run.get("check_suite_id"))
-                _positive(run.get("run_number"))
-                _positive(run.get("run_attempt"))
                 eligible.append(run)
         if not eligible:
             raise HostingError("checks_missing")
@@ -183,7 +185,14 @@ class GitHubReadinessClient:
                 key="check_runs",
                 params={"filter": "all"},
             )
-            by_id = {check["id"]: check for check in checks}
+            for job in jobs:
+                for key in ("id", "run_id", "run_attempt"):
+                    _positive(job.get(key))
+            by_id = {}
+            for check in checks:
+                _positive(_object(check.get("app")).get("id"))
+                _positive(_object(check.get("check_suite")).get("id"))
+                by_id[_positive(check.get("id"))] = check
             for name in self.required:
                 matches = [job for job in jobs if job.get("name") == name]
                 if not matches:
