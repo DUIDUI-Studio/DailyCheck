@@ -375,7 +375,8 @@ class HostingClient:
         if method != "GET" and not finalization and (not allowed or method not in {"POST", "PATCH"}):
             raise HostingError("unsupported_hosting_write")
         compare = re.fullmatch(
-            rf"/repos/{re.escape(c.repo)}/compare/[0-9a-f]{{40}}\.\.\.[0-9a-f]{{40}}", path
+            rf"/repos/{re.escape(c.repo)}/compare/[0-9a-f]{{40}}\.\.\.[0-9a-f]{{40}}"
+            r"(?:\?per_page=1&page=2)?", path
         )
         if (not (finalization and path == "/graphql")
                 and path != f"/repos/{c.repo}" and not path.startswith(f"/repos/{c.repo}/")) or any(

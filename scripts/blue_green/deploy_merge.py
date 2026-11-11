@@ -90,7 +90,7 @@ def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -
         raise HostingError("github_target_changed")
     head_ref = "refs/heads/" + data["head"]["ref"]
     github_ff_payload(base, sha, head_ref, "0" * 32)
-    comparison = client.get(f"{root}/compare/{base}...{sha}")
+    comparison = client.get(f"{root}/compare/{base}...{sha}?per_page=1&page=2")
     if (comparison.get("status") != "ahead"
             or comparison.get("merge_base_commit", {}).get("sha") != base
             or comparison.get("base_commit", {}).get("sha") != base):
