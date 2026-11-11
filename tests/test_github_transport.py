@@ -30,6 +30,8 @@ config = sys.stdin.read()
 url = urlsplit(args[-1])
 query = parse_qs(url.query)
 key = url.path + ("?page=" + query["page"][0] if "page" in query else "")
+if "/compare/" in url.path:
+    key = url.path + ("?" + url.query if url.query else "")
 table = json.loads(Path(os.environ["FAKE_TABLE"]).read_text())
 state_path = Path(os.environ["FAKE_STATE"])
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -44,7 +46,8 @@ if key == "/graphql" and row.get("echo_mutation"):
     payload = json.loads(json.loads(line[7:]))
     row["data"] = {"data": {"updateRefs": {
         "clientMutationId": payload["variables"]["input"]["clientMutationId"]}}}
-log = {"path": url.path, "query": query, "method": args[args.index("--request")+1],
+log = {"path": url.path, "query": query, "raw_query": url.query,
+       "method": args[args.index("--request")+1],
        "bearer": "Authorization: Bearer " in config, "argv_has_token": "test-credential" in str(args),
        "config": config}
 if url.path == "/graphql":
@@ -531,8 +534,9 @@ def ordinary(api, tmp_path, monkeypatch):
     before.update(node_id="PR_synthetic_160", merged=False)
     before["head"]["repo"]["id"] = REPO_ID
     table[ROOT + "/pulls/160"] = response(before)
-    table[ROOT + "/compare/" + BASE + "..." + SHA] = response({
-        "status": "ahead", "base_commit": {"sha": BASE}, "merge_base_commit": {"sha": BASE}})
+    table[ROOT + "/compare/" + BASE + "..." + SHA + "?per_page=1&page=2"] = response({
+        "status": "ahead", "base_commit": {"sha": BASE}, "merge_base_commit": {"sha": BASE},
+        "ahead_by": 1, "behind_by": 0, "total_commits": 1, "commits": []})
     table[ROOT + "/git/ref/heads/main"] = response({
         "ref": "refs/heads/main", "object": {"sha": BASE}})
     table[ROOT + "/branches/main/protection"] = response({
@@ -750,6 +754,102 @@ def test_ordinary_finalization_cli_checks_and_atomic_exact_h_postfacts(api, tmp_
           "post_read_paths": [r["path"] for r in api.log()[-3:]]})
 
 
+def test_compare_metadata_empty_second_page_retains_exact_ff_proof(api, tmp_path, monkeypatch):
+    table = merged_table(ordinary(api, tmp_path, monkeypatch))
+    comparison = table[ROOT + f"/compare/{BASE}...{SHA}?per_page=1&page=2"]["data"]
+    assert comparison["commits"] == [] and "files" not in comparison
+    api.write(table)
+    result = merge_cli(tmp_path)
+    reads = [r for r in api.log() if "/compare/" in r["path"]]
+    proof("compare-request-observation", {"native_exit": result.returncode,
+          "stdout": json.loads(result.stdout),
+          "reads": [{k: r[k] for k in ("path", "raw_query", "query", "method")} for r in reads]})
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = json.loads(result.stdout)
+    assert out["merged"] is True and out["main_sha"] == out["merged_sha"] == SHA
+    assert len(reads) == 2, "initial and held pre-write facts must both be current"
+    assert all(r["path"] == ROOT + f"/compare/{BASE}...{SHA}"
+               and r["raw_query"] == "per_page=1&page=2"
+               and r["query"] == {"per_page": ["1"], "page": ["2"]}
+               and r["method"] == "GET" for r in reads)
+    posts = [r for r in api.log() if r["method"] == "POST"]
+    assert len(posts) == 1 and posts[0]["path"] == "/graphql"
+    proof("compare-metadata-success", {"native_exit": result.returncode, "stdout": out,
+          "comparison": comparison,
+          "reads": [{k: r[k] for k in ("path", "raw_query", "query", "method")} for r in reads],
+          "post_count": len(posts), "fences": posts[0]["retained_fences"]})
+
+
+@pytest.mark.parametrize("phase", ["initial", "prewrite"])
+@pytest.mark.parametrize("damage", ["identical", "diverged", "behind", "empty", "missing_status",
+                                    "missing_base", "missing_mergebase", "wrong_base", "wrong_mergebase"])
+def test_compare_metadata_invalid_proof_never_writes(api, tmp_path, monkeypatch, damage, phase):
+    table = merged_table(ordinary(api, tmp_path, monkeypatch))
+    path = ROOT + f"/compare/{BASE}...{SHA}?per_page=1&page=2"
+    valid = table[path]
+    invalid = json.loads(json.dumps(valid))
+    data = invalid["data"]
+    if damage in {"identical", "diverged", "behind"}:
+        data["status"] = damage
+    elif damage == "empty":
+        data.clear()
+    elif damage.startswith("missing_"):
+        data.pop({"missing_status": "status", "missing_base": "base_commit",
+                  "missing_mergebase": "merge_base_commit"}[damage])
+    else:
+        data["base_commit" if damage == "wrong_base" else "merge_base_commit"]["sha"] = "f" * 40
+    table[path] = invalid if phase == "initial" else [valid, invalid]
+    api.write(table)
+    result = merge_cli(tmp_path)
+    out = json.loads(result.stdout)
+    assert result.returncode == 32 and out["reason"] == "github_not_fast_forward"
+    assert out["merged"] is False
+    reads = [r for r in api.log() if "/compare/" in r["path"]]
+    assert len(reads) == (1 if phase == "initial" else 2), "no retry/fallback on absent proof"
+    assert all(r["raw_query"] == "per_page=1&page=2" for r in reads)
+    assert not [r for r in api.log() if r["method"] != "GET"]
+    proof(f"compare-metadata-{phase}-{damage}", {"native_exit": result.returncode,
+          "stdout": out, "compare_count": len(reads), "queries": [r["raw_query"] for r in reads],
+          "post_count": 0})
+
+
+def test_compare_metadata_identical_binding_rejects_before_http(api, tmp_path, monkeypatch):
+    api.write(ordinary(api, tmp_path, monkeypatch))
+    result = merge_cli(tmp_path, base=SHA)
+    assert result.returncode == 32 and json.loads(result.stdout)["merged"] is False
+    assert not api.log(), "H=B must reject before any compare or other HTTP"
+
+
+@pytest.mark.parametrize("suffix", ["", "?per_page=1&page=2"], ids=["legacy", "fixed-page2"])
+def test_compare_path_exact_supported_query(api, suffix):
+    path = ROOT + f"/compare/{BASE}...{SHA}" + suffix
+    api.write({path: response({"status": "ahead"})})
+    assert api.client().get(path) == {"status": "ahead"}
+    assert len(api.log()) == 1 and api.log()[0]["raw_query"] == suffix.lstrip("?")
+
+
+@pytest.mark.parametrize("suffix", ["?page=2", "?per_page=1&page=1", "?per_page=2&page=2",
+    "?page=2&per_page=1", "?per_page=1&per_page=1&page=2", "?per_page=1&page=2&page=2",
+    "?per_page=1&page=2&extra=1", "?per_page=1&page=2&", "?per_page=01&page=2",
+    "?per_page=1&page=02", "?per_page=1", "?per_page=1&%70age=2"])
+def test_compare_path_rejects_other_queries_before_transport(api, suffix):
+    with pytest.raises(HostingError, match="invalid_api_path"):
+        api.client().get(ROOT + f"/compare/{BASE}...{SHA}" + suffix)
+    assert not api.log()
+
+
+@pytest.mark.parametrize("path", [ROOT + f"/compare/{BASE[:-1]}...{SHA}",
+    ROOT + f"/compare/{BASE}...{SHA.upper()}?per_page=1&page=2",
+    ROOT + f"/compare/{BASE}...{'g' * 40}?per_page=1&page=2",
+    ROOT + f"/compare/{BASE}..{SHA}?per_page=1&page=2",
+    ROOT + f"/compare/../{BASE}...{SHA}?per_page=1&page=2",
+    f"/repos/foreign/repo/compare/{BASE}...{SHA}?per_page=1&page=2"])
+def test_compare_path_rejects_malformed_sha_or_repo_binding(api, path):
+    with pytest.raises(HostingError, match="invalid_api_path"):
+        api.client().get(path)
+    assert not api.log()
+
+
 @pytest.mark.parametrize("failure", ["head", "base", "foreign", "ancestry", "protection",
                                      "review", "stale_review", "ci", "no_fence", "absent_auth"])
 def test_ordinary_finalization_bad_preconditions_never_write(api, tmp_path, monkeypatch, failure):
@@ -763,7 +863,7 @@ def test_ordinary_finalization_bad_preconditions_never_write(api, tmp_path, monk
         else:
             p["head"]["repo"]["id"] = 1
     if failure == "ancestry":
-        table[ROOT + f"/compare/{BASE}...{SHA}"]["data"]["status"] = "diverged"
+        table[ROOT + f"/compare/{BASE}...{SHA}?per_page=1&page=2"]["data"]["status"] = "diverged"
     if failure == "protection":
         table[ROOT + "/branches/main/protection"] = response({}, status=404)
     if failure in {"review", "stale_review"}:

@@ -1239,6 +1239,7 @@ attempt/state/蓝绿锁、hosting/role 配置及 check2–8 不变。DB/TMP/状�
 该次私有测试目录，移除 live 身份/凭据/native 上下文；子 PATH 前置所选解释器目录以发现
 同 venv 已安装工具。完整 tests/、session evidence 与 strict known14 门禁保留，native 分支不变。
 
+compare 证明只使用 `ahead` 与精确 B/base/merge-base，测试记录完整查询，不能由分页归一化掩盖差异。
 候选准备冻结 main B，check/finalize 都传 B，H 必须包含 B。普通 GitHub pipeline
 拒绝 skip-verify、短观察和非 candidate/merge 入口；观察以 monotonic 实际时间计。
 verify 后每个 promote/switch/观察/finalize/release 边界复核 HEAD=H 与 tracked tree
