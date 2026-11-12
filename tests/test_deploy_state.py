@@ -700,3 +700,74 @@ def test_admission_never_normalizes_untrusted_failed_state(state_dir, damage):
         proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD, *identity)
         assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed", proc.stdout + proc.stderr
         assert _admission_inventory(state_dir) == before
+
+
+def _initialize_idle_native_fixture(state_dir):
+    from scripts.prod_agent.native_queue import LoopbackFixtureScope, NativeQueue, ProducerPolicy
+
+    class NoFacts:
+        def read(self, candidate):
+            raise AssertionError("idle initialization must not read facts")
+
+    root = state_dir.parent
+    (root / ".native-queue-fixture").write_text("synthetic-owned-fixture\n")
+    scope = LoopbackFixtureScope(root, "http://127.0.0.1:9")
+    runner = NativeQueue(root / "repo", state_dir,
+                         ProducerPolicy(101, 102, "a" * 40, 103, 104), NoFacts())
+    runner.initialize_fixture(scope)
+    return runner
+
+
+@pytest.mark.parametrize("damage", ["duplicate-root", "duplicate-nested", "syntax"])
+@pytest.mark.parametrize("identity", ["github", "omitted", "gitea"])
+def test_native_marker_preserves_strict_admission_precedence(state_dir, damage, identity):
+    state = _released_outcome(state_dir)
+    oid, outcome = next(iter(state["outcomes"].items()))
+    assert state["generation"] == 1 and state["last_attempt"]["outcome_id"] == oid
+    assert outcome["result"] == "failed" and outcome["rc"] == 21
+    assert outcome["deployment"] == {"provider": "github", "host": "github.com",
+                                      "repository": FAILED_REPOSITORY, "pr": 160}
+    _initialize_idle_native_fixture(state_dir)
+    state = _state(state_dir)
+    assert state["outcomes"][oid] == outcome and state["native_queue"]["active"] is None
+    path = state_dir / "state.json"
+    raw = json.dumps(state, separators=(",", ":")).encode()
+    if damage == "duplicate-root":
+        raw = raw[:-1] + b',"outcomes":{}}'
+        assert raw.count(b'"outcomes"') == 2
+    elif damage == "duplicate-nested":
+        needle = b'"deployment":{"provider":"github"'
+        assert raw.count(needle) == 1
+        raw = raw.replace(needle, b'"deployment":{"provider":"github","provider":"gitea"')
+    else:
+        raw += b','
+    path.write_bytes(raw)
+    (state_dir / "lock.token").write_bytes(b'preserved-native-token\n')
+    (state_dir / "lock.token").chmod(0o600)
+    before = _admission_inventory(state_dir)
+    extra = {"github": ["--deployment-provider", "github", "--deployment-host", "github.com",
+                         "--deployment-repository", FAILED_REPOSITORY],
+             "omitted": [],
+             "gitea": ["--deployment-provider", "gitea", "--deployment-host", "gitea.example",
+                        "--deployment-repository", "eric/dailycheck"]}[identity]
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD, *extra)
+    assert proc.returncode == 10, proc.stdout + proc.stderr
+    assert proc.stdout == ""
+    assert proc.stderr == "[deploy_state] native grant/admission requires reconciliation\n"
+    assert _admission_inventory(state_dir) == before
+    assert not list(state_dir.glob("state.json.corrupt-*"))
+
+
+def test_healthy_idle_native_marker_still_admits(state_dir):
+    runner = _initialize_idle_native_fixture(state_dir)
+    from scripts.prod_agent.native_queue import deploy_state
+
+    with runner.fence():
+        state = deploy_state.load_state(state_dir, strict=True)
+        assert state["native_queue"]["active"] is None
+        assert not deploy_state.native_blocked(state_dir, state)
+    marker = (state_dir / "native-queue.guard").read_bytes()
+    proc = _run(state_dir, "acquire", "--pr", "161", "--sha", "d" * 40)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _out(proc)["token"]
+    assert (state_dir / "native-queue.guard").read_bytes() == marker

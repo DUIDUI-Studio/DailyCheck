@@ -514,6 +514,7 @@ exact-G reconciliation。intent 后超时、进程死亡、出队/同 G 再入�
 
 同 trusted state 目录的 `native-queue.guard` 只保存初始化/待对账标记，无正向授权；marker
 先于 external intent durable 写入，缺失、损坏、marker/state 不一致均阻断 healing/admission。
+acquire 严格解析失败时须保持 native marker 的拒绝优先级（rc10），无 marker 仍 rc2 且不自愈，合法 idle native state 仍可申请锁。
 不存在第二个 queue/DB/lock；不能删除/替换 trusted state 目录或锁文件。恢复先取同一 OS
 fence，只读 host/runtime，绝不重复部署或 grant；未知 main、wrong merge SHA、缺事实、incident
 保留 reconcile_required。仅 PR merge SHA=main=runtime=G、原完整检查和观察均确认时，同一
