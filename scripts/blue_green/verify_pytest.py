@@ -32,7 +32,7 @@ def main() -> int:
     Path(env["HOME"]).mkdir(mode=0o700)
     # close_fds is essential: removing the descriptor names would leave kernel authority.
     return subprocess.call([sys.executable, "-B", "-m", "pytest", *sys.argv[2:]],
-                           env=env, close_fds=True)
+                           env=env, close_fds=True, umask=0o022)
 
 
 if __name__ == "__main__":

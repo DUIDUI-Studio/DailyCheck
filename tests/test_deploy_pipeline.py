@@ -57,6 +57,7 @@ def _write_fake(path: Path, label: str, calls: Path, rc: int) -> None:
 
 def _env(sb: dict, **extra) -> dict:
     env = os.environ.copy()
+    env["PYTHONPATH"] = str(sb["tmp"])
     env["DAILYCHECK_DEPLOY_STATE_DIR"] = str(sb["state"])
     env["DAILYCHECK_PIPELINE_LOG"] = str(sb["tmp"] / "pipeline.log")
     env["DAILYCHECK_PIPELINE_TICK_SEC"] = "1"

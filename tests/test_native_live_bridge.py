@@ -158,7 +158,7 @@ class AppHTTP:
 
 
 @pytest.fixture
-def bridge(tmp_path, monkeypatch):
+def bridge(tmp_path, monkeypatch, *, reviewer_uid=None):
     (tmp_path / ".native-h-fixture").write_text("synthetic-owned-fixture\n")
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     server = AppHTTP(key.public_key())
@@ -200,7 +200,7 @@ def bridge(tmp_path, monkeypatch):
                  "mcp_health_token_file": str(tmp_path / "mcp-health-token"),
                  "runtime_file": str(tmp_path / "runtime.json"),
                  "bootstrap_file": str(tmp_path / "bootstrap.json"), "review_directory": str(tmp_path / "reviews"),
-                 "reviewers": {str(os.geteuid()): "synthetic-independent"}, "writer": "synthetic-writer",
+                 "reviewers": {str(os.geteuid() if reviewer_uid is None else reviewer_uid): "synthetic-independent"}, "writer": "synthetic-writer",
                  "release_root": str(tmp_path / "releases"), "units": ["dailycheck.service", "dailycheck-mcp.service"],
                  "runtime": runtime_identity()}
         private(tmp_path / "policy.json", value)

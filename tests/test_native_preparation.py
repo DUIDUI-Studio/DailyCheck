@@ -1,8 +1,8 @@
 """Owned-fixture behaviour and rejection tests for the native preparation adapter.
 
-These are portable file/process/HTTP controls. They never claim a Linux UID
-transition, a real 600-second window, an installed policy or production
-acceptance; every synthetic record is explicitly owned-fixture input.
+These are owned file/process/HTTP controls; root profiles use real nonroot
+reviewer children. They do not claim a real 600-second window, installed policy
+or production acceptance; every record is explicitly synthetic fixture input.
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import pwd
 import select
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -39,8 +41,25 @@ from scripts.prod_agent.native_prepare import (
 from scripts.prod_agent.native_queue import NativeQueue, deploy_state
 from tests import test_native_live_bridge as bridge_tests
 
-bridge = bridge_tests.bridge
 git = bridge_tests.git
+
+
+@pytest.fixture
+def bridge(tmp_path, monkeypatch):
+    uid = 65531 if os.geteuid() == 0 else os.geteuid()
+    yield from bridge_tests.bridge.__wrapped__(tmp_path, monkeypatch, reviewer_uid=uid)
+
+
+@pytest.fixture
+def tmp_path(tmp_path):
+    if os.geteuid() != 0:
+        yield tmp_path
+        return
+    # Only this fixture directory becomes traversable, never pytest ancestors.
+    with tempfile.TemporaryDirectory(prefix="dc-native-preparation-", dir="/tmp") as name:
+        root = Path(name).resolve()
+        root.chmod(0o755)
+        yield root
 
 
 def private(path: Path, value: object) -> None:
@@ -66,7 +85,7 @@ def plan_document(b, policy: InstalledPolicy, records: Path) -> dict:
     try:
         reviewer_gid = pwd.getpwuid(reviewer_uid).pw_gid
     except KeyError:
-        reviewer_gid = 65531
+        reviewer_gid = os.getegid() if reviewer_uid == os.geteuid() else 65531
     application_environment = records / "application.env"
     private(application_environment, "\n".join((
         "DAILYCHECK_SECRET_KEY=" + "s" * 40,
@@ -599,10 +618,11 @@ def synthetic_reviewer_account(monkeypatch):
     record only for the current approved reviewer UID; every other lookup uses
     the real NSS. It is not a kernel identity or production-account claim.
     """
-    reviewer_uid = os.geteuid()
+    reviewer_uid = 65531 if os.geteuid() == 0 else os.geteuid()
     original = pwd.getpwuid
     record = pwd.struct_passwd(("synthetic-reviewer", "x", reviewer_uid,
-                                 SYNTHETIC_REVIEWER_GID, "Synthetic owned reviewer",
+                                 SYNTHETIC_REVIEWER_GID if os.geteuid() == 0 else os.getegid(),
+                                 "Synthetic owned reviewer",
                                  "/nonexistent", "/bin/false"))
 
     def getpwuid(uid):
@@ -613,7 +633,65 @@ def synthetic_reviewer_account(monkeypatch):
     monkeypatch.setattr(pwd, "getpwuid", getpwuid)
 
 
-def test_review_request_and_result_are_exactly_bound(bridge, synthetic_reviewer_account):
+@pytest.fixture
+def review_publisher(bridge):
+    policy = bridge["policy"]
+    uid = int(next(iter(policy.value["reviewers"])))
+    gid = SYNTHETIC_REVIEWER_GID if os.geteuid() == 0 else os.getegid()
+    directory = policy.location("review_directory")
+    result_directory = directory / str(uid)
+    result_directory.mkdir(mode=0o700)
+    if os.geteuid() == 0:
+        os.chown(directory, 0, gid)
+        directory.chmod(0o750)
+        os.chown(result_directory, uid, gid)
+    assert result_directory.stat().st_uid == uid
+    assert uid > 0 and uid != policy.value["app_uid"]
+    code = r"""import json,os,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from scripts.prod_agent.native_prepare import publish_review_result
+row={'uid':os.geteuid(),'gid':os.getegid()}
+try:
+ row['record']=publish_review_result(Path(sys.argv[2]),sys.argv[3],decision=sys.argv[4])
+except ValueError as exc:
+ row['error']=str(exc)
+print(json.dumps(row))
+"""
+
+    def publish(candidate_digest, *, decision="pass"):
+        kwargs = {"user": uid, "group": gid, "extra_groups": []} if os.geteuid() == 0 else {}
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", code, str(bridge_tests.ROOT),
+             str(directory), candidate_digest, decision],
+            env={"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs)
+        print(json.dumps({"review_publisher_pid": child.pid, "before_IO": True}))
+        try:
+            out, err = child.communicate(timeout=15)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+        assert child.returncode == 0, err
+        row = json.loads(out)
+        assert (row["uid"], row["gid"]) == (uid, gid)
+        proof = {"review_publisher_pid": child.pid, "positive_wait_exit": child.returncode,
+                 "uid": row["uid"], "gid": row["gid"],
+                 "result_directory_uid": result_directory.stat().st_uid}
+        if "error" in row:
+            print(json.dumps({**proof, "rejection": row["error"]}))
+            raise ValueError(row["error"])
+        result = result_directory / (candidate_digest + ".json")
+        assert result.stat().st_uid == uid and stat_mode(result) == 0o600
+        print(json.dumps({**proof, "result_uid": result.stat().st_uid,
+                          "result_mode": oct(stat_mode(result))}))
+        return row["record"]
+
+    return publish
+
+
+def test_review_request_and_result_are_exactly_bound(bridge, synthetic_reviewer_account, review_publisher):
     b = bridge
     policy = b["policy"]
     preparer_for_review = preparer(b)
@@ -624,12 +702,10 @@ def test_review_request_and_result_are_exactly_bound(bridge, synthetic_reviewer_
     assert path.parent.name == request["request"].split("/")[-2]
     assert stat_mode(path) == 0o640
     assert stat_mode(path.parent) == 0o750
-    (policy.location("review_directory") / str(os.geteuid())).mkdir(mode=0o700)
-    record = publish_review_result(policy.location("review_directory"), digest(candidate),
-                                   decision="pass")
+    record = review_publisher(digest(candidate))
     assert record["candidate_sha256"] == digest(candidate)
     assert record["ci_sha256"] == digest(ci) and record["verdict"] == "pass"
-    assert stat_mode(policy.location("review_directory") / str(os.geteuid())
+    assert stat_mode(policy.location("review_directory") / str(request["reviewer_uid"])
                      / (digest(candidate) + ".json")) == 0o600
     review = ProtectedReview(policy, fixture_ci=lambda _: ci)
     assert review.read(candidate)["reviewer"] == record["reviewer"]
@@ -642,7 +718,7 @@ def stat_mode(path: Path) -> int:
 @pytest.mark.parametrize("damage", ["no-request", "wrong-digest", "fail", "root",
                                      "tamper-ci", "already"])
 def test_review_result_rejects_unsafe_or_second_publication(
-        bridge, monkeypatch, synthetic_reviewer_account, damage):
+        bridge, synthetic_reviewer_account, review_publisher, damage):
     b = bridge
     policy = b["policy"]
     candidate = {"synthetic": "candidate"}
@@ -650,28 +726,52 @@ def test_review_result_rejects_unsafe_or_second_publication(
     preparer_for_review = preparer(b)
     preparer_for_review.prepare_review_request(candidate, ci)
     directory = policy.location("review_directory")
-    (directory / str(os.geteuid())).mkdir(mode=0o700)
     digest_value = digest(candidate)
     if damage in {"no-request", "wrong-digest"}:
         digest_value = "f" * 64
     elif damage == "fail":
         with pytest.raises(ValueError, match="pass"):
-            publish_review_result(directory, digest_value, decision="fail")
+            review_publisher(digest_value, decision="fail")
         return
     elif damage == "root":
-        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        if os.geteuid() == 0:
+            with pytest.raises(ValueError, match="denied for root"):
+                publish_review_result(directory, digest_value, decision="pass")
+        else:
+            with pytest.raises(PermissionError):
+                os.setuid(0)
+        return
     elif damage == "tamper-ci":
-        request_path = directory / "requests" / str(os.geteuid()) / (digest_value + ".json")
+        request_path = directory / "requests" / next(iter(policy.value["reviewers"])) / (digest_value + ".json")
         request = json.loads(request_path.read_text())
         request["expected"]["ci_sha256"] = "f" * 64
         private(request_path, request)
+        request_path.chmod(0o640)
     elif damage == "already":
-        publish_review_result(directory, digest_value, decision="pass")
-    with pytest.raises(ValueError):
-        publish_review_result(directory, digest_value, decision="pass")
+        review_publisher(digest_value)
+    expected = {"no-request": "protected review request unavailable",
+                "wrong-digest": "protected review request unavailable",
+                "tamper-ci": "review request binding mismatch",
+                "already": "review result already published"}[damage]
+    with pytest.raises(ValueError, match=expected):
+        review_publisher(digest_value)
 
 
-def test_review_request_denies_missing_approved_account(bridge, monkeypatch):
+def test_review_result_denies_wrong_owner_directory(bridge, synthetic_reviewer_account, review_publisher):
+    policy = bridge["policy"]
+    candidate = {"synthetic": "wrong-owner"}
+    preparer(bridge).prepare_review_request(candidate, {"synthetic": "ci"})
+    directory = policy.location("review_directory") / next(iter(policy.value["reviewers"]))
+    if os.geteuid() == 0:
+        os.chown(directory, policy.value["app_uid"], policy.value["app_uid"])
+        with pytest.raises(ValueError, match="unsafe reviewer result directory"):
+            review_publisher(digest(candidate))
+    else:
+        with pytest.raises(PermissionError):
+            os.chown(directory, policy.value["app_uid"], policy.value["app_uid"])
+
+
+def test_review_request_denies_missing_approved_account(bridge, monkeypatch, review_publisher):
     """The unchanged product denies an absent approved reviewer account."""
     b = bridge
     policy = b["policy"]
@@ -685,14 +785,13 @@ def test_review_request_denies_missing_approved_account(bridge, monkeypatch):
 
     monkeypatch.setattr(pwd, "getpwuid", missing)
     directory = policy.location("review_directory")
-    (directory / str(os.geteuid())).mkdir(mode=0o700)
     before = sorted(path.relative_to(directory).as_posix()
                     for path in directory.rglob("*"))
     candidate = {"synthetic": "candidate"}
     with pytest.raises(ValueError, match="reviewer account does not exist"):
         preparer(b).prepare_review_request(candidate, {"synthetic": "ci"})
     with pytest.raises(ValueError, match="protected review request unavailable"):
-        publish_review_result(directory, digest(candidate), decision="pass")
+        review_publisher(digest(candidate))
     after = sorted(path.relative_to(directory).as_posix()
                    for path in directory.rglob("*"))
     assert after == before
