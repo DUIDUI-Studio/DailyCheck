@@ -341,12 +341,17 @@ def test_status_json_reports_all(state_dir: Path):
 
 
 def test_corrupt_state_heals_on_write(state_dir: Path):
+    """Historical healing regression: acquire now preserves corruption instead."""
+    token = _acquire(state_dir)
+    assert _run(state_dir, "release", "--token", token, "--result", "failed").returncode == 0
     (state_dir / "state.json").write_text("{not json", encoding="utf-8")
+    (state_dir / "lock.token").write_text("preserved-legacy-token\n")
+    (state_dir / "lock.token").chmod(0o600)
+    before = _admission_inventory(state_dir)
     proc = _run(state_dir, "acquire", "--pr", "1", "--sha", "x")
-    assert proc.returncode == 0
-    assert list(state_dir.glob("state.json.corrupt-*"))
-    assert _state(state_dir)["lock"]["pr"] == 1
-    assert "损坏" in proc.stderr
+    assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed"
+    assert _admission_inventory(state_dir) == before
+    assert not list(state_dir.glob("state.json.corrupt-*"))
 
 
 def test_corrupt_state_read_commands_survive(state_dir: Path):
@@ -645,3 +650,53 @@ def test_unqualified_success_from_foreign_deployment_cannot_clear_failure(state_
     proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD)
     assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed"
     assert (state_dir / "state.json").read_bytes() == before
+
+
+def _admission_inventory(root):
+    inventory = {".": ("directory", root.stat().st_mode & 0o777)}
+    for path in root.rglob("*"):
+        assert not path.is_symlink()
+        inventory[path.relative_to(root).as_posix()] = (
+            "directory" if path.is_dir() else "file", path.stat().st_mode & 0o777,
+            None if path.is_dir() else path.read_bytes())
+    return inventory
+
+
+@pytest.mark.parametrize("damage", ["duplicate-root", "duplicate-nested", "syntax"])
+def test_admission_never_normalizes_untrusted_failed_state(state_dir, damage):
+    state = _released_outcome(state_dir)
+    oid, outcome = next(iter(state["outcomes"].items()))
+    assert state["generation"] == 1 and state["last_attempt"]["outcome_id"] == oid
+    assert outcome["result"] == "failed" and outcome["rc"] == 21
+    assert outcome["deployment"] == {"provider": "github", "host": "github.com",
+                                      "repository": FAILED_REPOSITORY, "pr": 160}
+    path = state_dir / "state.json"
+    original = path.read_bytes()
+    # Exact well-formed omitted-identity control from the accepted review.
+    control = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD)
+    assert control.returncode == 2 and _out(control)["reason"] == "failed-head"
+    assert path.read_bytes() == original
+    raw = json.dumps(state, separators=(",", ":")).encode()
+    if damage == "duplicate-root":
+        raw = raw[:-1] + b',"outcomes":{}}'
+        assert raw.count(b'"outcomes"') == 2
+    elif damage == "duplicate-nested":
+        needle = b'"deployment":{"provider":"github"'
+        assert raw.count(needle) == 1
+        raw = raw.replace(needle, b'"deployment":{"provider":"github","provider":"gitea"')
+    else:
+        raw += b','
+    path.write_bytes(raw)
+    (state_dir / "lock.token").write_bytes(b'preserved-review-token\n')
+    (state_dir / "lock.token").chmod(0o600)
+    before = _admission_inventory(state_dir)
+    for identity in (
+        ["--deployment-provider", "github", "--deployment-host", "github.com",
+         "--deployment-repository", FAILED_REPOSITORY],
+        [],
+        ["--deployment-provider", "gitea", "--deployment-host", "gitea.example",
+         "--deployment-repository", "eric/dailycheck"],
+    ):
+        proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD, *identity)
+        assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed", proc.stdout + proc.stderr
+        assert _admission_inventory(state_dir) == before
