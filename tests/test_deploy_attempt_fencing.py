@@ -408,8 +408,21 @@ def test_invalid_process_descriptor_is_not_a_lock_bypass(sandbox):
 
 
 def test_corrupt_old_state_is_recovered_without_corrupting_acquire_identity(sandbox):
+    """Historical recovery regression: admission must preserve corrupt state."""
+    from tests.test_deploy_state import _admission_inventory
+
+    acquired = _ds(sandbox, "acquire", "--pr", "42", "--sha", SHA)
+    assert acquired.returncode == 0, acquired.stdout + acquired.stderr
+    token = json.loads(acquired.stdout)["token"]
+    assert _ds(sandbox, "release", "--token", token, "--result", "failed").returncode == 0
     (sandbox["state"] / "state.json").write_text("{broken")
+    (sandbox["state"] / "lock.token").write_text("preserved-pipeline-token\n")
+    (sandbox["state"] / "lock.token").chmod(0o600)
+    before = _admission_inventory(sandbox["state"])
     proc = _pipe(sandbox, "42", SHA, "--observe-min", "0")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert _state(sandbox)["deployed"]["sha"] == SHA
-    assert list(sandbox["state"].glob("state.json.corrupt-*"))
+    assert proc.returncode == 11, proc.stdout + proc.stderr
+    assert "acquire 失败 rc=2" in proc.stdout + proc.stderr
+    assert "reconcile-needed" in proc.stdout + proc.stderr
+    assert _calls(sandbox) == []
+    assert _admission_inventory(sandbox["state"]) == before
+    assert not list(sandbox["state"].glob("state.json.corrupt-*"))

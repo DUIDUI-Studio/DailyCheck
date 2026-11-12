@@ -683,9 +683,8 @@ def _acquire(args) -> int:
                 or getattr(args, "deployment_host", "")
                 or getattr(args, "deployment_repository", "")) and deployment is None:
             return _fail("invalid deployment identity", EXIT_USAGE)
-        strict = deployment is not None and deployment["provider"] == "github"
         try:
-            state = _load_state(directory, heal=not strict, strict=strict)
+            state = _load_state(directory, strict=True)
         except ValueError:
             _emit({"ok": False, "reason": "reconcile-needed", "status": "failed-pending"})
             return EXIT_FAILED_PENDING
