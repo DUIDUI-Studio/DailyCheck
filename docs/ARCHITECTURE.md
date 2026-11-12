@@ -1235,6 +1235,7 @@ ordinary pipeline 在候选 checkout 前于既有 process fence 内保存当前 
 finalizer 的有限 helper import closure（私有临时目录、代码上限 1MiB），恢复 main 后仍用
 同一 ABI 与 hosting 实现收锁和 typed 回写；先持锁恢复再 release，不以旧树 helper 回退。
 心跳和同步子进程退出后清理副本；清理失败显式告警，原失败码与未确认结果仍保留。
+验证边界回归同时观察 pytest 子进程创建掩码、父进程权限与沙盒导入来源。
 ordinary verify check1 只在 pytest 子进程重建测试环境并关闭继承的非标准 FD；父会话的
 attempt/state/蓝绿锁、hosting/role 配置及 check2–8 不变。DB/TMP/状态/报告/收件箱均指向
 该次私有测试目录，移除 live 身份/凭据/native 上下文；子 PATH 前置所选解释器目录以发现

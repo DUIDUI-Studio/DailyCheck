@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import deploy_state as ds
 base=Path(sys.argv[2]); dirty=sys.argv[3]=='dirty'
+os.umask(0o077)
 os.environ['DAILYCHECK_DEPLOY_STATE_DIR']=str(base/'parent-state')
 out=io.StringIO()
 with contextlib.redirect_stdout(out):
@@ -90,6 +91,7 @@ finally:
     seam.wait()
     with (base/'pids.jsonl').open('a') as f:f.write(json.dumps({'pid':seam.pid,'positive_wait_exit':seam.returncode})+'\n')
 checks.append(competing('after'))
+assert os.umask(0o077)==0o077
 assert dict(os.environ)==before
 assert (base/'parent-state/state.json').read_bytes()==lock_before
 assert ds.process_lock_fd()==fd
@@ -101,7 +103,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 assert release==0
 print(json.dumps({'check1_rc':seam.returncode,'output':output,'competitor_codes':checks,
     'parent_environment_unchanged':True,'parent_lock_unchanged_until_release':True,
-    'parent_fds_unchanged':True,'release_rc':release}))
+    'parent_fds_unchanged':True,'parent_umask':0o077,'release_rc':release}))
 '''
 
 
@@ -141,8 +143,9 @@ def test_observed_child():
             s=os.fstat(int(n))
             if [s.st_dev,s.st_ino]==expected:leaked.append(n)
         except OSError:pass
+    mask=os.umask(0o022);os.umask(mask)
     (BASE/'child.json').write_text(json.dumps({{'authority_fds':leaked,'environment':dict(os.environ),
-        'ruff':shutil.which('ruff')}}))
+        'ruff':shutil.which('ruff'),'umask':mask}}))
     (BASE/'ready').write_text('ready')
     deadline=time.monotonic()+20
     while not (BASE/'gate').exists() and time.monotonic()<deadline:time.sleep(.02)
@@ -223,3 +226,12 @@ def test_check1_real_native_and_strict_gate(tmp_path, mode, native):
         assert "DAILYCHECK_HOSTING_PROVIDER" not in env and "GITHUB_TOKEN" not in env
         assert "SIM_USER_PASSWORD" not in env
         assert env["DAILYCHECK_DB_DIR"].startswith(str(tmp_path / "tmp"))
+
+
+def test_check1_uses_child_creation_mask_without_changing_parent(tmp_path):
+    result = _case(tmp_path, "pass")
+    assert result["check1_rc"] == result["native_exit"] == 0
+    assert result["child"]["umask"] == 0o022
+    assert result["parent_umask"] == 0o077
+    assert result["parent_environment_unchanged"] and result["parent_fds_unchanged"]
+    assert result["competitor_codes"] == [10, 10, 10]

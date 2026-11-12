@@ -645,6 +645,23 @@ def test_dashboard_hook_failure_records_audit(sandbox):
     assert "kind=dashboard-hook-failed" in _audit(sandbox), _audit(sandbox)
 
 
+def test_dashboard_sandbox_does_not_import_ambient_module(sandbox, tmp_path, monkeypatch):
+    external = tmp_path / "external"
+    module = external / "scripts/dailycheck_dashboard"
+    module.mkdir(parents=True)
+    (external / "scripts/__init__.py").write_text("")
+    (module / "__init__.py").write_text("")
+    marker = external / "imported"
+    (module / "__main__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned sentinel')\n")
+    monkeypatch.setenv("PYTHONPATH", str(external))
+    proc = _pipe(sandbox, "42", SHA, "--observe-min", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not marker.exists(), "sandbox imported the owned ambient dashboard sentinel"
+    assert "kind=dashboard-hook-failed" in _audit(sandbox), _audit(sandbox)
+    assert _env(sandbox, PYTHONPATH=str(external))["PYTHONPATH"] == str(external)
+
+
 
 # ---------------------------------------------------------------- 候选模式
 
