@@ -13,7 +13,7 @@
     "scripts/ci/pytest_summary.py": "4a5abc5d1a174c697508688103cddefdd049e5b9",
     "scripts/ci/trusted_producer.py": "b910b851b01b70bf1c2d340a61629723825a7ca2",
     "scripts/dev_smoke_t11_e2e.py": "4be5629cffe7e33ab4c82fa0d1e37f6ea59c8c40",
-    "scripts/hosting.py": "b095dbef2e16113ed4791413f609c158c716b94d",
+    "scripts/hosting.py": "76d3c0fd14a67be3a1a731c927ce08daef5aefdc",
     "scripts/mcp_contracts.py": "6482e136fd74265ffa1bfc591dc2138b6e275ee3",
     "tests/known_failures.txt": "9acc4ec1ea23c7418475c3046b9d248b184691b6"
   },
