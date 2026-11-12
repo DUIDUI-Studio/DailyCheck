@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.blue_green import deploy_state  # noqa: E402
 from scripts.hosting import (  # noqa: E402
     AccessRole,
     HostingClient,
@@ -259,20 +260,37 @@ def _github_pr_block() -> str:
     client = HostingClient(HostingConfig.from_environment())
     client.verify_repository()
     prs = client.pages(f"/repos/{client.config.repo}/pulls", params={"state": "open"})
+    try:
+        state = deploy_state.load_state(deploy_state.state_dir(), strict=True) if ordinary else None
+    except ValueError:
+        return _alert("GitHub ordinary deployment=reconcile-needed actionable=false; durable state unavailable")
     if not prs:
         return ""
     lines = [f"{client.config.repo} open PRs (GitHub {'ordinary Prod' if ordinary else 'shadow-only'}):"]
+    candidates = False
     for pr in prs:
         number = pr.get("number")
         head = pr.get("head")
         if type(number) is not int or not isinstance(head, dict) or not isinstance(head.get("sha"), str):
             raise ValueError("invalid_pr_response")
+        if ordinary:
+            blocked = deploy_state.failed_head_status(state, number, head["sha"], {
+                "provider": "github", "host": "github.com", "repository": client.config.repo,
+                "pr": number})
+            if blocked:
+                lines.append(f"- PR #{number} {client.config.pr_url(number)} head={head['sha']} "
+                             f"deployment={blocked} actionable=false")
+                continue
+        candidates = True
         evidence = GitHubReadinessClient(client).check(number, head["sha"])
         lines.append(f"- PR #{number} {client.config.pr_url(number)} head={head['sha']} base={evidence.get('base_sha')} checks={evidence['reason']}")
-    lines.append(
-        "Prod must independently review and run the exact-H deploy-first candidate pipeline; "
-        "freeze B and confirm finalization before delivery. Readiness is not deployment success."
-        if ordinary else "Shadow evidence only; GitHub finalization is unsupported.")
+    if ordinary:
+        lines.append("Failed/reconcile-needed heads are non-actionable; report recovery does not permit deployment.")
+    if candidates:
+        lines.append(
+            "Prod must independently review and run the exact-H deploy-first candidate pipeline; "
+            "freeze B and confirm finalization before delivery. Readiness is not deployment success."
+            if ordinary else "Shadow evidence only; GitHub finalization is unsupported.")
     return "\n".join(lines)
 
 

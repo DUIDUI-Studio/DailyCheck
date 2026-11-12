@@ -9,6 +9,7 @@ clear-lock / status 的全部状态机路径与退出码。
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -501,3 +502,146 @@ def test_failed_open_head_cannot_acquire_again(state_dir, publication, qualified
     assert {name: (state_dir / name).read_bytes() for name in before} == before
     catchup = _run(state_dir, "catchup", "--main-sha", "b" * 40)
     assert catchup.returncode == 1 and _out(catchup)["status"] == "behind"
+
+
+@pytest.mark.parametrize("different", ["provider", "host", "repository", "pr", "sha", "prefix"])
+def test_failed_head_isolated_from_other_deployments(state_dir, different):
+    failed = _released_outcome(state_dir)
+    target = {"provider": "github", "host": "github.com", "repository": FAILED_REPOSITORY,
+              "pr": 160, "sha": FAILED_HEAD}
+    target[different if different != "prefix" else "sha"] = {
+        "provider": "gitea", "host": "other.example", "repository": "other/repository",
+        "pr": 161, "sha": "d" * 40, "prefix": FAILED_HEAD[:12]}[different]
+    proc = _run(state_dir, "acquire", "--pr", str(target["pr"]), "--sha", target["sha"],
+                "--deployment-provider", target["provider"], "--deployment-host", target["host"],
+                "--deployment-repository", target["repository"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _state(state_dir)["outcomes"] == failed["outcomes"]
+    assert _state(state_dir)["generation"] == failed["generation"] + 1
+
+
+def test_gitea_outcome_reporting_to_github_does_not_block_github_deployment(state_dir):
+    state = _released_outcome(state_dir, provider="gitea", host="gitea.example", repository="eric/dailycheck")
+    assert next(iter(state["outcomes"].values()))["hosting"]["provider"] == "github"
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD,
+                "--deployment-provider", "github", "--deployment-host", "github.com",
+                "--deployment-repository", FAILED_REPOSITORY)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _state(state_dir)["outcomes"] == state["outcomes"]
+
+
+@pytest.mark.parametrize("damage", ["deployment", "receipt", "result", "generation", "anchor",
+                                     "anchor-generation", "missing", "ambiguous",
+                                     "deployment-pr", "unproven-foreign"])
+def test_relevant_unproven_outcomes_reject_without_state_mutation(state_dir, damage):
+    state = _released_outcome(state_dir)
+    oid, outcome = next(iter(state["outcomes"].items()))
+    if damage == "deployment":
+        del outcome["deployment"]
+    elif damage == "receipt":
+        del outcome["public_receipt"]
+    elif damage == "result":
+        outcome["result"] = "success"  # actual failure rc21 cannot be relabelled
+    elif damage == "generation":
+        outcome["generation"] = True
+    elif damage == "anchor":
+        state["last_attempt"]["outcome_id"] = "missing"
+    elif damage == "anchor-generation":
+        state["last_attempt"]["generation"] = True
+    elif damage == "missing":
+        state["outcomes"] = {}
+    elif damage == "deployment-pr":
+        outcome["deployment"]["pr"] = 161
+    elif damage == "unproven-foreign":
+        outcome["deployment"] = {"provider": "gitea", "host": "gitea.example",
+                                 "repository": "eric/dailycheck", "pr": 160}
+        outcome.pop("public_receipt")
+    else:
+        state["outcomes"]["other-attempt"] = {**outcome, "attempt_id": "other-attempt"}
+    path = state_dir / "state.json"
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD,
+                "--deployment-provider", "github", "--deployment-host", "github.com",
+                "--deployment-repository", FAILED_REPOSITORY)
+    assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed", proc.stdout + proc.stderr
+    assert path.read_bytes() == before and not (state_dir / "lock.token").exists()
+
+
+@pytest.mark.parametrize("raw", ['{bad', '[]', '{"outcomes":[]}',
+                                 '{"generation":1,"generation":2}', '{"generation":NaN}'])
+def test_github_corrupt_state_is_not_healed_into_admission(state_dir, raw):
+    path = state_dir / "state.json"
+    path.write_text(raw)
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD,
+                "--deployment-provider", "github", "--deployment-host", "github.com",
+                "--deployment-repository", FAILED_REPOSITORY)
+    assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed"
+    assert path.read_text() == raw
+    assert not list(state_dir.glob("*.corrupt-*")) and not (state_dir / "lock.token").exists()
+
+
+@pytest.mark.parametrize("barrier", ["process", "lease", "native", "expired"])
+def test_failed_head_guard_preserves_existing_fences(state_dir, barrier):
+    _released_outcome(state_dir)
+    if barrier in {"process", "lease", "expired"}:
+        assert _run(state_dir, "acquire", "--pr", "161", "--sha", "d" * 40).returncode == 0
+        if barrier != "lease":
+            _age_lock(state_dir)
+    if barrier == "native":
+        (state_dir / "native-queue.guard").write_text('{}')
+    path = state_dir / "state.json"
+    before = path.read_bytes()
+    token = (state_dir / "lock.token").read_bytes() if (state_dir / "lock.token").exists() else None
+    with (state_dir / ".attempt.lock").open("a+") as fence:
+        if barrier == "process":
+            fcntl.flock(fence, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD,
+                    "--deployment-provider", "github", "--deployment-host", "github.com",
+                    "--deployment-repository", FAILED_REPOSITORY)
+    assert proc.returncode == (2 if barrier == "expired" else 10), proc.stdout + proc.stderr
+    assert path.read_bytes() == before
+    assert ((state_dir / "lock.token").read_bytes() if token is not None else None) == token
+
+
+def test_unrelated_malformed_outcome_does_not_poison_new_head(state_dir):
+    state = _released_outcome(state_dir)
+    next(iter(state["outcomes"].values())).pop("deployment")
+    (state_dir / "state.json").write_text(json.dumps(state))
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", "d" * 40,
+                "--deployment-provider", "github", "--deployment-host", "github.com",
+                "--deployment-repository", FAILED_REPOSITORY)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _state(state_dir)["outcomes"] == state["outcomes"]
+
+
+def test_success_without_deployment_provenance_is_not_clearance(state_dir):
+    state = _released_outcome(state_dir, result="success")
+    next(iter(state["outcomes"].values())).pop("deployment")
+    (state_dir / "state.json").write_text(json.dumps(state))
+    before = (state_dir / "state.json").read_bytes()
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD,
+                "--deployment-provider", "github", "--deployment-host", "github.com",
+                "--deployment-repository", FAILED_REPOSITORY)
+    assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed"
+    assert (state_dir / "state.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("host,repository", [("github.com", "other/repository"),
+                                             ("other.example", FAILED_REPOSITORY)])
+def test_missing_caller_identity_cannot_escape_typed_github_failure(state_dir, host, repository):
+    _released_outcome(state_dir, host=host, repository=repository)
+    before = (state_dir / "state.json").read_bytes()
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD)
+    assert proc.returncode == 2 and _out(proc)["reason"] == "failed-head"
+    assert (state_dir / "state.json").read_bytes() == before
+
+
+def test_unqualified_success_from_foreign_deployment_cannot_clear_failure(state_dir):
+    _released_outcome(state_dir)
+    state = _released_outcome(state_dir, repository="other/repository", result="success")
+    assert len(state["outcomes"]) == 2
+    before = (state_dir / "state.json").read_bytes()
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD)
+    assert proc.returncode == 2 and _out(proc)["reason"] == "reconcile-needed"
+    assert (state_dir / "state.json").read_bytes() == before

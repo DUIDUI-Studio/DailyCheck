@@ -14,6 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "prod_a
 
 import pr_poll  # noqa: E402
 
+from tests.test_github_transport import (  # noqa: E402
+    REPO,
+    SHA,
+    ordinary,
+)
+from tests.test_github_transport import (
+    api as api,
+)
+
 FAKE_CURL = '''#!{py}
 import json, os, sys
 args = sys.argv[1:]
@@ -190,3 +199,54 @@ def test_docstring_paths_point_at_real_file():
     assert '"scripts", "prod_agent", "pr_poll.py"' in content
     assert (Path(__file__).resolve().parents[1]
             / "scripts" / "prod_agent" / "pr_poll.py").exists()
+
+
+@pytest.mark.parametrize("damage", ["json", "shape", "missing", "ambiguous"])
+def test_ordinary_poll_invalid_state_is_non_actionable(api, tmp_path, monkeypatch, damage):
+    from tests.test_deploy_state import _released_outcome
+
+    table = ordinary(api, tmp_path, monkeypatch)
+    api.write(table)
+    directory = tmp_path / "deploy-state"
+    directory.mkdir()
+    state = _released_outcome(directory)
+    oid, outcome = next(iter(state["outcomes"].items()))
+    if damage == "missing":
+        outcome.pop("deployment")
+    elif damage == "ambiguous":
+        state["outcomes"]["ambiguous"] = {**outcome, "attempt_id": "ambiguous"}
+    raw = '{broken' if damage == "json" else json.dumps({"outcomes": []} if damage == "shape" else state)
+    path = directory / "state.json"
+    path.write_text(raw)
+    text = pr_poll._github_pr_block()
+    assert "reconcile-needed actionable=false" in text and "checks=ready" not in text
+    assert path.read_text() == raw
+    assert all(row["method"] == "GET" for row in api.log())
+
+
+def test_shadow_does_not_read_failed_deployment_state(api, tmp_path, monkeypatch):
+    table = ordinary(api, tmp_path, monkeypatch)
+    api.write(table)
+    monkeypatch.delenv("DAILYCHECK_GITHUB_LANE")
+    directory = tmp_path / "deploy-state"
+    directory.mkdir()
+    (directory / "state.json").write_text('{broken')
+    text = pr_poll._github_pr_block()
+    assert "shadow-only" in text and "checks=ready" in text
+    assert "reconcile-needed" not in text
+
+
+def test_new_head_uses_existing_current_readiness_gates(api, tmp_path, monkeypatch):
+    from tests.test_deploy_state import _released_outcome
+
+    table = ordinary(api, tmp_path, monkeypatch)
+    directory = tmp_path / "deploy-state"
+    directory.mkdir()
+    _released_outcome(directory, sha="d" * 40)
+    api.write(table)
+    assert f"head={SHA}" in pr_poll._github_pr_block()
+    assert "checks=ready" in pr_poll._github_pr_block()
+    table[f"/repos/{REPO}/commits/{SHA}/check-runs?page=1"]["data"]["check_runs"][0]["conclusion"] = "failure"
+    api.write(table)
+    text = pr_poll._github_pr_block()
+    assert "checks=ready" not in text and "deployment=failed-head" not in text

@@ -254,7 +254,20 @@ def _empty_state() -> dict:
     }
 
 
-def _load_state(directory: Path, heal: bool = False) -> dict:
+def _state_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("ambiguous deployment state")
+        value[key] = item
+    return value
+
+
+def _state_constant(_value):
+    raise ValueError("invalid deployment state number")
+
+
+def _load_state(directory: Path, heal: bool = False, *, strict: bool = False) -> dict:
     """读取 state.json。
 
     文件缺失 -> 空状态。JSON 损坏 -> 返回空状态；heal=True（写命令）时把
@@ -264,13 +277,24 @@ def _load_state(directory: Path, heal: bool = False) -> dict:
     if not path.exists():
         return _empty_state()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"),
+                          object_pairs_hook=_state_object if strict else dict,
+                          **({"parse_constant": _state_constant} if strict else {}))
         if not isinstance(data, dict):
             raise ValueError("state root is not an object")
         for key, default in _empty_state().items():
             data.setdefault(key, default)
+        if strict and (type(data["version"]) is not int or data["version"] != 1
+                       or type(data["generation"]) is not int or data["generation"] < 0
+                       or not isinstance(data["outcomes"], dict)
+                       or any(not isinstance(value, dict) for value in data["outcomes"].values())
+                       or data["deployed"] is not None and not isinstance(data["deployed"], dict)
+                       or data["last_attempt"] is not None and not isinstance(data["last_attempt"], dict)):
+            raise ValueError("invalid deployment state shape")
         return data
     except (json.JSONDecodeError, ValueError, OSError) as exc:
+        if strict:
+            raise ValueError("deployment state requires reconciliation") from exc
         print(f"[deploy_state] WARN: state 文件损坏（{exc}）—— 按空状态处理", file=sys.stderr)
         if heal and not (directory / NATIVE_GUARD_FILENAME).exists():
             bak = path.with_name(f"{STATE_FILENAME}.corrupt-{_now()}")
@@ -536,6 +560,106 @@ def _deployment_identity(provider, host, repository, pr) -> dict | None:
     return {"provider": provider, "host": host, "repository": repository, "pr": pr}
 
 
+def _outcome_deployment(value) -> dict | None:
+    if (not isinstance(value, dict)
+            or set(value) != {"provider", "host", "repository", "pr"}
+            or any(not isinstance(value[k], str) for k in ("provider", "host", "repository"))):
+        return None
+    identity = _deployment_identity(value["provider"], value["host"], value["repository"], value["pr"])
+    return identity if identity == value else None
+
+
+def _valid_head_outcome(key, outcome, generation) -> bool:
+    try:
+        return (isinstance(key, str) and ATTEMPT_ID.fullmatch(key) is not None
+                and outcome.get("attempt_id") == key
+                and type(generation) is int
+                and type(outcome.get("generation")) is int
+                and 1 <= outcome["generation"] <= generation
+                and type(outcome.get("pr")) is int and outcome["pr"] > 0
+                and outcome.get("hosting") == PUBLIC_CODE_HOSTING
+                and type(outcome["hosting"]["repository_id"]) is int
+                and _outcome_deployment(outcome.get("deployment")) is not None
+                and outcome["deployment"]["pr"] == outcome["pr"]
+                and outcome.get("candidate") is None
+                and outcome.get("result") in {OUTCOME_RESULT_SUCCESS, OUTCOME_RESULT_FAILED}
+                and type(outcome.get("rc")) is int and 0 <= outcome["rc"] <= 255
+                and (outcome["rc"] == 0) == (outcome["result"] == OUTCOME_RESULT_SUCCESS)
+                and isinstance(outcome.get("stage"), str)
+                and OUTCOME_STAGE.fullmatch(outcome["stage"]) is not None
+                and isinstance(outcome.get("verification"), str)
+                and VERIFICATION.fullmatch(outcome["verification"]) is not None
+                and str(uuid.UUID(outcome["public_receipt"])) == outcome["public_receipt"]
+                and isinstance(outcome.get("outcome_at"), str)
+                and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", outcome["outcome_at"]) is not None
+                and type(outcome.get("created_at")) is int and outcome["created_at"] >= 0)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def failed_head_status(state: dict, pr: int, sha: str, deployment: dict | None = None) -> str | None:
+    """Pure ordinary-GitHub admission check; publication is never clearance.
+
+    Explicit foreign provenance stays separate. An unqualified legacy caller
+    only collides with a typed GitHub deployment, never an unproven old attempt.
+    Missing provenance for the protected GitHub target requires reconciliation;
+    the public reporting sink cannot identify a foreign deployment for it.
+    """
+    public = _deployment_identity("github", "github.com", PUBLIC_CODE_HOSTING["repository"], pr)
+    target = deployment if deployment is not None else public
+    if (target is None or target.get("provider") != "github"
+            or not isinstance(sha, str) or FULL_SHA.fullmatch(sha) is None):
+        return None
+    unknown_blocks = deployment is not None and target == public
+    outcomes = state.get("outcomes", {})
+    if not isinstance(outcomes, dict):
+        return "reconcile-needed" if unknown_blocks else None
+    matches = {}
+    for key, outcome in outcomes.items():
+        if not isinstance(outcome, dict) or outcome.get("pr") != pr or outcome.get("sha") != sha:
+            continue
+        actual = _outcome_deployment(outcome.get("deployment"))
+        if actual is None:
+            if unknown_blocks:
+                return "reconcile-needed"
+            continue
+        valid = _valid_head_outcome(key, outcome, state.get("generation"))
+        if actual["provider"] != "github" or deployment is not None and actual != target:
+            if unknown_blocks and not valid:
+                return "reconcile-needed"
+            continue
+        if not valid:
+            return "reconcile-needed"
+        matches[key] = outcome
+    last = state.get("last_attempt")
+    if isinstance(last, dict) and last.get("pr") == pr and last.get("sha") == sha:
+        key = last.get("outcome_id")
+        outcome = matches.get(key) if isinstance(key, str) else None
+        referenced = outcomes.get(key) if isinstance(key, str) else None
+        actual = _outcome_deployment(referenced.get("deployment")) if isinstance(referenced, dict) else None
+        if outcome is not None:
+            if (type(last.get("pr")) is not int or type(last.get("generation")) is not int
+                    or last["generation"] != outcome["generation"]
+                    or last.get("result") != outcome["result"]):
+                return "reconcile-needed"
+        elif unknown_blocks and (actual is None or actual == target
+                                 or referenced.get("pr") != pr or referenced.get("sha") != sha):
+            return "reconcile-needed"
+    elif last is not None and not isinstance(last, dict) and unknown_blocks:
+        return "reconcile-needed"
+    if not matches:
+        return None
+    identities = {tuple(outcome["deployment"][key] for key in ("provider", "host", "repository", "pr"))
+                  for outcome in matches.values()}
+    if deployment is None and len(identities) != 1:
+        return "reconcile-needed"
+    latest = max(outcome["generation"] for outcome in matches.values())
+    current = [outcome for outcome in matches.values() if outcome["generation"] == latest]
+    if len(current) != 1:
+        return "reconcile-needed"
+    return "failed-head" if current[0]["result"] == OUTCOME_RESULT_FAILED else None
+
+
 def cmd_acquire(args) -> int:
     if os.environ.get(ATTEMPT_ENV) is not None:
         return _fail("cannot acquire another lease inside an attempt", EXIT_TOKEN_MISMATCH)
@@ -551,7 +675,20 @@ def _acquire(args) -> int:
     """抢锁。无活跃锁（或过期可抢占）时成功；被占用 -> rc 10。"""
     directory = _state_dir()
     with _write_lock(directory):
-        state = _load_state(directory, heal=True)
+        deployment = _deployment_identity(
+            getattr(args, "deployment_provider", ""),
+            getattr(args, "deployment_host", ""),
+            getattr(args, "deployment_repository", ""), args.pr)
+        if (getattr(args, "deployment_provider", "")
+                or getattr(args, "deployment_host", "")
+                or getattr(args, "deployment_repository", "")) and deployment is None:
+            return _fail("invalid deployment identity", EXIT_USAGE)
+        strict = deployment is not None and deployment["provider"] == "github"
+        try:
+            state = _load_state(directory, heal=not strict, strict=strict)
+        except ValueError:
+            _emit({"ok": False, "reason": "reconcile-needed", "status": "failed-pending"})
+            return EXIT_FAILED_PENDING
         if native_blocked(directory, state):
             return _fail("native grant/admission requires reconciliation", EXIT_LOCK_BUSY)
         now = _now()
@@ -560,6 +697,12 @@ def _acquire(args) -> int:
             _emit({"ok": False, "reason": "lock-busy", "lock": _lock_brief(lock)})
             return EXIT_LOCK_BUSY
 
+        blocked = failed_head_status(state, args.pr, args.sha or "", deployment)
+        if blocked:
+            _emit({"ok": False, "reason": blocked, "status": "failed-pending",
+                   "pr": args.pr, "sha": args.sha})
+            return EXIT_FAILED_PENDING
+
         if isinstance(lock, dict):
             # 过期锁被抢占：留证据（诊断「谁死在半路」）
             evicted = dict(lock)
@@ -567,15 +710,6 @@ def _acquire(args) -> int:
             state["last_evicted"] = evicted
 
         token = secrets.token_hex(8)
-        deployment = _deployment_identity(
-            getattr(args, "deployment_provider", ""),
-            getattr(args, "deployment_host", ""),
-            getattr(args, "deployment_repository", ""),
-            args.pr)
-        if (getattr(args, "deployment_provider", "")
-                or getattr(args, "deployment_host", "")
-                or getattr(args, "deployment_repository", "")) and deployment is None:
-            return _fail("invalid deployment identity", EXIT_USAGE)
         try:
             previous_generation = int(state.get("generation") or 0)
         except (TypeError, ValueError):
