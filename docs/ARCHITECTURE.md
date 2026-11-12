@@ -1227,6 +1227,7 @@ finalizer / typed report 链路，缺省仍为 `shadow`，provider 缺省仍为 
 durable state 检查当前 outcome 的未 linked receipt，即使事件/收件箱缺失也交 Prod 对账。
 公开报告仍必须经原 `DurablePublicationAuthority`、deployment/source binding、immutable
 typed projection；lane flag、CLI success、report HTTP 均不产生 outcome authority。
+failed-open-head 回归同时验证发现信息与实际 acquire，报告 linked 不作为部署失败清除凭据。
 ordinary GitHub catchup 复用当前 `sys.executable`，兼容既有 hosted executor 的解释器路径；
 Gitea 仍使用 `/usr/bin/python3`，解释器不可用仍告警。CI manifest 只同步已审查 hosting
 blob 与两个 workflow manifest identity，执行器、runtime、其余十五个成员及门禁不变。

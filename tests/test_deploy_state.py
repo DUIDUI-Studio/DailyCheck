@@ -453,3 +453,51 @@ def test_state_file_not_world_readable(state_dir: Path):
     # 目录也收紧（否则 0600 文件在 0755 目录里仍可被列举）
     assert (state_dir.stat().st_mode & 0o777) == 0o700
 
+
+
+# Genuine typed outcomes from the real process fence and release transaction.
+FAILED_HEAD = "a" * 40
+FAILED_REPOSITORY = "DUIDUI-Studio/DailyCheck"
+
+
+def _released_outcome(state_dir, *, pr=160, sha=FAILED_HEAD, provider="github",
+                      host="github.com", repository=FAILED_REPOSITORY, result="failed"):
+    owner = state_dir.parent / "release-owned-outcome.py"
+    owner.write_text(f"""import argparse,contextlib,io,json,os,sys
+sys.path.insert(0,{str(SCRIPT.parent)!r})
+import deploy_state as ds
+out=io.StringIO()
+with contextlib.redirect_stdout(out):
+ rc=ds.cmd_acquire(argparse.Namespace(pr={pr!r},sha={sha!r},session='owned-failure',phase='verify',
+     deployment_provider={provider!r},deployment_host={host!r},deployment_repository={repository!r}))
+assert rc==0,out.getvalue()
+os.environ[ds.ATTEMPT_ENV]=out.getvalue()
+raise SystemExit(ds.cmd_release(argparse.Namespace(token=json.loads(out.getvalue())['token'],
+ result={result!r},sha={sha!r},note='owned verification',rc={21 if result == 'failed' else 0},
+ stage='verify',verification='normal')))
+""")
+    proc = _run(state_dir, "run", "--", sys.executable, "-B", str(owner))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state = _state(state_dir)
+    assert state["lock"] is None and len(state["outcomes"]) >= 1
+    return state
+
+
+@pytest.mark.parametrize("publication", ["ready", "uncertain", "linked"])
+@pytest.mark.parametrize("qualified", [True, False])
+def test_failed_open_head_cannot_acquire_again(state_dir, publication, qualified):
+    assert _run(state_dir, "init", "--sha", "c" * 40).returncode == 0
+    state = _released_outcome(state_dir)
+    oid = state["last_attempt"]["outcome_id"]
+    state["publications"][oid] = {"state": publication}
+    (state_dir / "state.json").write_text(json.dumps(state))
+    (state_dir / "lock.token").write_text("owned-preserved-token\n")
+    before = {name: (state_dir / name).read_bytes() for name in ("state.json", "lock.token")}
+    extra = (["--deployment-provider", "github", "--deployment-host", "github.com",
+              "--deployment-repository", FAILED_REPOSITORY] if qualified else [])
+    proc = _run(state_dir, "acquire", "--pr", "160", "--sha", FAILED_HEAD, *extra)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert _out(proc)["reason"] == "failed-head"
+    assert {name: (state_dir / name).read_bytes() for name in before} == before
+    catchup = _run(state_dir, "catchup", "--main-sha", "b" * 40)
+    assert catchup.returncode == 1 and _out(catchup)["status"] == "behind"

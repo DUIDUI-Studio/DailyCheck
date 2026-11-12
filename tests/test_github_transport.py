@@ -1368,3 +1368,26 @@ def test_legacy_launcher_explicit_github_selects_canonical_without_gitea(
     assert "checks=ready" in current.stdout
     assert not requests
     assert api.log() and all(r["bearer"] for r in api.log())
+
+
+@pytest.mark.parametrize("publication", ["ready", "uncertain", "linked"])
+def test_ordinary_poll_does_not_offer_failed_open_green_head(api, tmp_path, monkeypatch, publication):
+    from scripts.prod_agent import pr_poll
+    from tests.test_deploy_state import _released_outcome
+
+    table = ordinary(api, tmp_path, monkeypatch)
+    api.write(table)
+    # The current head genuinely passes the existing readiness reader, H != B.
+    assert GitHubReadinessClient(HostingClient(HostingConfig.from_environment())).check(160, SHA)["ready"]
+    directory = Path(os.environ["DAILYCHECK_DEPLOY_STATE_DIR"])
+    directory.mkdir()
+    state = _released_outcome(directory)
+    oid = state["last_attempt"]["outcome_id"]
+    state["publications"][oid] = {"state": publication}
+    state["deployed"] = {"sha": "c" * 40}
+    (directory / "state.json").write_text(json.dumps(state))
+    before = (directory / "state.json").read_bytes()
+    text = pr_poll._github_pr_block()
+    assert "deployment=failed-head actionable=false" in text, text
+    assert "checks=ready" not in text and "run the exact-H" not in text
+    assert (directory / "state.json").read_bytes() == before
