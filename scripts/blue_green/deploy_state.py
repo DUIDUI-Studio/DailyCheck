@@ -686,6 +686,8 @@ def _acquire(args) -> int:
         try:
             state = _load_state(directory, strict=True)
         except ValueError:
+            if (directory / NATIVE_GUARD_FILENAME).exists():
+                return _fail("native grant/admission requires reconciliation", EXIT_LOCK_BUSY)
             _emit({"ok": False, "reason": "reconcile-needed", "status": "failed-pending"})
             return EXIT_FAILED_PENDING
         if native_blocked(directory, state):
