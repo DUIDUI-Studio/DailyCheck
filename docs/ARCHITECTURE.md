@@ -3118,6 +3118,8 @@ GET/旧 MCP 仅投影摘要、历史和暂停原因。撤回不依赖 ORDER_CHAN
 再显式发布；成对 order/proposal 详情提供“同意整份方案”或必填留言拒绝。
 新建/同意/拒绝由 `DAILYCHECK_ORDER_CHANGES` 默认关闭的开关控制，读取、撤回和
 原 claim/fence/恢复协议持续有效，不增加 schema、MCP 工具或外部消息。
+Issue #14 的 GET 回归覆盖直接访问新建表单：只有 pending/approved 可打开，
+其他订单状态须返回带可读原因的 409；GET 保持 no-store 且不写业务数据。
 
 服务器按 version=1 生成不可变完整 before/after 行、货品/运费/总计/差额、
 历史核对引用/说明/人/时间、联合仓与替换报价指纹；不信任客户端价格与金额。
