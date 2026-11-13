@@ -517,6 +517,76 @@ def _run_up(env: dict[str, str], sha: str) -> subprocess.CompletedProcess:
     return _run(UP, "99", sha, "--skip-db-copy", env=clean, timeout=120)
 
 
+
+@pytest.mark.parametrize("abbrev", [8, 12])
+@pytest.mark.parametrize("width", [40, 7, 8], ids=["full", "short7", "short8"])
+@pytest.mark.parametrize("native_repo", [False, True], ids=["app", "native"])
+def test_up_accepts_same_full_commit_identity(up_env, tmp_path, abbrev, width, native_repo):
+    """Git's display abbreviation never changes the live deployment identity."""
+    repo = Path(up_env["DAILYCHECK_APP_DIR"])
+    subprocess.run(["git", "-C", str(repo), "config", "core.abbrev", str(abbrev)], check=True)
+    full = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    assert len(subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], text=True,
+    ).strip()) == abbrev
+    env = {k: v for k, v in up_env.items() if not k.startswith("_")}
+    if native_repo:
+        # Production may export APP_DIR without .git; only DC_NATIVE_REPO owns identity.
+        app = tmp_path / "exported-app"
+        app.mkdir()
+        env.update(DAILYCHECK_APP_DIR=str(app), DC_NATIVE_REPO=str(repo))
+    source_db = tmp_path / "source-db"
+    source_db.mkdir()
+    (source_db / "master.db").write_bytes(b"isolated database fixture")
+    env["DAILYCHECK_SRC_DB_DIR"] = str(source_db)
+    r = _run(UP, "99", full[:width], env=env)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert Path(env["GREEN_DB"], "master.db").read_bytes() == b"isolated database fixture"
+    assert _count(_calls(env), "restart dailycheck-green.service") == 1
+    assert _count(_calls(env), "restart dailycheck-green-mcp.service") == 1
+
+
+@pytest.mark.parametrize("identity", ["unknown", "other", "blob", "option", "missing-head"])
+def test_up_rejects_invalid_commit_before_side_effects(up_env, tmp_path, identity):
+    """Unresolvable, noncommit or different identities cannot copy DBs or touch services."""
+    repo = up_env["DAILYCHECK_APP_DIR"]
+    full = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+    requested = "missing-commit"
+    if identity == "other":
+        requested = full
+        subprocess.run([
+            "git", "-C", repo, "-c", "user.email=t@example.com", "-c", "user.name=t",
+            "commit", "-q", "--allow-empty", "-m", "different commit",
+        ], check=True)
+    elif identity == "blob":
+        requested = subprocess.check_output(
+            ["git", "-C", repo, "hash-object", "-w", "--stdin"], input="not a commit", text=True,
+        ).strip()
+    elif identity == "option":
+        requested = "--output=" + str(tmp_path / "must-not-exist")
+    elif identity == "missing-head":
+        empty = tmp_path / "empty-repo"
+        subprocess.run(["git", "init", "-q", str(empty)], check=True)
+        up_env = dict(up_env, DC_NATIVE_REPO=str(empty))
+        requested = full
+    green = Path(up_env["GREEN_DB"])
+    sentinel = green / "unchanged.db"
+    sentinel.write_bytes(b"existing green database")
+    unit_paths = [Path(up_env[k]) for k in ("GREEN_UNIT_PATH", "GREEN_MCP_UNIT_PATH")]
+    before = [(p.read_bytes(), p.stat().st_mode) for p in [sentinel, *unit_paths]]
+    env = {k: v for k, v in up_env.items() if not k.startswith("_")}
+    # No source DB exists: admission must fail before reaching the copy step.
+    env["DAILYCHECK_SRC_DB_DIR"] = str(tmp_path / "absent-source-db")
+    r = _run(UP, "99", requested, env=env)
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "[up] ERROR:" in r.stderr
+    assert _calls(env) == []
+    assert [(p.read_bytes(), p.stat().st_mode) for p in [sentinel, *unit_paths]] == before
+    assert sorted(p.name for p in green.iterdir()) == ["unchanged.db"]
+    assert not Path(env["BACKUP_DIR"]).exists()
+    assert not (tmp_path / "must-not-exist").exists()
+
+
 def test_up_switches_to_blue_before_restarting_live_green(up_env, tmp_path):
     """绿在役（weight=100）→ 先 switch.sh blue 100，**再**restart 绿（顺序断言）。"""
     r = _run_up(up_env, up_env["_SHA"])

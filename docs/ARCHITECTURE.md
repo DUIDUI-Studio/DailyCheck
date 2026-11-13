@@ -165,6 +165,8 @@ flowchart LR
 
 Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起绿：DB `cp -a` + systemd **restart** + 30×2s 健康检查，**重启前先判绿是否在承流**，在役则先切蓝；**并把 unit 复位成静息态**——`DRY_RUN=true` + 副本库）→ `verify.sh`（八项生产验证，报告落 `backups/prod-verifications/`）→ `promote.sh`（**绿转正**：关 `DRY_RUN` + DB 指回真库 + daemon-reload/restart + 健康复核，幂等 + 备份 + 失败回滚）→ `switch.sh`（nginx upstream weight/down 切流量，`nginx -t` 验证 + 失败自动还原备份）→ `rollback.sh`（秒级切回蓝 + journalctl/DB 取证）→ `down.sh`（绿下线，`--keep-blue` 保留 DB 7 天）。端口：蓝 :8090/:5100，绿 :8091/:5101。全脚本支持 `--dry-run`（只回显不执行）。**完整时序**：up（复位静息态 → 重启为 `DRY_RUN=true` + 副本库）→ verify → promote → switch（5/50/100）。
 
+`up.sh` 在 DB/服务操作前，于 `DC_NATIVE_REPO`（未设置则 `APP_DIR`）将 HEAD 与输入解析为唯一完整 commit identity 后比较；无法解析、非 commit 或身份不符均拒绝，不依赖 `core.abbrev`。
+
 **多仓履约发布节奏（T1→T2→T3，2026-10-29，spec §6/D14）**：
 - **T1 兼容发布**：新代码（含 MCP / bot / 订单板 / 报表）全量上线，`config.MULTI_WAREHOUSE_FULFILLMENT`
   **保持关闭** → 目录/提交/发货与存量逐字节恒等（单仓路径）；master v4/v5/v6 与每仓 schema v6 迁移在

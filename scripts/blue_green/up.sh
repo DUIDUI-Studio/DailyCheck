@@ -514,15 +514,17 @@ fi
 
 # 2. 验证 git HEAD 一致（live 模式必查；dry-run 跳过）
 #
-# 注意：COMMIT_SHA 是短 SHA (7 chars)，git rev-parse HEAD 返 full SHA (40 chars)
-# 直接比较永远不等。统一用 --short 让两边都 7 chars。
-# 接受 full SHA 输入：--short 会截断到 7 chars 比较（SHA 唯一性保证安全）。
+# 在同一仓库内将 HEAD 和输入解析为完整 commit identity；短 SHA 必须能唯一解析。
+# 不比较展示用短 SHA：其长度可能随 core.abbrev 或对象唯一性变化。
 if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   cd "${APP_DIR}"
-  ACTUAL_HEAD="$(git -C "${DC_NATIVE_REPO:-${APP_DIR}}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  COMMIT_SHA_SHORT="${COMMIT_SHA:0:7}"
-  if [[ "${ACTUAL_HEAD}" != "${COMMIT_SHA_SHORT}" ]]; then
-    echo "[up] ERROR: APP_DIR HEAD (${ACTUAL_HEAD}) != COMMIT_SHA (${COMMIT_SHA_SHORT})" >&2
+  if ! ACTUAL_HEAD="$(git -C "${DC_NATIVE_REPO:-${APP_DIR}}" rev-parse --verify --end-of-options 'HEAD^{commit}' 2>/dev/null)" \
+     || ! REQUESTED_COMMIT="$(git -C "${DC_NATIVE_REPO:-${APP_DIR}}" rev-parse --verify --end-of-options "${COMMIT_SHA}^{commit}" 2>/dev/null)"; then
+    echo "[up] ERROR: 无法在部署仓库解析 HEAD 或 COMMIT_SHA 为唯一 commit" >&2
+    exit 1
+  fi
+  if [[ "${ACTUAL_HEAD}" != "${REQUESTED_COMMIT}" ]]; then
+    echo "[up] ERROR: APP_DIR HEAD (${ACTUAL_HEAD}) != COMMIT_SHA (${REQUESTED_COMMIT})" >&2
     echo "[up]   Eric 需要先 git pull + checkout ${COMMIT_SHA}" >&2
     exit 1
   fi
