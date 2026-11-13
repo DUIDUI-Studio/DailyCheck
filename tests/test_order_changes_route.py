@@ -319,6 +319,22 @@ def login(e, user=4, warehouse=1):
         session['warehouse_id'] = warehouse
 
 
+@pytest.mark.parametrize('status', ['delivered', 'cancelled', 'shipped', 'rejected',
+                                    'pending', 'approved'])
+def test_new_change_form_checks_order_status_without_writes(ship_env, monkeypatch, status):
+    e = ship_env
+    monkeypatch.setattr(config, 'ORDER_CHANGES_ENABLED', True)
+    oid, _ = e['create_order']([(101, 4, 'A')], status=status)
+    login(e)
+    before = hashlib.sha256(e['master_path'].read_bytes()).hexdigest()
+    response = e['client'].get(f'/store-ordering/orders/{oid}/changes/new')
+    assert response.status_code == (200 if status in ('pending', 'approved') else 409)
+    if status not in ('pending', 'approved'):
+        assert '仅待审批或已审批的普通订货单可提变更' in response.get_data(as_text=True)
+    assert response.headers['Cache-Control'] == 'no-store'
+    assert hashlib.sha256(e['master_path'].read_bytes()).hexdigest() == before
+
+
 def proposal(e, status='approved'):
     oid, ids = e['create_order']([(101, 4, 'A'), (102, 3, 'A')], status=status)
     pid = seed_proposal(e['master'], oid, [ids[0]])
