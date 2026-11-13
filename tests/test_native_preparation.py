@@ -634,7 +634,7 @@ def synthetic_reviewer_account(monkeypatch):
 
 
 @pytest.fixture
-def review_publisher(bridge):
+def review_publisher(bridge, tmp_path):
     policy = bridge["policy"]
     uid = int(next(iter(policy.value["reviewers"])))
     gid = SYNTHETIC_REVIEWER_GID if os.geteuid() == 0 else os.getegid()
@@ -647,11 +647,32 @@ def review_publisher(bridge):
         os.chown(result_directory, uid, gid)
     assert result_directory.stat().st_uid == uid
     assert uid > 0 and uid != policy.value["app_uid"]
-    code = r"""import json,os,sys
+    # A private production checkout can contain 0600 source files. The real
+    # reviewer UID gets only an owned, read-only copy of the Python import tree;
+    # the production checkout, credentials and guard implementation stay intact.
+    source = tmp_path / "reviewer-source"
+    source.mkdir(mode=0o755)
+    for original in sorted((bridge_tests.ROOT / "scripts").rglob("*.py")):
+        assert not original.is_symlink()
+        target = source / original.relative_to(bridge_tests.ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raw = original.read_bytes()
+        target.write_bytes(raw)
+        assert target.read_bytes() == raw
+        target.chmod(0o444)
+    source_dirs = [source, *(p for p in source.rglob("*") if p.is_dir())]
+    for path in source_dirs:
+        path.chmod(0o555)
+    expected_source = hashlib.sha256(
+        (bridge_tests.ROOT / "scripts/prod_agent/native_prepare.py").read_bytes()
+    ).hexdigest()
+    code = r"""import hashlib,json,os,sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])
+from scripts.prod_agent import native_prepare
 from scripts.prod_agent.native_prepare import publish_review_result
-row={'uid':os.geteuid(),'gid':os.getegid()}
+row={'uid':os.geteuid(),'gid':os.getegid(),
+     'source_sha256':hashlib.sha256(Path(native_prepare.__file__).read_bytes()).hexdigest()}
 try:
  row['record']=publish_review_result(Path(sys.argv[2]),sys.argv[3],decision=sys.argv[4])
 except ValueError as exc:
@@ -662,7 +683,7 @@ print(json.dumps(row))
     def publish(candidate_digest, *, decision="pass"):
         kwargs = {"user": uid, "group": gid, "extra_groups": []} if os.geteuid() == 0 else {}
         child = subprocess.Popen(
-            [sys.executable, "-I", "-B", "-c", code, str(bridge_tests.ROOT),
+            [sys.executable, "-I", "-B", "-c", code, str(source),
              str(directory), candidate_digest, decision],
             env={"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs)
@@ -676,6 +697,7 @@ print(json.dumps(row))
         assert child.returncode == 0, err
         row = json.loads(out)
         assert (row["uid"], row["gid"]) == (uid, gid)
+        assert row["source_sha256"] == expected_source
         proof = {"review_publisher_pid": child.pid, "positive_wait_exit": child.returncode,
                  "uid": row["uid"], "gid": row["gid"],
                  "result_directory_uid": result_directory.stat().st_uid}
@@ -688,7 +710,12 @@ print(json.dumps(row))
                           "result_mode": oct(stat_mode(result))}))
         return row["record"]
 
-    return publish
+    try:
+        yield publish
+    finally:
+        # Non-root fixture owners also need to remove their read-only tree.
+        for path in source_dirs:
+            path.chmod(0o755)
 
 
 def test_review_request_and_result_are_exactly_bound(bridge, synthetic_reviewer_account, review_publisher):
