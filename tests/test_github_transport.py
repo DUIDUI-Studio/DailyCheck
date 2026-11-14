@@ -15,6 +15,7 @@ import pytest
 
 from scripts.hosting import AccessRole, HostingClient, HostingConfig, HostingError
 from scripts.prod_agent.github_readiness import GitHubReadinessClient
+from tests.conftest import candidate_python_env
 
 REPO = "DUIDUI-Studio/DailyCheck"
 ROOT = f"/repos/{REPO}"
@@ -1043,6 +1044,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
     missing = subprocess.run([sys.executable, "-B", "-c",
                              "from scripts.prod_agent.pr_poll import _catchup_block; print(_catchup_block())"],
                              cwd=root,
+                             env={**candidate_python_env(root), "PYTHONSAFEPATH": "1"},
                              capture_output=True, text=True, timeout=30)
     assert missing.returncode == 0 and "invalid or absent facts" in missing.stdout
     proof("poll-no-output", {"native_exit": missing.returncode, "stdout": missing.stdout})

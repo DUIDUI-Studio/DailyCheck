@@ -3516,6 +3516,10 @@ flowchart LR
 `<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout）运行，使 `parents[2]`
 解析到含 `scripts` 的仓库根，再与当前 launcher 各自真跑 HTTP fixture 比较 stdout 和
 请求 path/auth；不得把参考脚本丢在裸临时目录里执行。
+同文件的 ordinary catchup 空输出控制显式给被测 `python -c` 子进程传入 candidate
+导入根并固定 `PYTHONSAFEPATH=1`，保留父环境的只读 evidence plugin 路径；因此真正调用
+`_catchup_block` 验证缺失事实告警，不把找不到 `scripts` 的 fixture 导入失败当作产品回归。
+该环境只作用于被测子进程，不改变 producer/verifier 或 ordinary 准入与报告行为。
 
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/
