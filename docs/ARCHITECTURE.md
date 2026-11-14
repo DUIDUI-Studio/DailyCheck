@@ -1272,8 +1272,24 @@ beforeOid / 非 force FF；[indirect merges](https://docs.github.com/en/pull-req
 说明相同 head 进入 base 可标 merged，但该标记不证明保护条件。故保留独立前置和
 真实 post-read，文档不替代平台验收。安全禁用配置见 `deploy/github-production.env.example`。
 
-Issue14 release credential admission regression is specified in
-`tests/test_release_credentials.py`; reusable operator-bound entry is pending implementation.
+Issue14 的 `scripts/blue_green/release_credentials.py` 从显式 operator admission
+生成仓库拥有模板的私有 entry/selector；分别固定当前 attempt 代次和 deployed 锚点代次，
+保留先前失败后仍可准入不同的新目标，同一已消费 PR/H 仍拒绝；绑定完整 PR/H/B、session/Task/Dispatch、
+既有 shim 和八项 helper SHA256、真实 source binding digest。runtime 不从候选代码、
+ambient env 或 success journal 获取续签 authority。沿用固定 App/repo role shim 的
+`--exec`，在 startup、late finalizer、typed report 各有限续签一次；同 PID/PGID/继承
+OS flock FD 的单次 pipe continuation 后 exec 原生消费者，新建客户端读取更新文件。
+exclusive invocation/phase intent（文件及目录 fsync）在失败/UNKNOWN 时保留并拒绝重复；
+不加 daemon、写重试、新 token source/权限、安装或激活。首次续签前用既有 resolver 和
+state transaction 验证 exact 私有来源绑定，缺失/歧义/变更先拒绝；late phase 再验证。
+ordinary pipeline 直接入口也在原进程 fence 内、acquire/candidate 前复用同一 schema 准入，
+缺失/错误/歧义映射返回 25；已有 durable outcome 的报告阶段仍保留独立绑定校验。
+既有 transactional privileged binding installer 边界不变，不自动建 issue/绑定。
+`deploy_report.py` 保留安全的原始 HostingError code，避免仅异常类型丢失失败原因。
+`tests/test_release_process.py` 以 owned fake shim/HTTP/Git ports 调用未改写的原生
+finalizer/report/state/publication，覆盖过期 startup token、新 late client、真实锁竞争、
+精确身份、重复/未知及 native wait/ECHILD；不据此声称生产安装或交付。
+操作边界与 schema 见 [RELEASE_CREDENTIALS.md](../scripts/blue_green/RELEASE_CREDENTIALS.md)。
 
 `DAILYCHECK_HOSTING_PROVIDER` 缺省为 `gitea`，现有生产地址、凭据路径、部署阶段与
 队列不变。`scripts/hosting.py` 定义显式 `Provider` / `AccessRole` / `HostingConfig`，
