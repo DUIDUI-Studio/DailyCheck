@@ -819,6 +819,8 @@ def new_order_change(order_id: int):
         abort(409, description='订单变更入口尚未启用')
     if not ocp.can_propose(master, order, int(g.user['id']), _current_warehouse_code()):
         abort(403)
+    if order['status'] not in ('pending', 'approved'):
+        abort(409, description='仅待审批或已审批的普通订货单可提变更')
     return _change_form(master, order)
 
 

@@ -1797,7 +1797,10 @@ event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 
 证明远端 Gitea/GitHub runner 执行已成功，真实两端 CI 必须在后续授权发布后验证。
 
 测试：`tests/test_github_transport.py` 经 fake curl 子进程覆盖 credential roles、HTTP/auth、分页、
-malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/test_ci_portability.py`
+malformed/stale/producer/rerun、各 caller 和原生签名 webhook；legacy launcher 对照把
+`origin/main` 版本放入临时 `<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout），
+使其按 `parents[2]` 解析仓库根后与当前 launcher 各自真跑 HTTP fixture，比较 stdout、请求路径与
+auth 优先级；`tests/test_ci_portability.py`
 对本机认证 Git HTTP endpoint 真执行 source checkout，并验证 job 隔离；
 `tests/test_github_shadow_boundary.py` 真跑 receiver→CLI、adapter→sender、本机 HTTP 捕获器与
 预存未标记 SQLite row，断言零 shadow POST / 零越界写，且 Gitea 正控仍恰好投递一次；
@@ -3118,6 +3121,9 @@ GET/旧 MCP 仅投影摘要、历史和暂停原因。撤回不依赖 ORDER_CHAN
 再显式发布；成对 order/proposal 详情提供“同意整份方案”或必填留言拒绝。
 新建/同意/拒绝由 `DAILYCHECK_ORDER_CHANGES` 默认关闭的开关控制，读取、撤回和
 原 claim/fence/恢复协议持续有效，不增加 schema、MCP 工具或外部消息。
+Issue #14 的 GET 回归覆盖直接访问新建表单：只有 pending/approved 可打开，
+其他订单状态须返回带可读原因的 409；GET 保持 no-store 且不写业务数据。
+状态守卫在开关与提议权限校验之后、候选查询及表单渲染之前执行，保留原 403 优先级。
 
 服务器按 version=1 生成不可变完整 before/after 行、货品/运费/总计/差额、
 历史核对引用/说明/人/时间、联合仓与替换报价指纹；不信任客户端价格与金额。
@@ -3471,6 +3477,11 @@ flowchart LR
 `code/db`、嵌套 `code/db/custom-data`、不同名子目录与外部根的 create/clone/
 旧库初始化 → master 注册 → 实际 UoW 打开，并保留旧注册、绝对行和显式 Bot
 根在实际 inventory/只读 procurement 调用中的优先级。仅夹具打开既有 rollout。
+
+`tests/test_github_transport.py` 的 legacy launcher 对照把 `origin/main` 版本放进临时
+`<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout）运行，使 `parents[2]`
+解析到含 `scripts` 的仓库根，再与当前 launcher 各自真跑 HTTP fixture 比较 stdout 和
+请求 path/auth；不得把参考脚本丢在裸临时目录里执行。
 
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/
