@@ -410,7 +410,7 @@ class SourceSpec:
 
 @dataclass(frozen=True)
 class AnchorSpec:
-    path: Path
+    state_dir: Path
     source_sha: str
 
 
@@ -439,12 +439,15 @@ class ReadOncePlan:
     deploy_anchor: AnchorSpec
     database: DatabaseSpec
     active_business: ActiveBusinessSpec
-    fence_path: Path
     claim_dir: Path
     item_id: int | None
     created_by_user_id: int
     rate_limit: int
     plan_sha256: str
+
+    @property
+    def fence_path(self) -> Path:
+        return self.deploy_anchor.state_dir / ".attempt.lock"
 
 
 def _build_plan(data: object, *, plan_sha256: str) -> ReadOncePlan:
@@ -463,7 +466,6 @@ def _build_plan(data: object, *, plan_sha256: str) -> ReadOncePlan:
             "deploy_anchor",
             "database",
             "active_business",
-            "fence",
             "claim_dir",
             "item",
             "field_consent",
@@ -494,7 +496,7 @@ def _build_plan(data: object, *, plan_sha256: str) -> ReadOncePlan:
     source_sha = _sha1(source["git_sha"], "source.git_sha")
 
     anchor = _mapping(plan["deploy_anchor"], "deploy_anchor")
-    _exact_keys(anchor, {"path", "source_sha"}, "deploy_anchor")
+    _exact_keys(anchor, {"state_dir", "source_sha"}, "deploy_anchor")
     anchor_sha = _sha1(anchor["source_sha"], "deploy_anchor.source_sha")
     if anchor_sha != source_sha:
         raise ReadOnceError("deploy_anchor_source_mismatch", stage="plan")
@@ -512,9 +514,6 @@ def _build_plan(data: object, *, plan_sha256: str) -> ReadOncePlan:
     active = _mapping(plan["active_business"], "active_business")
     _exact_keys(active, {"pid", "start_time"}, "active_business")
     start_time = _text(active["start_time"], "active_business.start_time", max_len=64)
-
-    fence = _mapping(plan["fence"], "fence")
-    _exact_keys(fence, {"path"}, "fence")
 
     item = _mapping(plan["item"], "item")
     _exact_keys(item, {"id"}, "item")
@@ -552,7 +551,7 @@ def _build_plan(data: object, *, plan_sha256: str) -> ReadOncePlan:
             module=module,
         ),
         deploy_anchor=AnchorSpec(
-            path=_absolute_path(anchor["path"], "deploy_anchor.path"),
+            state_dir=_absolute_path(anchor["state_dir"], "deploy_anchor.state_dir"),
             source_sha=anchor_sha,
         ),
         database=DatabaseSpec(
@@ -565,7 +564,6 @@ def _build_plan(data: object, *, plan_sha256: str) -> ReadOncePlan:
             pid=_integer(active["pid"], "active_business.pid", minimum=1, maximum=2**31 - 1),
             start_time=start_time,
         ),
-        fence_path=_absolute_path(fence["path"], "fence.path"),
         claim_dir=_absolute_path(plan["claim_dir"], "claim_dir"),
         item_id=item_id,
         created_by_user_id=created_by,
@@ -660,29 +658,51 @@ def _verify_source(plan: ReadOncePlan) -> dict:
     head = git_out.decode("ascii", "replace").strip() if git_rc == 0 else ""
     if head != plan.source.git_sha:
         raise ReadOnceError("source_sha_mismatch", stage="source")
-    _status_pid, status_rc, status_out, _ = _run_checked(
-        [
-            git,
-            "-C",
-            str(resolved_repo),
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-            "--",
-            "mcp_server",
-            "config.py",
-            "db",
-            "permissions.py",
-        ],
-        cwd=None,
-        env=_tool_env(),
-        timeout=15,
+    # Compare actual bytes with HEAD, including assume-unchanged/skip-worktree
+    # files. All repository Python can execute at import time, before dispatch.
+    _, rc, tree, _ = _run_checked(
+        [git, "-C", str(resolved_repo), "ls-tree", "-rz", "HEAD"],
+        cwd=None, env=_tool_env(), timeout=15,
     )
-    if status_rc != 0 or status_out.strip():
-        raise ReadOnceError("source_tree_dirty", stage="source")
+    if rc != 0:
+        raise ReadOnceError("source_tree_unavailable", stage="source")
+    try:
+        for entry in tree.split(b"\0"):
+            if not entry:
+                continue
+            metadata, name = entry.split(b"\t", 1)
+            mode, kind, expected = metadata.split()
+            if not name.endswith(b".py"):
+                continue
+            path = resolved_repo / os.fsdecode(name)
+            if kind != b"blob" or mode not in (b"100644", b"100755"):
+                raise ReadOnceError("source_tree_dirty", stage="source")
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise ReadOnceError("source_tree_dirty", stage="source")
+            content = path.read_bytes()
+            actual = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
+            if actual.encode() != expected:
+                raise ReadOnceError("source_tree_dirty", stage="source")
+        # A different running client cannot vouch for a clean candidate copy.
+        if Path(__file__).read_bytes() != (resolved_repo / "scripts/mcp_lucy_read_once.py").read_bytes():
+            raise ReadOnceError("source_runner_mismatch", stage="source")
+    except OSError as exc:
+        raise ReadOnceError("source_tree_dirty", stage="source") from exc
+    for extra in ([], ["--ignored"]):
+        _, rc, untracked, _ = _run_checked(
+            [git, "-C", str(resolved_repo), "ls-files", "-z", "--others",
+             "--exclude-standard", *extra, "--", "*.py"],
+            cwd=None, env=_tool_env(), timeout=15,
+        )
+        # Installed dependencies are part of the explicitly trusted interpreter,
+        # not application source. Never clean or stage any ignored runtime files.
+        unexpected = [name for name in untracked.split(b"\0") if name
+                      and name.split(b"/", 1)[0] not in {b".venv", b"node_modules"}]
+        if rc != 0 or unexpected:
+            raise ReadOnceError("source_tree_dirty", stage="source")
 
     code = (
-        "import json, mcp_server\n"
+        "import json, mcp_server.main\n"
         "print(json.dumps({'file': mcp_server.__file__}, sort_keys=True))\n"
     )
     env = _tool_env()
@@ -711,43 +731,65 @@ def _verify_source(plan: ReadOncePlan) -> dict:
     }
 
 
-def _read_anchor(path: Path) -> dict:
-    data = _read_protected_bytes(path, max_bytes=MAX_ANCHOR_BYTES, private=False)
-    payload = _parse_json_bytes(data, "deploy_anchor")
-    if not isinstance(payload, dict):
-        raise ReadOnceError("deploy_anchor_invalid", stage="anchor")
-    return payload
+def _trusted_state_directory(plan: ReadOncePlan) -> Path:
+    directory = plan.deploy_anchor.state_dir
+    try:
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or directory.resolve(strict=True) != directory
+                or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022):
+            raise ReadOnceError("deploy_state_dir_untrusted", stage="anchor")
+    except OSError as exc:
+        raise ReadOnceError("deploy_state_dir_unavailable", stage="anchor") from exc
+    return directory
 
 
-def _verify_anchor(plan: ReadOncePlan) -> tuple[dict, Path]:
-    payload = _read_anchor(plan.deploy_anchor.path)
-    deployed = payload.get("deployed") if isinstance(payload.get("deployed"), dict) else {}
-    source_sha = payload.get("source_sha") or deployed.get("sha")
-    release_id = payload.get("release_id") or deployed.get("pr")
-    root_value = payload.get("deployment_root")
-    if not isinstance(source_sha, str) or source_sha != plan.deploy_anchor.source_sha:
-        raise ReadOnceError("deploy_anchor_source_mismatch", stage="anchor")
-    if not isinstance(release_id, (str, int)) or isinstance(release_id, bool):
-        raise ReadOnceError("deploy_anchor_release_missing", stage="anchor")
-    if not isinstance(root_value, str):
-        raise ReadOnceError("deploy_anchor_root_missing", stage="anchor")
-    root = Path(root_value)
-    if not root.is_absolute():
-        raise ReadOnceError("deploy_anchor_root_invalid", stage="anchor")
-    for child in (
-        plan.database.master_path,
-        plan.database.warehouse_root,
-        plan.fence_path,
-    ):
-        if not _within(child, root):
-            raise ReadOnceError("deploy_anchor_scope_mismatch", stage="anchor")
+def _verify_anchor(plan: ReadOncePlan) -> dict:
+    # Source preflight has already verified the unchanged producer module.
+    from scripts.blue_green import deploy_state as producer
+
+    directory = _trusted_state_directory(plan)
+    raw = _read_protected_bytes(directory / "state.json", max_bytes=MAX_ANCHOR_BYTES, private=True)
+    try:
+        state = json.loads(raw.decode("utf-8"), object_pairs_hook=producer._state_object,
+                           parse_constant=producer._state_constant)
+        if (not isinstance(state, dict) or type(state.get("version")) is not int
+                or state["version"] != 1 or state.get("lock") is not None
+                or "lock" not in state or state.get("last_attempt") is not None
+                or "last_attempt" not in state or producer.native_blocked(directory, state)):
+            raise ValueError("unsettled state")
+        deployed = state["deployed"]
+        if (not isinstance(deployed, dict) or deployed.get("sha") != plan.deploy_anchor.source_sha
+                or type(deployed.get("pr")) is not int or deployed["pr"] <= 0
+                or type(deployed.get("at")) is not int or deployed["at"] <= 0):
+            raise ValueError("missing successful release")
+        generation = state.get("generation", 0)
+        outcomes = state.get("outcomes", {})
+        if (type(generation) is not int or generation < 0 or not isinstance(outcomes, dict)
+                or any(not isinstance(value, dict) for value in outcomes.values())):
+            raise ValueError("invalid outcomes")
+        outcome_id = deployed.get("outcome_id")
+        if outcome_id is not None or "generation" in deployed:
+            outcome = outcomes.get(outcome_id) if isinstance(outcome_id, str) else None
+            if (not isinstance(outcome, dict)
+                    or not producer._valid_head_outcome(outcome_id, outcome, generation)
+                    or outcome.get("sha") != deployed["sha"]
+                    or outcome["pr"] != deployed["pr"] or outcome["result"] != "success"
+                    or outcome["generation"] != deployed.get("generation")
+                    or outcome["generation"] != generation or outcome["created_at"] != deployed["at"]):
+                raise ValueError("mismatched outcome")
+        elif outcomes:
+            raise ValueError("missing outcome reference")
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+        raise ReadOnceError("deploy_state_invalid_or_unsettled", stage="anchor") from exc
     if not _within(plan.database.warehouse_file, plan.database.warehouse_root):
         raise ReadOnceError("warehouse_file_outside_root", stage="anchor")
-    return {
-        "path": str(plan.deploy_anchor.path),
-        "source_sha": source_sha,
-        "release_id": str(release_id),
-    }, root
+    # Narrow pilot excludes external symlink mappings, including wh_002.
+    if (plan.database.warehouse_file.is_symlink()
+            or not plan.database.warehouse_file.is_file()):
+        raise ReadOnceError("warehouse_file_not_regular", stage="anchor")
+    return {"path": str(directory / "state.json"), "source_sha": deployed["sha"],
+            "release_id": str(deployed["pr"]), "generation": deployed.get("generation"),
+            "outcome_id": outcome_id}
 
 
 def _stat_identity(path: Path) -> dict:
@@ -866,9 +908,10 @@ def _verify_active_business(plan: ReadOncePlan) -> dict:
 
 
 def _acquire_fence(plan: ReadOncePlan) -> tuple[int, dict]:
+    _trusted_state_directory(plan)
     path = plan.fence_path
     try:
-        info = path.stat()
+        info = path.lstat()
     except OSError as exc:
         raise ReadOnceError("fence_missing", stage="fence") from exc
     if not stat.S_ISREG(info.st_mode):
@@ -882,14 +925,27 @@ def _acquire_fence(plan: ReadOncePlan) -> tuple[int, dict]:
     except OSError as exc:
         raise ReadOnceError("fence_open_failed", stage="fence") from exc
     try:
+        held = os.fstat(fd)
+        current = path.lstat()
+        if (not stat.S_ISREG(held.st_mode) or held.st_uid not in (0, os.geteuid())
+                or held.st_mode & 0o077
+                or (held.st_dev, held.st_ino) != (info.st_dev, info.st_ino)
+                or (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)):
+            raise ReadOnceError("fence_untrusted", stage="fence")
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except ReadOnceError:
+        os.close(fd)
+        raise
     except BlockingIOError as exc:
         os.close(fd)
         raise ReadOnceError("fence_busy", stage="fence") from exc
     except OSError as exc:
         os.close(fd)
         raise ReadOnceError("fence_lock_failed", stage="fence") from exc
-    return fd, {"path": str(path), "shared": True}
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, {"path": str(path), "shared": True, "dev": held.st_dev, "ino": held.st_ino}
 
 
 def _release_fence(fd: int | None) -> bool:
@@ -1048,16 +1104,46 @@ def _recover_uniquely_bound_identity(plan: ReadOncePlan, receipt: dict) -> int |
     return None
 
 
+@dataclass
+class _IdentityCustody:
+    plan: ReadOncePlan
+    issue_started: bool = False
+    token_id: int | None = None
+    revoked: bool | None = None
+
+    def revoke(self) -> bool:
+        if self.revoked is not None:
+            return self.revoked
+        if not self.issue_started:
+            self.revoked = True
+            return True
+        self.revoked = False
+        try:
+            if self.token_id is None:
+                # Catchable interruption can land after COMMIT but before return.
+                with sqlite3.connect(self.plan.database.master_path, timeout=10) as conn:
+                    rows = conn.execute(
+                        "SELECT id FROM agent_tokens WHERE name = ?",
+                        (_token_name(self.plan.correlation),),
+                    ).fetchall()
+                if not rows:
+                    self.revoked = True
+                    return True
+                if len(rows) != 1:
+                    return False
+                self.token_id = rows[0][0]
+            self.revoked = _revoke_identity(self.plan, self.token_id)
+        except BaseException:  # Cleanup must continue even after catchable cancellation.
+            self.revoked = False
+        return self.revoked
+
+
 # ---------------------------------------------------------------------------
 # Policy plus the real MCP stdio job
 # ---------------------------------------------------------------------------
 
 
-def _write_policy(plan: ReadOncePlan, token_id: int) -> tuple[Path, Path]:
-    try:
-        directory = Path(tempfile.mkdtemp(prefix="dailycheck-read-once-"))
-    except OSError as exc:
-        raise ReadOnceError("policy_write_failed", stage="policy") from exc
+def _write_policy(plan: ReadOncePlan, token_id: int, directory: Path) -> Path:
     try:
         os.chmod(directory, 0o700)
         now = _utcnow()
@@ -1083,13 +1169,9 @@ def _write_policy(plan: ReadOncePlan, token_id: int) -> tuple[Path, Path]:
             os.fsync(fd)
         finally:
             os.close(fd)
-        return directory, path
+        return path
     except (OSError, RuntimeError) as exc:
-        shutil.rmtree(directory, ignore_errors=True)
         raise ReadOnceError("policy_write_failed", stage="policy") from exc
-    except ReadOnceError:
-        shutil.rmtree(directory, ignore_errors=True)
-        raise
 
 
 def _child_env(plan: ReadOncePlan, raw_token: str) -> dict[str, str]:
@@ -1126,7 +1208,8 @@ def _validate_sdk() -> None:
 class _SpawnObserver:
     """Scoped observer around the SDK spawn seam; returns the real process."""
 
-    def __init__(self, module) -> None:
+    def __init__(self, module, child) -> None:
+        self.child = child
         self.module = module
         self.original = module.__dict__["_create_platform_compatible_process"]
         self.process = None
@@ -1139,6 +1222,8 @@ class _SpawnObserver:
         async def observed(*args, **kwargs):
             process = await original(*args, **kwargs)
             self.process = process
+            self.child.pid = process.pid
+            self.child.start_time = _process_start_time(process.pid)
             return process
 
         functools.update_wrapper(observed, original)
@@ -1167,7 +1252,7 @@ async def _finalize_child(process, state: ChildState) -> None:
         state.cleaned = True
         return
     state.pid = process.pid
-    state.start_time = _process_start_time(process.pid)
+    state.start_time = state.start_time or _process_start_time(process.pid)
     with anyio.CancelScope(shield=True):
         stdin = getattr(process, "stdin", None)
         if stdin is not None:
@@ -1222,13 +1307,14 @@ async def _mcp_job(
     item_id: int,
     deadline: float,
     child: ChildState,
+    custody: _IdentityCustody,
 ) -> tuple[dict, list[dict]]:
     import anyio
     import mcp.client.stdio as sdk_stdio
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    observer = _SpawnObserver(sdk_stdio)
+    observer = _SpawnObserver(sdk_stdio, child)
     calls: list[dict] = []
     item: dict | None = None
     params = StdioServerParameters(
@@ -1248,76 +1334,83 @@ async def _mcp_job(
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise ReadOnceError("budget_exhausted", stage="mcp", exit_code=EXIT_TRANSPORT)
+    stack = contextlib.AsyncExitStack()
     try:
         observer.install()
         with anyio.fail_after(remaining):
-            async with stdio_client(params, errlog=subprocess.DEVNULL) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    listed = await session.list_tools()
-                    names = tuple(tool.name for tool in listed.tools)
-                    if names != STRICT_TOOL_NAMES:
-                        raise ReadOnceError(
-                            "mcp_toolset_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
-                        )
-
-                    started = _iso(_utcnow())
-                    warehouses = _decode_tool_result(
-                        await session.call_tool("warehouse_list", {})
-                    )
-                    if (
-                        not isinstance(warehouses, list)
-                        or len(warehouses) != 1
-                        or set(warehouses[0]) != {"code", "name"}
-                        or warehouses[0]["code"] != plan.database.warehouse_code
-                    ):
-                        raise ReadOnceError(
-                            "mcp_warehouse_scope_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
-                        )
-                    calls.append(
-                        {
-                            "tool": "warehouse_list",
-                            "arguments": {},
-                            "started_at": started,
-                            "records": 1,
-                        }
+            try:
+                read, write = await stack.enter_async_context(
+                    stdio_client(params, errlog=subprocess.DEVNULL)
+                )
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+                listed = await session.list_tools()
+                names = tuple(tool.name for tool in listed.tools)
+                if names != STRICT_TOOL_NAMES:
+                    raise ReadOnceError(
+                        "mcp_toolset_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
                     )
 
-                    started = _iso(_utcnow())
-                    detail = _decode_tool_result(
-                        await session.call_tool(
-                            "items_detail",
-                            {
-                                "item_id": item_id,
-                                "warehouse_code": plan.database.warehouse_code,
-                            },
-                        )
+                started = _iso(_utcnow())
+                warehouses = _decode_tool_result(
+                    await session.call_tool("warehouse_list", {})
+                )
+                if (
+                    not isinstance(warehouses, list)
+                    or len(warehouses) != 1
+                    or set(warehouses[0]) != {"code", "name"}
+                    or warehouses[0]["code"] != plan.database.warehouse_code
+                ):
+                    raise ReadOnceError(
+                        "mcp_warehouse_scope_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
                     )
-                    if not isinstance(detail, list) or len(detail) != 1:
-                        raise ReadOnceError(
-                            "mcp_item_shape_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
-                        )
-                    candidate = detail[0]
-                    if not isinstance(candidate, dict) or set(candidate) != set(ITEM_DETAIL_FIELDS):
-                        raise ReadOnceError(
-                            "mcp_item_shape_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
-                        )
-                    if candidate.get("id") != item_id:
-                        raise ReadOnceError(
-                            "mcp_item_identity_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
-                        )
-                    calls.append(
+                calls.append(
+                    {
+                        "tool": "warehouse_list",
+                        "arguments": {},
+                        "started_at": started,
+                        "records": 1,
+                    }
+                )
+
+                started = _iso(_utcnow())
+                detail = _decode_tool_result(
+                    await session.call_tool(
+                        "items_detail",
                         {
-                            "tool": "items_detail",
-                            "arguments": {
-                                "item_id": item_id,
-                                "warehouse_code": plan.database.warehouse_code,
-                            },
-                            "started_at": started,
-                            "records": 1,
-                        }
+                            "item_id": item_id,
+                            "warehouse_code": plan.database.warehouse_code,
+                        },
                     )
-                    item = dict(candidate)
+                )
+                if not isinstance(detail, list) or len(detail) != 1:
+                    raise ReadOnceError(
+                        "mcp_item_shape_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
+                    )
+                candidate = detail[0]
+                if not isinstance(candidate, dict) or set(candidate) != set(ITEM_DETAIL_FIELDS):
+                    raise ReadOnceError(
+                        "mcp_item_shape_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
+                    )
+                if candidate.get("id") != item_id:
+                    raise ReadOnceError(
+                        "mcp_item_identity_mismatch", stage="mcp", exit_code=EXIT_TRANSPORT
+                    )
+                calls.append(
+                    {
+                        "tool": "items_detail",
+                        "arguments": {
+                            "item_id": item_id,
+                            "warehouse_code": plan.database.warehouse_code,
+                        },
+                        "started_at": started,
+                        "records": 1,
+                    }
+                )
+                item = dict(candidate)
+            finally:
+                custody.revoke()
+                await stack.__aexit__(*sys.exc_info())
     except TimeoutError as exc:
         child.timed_out = True
         raise ReadOnceError("mcp_timeout", stage="mcp", exit_code=EXIT_TRANSPORT) from exc
@@ -1326,6 +1419,7 @@ async def _mcp_job(
     except Exception as exc:  # noqa: BLE001 - transport failures are fail-closed
         raise ReadOnceError("mcp_transport_failed", stage="mcp", exit_code=EXIT_TRANSPORT) from exc
     finally:
+        custody.revoke()
         observer.restore()
         await _finalize_child(observer.process, child)
     if item is None:
@@ -1431,6 +1525,7 @@ def _consume(args: argparse.Namespace) -> int:
     policy_dir: Path | None = None
     fence_fd: int | None = None
     child = ChildState()
+    custody = _IdentityCustody(plan)
     calls: list[dict] = []
     item: dict | None = None
     failure: ReadOnceError | None = None
@@ -1481,7 +1576,7 @@ def _consume(args: argparse.Namespace) -> int:
         stage = "source"
         source_evidence = _verify_source(plan)
         stage = "anchor"
-        anchor_evidence, _deployment_root = _verify_anchor(plan)
+        anchor_evidence = _verify_anchor(plan)
         stage = "binding"
         binding_evidence = _verify_active_business(plan)
         stage = "item"
@@ -1491,32 +1586,33 @@ def _consume(args: argparse.Namespace) -> int:
         _validate_sdk()
         raw_token = secrets.token_urlsafe(32)
         stage = "identity"
-        token_id = _issue_identity(plan, raw_token)
+        custody.issue_started = True
+        token_id = custody.token_id = _issue_identity(plan, raw_token)
         ledger.update(token_id=token_id, token_name=token_name)
         stage = "policy"
-        policy_dir, policy_path = _write_policy(plan, token_id)
+        policy_dir = Path(tempfile.mkdtemp(prefix="dailycheck-read-once-"))
+        policy_path = _write_policy(plan, token_id, policy_dir)
         stage = "mcp"
-        item, calls = _run_mcp(plan, policy_path, raw_token, item_id, deadline, child)
+        item, calls = _run_mcp(plan, policy_path, raw_token, item_id, deadline, child, custody)
     except ReadOnceError as exc:
         failure = exc
-    except Exception:  # noqa: BLE001 - never leak details
-        failure = ReadOnceError("internal_error", stage=stage, exit_code=EXIT_PREFLIGHT)
-
-    # ----- cleanup, in the fixed order: revoke, child, temp, fence -----
-    if token_id is not None and raw_token is not None:
-        stage = "revoke"
+    except BaseException as exc:  # Catchable cancellation must enter custody cleanup.
+        code = "consume_cancelled" if not isinstance(exc, Exception) else "internal_error"
+        failure = ReadOnceError(code, stage=stage, exit_code=EXIT_PREFLIGHT)
+    finally:
+        # SDK scope revokes before settling its child; this also handles the
+        # issue-to-policy and issue-to-ledger windows without a second grant.
+        cleanup["token_revoked"] = custody.revoke()
+        token_id = custody.token_id
+        cleanup["child_waited"] = child.pid is None or (child.cleaned and child.waited)
         try:
-            cleanup["token_revoked"] = _revoke_identity(plan, token_id)
-        except Exception:  # noqa: BLE001
-            cleanup["token_revoked"] = False
-    else:
-        cleanup["token_revoked"] = True
-    cleanup["child_waited"] = child.cleaned and child.waited
-    stage = "temp"
-    cleanup["policy_removed"] = _remove_policy_dir(policy_dir)
-    stage = "fence"
-    cleanup["fence_released"] = _release_fence(fence_fd)
-    fence_fd = None
+            cleanup["policy_removed"] = _remove_policy_dir(policy_dir)
+        except BaseException:
+            cleanup["policy_removed"] = False
+        finally:
+            cleanup["fence_released"] = _release_fence(fence_fd)
+            fence_fd = None
+        raw_token = None
 
     all_clean = all(cleanup.values())
     try:
@@ -1530,14 +1626,17 @@ def _consume(args: argparse.Namespace) -> int:
             current_state = "cleaning"
         if current_state == "cleaning":
             ledger.advance(final_state, stage="cleanup")
-    except ReadOnceError:
+    except BaseException:
         if failure is None:
             failure = ReadOnceError("claim_state_failed", stage="cleanup", exit_code=EXIT_RECONCILE)
+
+    if not all_clean:
+        failure = ReadOnceError("cleanup_incomplete", stage="cleanup", exit_code=EXIT_RECONCILE)
 
     if failure is not None:
         _emit(
             _failure_payload(
-                status="failed",
+                status="reconcile_required" if failure.exit_code == EXIT_RECONCILE else "failed",
                 stage=failure.stage,
                 code=failure.code,
                 correlation=plan.correlation,
@@ -1551,24 +1650,6 @@ def _consume(args: argparse.Namespace) -> int:
             )
         )
         return failure.exit_code
-    if not all_clean:
-        _emit(
-            _failure_payload(
-                status="reconcile_required",
-                stage="cleanup",
-                code="cleanup_incomplete",
-                correlation=plan.correlation,
-                plan_sha256=plan.plan_sha256,
-                token_id=token_id,
-                token_name=token_name if token_id is not None else None,
-                child=child,
-                cleanup=cleanup,
-                receipt=str(ledger.path),
-                state=ledger.data.get("state"),
-            )
-        )
-        return EXIT_RECONCILE
-
     result = {
         "schema": RESULT_SCHEMA,
         "version": SCHEMA_VERSION,
@@ -1578,6 +1659,7 @@ def _consume(args: argparse.Namespace) -> int:
         "identity": plan.identity,
         "source": source_evidence,
         "anchor": anchor_evidence,
+        "fence": fence_evidence,
         "data": {
             "master_path": str(plan.database.master_path),
             "warehouse_code": plan.database.warehouse_code,
@@ -1618,10 +1700,11 @@ def _run_mcp(
     item_id: int,
     deadline: float,
     child: ChildState,
+    custody: _IdentityCustody,
 ) -> tuple[dict, list[dict]]:
     import anyio
 
-    return anyio.run(_mcp_job, plan, policy_path, raw_token, item_id, deadline, child)
+    return anyio.run(_mcp_job, plan, policy_path, raw_token, item_id, deadline, child, custody)
 
 
 def _remove_policy_dir(directory: Path | None) -> bool:
@@ -1639,7 +1722,7 @@ def _limitations(plan: ReadOncePlan, binding: dict) -> list[str]:
         "The existing agent_tokens schema has no universal expiry: the strict policy "
         "deadline plus verified revocation bound this identity; parent death before "
         "revocation is an operator recovery requirement, not a guaranteed global TTL.",
-        "The deployment fence/anchor and active-source/data locators must be supplied "
+        "The deployment state directory and active-source/data locators must be supplied "
         "and revalidated by the future authorized Prod operator against the real "
         "deployment contract; this run does not establish a production mapping.",
     ]

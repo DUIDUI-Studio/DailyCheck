@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -119,8 +120,38 @@ def _start_time(pid: int) -> str:
     return value
 
 
+@pytest.fixture(scope="session")
+def source_snapshot(tmp_path_factory):
+    """Commit a task-owned candidate snapshot; never stage source for a real consume."""
+    root = tmp_path_factory.mktemp("read-once-source").resolve()
+    files = subprocess.check_output(["git", "ls-files", "-z"], cwd=REPO_ROOT).split(b"\0")
+    for name in files:
+        if not name:
+            continue
+        relative = os.fsdecode(name)
+        source = REPO_ROOT / relative
+        if source.is_file():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    for args in (["init", "-q"], ["add", "."],
+                 ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@invalid",
+                  "commit", "-qm", "synthetic source snapshot"]):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    return root
+
+
+def _producer(env, *args):
+    result = subprocess.run(
+        [sys.executable, "-B", str(REPO_ROOT / "scripts/blue_green/deploy_state.py"), *args],
+        env={**runner._tool_env(), "DAILYCHECK_DEPLOY_STATE_DIR": str(env["state_dir"])},
+        capture_output=True, text=True, timeout=15,
+    )
+    return result
+
+
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, source_snapshot):
     root = tmp_path.resolve()
     warehouses = root / "warehouses"
     warehouses.mkdir()
@@ -128,20 +159,16 @@ def env(tmp_path):
     _build_warehouse(warehouse_file)
     master = root / "master.db"
     _build_master(master, warehouse_file)
-    fence = root / "deploy.lock"
-    fence.write_text("", encoding="utf-8")
-    os.chmod(fence, 0o600)
-    anchor = root / "deployed.json"
-    anchor.write_text(
-        json.dumps(
-            {
-                "source_sha": HEAD_SHA,
-                "release_id": "synthetic-release-1",
-                "deployment_root": str(root),
-            }
-        ),
-        encoding="utf-8",
-    )
+    # Data, executable source and deployment state are three independent roots.
+    state_dir = root / "separate-deployer-state"
+    producer_env = {"state_dir": state_dir}
+    source_sha = subprocess.check_output(
+        ["git", "-C", str(source_snapshot), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    assert _producer(producer_env, "acquire", "--pr", "17", "--sha", source_sha).returncode == 0
+    assert _producer(producer_env, "release", "--result", "success", "--sha", source_sha).returncode == 0
+    fence = state_dir / ".attempt.lock"
+    anchor = state_dir / "state.json"
     claims = root / "claims"
     claims.mkdir(mode=0o700)
 
@@ -167,6 +194,9 @@ def env(tmp_path):
         "warehouse_file": warehouse_file,
         "master": master,
         "fence": fence,
+        "state_dir": state_dir,
+        "source": source_snapshot,
+        "source_sha": source_sha,
         "anchor": anchor,
         "claims": claims,
         "holder": holder,
@@ -196,12 +226,12 @@ def _plan_data(env, **overrides) -> dict:
         "expires_at": _utc_iso(7200),
         "budget_seconds": 30,
         "source": {
-            "repository": str(REPO_ROOT),
-            "git_sha": HEAD_SHA,
+            "repository": str(env["source"]),
+            "git_sha": env["source_sha"],
             "python": sys.executable,
             "module": "mcp_server",
         },
-        "deploy_anchor": {"path": str(env["anchor"]), "source_sha": HEAD_SHA},
+        "deploy_anchor": {"state_dir": str(env["state_dir"]), "source_sha": env["source_sha"]},
         "database": {
             "master_path": str(env["master"]),
             "warehouse_root": str(env["warehouses"]),
@@ -209,7 +239,6 @@ def _plan_data(env, **overrides) -> dict:
             "warehouse_file": str(env["warehouse_file"]),
         },
         "active_business": {"pid": env["holder"].pid, "start_time": env["holder_start"]},
-        "fence": {"path": str(env["fence"])},
         "claim_dir": str(env["claims"]),
         "item": {"id": 1},
         "field_consent": {"item_detail": True, "unit_cost": True},
@@ -263,6 +292,7 @@ def test_consume_real_stdio_one_item_success(env, capsys):
     assert result["mcp"]["server_returncode"] == 0
     assert result["mcp"]["child_waited"] is True
     assert isinstance(result["mcp"]["server_pid"], int)
+    assert result["mcp"]["server_start_time"]
     assert [call["tool"] for call in result["mcp"]["calls"]] == ["warehouse_list", "items_detail"]
     assert result["token"]["revoked"] is True
     assert result["token"]["revocation_verified"] is True
@@ -401,23 +431,14 @@ def test_preflight_rejects_before_identity(
 
 
 def test_anchor_source_mismatch_is_preflight_rejected(env, capsys):
-    bad_anchor = env["root"] / "bad-anchor.json"
-    bad_anchor.write_text(
-        json.dumps(
-            {
-                "source_sha": "0" * 40,
-                "release_id": "synthetic-release-1",
-                "deployment_root": str(env["root"]),
-            }
-        ),
-        encoding="utf-8",
-    )
+    state = json.loads(env["anchor"].read_text())
+    state["deployed"]["sha"] = "0" * 40
+    env["anchor"].write_text(json.dumps(state))
     data = _plan_data(env)
-    data["deploy_anchor"]["path"] = str(bad_anchor)
     plan, sha = _write_plan(env, data)
     code, result, _ = _run_consume(capsys, plan, sha)
     assert code != runner.EXIT_OK
-    assert result["code"] == "deploy_anchor_source_mismatch"
+    assert result["code"] == "deploy_state_invalid_or_unsettled"
     assert _created_rows(env["master"]) == []
     assert json.loads(_claim_file(env).read_text(encoding="utf-8"))["state"] == "preflight-rejected"
 
@@ -896,3 +917,382 @@ def test_relay_request_hash_and_correlation_are_pinned(env, capsys, monkeypatch)
     assert code != runner.EXIT_OK
     assert payload["code"] == "request_correlation_mismatch"
     assert _ssh_invocations(log) == []
+
+
+# Repair 3: actual deployer compatibility and catchable-cancellation custody.
+
+def _load(env):
+    path, sha = _write_plan(env, _plan_data(env))
+    return runner.load_plan(str(path), expected_sha256=sha, expected_correlation=CORRELATION)
+
+
+def _contend(env):
+    # This is the unchanged producer's real exclusive flock, not a fake lock.
+    return _producer(env, "run", "--", sys.executable, "-B", "-c", "pass")
+
+
+def test_real_producer_state_and_fence_have_independent_roots(env, capsys, monkeypatch):
+    state_before = env["anchor"].read_bytes()
+    inode_before = env["fence"].stat().st_ino
+    events = []
+    original_revoke = runner._revoke_identity
+    original_finalize = runner._finalize_child
+    original_remove = runner._remove_policy_dir
+    original_release = runner._release_fence
+
+    def blocked(phase):
+        assert _contend(env).returncode == 10, phase
+        assert env["fence"].stat().st_ino == inode_before
+        events.append(phase)
+
+    def revoke(plan, token_id):
+        blocked("revoke")
+        return original_revoke(plan, token_id)
+
+    async def finalize(process, child):
+        blocked("child_wait")
+        assert _created_rows(env["master"])[0]["revoked_at"]
+        await original_finalize(process, child)
+        assert child.waited
+
+    def remove(directory):
+        blocked("temp")
+        assert _created_rows(env["master"])[0]["revoked_at"]
+        assert directory.exists()
+        return original_remove(directory)
+
+    def release(fd):
+        blocked("release_last")
+        return original_release(fd)
+
+    monkeypatch.setattr(runner, "_revoke_identity", revoke)
+    monkeypatch.setattr(runner, "_finalize_child", finalize)
+    monkeypatch.setattr(runner, "_remove_policy_dir", remove)
+    monkeypatch.setattr(runner, "_release_fence", release)
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, captured = _run_consume(capsys, path, sha)
+    assert code == 0, result
+    assert events == ["revoke", "child_wait", "temp", "release_last"]
+    assert _contend(env).returncode == 0
+    assert env["anchor"].read_bytes() == state_before
+    assert "attempt_token" not in captured.out and "token_hash" not in captured.out
+    assert result["anchor"]["release_id"] == "17"
+    assert result["anchor"]["path"] == str(env["anchor"])
+
+
+def _produce_outcome(env):
+    # Run under producer-owned inherited descriptor and its exact attempt identity.
+    code = '''
+import json, os
+from argparse import Namespace
+from scripts.blue_green import deploy_state as d
+assert d.main(["acquire", "--pr", "17", "--sha", SHA,
+               "--deployment-provider", "github", "--deployment-host", "github.com",
+               "--deployment-repository", "DUIDUI-Studio/DailyCheck"]) == 0
+lock = json.loads((d._state_dir() / "state.json").read_text())["lock"]
+os.environ[d.ATTEMPT_ENV] = json.dumps({k: lock[k] for k in ("token", "pr", "sha", "session")})
+assert d.main(["release", "--result", "success", "--sha", SHA]) == 0
+'''.replace('SHA', repr(env['source_sha']))
+    result = subprocess.run(
+        [sys.executable, "-B", str(REPO_ROOT / "scripts/blue_green/deploy_state.py"),
+         "run", "--", sys.executable, "-B", "-c", code],
+        env={**runner._tool_env(), "PYTHONPATH": str(REPO_ROOT),
+             "DAILYCHECK_DEPLOY_STATE_DIR": str(env["state_dir"])},
+        capture_output=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+
+
+def test_real_producer_owned_outcome_is_validated_and_redacted(env, capsys):
+    _produce_outcome(env)
+    before = env["anchor"].read_bytes()
+    state = json.loads(before)
+    outcome_id = state["deployed"]["outcome_id"]
+    outcome = state["outcomes"][outcome_id]
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, captured = _run_consume(capsys, path, sha)
+    assert code == 0, result
+    assert result["anchor"]["outcome_id"] == outcome_id
+    assert result["anchor"]["generation"] == state["generation"]
+    assert outcome["attempt_token"] not in captured.out + captured.err
+    assert env["anchor"].read_bytes() == before
+
+
+@pytest.mark.parametrize("mutation", [
+    "sha", "pr", "result", "generation", "reference", "deployment", "version",
+    "lease", "last_attempt", "native", "substitute", "duplicate", "missing",
+])
+def test_real_state_malformed_mismatched_or_unsettled_refuses(env, capsys, mutation):
+    _produce_outcome(env)
+    state = json.loads(env["anchor"].read_bytes())
+    outcome = state["outcomes"][state["deployed"]["outcome_id"]]
+    if mutation == "sha":
+        outcome["sha"] = "0" * 40
+    elif mutation == "pr":
+        outcome["pr"] += 1
+    elif mutation == "result":
+        outcome["result"] = "failed"
+    elif mutation == "generation":
+        state["generation"] += 1
+    elif mutation == "reference":
+        state["deployed"]["outcome_id"] = "absent"
+    elif mutation == "deployment":
+        outcome["deployment"]["pr"] += 1
+    elif mutation == "version":
+        state["version"] = True
+    elif mutation == "lease":
+        state["lock"] = {"token": "SECRET-LEASE-CANARY"}
+    elif mutation == "last_attempt":
+        state["last_attempt"] = {"result": "failed"}
+    elif mutation == "native":
+        state["native_queue"] = {"active": None}
+    elif mutation == "substitute":
+        state = {"source_sha": env["source_sha"], "release_id": "17", "deployment_root": "/"}
+    elif mutation == "missing":
+        env["anchor"].unlink()
+    if mutation != "missing":
+        raw = json.dumps(state)
+        if mutation == "duplicate":
+            raw = raw[:-1] + ', "version":1}'
+        env["anchor"].write_text(raw)
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, captured = _run_consume(capsys, path, sha)
+    assert code != 0 and result["status"] != "succeeded"
+    assert _created_rows(env["master"]) == []
+    assert "SECRET-LEASE-CANARY" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "public", "directory", "inode", "owner"])
+def test_existing_fence_identity_guards(env, capsys, monkeypatch, kind):
+    fence = env["fence"]
+    if kind == "missing":
+        fence.unlink()
+    elif kind == "symlink":
+        original = fence.with_name("old-lock")
+        fence.rename(original)
+        fence.symlink_to(original)
+    elif kind == "public":
+        fence.chmod(0o644)
+    elif kind == "directory":
+        fence.unlink()
+        fence.mkdir()
+    else:
+        original_open = runner.os.open
+        def changed_open(path, flags, *args, **kwargs):
+            if Path(path) == fence and kind == "inode":
+                replacement = fence.with_name("replacement")
+                replacement.write_bytes(b"")
+                replacement.chmod(0o600)
+                replacement.replace(fence)
+            fd = original_open(path, flags, *args, **kwargs)
+            if Path(path) == fence and kind == "owner":
+                real_fstat = runner.os.fstat
+                def alien_fstat(target):
+                    info = real_fstat(target)
+                    if target == fd:
+                        import types
+                        return types.SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid()+1,
+                                                     st_dev=info.st_dev, st_ino=info.st_ino)
+                    return info
+                monkeypatch.setattr(runner.os, "fstat", alien_fstat)
+            return fd
+        monkeypatch.setattr(runner.os, "open", changed_open)
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, _ = _run_consume(capsys, path, sha)
+    assert code != 0, result
+    assert _created_rows(env["master"]) == []
+    if kind == "missing":
+        assert not fence.exists()  # consumer never creates the real producer lock
+
+
+@pytest.mark.parametrize("kind", ["blueprint", "runner", "untracked", "ignored", "assume_unchanged"])
+def test_executable_source_drift_refuses_before_import_or_grant(env, capsys, kind):
+    source = env["source"]
+    relative = "scripts/mcp_lucy_read_once.py" if kind == "runner" else "blueprints/consumption.py"
+    if kind == "untracked":
+        relative = "blueprints/untracked_canary.py"
+    elif kind == "ignored":
+        relative = "db/warehouses/ignored_canary.py"
+    path = source / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before = path.read_bytes() if path.exists() else None
+    marker = env["root"] / "source-canary"
+    # Real imported module-scope side effect; red evidence proves the old child executes it.
+    canary = f'\nfrom pathlib import Path as _CanaryPath\n_CanaryPath({str(marker)!r}).write_text("harmless")\n'.encode()
+    ignore_path = source / ".git/info/exclude"
+    ignore_before = ignore_path.read_bytes()
+    try:
+        if kind == "ignored":
+            ignore_path.write_bytes(ignore_before + b"\n/db/warehouses/ignored_canary.py\n")
+        if kind == "assume_unchanged":
+            subprocess.run(["git", "-C", str(source), "update-index", "--assume-unchanged", relative], check=True)
+        path.write_bytes((before or b"") + canary)
+        plan_path, sha = _write_plan(env, _plan_data(env))
+        code, result, _ = _run_consume(capsys, plan_path, sha)
+        assert code != 0 and result["code"] == "source_tree_dirty", result
+        assert not marker.exists()
+        assert _created_rows(env["master"]) == []
+    finally:
+        if before is None:
+            path.unlink()
+        else:
+            path.write_bytes(before)
+            assert path.read_bytes() == before
+        ignore_path.write_bytes(ignore_before)
+        if kind == "assume_unchanged":
+            subprocess.run(["git", "-C", str(source), "update-index", "--no-assume-unchanged", relative], check=True)
+    assert subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"]) == b""
+
+
+@pytest.mark.parametrize("window", ["policy", "ledger", "commit_return", "sdk", "cancel", "unexpected"])
+def test_catchable_cancellation_revokes_settles_and_releases_last(env, capsys, monkeypatch, window):
+    from mcp import ClientSession
+    warehouse_before = env["warehouse_file"].read_bytes()
+    existing_before = _token_rows(env["master"])[0]
+    events = []
+    directories = []
+    original_revoke = runner._revoke_identity
+    original_remove = runner._remove_policy_dir
+    original_release = runner._release_fence
+    original_finalize = runner._finalize_child
+    exception_canary = "SECRET-INTERRUPTION-CANARY"
+
+    def interrupt(*a, **kw):
+        raise KeyboardInterrupt(exception_canary)
+
+    if window == "policy":
+        monkeypatch.setattr(runner, "_write_policy", interrupt)
+    elif window == "ledger":
+        original_update = runner.ClaimLedger.update
+        def update(self, **changes):
+            if changes.get("token_id"):
+                raise OSError(exception_canary)
+            return original_update(self, **changes)
+        monkeypatch.setattr(runner.ClaimLedger, "update", update)
+    elif window == "commit_return":
+        original_issue = runner._issue_identity
+        def issue(plan, token):
+            original_issue(plan, token)
+            interrupt()
+        monkeypatch.setattr(runner, "_issue_identity", issue)
+    else:
+        async def read(self, name, arguments, *a, **kw):
+            assert _contend(env).returncode == 10
+            if window == "cancel":
+                import asyncio
+                raise asyncio.CancelledError(exception_canary)
+            if window == "unexpected":
+                raise RuntimeError(exception_canary)
+            interrupt()
+        monkeypatch.setattr(ClientSession, "call_tool", read)
+
+    def revoke(plan, token_id):
+        assert _contend(env).returncode == 10
+        events.append("revoke")
+        return original_revoke(plan, token_id)
+
+    async def finalize(process, child):
+        assert _created_rows(env["master"])[0]["revoked_at"]
+        assert _contend(env).returncode == 10
+        events.append("child")
+        await original_finalize(process, child)
+        assert child.waited
+
+    def remove(directory):
+        assert _created_rows(env["master"])[0]["revoked_at"]
+        assert _contend(env).returncode == 10
+        if directory:
+            directories.append(directory)
+        events.append("temp")
+        return original_remove(directory)
+
+    def release(fd):
+        assert events[-1] == "temp"
+        assert all(not directory.exists() for directory in directories)
+        assert _contend(env).returncode == 10
+        events.append("fence")
+        return original_release(fd)
+
+    monkeypatch.setattr(runner, "_revoke_identity", revoke)
+    monkeypatch.setattr(runner, "_finalize_child", finalize)
+    monkeypatch.setattr(runner, "_remove_policy_dir", remove)
+    monkeypatch.setattr(runner, "_release_fence", release)
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, captured = _run_consume(capsys, path, sha)
+    assert code != 0 and result["status"] != "succeeded", result
+    assert result.get("item") is None
+    assert all(result["cleanup"].values()), result
+    assert exception_canary not in captured.out + captured.err
+    assert _created_rows(env["master"])[0]["revoked_at"]
+    assert len(_created_rows(env["master"])) == 1
+    assert env["warehouse_file"].read_bytes() == warehouse_before
+    assert _token_rows(env["master"])[0] == existing_before
+    if window in {"sdk", "cancel", "unexpected"}:
+        assert events == ["revoke", "child", "temp", "fence"]
+        assert result["child"]["waited"]
+        with pytest.raises(ProcessLookupError):
+            os.kill(result["child"]["pid"], 0)
+    else:
+        assert events == ["revoke", "temp", "fence"]
+    assert _contend(env).returncode == 0
+    # Cleanup is not permission to replay, and no second grant/read occurs.
+    monkeypatch.undo()
+    again, replay, _ = _run_consume(capsys, path, sha)
+    assert again == runner.EXIT_CLAIM and replay["status"] == "replay_rejected"
+    assert len(_created_rows(env["master"])) == 1
+
+
+def test_external_warehouse_symlink_remains_fail_closed(env, capsys):
+    external = env["root"] / "external.db"
+    env["warehouse_file"].rename(external)
+    env["warehouse_file"].symlink_to(external)
+    before = external.read_bytes()
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, _ = _run_consume(capsys, path, sha)
+    assert code != 0 and result["status"] != "succeeded"
+    assert _created_rows(env["master"]) == []
+    assert external.read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["symlink", "writable", "missing"])
+def test_state_directory_requires_trusted_explicit_identity(env, capsys, kind):
+    data = _plan_data(env)
+    if kind == "symlink":
+        alias = env["root"] / "state-alias"
+        alias.symlink_to(env["state_dir"], target_is_directory=True)
+        data["deploy_anchor"]["state_dir"] = str(alias)
+    elif kind == "writable":
+        env["state_dir"].chmod(0o777)
+    else:
+        data["deploy_anchor"]["state_dir"] = str(env["root"] / "absent-state")
+    path, sha = _write_plan(env, data)
+    code, result, _ = _run_consume(capsys, path, sha)
+    assert code != 0 and result["status"] != "succeeded"
+    assert _created_rows(env["master"]) == []
+
+
+def test_init_only_producer_state_is_not_successful_release(env, capsys):
+    env["anchor"].unlink()
+    assert _producer(env, "init", "--sha", env["source_sha"]).returncode == 0
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, _ = _run_consume(capsys, path, sha)
+    assert code != 0 and result["code"] == "deploy_state_invalid_or_unsettled"
+    assert _created_rows(env["master"]) == []
+
+
+def test_actual_ledger_replace_failure_after_issue_still_cleans(env, capsys, monkeypatch):
+    original_replace = runner.os.replace
+    def refuse_claim_write(source, target):
+        if Path(target) == _claim_file(env) and _created_rows(env["master"]):
+            raise OSError("SECRET-LEDGER-WRITE-CANARY")
+        return original_replace(source, target)
+    monkeypatch.setattr(runner.os, "replace", refuse_claim_write)
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, captured = _run_consume(capsys, path, sha)
+    assert code != 0 and result["status"] != "succeeded"
+    assert all(result["cleanup"].values()), result
+    assert _created_rows(env["master"])[0]["revoked_at"]
+    assert list(env["claims"].iterdir()) == [_claim_file(env)]
+    assert "SECRET-LEDGER-WRITE-CANARY" not in captured.out + captured.err
+    assert _contend(env).returncode == 0

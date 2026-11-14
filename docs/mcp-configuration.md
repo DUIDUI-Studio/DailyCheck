@@ -217,8 +217,8 @@ query client, credential service, or job queue.
 
 - `consume` runs one operator-owned, hash-pinned plan on the host. The plan
   binds the repository and full git SHA, deployment anchor, one warehouse and
-  its exact file, the deployment fence path, the active-business PID/start and
-  master file binding, one item, and explicit `field_consent` for the complete
+  its exact file, an explicit trusted deployment state directory, the
+  active-business PID/start and master file binding, one item, and explicit `field_consent` for the complete
   single-item shape **including `unit_cost`**. Missing/unknown fields, a stale
   UTC deadline, a changed hash/correlation, unsafe paths, or denied consent fail
   before any identity or read.
@@ -228,8 +228,25 @@ query client, credential service, or job queue.
   `reconcile_required` for the operator and is not retried automatically.
 - Preflight takes a **shared** lock on the existing deployment fence (the file
   must already exist; the runner never creates, truncates, or clears a lock),
-  then verifies the source HEAD/clean tree, the deploy anchor's source/release
-  and deployment root, and the active-business PID/start/master-fd binding.
+  then verifies the source HEAD and every tracked Python file against its Git blob
+  (including the runner and blueprint import side effects, even if marked
+  assume-unchanged), refuses untracked Python source before fresh imports, and
+  checks the active-business PID/start/master-fd binding. Ignored Python files
+  are also refused outside the trusted interpreter's `.venv`/`node_modules`.
+  `deploy_anchor` now contains exactly `state_dir` and `source_sha`; no separate
+  `fence` locator is accepted. Fixed `state.json` and `.attempt.lock` filenames
+  bind both artifacts to that same canonical, trusted owner/mode directory,
+  independent of the source and DB roots. The runner checks lock fstat/lstat
+  inode equality and private owner/mode after opening; it never creates or
+  chmods the deployment lock. It directly consumes unchanged `deploy_state.py`
+  releases: version 1, settled lease/native state, no failed last attempt,
+  `deployed.sha/pr/at`, and validates the referenced successful outcome's
+  SHA/PR/generation/deployment identity when present. An init-only baseline
+  without a release PR, malformed/missing/unknown state, or an authored
+  `source_sha/release_id/deployment_root` substitute fails closed. These are
+  deployment facts, never proof of Owner approval or a live process identity.
+  The first pilot requires an explicitly approved regular-file warehouse;
+  external symlink mappings such as `wh_002` remain fail-closed.
   Production consume is Linux-only; a non-Linux synthetic plan uses a clearly
   labeled surrogate and Linux CI covers the real `/proc` path.
 - Only after preflight does the runner create one temporary `agent_tokens` row:
@@ -243,13 +260,19 @@ query client, credential service, or job queue.
   `initialize -> tools/list (exactly 3) -> warehouse_list (exactly 1) ->
   items_detail (exactly 1)`. The result carries one item, the MCP tool/argument
   metadata, actual child pid/start/returncode/wait evidence, and cleanup proof.
-  Token revocation is proven by commit + re-read; temp files are removed and the
-  fence is released last. Any cleanup failure returns a non-zero
+  Consume custody is held on a real `finally` path, including KeyboardInterrupt,
+  SDK cancellation, unexpected exceptions and ledger failure after issuance.
+  Revocation (commit + re-read) precedes positive child settlement, own policy
+  temp removal and fence release last; the producer's exclusive flock remains
+  blocked through this cleanup. No cancellation or incomplete cleanup returns
+  business success or grants another read. Any cleanup failure returns a non-zero
   `reconcile_required` result with no business success.
 - The existing token schema has no universal expiry. This job bounds its
-  identity with the strict policy deadline and verified revocation; unexpected
-  parent death before revocation is an operator recovery requirement, not a
-  guaranteed global TTL.
+  identity with the strict policy deadline and verified revocation;
+  uncatchable death (SIGKILL/host crash) cannot run `finally` and still needs
+  later explicitly authorized operator reconciliation of any surviving row,
+  including a receipt-recorded token id. There is no guaranteed global TTL,
+  background sweeper, third command or automatic retry.
 - `relay` (Mac) reads a protected relay request, requires the supplied SSH
   public key to match the trusted fingerprint, fixes the host alias to
   `wdg_vps`, resolves the alias destination/port locally and refuses a mismatch,

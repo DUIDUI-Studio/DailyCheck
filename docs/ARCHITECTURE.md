@@ -2909,7 +2909,7 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
 - `consume`（host-local）：只接受一份 operator 保护的 JSON plan（单 fd、no-follow、
   私有权限、精确 schema、correlation + 完整 plan SHA-256、UTC 截止、1..60s 预算）。
   plan 绑定仓库源码 repository/完整 git SHA、部署 anchor、唯一仓库与精确仓文件、
-  部署 fence 路径、active-business PID/start/master 文件绑定、单个 item 与显式
+  独立可信部署 state_dir、active-business PID/start/master 文件绑定、单个 item 与显式
   `field_consent`（完整单条 shape + `unit_cost`）。缺字段、未知字段、过期、越界、
   换行/控制字符、缺失 consent 一律在产生任何效果前拒绝。
 - 生命周期固定为
@@ -2918,9 +2918,18 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
   receipt；重复调用在创建任何 token/读取前被拒绝，receipt 永不删除/重置。中断的
   `reading/cleaning` 只能由 operator 按 receipt 对账，runner 不会自动重读。
 - preflight 依次取得既有部署 fence 的**共享** `flock`（只打开既有文件，不创建/截断/
-  清除锁）、校验源码 HEAD + 干净子树 + 新鲜进程 import 位置、部署 anchor 的
-  `source_sha`/`release_id`/`deployment_root`（master/warehouse/fence 必须在其内）、
-  active-business PID/start 与 master fd 绑定。fence 忙、anchor/source 不符、绑定
+  清除锁/chmod），plan 的 `deploy_anchor` 仅含 `state_dir` + `source_sha`，不再接受
+  独立 fence locator；固定读取同一 canonical 可信 owner/mode 目录的 `state.json` 与
+  `.attempt.lock`，与 source/DB 根独立，open 后核对 fd/path inode 与私有权限。
+  原样消费 `deploy_state.py` 的 version=1、settled lease/native 状态、无失败
+  last_attempt、成功 `deployed.sha/pr/at`；若有 outcome 引用则按 producer schema
+  校验成功 result、SHA/PR/generation/deployment identity。只有 init 的无 PR 基线、
+  缺失/未知/畸形/未 settled 状态及自造 `source_sha/release_id/deployment_root` 均拒绝。
+  源码 HEAD 后逐一比较全部 tracked Python 的 Git blob 与磁盘字节（含 runner、
+  blueprint 模块顶层及 assume-unchanged 文件），拒绝 untracked/ignored Python
+  （可信解释器的 `.venv`/`node_modules` 除外），然后才新鲜 import/签发；不清理 DB/log。
+  首个 pilot 仅选显式获批的 regular-file 仓，`wh_002` 外链 symlink 继续拒绝。
+  再核对 active-business PID/start 与 master fd 绑定。fence 忙、anchor/source 不符、绑定
   不符均在签发凭据前失败。生产模式仅 Linux；非 Linux 的 synthetic plan 使用**显式
   标注**的 surrogate（`ps` + `lsof`），Linux CI 覆盖真实 `/proc` 检查。
 - 通过 preflight 后，runner 才用既有 `agent_tokens` schema 新建**唯一**一条 identity：
@@ -2939,7 +2948,11 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
   policy/temp，最后释放 fence。任一步失败 → 非零结构化 failure、不返回业务成功、
   保留 claim barrier 并要求 operator 对账。既有 schema 无全局 TTL，因此该 identity
   只由严格 policy 截止 + 已验证吊销约束；父进程在吊销前意外死亡属于恢复要求，
-  不是有保证的全局过期。
+  不是有保证的全局过期。consume custody 的真实 finally 覆盖 KeyboardInterrupt、
+  SDK cancellation、issue 后 ledger 写入失败与意外异常；SDK context 退出前先撤销，
+  再正向 wait child、删自有 policy，fence 最后释放，期间真实 deployer EX flock 均被阻塞。
+  SIGKILL/host crash 不运行 finally，遗留行（含 receipt 已记 id）仍需后续显式授权的
+  operator 对账；不增加 sweeper/第三命令/自动重读。
 - `relay`（Mac）：读取 operator 保护的 relay request，要求 request 内提供的 SSH
   public key 指纹匹配、host alias 固定为 `wdg_vps`、本地 `ssh -G` 解析的
   destination/port 与 request 一致；仅创建任务内 0600 known_hosts，固定
@@ -3628,6 +3641,10 @@ hash/correlation/expiry/source/anchor/consent/unsafe-path/fence-busy 在签发�
 父进程拥有的 child 超时清理、吊销失败不返回成功且保留 barrier、输出 canary/raw token/
 token hash 不泄漏、恶意换行/路径无副作用；relay 以 PATH 注入的 hermetic fake ssh 覆盖
 hostkey 指纹/缺失 key/alias 目标不符/EPERM/超时/远端 reconcile 的失败关闭与无降级。
+repair3 回归还直接调用未改动 producer 生成 state/owned outcome，并以其 `run` 的 EX
+flock 在真实 SDK child、revoke、positive wait、policy 清理和 release-last 阶段证明冲突；
+覆盖 malformed/outcome mismatch、fence inode/owner/mode、blueprint canary 拒绝及字节恢复、
+issue→policy/ledger/commit-return/SDK 的 catchable cancellation，仓字节与无关行保持不变。
 Linux CI 另跑真实 `/proc` PID/start/master-fd 绑定用例；非 Linux 的 synthetic binding
 在结果中显式标注为 surrogate。测试不连接生产、不读取既有凭据/SSH 配置。
 
