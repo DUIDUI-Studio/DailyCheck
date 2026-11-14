@@ -2841,6 +2841,60 @@ Issue #144 扩充 store_order_detail 的内部 output_shape 和生成台账：�
 声明/路径 ACL 保持兼容；服务层对头/明细使用显式字段白名单，不暴露内部 command、
 claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 或写 stale。
 
+### 9.6 只读查询策略（Issue #16，默认关闭；不构成生产激活）
+
+`mcp_server/readonly.py::ReadonlyPolicy` 是一个**显式加载、不可变**的进程级策略。
+不传 `--readonly-policy PATH` 时服务行为与既有完全一致；显式传入后 HTTP 与 stdio
+使用同一严格边界。**策略加载失败必须停止进程**，不回退标准模式。策略文件只含
+非秘密控制字段，不含 raw token：
+
+| 字段 | 语义 |
+|---|---|
+| `schema_version` | 必须为 `1` |
+| `token_id` | 一个既有 `agent_tokens.id`（不新建表、不改 schema、不签发） |
+| `expires_at` | 显式 UTC 截止时间（ISO-8601 带时区）；加载时已过期即拒绝 |
+| `master_path` | 必须等于进程实际配置的 `master.db` 规范路径 |
+| `warehouse_root` | 受信既存目录；每个仓文件必须落在其内 |
+| `warehouses` | 非空 `code -> 精确规范文件` 映射；禁止重复文件别名 |
+
+加载时校验绝对路径、存在性、master 一致性、root containment、symlink 逃逸与重复
+别名；运行期不 `mkdir`、不迁移、不创建缺库，也不使用 `immutable=1`（会掩盖 WAL
+中的已提交数据）。
+
+**严格模式的服务器边界**
+
+- `tools/list` 仅返回 `warehouse_list` / `items_list` / `items_detail`；全局 32 项
+  注册与 wire 声明不变，普通票据仍看到全部工具。
+- `tools/call` 在任何 handler / 业务库打开前，用同一静态集合拒绝所有写工具、其它
+  只读工具以及未知/未来工具；只接受的参数集合是精确的（`warehouse_list` 无参数；
+  `items_list` 仅 `warehouse_code`；`items_detail` 仅 `item_id` + `warehouse_code`），
+  并校验类型。SQL、文件路径、data root、`profile`、`read_only` 等覆盖参数一律拒绝。
+- `warehouse_list` 在严格模式显式检查 `GET /api/v1/warehouses`；每项仍执行既有
+  `check_warehouse` / `check_path`。token 的 `allowed_warehouses` 必须是显式非空
+  列表且是策略映射的子集；`allowed_write_paths` 必须为空。
+- 认证只走既有 `agent_tokens` 表（`mode=ro`，固定 `token_id` + prefix + pbkdf2 +
+  `revoked_at IS NULL`）；严格模式**不使用** `DAILYCHECK_MCP_TOKEN` env 短路，即使
+  该 env 值与已撤销票据相同。每个请求重新认证，每个工具调用再次校验期限与撤销。
+- stdio 仍是进程级 `DAILYCHECK_MCP_TOKEN`，但会以真实表认证换取上下文，不是不受限
+  的 env 身份；secret 不进入 argv、响应或日志。
+- 库存读取固定 `read_only=True`，连接为 `mode=ro` + `PRAGMA query_only` + SQLite
+  authorizer（拒绝写/DDL/`ATTACH`/`DETACH`/扩展加载）。仓文件必须同时满足：
+  master metadata 解析后的规范路径等于策略中该 code 的**精确文件**，且该文件在受信
+  root 内；否则在打开业务库前拒绝。缺库、缺表、缺列明确失败，**不迁移、不初始化、
+  不缓存、不回退 rw**。
+- 输出保留现有 `TextContent(JSON)` wire 与字段（`items_*` 仍含 `unit_cost`）。
+- 审计复用 metadata-only `access.log`（token id / method / status / duration /
+  tool name）。严格模式拒绝的工具名统一记录为固定 `restricted`，不把调用方字符串
+  写进日志或错误；审计仍是 best-effort，不宣称 fail-closed 持久回执。
+- SQLite WAL：`mode=ro` 读取可能创建/更新 `-shm` sidecar；主库与 `-wal` 字节不变
+  视为读取正确，不用 `immutable=1` 隐藏此限制。只读承诺不覆盖操作系统层面的
+  sidecar 权限行为。
+- 信任边界是受信 operator 的配置/代码/文件系统；不声称抵御已掌控文件系统的管理员。
+
+**未激活的生产事项（Owner / Prod 门禁）**：本策略默认 OFF。生产凭据的安全签发/注入/
+轮换、网络入口、服务安装、蓝绿部署与 Lucy 真实接收方验收仍由 Owner 拍板、Prod 执行；
+本次不读取既有凭据、不修改生产配置、不改变 CI/分支保护。
+
 ## 10. 业务领域模型
 
 ### 10.1 仓库类型
@@ -3501,6 +3555,12 @@ Issue #140 的 `tests/test_wms_dashboard.py` 覆盖真实 Cookie/DC/viewer 权�
 `test_wms_web_service.py` 用真实已核验 schema 的合成 SQLite 数据与 SQL 方言适配执行查询，
 验证 >500 行唯一分页、跨货主同编码、空仓历史、双方向同编号、库位一对多及其他仓单货主边界。
 `test_mcp_wms.py` 与 MCP 契约门禁验证旧调用；CI 禁止连接第三方生产库，真实验证归 Prod。
+
+Issue #16 的 `tests/test_mcp_readonly_policy.py`、`tests/mcp_server/test_protocol/test_readonly_policy_http.py`
+与 `test_readonly_policy_stdio.py` 覆盖显式只读策略的加载校验、真实 loopback HTTP 与真实 stdio 协议、
+三工具成功值、全部写/非首期/未知工具拒绝、精确参数/类型、过期/撤销/env 短路、token scope、
+metadata 跨仓/逃逸、legacy/不兼容/缺库/WAL 夹具、连接级 UPDATE/DDL/ATTACH 拒绝与文件字节不变量；
+策略默认关闭，标准模式 32 项工具与既有 wire 契约由原回归继续覆盖。
 
 Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
 `selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时

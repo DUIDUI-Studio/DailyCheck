@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from mcp_server.protocol.server import build_server
+from mcp_server.readonly import ReadonlyPolicy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,9 +40,10 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
     Starlette guarantees this runs before first request and after
     the server stops accepting connections.
     """
+    policy = getattr(app.state, "readonly_policy", None)
     transport = SseServerTransport(MESSAGES_PATH)
     app.state.sse_transport = transport
-    app.state.mcp_server = build_server()
+    app.state.mcp_server = build_server(policy)
     app.state.streamable_manager = StreamableHTTPSessionManager(app.state.mcp_server, json_response=True, stateless=True)
     logger.info("MCP server initialized")
     try:
@@ -54,23 +56,29 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 # ---------------------------------------------------------------------------
 # Auth middleware — validates Bearer token via DAILYCHECK_MCP_TOKEN env var
 # OR queries agent_tokens table (production main path).
-# Fallback chain: env → agent_tokens table
+# Fallback chain: env → agent_tokens table (standard mode only).
+# Strict policy mode is table-only and never takes the env shortcut.
 # ---------------------------------------------------------------------------
 
 class AuthMiddleware:
     """ASGI middleware that authenticates Bearer tokens.
 
-    Fallback chain:
+    Standard mode fallback chain:
       1. env DAILYCHECK_MCP_TOKEN (legacy dev/test; backward-compat)
       2. agent_tokens table (production main path) — checked via werkzeug
          pbkdf2:sha256 hash, supports per-token revocation + future ACL.
+
+    Strict mode (an explicit ReadonlyPolicy was passed): only the pinned
+    agent_tokens row authenticated over a read-only table connection; the env
+    shortcut is not available, even if the env value equals a revoked token.
 
     Both branches verify the same header shape; either success short-circuits
     to next middleware. 401 if neither matches.
     """
 
-    def __init__(self, app) -> None:
+    def __init__(self, app, policy: ReadonlyPolicy | None = None) -> None:
         self.app = app
+        self.policy = policy
         # P0-4 per-token 配额：key=token_id，每 token 独立滑动窗口。
         # 单 uvicorn 进程内共享；重启清零（v1 约定，见 rate_limit_pure）。
         self._limiters: dict[int, object] = {}
@@ -83,19 +91,24 @@ class AuthMiddleware:
         headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
         auth = headers.get("authorization", "")
 
-        # Branch 1: legacy env-based shared secret (dev only, but kept for
-        # zero-friction local testing without provisioning a token).
-        expected = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
-        if expected and auth.startswith("Bearer ") and auth[7:].strip() == expected:
-            await self.app(scope, receive, send)
-            return
+        if self.policy is None:
+            # Branch 1: legacy env-based shared secret (dev only, but kept for
+            # zero-friction local testing without provisioning a token).
+            expected = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
+            if expected and auth.startswith("Bearer ") and auth[7:].strip() == expected:
+                await self.app(scope, receive, send)
+                return
 
-        # Branch 2: agent_tokens table lookup (production).
+        # Branch 2: agent_tokens table lookup (production / strict mode).
         # Lazy import to avoid loading SQLite connection machinery for the
         # env-only dev path (and to keep cold-start minimal).
         try:
-            from mcp_server.service.auth import authenticate, set_current_auth
-            ctx = authenticate(auth) if auth.startswith("Bearer ") else None
+            from mcp_server.service.auth import (
+                authenticate,
+                reset_current_auth,
+                set_current_auth,
+            )
+            ctx = authenticate(auth, policy=self.policy) if auth.startswith("Bearer ") else None
             if ctx is not None:
                 # P0-4: per-token 滑动窗口配额（默认 MCP_DEFAULT_RATE_LIMIT/分钟）。
                 from rate_limit_pure import SlidingWindowLimiter, mcp_quota_limit
@@ -117,13 +130,21 @@ class AuthMiddleware:
                 # Publish the context two ways: in the ASGI scope (transport
                 # level) and in a ContextVar — tool handlers are sync functions
                 # with no access to scope, so the ContextVar is what actually
-                # reaches them.
+                # reaches them. Always restore it so a sequential or failed
+                # request cannot borrow this caller's identity.
                 scope.setdefault("state", {})["auth"] = ctx
-                set_current_auth(ctx)
-                await self.app(scope, receive, send)
+                token = set_current_auth(ctx)
+                try:
+                    await self.app(scope, receive, send)
+                finally:
+                    reset_current_auth(token)
                 return
         except Exception as e:
-            logger.warning("agent_tokens lookup failed: %s", e)
+            if self.policy is None:
+                logger.warning("agent_tokens lookup failed: %s", e)
+            else:
+                # Never echo a raw exception/path in strict mode.
+                logger.warning("strict authentication failed")
 
         resp = JSONResponse(
             {"error": "unauthorized", "message": "Invalid or missing token"},
@@ -166,11 +187,15 @@ async def streamable_http_asgi(scope, receive, send) -> None:
 # Health check — more thorough than just "ok"
 # ---------------------------------------------------------------------------
 
-def _build_app() -> Starlette:
-    """Construct the Starlette app (exposed for programmatic use)."""
+def _build_app(policy: ReadonlyPolicy | None = None) -> Starlette:
+    """Construct the Starlette app (exposed for programmatic use).
+
+    ``policy`` is threaded explicitly into both the middleware and the lifespan
+    server construction so one transport cannot end up unguarded.
+    """
     app = Starlette(
         lifespan=lifespan,
-        middleware=[Middleware(AuthMiddleware)],
+        middleware=[Middleware(AuthMiddleware, policy=policy)],
         routes=[
             Route(SSE_PATH, endpoint=sse_endpoint, methods=["GET"]),
             Mount(MESSAGES_PATH, app=post_message),
@@ -178,6 +203,7 @@ def _build_app() -> Starlette:
             Route(HEALTH_PATH, endpoint=health, methods=["GET"]),
         ],
     )
+    app.state.readonly_policy = policy
     return app
 
 
@@ -188,13 +214,20 @@ def health(request) -> JSONResponse:
         "transport": "ok",
         "db": "unknown",
     }
+    policy = getattr(request.app.state, "readonly_policy", None)
     try:
-        from mcp_server.data.unit_of_work import master_connection
-        with master_connection() as conn:
-            conn.execute("SELECT 1").fetchone()
+        if policy is not None:
+            from mcp_server.readonly import readonly_connection
+
+            with readonly_connection(policy.master_path) as conn:
+                conn.execute("SELECT 1").fetchone()
+        else:
+            from mcp_server.data.unit_of_work import master_connection
+            with master_connection() as conn:
+                conn.execute("SELECT 1").fetchone()
         checks["db"] = "ok"
     except Exception as e:
-        checks["db"] = f"error: {e}"
+        checks["db"] = "error" if policy is not None else f"error: {e}"
 
     status_code = 200 if all(v == "ok" for v in checks.values()) else 503
     return JSONResponse({"status": "ok", "checks": checks}, status_code=status_code)
@@ -214,38 +247,62 @@ def health(request) -> JSONResponse:
 )
 @click.option("--port", default=5100, help="TCP port (http mode only)")
 @click.option("--host", default="127.0.0.1", help="Bind address (http mode only)")
-def run(transport: str, port: int, host: str) -> None:
+@click.option(
+    "--readonly-policy",
+    "readonly_policy_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Explicit read-only policy JSON (default: off)",
+)
+def run(transport: str, port: int, host: str, readonly_policy_path: str | None) -> None:
     """Start the DailyCheck MCP server.
 
     stdio  — local process via stdin/stdout (default, for Claude Code)
     http   — HTTP/SSE on TCP port (for remote agents)
+
+    --readonly-policy enables the strict, server-enforced read-only pilot.
+    A requested policy that cannot be loaded stops the process; it never falls
+    back to standard mode.
     """
+    policy = None
+    if readonly_policy_path is not None:
+        from mcp_server.readonly import ReadonlyPolicyError
+
+        try:
+            policy = ReadonlyPolicy.load(readonly_policy_path)
+        except ReadonlyPolicyError as exc:
+            raise click.ClickException(f"readonly policy rejected: {exc}") from exc
+
     if transport == "stdio":
-        _run_stdio()
+        if policy is None:
+            _run_stdio()
+        else:
+            _run_stdio(policy)
     else:
-        _run_http(port, host)
+        if policy is None:
+            _run_http(port, host)
+        else:
+            _run_http(port, host, policy)
 
 
-def _run_stdio() -> None:
+def _run_stdio(policy: ReadonlyPolicy | None = None) -> None:
     from mcp.server.stdio import stdio_server
 
     async def main() -> None:
+        server = build_server(policy)
         async with stdio_server() as (read, write):
-            await _mcp_server.run(read, write, _mcp_server.create_initialization_options())
+            await server.run(read, write, server.create_initialization_options())
 
     asyncio.run(main())
 
 
-def _run_http(port: int, host: str) -> None:
+def _run_http(port: int, host: str, policy: ReadonlyPolicy | None = None) -> None:
     import uvicorn
 
-    app = _build_app()
+    app = _build_app(policy)
     logger.info("Starting HTTP/SSE MCP server on %s:%d", host, port)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
-
-# Keep stdio path consistent — build server once at module load
-_mcp_server = build_server()
 
 if __name__ == "__main__":
     run()

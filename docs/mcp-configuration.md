@@ -134,16 +134,80 @@ curl -H "Authorization: Bearer your_token" http://YOUR_HOST_IP:5100/health
 
 ---
 
+## Strict read-only policy (opt-in, Issue #16)
+
+The server can be started with an explicit, finite read-only policy. Without the
+flag the server keeps its existing behaviour. The policy is loaded once at
+process start; if it is missing, malformed, expired, or inconsistent with the
+configured master, the process stops instead of falling back to standard mode.
+HTTP and stdio use the same policy object.
+
+```bash
+python -m mcp_server --transport http \
+  --host 127.0.0.1 --port 5100 \
+  --readonly-policy /etc/dailycheck/mcp-readonly.json
+```
+
+The policy file contains only non-secret control fields (no bearer token):
+
+```json
+{
+  "schema_version": 1,
+  "token_id": 42,
+  "expires_at": "2026-11-15T00:00:00Z",
+  "master_path": "/var/lib/dailycheck/db/master.db",
+  "warehouse_root": "/var/lib/dailycheck/db/warehouses",
+  "warehouses": {
+    "<approved-warehouse-code>": "/var/lib/dailycheck/db/warehouses/<approved-file>.db"
+  }
+}
+```
+
+Rules enforced by the server:
+
+- `token_id` must be one **existing** `agent_tokens` row; the row's plaintext
+  bearer token is still presented by the caller and checked against the table
+  (`prefix` + `pbkdf2` + `revoked_at IS NULL`). No raw token is stored in the
+  policy file or printed.
+- The token must have an explicit, non-empty `allowed_warehouses` list that is a
+  subset of the policy's `warehouses` map, and an empty `allowed_write_paths`.
+  A policy never widens a token's ACL.
+- `expires_at` is an explicit UTC deadline. It is checked at load and on every
+  request/tool call; revocation is re-checked for each new operation. There is no
+  auto-renewal.
+- Only `warehouse_list`, `items_list`, and `items_detail` are listed and
+  dispatchable. Every other tool — including writes, canonical/order/WMS reads,
+  and future/unknown names — is rejected before any handler or business database
+  open. Arguments must match the exact declared key set and types; SQL, paths,
+  data roots, `profile`, and `read_only` overrides are not accepted.
+- Reads use `mode=ro` plus `PRAGMA query_only` plus a SQLite authorizer that
+  denies writes, DDL, `ATTACH`/`DETACH`, and extension loading. The warehouse
+  metadata path must resolve to the exact approved file for that code; missing
+  databases or incompatible schemas fail closed and are never migrated or created.
+- `items_list` / `items_detail` keep the existing wire fields, including
+  `unit_cost`.
+- Audit reuses the metadata-only `access.log`. A tool rejected by the strict
+  allowlist is logged with the fixed marker `restricted`, never its caller-supplied
+  name. Audit remains best-effort, not a fail-closed durable receipt.
+- A read-only WAL read may create or update the `-shm` sidecar; the main database
+  and `-wal` remain unchanged. `immutable=1` is intentionally not used.
+- The trust boundary is the operator's configuration, code, and filesystem. The
+  policy does not claim protection from an administrator who can rewrite those.
+
+This policy is **off by default and does not activate production access**. Secure
+provisioning of the bearer token, network entry, deployment, and real receiver
+acceptance remain Owner/Prod decisions under `docs/agent-framework/workflow.md`.
+
 ## Available Tools
 
-The live server registers **29 tools**: 14 inventory/document/analysis tools,
-13 canonical tools and two store-order reads. The external integration
-[tools.json](integrations/dailycheck-mcp/tools.json) intentionally contains a
-**16-tool subset** (the 14 base tools plus two store-order reads); it is not the
-full live list and does not grant token permissions.
+The live server registers **32 tools**: 14 inventory/document/analysis tools,
+13 canonical tools, two store-order reads and three external WMS reads. The
+external integration [tools.json](integrations/dailycheck-mcp/tools.json)
+intentionally contains a **19-tool subset**; it is not the full live list and
+does not grant token permissions.
 
 The generated [complete contracts](integrations/dailycheck-mcp/registry.md) and
-[machine-readable ledger](integrations/dailycheck-mcp/registry.json) cover all 29
+[machine-readable ledger](integrations/dailycheck-mcp/registry.json) cover all 32
 names, handlers, input declarations, actual minimum output shapes, ACL enforcement,
 warehouse scope, compatibility and regression references. `get_tools()` and dispatch
 are derived from `mcp_server/protocol/registry.py`. Bot execution remains independently

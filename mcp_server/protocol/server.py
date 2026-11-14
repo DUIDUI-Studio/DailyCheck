@@ -4,14 +4,27 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from mcp.server import Server
 from mcp.types import TextContent, Tool
 
 from mcp_server.infra.access_log import write_mcp_access_log
-from mcp_server.infra.errors import McpError
+from mcp_server.infra.errors import McpError, UnauthorizedError
 from mcp_server.protocol.registry import get_handlers
 from mcp_server.protocol.tools import get_tools
+from mcp_server.readonly import (
+    STRICT_REJECTED_TOOL_LOG_NAME,
+    STRICT_TOOL_NAMES,
+    ReadonlyPolicyError,
+    ensure_token_active,
+    reset_current_policy,
+    set_current_policy,
+    validate_strict_arguments,
+)
+
+if TYPE_CHECKING:
+    from mcp_server.readonly import ReadonlyPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +59,28 @@ def _bounded_tool_name(name: str) -> str:
 _tool_map = get_handlers()
 
 
-def build_server() -> Server:
-    """Build and return a configured MCP Server."""
+def _strict_rejection() -> ValueError:
+    """A fixed error that never echoes a caller-controlled tool name."""
+    return ValueError("Unknown tool")
+
+
+def build_server(policy: ReadonlyPolicy | None = None) -> Server:
+    """Build and return a configured MCP Server.
+
+    ``policy`` is the explicit, opt-in strict read-only mode.  Passing None
+    preserves the existing full-registry behaviour.  The policy is captured in
+    this server's closures; no module-level state decides the transport.
+    """
+    strict = policy is not None
     server = Server("dailycheck-mcp")
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        """Serve the tool registry."""
-        return get_tools()
+        """Serve the tool registry (filtered to the pilot allowlist in strict mode)."""
+        tools = get_tools()
+        if strict:
+            return [tool for tool in tools if tool.name in STRICT_TOOL_NAMES]
+        return tools
 
     @server.call_tool()
     async def call_tool(
@@ -66,11 +93,42 @@ def build_server() -> Server:
         400 unknown tool / 500 unexpected error), never the HTTP transport
         status. Logging failures are swallowed so they cannot change the
         handler's response or make it run twice.
+
+        In strict mode the static allowlist, exact-argument check and policy
+        deadline/revocation check all run before any handler or business
+        database is opened.
         """
         started_ns = time.perf_counter_ns()
         status = 500
+        log_name = _bounded_tool_name(name)
+        policy_token = None
 
         try:
+            if strict:
+                if name not in STRICT_TOOL_NAMES:
+                    log_name = STRICT_REJECTED_TOOL_LOG_NAME
+                    status = 400
+                    logger.warning("call_tool: restricted tool rejected")
+                    raise _strict_rejection()
+                policy_token = set_current_policy(policy)
+                try:
+                    validate_strict_arguments(name, arguments)
+                except McpError as e:
+                    logger.info("call_tool %r rejected strict arguments", name)
+                    status = e.http_status
+                    payload = json.dumps(e.to_dict(), ensure_ascii=False)
+                    return [TextContent(type="text", text=payload)]
+                try:
+                    ensure_token_active(policy)
+                except ReadonlyPolicyError:
+                    logger.info("call_tool: readonly policy inactive")
+                    status = 401
+                    payload = json.dumps(
+                        UnauthorizedError("readonly policy inactive").to_dict(),
+                        ensure_ascii=False,
+                    )
+                    return [TextContent(type="text", text=payload)]
+
             handler = _tool_map.get(name)
             if handler is None:
                 logger.warning("call_tool: unknown tool %r", name)
@@ -90,6 +148,8 @@ def build_server() -> Server:
             status = 200
             return [TextContent(type="text", text=payload)]
         finally:
+            if policy_token is not None:
+                reset_current_policy(policy_token)
             duration_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
             try:
                 write_mcp_access_log(
@@ -98,7 +158,7 @@ def build_server() -> Server:
                     path=_ACCESS_LOG_PATH,
                     status=status,
                     duration_ms=duration_ms,
-                    tool_name=_bounded_tool_name(name),
+                    tool_name=log_name,
                 )
             except Exception:
                 logger.debug("call_tool: access log write failed", exc_info=True)

@@ -4,11 +4,16 @@ from __future__ import annotations
 import contextvars
 import json
 import os
+import sqlite3
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from werkzeug.security import check_password_hash
 
 from mcp_server.data.unit_of_work import master_connection
+
+if TYPE_CHECKING:
+    from mcp_server.readonly import ReadonlyPolicy
 
 # Plaintext prefix length kept for an indexed lookup. 8 chars of a
 # token_urlsafe(32) secret reveal nothing usable, while turning the lookup
@@ -37,20 +42,29 @@ class AuthContext:
     rate_limit: int | None = None  # 每分钟配额，None = 默认（rate_limit_pure）
     read_only: bool = False  # Explicit bot query connection boundary.
     warehouse_base_dir: str | None = None  # Bot data root, independent of code/CWD.
+    readonly_policy: ReadonlyPolicy | None = None  # Strict process policy, if any.
 
 
-def authenticate(authorization_header: str) -> AuthContext | None:
+def authenticate(
+    authorization_header: str, *, policy: ReadonlyPolicy | None = None
+) -> AuthContext | None:
     """验证 Bearer token，返回 AuthContext 或 None。
 
     快路径：按 token_prefix 索引等值查 → 最多一次 pbkdf2 校验。
     回退：token_prefix 为 NULL 的历史行（建 token_prefix 之前签发的），
     走小范围扫描；已吊销的行不在任一查询里，避免为死 token 付 pbkdf2。
+
+    ``policy`` is the explicit, opt-in strict mode.  When present, only the
+    pinned table row may authenticate; the legacy env shortcut and the
+    NULL-prefix fallback are not available.
     """
     if not authorization_header.startswith("Bearer "):
         return None
     raw = authorization_header[len("Bearer "):].strip()
     if not raw:
         return None
+    if policy is not None:
+        return _authenticate_strict(raw, policy)
     with master_connection() as conn:
         rows = conn.execute(
             _SELECT_COLS + "WHERE token_prefix = ? AND revoked_at IS NULL",
@@ -78,6 +92,51 @@ def authenticate(authorization_header: str) -> AuthContext | None:
                 rate_limit=row["rate_limit"],
             )
     return None
+
+
+def _authenticate_strict(raw: str, policy: ReadonlyPolicy) -> AuthContext | None:
+    """Table-only authentication pinned to one existing, finite-scope token."""
+    from mcp_server.readonly import ReadonlyPolicyError, readonly_connection
+
+    try:
+        policy.ensure_active()
+        with readonly_connection(policy.master_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                _SELECT_COLS + "WHERE id = ? AND token_prefix = ? AND revoked_at IS NULL",
+                (policy.token_id, token_prefix(raw)),
+            ).fetchone()
+    except (ReadonlyPolicyError, sqlite3.Error):
+        return None
+    if row is None or row["token_hash"] is None:
+        return None
+    if not check_password_hash(row["token_hash"], raw):
+        return None
+    try:
+        read_paths = json.loads(row["allowed_read_paths_json"] or "[]")
+        write_paths = json.loads(row["allowed_write_paths_json"] or "[]")
+        wh_codes = json.loads(row["allowed_warehouse_codes_json"] or "null")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(read_paths, list) or not all(isinstance(p, str) for p in read_paths):
+        return None
+    if not isinstance(write_paths, list) or write_paths:
+        return None
+    if (
+        not isinstance(wh_codes, list)
+        or not wh_codes
+        or not all(isinstance(code, str) and code in policy.warehouses for code in wh_codes)
+    ):
+        return None
+    return AuthContext(
+        token_id=row["id"],
+        allowed_read_paths=read_paths,
+        allowed_write_paths=[],
+        allowed_warehouses=list(wh_codes),
+        rate_limit=row["rate_limit"],
+        read_only=True,
+        readonly_policy=policy,
+    )
 
 
 def check_warehouse(ctx: AuthContext, warehouse_code: str) -> bool:
@@ -115,9 +174,18 @@ _current_auth: contextvars.ContextVar[AuthContext | None] = contextvars.ContextV
 )
 
 
-def set_current_auth(ctx: AuthContext | None) -> None:
-    """Publish the AuthContext of the in-flight request (called by AuthMiddleware)."""
-    _current_auth.set(ctx)
+def set_current_auth(ctx: AuthContext | None):
+    """Publish the AuthContext of the in-flight request (called by AuthMiddleware).
+
+    Returns the ContextVar token so a caller can restore the previous value in a
+    ``finally`` block; existing callers that ignore the return value are unchanged.
+    """
+    return _current_auth.set(ctx)
+
+
+def reset_current_auth(token) -> None:
+    """Restore the context that preceded the request-scoped ``token``."""
+    _current_auth.reset(token)
 
 
 def resolve_ctx() -> AuthContext:
@@ -127,14 +195,29 @@ def resolve_ctx() -> AuthContext:
     Bearer token and published it via set_current_auth() — use it, so that
     token's warehouse/path ACLs actually apply.
 
-    stdio transport (local Claude Code etc.): there is no ASGI scope and no
-    per-request token, so the process-level DAILYCHECK_MCP_TOKEN *is* the
-    identity. That fallback is a required path there, not a convenience.
+    Strict stdio transport: the process-level DAILYCHECK_MCP_TOKEN is
+    authenticated against the real agent_tokens table under the loaded policy;
+    it is not accepted as an unrestricted environment identity.
+
+    Standard stdio transport (local Claude Code etc.): there is no ASGI scope
+    and no per-request token, so the process-level DAILYCHECK_MCP_TOKEN *is*
+    the identity. That fallback is a required path there, not a convenience.
 
     Raises UnauthorizedError when neither source yields a context.
     """
     ctx = _current_auth.get()
     if ctx is not None:
+        return ctx
+    from mcp_server.readonly import get_current_policy
+    policy = get_current_policy()
+    if policy is not None:
+        from mcp_server.infra.errors import UnauthorizedError
+        token = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
+        if not token:
+            raise UnauthorizedError("no auth context; DAILYCHECK_MCP_TOKEN not set")
+        ctx = authenticate(f"Bearer {token}", policy=policy)
+        if ctx is None:
+            raise UnauthorizedError("invalid token")
         return ctx
     from mcp_server.infra.errors import UnauthorizedError
     token = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
