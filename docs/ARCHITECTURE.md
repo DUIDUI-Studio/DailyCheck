@@ -2901,6 +2901,59 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
 轮换、网络入口、服务安装、蓝绿部署与 Lucy 真实接收方验收仍由 Owner 拍板、Prod 执行；
 本次不读取既有凭据、不修改生产配置、不改变 CI/分支保护。
 
+### 9.7 一次性 Lucy 读取 runner（Issue #16，默认关闭；不构成生产激活）
+
+`scripts/mcp_lucy_read_once.py` 是承载上述严格策略的**有限接收客户端**，只有两个
+子命令，不是通用网关/查询客户端/凭据服务/队列：
+
+- `consume`（host-local）：只接受一份 operator 保护的 JSON plan（单 fd、no-follow、
+  私有权限、精确 schema、correlation + 完整 plan SHA-256、UTC 截止、1..60s 预算）。
+  plan 绑定仓库源码 repository/完整 git SHA、部署 anchor、唯一仓库与精确仓文件、
+  部署 fence 路径、active-business PID/start/master 文件绑定、单个 item 与显式
+  `field_consent`（完整单条 shape + `unit_cost`）。缺字段、未知字段、过期、越界、
+  换行/控制字符、缺失 consent 一律在产生任何效果前拒绝。
+- 生命周期固定为
+  `claimed -> preflight-rejected | reading -> cleaning -> succeeded | reconcile_required`。
+  每次 correlation 在 operator 指定目录原子创建**一次**、fsync 的非秘密 claim
+  receipt；重复调用在创建任何 token/读取前被拒绝，receipt 永不删除/重置。中断的
+  `reading/cleaning` 只能由 operator 按 receipt 对账，runner 不会自动重读。
+- preflight 依次取得既有部署 fence 的**共享** `flock`（只打开既有文件，不创建/截断/
+  清除锁）、校验源码 HEAD + 干净子树 + 新鲜进程 import 位置、部署 anchor 的
+  `source_sha`/`release_id`/`deployment_root`（master/warehouse/fence 必须在其内）、
+  active-business PID/start 与 master fd 绑定。fence 忙、anchor/source 不符、绑定
+  不符均在签发凭据前失败。生产模式仅 Linux；非 Linux 的 synthetic plan 使用**显式
+  标注**的 surrogate（`ps` + `lsof`），Linux CI 覆盖真实 `/proc` 检查。
+- 通过 preflight 后，runner 才用既有 `agent_tokens` schema 新建**唯一**一条 identity：
+  name 由 correlation 派生、内存生成随机 secret、只含
+  `GET /api/v1/warehouses` + `GET /api/v1/items` 两个 read path、空 write path、
+  单一仓库、rate limit；不存/不返回明文，不触碰既有票据。policy 文件 0600 落在
+  0700 临时目录，child env 只注入本次 token 与一个**每任务临时** `DAILYCHECK_SECRET_KEY`
+  （非 Web 进程、不读既有 env/不重启服务）。
+- MCP 调用固定为 `initialize -> tools/list（恰好 3 项）-> warehouse_list（恰好 1 仓）
+  -> items_detail（恰好 1 item）`；使用公开 SDK `ClientSession`/`stdio_client`，仅以
+  作用域内 observer 观察 SDK spawn seam 并返回真实 child 对象（不替换全局
+  `subprocess.Popen`）。超时/异常时 shielded 清理只终止本次拥有的 child/session，
+  记录实际 pid/start/returncode/wait/ECHILD 证据。业务 `TextContent` JSON 即使
+  `isError=false` 也拒绝 `error` payload。
+- 清理顺序：只吊销本次新建 identity 并 re-read 证明，child 已 wait，删除自有
+  policy/temp，最后释放 fence。任一步失败 → 非零结构化 failure、不返回业务成功、
+  保留 claim barrier 并要求 operator 对账。既有 schema 无全局 TTL，因此该 identity
+  只由严格 policy 截止 + 已验证吊销约束；父进程在吊销前意外死亡属于恢复要求，
+  不是有保证的全局过期。
+- `relay`（Mac）：读取 operator 保护的 relay request，要求 request 内提供的 SSH
+  public key 指纹匹配、host alias 固定为 `wdg_vps`、本地 `ssh -G` 解析的
+  destination/port 与 request 一致；仅创建任务内 0600 known_hosts，固定
+  `StrictHostKeyChecking=yes`、`UpdateHostKeys=no`、`BatchMode=yes`、禁用
+  forwarding/agent-forward/X11/PTY/ControlMaster/ProxyCommand，执行**一条**固定
+  remote `consume` 命令。hostkey/EPERM/超时/不完整结果一律失败关闭，不降级、不换
+  主机、不重试；超时是 unknown，不是成功。
+- relay request 里的公钥/指纹 provenance 是 Owner/Prod 前置条件，runner 不做
+  `ssh-keyscan`、不自动信任、不改全局 SSH 配置。plan/receipt 中的 Owner 引用只是
+  审计引用，**JSON 布尔值本身不是 Owner 批准**；OS 保护的 operator plan 与后续
+  Owner/Prod dispatch 才提供授权。生产 fence/anchor/data/identity 的实际取值当前
+  未知，必须由未来授权的 Prod operator 按真实部署契约提供并复核；本地 synthetic
+  证明不建立生产映射。业务结果只交给授权接收方/Owner，不进入公开 PR/Slack。
+
 ## 10. 业务领域模型
 
 ### 10.1 仓库类型
@@ -3567,6 +3620,16 @@ Issue #16 的 `tests/test_mcp_readonly_policy.py`、`tests/mcp_server/test_proto
 三工具成功值、全部写/非首期/未知工具拒绝、精确参数/类型、过期/撤销/env 短路、token scope、
 metadata 跨仓/逃逸、legacy/不兼容/缺库/WAL 夹具、连接级 UPDATE/DDL/ATTACH 拒绝与文件字节不变量；
 策略默认关闭，标准模式 32 项工具与既有 wire 契约由原回归继续覆盖。
+
+Issue #16 的 `tests/test_mcp_lucy_read_once.py` 以**本地合成** master/warehouse、真实 holder
+进程、真实 SDK stdio child 与真实 claim/fence 覆盖一次性 runner：单 item 成功及 child
+pid/start/returncode/wait、既有票据行与仓文件字节不变量、重复 plan 的 replay 拒绝、
+hash/correlation/expiry/source/anchor/consent/unsafe-path/fence-busy 在签发前失败、
+父进程拥有的 child 超时清理、吊销失败不返回成功且保留 barrier、输出 canary/raw token/
+token hash 不泄漏、恶意换行/路径无副作用；relay 以 PATH 注入的 hermetic fake ssh 覆盖
+hostkey 指纹/缺失 key/alias 目标不符/EPERM/超时/远端 reconcile 的失败关闭与无降级。
+Linux CI 另跑真实 `/proc` PID/start/master-fd 绑定用例；非 Linux 的 synthetic binding
+在结果中显式标注为 surrogate。测试不连接生产、不读取既有凭据/SSH 配置。
 
 Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
 `selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时

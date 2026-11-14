@@ -209,6 +209,61 @@ This policy is **off by default and does not activate production access**. Secur
 provisioning of the bearer token, network entry, deployment, and real receiver
 acceptance remain Owner/Prod decisions under `docs/agent-framework/workflow.md`.
 
+## One-shot Lucy read runner (Issue #16, not activated)
+
+`scripts/mcp_lucy_read_once.py` is the finite receiving client that consumes the
+strict policy above. It has exactly two subcommands and is not a gateway,
+query client, credential service, or job queue.
+
+- `consume` runs one operator-owned, hash-pinned plan on the host. The plan
+  binds the repository and full git SHA, deployment anchor, one warehouse and
+  its exact file, the deployment fence path, the active-business PID/start and
+  master file binding, one item, and explicit `field_consent` for the complete
+  single-item shape **including `unit_cost`**. Missing/unknown fields, a stale
+  UTC deadline, a changed hash/correlation, unsafe paths, or denied consent fail
+  before any identity or read.
+- One durable non-secret claim receipt per correlation is created atomically and
+  fsynced before any credential exists. The same plan can never run twice; a
+  claimed attempt is never reset. An interrupted attempt stays
+  `reconcile_required` for the operator and is not retried automatically.
+- Preflight takes a **shared** lock on the existing deployment fence (the file
+  must already exist; the runner never creates, truncates, or clears a lock),
+  then verifies the source HEAD/clean tree, the deploy anchor's source/release
+  and deployment root, and the active-business PID/start/master-fd binding.
+  Production consume is Linux-only; a non-Linux synthetic plan uses a clearly
+  labeled surrogate and Linux CI covers the real `/proc` path.
+- Only after preflight does the runner create one temporary `agent_tokens` row:
+  correlation-derived name, random secret held in memory, exactly
+  `GET /api/v1/warehouses` and `GET /api/v1/items`, no write paths, one warehouse,
+  and a rate limit. Existing identities are untouched; no plaintext is stored
+  or returned. The non-secret policy file is 0600 in a 0700 temp directory, and
+  the child environment receives only this job's token plus a fresh per-job
+  `DAILYCHECK_SECRET_KEY` (no existing web/MCP secret is read).
+- The child is the real MCP SDK stdio client. Calls are fixed:
+  `initialize -> tools/list (exactly 3) -> warehouse_list (exactly 1) ->
+  items_detail (exactly 1)`. The result carries one item, the MCP tool/argument
+  metadata, actual child pid/start/returncode/wait evidence, and cleanup proof.
+  Token revocation is proven by commit + re-read; temp files are removed and the
+  fence is released last. Any cleanup failure returns a non-zero
+  `reconcile_required` result with no business success.
+- The existing token schema has no universal expiry. This job bounds its
+  identity with the strict policy deadline and verified revocation; unexpected
+  parent death before revocation is an operator recovery requirement, not a
+  guaranteed global TTL.
+- `relay` (Mac) reads a protected relay request, requires the supplied SSH
+  public key to match the trusted fingerprint, fixes the host alias to
+  `wdg_vps`, resolves the alias destination/port locally and refuses a mismatch,
+  writes only a task-local 0600 known_hosts, and runs one fixed remote `consume`
+  command with `StrictHostKeyChecking=yes`, `UpdateHostKeys=no`,
+  `BatchMode=yes`, no forwarding/X11/PTY/ControlMaster, and no fallback after a
+  host-key denial, EPERM, or timeout. Key provenance remains an Owner/Prod
+  prerequisite; the runner never runs `ssh-keyscan` or changes global SSH config.
+- A plan or request is a protected operator artifact, not self-authenticating
+  Owner approval. The concrete production fence/anchor/data/identity values are
+  still unknown and must be supplied and revalidated by the future authorized
+  Prod operator. Business results go only to the authorized receiver/owner,
+  never to a public PR or chat channel.
+
 ## Available Tools
 
 The live server registers **32 tools**: 14 inventory/document/analysis tools,
