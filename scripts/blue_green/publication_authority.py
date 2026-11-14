@@ -36,8 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import deploy_state
-
+from scripts.blue_green import deploy_state
 from scripts.hosting import HostingError
 
 BINDINGS_FILENAME = "bindings.json"

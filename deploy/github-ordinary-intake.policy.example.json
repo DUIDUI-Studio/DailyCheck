@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "repository_id": 1448986421,
+  "repository": "DUIDUI-Studio/DailyCheck",
+  "mode": "quarantined",
+  "since_ms": 0,
+  "review_targets": [],
+  "automatic_pr_range": null,
+  "excluded_open_prs": [15, 17, 18],
+  "review_actor_ids": []
+}

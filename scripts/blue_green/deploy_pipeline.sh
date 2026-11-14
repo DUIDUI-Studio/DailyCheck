@@ -313,7 +313,8 @@ print(root, flush=True)
 bg = "scripts/blue_green/"
 paths = [bg + name for name in ("deploy_state.py", "deploy_report.py", "deploy_merge.py",
                                "deploy_triage_pure.py", "publication_authority.py")]
-paths += ["scripts/hosting.py", "scripts/prod_agent/github_readiness.py"]
+paths += ["scripts/hosting.py", "scripts/prod_agent/github_readiness.py",
+          "scripts/prod_agent/github_intake.py"]
 required = {bg + "deploy_state.py"}
 if (source / (bg + "deploy_report.py")).is_file():
     required.update([bg + "deploy_report.py", bg + "deploy_triage_pure.py",

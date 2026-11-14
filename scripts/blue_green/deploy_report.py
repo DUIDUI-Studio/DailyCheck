@@ -98,6 +98,7 @@ from scripts.hosting import (  # noqa: E402
     provider,
     require_shadow_path,
 )
+from scripts.prod_agent import github_intake  # noqa: E402
 
 MARKER = "<!-- deploy-report:v1 -->"
 DEFAULT_TOKEN_FILE = "/etc/dailycheck/gitea-token"
@@ -401,7 +402,9 @@ def append_event(event: dict[str, Any]) -> bool:
         except HostingError:
             print("[deploy-report] GitHub event log requires shadow isolation", file=sys.stderr)
             return False
-        event = {**event, "hosting_provider": "github", "intake_mode": "shadow", "repo_full_name": _repo()}
+        event = {**event, "hosting_provider": "github",
+                 "intake_mode": "ordinary-audit" if github_intake.enabled() else "shadow",
+                 "repo_full_name": _repo()}
     line = json.dumps(event, ensure_ascii=False) + "\n"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -425,6 +428,7 @@ def push_inbox_event(
     nxt: str,
     comment_id: int = 0,
     log_path: str = "",
+    publication_rc: int = 0,
 ) -> bool:
     """把部署结果投进 prod-agent 的唤醒队列（Hermes ``inbox.jsonl``）。
 
@@ -469,10 +473,22 @@ def push_inbox_event(
     if provider() is Provider.GITHUB:
         payload.update(hosting_provider="github", intake_mode="shadow")
         try:
-            if not github_ordinary_enabled():
+            if github_intake.enabled():
+                facts = github_intake.outcome_facts(pr, sha)
+                # Forward only typed identity/result facts. Private log/reasons stay private.
+                payload = {k: payload[k] for k in (
+                    "event", "action", "received_at_ms", "repo_full_name", "pr_number",
+                    "pr_head_sha", "pr_url", "pr_base_ref")}
+                payload.update(facts, delivery_id=f"outcome-{facts['outcome_id']}-{facts['generation']}",
+                               publication_rc=publication_rc,
+                               feedback_action="reconcile_report" if facts["publication_state"] != "linked"
+                               else "record_success" if facts["deploy_rc"] == 0 else "route_failure",
+                               deployment_actionable=False)
+                payload = github_intake.seal(payload, "outcome")
+            elif not github_ordinary_enabled():
                 require_shadow_path(p)
-        except HostingError:
-            print("[deploy-report] GitHub production intake unsupported", file=sys.stderr)
+        except (HostingError, OSError, ValueError, TypeError) as exc:
+            print(f"[deploy-report] GitHub feedback unavailable; reconcile required: {type(exc).__name__}", file=sys.stderr)
             return False
     line = json.dumps(payload, ensure_ascii=False) + "\n"
     try:
@@ -851,6 +867,9 @@ def _cmd_write_github(args, tail: str, authority):
         try:
             outcome_info = publication_authority.load_durable_outcome(
                 deploy_state.state_dir(), args.pr, args.sha)
+            if github_intake.enabled():
+                # Admission never turns historical publication recovery into a new ordinary send.
+                github_intake.outcome_facts(args.pr, args.sha)
         except (HostingError, OSError, ValueError, TypeError) as exc:
             resolve_error = exc
 
@@ -993,6 +1012,7 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
     pushed = push_inbox_event(
         args.pr, args.sha, tr, align, nxt, comment_id,
         str(Path(args.log).resolve()) if args.log else "",
+        publication_rc=write_rc,
     )
     if pushed:
         message = "GitHub private inbox recorded; poll reconciliation required" \

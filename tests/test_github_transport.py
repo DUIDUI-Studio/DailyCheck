@@ -934,19 +934,17 @@ def test_ordinary_credential_is_file_only_separate_and_transport_is_finite(api, 
     assert not api.log()
 
 
-def test_ordinary_poller_cli_uses_readiness_and_missing_auth_alerts(api, tmp_path, monkeypatch):
+def test_ordinary_poller_cli_keeps_unactivated_intake_inert(api, tmp_path, monkeypatch):
     api.write(ordinary(api, tmp_path, monkeypatch))
     root = Path(__file__).resolve().parents[1]
-    # No production checkout: unavailable catchup must alert, never silently mean zero work.
+    # Intake OFF must precede provider calls and any mutation-capable cron agent.
     monkeypatch.setenv("DAILYCHECK_PROD_REPO", str(tmp_path / "absent-prod"))
     command = [sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")]
     result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0 and "GitHub ordinary Prod" in result.stdout
-    assert f"head={SHA} base={BASE} checks=ready" in result.stdout
-    assert "_catchup_block" in result.stdout and "异常" in result.stdout
+    assert result.returncode == 0 and result.stdout == "" and api.log() == []
     monkeypatch.delenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE")
     missing = subprocess.run(command, capture_output=True, text=True, timeout=30)
-    assert missing.returncode == 0 and "异常" in missing.stdout and "checks=ready" not in missing.stdout
+    assert missing.returncode == 0 and missing.stdout == "" and api.log() == []
     proof("poll-cli", {"native_exit": result.returncode, "stdout": result.stdout,
                        "missing_auth_stdout": missing.stdout})
 
@@ -997,8 +995,8 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
     result = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert '"status": "behind"' in result.stdout and main in result.stdout
-    assert f"head={SHA} base={BASE} checks=ready" in result.stdout
+    assert '"status": "behind"' not in result.stdout and "checks=ready" not in result.stdout
+    assert api.log() == [], "Inactive intake cannot query/wake the ordinary provider"
     assert "report publication failed or unconfirmed" in result.stdout
     proof("poll-catchup", {"native_exit": result.returncode, "stdout": result.stdout,
                            "deployed": deployed, "main": main})
@@ -1042,7 +1040,9 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
               "gitea_command": attempted[-1], "helper_args": json.loads(receipt.read_text())})
     # A broken schedule helper can exit zero without producing its required facts.
     (bg / "deploy_state.py").write_text("raise SystemExit(0)\n")
-    missing = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],
+    missing = subprocess.run([sys.executable, "-B", "-c",
+                             "from scripts.prod_agent.pr_poll import _catchup_block; print(_catchup_block())"],
+                             cwd=root,
                              capture_output=True, text=True, timeout=30)
     assert missing.returncode == 0 and "invalid or absent facts" in missing.stdout
     proof("poll-no-output", {"native_exit": missing.returncode, "stdout": missing.stdout})

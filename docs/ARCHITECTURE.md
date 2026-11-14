@@ -1763,11 +1763,42 @@ shadow / publication / fencing 兼容回归保留；全仓测试由 Coordinator 
 GitHub main push 跳过冗余的 full test job；H/G 两个 required context 与 reports 复用、Gitea
 push 行为不变，workflow_dispatch 仍可手动触发。本次未改分支保护、发布或部署设置。
 
-**Ordinary intake 回归基线（2026-11-14，source preparation）**：
+**Ordinary intake（2026-11-14，source preparation；默认 OFF）**：
+`scripts/hosting.py` 保持 B 的字节和 producer pin 不变，其原 `require_production_work` 继续
+拒绝所有 GitHub 工作，且不导入 ordinary 模块。只有新接入 consumer 调用独立
+`github_intake.require_work`，其余原 caller 不扩权；新模块不进入受信 CI producer import closure。
 `tests/test_github_ordinary_intake.py` 用实际 HTTP receiver、adapter/reducer/sender 进程和
 owned loopback GitHub/Hermes 端点复现：签名与 exact-H checks 有效，仍被
-`github_shadow_only` 拒绝（0 POST，期望 1）。拟新增默认 OFF、空目标集合的独立普通来源
-信封，保留历史 shadow 拒绝；源码验证不证明远端安装、路由或生产验收。
+`github_shadow_only` 拒绝（0 POST，期望 1）；回归 commit 保留此失败，修复后同一 consumer
+恰好收到一次请求。新增 `github_intake.py` 私有 HMAC 信封覆盖固定 github.com / 仓 ID
+1448986421 / DUIDUI-Studio/DailyCheck、阶段、epoch、policy hash、PR/full H；只由验签 receiver、
+实时 readiness reducer、durable reporter 及受审 cron 前门生成。仅切换 lane/env 不能升级
+历史无签名、shadow、旧 epoch 或撤销准入的 payload/SQLite row。receiver 限 1 MiB、严格 JSON、
+typed 仓 ID 和事件/action 白名单；发送给 router 的身份/结果字段不含 PR 标题、正文、日志路径。
+
+准入配置见 [`github-ordinary-intake.md`](agent-framework/github-ordinary-intake.md)。默认关闭、
+quarantine 空清单；Owner-protected policy 后续可选择有限 PR 区间的 automatic 模式，按稳定规则
+自动选择未来 current H，无须 Owner 逐 PR 手批。暂停 15/17/18 与原 failed-H/native fence 保留。
+CI exact-H 两项成功可唤醒 `dispatch_phase=prod_review`；预唤醒不要求尚未产出的 Prod approval，
+允许 GitHub 因缺审批显示 blocked，但核对保护/可信 checks/App/workflow/run 及当前 H/B，当前 H
+已有 CHANGES_REQUESTED 则不派发。candidate/merge 仍须原 Prod 独立审批与完整发布门禁。
+
+`github_dispatch.py` 是既有 cron 的有限前门，不 refresh、不创建 scheduler；纯
+`--policy-preflight` 在任何 refresh/API/claim 前校验策略，cron 随后复用同一 reducer DB、阶段
+去重与 Hermes routes。安装要求 cron `no_agent=true`，不再由巡检输出另起有修改职责的 agent。
+sender 还须原 claimed row 完整 payload 匹配，并原子写一次 send intent；202 仅记录
+awaiting_agent_receipt，丢响应/过期 claim 保留 delivery_unknown，均不自动重发或并发重唤醒。
+固定 numeric review actor 的正式 exact dispatched-H review 回读，可在 claim 时间与原 CI
+run/attempt 对齐后结束审查等待；仅 APPROVED/CHANGES_REQUESTED，且 actor 不得是 PR author。
+BLOCKER 允许修复后新 H 重新审查；旧 H 不重放。无证据保持 UNKNOWN；TTL 不证明进程退出。
+
+ordinary 结果由现有 publication authority/source binding/current generation/receipt 重新解析，
+且 outcome 时间不得早于激活 epoch，才签发 `result_reconcile` → dailycheck-deploy；旧 gen11
+或 shadow 报告不改名重发。typed public receipt 与私有诊断分离，publication 未 linked 显式
+unconfirmed，由原 poll `_report_block` 和 cron 对账报告显示；结果提示不许可 redeploy/grant。
+pipeline 的冻结 helper closure 增加该模块，避免 checkout/restore 后丢失 reporter 导入。
+上述源码验证不证明远端安装、router prompt、凭据刷新、保护对齐或生产验收；Gitea 与默认 shadow
+边界保持原行为。下文 shadow 路径限制适用于未显式激活 ordinary 的 GitHub。
 
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。

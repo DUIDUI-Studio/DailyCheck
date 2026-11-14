@@ -306,7 +306,7 @@ def _report_block() -> str:
             latest[(event.get("pr"), event.get("sha"))] = event
     failed = {(e.get("pr"), e.get("sha")) for e in latest.values() if e.get("publication_rc")}
     # Cleanup is best-effort: even a missing event/inbox must not hide an unlinked receipt.
-    state = deploy_state.load_state(deploy_state.state_dir())
+    state = deploy_state.load_state(deploy_state.state_dir(), strict=True)
     for anchor in (state.get("deployed") or {}, state.get("last_attempt") or {}):
         outcome_id = anchor.get("outcome_id")
         outcome = state.get("outcomes", {}).get(outcome_id) or {}
@@ -322,6 +322,20 @@ def _report_block() -> str:
 
 
 def main() -> int:
+    if github_ordinary_enabled():
+        from scripts.prod_agent.github_dispatch import main as dispatch_main
+
+        if os.environ.get("DAILYCHECK_GITHUB_INTAKE_ENABLED") == "1":
+            return dispatch_main()
+        # An unactivated intake cannot turn a cron summary into mutation authority.
+        # Retain outcome/publication observations while ordinary admission is OFF.
+        try:
+            block = _report_block()
+            if block:
+                print(block)
+        except Exception as exc:
+            print(_alert(f"report reconciliation unavailable: {type(exc).__name__}"))
+        return 0
     blocks = []
     for fn in (_catchup_block, _pr_block, _report_block):
         try:

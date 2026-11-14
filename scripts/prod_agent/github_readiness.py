@@ -41,7 +41,7 @@ class GitHubReadinessClient:
         self.required = required
         self.root = f"/repos/{self.config.repo}"
 
-    def _candidate(self, number: int, expected: str) -> Candidate:
+    def _candidate(self, number: int, expected: str, *, for_intake: bool = False) -> Candidate:
         pr = _object(self.client.get(f"{self.root}/pulls/{number}"))
         if _positive(pr.get("number")) != number or pr.get("state") != "open" or pr.get("draft") is not False:
             raise HostingError("pr_not_open_or_not_ready")
@@ -59,11 +59,16 @@ class GitHubReadinessClient:
         base_sha = base.get("sha")
         if not isinstance(base_sha, str) or not _SHA.fullmatch(base_sha):
             raise HostingError("invalid_base_sha")
-        if pr.get("mergeable") is not True or pr.get("mergeable_state") not in {
+        allowed_states = {
             "clean",
             "unstable",
             "has_hooks",
-        }:
+        }
+        if for_intake:
+            # Missing Prod approval may block GitHub merging; it must not block waking Prod.
+            allowed_states.add("blocked")
+            self._intake_policy(number, expected)
+        if pr.get("mergeable") is not True or pr.get("mergeable_state") not in allowed_states:
             raise HostingError("not_mergeable")
         branch = _object(
             self.client.get(f"{self.root}/branches/{quote(self.config.base_ref, safe='')}")
@@ -73,6 +78,34 @@ class GitHubReadinessClient:
         if not isinstance(head.get("ref"), str) or not head["ref"]:
             raise HostingError("invalid_head_ref")
         return Candidate(number, expected, base_sha, head["ref"])
+
+    def _intake_policy(self, number: int, expected: str) -> None:
+        protection = _object(self.client.get(f"{self.root}/branches/main/protection"))
+        required = _object(protection.get("required_status_checks"))
+        checks = required.get("checks")
+        reviews = _object(protection.get("required_pull_request_reviews"))
+        count = _positive(reviews.get("required_approving_review_count"))
+        if (not isinstance(checks, list)
+                or _object(protection.get("enforce_admins")).get("enabled") is not True
+                or reviews.get("dismiss_stale_reviews") is not True or count < 1
+                or any(not isinstance(c, dict) or type(c.get("app_id")) is not int
+                       or c["app_id"] != self.config.actions_app_id for c in checks)
+                or {c.get("context") for c in checks} != set(self.required)
+                or any(c not in self.required for c in required.get("contexts", []))):
+            raise HostingError("github_required_protection_unproven")
+        latest = {}
+        for review in self.client.pages(f"{self.root}/pulls/{number}/reviews"):
+            ident = _positive(review.get("id"))
+            state = review.get("state")
+            if state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+                user = _positive(_object(review.get("user")).get("id"))
+                commit = review.get("commit_id")
+                if not isinstance(commit, str) or not _SHA.fullmatch(commit):
+                    raise HostingError("github_invalid_review")
+                if ident > latest.get(user, (0, "", ""))[0]:
+                    latest[user] = (ident, state, commit)
+        if any(state == "CHANGES_REQUESTED" and commit == expected for _, state, commit in latest.values()):
+            raise HostingError("github_review_blocked")
 
     def _latest_run(self, candidate: Candidate, workflow_id: int) -> dict:
         runs = self.client.pages(
@@ -126,6 +159,7 @@ class GitHubReadinessClient:
         *,
         repo: str | None = None,
         expected_base_sha: str | None = None,
+        for_intake: bool = False,
     ) -> dict:
         result = {
             "ready": False,
@@ -150,7 +184,7 @@ class GitHubReadinessClient:
             ):
                 raise HostingError("invalid_candidate")
             self.client.verify_repository()
-            candidate = self._candidate(pr_number, expected_head_sha)
+            candidate = self._candidate(pr_number, expected_head_sha, for_intake=for_intake)
             result.update(
                 actual_head=candidate.head, base_sha=candidate.base, pr_state="open", mergeable=True
             )
@@ -258,7 +292,7 @@ class GitHubReadinessClient:
                 for k in ("id", "run_attempt", "status", "conclusion", "updated_at")
             ):
                 raise HostingError("run_changed")
-            if self._candidate(pr_number, expected_head_sha) != candidate:
+            if self._candidate(pr_number, expected_head_sha, for_intake=for_intake) != candidate:
                 raise HostingError("base_changed")
             result["freshness"] = "pr_head_base_and_latest_run_reread"
             result["verified_at_ms"] = int(time.time() * 1000)

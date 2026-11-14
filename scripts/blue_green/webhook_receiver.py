@@ -65,7 +65,9 @@ from scripts.hosting import (  # noqa: E402
     Provider,
     provider,
     require_shadow_path,
+    strict_json_loads,
 )
+from scripts.prod_agent.github_intake import admitted, enabled, policy, seal  # noqa: E402
 
 _GITHUB_INTAKE_LOCK = threading.Lock()
 
@@ -312,19 +314,24 @@ def _build_status_record(delivery_id: str, data: dict, pr: dict) -> dict:
 
 
 def _github_webhook(payload: bytes):
-    """Native GitHub events are hints in a separately configured shadow inbox."""
+    """Authenticate hints; ordinary admission never upgrades existing shadow rows."""
     try:
         config = HostingConfig.from_environment()
-        shadow = require_shadow_path(INBOX_PATH)
-        require_shadow_path(PROCESSED_PATH)
-        if (INBOX_PATH.resolve() != (shadow / "inbox.jsonl").resolve()
-                or PROCESSED_PATH.resolve() != (shadow / "processed.jsonl").resolve()):
-            abort(503, "GitHub requires isolated shadow intake")
-        data = json.loads(payload)
+        ordinary = enabled()
+        rule = policy() if ordinary else None
+        if not ordinary:
+            shadow = require_shadow_path(INBOX_PATH)
+            require_shadow_path(PROCESSED_PATH)
+            if (INBOX_PATH.resolve() != (shadow / "inbox.jsonl").resolve()
+                    or PROCESSED_PATH.resolve() != (shadow / "processed.jsonl").resolve()):
+                abort(503, "GitHub requires isolated shadow intake")
+        data = strict_json_loads(payload)
         if not isinstance(data, dict):
             abort(400, "invalid payload")
+        if ordinary and (data.get("intake_mode") == "shadow" or "ordinary_provenance" in data):
+            abort(400, "historical intake payload")
         repository = data.get("repository")
-        if not isinstance(repository, dict) or repository.get("id") != config.repo_id or repository.get("full_name") != config.repo:
+        if not isinstance(repository, dict) or type(repository.get("id")) is not int or repository.get("id") != config.repo_id or repository.get("full_name") != config.repo:
             abort(400, "repository mismatch")
         event = request.headers.get("X-GitHub-Event", "")
         action = data.get("action")
@@ -349,6 +356,12 @@ def _github_webhook(payload: bytes):
             return jsonify(status="ignored", reason="event"), 200
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
             abort(400, "invalid head sha")
+        if ordinary:
+            if event == "pull_request" and (type(data.get("number")) is not int or data["number"] <= 0):
+                abort(400, "invalid pull request number")
+            if (rule.pr_range is None and not any(rule.accepts(pr, sha) for pr, head in rule.targets if head == sha)
+                    or event == "pull_request" and not rule.accepts(data["number"], sha)):
+                return jsonify(status="ignored", reason="ordinary_not_admitted"), 200
         delivery = request.headers.get("X-GitHub-Delivery", "")
         if not re.fullmatch(r"[A-Za-z0-9-]{1,128}", delivery):
             abort(400, "invalid delivery id")
@@ -376,6 +389,8 @@ def _github_webhook(payload: bytes):
                     continue
                 if type(pr.get("number")) is not int or pr["number"] <= 0:
                     raise HostingError("invalid_pr_number")
+                if ordinary and not admitted(pr["number"], sha):
+                    continue
                 matches.append(pr)
             if not matches:
                 return jsonify(status="ignored", reason="no_current_pr"), 200
@@ -396,8 +411,18 @@ def _github_webhook(payload: bytes):
                     record["source_event"] = event
                     record["check_suite_id"] = source.get("id")
                 record.update(hosting_provider="github", intake_mode="shadow", source_delivery_id=delivery, pr_base_sha=pr["base"].get("sha"))
+                if ordinary:
+                    # PR text is never router authority. The hint carries identity only.
+                    record = {k: record[k] for k in (
+                        "delivery_id", "event", "action", "received_at_ms", "repo_full_name",
+                        "pr_number", "pr_head_sha", "pr_base_ref", "pr_base_sha", "pr_url",
+                        "source_delivery_id")}
+                    record.update(source_event=event, source_action="status" if event == "status" else action,
+                                  check_conclusion="success" if event != "pull_request" else "",
+                                  pr_url=config.pr_url(pr["number"]))
+                    record = seal(record, "receiver")
                 _append_inbox(record)
-        return jsonify(status="queued", delivery_id=delivery, mode="shadow"), 202
+        return jsonify(status="queued", delivery_id=delivery, mode="ordinary" if ordinary else "shadow"), 202
     except (HostingError, OSError):
         abort(503, "hosting lookup unavailable")
     except (ValueError, UnicodeError):
@@ -410,6 +435,11 @@ def _github_webhook(payload: bytes):
 @app.post("/webhook")
 def webhook():
     _require_secret()
+    try:
+        if provider() is Provider.GITHUB:
+            request.max_content_length = 1_048_576
+    except HostingError:
+        abort(503, "invalid hosting configuration")
     # 1. HMAC 验签
     signature = request.headers.get("X-Hub-Signature-256", "")
     payload = request.get_data()

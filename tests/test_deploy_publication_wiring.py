@@ -181,6 +181,9 @@ def sandbox(tmp_path, loopback):
         shutil.copy2(BG_DIR / name, sb / name)
         (sb / name).chmod(0o755)
     shutil.copy2(REPO_ROOT / "scripts/hosting.py", tmp_path / "scripts/hosting.py")
+    reader = tmp_path / "scripts/prod_agent"
+    reader.mkdir()
+    shutil.copy2(REPO_ROOT / "scripts/prod_agent/github_intake.py", reader / "github_intake.py")
     calls = tmp_path / "calls.txt"
     for name in ("up.sh", "verify.sh", "promote.sh", "switch.sh"):
         path = sb / name

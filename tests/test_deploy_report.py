@@ -628,6 +628,9 @@ def pipeline_sandbox(tmp_path, monkeypatch):
         shutil.copy2(BG_DIR / name, sb / name)
         (sb / name).chmod(0o755)
     shutil.copy2(BG_DIR.parent / "hosting.py", tmp_path / "scripts/hosting.py")
+    reader = tmp_path / "scripts/prod_agent"
+    reader.mkdir()
+    shutil.copy2(BG_DIR.parent / "prod_agent/github_intake.py", reader / "github_intake.py")
     # The report now imports the shared hosting boundary from its repository root.
     monkeypatch.setenv("PYTHONPATH", str(BG_DIR.parents[1]))
     calls = tmp_path / "calls.txt"
