@@ -2934,9 +2934,13 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
   operator 显式选定的解释器及已安装依赖单独受信；顶层 `.venv`/`node_modules` 仅当
   禁用 site startup 的 isolated metadata query 确认它是该解释器实际 ordinary environment
   目录才豁免（Python <=3.13 同时核对选定 executable 的 ordinary `pyvenv.cfg`）；
-  basename、嵌套假依赖目录或指向受信根的链接不能获得信任。普通 DB/log 保持可用、
-  字节不变；不声称抵御 preflight 后任意并发替换或解释器自身被改写。
-  首个 pilot 仅选显式获批的 regular-file 仓，`wh_002` 外链 symlink 继续拒绝。
+  basename、嵌套假依赖目录或指向受信根的链接不能获得信任。受信依赖根以外源码树中
+  **所有 symlink** 均拒绝，包括未选中仓的普通数据文件链接。普通 DB/log 的兼容与
+  字节不变仅指 regular 文件；不声称抵御 preflight 后任意并发替换或解释器自身被改写。
+  首个 pilot 仍须显式获批的 regular-file 仓，但仅选普通仓并不足以就绪：已测量的
+  `wh_002.db` 外链形状会阻止同一 checkout 中任何普通仓 pilot，原地生产试读明确
+  **BLOCKED**。真实试读还需另行具体批准的无链接执行检出或布局补救；本 Task 不批准
+  生产缓存/链接清理、布局变更或临时 source 部署。
   再核对 active-business PID/start 与 master fd 绑定。fence 忙、anchor/source 不符、绑定
   不符均在签发凭据前失败。生产模式仅 Linux；非 Linux 的 synthetic plan 使用**显式
   标注**的 surrogate（`ps` + `lsof`），Linux CI 覆盖真实 `/proc` 检查。

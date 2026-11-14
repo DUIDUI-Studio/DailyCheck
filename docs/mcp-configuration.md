@@ -242,8 +242,10 @@ query client, credential service, or job queue.
   is that interpreter's actual ordinary environment directory, as reported by
   an isolated interpreter metadata query with site startup disabled (and the
   selected executable's ordinary `pyvenv.cfg` for Python <=3.13). A basename, nested fake dependency
-  root or link into a trusted root grants no trust. Ordinary DB/log files stay
-  usable and untouched. This admission does not protect against concurrent
+  root or link into a trusted root grants no trust. Every symlink in the source
+  tree outside trusted dependency roots is refused, including ordinary data-file
+  links for warehouses that the plan does not select. Ordinary DB/log compatibility
+  and byte invariance apply only to regular files. This admission does not protect against concurrent
   arbitrary filesystem replacement after preflight or a rewritten interpreter.
   Preflight also checks the active-business PID/start/master-fd binding.
   `deploy_anchor` now contains exactly `state_dir` and `source_sha`; no separate
@@ -258,8 +260,13 @@ query client, credential service, or job queue.
   without a release PR, malformed/missing/unknown state, or an authored
   `source_sha/release_id/deployment_root` substitute fails closed. These are
   deployment facts, never proof of Owner approval or a live process identity.
-  The first pilot requires an explicitly approved regular-file warehouse;
-  external symlink mappings such as `wh_002` remain fail-closed.
+  The first pilot requires an explicitly approved regular-file warehouse, but
+  selecting one alone is insufficient. The measured `wh_002.db` symlink shape
+  blocks every ordinary-warehouse pilot in that same checkout, so an in-place
+  production read is **BLOCKED**. A real pilot also needs a separately and
+  specifically approved link-free execution checkout or another approved layout
+  remedy. This Task authorizes no production cache/link cleanup, layout change,
+  or temporary source deployment.
   Production consume is Linux-only; a non-Linux synthetic plan uses a clearly
   labeled surrogate and Linux CI covers the real `/proc` path.
 - Only after preflight does the runner create one temporary `agent_tokens` row:
