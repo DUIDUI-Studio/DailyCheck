@@ -1272,6 +1272,9 @@ beforeOid / 非 force FF；[indirect merges](https://docs.github.com/en/pull-req
 说明相同 head 进入 base 可标 merged，但该标记不证明保护条件。故保留独立前置和
 真实 post-read，文档不替代平台验收。安全禁用配置见 `deploy/github-production.env.example`。
 
+Issue14 release credential admission regression is specified in
+`tests/test_release_credentials.py`; reusable operator-bound entry is pending implementation.
+
 `DAILYCHECK_HOSTING_PROVIDER` 缺省为 `gitea`，现有生产地址、凭据路径、部署阶段与
 队列不变。`scripts/hosting.py` 定义显式 `Provider` / `AccessRole` / `HostingConfig`，
 集中 GitHub REST 认证、JSON 响应、分页与错误边界。未知 provider、缺凭据、错误 host/repo、
