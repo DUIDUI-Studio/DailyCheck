@@ -915,7 +915,10 @@ def _cmd_write_github(args, tail: str, authority):
                 payload_sha256=digest, binding_sha256=binding.binding_sha256)
             comment_id = publish_public(facts, context, authority=adapter)
     except (HostingError, OSError, ValueError, TypeError) as exc:
-        print(f"[deploy-report] public publication blocked: {type(exc).__name__}",
+        reason = str(exc) if isinstance(exc, HostingError) else type(exc).__name__
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", reason) is None:
+            reason = type(exc).__name__
+        print(f"[deploy-report] public publication blocked: {reason}",
               file=sys.stderr)
         write_rc = 1
     return comment_id, tr, align, fetch_error, nxt, write_rc

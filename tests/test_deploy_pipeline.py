@@ -904,6 +904,14 @@ else: os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
     for name in ("deploy_triage_pure.py", "publication_authority.py"):
         shutil.copy2(BG_DIR / name, sb["dir"] / name)
     shutil.copy2(BG_DIR.parent / "hosting.py", sb["tmp"] / "scripts/hosting.py")
+    # Public PR and private source numbers are deliberately different.
+    (sb["state"] / "bindings.json").write_text(json.dumps({"version": 1, "bindings": [{
+        "pr": 42,
+        "public": {"provider": "github", "host": "github.com", "repository_id": 1448986421,
+                   "repository": "DUIDUI-Studio/DailyCheck"},
+        "source": {"provider": "github", "host": "github.com", "repository_id": 1449125557,
+                   "repository": "DUIDUI-Studio/DailyCheck-ops", "kind": "issue", "number": 7},
+    }]}))
     extra, _ = _observe_tools(sb)
     sb["ordinary_env"] = {**_cand_env(sb), **extra,
         "PATH": str(tools) + os.pathsep + os.environ["PATH"], "PYTHON": str(python),

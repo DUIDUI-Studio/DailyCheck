@@ -191,6 +191,27 @@ elif [[ "${DRY_RUN}" -eq 0 ]]; then
   "${PY}" "${DS}" process-owned || die 11 "部署进程锁描述符无效"
 fi
 
+# Resolve the operator-owned private source before acquire/candidate/traffic stages.
+# The reusable credential entry additionally checks this before startup renewal.
+if [[ "${GITHUB_ORDINARY}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
+  if ! "${PY}" - "${REPO_ROOT}" "${STATE_DIR}" "${PR}" <<'PY_SOURCE_ADMISSION'
+import sys
+from pathlib import Path
+root, directory, pr = sys.argv[1:]
+sys.path[:0] = [str(Path(root) / "scripts/blue_green"), root]
+import deploy_state
+from publication_authority import resolve_source_binding
+from scripts.hosting import HostingError
+try:
+    with deploy_state.state_transaction(Path(directory)):
+        resolve_source_binding(Path(directory), int(pr))
+except HostingError as exc:
+    print("[pipeline] source admission blocked: " + str(exc), file=sys.stderr)
+    raise SystemExit(25) from None
+PY_SOURCE_ADMISSION
+  then die 25 "private source admission failed before candidate preparation"; fi
+fi
+
 log "PR #${PR} sha=${SHA:0:12} session=${SESSION} dry-run=${DRY_RUN} observe=${OBSERVE_MIN}min"
 log "log=${LOG}"
 

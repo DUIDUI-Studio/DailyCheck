@@ -602,13 +602,40 @@ def test_dry_run_mints_no_outcome_and_publishes_nothing(sandbox):
 
 
 def test_missing_binding_blocks_publication_but_keeps_private_outcome(sandbox):
+    _prepare(sandbox)
     (sandbox["state"] / "bindings.json").unlink()
-    proc = _success(sandbox)
-    assert "PR 回写失败" in proc.stdout or "public publication blocked" in proc.stderr + proc.stdout
+    proc = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                   "--log", str(sandbox["tmp"] / "pipeline.log"))
+    assert proc.returncode == 1
+    assert "private_source_binding_missing" in proc.stderr
     _, _, outcome = _outcome(sandbox)
     assert outcome is not None, "the durable receipt must survive a blocked publication"
     assert not sandbox["api"].posts
     assert PRIVATE_CANARY in _private_text(sandbox)
+
+
+@pytest.mark.parametrize("damage,reason", [
+    ("missing", "private_source_binding_missing"),
+    ("ambiguous", "private_source_binding_ambiguous"),
+    ("wrong", "private_source_binding_invalid"),
+])
+def test_source_admission_precedes_acquire_and_candidate_stages(sandbox, damage, reason):
+    path = sandbox["state"] / "bindings.json"
+    if damage == "missing":
+        path.unlink()
+    else:
+        document = bindings()
+        if damage == "ambiguous":
+            document["bindings"] *= 2
+        else:
+            document["bindings"][0]["source"]["repository_id"] = 1448986421
+        path.write_text(json.dumps(document))
+    proc = _pipe(sandbox, str(PR), SHA)
+    assert proc.returncode == 25, proc.stdout + proc.stderr
+    assert reason in proc.stderr
+    assert not sandbox["calls"].exists()
+    assert not sandbox["api"].requests
+    assert not _state(sandbox).get("lock") and not _state(sandbox).get("outcomes")
 
 
 def test_gitea_deployment_cannot_authorize_github_pr(sandbox):
@@ -830,11 +857,15 @@ def test_changed_binding_invalidates_an_existing_publication_claim(sandbox):
 
 
 def test_ambiguous_binding_blocks_publication_and_keeps_private_outcome(sandbox):
+    _prepare(sandbox)
     document = bindings()
     document["bindings"].append(json.loads(json.dumps(document["bindings"][0])))
     document["bindings"][1]["source"]["number"] = 8
     (sandbox["state"] / "bindings.json").write_text(json.dumps(document))
-    _success(sandbox)
+    proc = _report(sandbox, "--pr", str(PR), "--sha", SHA, "--rc", "0",
+                   "--log", str(sandbox["tmp"] / "pipeline.log"))
+    assert proc.returncode == 1
+    assert "private_source_binding_ambiguous" in proc.stderr
     _, _, outcome = _outcome(sandbox)
     assert outcome is not None
     assert not sandbox["api"].posts
