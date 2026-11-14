@@ -1788,6 +1788,11 @@ CI exact-H 两项成功可唤醒 `dispatch_phase=prod_review`；预唤醒不要�
 去重与 Hermes routes。安装要求 cron `no_agent=true`，不再由巡检输出另起有修改职责的 agent。
 sender 还须原 claimed row 完整 payload 匹配，并原子写一次 send intent；202 仅记录
 awaiting_agent_receipt，丢响应/过期 claim 保留 delivery_unknown，均不自动重发或并发重唤醒。
+cron 的 `github_dispatch` 在解析 adapter stdout 或处理非零退出前，将 phase/native rc、
+stdout/stderr 原始 bytes 的有界副本（每流64KiB）、总长度与 SHA256 写到既有私有 invocation
+audit 目录；固定前门通过 `DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR` 传递该0700目录。记录为
+0600/nosymlink 文件，公共状态只给安全分类和证据 basename/hash；子进程 reason/raw 不转发。
+目录或记录失败显式停止，保留已知 child phase/rc，不再运行下一个 ingest/drain 补日志。
 固定 numeric review actor 的正式 exact dispatched-H review 回读，可在 claim 时间与原 CI
 run/attempt 对齐后结束审查等待；仅 APPROVED/CHANGES_REQUESTED，且 actor 不得是 PR author。
 BLOCKER 允许修复后新 H 重新审查；旧 H 不重放。无证据保持 UNKNOWN；TTL 不证明进程退出。
@@ -3520,6 +3525,10 @@ flowchart LR
 导入根并固定 `PYTHONSAFEPATH=1`，保留父环境的只读 evidence plugin 路径；因此真正调用
 `_catchup_block` 验证缺失事实告警，不把找不到 `scripts` 的 fixture 导入失败当作产品回归。
 该环境只作用于被测子进程，不改变 producer/verifier 或 ordinary 准入与报告行为。
+`test_github_dispatch_diagnostics.py` 用实际 failing child 验证解析/异常前的私有诊断、字节截断/
+完整hash、写失败停止与 secret 不外泄；operator fixed-launcher 的 argv 验证另保留，不以裸
+Python 的 SOURCE 边界测试替代。ordinary fixture 另显式构造历史终态，核对真实新H lifecycle
+和CI产生新trigger时旧行/旧delivery逐字段不变，同H不重发，claimed/UNKNOWN仍阻跨H。
 
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/

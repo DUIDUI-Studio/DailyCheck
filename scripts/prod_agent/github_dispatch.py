@@ -8,12 +8,17 @@ authenticated routes, with the same admission and dedup as receiver work.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -23,6 +28,92 @@ from scripts.prod_agent import github_intake  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 ADAPTER = ROOT / "deploy/scripts/dc-notify-prod-agent.sh"
+DIAGNOSTIC_LIMIT = 65_536
+
+
+def _audit_directory() -> int:
+    """Open the existing private invocation directory without following symlinks."""
+    descriptor = None
+    try:
+        path = Path(os.environ["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"])
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for component in path.parts[1:]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            info = os.fstat(descriptor)
+            # A root-owned sticky temporary ancestor cannot unlink another UID's
+            # owned child. The evidence directory itself must still be private.
+            if (info.st_uid not in {0, os.geteuid()}
+                    or info.st_mode & 0o022 and not
+                    (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)):
+                raise ValueError
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError
+        return descriptor
+    except (KeyError, OSError, ValueError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise HostingError("ordinary_cron_diagnostic_unavailable") from exc
+
+
+def _record_child(directory: int, phase: str, result: subprocess.CompletedProcess) -> dict:
+    def stream(raw: bytes) -> dict:
+        retained = raw[:DIAGNOSTIC_LIMIT]
+        return {"raw_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                "retained_bytes": len(retained), "truncated": len(raw) > len(retained),
+                "base64": base64.b64encode(retained).decode("ascii")}
+
+    document = {"version": 1, "phase": phase, "native_rc": result.returncode,
+                "stdout": stream(result.stdout), "stderr": stream(result.stderr)}
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    name = "dispatch-" + uuid.uuid4().hex + ".json"
+    try:
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        with os.fdopen(descriptor, "wb") as output:
+            info = os.fstat(output.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise ValueError
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        os.fsync(directory)
+    except (OSError, ValueError) as exc:
+        raise HostingError("ordinary_cron_diagnostic_unavailable") from exc
+    return {"phase": phase, "native_rc": result.returncode,
+            "evidence": name, "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _adapter(directory: int, phase: str, env: dict, status: dict,
+             hint: dict | None = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(["bash", str(ADAPTER), *(["--drain"] if phase == "drain" else [])],
+                            input=json.dumps(hint).encode() if hint is not None else None,
+                            capture_output=True, env=env)
+    status["child"] = {"phase": phase, "native_rc": result.returncode}
+    status.setdefault("diagnostics", []).append(_record_child(directory, phase, result))
+    return result
+
+
+def _decision(raw: bytes) -> dict:
+    try:
+        decision = json.loads(raw)
+        kind = decision.get("decision")
+        if kind not in {"silent", "suppress", "defer", "trigger"}:
+            raise ValueError
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HostingError("ordinary_cron_adapter_invalid_output") from exc
+    # Child reason/text is private evidence, never general cron/agent output.
+    summary = {"decision": kind}
+    trigger = decision.get("trigger_id")
+    if isinstance(trigger, str) and re.fullmatch(r"trig_[0-9a-f]{24}", trigger):
+        summary["trigger_id"] = trigger
+    return summary
 
 
 def policy_preflight() -> dict:
@@ -55,6 +146,7 @@ def reconcile_status() -> dict:
 def main() -> int:
     status = {"deployment_actionable": False, "entrypoint": "github_dispatch",
               "intake": "off", "dispatches": []}
+    audit = None
     try:
         if not github_intake.enabled():
             return 0
@@ -62,6 +154,7 @@ def main() -> int:
         status.update(intake="quarantined" if rule.pr_range is None else "automatic",
                       policy_sha256=rule.digest)
         if rule.has_targets():
+            audit = _audit_directory()
             client = HostingClient(HostingConfig.from_environment())
             client.verify_repository()
             prs = client.pages(f"/repos/{client.config.repo}/pulls", params={"state": "open"})
@@ -80,18 +173,15 @@ def main() -> int:
                     "check_conclusion": "success"}, "receiver")
                 # Clients have finite request/page bounds. Reap the adapter itself;
                 # an outer timeout killing only bash would leave late reducer claims.
-                result = subprocess.run(["bash", str(ADAPTER)], input=json.dumps(hint),
-                                        text=True, capture_output=True, env=env)
-                decision = json.loads(result.stdout) if result.stdout else {}
-                status["dispatches"].append({"pr": pr["number"], "head": head,
-                    "native_rc": result.returncode,
-                    "decision": {key: decision[key] for key in ("decision", "reason", "trigger_id") if key in decision}})
+                result = _adapter(audit, "ingest", env, status, hint)
+                observation = {"pr": pr["number"], "head": head, "native_rc": result.returncode}
+                status["dispatches"].append(observation)
                 if result.returncode not in {0, 75}:
                     raise HostingError("ordinary_cron_adapter_unconfirmed")
+                observation["decision"] = _decision(result.stdout)
             # Drains already-admitted work too; stored signatures, current policy,
             # live H/CI, native fences and result provenance are rechecked in the queue.
-            result = subprocess.run(["bash", str(ADAPTER), "--drain"], text=True,
-                                    capture_output=True, env=env)
+            result = _adapter(audit, "drain", env, status)
             status["drain_native_rc"] = result.returncode
             if result.returncode not in {0, 75}:
                 raise HostingError("ordinary_cron_drain_unconfirmed")
@@ -102,6 +192,9 @@ def main() -> int:
         # Never refresh/retry on an unknown invocation. Existing job logs remain observable.
         print(json.dumps(status, sort_keys=True))
         return 1
+    finally:
+        if audit is not None:
+            os.close(audit)
     if status["dispatches"] or status.get("publication_alert") or status.get("dispatch_reconciliation"):
         print(json.dumps(status, sort_keys=True))
     return 0

@@ -75,6 +75,14 @@ Coordinator 仍需读实际 forge typed report、checks/reviews 与 private sour
 前门会再次核对策略、实时事实并通过既有 adapter/reducer claim/发送，不绕开持久去重。
 现有 `pr_poll.py` ordinary CLI 复用此门；OFF 时只保留 publication 对账观察，不生成部署工作。
 
+有目标的实际 dispatch 另需既有私有 audit 目录：固定 root frontdoor 将当前 invocation 的
+0700 observation 目录作为 `DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR` 传给子进程；目录缺失/
+不安全在 API/child 前失败，OFF/空准入和纯 preflight 不写诊断。每个已退出 adapter 在解析或
+非零异常前保留0600 JSON证据，stdout/stderr以base64保存每流最多64KiB，另记完整长度/hash。
+外层状态只含phase/native rc、安全分类与证据basename/hash；raw和child reason留私有目录，
+不得粘贴至公共报告/提示。记录失败也停止，不补发/重试。新SOURCE必须与传递此目录的固定
+frontdoor一起审查采用；原有stdout/stderr/native wait回执仍保留，历史已丢stderr无法重建。
+
 远端安装/配置 owner 必须另行审查：固定 source/hash/import closure 与 credential 顺序，receiver
 及 watcher 的 provider/repo/env 与 inbox 路径，旧 Gitea router/prompt 改为 typed ordinary phase，
 保持 check_suite→wdg-ci 与 deploy_result→dailycheck-deploy，cron `no_agent=true`。调查实测 job

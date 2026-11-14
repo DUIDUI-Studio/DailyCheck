@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -108,7 +109,9 @@ os.execv("/usr/bin/curl", ["/usr/bin/curl", *args])
         "DAILYCHECK_HOSTING_PROVIDER": "github", "DAILYCHECK_GITHUB_LANE": "ordinary",
         "DAILYCHECK_GITHUB_INTAKE_ENABLED": "1",
         "DAILYCHECK_GITHUB_INTAKE_SINCE_MS": str(int(time.time() * 1000) - 1000),
-        "DAILYCHECK_GITHUB_INTAKE_TARGETS": json.dumps([{"pr": 160, "head": SHA}]),
+        "DAILYCHECK_GITHUB_INTAKE_TARGETS": json.dumps([
+            {"pr": 160, "head": head} for head in
+            ([SHA, "c" * 40] if getattr(request, "param", None) == "two-heads" else [SHA])]),
         "DAILYCHECK_GITHUB_INTAKE_KEY_FILE": str(key),
         "DAILYCHECK_GITHUB_READ_TOKEN": "owned-fake-read",
         "DAILYCHECK_DEPLOY_STATE_DIR": str(tmp_path / "deploy-state"),
@@ -124,6 +127,9 @@ os.execv("/usr/bin/curl", ["/usr/bin/curl", *args])
         "DAILYCHECK_HERMES_WEBHOOK_URL": f"http://127.0.0.1:{server.server_port}",
         "TMPDIR": str(tmp_path),
     })
+    audit = tmp_path / "dispatch-audit"
+    audit.mkdir(mode=0o700)
+    env["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"] = str(audit.resolve())
     initialized = subprocess.run([sys.executable, str(SOURCE / "scripts/blue_green/deploy_state.py"),
                                   "init", "--sha", BASE], env=env, capture_output=True, text=True)
     assert initialized.returncode == 0, initialized.stderr
@@ -600,3 +606,64 @@ else:
     assert legacy.returncode == 0, legacy.stderr
     assert json.loads(legacy.stdout) == {"reason": "github_shadow_only", "new_intake_imported": False}
     assert not lane.posts
+
+
+@pytest.mark.parametrize("previous", ["shadow_rejected", "claimed", "delivery_unknown"])
+@pytest.mark.parametrize("lane", ["two-heads"], indirect=True)
+def test_new_head_preserves_terminal_history_and_respects_unresolved_work(lane, previous):
+    new_head = "c" * 40
+    # Both heads belong to the same synthetic admission version; changing policy
+    # here would invalidate old provenance and test a different boundary.
+    assert lane.post(delivery="old-head")[0] == 202
+    assert lane.adapter(lane.records()[-1]).returncode == 75
+    db = Path(lane.env["DAILYCHECK_EVENT_REDUCER_DB"])
+    # Fixture-only snapshot of externally observed historical states. This SQL
+    # provisions owned test data; no production recovery API or transition exists.
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        old_id = conn.execute("SELECT trigger_id FROM trigger_queue").fetchone()[0]
+        conn.execute("""UPDATE trigger_queue SET state=?, attempts=1, last_error=?,
+                     lease_token=?,lease_expires_ms=?,completed_at_ms=? WHERE trigger_id=?""",
+                     ("claimed" if previous == "claimed" else "done",
+                      "" if previous == "claimed" else previous,
+                      "synthetic-held-lease" if previous == "claimed" else None,
+                      int(time.time() * 1000) + 60000 if previous == "claimed" else None,
+                      None if previous == "claimed" else 123456, old_id))
+        old_row = dict(conn.execute("SELECT * FROM trigger_queue WHERE trigger_id=?", (old_id,)).fetchone())
+        old_deliveries = [dict(row) for row in conn.execute(
+            "SELECT * FROM deliveries WHERE trigger_id=? ORDER BY delivery_id", (old_id,))]
+    new_table = json.loads(json.dumps(lane.table).replace(SHA, new_head))
+    run = new_table[ROOT + "/actions/workflows/12/runs?page=1"]["data"]["workflow_runs"][0]
+    run.update(id=41, run_number=41, run_attempt=1, check_suite_id=141)
+    checks = new_table[ROOT + f"/commits/{new_head}/check-runs?page=1"]["data"]["check_runs"]
+    jobs = new_table.pop(ROOT + "/actions/runs/40/jobs?page=1")
+    for index, (check, job) in enumerate(zip(checks, jobs["data"]["jobs"], strict=True)):
+        check.update(id=61 + index, check_suite={"id": 141})
+        job.update(id=161 + index, run_id=41, run_attempt=1,
+                   check_run_url=f"https://api.github.com{ROOT}/check-runs/{61 + index}")
+    new_table[ROOT + "/actions/runs/41/jobs?page=1"] = jobs
+    lane.table.clear()
+    lane.table.update(new_table)
+    lifecycle = {"number": 160, "action": "synchronize",
+                 "repository": {"id": REPO_ID, "full_name": REPO},
+                 "pull_request": lane.table[ROOT + "/pulls/160"]["data"]}
+    assert lane.post(lifecycle, event="pull_request", delivery="new-head-lifecycle")[0] == 202
+    assert lane.adapter(lane.records()[-1]).returncode in {0, 75}
+    assert lane.adapter().returncode == 0
+    if previous == "shadow_rejected":
+        assert len(lane.posts) == 1 and lane.posts[0]["body"]["pr_head_sha"] == new_head
+        assert lane.posts[0]["body"]["observed_ci_run_id"] == 41
+        assert lane.posts[0]["body"]["observed_ci_attempt"] == 1
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            assert dict(conn.execute("SELECT * FROM trigger_queue WHERE trigger_id=?", (old_id,)).fetchone()) == old_row
+            assert [dict(row) for row in conn.execute(
+                "SELECT * FROM deliveries WHERE trigger_id=? ORDER BY delivery_id", (old_id,))] == old_deliveries
+            assert conn.execute("SELECT COUNT(*) FROM trigger_queue").fetchone()[0] == 2
+        assert lane.post(lifecycle, event="pull_request", delivery="same-head-repeat")[0] == 202
+        assert lane.adapter(lane.records()[-1]).returncode == 0
+        assert lane.adapter().returncode == 0 and len(lane.posts) == 1
+    else:
+        assert lane.posts == []
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("SELECT last_error FROM trigger_queue WHERE trigger_id=?", (old_id,)).fetchone()[0] == "delivery_unknown"
