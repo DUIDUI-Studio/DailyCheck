@@ -1763,6 +1763,12 @@ shadow / publication / fencing 兼容回归保留；全仓测试由 Coordinator 
 GitHub main push 跳过冗余的 full test job；H/G 两个 required context 与 reports 复用、Gitea
 push 行为不变，workflow_dispatch 仍可手动触发。本次未改分支保护、发布或部署设置。
 
+**Ordinary intake 回归基线（2026-11-14，source preparation）**：
+`tests/test_github_ordinary_intake.py` 用实际 HTTP receiver、adapter/reducer/sender 进程和
+owned loopback GitHub/Hermes 端点复现：签名与 exact-H checks 有效，仍被
+`github_shadow_only` 拒绝（0 POST，期望 1）。拟新增默认 OFF、空目标集合的独立普通来源
+信封，保留历史 shadow 拒绝；源码验证不证明远端安装、路由或生产验收。
+
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。
 check payload 缺 PR 列表也不猜第一个；分页查当前 open PR，同 H 的多个 PR 分别归一化。
