@@ -230,9 +230,22 @@ query client, credential service, or job queue.
   must already exist; the runner never creates, truncates, or clears a lock),
   then verifies the source HEAD and every tracked Python file against its Git blob
   (including the runner and blueprint import side effects, even if marked
-  assume-unchanged), refuses untracked Python source before fresh imports, and
-  checks the active-business PID/start/master-fd binding. Ignored Python files
-  are also refused outside the trusted interpreter's `.venv`/`node_modules`.
+  assume-unchanged), then checks pathspec-free NUL-delimited ordinary and ignored
+  Git inventories and the actual filesystem before fresh application imports.
+  Tracked links/gitlinks, nested repositories (including git-file checkouts),
+  directory or ancestor links, untracked/ignored Python, application bytecode
+  (including timestamp-valid and unchecked-hash caches), and the selected
+  interpreter's native-extension forms are refused. No caches are deleted;
+  `-B` prevents writes but does not prevent loading existing bytecode.
+  The explicitly selected interpreter and its installed dependencies remain
+  trusted separately: a top-level `.venv`/`node_modules` is exempt only when it
+  is that interpreter's actual ordinary environment directory, as reported by
+  an isolated interpreter metadata query with site startup disabled (and the
+  selected executable's ordinary `pyvenv.cfg` for Python <=3.13). A basename, nested fake dependency
+  root or link into a trusted root grants no trust. Ordinary DB/log files stay
+  usable and untouched. This admission does not protect against concurrent
+  arbitrary filesystem replacement after preflight or a rewritten interpreter.
+  Preflight also checks the active-business PID/start/master-fd binding.
   `deploy_anchor` now contains exactly `state_dir` and `source_sha`; no separate
   `fence` locator is accepted. Fixed `state.json` and `.attempt.lock` filenames
   bind both artifacts to that same canonical, trusted owner/mode directory,

@@ -666,16 +666,57 @@ def _verify_source(plan: ReadOncePlan) -> dict:
     )
     if rc != 0:
         raise ReadOnceError("source_tree_unavailable", stage="source")
+    # Query only the explicitly trusted interpreter, isolated from repository
+    # imports. -B prevents writes; it does NOT authenticate existing bytecode.
+    _, rc, interpreter, _ = _run_checked(
+        [str(plan.source.python), "-I", "-S", "-B", "-c",
+         "import sys,json,importlib.machinery; "
+         "print(json.dumps({'prefix':sys.prefix,'base_prefix':sys.base_prefix,"
+         "'executable':sys.executable,"
+         "'extensions':importlib.machinery.EXTENSION_SUFFIXES}))"],
+        cwd=None, env=_tool_env(), timeout=15,
+    )
     try:
+        if rc != 0:
+            raise ValueError("interpreter unavailable")
+        runtime = json.loads(interpreter)
+        executable_suffixes = (".py", ".pyc", ".pyo", *runtime["extensions"])
+        # A basename alone grants no trust. Only the selected interpreter's
+        # actual environment may occupy one of the legacy dependency roots.
+        prefix = Path(runtime["prefix"]).resolve(strict=True)
+        # Python <=3.13 sets the venv prefix in site.py, which -S suppresses.
+        # Recover only the standard environment of the selected executable;
+        # never run site/.pth code just to decide which source may be imported.
+        executable_environment = Path(runtime["executable"]).parent.parent
+        environment_config = executable_environment / "pyvenv.cfg"
+        if environment_config.is_file() and not environment_config.is_symlink():
+            prefix = executable_environment.resolve(strict=True)
+        trusted_dependencies = {
+            resolved_repo / name for name in (".venv", "node_modules")
+            if prefix == resolved_repo / name
+            and prefix != Path(runtime["base_prefix"]).resolve(strict=True)
+        }
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
+        raise ReadOnceError("source_python_invalid", stage="source") from exc
+
+    try:
+        tracked_python = set()
         for entry in tree.split(b"\0"):
             if not entry:
                 continue
             metadata, name = entry.split(b"\t", 1)
             mode, kind, expected = metadata.split()
+            if kind != b"blob" or mode not in (b"100644", b"100755"):
+                raise ReadOnceError("source_tree_dirty", stage="source")
+            path = resolved_repo / os.fsdecode(name)
             if not name.endswith(b".py"):
                 continue
-            path = resolved_repo / os.fsdecode(name)
-            if kind != b"blob" or mode not in (b"100644", b"100755"):
+            tracked_python.add(path)
+            # A regular leaf behind a linked ancestor is still unverified.
+            if path.resolve(strict=True) != path or any(
+                parent.is_symlink() for parent in path.parents if parent != resolved_repo
+                and parent.is_relative_to(resolved_repo)
+            ):
                 raise ReadOnceError("source_tree_dirty", stage="source")
             if not stat.S_ISREG(path.lstat().st_mode):
                 raise ReadOnceError("source_tree_dirty", stage="source")
@@ -686,20 +727,55 @@ def _verify_source(plan: ReadOncePlan) -> dict:
         # A different running client cannot vouch for a clean candidate copy.
         if Path(__file__).read_bytes() != (resolved_repo / "scripts/mcp_lucy_read_once.py").read_bytes():
             raise ReadOnceError("source_runner_mismatch", stage="source")
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise ReadOnceError("source_tree_dirty", stage="source") from exc
+    inventories = []
     for extra in ([], ["--ignored"]):
         _, rc, untracked, _ = _run_checked(
             [git, "-C", str(resolved_repo), "ls-files", "-z", "--others",
-             "--exclude-standard", *extra, "--", "*.py"],
+             "--exclude-standard", *extra],
             cwd=None, env=_tool_env(), timeout=15,
         )
-        # Installed dependencies are part of the explicitly trusted interpreter,
-        # not application source. Never clean or stage any ignored runtime files.
-        unexpected = [name for name in untracked.split(b"\0") if name
-                      and name.split(b"/", 1)[0] not in {b".venv", b"node_modules"}]
-        if rc != 0 or unexpected:
+        if rc != 0:
             raise ReadOnceError("source_tree_dirty", stage="source")
+        inventories.extend(resolved_repo / os.fsdecode(name).rstrip("/")
+                           for name in untracked.split(b"\0") if name)
+
+    def admit(path: Path) -> bool:
+        """Return whether to traverse an ordinary directory; never follow links."""
+        if any(parent in trusted_dependencies for parent in path.parents):
+            return False
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or path.resolve(strict=True) != path:
+            raise ReadOnceError("source_tree_dirty", stage="source")
+        if path in trusted_dependencies:
+            if not stat.S_ISDIR(mode):
+                raise ReadOnceError("source_tree_dirty", stage="source")
+            return False
+        if stat.S_ISDIR(mode):
+            # ls-files can collapse an entire nested repository to one name.
+            if (path / ".git").exists() or (path / ".git").is_symlink():
+                raise ReadOnceError("source_tree_dirty", stage="source")
+            return True
+        if path.name.endswith(executable_suffixes) and (
+            not path.name.endswith(".py") or path not in tracked_python
+        ):
+            raise ReadOnceError("source_tree_dirty", stage="source")
+        return False
+
+    try:
+        for path in inventories:
+            admit(path)
+        pending = [resolved_repo]
+        while pending:
+            directory = pending.pop()
+            for path in directory.iterdir():
+                if path == resolved_repo / ".git":
+                    continue
+                if admit(path):
+                    pending.append(path)
+    except (OSError, RuntimeError) as exc:
+        raise ReadOnceError("source_tree_dirty", stage="source") from exc
 
     code = (
         "import json, mcp_server.main\n"

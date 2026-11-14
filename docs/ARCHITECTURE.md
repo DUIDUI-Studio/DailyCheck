@@ -2926,8 +2926,16 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
   校验成功 result、SHA/PR/generation/deployment identity。只有 init 的无 PR 基线、
   缺失/未知/畸形/未 settled 状态及自造 `source_sha/release_id/deployment_root` 均拒绝。
   源码 HEAD 后逐一比较全部 tracked Python 的 Git blob 与磁盘字节（含 runner、
-  blueprint 模块顶层及 assume-unchanged 文件），拒绝 untracked/ignored Python
-  （可信解释器的 `.venv`/`node_modules` 除外），然后才新鲜 import/签发；不清理 DB/log。
+  blueprint 模块顶层及 assume-unchanged 文件）；先于后缀筛选检查 Git mode，拒绝 tracked
+  link/gitlink。无 pathspec、NUL 分隔的 ordinary/ignored 清单结合实际 lstat/canonical
+  遍历，拒绝嵌套仓库（含 git-file checkout）、目录/祖先链接、untracked/ignored Python、
+  应用字节码（含 timestamp-valid / unchecked-hash cache）及目标解释器 native-extension
+  形式，然后才新鲜应用 import/签发。`-B` 只禁写、不阻止加载缓存；runner 不删除缓存。
+  operator 显式选定的解释器及已安装依赖单独受信；顶层 `.venv`/`node_modules` 仅当
+  禁用 site startup 的 isolated metadata query 确认它是该解释器实际 ordinary environment
+  目录才豁免（Python <=3.13 同时核对选定 executable 的 ordinary `pyvenv.cfg`）；
+  basename、嵌套假依赖目录或指向受信根的链接不能获得信任。普通 DB/log 保持可用、
+  字节不变；不声称抵御 preflight 后任意并发替换或解释器自身被改写。
   首个 pilot 仅选显式获批的 regular-file 仓，`wh_002` 外链 symlink 继续拒绝。
   再核对 active-business PID/start 与 master fd 绑定。fence 忙、anchor/source 不符、绑定
   不符均在签发凭据前失败。生产模式仅 Linux；非 Linux 的 synthetic plan 使用**显式
@@ -3645,6 +3653,10 @@ repair3 回归还直接调用未改动 producer 生成 state/owned outcome，并
 flock 在真实 SDK child、revoke、positive wait、policy 清理和 release-last 阶段证明冲突；
 覆盖 malformed/outcome mismatch、fence inode/owner/mode、blueprint canary 拒绝及字节恢复、
 issue→policy/ledger/commit-return/SDK 的 catchable cancellation，仓字节与无关行保持不变。
+repair4 使用每例独立 checkout 覆盖 nested git-dir/git-file、目录/祖先链接、tracked
+link/gitlink、source-less/timestamp/unchecked bytecode、native extension 和假依赖根；
+要求 source 阶段在应用 import subprocess 启动前拒绝，无 canary/identity/read，且 replay
+拒绝。真实选定 venv/installed dependency 与普通 DB/log 的正向用例保持可用。
 Linux CI 另跑真实 `/proc` PID/start/master-fd 绑定用例；非 Linux 的 synthetic binding
 在结果中显式标注为 surrogate。测试不连接生产、不读取既有凭据/SSH 配置。
 

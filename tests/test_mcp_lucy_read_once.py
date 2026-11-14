@@ -9,10 +9,14 @@ MCP stdio child through the public SDK.  The relay tests inject a hermetic fake
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
+import py_compile
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import textwrap
@@ -1143,6 +1147,201 @@ def test_executable_source_drift_refuses_before_import_or_grant(env, capsys, kin
         if kind == "assume_unchanged":
             subprocess.run(["git", "-C", str(source), "update-index", "--no-assume-unchanged", relative], check=True)
     assert subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"]) == b""
+
+
+@pytest.fixture
+def admission_env(env):
+    """Every hostile layout has its own checkout, never a shared-source mutation."""
+    isolated = env["root"] / "admission-source"
+    subprocess.run(["git", "clone", "-q", "--no-hardlinks", str(env["source"]), str(isolated)],
+                   check=True, capture_output=True)
+    env["source"] = isolated
+    return env
+
+
+def _admission_git(env, *args):
+    return subprocess.check_output(
+        ["git", "-c", "user.name=Synthetic", "-c", "user.email=synthetic@invalid",
+         "-C", str(env["source"]), *args], stderr=subprocess.PIPE,
+    )
+
+
+def _repin_admission(env):
+    _admission_git(env, "commit", "-qm", "synthetic executable layout")
+    env["source_sha"] = _admission_git(env, "rev-parse", "HEAD").decode().strip()
+    assert _producer(env, "acquire", "--pr", "17", "--sha", env["source_sha"]).returncode == 0
+    assert _producer(env, "release", "--result", "success", "--sha", env["source_sha"]).returncode == 0
+
+
+def _plant_admission_shape(env, kind, marker):
+    source = env["source"]
+    canary = f"\nfrom pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+    if kind in {"nested_git", "ignored_nested_git", "nested_gitfile", "directory_link", "tracked_gitlink"}:
+        import anyio
+        package = source / "anyio"
+        shutil.copytree(Path(anyio.__file__).parent, package,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        with (package / "__init__.py").open("a") as stream:
+            stream.write(canary)
+        if kind == "directory_link":
+            target = env["root"] / "external-anyio"
+            package.rename(target)
+            package.symlink_to(target, target_is_directory=True)
+        else:
+            options = ["--separate-git-dir", str(env["root"] / "nested-git")] if kind == "nested_gitfile" else []
+            subprocess.run(["git", "init", "-q", *options, str(package)],
+                           check=True, capture_output=True)
+            if kind == "ignored_nested_git":
+                with (source / ".git/info/exclude").open("a") as stream:
+                    stream.write("\n/anyio/\n")
+            if kind == "tracked_gitlink":
+                _admission_git(env, "update-index", "--add", "--cacheinfo",
+                               f"160000,{env['source_sha']},anyio")
+                _repin_admission(env)
+    elif kind in {"source_less", "timestamp_cache", "unchecked_cache"}:
+        main = source / "mcp_server/main.py"
+        original = main.read_text()
+        payload = env["root"] / "bytecode-input.py"
+        payload.write_text(canary if kind == "source_less" else original + canary)
+        target = (source / "anyio.pyc" if kind == "source_less"
+                  else Path(importlib.util.cache_from_source(str(main))))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        mode = (py_compile.PycInvalidationMode.UNCHECKED_HASH if kind == "unchecked_cache"
+                else py_compile.PycInvalidationMode.TIMESTAMP)
+        py_compile.compile(str(payload), cfile=str(target), doraise=True, invalidation_mode=mode)
+        if kind == "timestamp_cache":
+            cached = target.read_bytes()
+            target.write_bytes(cached[:8] + struct.pack("<II", int(main.stat().st_mtime),
+                                                       main.stat().st_size) + cached[16:])
+    elif kind == "ancestor_link":
+        package = source / "mcp_server"
+        target = env["root"] / "external-mcp-server"
+        package.rename(target)
+        package.symlink_to(target, target_is_directory=True)
+    elif kind == "tracked_link":
+        (source / "source-link").symlink_to("mcp_server")
+        _admission_git(env, "add", "source-link")
+        _repin_admission(env)
+    elif kind in {"dependency_link", "link_into_dependency"}:
+        dependency = source / ".venv"
+        if kind == "dependency_link":
+            dependency.symlink_to(Path(sys.prefix), target_is_directory=True)
+        else:
+            dependency.mkdir()
+            (source / "anyio").symlink_to(Path(sys.prefix), target_is_directory=True)
+    elif kind == "native_extension":
+        import markupsafe._speedups as native
+        suffix = next(s for s in importlib.machinery.EXTENSION_SUFFIXES
+                      if native.__file__.endswith(s))
+        shutil.copyfile(native.__file__, source / ("anyio" + suffix))
+    else:
+        relative = {"ordinary": "extra.py", "ignored": "db/warehouses/extra.py",
+                    "nested_fake_dependency": "pkg/.venv/shadow.py",
+                    "fake_top_dependency": ".venv/shadow.py",
+                    "fake_node_dependency": "node_modules/shadow.py"}[kind]
+        path = source / relative
+        if kind == "ignored":
+            with (source / ".git/info/exclude").open("a") as stream:
+                stream.write(f"\n/{relative}\n")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(canary)
+
+
+@pytest.mark.parametrize("kind", [
+    "ordinary", "ignored", "nested_git", "ignored_nested_git", "nested_gitfile", "directory_link",
+    "tracked_gitlink", "tracked_link", "ancestor_link", "source_less", "timestamp_cache",
+    "unchecked_cache", "native_extension", "nested_fake_dependency", "fake_top_dependency",
+    "fake_node_dependency", "dependency_link", "link_into_dependency",
+])
+def test_source_loading_forms_refuse_before_probe_grant_and_replay(admission_env, capsys,
+                                                                  monkeypatch, kind):
+    env = admission_env
+    marker = env["root"] / "admission-canary"
+    _plant_admission_shape(env, kind, marker)
+    probes, grants, reads = [], [], []
+    checked, issue, run_mcp = runner._run_checked, runner._issue_identity, runner._run_mcp
+
+    def observe(argv, **kwargs):
+        if "-c" in argv and "import json, mcp_server.main" in argv[-1]:
+            probes.append(argv)
+        return checked(argv, **kwargs)
+
+    def issue_observer(*args):
+        grants.append(True)
+        return issue(*args)
+
+    def read_observer(*args):
+        reads.append(True)
+        return run_mcp(*args)
+
+    monkeypatch.setattr(runner, "_run_checked", observe)
+    monkeypatch.setattr(runner, "_issue_identity", issue_observer)
+    monkeypatch.setattr(runner, "_run_mcp", read_observer)
+    warehouse_before = _sha_file(env["warehouse_file"])
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, _ = _run_consume(capsys, path, sha)
+    assert probes == [], "application import subprocess started before source refusal"
+    assert code == runner.EXIT_PREFLIGHT and result["stage"] == "source", result
+    assert result["code"] == "source_tree_dirty", result
+    assert not marker.exists()
+    assert grants == reads == []
+    assert _created_rows(env["master"]) == []
+    second_code, second, _ = _run_consume(capsys, path, sha)
+    assert second_code == runner.EXIT_CLAIM and second["code"] == "already_claimed"
+    assert probes == grants == reads == []
+    assert _created_rows(env["master"]) == []
+    assert _sha_file(env["warehouse_file"]) == warehouse_before
+
+
+def test_clean_installed_dependencies_and_runtime_files_are_usable(admission_env, capsys):
+    env = admission_env
+    source = env["source"]
+    runtime_files = [source / "db/warehouses/runtime.db", source / "logs/access.log",
+                     source / "node_modules/package/index.js"]
+    for path in runtime_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ordinary ignored runtime bytes\x00\xff")
+    before = {path: path.read_bytes() for path in runtime_files}
+    for path in runtime_files:
+        assert _admission_git(env, "check-ignore", str(path)).strip()
+    path, sha = _write_plan(env, _plan_data(env))
+    code, result, _ = _run_consume(capsys, path, sha)
+    assert code == runner.EXIT_OK, result
+    assert result["mcp"]["child_waited"] and result["mcp"]["server_returncode"] == 0
+    assert [call["tool"] for call in result["mcp"]["calls"]] == ["warehouse_list", "items_detail"]
+    assert result["item"]["id"] == 1 and result["token"]["revocation_verified"]
+    assert all(result["cleanup"].values())
+    rows = _created_rows(env["master"])
+    assert len(rows) == 1 and rows[0]["revoked_at"]
+    assert {path: path.read_bytes() for path in runtime_files} == before
+
+
+@pytest.mark.parametrize("dependency_root", [".venv", "node_modules"])
+def test_selected_installed_interpreter_root_is_trusted(admission_env, dependency_root):
+    env = admission_env
+    interpreter_root = env["source"] / dependency_root
+    # A real venv, selected explicitly; a fake directory basename never suffices.
+    subprocess.run([sys.executable, "-B", "-m", "venv", "--without-pip",
+                    "--system-site-packages", str(interpreter_root)], check=True,
+                   capture_output=True, timeout=30)
+    data = _plan_data(env)
+    data["source"]["python"] = str(interpreter_root / "bin/python")
+    path, sha = _write_plan(env, data)
+    # Use the public plan loading path, including the selected interpreter.
+    plan = runner.load_plan(str(path), expected_sha256=sha, expected_correlation=CORRELATION)
+    evidence = runner._verify_source(plan)
+    assert evidence["import_returncode"] == 0
+    # Metadata admission itself must not execute installed .pth startup code
+    # before rejecting application drift (site sets venv prefixes on <=3.13).
+    marker = env["root"] / "site-startup-canary"
+    site_packages = next(interpreter_root.glob("lib/python*/site-packages"))
+    (site_packages / "admission-canary.pth").write_text(
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')\n"
+    )
+    (env["source"] / "unverified.py").write_text("pass\n")
+    with pytest.raises(runner.ReadOnceError, match="source_tree_dirty"):
+        runner._verify_source(plan)
+    assert not marker.exists(), "interpreter metadata query executed site startup before admission"
 
 
 @pytest.mark.parametrize("window", ["policy", "ledger", "commit_return", "sdk", "cancel", "unexpected"])
