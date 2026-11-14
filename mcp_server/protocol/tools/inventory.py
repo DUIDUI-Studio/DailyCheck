@@ -61,4 +61,10 @@ def movements_list_impl(args: dict, *, ctx=None) -> list[dict]:
 
 def warehouse_list_impl(_args: dict, *, ctx=None) -> list[dict]:
     ctx = ctx if ctx is not None else _get_ctx()
+    # Standard mode historically had no path check here (documented gap). Strict
+    # mode closes it for the pilot without changing standard tool behaviour.
+    if ctx.readonly_policy is not None and not check_path(
+        ctx, "GET", "/api/v1/warehouses"
+    ):
+        raise ForbiddenError("forbidden_path")
     return svc_list_warehouses(ctx)

@@ -1321,6 +1321,12 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
     env.pop("DAILYCHECK_HOSTING_PROVIDER", None)
     if selected is not None:
         env["DAILYCHECK_HOSTING_PROVIDER"] = selected
+    # The reference is copied out of the repository, so its own parents[2]
+    # import-root discovery no longer reaches scripts/; give both processes
+    # the explicit repository root.
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(root), env.get("PYTHONPATH")))
+    )
     before = subprocess.run(
         [sys.executable, str(reference)],
         cwd=root,

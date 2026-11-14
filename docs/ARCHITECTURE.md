@@ -2841,6 +2841,144 @@ Issue #144 扩充 store_order_detail 的内部 output_shape 和生成台账：�
 声明/路径 ACL 保持兼容；服务层对头/明细使用显式字段白名单，不暴露内部 command、
 claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 或写 stale。
 
+### 9.6 只读查询策略（Issue #16，默认关闭；不构成生产激活）
+
+`mcp_server/readonly.py::ReadonlyPolicy` 是一个**显式加载、不可变**的进程级策略。
+不传 `--readonly-policy PATH` 时服务行为与既有完全一致；显式传入后 HTTP 与 stdio
+使用同一严格边界。**策略加载失败必须停止进程**，不回退标准模式。策略文件只含
+非秘密控制字段，不含 raw token：
+
+| 字段 | 语义 |
+|---|---|
+| `schema_version` | 必须为 `1` |
+| `token_id` | 一个既有 `agent_tokens.id`（不新建表、不改 schema、不签发） |
+| `expires_at` | 显式 UTC 截止时间（ISO-8601 带时区）；加载时已过期即拒绝 |
+| `master_path` | 必须等于进程实际配置的 `master.db` 规范路径 |
+| `warehouse_root` | 受信既存目录；每个仓文件必须落在其内 |
+| `warehouses` | 非空 `code -> 精确规范文件` 映射；禁止重复文件别名 |
+
+加载时校验绝对路径、存在性、master 一致性、root containment、symlink 逃逸与重复
+别名；运行期不 `mkdir`、不迁移、不创建缺库，也不使用 `immutable=1`（会掩盖 WAL
+中的已提交数据）。
+
+**严格模式的服务器边界**
+
+- `tools/list` 仅返回 `warehouse_list` / `items_list` / `items_detail`；全局 32 项
+  注册与 wire 声明不变，普通票据仍看到全部工具。
+- `tools/call` 在任何 handler / 业务库打开前，用同一静态集合拒绝所有写工具、其它
+  只读工具以及未知/未来工具；只接受的参数集合是精确的（`warehouse_list` 无参数；
+  `items_list` 仅 `warehouse_code`；`items_detail` 仅 `item_id` + `warehouse_code`），
+  并校验类型。SQL、文件路径、data root、`profile`、`read_only` 等覆盖参数一律拒绝。
+- `warehouse_list` 在严格模式显式检查 `GET /api/v1/warehouses`；每项仍执行既有
+  `check_warehouse` / `check_path`。token 的 `allowed_warehouses` 必须是显式非空
+  列表且是策略映射的子集；`allowed_write_paths` 必须为空。
+- 认证只走既有 `agent_tokens` 表（`mode=ro`，固定 `token_id` + prefix + pbkdf2 +
+  `revoked_at IS NULL`）；严格模式**不使用** `DAILYCHECK_MCP_TOKEN` env 短路，即使
+  该 env 值与已撤销票据相同。每个请求重新认证，每个工具调用再次校验期限与撤销。
+- stdio 仍是进程级 `DAILYCHECK_MCP_TOKEN`，但会以真实表认证换取上下文，不是不受限
+  的 env 身份。Bearer secret 只应出现在受保护的认证传输/env，不进入 argv、工具参数/
+  工具名或响应，也不写入 metadata 审计或报告。
+- 库存读取固定 `read_only=True`，连接为 `mode=ro` + `PRAGMA query_only` + SQLite
+  authorizer（拒绝写/DDL/`ATTACH`/`DETACH`/扩展加载）。仓文件必须同时满足：
+  master metadata 解析后的规范路径等于策略中该 code 的**精确文件**，且该文件在受信
+  root 内；否则在打开业务库前拒绝。缺库、缺表、缺列明确失败，**不迁移、不初始化、
+  不缓存、不回退 rw**。
+- 输出保留现有 `TextContent(JSON)` wire 与字段（`items_*` 仍含 `unit_cost`）。
+- 审计复用 metadata-only `access.log`（token id / method / status / duration /
+  tool name）。严格模式对**调用方的 MCP wire 响应**与 **metadata 审计**使用固定安全
+  文本：拒绝的工具名在审计中记为 `restricted`，未知工具错误固定为 `Unknown tool`，
+  不把调用方字符串写进这两个通道。**但 MCP SDK 1.30.0 自身会在 operator-side
+  stderr 记录被拒工具名（`Tool '<name>' not listed...`）以及非法 `arguments` 的
+  pydantic `input_value` 详情；该 stderr 通道不由 metadata 审计净化。** operator
+  诊断日志应按常规生产日志策略限制暴露；本实现不声称已实现日志过滤器、零日志或
+  已验证生产日志配置。审计仍是 best-effort，不宣称 fail-closed 持久回执。
+- SQLite WAL：`mode=ro` 读取可能创建/更新 `-shm` sidecar；主库与 `-wal` 字节不变
+  视为读取正确，不用 `immutable=1` 隐藏此限制。只读承诺不覆盖操作系统层面的
+  sidecar 权限行为。
+- 信任边界是受信 operator 的配置/代码/文件系统；不声称抵御已掌控文件系统的管理员。
+
+**未激活的生产事项（Owner / Prod 门禁）**：本策略默认 OFF。生产凭据的安全签发/注入/
+轮换、网络入口、服务安装、蓝绿部署与 Lucy 真实接收方验收仍由 Owner 拍板、Prod 执行；
+本次不读取既有凭据、不修改生产配置、不改变 CI/分支保护。
+
+### 9.7 一次性 Lucy 读取 runner（Issue #16，默认关闭；不构成生产激活）
+
+`scripts/mcp_lucy_read_once.py` 是承载上述严格策略的**有限接收客户端**，只有两个
+子命令，不是通用网关/查询客户端/凭据服务/队列：
+
+- `consume`（host-local）：只接受一份 operator 保护的 JSON plan（单 fd、no-follow、
+  私有权限、精确 schema、correlation + 完整 plan SHA-256、UTC 截止、1..60s 预算）。
+  plan 绑定仓库源码 repository/完整 git SHA、部署 anchor、唯一仓库与精确仓文件、
+  独立可信部署 state_dir、active-business PID/start/master 文件绑定、单个 item 与显式
+  `field_consent`（完整单条 shape + `unit_cost`）。缺字段、未知字段、过期、越界、
+  换行/控制字符、缺失 consent 一律在产生任何效果前拒绝。
+- 生命周期固定为
+  `claimed -> preflight-rejected | reading -> cleaning -> succeeded | reconcile_required`。
+  每次 correlation 在 operator 指定目录原子创建**一次**、fsync 的非秘密 claim
+  receipt；重复调用在创建任何 token/读取前被拒绝，receipt 永不删除/重置。中断的
+  `reading/cleaning` 只能由 operator 按 receipt 对账，runner 不会自动重读。
+- preflight 依次取得既有部署 fence 的**共享** `flock`（只打开既有文件，不创建/截断/
+  清除锁/chmod），plan 的 `deploy_anchor` 仅含 `state_dir` + `source_sha`，不再接受
+  独立 fence locator；固定读取同一 canonical 可信 owner/mode 目录的 `state.json` 与
+  `.attempt.lock`，与 source/DB 根独立，open 后核对 fd/path inode 与私有权限。
+  原样消费 `deploy_state.py` 的 version=1、settled lease/native 状态、无失败
+  last_attempt、成功 `deployed.sha/pr/at`；若有 outcome 引用则按 producer schema
+  校验成功 result、SHA/PR/generation/deployment identity。只有 init 的无 PR 基线、
+  缺失/未知/畸形/未 settled 状态及自造 `source_sha/release_id/deployment_root` 均拒绝。
+  源码 HEAD 后逐一比较全部 tracked Python 的 Git blob 与磁盘字节（含 runner、
+  blueprint 模块顶层及 assume-unchanged 文件）；先于后缀筛选检查 Git mode，拒绝 tracked
+  link/gitlink。无 pathspec、NUL 分隔的 ordinary/ignored 清单结合实际 lstat/canonical
+  遍历，拒绝嵌套仓库（含 git-file checkout）、目录/祖先链接、untracked/ignored Python、
+  应用字节码（含 timestamp-valid / unchecked-hash cache）及目标解释器 native-extension
+  形式，然后才新鲜应用 import/签发。`-B` 只禁写、不阻止加载缓存；runner 不删除缓存。
+  operator 显式选定的解释器及已安装依赖单独受信；顶层 `.venv`/`node_modules` 仅当
+  禁用 site startup 的 isolated metadata query 确认它是该解释器实际 ordinary environment
+  目录才豁免（Python <=3.13 同时核对选定 executable 的 ordinary `pyvenv.cfg`）；
+  basename、嵌套假依赖目录或指向受信根的链接不能获得信任。受信依赖根以外源码树中
+  **所有 symlink** 均拒绝，包括未选中仓的普通数据文件链接。普通 DB/log 的兼容与
+  字节不变仅指 regular 文件；不声称抵御 preflight 后任意并发替换或解释器自身被改写。
+  首个 pilot 仍须显式获批的 regular-file 仓，但仅选普通仓并不足以就绪：已测量的
+  `wh_002.db` 外链形状会阻止同一 checkout 中任何普通仓 pilot，原地生产试读明确
+  **BLOCKED**。真实试读还需另行具体批准的无链接执行检出或布局补救；本 Task 不批准
+  生产缓存/链接清理、布局变更或临时 source 部署。
+  再核对 active-business PID/start 与 master fd 绑定。fence 忙、anchor/source 不符、绑定
+  不符均在签发凭据前失败。生产模式仅 Linux；非 Linux 的 synthetic plan 使用**显式
+  标注**的 surrogate（`ps` + `lsof`），Linux CI 覆盖真实 `/proc` 检查。
+- 通过 preflight 后，runner 才用既有 `agent_tokens` schema 新建**唯一**一条 identity：
+  name 由 correlation 派生、内存生成随机 secret、只含
+  `GET /api/v1/warehouses` + `GET /api/v1/items` 两个 read path、空 write path、
+  单一仓库、rate limit；不存/不返回明文，不触碰既有票据。policy 文件 0600 落在
+  0700 临时目录，child env 只注入本次 token 与一个**每任务临时** `DAILYCHECK_SECRET_KEY`
+  （非 Web 进程、不读既有 env/不重启服务）。
+- MCP 调用固定为 `initialize -> tools/list（恰好 3 项）-> warehouse_list（恰好 1 仓）
+  -> items_detail（恰好 1 item）`；使用公开 SDK `ClientSession`/`stdio_client`，仅以
+  作用域内 observer 观察 SDK spawn seam 并返回真实 child 对象（不替换全局
+  `subprocess.Popen`）。超时/异常时 shielded 清理只终止本次拥有的 child/session，
+  记录实际 pid/start/returncode/wait/ECHILD 证据。业务 `TextContent` JSON 即使
+  `isError=false` 也拒绝 `error` payload。
+- 清理顺序：只吊销本次新建 identity 并 re-read 证明，child 已 wait，删除自有
+  policy/temp，最后释放 fence。任一步失败 → 非零结构化 failure、不返回业务成功、
+  保留 claim barrier 并要求 operator 对账。既有 schema 无全局 TTL，因此该 identity
+  只由严格 policy 截止 + 已验证吊销约束；父进程在吊销前意外死亡属于恢复要求，
+  不是有保证的全局过期。consume custody 的真实 finally 覆盖 KeyboardInterrupt、
+  SDK cancellation、issue 后 ledger 写入失败与意外异常；SDK context 退出前先撤销，
+  再正向 wait child、删自有 policy，fence 最后释放，期间真实 deployer EX flock 均被阻塞。
+  SIGKILL/host crash 不运行 finally，遗留行（含 receipt 已记 id）仍需后续显式授权的
+  operator 对账；不增加 sweeper/第三命令/自动重读。
+- `relay`（Mac）：读取 operator 保护的 relay request，要求 request 内提供的 SSH
+  public key 指纹匹配、host alias 固定为 `wdg_vps`、本地 `ssh -G` 解析的
+  destination/port 与 request 一致；仅创建任务内 0600 known_hosts，固定
+  `StrictHostKeyChecking=yes`、`UpdateHostKeys=no`、`BatchMode=yes`、禁用
+  forwarding/agent-forward/X11/PTY/ControlMaster/ProxyCommand，执行**一条**固定
+  remote `consume` 命令。hostkey/EPERM/超时/不完整结果一律失败关闭，不降级、不换
+  主机、不重试；超时是 unknown，不是成功。
+- relay request 里的公钥/指纹 provenance 是 Owner/Prod 前置条件，runner 不做
+  `ssh-keyscan`、不自动信任、不改全局 SSH 配置。plan/receipt 中的 Owner 引用只是
+  审计引用，**JSON 布尔值本身不是 Owner 批准**；OS 保护的 operator plan 与后续
+  Owner/Prod dispatch 才提供授权。生产 fence/anchor/data/identity 的实际取值当前
+  未知，必须由未来授权的 Prod operator 按真实部署契约提供并复核；本地 synthetic
+  证明不建立生产映射。业务结果只交给授权接收方/Owner，不进入公开 PR/Slack。
+
 ## 10. 业务领域模型
 
 ### 10.1 仓库类型
@@ -3501,6 +3639,30 @@ Issue #140 的 `tests/test_wms_dashboard.py` 覆盖真实 Cookie/DC/viewer 权�
 `test_wms_web_service.py` 用真实已核验 schema 的合成 SQLite 数据与 SQL 方言适配执行查询，
 验证 >500 行唯一分页、跨货主同编码、空仓历史、双方向同编号、库位一对多及其他仓单货主边界。
 `test_mcp_wms.py` 与 MCP 契约门禁验证旧调用；CI 禁止连接第三方生产库，真实验证归 Prod。
+
+Issue #16 的 `tests/test_mcp_readonly_policy.py`、`tests/mcp_server/test_protocol/test_readonly_policy_http.py`
+与 `test_readonly_policy_stdio.py` 覆盖显式只读策略的加载校验、真实 loopback HTTP 与真实 stdio 协议、
+三工具成功值、全部写/非首期/未知工具拒绝、精确参数/类型、过期/撤销/env 短路、token scope、
+metadata 跨仓/逃逸、legacy/不兼容/缺库/WAL 夹具、连接级 UPDATE/DDL/ATTACH 拒绝与文件字节不变量；
+策略默认关闭，标准模式 32 项工具与既有 wire 契约由原回归继续覆盖。
+
+Issue #16 的 `tests/test_mcp_lucy_read_once.py` 以**本地合成** master/warehouse、真实 holder
+进程、真实 SDK stdio child 与真实 claim/fence 覆盖一次性 runner：单 item 成功及 child
+pid/start/returncode/wait、既有票据行与仓文件字节不变量、重复 plan 的 replay 拒绝、
+hash/correlation/expiry/source/anchor/consent/unsafe-path/fence-busy 在签发前失败、
+父进程拥有的 child 超时清理、吊销失败不返回成功且保留 barrier、输出 canary/raw token/
+token hash 不泄漏、恶意换行/路径无副作用；relay 以 PATH 注入的 hermetic fake ssh 覆盖
+hostkey 指纹/缺失 key/alias 目标不符/EPERM/超时/远端 reconcile 的失败关闭与无降级。
+repair3 回归还直接调用未改动 producer 生成 state/owned outcome，并以其 `run` 的 EX
+flock 在真实 SDK child、revoke、positive wait、policy 清理和 release-last 阶段证明冲突；
+覆盖 malformed/outcome mismatch、fence inode/owner/mode、blueprint canary 拒绝及字节恢复、
+issue→policy/ledger/commit-return/SDK 的 catchable cancellation，仓字节与无关行保持不变。
+repair4 使用每例独立 checkout 覆盖 nested git-dir/git-file、目录/祖先链接、tracked
+link/gitlink、source-less/timestamp/unchecked bytecode、native extension 和假依赖根；
+要求 source 阶段在应用 import subprocess 启动前拒绝，无 canary/identity/read，且 replay
+拒绝。真实选定 venv/installed dependency 与普通 DB/log 的正向用例保持可用。
+Linux CI 另跑真实 `/proc` PID/start/master-fd 绑定用例；非 Linux 的 synthetic binding
+在结果中显式标注为 surrogate。测试不连接生产、不读取既有凭据/SSH 配置。
 
 Issue #130 的 `tests/test_store_ordering_receive.py` 覆盖自动建行复制来源仓
 `selling_price` / `unit_cost`、来源仓存在同 `canonical_id` 的 inactive/alias 重复行时

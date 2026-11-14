@@ -134,16 +134,189 @@ curl -H "Authorization: Bearer your_token" http://YOUR_HOST_IP:5100/health
 
 ---
 
+## Strict read-only policy (opt-in, Issue #16)
+
+The server can be started with an explicit, finite read-only policy. Without the
+flag the server keeps its existing behaviour. The policy is loaded once at
+process start; if it is missing, malformed, expired, or inconsistent with the
+configured master, the process stops instead of falling back to standard mode.
+HTTP and stdio use the same policy object.
+
+```bash
+python -m mcp_server --transport http \
+  --host 127.0.0.1 --port 5100 \
+  --readonly-policy /etc/dailycheck/mcp-readonly.json
+```
+
+The policy file contains only non-secret control fields (no bearer token):
+
+```json
+{
+  "schema_version": 1,
+  "token_id": 42,
+  "expires_at": "2026-11-15T00:00:00Z",
+  "master_path": "/var/lib/dailycheck/db/master.db",
+  "warehouse_root": "/var/lib/dailycheck/db/warehouses",
+  "warehouses": {
+    "<approved-warehouse-code>": "/var/lib/dailycheck/db/warehouses/<approved-file>.db"
+  }
+}
+```
+
+Rules enforced by the server:
+
+- `token_id` must be one **existing** `agent_tokens` row; the row's plaintext
+  bearer token is still presented by the caller and checked against the table
+  (`prefix` + `pbkdf2` + `revoked_at IS NULL`). No raw token is stored in the
+  policy file or printed.
+- The token must have an explicit, non-empty `allowed_warehouses` list that is a
+  subset of the policy's `warehouses` map, and an empty `allowed_write_paths`.
+  A policy never widens a token's ACL.
+- `expires_at` is an explicit UTC deadline. It is checked at load and on every
+  request/tool call; revocation is re-checked for each new operation. There is no
+  auto-renewal.
+- Only `warehouse_list`, `items_list`, and `items_detail` are listed and
+  dispatchable. Every other tool — including writes, canonical/order/WMS reads,
+  and future/unknown names — is rejected before any handler or business database
+  open. Arguments must match the exact declared key set and types; SQL, paths,
+  data roots, `profile`, and `read_only` overrides are not accepted.
+- Reads use `mode=ro` plus `PRAGMA query_only` plus a SQLite authorizer that
+  denies writes, DDL, `ATTACH`/`DETACH`, and extension loading. The warehouse
+  metadata path must resolve to the exact approved file for that code; missing
+  databases or incompatible schemas fail closed and are never migrated or created.
+- `items_list` / `items_detail` keep the existing wire fields, including
+  `unit_cost`.
+- Audit reuses the metadata-only `access.log`. A tool rejected by the strict
+  allowlist is recorded there with the fixed marker `restricted`, and the MCP wire
+  response uses fixed safe text (`Unknown tool`); caller-supplied names and
+  argument details are not copied into either channel. Note: MCP SDK 1.30.0
+  itself may write a rejected tool name (`Tool '<name>' not listed...`) and
+  pydantic `input_value` details for malformed arguments to the operator-side
+  stderr log. That stderr channel is not scrubbed by the metadata audit. Keep
+  operator diagnostics exposure under the normal production log policy; this
+  repository does not claim an implemented log filter, zero logging, or a
+  verified production logging configuration. Audit remains best-effort, not a
+  fail-closed durable receipt.
+- Bearer secrets belong only to the protected authentication transport/env and
+  are not accepted in tool arguments or names, nor written to audit records or
+  reports.
+- A read-only WAL read may create or update the `-shm` sidecar; the main database
+  and `-wal` remain unchanged. `immutable=1` is intentionally not used.
+- The trust boundary is the operator's configuration, code, and filesystem. The
+  policy does not claim protection from an administrator who can rewrite those.
+
+This policy is **off by default and does not activate production access**. Secure
+provisioning of the bearer token, network entry, deployment, and real receiver
+acceptance remain Owner/Prod decisions under `docs/agent-framework/workflow.md`.
+
+## One-shot Lucy read runner (Issue #16, not activated)
+
+`scripts/mcp_lucy_read_once.py` is the finite receiving client that consumes the
+strict policy above. It has exactly two subcommands and is not a gateway,
+query client, credential service, or job queue.
+
+- `consume` runs one operator-owned, hash-pinned plan on the host. The plan
+  binds the repository and full git SHA, deployment anchor, one warehouse and
+  its exact file, an explicit trusted deployment state directory, the
+  active-business PID/start and master file binding, one item, and explicit `field_consent` for the complete
+  single-item shape **including `unit_cost`**. Missing/unknown fields, a stale
+  UTC deadline, a changed hash/correlation, unsafe paths, or denied consent fail
+  before any identity or read.
+- One durable non-secret claim receipt per correlation is created atomically and
+  fsynced before any credential exists. The same plan can never run twice; a
+  claimed attempt is never reset. An interrupted attempt stays
+  `reconcile_required` for the operator and is not retried automatically.
+- Preflight takes a **shared** lock on the existing deployment fence (the file
+  must already exist; the runner never creates, truncates, or clears a lock),
+  then verifies the source HEAD and every tracked Python file against its Git blob
+  (including the runner and blueprint import side effects, even if marked
+  assume-unchanged), then checks pathspec-free NUL-delimited ordinary and ignored
+  Git inventories and the actual filesystem before fresh application imports.
+  Tracked links/gitlinks, nested repositories (including git-file checkouts),
+  directory or ancestor links, untracked/ignored Python, application bytecode
+  (including timestamp-valid and unchecked-hash caches), and the selected
+  interpreter's native-extension forms are refused. No caches are deleted;
+  `-B` prevents writes but does not prevent loading existing bytecode.
+  The explicitly selected interpreter and its installed dependencies remain
+  trusted separately: a top-level `.venv`/`node_modules` is exempt only when it
+  is that interpreter's actual ordinary environment directory, as reported by
+  an isolated interpreter metadata query with site startup disabled (and the
+  selected executable's ordinary `pyvenv.cfg` for Python <=3.13). A basename, nested fake dependency
+  root or link into a trusted root grants no trust. Every symlink in the source
+  tree outside trusted dependency roots is refused, including ordinary data-file
+  links for warehouses that the plan does not select. Ordinary DB/log compatibility
+  and byte invariance apply only to regular files. This admission does not protect against concurrent
+  arbitrary filesystem replacement after preflight or a rewritten interpreter.
+  Preflight also checks the active-business PID/start/master-fd binding.
+  `deploy_anchor` now contains exactly `state_dir` and `source_sha`; no separate
+  `fence` locator is accepted. Fixed `state.json` and `.attempt.lock` filenames
+  bind both artifacts to that same canonical, trusted owner/mode directory,
+  independent of the source and DB roots. The runner checks lock fstat/lstat
+  inode equality and private owner/mode after opening; it never creates or
+  chmods the deployment lock. It directly consumes unchanged `deploy_state.py`
+  releases: version 1, settled lease/native state, no failed last attempt,
+  `deployed.sha/pr/at`, and validates the referenced successful outcome's
+  SHA/PR/generation/deployment identity when present. An init-only baseline
+  without a release PR, malformed/missing/unknown state, or an authored
+  `source_sha/release_id/deployment_root` substitute fails closed. These are
+  deployment facts, never proof of Owner approval or a live process identity.
+  The first pilot requires an explicitly approved regular-file warehouse, but
+  selecting one alone is insufficient. The measured `wh_002.db` symlink shape
+  blocks every ordinary-warehouse pilot in that same checkout, so an in-place
+  production read is **BLOCKED**. A real pilot also needs a separately and
+  specifically approved link-free execution checkout or another approved layout
+  remedy. This Task authorizes no production cache/link cleanup, layout change,
+  or temporary source deployment.
+  Production consume is Linux-only; a non-Linux synthetic plan uses a clearly
+  labeled surrogate and Linux CI covers the real `/proc` path.
+- Only after preflight does the runner create one temporary `agent_tokens` row:
+  correlation-derived name, random secret held in memory, exactly
+  `GET /api/v1/warehouses` and `GET /api/v1/items`, no write paths, one warehouse,
+  and a rate limit. Existing identities are untouched; no plaintext is stored
+  or returned. The non-secret policy file is 0600 in a 0700 temp directory, and
+  the child environment receives only this job's token plus a fresh per-job
+  `DAILYCHECK_SECRET_KEY` (no existing web/MCP secret is read).
+- The child is the real MCP SDK stdio client. Calls are fixed:
+  `initialize -> tools/list (exactly 3) -> warehouse_list (exactly 1) ->
+  items_detail (exactly 1)`. The result carries one item, the MCP tool/argument
+  metadata, actual child pid/start/returncode/wait evidence, and cleanup proof.
+  Consume custody is held on a real `finally` path, including KeyboardInterrupt,
+  SDK cancellation, unexpected exceptions and ledger failure after issuance.
+  Revocation (commit + re-read) precedes positive child settlement, own policy
+  temp removal and fence release last; the producer's exclusive flock remains
+  blocked through this cleanup. No cancellation or incomplete cleanup returns
+  business success or grants another read. Any cleanup failure returns a non-zero
+  `reconcile_required` result with no business success.
+- The existing token schema has no universal expiry. This job bounds its
+  identity with the strict policy deadline and verified revocation;
+  uncatchable death (SIGKILL/host crash) cannot run `finally` and still needs
+  later explicitly authorized operator reconciliation of any surviving row,
+  including a receipt-recorded token id. There is no guaranteed global TTL,
+  background sweeper, third command or automatic retry.
+- `relay` (Mac) reads a protected relay request, requires the supplied SSH
+  public key to match the trusted fingerprint, fixes the host alias to
+  `wdg_vps`, resolves the alias destination/port locally and refuses a mismatch,
+  writes only a task-local 0600 known_hosts, and runs one fixed remote `consume`
+  command with `StrictHostKeyChecking=yes`, `UpdateHostKeys=no`,
+  `BatchMode=yes`, no forwarding/X11/PTY/ControlMaster, and no fallback after a
+  host-key denial, EPERM, or timeout. Key provenance remains an Owner/Prod
+  prerequisite; the runner never runs `ssh-keyscan` or changes global SSH config.
+- A plan or request is a protected operator artifact, not self-authenticating
+  Owner approval. The concrete production fence/anchor/data/identity values are
+  still unknown and must be supplied and revalidated by the future authorized
+  Prod operator. Business results go only to the authorized receiver/owner,
+  never to a public PR or chat channel.
+
 ## Available Tools
 
-The live server registers **29 tools**: 14 inventory/document/analysis tools,
-13 canonical tools and two store-order reads. The external integration
-[tools.json](integrations/dailycheck-mcp/tools.json) intentionally contains a
-**16-tool subset** (the 14 base tools plus two store-order reads); it is not the
-full live list and does not grant token permissions.
+The live server registers **32 tools**: 14 inventory/document/analysis tools,
+13 canonical tools, two store-order reads and three external WMS reads. The
+external integration [tools.json](integrations/dailycheck-mcp/tools.json)
+intentionally contains a **19-tool subset**; it is not the full live list and
+does not grant token permissions.
 
 The generated [complete contracts](integrations/dailycheck-mcp/registry.md) and
-[machine-readable ledger](integrations/dailycheck-mcp/registry.json) cover all 29
+[machine-readable ledger](integrations/dailycheck-mcp/registry.json) cover all 32
 names, handlers, input declarations, actual minimum output shapes, ACL enforcement,
 warehouse scope, compatibility and regression references. `get_tools()` and dispatch
 are derived from `mcp_server/protocol/registry.py`. Bot execution remains independently
