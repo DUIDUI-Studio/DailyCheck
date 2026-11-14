@@ -1816,7 +1816,10 @@ event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 
 证明远端 Gitea/GitHub runner 执行已成功，真实两端 CI 必须在后续授权发布后验证。
 
 测试：`tests/test_github_transport.py` 经 fake curl 子进程覆盖 credential roles、HTTP/auth、分页、
-malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/test_ci_portability.py`
+malformed/stale/producer/rerun、各 caller 和原生签名 webhook；legacy launcher 对照把
+`origin/main` 版本放入临时 `<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout），
+使其按 `parents[2]` 解析仓库根后与当前 launcher 各自真跑 HTTP fixture，比较 stdout、请求路径与
+auth 优先级；`tests/test_ci_portability.py`
 对本机认证 Git HTTP endpoint 真执行 source checkout，并验证 job 隔离；
 `tests/test_github_shadow_boundary.py` 真跑 receiver→CLI、adapter→sender、本机 HTTP 捕获器与
 预存未标记 SQLite row，断言零 shadow POST / 零越界写，且 Gitea 正控仍恰好投递一次；
@@ -3490,6 +3493,11 @@ flowchart LR
 `code/db`、嵌套 `code/db/custom-data`、不同名子目录与外部根的 create/clone/
 旧库初始化 → master 注册 → 实际 UoW 打开，并保留旧注册、绝对行和显式 Bot
 根在实际 inventory/只读 procurement 调用中的优先级。仅夹具打开既有 rollout。
+
+`tests/test_github_transport.py` 的 legacy launcher 对照把 `origin/main` 版本放进临时
+`<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout）运行，使 `parents[2]`
+解析到含 `scripts` 的仓库根，再与当前 launcher 各自真跑 HTTP fixture 比较 stdout 和
+请求 path/auth；不得把参考脚本丢在裸临时目录里执行。
 
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/

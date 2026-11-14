@@ -1307,8 +1307,14 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
     source = subprocess.check_output(
         ["git", "show", "origin/main:deploy/scripts/dailycheck_pr_poll.py"], cwd=root, text=True
     )
-    reference = tmp_path / "original-poller.py"
+    # The launcher resolves the repo root as ``Path(__file__).parents[2]``, so run the
+    # reference from an equivalent ``<root>/deploy/scripts`` layout whose ``scripts``
+    # package resolves to this checkout instead of from a bare temp file.
+    sandbox = tmp_path / "legacy-repo"
+    reference = sandbox / "deploy/scripts/original-poller.py"
+    reference.parent.mkdir(parents=True)
     reference.write_text(source)
+    (sandbox / "scripts").symlink_to(root / "scripts", target_is_directory=True)
     env = {
         **os.environ,
         "GITEA_URL": host + url_root,
@@ -1329,6 +1335,7 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
         text=True,
         timeout=20,
     )
+    reference_requests = list(requests)
     requests.clear()
     current = subprocess.run(
         [sys.executable, str(root / "deploy/scripts/dailycheck_pr_poll.py")],
@@ -1340,11 +1347,13 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
     )
     assert current.returncode == before.returncode == 0
     assert current.stdout == before.stdout and "30 分钟兜底轮询" in current.stdout
-    assert len(requests) == 2
     prefix = url_root.rstrip("/") + "/api/v1/repos/legacy/fixture/"
-    assert all(
-        r["path"].startswith(prefix) and r["auth"] == "token legacy-file-token" for r in requests
-    )
+    assert len(reference_requests) == len(requests) == 2
+    for recorded in (reference_requests, requests):
+        assert all(
+            r["path"].startswith(prefix) and r["auth"] == "token legacy-file-token"
+            for r in recorded
+        )
 
 
 def test_legacy_launcher_explicit_github_selects_canonical_without_gitea(
