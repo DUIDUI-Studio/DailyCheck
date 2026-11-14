@@ -2876,7 +2876,8 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
   `revoked_at IS NULL`）；严格模式**不使用** `DAILYCHECK_MCP_TOKEN` env 短路，即使
   该 env 值与已撤销票据相同。每个请求重新认证，每个工具调用再次校验期限与撤销。
 - stdio 仍是进程级 `DAILYCHECK_MCP_TOKEN`，但会以真实表认证换取上下文，不是不受限
-  的 env 身份；secret 不进入 argv、响应或日志。
+  的 env 身份。Bearer secret 只应出现在受保护的认证传输/env，不进入 argv、工具参数/
+  工具名或响应，也不写入 metadata 审计或报告。
 - 库存读取固定 `read_only=True`，连接为 `mode=ro` + `PRAGMA query_only` + SQLite
   authorizer（拒绝写/DDL/`ATTACH`/`DETACH`/扩展加载）。仓文件必须同时满足：
   master metadata 解析后的规范路径等于策略中该 code 的**精确文件**，且该文件在受信
@@ -2884,8 +2885,13 @@ claim、权限集合或原始 proposal 快照。GET/只读 MCP 不回填 schema 
   不缓存、不回退 rw**。
 - 输出保留现有 `TextContent(JSON)` wire 与字段（`items_*` 仍含 `unit_cost`）。
 - 审计复用 metadata-only `access.log`（token id / method / status / duration /
-  tool name）。严格模式拒绝的工具名统一记录为固定 `restricted`，不把调用方字符串
-  写进日志或错误；审计仍是 best-effort，不宣称 fail-closed 持久回执。
+  tool name）。严格模式对**调用方的 MCP wire 响应**与 **metadata 审计**使用固定安全
+  文本：拒绝的工具名在审计中记为 `restricted`，未知工具错误固定为 `Unknown tool`，
+  不把调用方字符串写进这两个通道。**但 MCP SDK 1.30.0 自身会在 operator-side
+  stderr 记录被拒工具名（`Tool '<name>' not listed...`）以及非法 `arguments` 的
+  pydantic `input_value` 详情；该 stderr 通道不由 metadata 审计净化。** operator
+  诊断日志应按常规生产日志策略限制暴露；本实现不声称已实现日志过滤器、零日志或
+  已验证生产日志配置。审计仍是 best-effort，不宣称 fail-closed 持久回执。
 - SQLite WAL：`mode=ro` 读取可能创建/更新 `-shm` sidecar；主库与 `-wal` 字节不变
   视为读取正确，不用 `immutable=1` 隐藏此限制。只读承诺不覆盖操作系统层面的
   sidecar 权限行为。

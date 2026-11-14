@@ -187,8 +187,19 @@ Rules enforced by the server:
 - `items_list` / `items_detail` keep the existing wire fields, including
   `unit_cost`.
 - Audit reuses the metadata-only `access.log`. A tool rejected by the strict
-  allowlist is logged with the fixed marker `restricted`, never its caller-supplied
-  name. Audit remains best-effort, not a fail-closed durable receipt.
+  allowlist is recorded there with the fixed marker `restricted`, and the MCP wire
+  response uses fixed safe text (`Unknown tool`); caller-supplied names and
+  argument details are not copied into either channel. Note: MCP SDK 1.30.0
+  itself may write a rejected tool name (`Tool '<name>' not listed...`) and
+  pydantic `input_value` details for malformed arguments to the operator-side
+  stderr log. That stderr channel is not scrubbed by the metadata audit. Keep
+  operator diagnostics exposure under the normal production log policy; this
+  repository does not claim an implemented log filter, zero logging, or a
+  verified production logging configuration. Audit remains best-effort, not a
+  fail-closed durable receipt.
+- Bearer secrets belong only to the protected authentication transport/env and
+  are not accepted in tool arguments or names, nor written to audit records or
+  reports.
 - A read-only WAL read may create or update the `-shm` sidecar; the main database
   and `-wal` remain unchanged. `immutable=1` is intentionally not used.
 - The trust boundary is the operator's configuration, code, and filesystem. The
