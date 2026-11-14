@@ -3527,7 +3527,13 @@ flowchart LR
 该环境只作用于被测子进程，不改变 producer/verifier 或 ordinary 准入与报告行为。
 `test_github_dispatch_diagnostics.py` 用实际 failing child 验证解析/异常前的私有诊断、字节截断/
 完整hash、写失败停止与 secret 不外泄；operator fixed-launcher 的 argv 验证另保留，不以裸
-Python 的 SOURCE 边界测试替代。ordinary fixture 另显式构造历史终态，核对真实新H lifecycle
+Python 的 SOURCE 边界测试替代。两组测试共用 `tests/private_audit_testenv.py` 的每例唯一0700
+私有 audit fixture，先验证全部祖先的 owner/mode；Linux 可用 root-owned sticky `/dev/shm`，
+Mac 使用解析后的合格临时祖先。这里只存小型诊断数据，执行脚本、DB 与 pytest basetemp
+仍在原磁盘 scratch；依赖 fixture 先实等候 children/HTTP 退出，再清理 audit。missing/symlink/
+public 负控先证明合格路径可接纳，再只改变目标条件；另核非sticky0777祖先/private0700叶子
+仍在 provider/child 前拒绝，不放宽产品 guard 或 approved producer 的 `/tmp` 契约。
+ordinary fixture 另显式构造历史终态，核对真实新H lifecycle
 和CI产生新trigger时旧行/旧delivery逐字段不变，同H不重发，claimed/UNKNOWN仍阻跨H。
 
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库

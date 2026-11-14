@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from tests import test_github_ordinary_intake as ordinary
+from tests.private_audit_testenv import private_audit_fixture  # noqa: F401
 
 SOURCE = ordinary.SOURCE
 lane = ordinary.lane
@@ -35,8 +36,8 @@ def run_dispatch(lane, adapter):
 
 
 @pytest.mark.parametrize("fault", ["ingest", "drain", "malformed", "binary", "large", "write"])
-def test_actual_child_evidence_precedes_parsing_and_failure(lane, tmp_path, fault):
-    audit = tmp_path / "child-audit"
+def test_actual_child_evidence_precedes_parsing_and_failure(lane, tmp_path, private_audit, fault):
+    audit = private_audit / "child-audit"
     audit.mkdir(mode=0o700)
     lane.env["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"] = str(audit.resolve())
     calls = tmp_path / "child-calls"
@@ -98,20 +99,46 @@ def test_actual_child_evidence_precedes_parsing_and_failure(lane, tmp_path, faul
     assert lane.posts == []
 
 
-@pytest.mark.parametrize("fault", ["missing", "symlink", "public"])
-def test_unsafe_audit_directory_stops_before_provider_or_child(lane, tmp_path, fault):
-    directory = tmp_path / "private"
+@pytest.mark.parametrize("fault", ["missing", "symlink", "public", "nonsticky-ancestor"])
+def test_unsafe_audit_directory_stops_before_provider_or_child(lane, tmp_path, private_audit, fault):
+    directory = private_audit / "private"
     directory.mkdir(mode=0o700)
+    # Prove the same unmodified input reaches audit admission before changing
+    # exactly one condition; an unsafe pytest /tmp must not mask this control.
+    env = dict(lane.env, DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR=str(directory))
+    child = subprocess.Popen([sys.executable, "-B", "-c",
+        "import os; from scripts.prod_agent.github_dispatch import _audit_directory; "
+        "os.close(_audit_directory())"], cwd=SOURCE, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = child.communicate(timeout=30)
+    assert child.wait() == 0, err
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child.pid, os.WNOHANG)
+    assert not out and not err and not lane.reads
     if fault == "missing":
         lane.env.pop("DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR", None)
     elif fault == "symlink":
-        alias = tmp_path / "alias"
+        alias = private_audit / "alias"
         alias.symlink_to(directory, target_is_directory=True)
         lane.env["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"] = str(alias)
+    elif fault == "nonsticky-ancestor":
+        ancestor = private_audit / "nonsticky"
+        ancestor.mkdir()
+        ancestor.chmod(0o777)
+        directory = ancestor / "private"
+        directory.mkdir(mode=0o700)
+        assert stat.S_IMODE(ancestor.stat().st_mode) == 0o777
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        lane.env["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"] = str(directory)
     else:
         directory.chmod(0o777)
         lane.env["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"] = str(directory.resolve())
-    status, public, err = run_dispatch(lane, tmp_path / "must-not-run")
+    marker = tmp_path / "unexpected-child"
+    adapter = tmp_path / "must-not-run"
+    adapter.write_text("#!/bin/bash\nprintf child > " + shlex.quote(str(marker)) + "\nexit 23\n")
+    adapter.chmod(0o700)
+    status, public, err = run_dispatch(lane, adapter)
     assert status["error"] == "ordinary_cron_diagnostic_unavailable"
-    assert not lane.reads and not lane.posts
+    assert not lane.reads and not lane.posts and not marker.exists()
+    assert "child" not in status and "diagnostics" not in status
     assert CANARY not in public + err

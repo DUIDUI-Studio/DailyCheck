@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from tests.conftest import candidate_python_env
+from tests.private_audit_testenv import private_audit_fixture  # noqa: F401
 from tests.test_deploy_publication_wiring import (  # noqa: F401
     PRIVATE_CANARY,
     _pipe,
@@ -37,7 +38,7 @@ SOURCE = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
-def lane(tmp_path, request):
+def lane(tmp_path, request, private_audit):
     table = evidence()
     table[ROOT + "/branches/main/protection"] = {"data": {
         "required_status_checks": {"strict": True, "checks": [
@@ -127,7 +128,7 @@ os.execv("/usr/bin/curl", ["/usr/bin/curl", *args])
         "DAILYCHECK_HERMES_WEBHOOK_URL": f"http://127.0.0.1:{server.server_port}",
         "TMPDIR": str(tmp_path),
     })
-    audit = tmp_path / "dispatch-audit"
+    audit = private_audit / "dispatch-audit"
     audit.mkdir(mode=0o700)
     env["DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR"] = str(audit.resolve())
     initialized = subprocess.run([sys.executable, str(SOURCE / "scripts/blue_green/deploy_state.py"),
