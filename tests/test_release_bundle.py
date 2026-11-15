@@ -240,6 +240,8 @@ def main():
             since_ms=policy["since_ms"],
         ),
     )
+    if case in {"automatic-ci", "ci-drift", "forged-ci", "unsigned-ci"}:
+        profile["capability"].update(version=2, ci_run_id=None, ci_attempt=None)
     env = dict(
         lane.env,
         PATH=str(tools) + os.pathsep + os.environ["PATH"],
@@ -268,6 +270,10 @@ def main():
         "wrong-issue",
         "issue-unknown",
         "completion-failure",
+        "automatic-ci",
+        "ci-drift",
+        "forged-ci",
+        "unsigned-ci",
     ],
 )
 def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tmp_path, case):
@@ -422,12 +428,42 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
     result = dispatch(lane)
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(lane.posts) == 1
+    if case in {"forged-ci", "unsigned-ci"}:
+        import sqlite3
+
+        with sqlite3.connect(profile["reducer_db"]) as connection:
+            row = connection.execute("SELECT trigger_id,payload_json FROM trigger_queue").fetchone()
+            payload = json.loads(row[1])
+            if case == "forged-ci":
+                payload["observed_ci_run_id"] = 123456
+            else:
+                del payload["ordinary_provenance"]
+            connection.execute("UPDATE trigger_queue SET payload_json=? WHERE trigger_id=?",
+                               (json.dumps(payload), row[0]))
     time.sleep(1.1)  # Formal review timestamp must be after the actual dispatch claim.
     decision = "CHANGES_REQUESTED" if case == "blocker" else "APPROVED"
     review_rc, review_out, review_err = run(
         [sys.executable, "-B", str(Path(profile["root"]) / "review.py"), decision], env
     )
+    if case in {"forged-ci", "unsigned-ci"}:
+        assert review_rc == 78, (review_rc, review_out, review_err)
+        assert not (Path(profile["root"]) / "ci-binding.json").exists()
+        assert not mutations
+        assert not (tmp_path / "calls").exists()
+        save_proof("release-fullchain-" + case, dict(synthetic=True, review_rc=review_rc,
+                   no_review_write=True, no_candidate=True, no_ci_binding=True))
+        return
     assert review_rc == (31 if case == "blocker" else 0), (review_rc, review_out, review_err)
+    if case in {"automatic-ci", "ci-drift"}:
+        ci = json.loads((Path(profile["root"]) / "ci-binding.json").read_bytes())
+        assert ci["observed_ci_run_id"] == 40 and ci["observed_ci_attempt"] == 2
+        assert ci["pr_head_sha"] == SHA and ci["pr_base_sha"] == BASE
+    if case == "ci-drift":
+        # Mutate the actual external authority after review, without editing profile/claim.
+        matches = [value["data"]["workflow_runs"] for key, value in lane.table.items()
+                   if "/actions/workflows/" in key and "/runs?" in key]
+        assert len(matches) == 1
+        matches[0][0]["run_attempt"] += 1
     rc, out, err = run(
         [sys.executable, "-B", str(Path(profile["root"]) / "parent.py"), "--execute-admitted"], env
     )
@@ -441,39 +477,45 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
         "wrong-issue": 78,
         "issue-unknown": 29,
         "completion-failure": 29,
+        "automatic-ci": 0,
+        "ci-drift": 78,
     }[case]
     assert rc == expected, (
         rc,
         out,
         err,
-        (Path(profile["root"]) / "retained-child.private.log").read_text(),
+        (Path(profile["root"]) / "retained-child.private.log").read_text()
+        if (Path(profile["root"]) / "retained-child.private.log").exists() else "prelaunch",
     )
     wait = json.loads((Path(profile["root"]) / "retained-child-wait.json").read_text())
     assert wait["positive_wait"] and wait["actual_ECHILD"]
+    if case == "ci-drift":
+        assert not (tmp_path / "calls").exists()
+        assert not [row for row in mutations if row["method"] == "PATCH" or row["path"] == "/graphql"]
     rows = [json.loads(line) for line in (tmp_path / "fd-trace.jsonl").read_text().splitlines()]
     assert len({(row["dev"], row["ino"], row["fd"]) for row in rows}) == 1
     assert rows[1]["pid"] == rows[1]["pgid"]
     assert all(row["pgid"] == rows[1]["pgid"] for row in rows[1:])
     assert len(rows) == (
         2
-        if case in ("blocker", "forbidden-scope", "wrong-issue")
+        if case in ("blocker", "forbidden-scope", "wrong-issue", "ci-drift")
         else 3
         if case in ("up-failure", "aborted")
         else 4
     )
-    if case not in ("blocker", "forbidden-scope", "wrong-issue"):
+    if case not in ("blocker", "forbidden-scope", "wrong-issue", "ci-drift"):
         receipt = json.loads((Path(profile["root"]) / "completion-receipt.json").read_text())
         assert receipt["remote_orca_push"] is False
         assert receipt["status"] == (
             "delivered"
-            if case == "happy"
+            if case in ("happy", "automatic-ci")
             else "deploy_failed"
             if case in ("up-failure", "aborted")
             else "UNKNOWN"
         )
         state = json.loads((Path(profile["state"]) / "state.json").read_text())
         assert state["generation"] == 12 and state["lock"] is None
-        if case in ("happy", "completion-failure"):
+        if case in ("happy", "automatic-ci", "completion-failure"):
             assert len([row for row in mutations if row["method"] == "PATCH"]) == 2
             assert len([row for row in mutations if row["path"] == "/graphql"]) == 1
         elif case == "issue-unknown":
@@ -484,7 +526,7 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             }
         else:
             assert not [row for row in mutations if row["method"] == "PATCH"]
-    if case not in ("blocker", "forbidden-scope", "wrong-issue"):
+    if case not in ("blocker", "forbidden-scope", "wrong-issue", "ci-drift"):
         completion_rows = [
             row
             for row in lane.table[ROOT + "/issues/160/comments?page=1"]["data"]

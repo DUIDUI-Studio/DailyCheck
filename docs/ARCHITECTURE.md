@@ -1349,6 +1349,10 @@ preview，实际入口在任何 intent/refresh 前拒绝。PR18 续期 ABI 与�
 把不可变 bootstrap helper 与承流 checkout 分开，蓝绿阶段/完整 verify/真实 monotonic
 >=600s/保护 FF 顺序不变。selector 同时核对私有 binding、当前 H/B/CI、signed SQLite claim、
 policy 和 eligible formal APPROVED；BLOCKER/UNKNOWN/重复 intent 均不启动候选。
+whole-run capability v2 可在最终 push 前保持 CI run/attempt 同时为 null；正式 review 入口
+在原 process fence 内验证 ready 信封、实时精确仓/H/B/workflow/App/checks，然后只创建一次
+私有 ci-binding.json。后续 candidate 必须复核同一 claim/run/attempt 和实时 CI，漂移即停，
+无 post-push Root 填参步骤；v1 仍保留显式固定 CI 身份。无签名 SQLite row 不提供绑定权威。
 `release_review.py` 的固定 declassified review 只允许单次 exact-H 写与真实回读；
 `release_parent.py` 保留唯一 Popen，所有 postlaunch 错误路径先正向 wait/ECHILD，再记次错。
 late finalizer/report 在同一 FD/PID/PGID/attempt identity 下刷新既有 App 角色；显式获批的
@@ -4137,7 +4141,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/DEV_ENV.md`](DEV_ENV.md) — wdg-systemd 容器部署细节
 - [`docs/mcp-configuration.md`](mcp-configuration.md) — MCP 接入
 - [`docs/agent-framework/workflow.md`](agent-framework/workflow.md) — Dev/Prod/Owner 三方协作工作流（角色、门禁、merge 政策、蓝绿部署、应急）
-- [`docs/agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md) — Orca 角色、模型、effort、fallback 与同 Task 重试规则
+- 全局执行政策 `~/.agents/AGENTS.md` 与模型策略 `~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}` — 项目模型编排文档已按 Owner 要求移除；不从旧项目表派生执行阶段或模型门禁
 
 ### 部署 / 运维
 

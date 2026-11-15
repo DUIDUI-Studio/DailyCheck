@@ -141,7 +141,8 @@ def review_admission(*, require_approval=True):
         isinstance(capability, dict)
         and set(capability)
         == {"version", "owner", "ci_run_id", "ci_attempt", "policy_sha256", "since_ms"}
-        and capability["version"] == 1
+        and type(capability["version"]) is int
+        and capability["version"] in {1, 2}
         and isinstance(capability["owner"], str)
         and bool(capability["owner"]),
         "whole-run-capability-missing",
@@ -149,8 +150,11 @@ def review_admission(*, require_approval=True):
     require(
         all(
             type(capability[k]) is int and capability[k] > 0
-            for k in ("ci_run_id", "ci_attempt", "since_ms")
-        ),
+            for k in (("since_ms",) if capability["version"] == 2 else
+                      ("ci_run_id", "ci_attempt", "since_ms"))
+        )
+        and (capability["version"] != 2 or
+             capability["ci_run_id"] is None and capability["ci_attempt"] is None),
         "whole-run-capability-invalid",
     )
     rule = github_intake.policy()
@@ -172,10 +176,14 @@ def review_admission(*, require_approval=True):
         ).fetchall()
     require(len(rows) == 1, "single-review-claim-required")
     payload = json.loads(rows[0][0])
+    require(github_intake.authentic(payload, frozenset({"ready"})), "review-claim-unauthenticated")
     require(
         payload.get("pr_base_sha") == PROFILE["base"]
-        and payload.get("observed_ci_run_id") == capability["ci_run_id"]
-        and payload.get("observed_ci_attempt") == capability["ci_attempt"],
+        and all(type(payload.get(k)) is int and payload[k] > 0
+                for k in ("observed_ci_run_id", "observed_ci_attempt"))
+        and (capability["version"] == 2 or
+             payload.get("observed_ci_run_id") == capability["ci_run_id"]
+             and payload.get("observed_ci_attempt") == capability["ci_attempt"]),
         "review-ci-changed",
     )
     if require_approval:
@@ -187,10 +195,27 @@ def review_admission(*, require_approval=True):
     require(
         gate.get("ready") is True
         and gate.get("base_sha") == PROFILE["base"]
-        and gate.get("run_id") == capability["ci_run_id"]
-        and gate.get("run_attempt") == capability["ci_attempt"],
+        and gate.get("run_id") == payload["observed_ci_run_id"]
+        and gate.get("run_attempt") == payload["observed_ci_attempt"],
         "current-ci-not-ready",
     )
+    if capability["version"] == 2:
+        # First use binds the *actual* trusted CI after the natural final push.
+        # The signed native claim plus live repository/workflow/App check are
+        # authorities; an incoming hint, Agent argv or a later operator edit is not.
+        ci = {key: payload[key] for key in (
+            "pr_number", "pr_head_sha", "pr_base_sha", "observed_ci_run_id",
+            "observed_ci_attempt", "trigger_id", "admission_id", "policy_sha256",
+        )}
+        path = Path(PROFILE["root"]) / "ci-binding.json"
+        if not path.exists() and not require_approval:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                output.write((json.dumps(ci, sort_keys=True) + "\n").encode())
+                output.flush()
+                os.fsync(output.fileno())
+            sync_directory(PROFILE["root"])
+        require(json.loads(regular(path)) == ci, "bound-ci-changed")
     if require_approval:
         from scripts.blue_green import publication_authority
         from scripts.blue_green.release_issues import grant_client, issue, validate_protocol

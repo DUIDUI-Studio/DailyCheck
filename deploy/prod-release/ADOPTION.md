@@ -17,8 +17,17 @@ manifests, old queue rows, gen11 and failed attempts. No old profile can be repl
 App 5674104, installation 180015273, code repository 1448986421
 (DUIDUI-Studio/DailyCheck), operations repository 1449125557
 (DUIDUI-Studio/DailyCheck-ops), public engineering Issue19 ID6391796319 are
-observed identities. Private source Issue number/ID remain null until Owner
-confirms the actual source and access. Do not infer Ops Issue20 or reuse Ops1.
+observed identities. Private source Issue number/ID remain null in previews until
+the authorized dedicated-source creation is read back and its access verified.
+Do not infer Ops Issue20 or reuse Ops1.
+
+Whole-run capability version2 is installed before the final push with both CI
+identity fields null. Under the original process fence, the remote formal-review
+entry verifies the native signed ready claim and fresh exact repository/H/B/
+workflow/App checks, then atomically freezes ci-binding.json once. Candidate
+startup requires that same binding and fresh unchanged CI; a rerun or changed
+claim stops. There is no manual post-push profile editing or payload-selected CI.
+Version1 retains its explicitly pinned run/attempt contract for existing bundles.
 
 The dedicated Issue proposal requests only `issues:write` plus implicit
 `metadata:read`, one selected repository per token, separate from read/report/
