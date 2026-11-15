@@ -1342,6 +1342,29 @@ GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`，保留原同 SHA 
 
 #### 3.17.1 私有反馈与公开投影（Issue #162；本地实现，未启用）
 
+**PR20 自动交付准备（本地实现，未采用）**：`release_credentials.py` 从精确 source/helper
+闭包生成受保护的 review/parent/entry/selector/refresh 文件；允许空 live inputs 的 inert
+preview，实际入口在任何 intent/refresh 前拒绝。PR18 续期 ABI 与独立 R1/R2 caller 修复
+按源字节复用，未合并其业务历史。既有 pipeline 的显式 `DAILYCHECK_PIPELINE_REPO`
+把不可变 bootstrap helper 与承流 checkout 分开，蓝绿阶段/完整 verify/真实 monotonic
+>=600s/保护 FF 顺序不变。selector 同时核对私有 binding、当前 H/B/CI、signed SQLite claim、
+policy 和 eligible formal APPROVED；BLOCKER/UNKNOWN/重复 intent 均不启动候选。
+`release_review.py` 的固定 declassified review 只允许单次 exact-H 写与真实回读；
+`release_parent.py` 保留唯一 Popen，所有 postlaunch 错误路径先正向 wait/ECHILD，再记次错。
+late finalizer/report 在同一 FD/PID/PGID/attempt identity 下刷新既有 App 角色；显式获批的
+Issue-only 两仓 grant 由原 shim 的精确 adapter 在 startup/late report 更新，不扩大现有角色。
+`release_issues.py` 用 native state/publication/process fence 关联真实成功、linked receipt、
+source tuple 与已确认 Issue19/source Issue；PATCH 前 durable uncertain，丢 ACK 后只准 GET，
+没有第二次 PATCH。无 source/token scope/expiry/repository identity 即 fail closed。
+`release_finish.py` 把 native deploy rc、report rc、Issue 结果、UNKNOWN 和 remote_orca_push=false
+分开记录；远端文件/终端输出与既有本机 Orca forge tracker 回执是独立证据。
+ordinary pipeline 的报告失败现在返回29，保留既有非零首错及真实 deployed/outcome；
+`aborted`/未知失败有 typed 公共 stage，candidate/ownership drift 映射到有限 stage。
+Gitea best-effort 兼容路径保留。`release_config.py` 只在既有 publication_config_transaction
+内 CAS PR20 binding，安装前拒绝 unsafe path/硬链接/漂移，回退不得覆盖独立变化；
+没有新 daemon/timer、全局 scheduler patch、生产安装、grant、dispatch 或 tracker 恢复。
+
+
 运维目的地必须显式设置 `DAILYCHECK_GITHUB_OPERATIONS_REPO`、`_REPO_ID` 和
 `_EXPECT_PRIVATE=true`；不提供缺省公共 fallback。私有 mutation 前由 transport
 逐次认证 GET metadata，要求完整且精确的 ID/full_name/API URL/web URL、

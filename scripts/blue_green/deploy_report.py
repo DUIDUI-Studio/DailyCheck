@@ -19,8 +19,8 @@
    来处理」的推送：consumer 是 agent 的**事件文件**（JSONL，append-only），
    agent 自己轮询/被唤醒，不需要有人被喊醒。人也拿不到一个「请去处理」的
    请求 —— 人该看的时候会去 PR 上看，那是留档，不是工单。
-4. **best-effort，永不抛错**。Gitea 挂了 / token 过期 / 网络不通都只写日志，
-   因为这是部署收尾路径 —— 让「回写失败」把一次成功部署变成红，本末倒置。
+4. Gitea 保留 best-effort 兼容路径；显式 GitHub ordinary 对公开回写或私有
+   反馈 sink 失败返回非零，pipeline 保留部署首错及真实 outcome 并区分交付未确认。
 
 ## 三条通道各管什么
 
@@ -616,7 +616,7 @@ class PublicDeployFacts:
             raise HostingError("invalid_public_native_identity")
         enums = {
             "stage": {"acquire", "candidate", "up", "verify", "promote", "switch",
-                      "observe", "merge", "release", "complete"},
+                      "observe", "merge", "release", "complete", "aborted", "unknown"},
             "kind": {"success", "usage", "lock", "code", "drift", "env", "unknown"},
             "scope": {"in-scope", "out-of-scope", "undetermined"},
             "verdict": {"aligned", "drifted", "unverifiable", "unknown"},
@@ -830,6 +830,8 @@ def _public_stage(tr: dict, rc: int) -> str:
     stage = tr["stage"]
     if stage == "verify-drift":
         return "verify"
+    if stage in {"candidate-drift", "ownership"}:
+        return "candidate"
     if stage == "unknown" and rc == 0:
         return "complete"
     return stage
@@ -1018,6 +1020,9 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
         message = "GitHub private inbox recorded; poll reconciliation required" \
             if provider() is Provider.GITHUB else "已唤醒 prod-agent"
         print(f"[deploy-report] {message} next={nxt}", file=sys.stderr)
+    if provider() is Provider.GITHUB and github_ordinary_enabled() and (not appended or not pushed):
+        print("[deploy-report] ordinary feedback sink unconfirmed", file=sys.stderr)
+        return write_rc or 1
     return write_rc
 
 

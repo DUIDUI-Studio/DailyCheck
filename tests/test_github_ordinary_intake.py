@@ -61,11 +61,17 @@ def lane(tmp_path, request, private_audit):
             query = parse_qs(url.query)
             key = url.path + ("?page=" + query["page"][0] if "page" in query else "")
             reads.append(key)
+            if "authorize" in transport:
+                transport["authorize"](key, self.headers)
             row = table.get(key, {"status": 404, "data": {}})
             self.respond(row.get("status", 200), row["data"])
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers["Content-Length"]))
+            if "mutation" in transport and not self.path.startswith("/webhooks/"):
+                status, data = transport["mutation"](self.path, "POST", json.loads(raw), self.headers)
+                self.respond(status, data)
+                return
             expected = "sha256=" + hmac.new(b"owned-route-secret", raw, hashlib.sha256).hexdigest()
             assert hmac.compare_digest(self.headers["X-Hub-Signature-256"], expected)
             posts.append({"path": self.path, "event": self.headers["X-GitHub-Event"],
@@ -75,6 +81,11 @@ def lane(tmp_path, request, private_audit):
                 self.connection.close()
                 return
             self.respond(202, {})
+
+        def do_PATCH(self):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            status, data = transport["mutation"](self.path, "PATCH", json.loads(raw), self.headers)
+            self.respond(status, data)
 
         def respond(self, status, data):
             raw = json.dumps(data).encode()

@@ -308,9 +308,9 @@ def _outcome(sb):
     return state, outcome_id, (state.get("outcomes") or {}).get(outcome_id)
 
 
-def _success(sb):
+def _success(sb, expected_rc=0):
     proc = _pipe(sb, str(PR), SHA, "--observe-min", "0")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode == expected_rc, proc.stdout + proc.stderr
     return proc
 
 
@@ -606,7 +606,7 @@ def test_dry_run_mints_no_outcome_and_publishes_nothing(sandbox):
 
 def test_missing_binding_blocks_publication_but_keeps_private_outcome(sandbox):
     (sandbox["state"] / "bindings.json").unlink()
-    proc = _success(sandbox)
+    proc = _success(sandbox, expected_rc=29)
     assert "PR 回写失败" in proc.stdout or "public publication blocked" in proc.stderr + proc.stdout
     _, _, outcome = _outcome(sandbox)
     assert outcome is not None, "the durable receipt must survive a blocked publication"
@@ -774,7 +774,7 @@ def test_release_state_io_failure_mints_no_outcome(sandbox):
 def _drop_first_response(sandbox):
     sandbox["api"].drop_comment = True
     proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "0")
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.returncode == 29, proc.stdout + proc.stderr
     sandbox["api"].drop_comment = False
     state, outcome_id, outcome = _outcome(sandbox)
     assert state["publications"][outcome_id]["state"] == "uncertain"
@@ -837,7 +837,7 @@ def test_ambiguous_binding_blocks_publication_and_keeps_private_outcome(sandbox)
     document["bindings"].append(json.loads(json.dumps(document["bindings"][0])))
     document["bindings"][1]["source"]["number"] = 8
     (sandbox["state"] / "bindings.json").write_text(json.dumps(document))
-    _success(sandbox)
+    _success(sandbox, expected_rc=29)
     _, _, outcome = _outcome(sandbox)
     assert outcome is not None
     assert not sandbox["api"].posts
@@ -1312,3 +1312,43 @@ OWN
         for path in helper_tmp.iterdir():
             shutil.rmtree(path)
     assert not list(helper_tmp.iterdir())
+
+
+@pytest.mark.parametrize("stage,rc", [("aborted", 143), ("ownership", 28), ("candidate-drift", 26), ("unknown", 78)])
+def test_terminal_failure_stage_has_typed_public_projection(stage, rc):
+    from scripts.blue_green.deploy_report import PublicDeployFacts, _public_stage, render_public
+    facts = PublicDeployFacts(42, SHA, str(uuid.uuid4()), "2026-11-15T00:00:00Z",
+        rc, _public_stage({"stage": stage}, rc), "unknown", "undetermined", "unknown", "halt")
+    assert f"| RC | {rc} |" in render_public(facts)
+
+
+def test_report_write_failure_preserves_deploy_success_as_separate_fact(sandbox):
+    sandbox["api"].comment_status = 503
+    proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "10")
+    assert proc.returncode == 29, proc.stdout + proc.stderr
+    state, ident, outcome = _outcome(sandbox)
+    assert outcome["rc"] == 0 and outcome["stage"] == "complete"
+    assert state["publications"][ident]["state"] == "uncertain"
+    assert len(sandbox["api"].posts) == 1
+
+
+def test_aborted_native_attempt_publishes_failure_without_overwriting_cause(sandbox):
+    # TERM the actual pipeline during its owned up stage; no internal mock.
+    (sandbox["dir"] / "up.sh").write_text("#!/bin/sh\nkill -TERM $PPID\nexit 0\n")
+    proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "10")
+    assert proc.returncode == 143, proc.stdout + proc.stderr
+    state = _state(sandbox)
+    outcome = next(iter(state["outcomes"].values()))
+    assert outcome["rc"] == 143 and outcome["stage"] == "aborted"
+    assert "| RC | 143 |" in sandbox["api"].comments[0]["body"]
+    assert "| 阶段 | `aborted` |" in sandbox["api"].comments[0]["body"]
+
+
+def test_notification_write_failure_is_not_reported_as_ordinary_success(sandbox):
+    blocked = sandbox["tmp"] / "unwritable-event-file"
+    blocked.mkdir()
+    env = dict(sandbox["env"], DAILYCHECK_DEPLOY_EVENT_LOG=str(blocked))
+    proc = _pipe(sandbox, str(PR), SHA, "--observe-min", "10", env=env)
+    assert proc.returncode == 29, proc.stdout + proc.stderr
+    state, ident, outcome = _outcome(sandbox)
+    assert outcome["rc"] == 0 and state["publications"][ident]["state"] == "linked"
