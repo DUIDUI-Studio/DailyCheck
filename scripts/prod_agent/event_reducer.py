@@ -1993,7 +1993,9 @@ class EventReducer:
                                  (now_ms + 500, now_ms, trigger_id))
                     conn.execute("COMMIT")
                     return {"decision": "defer", "reason": "ordinary_not_sent",
-                            "trigger_id": trigger_id, "failed": True, "due_at_ms": now_ms + 500}
+                            "trigger_id": trigger_id, "failed": True, "due_at_ms": now_ms + 500,
+                            "failure_reason": safe_reason,
+                            "payload": strict_json_loads(row["payload_json"])}
                 conn.execute("UPDATE trigger_queue SET state='done', last_error='delivery_unknown', updated_at_ms=? WHERE trigger_id=?",
                              (now_ms, trigger_id))
                 conn.execute("COMMIT")

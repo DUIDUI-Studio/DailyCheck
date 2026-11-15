@@ -1827,6 +1827,9 @@ stdout/stderr 原始 bytes 的有界副本（每流64KiB）、总长度与 SHA25
 audit 目录；固定前门通过 `DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR` 传递该0700目录。记录为
 0600/nosymlink 文件，公共状态只给安全分类和证据 basename/hash；子进程 reason/raw 不转发。
 目录或记录失败显式停止，保留已知 child phase/rc，不再运行下一个 ingest/drain 补日志。
+sender 拒绝时，其原始闭门诊断写入 adapter 私有 stderr；未跨 send intent 的
+`ordinary_not_sent` 保留原签名 payload 与脱敏 failure_reason，使输出仍通过既有 authority
+校验并保留首因，不把已知未发送遮成 shadow rejection，也不改变 claim/send 重试边界。
 固定 numeric review actor 的正式 exact dispatched-H review 回读，可在 claim 时间与原 CI
 run/attempt 对齐后结束审查等待；仅 APPROVED/CHANGES_REQUESTED，且 actor 不得是 PR author。
 BLOCKER 允许修复后新 H 重新审查；旧 H 不重放。无证据保持 UNKNOWN；TTL 不证明进程退出。

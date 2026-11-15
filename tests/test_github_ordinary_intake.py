@@ -679,3 +679,30 @@ def test_new_head_preserves_terminal_history_and_respects_unresolved_work(lane, 
         assert lane.posts == []
         with sqlite3.connect(db) as conn:
             assert conn.execute("SELECT last_error FROM trigger_queue WHERE trigger_id=?", (old_id,)).fetchone()[0] == "delivery_unknown"
+
+
+def test_sender_refusal_retains_first_cause(lane):
+    def authorize(key, headers):
+        db = Path(lane.env["DAILYCHECK_EVENT_REDUCER_DB"])
+        claimed = False
+        if db.exists():
+            with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True) as conn:
+                claimed = bool(conn.execute(
+                    "SELECT 1 FROM trigger_queue WHERE state='claimed'").fetchone())
+        if claimed:
+            run = lane.table[ROOT + "/actions/workflows/12/runs?page=1"]["data"]["workflow_runs"][0]
+            run.update(status="in_progress", conclusion=None)
+
+    lane.transport["authorize"] = authorize
+    assert lane.post()[0] == 202
+    ingest = lane.adapter(lane.records()[0])
+    assert ingest.returncode == 75, (ingest.stdout, ingest.stderr)
+    drained = lane.adapter()
+    with sqlite3.connect(lane.env["DAILYCHECK_EVENT_REDUCER_DB"]) as conn:
+        row = conn.execute("SELECT state,last_error,attempts FROM trigger_queue").fetchone()
+    assert not lane.posts
+    assert row == ("pending", "", 1)
+    assert "ordinary_readiness_invalidated" in drained.stderr
+    failure = json.loads(drained.stderr.splitlines()[-1])
+    assert failure["reason"] == "ordinary_not_sent"
+    assert failure["failure_reason"] == "http_enqueue_exit=5"
