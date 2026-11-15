@@ -2,19 +2,31 @@
 
 > 版本：2026-10-15 定稿（Eric 口述对齐 + 实况核对；同日二次修订——push 政策放开、merge 政策改为 Prod 判定）。2026-10-25 修订——新增 §四「merge 后删除源分支」与 §三批量清理豁免（Eric 拍板）。2026-10-27 修订——全局化「CI 绿不是终态」，要求手动与定时 Coordinator 跟踪到部署成功。
 > 新/旧 agent session 接入本机制的提示词见 [`session-bootstrap.md`](session-bootstrap.md)。
-> 本文档是 Dev / Coordinator / Prod / Owner 四方协作的权威口径；与本文冲突的口头约定以本文为准。
+> 本文档是项目协作的权威口径。Owner 的明确指令优先；涉及红线的已授权调整须留下 `Owner-Authorization` 记录，不要求同一事项重复批准。
+> 2026-11-15 Owner 批准：默认单一主执行者负责完整结果，辅助与专职协调按需使用；既有 HOLD、明确预算、独立 review 与生产权限保持有效。
 > 机制细节的演进史见 `docs/agent-framework/v0.1.md`。
 
 ## 一、角色分工
 
 | 角色 | 载体 | 职责 | 绝不碰 |
 |------|------|------|--------|
-| **Dev Agent** | 本地开发机 | 开发、测试、提 PR（含「生产侧事项」段落，见 §三） | merge（由 Prod Agent 执行，§四）、生产环境（VPS 只读排查需 owner 授权） |
-| **Coordinator / Triage** | 本地 Orca（手动或定时） | Issue 认领、分派 writer/reviewer、跟踪冲突/CI/部署终态、回流失败 | 业务代码（分派后由 writer 写）、merge、部署、生产环境、Issue 关闭 |
+| **Dev / 主执行者** | 当前开发会话；确需隔离时使用独立 worker | 连续完成理解、诊断、设计、相关实现、修复、验证、PR 与交付跟进 | merge / 部署 / 关闭 Issue（Prod 执行）；生产只读排查仍需已有授权 |
+| **专职 Coordinator / Triage（条件角色）** | 多个独立工作流或明确指定的手动/定时协调会话 | Issue 认领、完整工作单元分派、依赖与写入冲突、跟踪终态、回流失败 | 业务代码（由 writer 写）、merge、部署、生产环境、Issue 关闭 |
+| **Reviewer（独立会话）** | 能满足独立性要求的只读会话 | 审查完整候选及实际差量，核验发现与相关证据 | 修复代码、接管 writer、替 Prod 执行发布 |
 | **Prod Agent** | VPS (wdg_vps) | **merge 判定**、部署执行、生产验证、灰度切流、回滚、清理 | 仓库治理决策（主动改 main 内容、开非常规 PR；对 PR 内容有异议 → 打回/开 Issue，不自行改代码） |
 | **Owner (Eric)** | — | 需求拍板、方案拍板、红线内政策的最终决定 | — |
 
 需求来源两条：owner 直接提需求；或 Prod Agent 在生产验证中发现问题 → 开 Issue → 转 Dev。
+
+### 执行方式与责任连续性
+
+- 默认当前 Dev 是完整结果的主执行者。读代码、设计、前后端实现、测试、修复和汇报是同一工作的环节，不分别创建角色或 Task。管理辅助 agent 不使主执行者自动变成禁止写代码的专职 Coordinator。
+- 原生 subagent 适合独立资料阅读、日志归纳、备选假设等辅助成果；短命令和连续调试由主执行者直接完成。只有跨 CLI/账户/环境、独立工作区、正式独立性或受监督生命周期等需要，才采用 Orca worker。使用技能本身不触发分工。
+- 一个共享工作树同一时间一个写者；正式 Reviewer 必须独立会话、只读。原生助手只有实际满足项目独立性要求才可承担正式 Review，否则使用独立 Orca worker。Orca worker 仍遵守其 Task 的委派权限。
+- 目标、验收、真实权限、共享写入归属与显式预算是硬边界。预计文件和操作步骤是起点；为原验收所需的关联实现与修复由原 writer 在授权内贯通，无关需求另立 Issue。
+- 新任务不使用通用一次或三次本地重试上限。有新证据、输入或假设时继续修正；同条件重复失败要重新检查前提。用户明确限制、生产 attempt fence、费用/资源预算仍适用；未知副作用先对账，不能启动重复写者。
+- 技能、模型评分和角色名称不新增审批或必经阶段。评分仅作选型建议；无评分不阻断已有权限内工作。不自动恢复旧 HOLD 或切换运行中的模型/提供商。
+- 主执行者保留原目标及返工责任。PR、CI green、子任务完成均不自动交棒；正式交接须有明确接收者、剩余工作和证据。交付仍按 §④′ 验收。
 
 ## 二、端到端流程
 
@@ -25,7 +37,7 @@
    ▼
 ⑤ 自动交接 Prod Agent：独立审查 + 候选部署（§四）
    │
-   ├─ 失败 ──► Coordinator 按 code/review/env 回流后重跑
+   ├─ 失败 ──► 主执行者 / 已指定 Coordinator 按 code/review/env 回流
    ▼
 ⑥ 部署 + 观察窗（蓝绿，§五）──► ⑦ merge / Issue 关闭 / 生产验证
    │
@@ -39,7 +51,7 @@
 1. 确认分支、确认改动范围
 2. `ruff check` 仅改动文件零告警
 3. pytest **零新增失败**：对比 `tests/known_failures.txt` 基线逐行比对（清单**只许收缩不许扩张**）
-4. 关键断言做**变异验证**：把修复临时还原成 bug 版，确认新测试真实 FAIL（防恒真式假绿）
+4. 涉及行为修复的关键断言做**变异验证**：临时还原 bug，确认回归测试真实 FAIL；纯文档调整不强造行为测试。按验收选择验证，已有有效证据可复用，改动输入或发现缺口才补跑
 5. shell 脚本改动：`bash -n` + dry-run 冒烟
 6. 触及架构子系统必须同步 `docs/ARCHITECTURE.md`（pre-commit hook 强制；helper：`scripts/arch_touched_sections.py`）
 
@@ -52,19 +64,19 @@
 | # | 规则 |
 |---|------|
 | A1 | 开工前确认没人正在做：`git worktree list` + `git branch -r --list '*issue-<N>*'` + 读 issue 最后一条评论 |
-| A2 | **先复现再改**。复现了贴证据；按 A/B/C 试过仍复现不了 → 在 issue 回帖说明，不猜着改 |
-| A3 | 一个 PR 收不了就拆子 issue，不在一个 PR 里堆 |
+| A2 | Bug 修复先建立复现或等价缺陷证据；失败后依据新证据调整假设，不设通用 A/B/C 次数门槛。无法证明缺陷时说明不确定性，不猜着改 |
+| A3 | 按独立验收与回滚边界拆 Issue；不按步骤、角色、文件数或预计耗时拆。同一根因与同一验收所需的关联修改由一个 writer 完成 |
 
 #### 工作区隔离（硬要求）
 
 | # | 规则 |
 |---|------|
-| B1 | 一律独立 worktree，**禁止在主工作树提交**：`git worktree add /tmp/dc-<N> -b <branch> origin/main` |
-| B2 | 起点固定 `origin/main`，不用本地分支、不用 `HEAD` |
-| B3 | 建完立刻验 upstream：`git rev-parse --abbrev-ref @{u}` 不得是 `github-legacy/*`。本仓 `origin` = Gitea、`github-legacy` 已废弃，无参数 `git push` 会推错地方（2026-10-24 实际发生） |
+| B1 | 使用独立 worktree，**禁止在主工作树提交**。已有适合本任务的隔离 Orca worktree 直接复用；仅缺少隔离或存在其他写者时新建，按当前 Orca 指南管理生命周期 |
+| B2 | 新任务分支基于刷新后的 `origin/main`；继续已有任务保留其分支与未提交工作，不为规则更新自动重建 |
+| B3 | 核对 `git remote get-url origin` 与 upstream，再选 GitHub/Gitea 工具；禁止推向废弃 `github-legacy/*`。当前 GitHub 仓为 `DUIDUI-Studio/DailyCheck`，旧 Gitea 流程仅适用于仍指向该平台的工作项 |
 | B4 | 分支命名 `{fix\|feat\|chore\|docs\|ci\|test\|refactor\|perf}/issue-<N>-<slug>` **[机验 H1]** |
 | B5 | 一个 issue 一个分支：分支号必须与 body 的 `Closes #N` 或 `Part-Of: #N` 一致 **[机验 H2]**；不带号的杂活必须写 `No-Issue: <理由>` **[机验 H3]** |
-| B6 | 开工先跑一次全量测试并记下失败数（本地基线 14 条 known），否则分不清后面的红是不是自己造成的 |
+| B6 | 开工建立一次当前提交的全量测试基线并记录真实失败集；可复用同提交、同环境且证据完整的已有运行。以当前 `tests/known_failures.txt` 为准，不把历史失败数当作当前事实 |
 
 #### 分支卫生
 
@@ -86,16 +98,16 @@
 | D5 | （不采用）规模阈值（如 >8 文件 / >400 行须写 `Scope-Justification`）。阈值容易误伤，逼人为了过门禁硬拆 PR，反而破坏 D1-D4 真正要判的东西。owner 2026-10-24 明确排除 |
 | D6 | 例外条款：**同根因的多点修改算一个 PR**，防止「一个 bug 修三处要开三个 PR」 |
 
-反面教材：PR #22 把「红线机验 + CI diff 修复 + 文档三处」混成一个 PR，合并后无法单独回滚，而 Prod Agent 提的两条缺陷正好藏在这个混合体里（Issue #24 / #26）。
+旧 Gitea 反面教材：PR #22 把「红线机验 + CI diff 修复 + 文档三处」混成一个 PR，合并后无法单独回滚，而 Prod Agent 提的两条缺陷正好藏在这个混合体里（Issue #24 / #26）。
 
 #### 收尾
 
 | # | 规则 |
 |---|------|
 | F1 | PR body 三段齐全 + `Closes #N` **[机验]** |
-| F2 | Dev 止于 PR，不 merge；Coordinator 接手跟踪到交付终态 |
+| F2 | Dev 不 merge；原主执行者持续负责返工与交付跟进。仅在有明确接收者时交接，不能因已提 PR 默认存在 Coordinator 接手 |
 | F3 | 在 issue 留阶段结论（不是关单，也不是交付终态） |
-| F4 | worktree 用完删掉。2026-10-24 已积累 50+ 个 worktree、大半 `prunable` —— 每个 `git worktree list` 都变成噪音 |
+| F4 | 清理本任务创建且已不再需要的临时文件与工作树。保留用户提供的工作区、未交付分支和待审证据；Orca 工作树按当前 CLI 指南回收，不删除其他任务资产 |
 | F5 | CI 绿后必须继续跟踪 Prod Agent；部署未成功时不得向 owner 报告“完成”，应报告 `awaiting_deploy` / `deploy_failed` |
 
 #### 为什么不把这些全做成机验
@@ -155,7 +167,10 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 - **允许 Dev 声明风险**：可以写"本次触及 X，生产验证时该类变更常见的失败模式是 Y 类"，这是提示不是指令。
 - Prod Agent 对 PR 内容本身有异议（设计/风险/范围）：**不 merge**，在 PR 评论打回并开 Issue 转 Dev；merge 判定权含否决权。
 
-### ④ CI 门禁（Gitea 分支保护 `main` 强制）
+### ④ CI 门禁（按当前 Git 平台的受保护 `main` 核对）
+
+下表保留 Gitea 的 check 全名；GitHub 以实际 workflow/check/run 身份核验 `test` 与
+`agent-framework-reports`。切换 hosting 不降低检查内容，也不证明生产 lane 已获授权或激活。
 
 | check | 内容 | 全绿标准 |
 |-------|------|---------|
@@ -165,7 +180,10 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
 
-### GitHub native-only CI 与 Prod gate（Issue164，本地 seam；未激活）
+### GitHub native-only CI 与 Prod gate（Issue164 设计记录）
+
+以下 OFF/未证明描述属于该方案的记录，不是当前生产配置检测。执行前核对实际已授权 lane；
+本次编排调整不改变任何发布激活状态。
 
 GitHub 的 H 是当前公开 PR head；B 是 merge_group 原始事件创建基线；G 是实际 tested /
 deployed group；P 是实际 Git graph 直接前驱。保留有序成员、authenticated repo/queue/entry
@@ -200,28 +218,29 @@ front/main/deployed=P=G1 且前驱已 merge/anchored。相同 G2 的旧 B 不必
 
 ### ④′ 自动交付跟随契约（2026-10-27 Eric 拍板，全局适用）
 
-CI 两必需 check 全绿后，Prod Agent 会自动接手独立审查和候选部署。**CI 绿不是
-交付终态，merge 也不是。** Dev / Coordinator / 所有定时任务必须按同一状态机跟进：
+CI 两必需 check 全绿触发向 Prod Agent 的交接义务；须核对实际接收与启动，不能由
+设计中的自动机制推断它已经工作。**CI 绿不是交付终态，merge 也不是。** 主执行者 /
+已指定 Coordinator / 所有定时任务必须按同一状态机跟进：
 
 | 状态 | 判据 | 当前 owner / 动作 |
 |---|---|---|
-| `ci_failed` | 任一必需 check 红 | Dev/Coordinator：原 Issue writer 修复并重新 Review/CI |
-| `merge_conflict` | PR `mergeable=false` | Coordinator：原 Issue writer 同步最新 `origin/main`，修冲突，推进同一 PR |
-| `review_blocker` | Reviewer 报 BLOCKER | Coordinator：writer 修复，新 Reviewer session 复审 |
-| `awaiting_prod` | CI 全绿，PR 仍 open，等待 Prod Agent 审查/合并 | Coordinator：继续跟踪，不得结束为“完成” |
-| `awaiting_deploy` | PR 已 merge，尚无成功部署报告 | Coordinator：继续查询部署报告和 Issue 状态 |
+| `ci_failed` | 任一必需 check 红 | Dev/主执行者 / 已指定 Coordinator：原 Issue writer 修复并重新 Review/CI |
+| `merge_conflict` | PR `mergeable=false` | 主执行者 / 已指定 Coordinator：原 Issue writer 同步最新 `origin/main`，修冲突，推进同一 PR |
+| `review_blocker` | Reviewer 报 BLOCKER | 主执行者 / 已指定 Coordinator：writer 修复，新 Reviewer session 复审 |
+| `awaiting_prod` | CI 全绿，PR 仍 open，等待 Prod Agent 审查/合并 | 主执行者 / 已指定 Coordinator：继续跟踪，不得结束为“完成” |
+| `awaiting_deploy` | PR 已 merge，尚无成功部署报告 | 主执行者 / 已指定 Coordinator：继续查询部署报告和 Issue 状态 |
 | `deploy_failed` | Prod Agent 回写失败 | 按归因回流：代码问题回 writer；环境/流程问题回 Prod Agent；不得盲改 PR |
-| `delivered` | PR merged + Issue closed + 两项 CI success + 部署成功报告 | Coordinator：记录终态、清理 worktree 并向 owner 汇报 |
+| `delivered` | PR merged + Issue closed + 两项 CI success + 部署成功报告 | 主执行者 / 已指定 Coordinator：记录终态、清理 worktree 并向 owner 汇报 |
 
 规则：
 
-- 手动 Coordinator 在 CI 绿后继续跟踪，不把会话停在 `awaiting_prod`。
+- 主执行者 / 已指定 Coordinator 在 CI 绿后继续跟踪，不把会话停在 `awaiting_prod`。
 - 定时任务不要求单次运行占满 40–60 分钟部署窗口，但必须把队列状态持久化为
   `awaiting_prod` / `awaiting_deploy` / `deploy_failed` / `delivered`，由后续运行持续对账；
   禁止在 CI 绿或 merge 时直接把队列项标成 `done`。
 - 日报/巡检必须区分“等部署”“部署失败”“已交付”；缺少部署报告时报告等待，
   不得推断成功。
-- 只有 Prod Agent 可以 merge、部署、关闭 Issue；Coordinator 只跟踪与回流。
+- 只有 Prod Agent 可以 merge、部署、关闭 Issue；专职 Coordinator 只跟踪与回流。未实际接收时记录当前状态、接收者和下一动作，持续对账，不另造无主交接。
 
 ## 三、Push 政策（2026-10-15 Eric 放开）
 
@@ -229,14 +248,17 @@ CI 两必需 check 全绿后，Prod Agent 会自动接手独立审查和候选�
 - 仍需 owner 单独确认的操作：`--force` / `--force-with-lease`、删除远程分支、改分支保护规则。
 - 豁免（2026-10-25 Eric 拍板）：`scripts/cleanup-merged-branches.sh` 的**批量清理**（只删已合入 main 的分支，merge-base 判定）视为已获授权，脚本内 `--no-verify` 即本次拍板的凭证姿势。单条手动删分支仍需逐次确认。
 - pre-push hook（`core.hooksPath` → `~/.workbuddy/git-hooks`）2026-10-19 起是**黑名单**：只拦「删除远程分支」和「非快进覆盖」，新分支/快进照常放行。
-  仍建议 `git push --no-verify`（避开 hook 里的网络调用），但不再强制。
+  按实际 hook 配置执行普通 push；不将绕过 hook 设为默认，不把历史配置当作当前检测结果。
 
-## 三″、平台命令对照（2026-10-22 迁至自托管 Gitea）
+## 三″、平台命令对照（按实际 origin 选用）
 
-CI/CD 已从 GitHub 迁到 hub1 上的 Gitea 28.1（`http://172.28.129.216:3000`，VPC 内网）。
-agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <token>`）。
+2026-11-15 本工作区 `origin` 为 `https://github.com/DUIDUI-Studio/DailyCheck.git`。
+GitHub 工作项使用可用的 GitHub 连接器或既有 `gh` 登录；旧 Gitea 工作项使用 Gitea
+REST API。先核对 remote、仓库、Issue/PR 身份；不同平台同号不是同一工作项。
+以下 Gitea 地址与 API 仅为旧部署的兼容说明，不要求新 GitHub 任务返回 Gitea。
+生产 hosting、受保护策略与发布 lane 以已授权的实时配置为准；本流程调整不激活它们。
 
-| 动作 | 原 GitHub 命令 | 现在（Gitea API） |
+| 动作 | GitHub | Gitea（旧平台） |
 |---|---|---|
 | 列 open PR | `gh pr list --state open` | `GET /api/v1/repos/{o}/{r}/pulls?state=open` |
 | 看单个 PR | `gh pr view N` | `GET /api/v1/repos/{o}/{r}/pulls/N` |
@@ -256,7 +278,7 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 3. **没有 `check_suite` 事件**。Gitea 用 `status` 事件代替（每次 commit status 变化触发一次），
    payload 里没有 PR 关联信息，需按 `sha` 反查 open PR。
 
-### 三″.1 地址与凭据（选错地址会直接 000）
+### 三″.1 旧 Gitea 地址与凭据（仅适用于该平台）
 
 | 你在哪 | API 根 | 判断方法 |
 |---|---|---|
@@ -274,12 +296,12 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 - 分支保护 `main`：禁止直推（`enable_push=false`），必需 check =
   `CI / test (pull_request)` + `CI / agent-framework-reports (pull_request)`。
 
-### 三″.2 五个高频坑（都实测过）
+### 三″.2 旧 Gitea 故障经验（不是当前 GitHub 配置）
 
 1. **别从旧分支开 PR**。GitHub 时代的旧分支自带旧 `ci.yml`（其中一步要去 github.com 下载 Python），
    在 hub1 上会超时重试，CI 能跑 1.5 小时。开 PR 前先 `git rebase origin/main`。
-2. **runner 并发 = 1**。单 PR 的 CI 约 25–40 分钟，同时开多个大改动只会互相排队。
-   别把 CI 当第一道关，本地先跑 ruff + pytest。
+2. 旧 Gitea 曾实测 runner 并发为 1、单 PR CI 约 25–40 分钟；当前容量应现场核对。
+   排队是正常状态，不据此添加通用 worker 上限；本地门禁仍先执行。
 3. **`GET /pulls/{N}/merge` 是陷阱**：对已合并的 PR 也返回 204。判断是否已合并用
    `GET /pulls/{N}` 的 `state` + `merged` 字段。
 4. **CI 卡在 `Checkout code` 7 分钟后失败 = 基础设施问题**（runner 与 Gitea 连通性），
@@ -381,7 +403,9 @@ fetch refs/pull/<N>/head → 校验 sha 包含 origin/main → checkout --detach
 - 铁律四条 + DB 隔离铁律见 `docs/ARCHITECTURE.md` §3.4
 - 已知注意：蓝 standby 进程内存里是旧代码，**重新启用蓝前必须 restart**
 
-### GitHub native-only Prod 生命周期（Issue164，本地 seam；未激活）
+### GitHub native-only Prod 生命周期（Issue164 设计记录）
+
+以下本地实现/默认 OFF 是原方案的权限范围记录；当前生产状态须从实时配置和授权核对。
 
 **2026-11-10 Owner 定向 ordinary cutover（D1，本地实现，默认 OFF）**：保留现有 Prod
 Agent、部署主机和 §五 deploy-first exact-H FF-only 蓝绿链路；本次窄范围 hosting

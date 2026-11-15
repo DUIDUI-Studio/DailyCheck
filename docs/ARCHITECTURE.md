@@ -1,6 +1,6 @@
 # DailyCheck 技术架构
 
-> **本文件是 Eric 拍板的硬性要求**：每次开发前必读，每次 commit 触及架构子系统时必同步。
+> **本文件是 Eric 拍板的硬性要求**：开发前读概览与所改子系统章节，每次 commit 触及架构子系统时必同步；相关铁律必须遵守。
 > 门禁：`scripts/git-hooks/pre-commit`（已装）— 触及子系统但本文件未在同 commit 改动 → 拒绝。
 > 辅助：`scripts/arch_touched_sections.py` — 基于 `git diff --cached` 提示需更新章节。
 > 维护成本：< 5 分钟/次。**不维护的代价**：下一个开发者必然踩坑。
@@ -1161,23 +1161,27 @@ gunicorn 每个 worker 都有自己的线程（生产 `-w 2 --threads 4`，蓝�
 
 ---
 
-### 3.15 Orca 角色模型路由（2026-11-03 项目表作废）
+### 3.15 完整任务执行与模型路由（2026-11-15）
 
-**现状**：DailyCheck 不再维护项目级模型路由表。模型、effort、quota pool 和
-fallback 由用户全局策略 `~/.agents/skills/orca-model-routing/` 决定；本项目
-采纳记录见 [`agent-framework/orca-overlay.md`](agent-framework/orca-overlay.md) §5。
+**执行方式**：默认一个主执行者贯通理解、诊断、设计、相关修改、修复、验证和交付跟进。
+技能和专业能力不对应固定角色接力；有独立辅助成果时按需用原生 subagent。跨 CLI/环境、
+独立工作区或正式独立性/监督确有需要时才用 Orca worker。专职 Coordinator 仅在多个独立
+工作流确需管理时设置；主执行者管理助手不失去写入职责。共享工作树一个写者，正式 Review
+独立只读，merge / 部署 / Issue 关闭仍由 Prod Agent 执行。
 
-**历史资产与 fail-closed**：
+**模型选择**：唯一来源是用户全局 `~/.agents/skills/orca-model-routing/`，采纳见
+[`orca-overlay.md`](agent-framework/orca-overlay.md) §5。先判断是否需要新 agent，再按完整
+任务能力和总完成成本选模型。评分器是可选建议，故障不阻断工作、不自动证明复杂度。
+Codex 使用官方订阅支持的 OpenAI 模型；Claude Code CLI 可用 CCSwitch 实际配置的模型 ID，
+不受 Desktop 三个别名限制。已有会话不自动换模型，候选配置不等于实测能力或成本收益。
 
-| 资产 | 状态 |
-|---|---|
-| `agent-framework/orca-model-routing.json` | `deprecated: true`，仅供审计，不参与派活 |
-| `scripts/agent_framework/model_routing.py` | 读取到 deprecated 文档时退出码 2，不生成 `worker-start` 命令 |
-| `tests/test_orca_model_routing.py` | 通用解析/校验用例保留；真实文件用例断言 deprecation |
+**恢复边界**：新任务的可恢复本地迭代无通用一次/三次上限，同条件失败应检查前提。
+用户明确限制、实际预算、生产 fence 和 HOLD 保留；未知副作用先对账，不能启动重复写者。
+原验收保持可见，局部通过、Owner 接管、PR、CI 与生产交付分开记录。
 
-**安全边界**：基础设施失败可切换、语义失败不切换等规则由全局策略定义；
-项目侧不再维护独立 fallback 顺序。模型选择以全局 `routing.json` 为准；同一
-worktree 仍遵守单写者铁律。
+**历史资产**：`agent-framework/orca-model-routing.json` 保留 `deprecated: true` 供审计；
+`scripts/agent_framework/model_routing.py` 仍对该文件退出码 2，不生成 launch 命令，原解析
+测试保留。旧 `classify/next` 接力和项目模型表不参与当前派发。
 
 ---
 
@@ -4026,7 +4030,7 @@ with app.test_client() as c, c.session_transaction() as s:
 | `/production*` 页无侧栏 | 低 | pre-existing（2026-10-14 登记） | `templates/production/{products,runs,product_edit,session}.html` 把 `sidebar` block 覆盖为空 → 桌面端在这些页没有导航（只能靠返回/页内链接）。本次新增的「生产记录」入口沿用同布局。移动端不受影响（`mobile-nav` 未被覆盖） |
 | PWA push / background sync 缺失 | 中 | pre-existing | 商业化差异化卖点 |
 | 企微推送无重发队列 / 无失败告警 | 低 | 已知限制（2026-10-16 登记，§3.9） | 对外通道失败只留 WARNING（`wecom_notify_dropped` + errcode），不阻塞下单、不回滚、不补发；机器人被移出群 / key 轮换后需人工更新 `/etc/dailycheck/app.env` 才恢复。通知 SLA 属商业化项，另立项 |
-| Orca 模型 fallback 依赖 Coordinator 调用路由工具 | 中 | 已登记（2026-10-26，§3.15） | 直接调用 `worker-start` 会绕过项目 fallback；Coordinator 必须在失败结算后显式运行 `classify`，且 `fallback_allowed=true` 才用 `next` 生成的同 Task 重试命令 |
+| 请求模型与实际宿主路由可能不一致 | 中 | §3.15，全局策略采纳 | 新 agent 核对 CLI、实际模型、effort 与额度池；配置存在不代表宿主已支持。保留真实请求证据，不以评分或旧项目 fallback 命令代替核验 |
 | 出品配方的多态行 `bom_item_id[]` / `bom_ic_recipe_id[]` 与 `bom_row_id[]` **不按位对齐** | **高** | pre-existing（Issue #47 复核时发现，**本次未修**，已另立 issue） | 模板每行只渲染「当前类型」的那一个 select（`bom_item_id` 或 `bom_ic_recipe_id`），浏览器提交时两个数组各自按类型计数、与 `bom_row_id[]` 长度不等；后端按 `item_ids[i]` / `ic_ids[i]` 取值 → **混合来源**的出品配方保存时，部分行的原料/用量被静默跳过，甚至写错行（行序为 [ic_recipe, item, item] 时，第 2 行可能被写成第 3 行的原料）。与 §13.13 同属「平行数组按位配对」家族，但根因在**模板渲染 ≠ 表单契约**，与 Issue #47 的两条缺陷不同源 → 按 workflow.md D2 另立 issue，不在本 PR 修。**修法**：每行同时渲染另一类型的 hidden 占位（`value=""`），或后端改为按行解析。存量风险：混合来源的出品配方保存后行数/用量可能与预期不符，**改配方前先核对行数** |
 | `sw.js` 导航分支的离线回落缓存不过鉴权 | 中 | pre-existing | `caches.match(req)` 会把安装时用会话凭据抓的 SSR HTML 按 URL 命中返回（缓存在同 profile 的离线/共享设备场景可读到他人页面）。与 §11「SW 缓存边界」的收窄范围无关（那条只覆盖非导航 GET），待另开 issue |
 | DC 发货入口与路由权限不一致（管理员无绑定→无入口） | 中 | **已修复（2026-11-02）** | `can_ship` 原为显式角色判断（`role in staff/manager/admin`），不含 `is_admin`；而 `@require_role("staff")` 对平台管理员直通 → 蓝天大厦 `wh_005` 无任何 `warehouse_users` 绑定时，管理员从该仓视角看不到发货表单。已改为 `is_admin or role in (...)`（§10.3.4），并给 `admin` 补 wh_005 绑定。**同类待查**：模板里其他按 `g.role` 控制动作按钮的位置（如门店侧 `can_deliver`）尚未逐个对齐 |
@@ -4043,7 +4047,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/DEV_ENV.md`](DEV_ENV.md) — wdg-systemd 容器部署细节
 - [`docs/mcp-configuration.md`](mcp-configuration.md) — MCP 接入
 - [`docs/agent-framework/workflow.md`](agent-framework/workflow.md) — Dev/Prod/Owner 三方协作工作流（角色、门禁、merge 政策、蓝绿部署、应急）
-- [`docs/agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md) — Orca 角色、模型、effort、fallback 与同 Task 重试规则
+- [`docs/agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md) — 完整任务执行、条件辅助与全局模型策略采纳
 
 ### 部署 / 运维
 
