@@ -1358,6 +1358,8 @@ source tuple 与已确认 Issue19/source Issue；PATCH 前 durable uncertain，�
 没有第二次 PATCH。无 source/token scope/expiry/repository identity 即 fail closed。
 `release_finish.py` 把 native deploy rc、report rc、Issue 结果、UNKNOWN 和 remote_orca_push=false
 分开记录；远端文件/终端输出与既有本机 Orca forge tracker 回执是独立证据。
+Issue reconciliation 的首个有限协议错误码保留在私有 receipt，后续报告错误不得覆盖部署首错；
+不把外部响应正文或任意异常文本投射为公开事实。
 ordinary pipeline 的报告失败现在返回29，保留既有非零首错及真实 deployed/outcome；
 `aborted`/未知失败有 typed 公共 stage，candidate/ownership drift 映射到有限 stage。
 Gitea best-effort 兼容路径保留。`release_config.py` 只在既有 publication_config_transaction

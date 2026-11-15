@@ -471,6 +471,10 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             assert len([row for row in mutations if row["path"] == "/graphql"]) == 1
         elif case == "issue-unknown":
             assert len([row for row in mutations if row["method"] == "PATCH"]) == 1
+            assert receipt["first_cause"] == {
+                "stage": "issue-reconcile",
+                "reason": "issue_close_unknown",
+            }
         else:
             assert not [row for row in mutations if row["method"] == "PATCH"]
     if case not in ("blocker", "forbidden-scope", "wrong-issue"):

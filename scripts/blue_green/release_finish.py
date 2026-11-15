@@ -91,6 +91,32 @@ def main():
             receipt["status"] = "delivered"
     except (HostingError, OSError, ValueError, TypeError, KeyError) as exc:
         receipt["reconciliation_error"] = type(exc).__name__
+        # These are closed local protocol codes, never an HTTP body or private diagnostic.
+        reason = (
+            str(exc)
+            if isinstance(exc, HostingError)
+            and str(exc)
+            in {
+                "issue_credential_custody",
+                "issue_grant_invalid",
+                "issue_scope_forbidden",
+                "issue_grant_expired",
+                "issue_repository_mismatch",
+                "issue_protocol_missing",
+                "issue_source_transport_unapproved",
+                "issue_targets_missing",
+                "issue_target_invalid",
+                "issue_target_mismatch",
+                "issue_identity_changed",
+                "issue_close_unknown",
+                "issue_process_fence_missing",
+                "issue_delivery_not_proved",
+                "issue_merge_not_proved",
+                "issue_close_uncertain_no_replay",
+            }
+            else type(exc).__name__
+        )
+        receipt.setdefault("first_cause", {"stage": "issue-reconcile", "reason": reason})
         rc = rc or 30
     raw = (json.dumps(receipt, sort_keys=True) + "\n").encode()
     try:
