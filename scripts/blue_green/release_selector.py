@@ -267,6 +267,7 @@ def late_binding(kind, args):
             "scripts/blue_green/deploy_pipeline.sh",
             "scripts/blue_green/release_finish.py",
             "scripts/blue_green/release_issues.py",
+            "scripts/blue_green/release_completion.py",
         }:
             regular(p.parent.parent.parent / relative, digest)
     current = state._load_state(Path(PROFILE["state"]))
@@ -442,6 +443,8 @@ def main():
             intake_environment()
             finish = Path(PROFILE["engine"]) / "scripts/blue_green/release_finish.py"
             regular(finish, PROFILE["pins"]["scripts/blue_green/release_finish.py"])
+            for name in ("release_issues.py", "release_completion.py"):
+                regular(finish.with_name(name), PROFILE["pins"]["scripts/blue_green/" + name])
             os.execv(
                 PROFILE["python"],
                 [

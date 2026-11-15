@@ -267,6 +267,7 @@ def main():
         "forbidden-scope",
         "wrong-issue",
         "issue-unknown",
+        "completion-failure",
     ],
 )
 def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tmp_path, case):
@@ -373,8 +374,13 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             )
             if case == "report-failure":
                 return 503, {}
+            completion = body["body"].startswith("<!-- dailycheck-release-completion:v1 -->")
+            if completion and case == "completion-failure":
+                return 503, {}
             row = dict(
-                id=201, body=body["body"], issue_url="https://api.github.com" + ROOT + "/issues/160"
+                id=202 if completion else 201,
+                body=body["body"],
+                issue_url="https://api.github.com" + ROOT + "/issues/160",
             )
             lane.table[ROOT + "/issues/160/comments?page=1"]["data"].append(row)
             return 201, row
@@ -434,6 +440,7 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
         "forbidden-scope": 1,
         "wrong-issue": 78,
         "issue-unknown": 29,
+        "completion-failure": 29,
     }[case]
     assert rc == expected, (
         rc,
@@ -466,7 +473,7 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
         )
         state = json.loads((Path(profile["state"]) / "state.json").read_text())
         assert state["generation"] == 12 and state["lock"] is None
-        if case == "happy":
+        if case in ("happy", "completion-failure"):
             assert len([row for row in mutations if row["method"] == "PATCH"]) == 2
             assert len([row for row in mutations if row["path"] == "/graphql"]) == 1
         elif case == "issue-unknown":
@@ -478,6 +485,24 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
         else:
             assert not [row for row in mutations if row["method"] == "PATCH"]
     if case not in ("blocker", "forbidden-scope", "wrong-issue"):
+        completion_rows = [
+            row
+            for row in lane.table[ROOT + "/issues/160/comments?page=1"]["data"]
+            if row["body"].startswith("<!-- dailycheck-release-completion:v1 -->")
+        ]
+        if case in ("report-failure", "completion-failure"):
+            assert completion_rows == []
+            if case == "completion-failure":
+                assert receipt["first_cause"] == "completion-feedback-unconfirmed"
+        else:
+            assert len(completion_rows) == 1
+            facts = json.loads(completion_rows[0]["body"].splitlines()[1])
+            assert set(facts) == {"pr", "head", "public_receipt", "status"}
+            assert facts["status"] == receipt["status"]
+            assert facts["public_receipt"] == receipt["public_receipt"]
+            assert (
+                OPS not in completion_rows[0]["body"] and "7001" not in completion_rows[0]["body"]
+            )
         notifications = [
             json.loads(line) for line in (tmp_path / "result-inbox.jsonl").read_text().splitlines()
         ]

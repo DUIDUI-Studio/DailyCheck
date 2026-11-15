@@ -44,3 +44,11 @@ The retained parent has no artificial one-hour deadline. Actual Popen ownership,
 wait/ECHILD, inherited flock and phase identity survive renewals. Terminal and
 SSH custody still need actual runtime observation; offline tests cannot prove
 that the production Hermes terminal will retain or notify the remote caller.
+
+The fixed producer also publishes a declassified completion comment after the
+bound Issue protocol, under the same native outcome/publication fence. The
+existing forge-only Orca tracker must adopt orca-tracker.prompt.md and require
+that exact producer/H/receipt/status; it cannot infer whole-run delivered from
+core deploy rc0 plus public Issue19 closed. Missing/UNKNOWN completion stays
+unconfirmed. Completion POST uncertainty is durable and never replayed; no new
+token scope, timer or direct remote-to-Orca push is added.

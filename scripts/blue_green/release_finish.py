@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.blue_green import deploy_state, publication_authority  # noqa: E402
+from scripts.blue_green.release_completion import emit  # noqa: E402
 from scripts.blue_green.release_issues import reconcile  # noqa: E402
 from scripts.hosting import HostingError  # noqa: E402
 
@@ -25,6 +26,10 @@ def main():
     selector.regular(
         Path(__file__).with_name("release_issues.py"),
         selector.PROFILE["pins"]["scripts/blue_green/release_issues.py"],
+    )
+    selector.regular(
+        Path(__file__).with_name("release_completion.py"),
+        selector.PROFILE["pins"]["scripts/blue_green/release_completion.py"],
     )
     profile = selector.PROFILE
     binding = selector.late_binding("typed-report", args)
@@ -118,6 +123,14 @@ def main():
         )
         receipt.setdefault("first_cause", {"stage": "issue-reconcile", "reason": reason})
         rc = rc or 30
+    if receipt.get("publication_state") == "linked" and report_rc == 0:
+        try:
+            receipt["completion_comment"] = emit(profile, receipt["status"])
+        except (HostingError, OSError, ValueError, TypeError, KeyError) as exc:
+            receipt["completion_feedback_error"] = type(exc).__name__
+            receipt.setdefault("first_cause", "completion-feedback-unconfirmed")
+            receipt["status"] = "UNKNOWN"
+            rc = rc or 29
     raw = (json.dumps(receipt, sort_keys=True) + "\n").encode()
     try:
         fd = os.open(

@@ -137,7 +137,12 @@ def build(head: str, base: str, output: Path):
         review_actor_ids=[354261992],
     )
     document("pilot.policy.disabled.json", policy)
-    for name in ("wdg-ci.prompt.md", "dailycheck-deploy.prompt.md", "ADOPTION.md"):
+    for name in (
+        "wdg-ci.prompt.md",
+        "dailycheck-deploy.prompt.md",
+        "orca-tracker.prompt.md",
+        "ADOPTION.md",
+    ):
         text = git("show", head + ":deploy/prod-release/" + name).decode()
         for key, value in dict(
             HEAD=head, BASE=base, ROOT=root, CI_RUN="PENDING_EXACT_H_CI", CI_ATTEMPT="null"

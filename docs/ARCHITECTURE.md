@@ -1360,6 +1360,11 @@ source tuple 与已确认 Issue19/source Issue；PATCH 前 durable uncertain，�
 分开记录；远端文件/终端输出与既有本机 Orca forge tracker 回执是独立证据。
 Issue reconciliation 的首个有限协议错误码保留在私有 receipt，后续报告错误不得覆盖部署首错；
 不把外部响应正文或任意异常文本投射为公开事实。
+`release_completion.py` 在同一 native process/state/publication 域下，另发固定去密终态评论；
+delivered 必须同时有 linked typed report、当前成功 outcome/anchor 和两个绑定 Issue 的原生 closed
+记录。先落 uncertain，再单次 POST，丢 ACK 不重发；notification 失败保留 UNKNOWN/非零。
+既有 forge-only Orca tracker 的提示模板必须要求该 producer/完整 H/public receipt 的 completion
+评论，缺失或 UNKNOWN 时不能仅凭 core rc0 和 public Issue19 closed 报 delivered。
 ordinary pipeline 的报告失败现在返回29，保留既有非零首错及真实 deployed/outcome；
 `aborted`/未知失败有 typed 公共 stage，candidate/ownership drift 映射到有限 stage。
 Gitea best-effort 兼容路径保留。`release_config.py` 只在既有 publication_config_transaction

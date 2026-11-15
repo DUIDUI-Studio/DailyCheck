@@ -30,6 +30,7 @@ PINS = frozenset(
         "scripts/prod_agent/github_intake.py",
         "scripts/blue_green/release_finish.py",
         "scripts/blue_green/release_issues.py",
+        "scripts/blue_green/release_completion.py",
     }
 )
 FIELDS = frozenset(
