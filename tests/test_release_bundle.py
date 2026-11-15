@@ -527,6 +527,43 @@ def exercise_fullchain(lane, tmp_path, case, *, work=None):
     assert len(lane.posts) == 1
     payload = lane.posts[0]["body"]
     trigger = payload["trigger_id"]
+    if work is not None and case.startswith("files-"):
+        path = ROOT + f"/pulls/{pr_number}/files"
+        lane.table[ROOT + f"/pulls/{pr_number}"]["data"]["changed_files"] = 101
+        lane.table[path + "?page=1"] = {"data": [
+            {"filename": f"synthetic/business_{i:03}.py"} for i in range(100)]}
+        lane.table[path + "?page=2"] = {"data": [{"filename": "synthetic/business_100.py"}]}
+        if case == "files-duplicate":
+            lane.table[path + "?page=2"]["data"][0]["filename"] = "synthetic/business_000.py"
+        elif case == "files-error":
+            lane.table[path + "?page=2"]["status"] = 500
+        elif case == "files-missing":
+            lane.table[path + "?page=2"]["data"] = []
+        elif case == "files-link":
+            lane.table[path + "?page=1"]["headers"] = {
+                "Link": '<https://foreign.invalid/files?page=2>; rel="next"'}
+        elif case == "files-unsafe":
+            lane.table[path + "?page=1"]["data"][0]["filename"] = "../foreign.py"
+        elif case == "files-exhausted":
+            from scripts.hosting import HostingClient
+
+            for page in range(1, HostingClient.MAX_PAGES + 1):
+                lane.table[path + "?page=" + str(page)] = {"data": [
+                    {"filename": f"synthetic/p{page}_business_{i:03}.py"} for i in range(100)]}
+        rc, out, err = run([sys.executable, "-I", "-B", str(automatic_entry), "inspect", trigger], env)
+        assert rc == (0 if case == "files-pages" else 78), (out, err)
+        if case == "files-pages":
+            rows = json.loads(out)["files"]
+            assert len(rows) == 101 and len({row["filename"] for row in rows}) == 101
+            assert path + "?page=2" in lane.reads
+        assert not mutations and not list(automatic_roots.iterdir())
+        if case == "files-exhausted":
+            assert len([key for key in lane.reads if key.startswith(path + "?page=")]) == 50
+        assert not (tmp_path / "refresh-count").exists()
+        save_proof("automatic-files-" + str(pr_number) + "-" + case,
+                   dict(synthetic=True, native_rc=rc, stdout=out, stderr=err,
+                        api_reads=lane.reads, no_profile=True, no_grant=True, no_candidate=True))
+        return
     if work is not None and case in {"inspect", "blob-drift"}:
         import base64
 

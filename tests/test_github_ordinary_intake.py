@@ -66,7 +66,7 @@ def lane(tmp_path, request, private_audit):
             if "authorize" in transport:
                 transport["authorize"](key, self.headers)
             row = table.get(key, {"status": 404, "data": {}})
-            self.respond(row.get("status", 200), row["data"])
+            self.respond(row.get("status", 200), row["data"], row.get("headers"))
 
         def do_POST(self):
             raw = self.rfile.read(int(self.headers["Content-Length"]))
@@ -89,10 +89,12 @@ def lane(tmp_path, request, private_audit):
             status, data = transport["mutation"](self.path, "PATCH", json.loads(raw), self.headers)
             self.respond(status, data)
 
-        def respond(self, status, data):
+        def respond(self, status, data, headers=None):
             raw = json.dumps(data).encode()
             self.send_response(status)
             self.send_header("Content-Length", str(len(raw)))
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(raw)
 

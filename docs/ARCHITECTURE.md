@@ -1384,8 +1384,8 @@ ready claim、实时精确仓/H/B/workflow/App CI、当前 deployed base、自�
 process checkpoint 核对实际父链 PID/kernel start、固定命令及 task/session 绑定，不依赖
 未导出的环境变量、不修改共享 gateway。缺绑定、
 串单、部分准备、旧 UNKNOWN、并发锁或身份漂移不 mint/send。固定 inspect/file 接口供
-Prod 逐文件独立审查，并验证 Git blob；GitHub files 分页只在该端点按 filename 去重，
-其他列表仍要求 numeric ID。改动已安装 authority 的 PR 必须与 reviewed engine 同字节，
+Prod 逐文件独立审查，并验证 Git blob；GitHub files 分页由 ordinary release 边界按 filename 去重，保留有界分页、路径与错误校验；
+共享 hosting transport 恢复精确 approved producer bytes，其他列表仍要求 numeric ID。改动已安装 authority 的 PR 必须与 reviewed engine 同字节，
 否则要求新 engine，不能悄悄使用旧部署权威。原 review/parent/pipeline/report/Issues
 完成协议不另建一套，晚期 helper 校验严格对应 pipeline 复制的八个 native consumers，
 renderer/自动入口/templates 在不可变 engine 另行全量 pin。status 只投射去密完成结果，

@@ -30,6 +30,9 @@ B = (161, "c" * 40, 72, 72001, 8, 88001)
     (A, "unsafe-parent"), (B, "partial-prepare"), (A, "binding-swap"),
     (B, "native-busy"),
     (A, "unregistered"), (B, "stale-pid"),
+    (A, "files-pages"), (B, "files-pages"), (A, "files-duplicate"),
+    (B, "files-error"), (A, "files-missing"), (B, "files-link"),
+    (A, "files-unsafe"), (B, "files-exhausted"),
 ])
 def test_automatic_work_from_native_authorities(lane, tmp_path, work, case):
     exercise_fullchain(lane, tmp_path, case, work=work)

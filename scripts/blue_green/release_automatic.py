@@ -169,6 +169,49 @@ def claim(template, trigger, *, authenticated=True):
     return payload
 
 
+def pr_files(client, pr):
+    """GitHub files have filename identities; keep that ABI in this release lane.
+
+    The approved shared HostingClient and its numeric-ID pagination stay intact.
+    Reuse its bounded transport/page budgets and reject partial or drifting lists.
+    """
+    from scripts.blue_green.release_issues import CODE
+    from scripts.hosting import HostingError, Provider
+
+    require(client.config.provider is Provider.GITHUB and client.config.repo == CODE
+            and type(pr) is int and 0 < pr <= 2147483647, "automatic-files-destination")
+    path = f"/repos/{CODE}/pulls/{pr}/files"
+    items, seen = [], set()
+    for page in range(1, client.MAX_PAGES + 1):
+        data, headers = client.request("GET", path + "?" + urllib.parse.urlencode(
+            {"per_page": client.PER_PAGE, "page": page}))
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            raise HostingError("invalid_page_items")
+        for row in data:
+            name = row.get("filename")
+            if (not isinstance(name, str) or not 0 < len(name) <= 512
+                    or Path(name).is_absolute() or str(Path(name)) != name
+                    or not Path(name).parts
+                    or ".." in Path(name).parts or any(ord(c) < 32 for c in name)
+                    or name in seen):
+                raise HostingError("invalid_or_repeated_page_item")
+            seen.add(name)
+        items.extend(data)
+        links = re.findall(r'<([^>]+)>;\s*rel="next"', headers, flags=re.I)
+        if links:
+            link = urllib.parse.urlsplit(links[0])
+            expected = urllib.parse.urlsplit(client.config.api_url + path)
+            if (len(links) != 1
+                    or (link.scheme, link.netloc, link.path)
+                    != (expected.scheme, expected.netloc, expected.path)
+                    or urllib.parse.parse_qs(link.query).get("page") != [str(page + 1)]
+                    or not data):
+                raise HostingError("invalid_pagination_link")
+        if not links and len(data) < client.PER_PAGE:
+            return items
+    raise HostingError("pagination_exhausted")
+
+
 def plan(config, trigger):
     from scripts.blue_green import deploy_state, publication_authority
     from scripts.blue_green.release_issues import CODE, OPS, issue
@@ -209,7 +252,7 @@ def plan(config, trigger):
     pr = client.get(f"/repos/{CODE}/pulls/{payload['pr_number']}")
     require(pr.get("number") == payload["pr_number"] and pr.get("head", {}).get("sha") == gate["actual_head"]
             and pr.get("base", {}).get("sha") == gate["base_sha"], "automatic-pr-changed")
-    files = client.pages(f"/repos/{CODE}/pulls/{payload['pr_number']}/files", item_key="filename")
+    files = pr_files(client, payload["pr_number"])
     require(type(pr.get("changed_files")) is int and pr["changed_files"] == len(files),
             "automatic-pr-files-incomplete")
     # A stable engine can deliver future business changes. A change to its own

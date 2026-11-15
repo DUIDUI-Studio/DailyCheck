@@ -466,15 +466,9 @@ class HostingClient:
     def get(self, path: str) -> object:
         return self.request("GET", path)[0]
 
-    def pages(self, path: str, *, key: str | None = None, params: dict | None = None,
-              item_key: str = "id") -> list[dict]:
-        if item_key != "id" and not (
-            item_key == "filename" and self.config.provider is Provider.GITHUB
-            and re.fullmatch(re.escape(f"/repos/{self.config.repo}/pulls/") + r"[1-9][0-9]*/files", path)
-        ):
-            raise HostingError("invalid_page_identity")
+    def pages(self, path: str, *, key: str | None = None, params: dict | None = None) -> list[dict]:
         items: list[dict] = []
-        seen: set[int | str] = set()
+        seen: set[int] = set()
         total = None
         for page in range(1, self.MAX_PAGES + 1):
             query = {
@@ -493,10 +487,8 @@ class HostingClient:
             if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
                 raise HostingError("invalid_page_items")
             for row in data:
-                ident = row.get(item_key)
-                valid = (type(ident) is int and ident > 0) if item_key == "id" else (
-                    isinstance(ident, str) and 0 < len(ident) <= 512)
-                if not valid or ident in seen:
+                ident = row.get("id")
+                if type(ident) is not int or ident <= 0 or ident in seen:
                     raise HostingError("invalid_or_repeated_page_item")
                 seen.add(ident)
             items.extend(data)
