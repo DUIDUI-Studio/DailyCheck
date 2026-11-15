@@ -1342,7 +1342,7 @@ GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`，保留原同 SHA 
 
 #### 3.17.1 私有反馈与公开投影（Issue #162；本地实现，未启用）
 
-**PR20 自动交付准备（本地实现，未采用）**：`release_credentials.py` 从精确 source/helper
+**PR20 自动交付协议**：`release_credentials.py` 从精确 source/helper
 闭包生成受保护的 review/parent/entry/selector/refresh 文件；允许空 live inputs 的 inert
 preview，实际入口在任何 intent/refresh 前拒绝。PR18 续期 ABI 与独立 R1/R2 caller 修复
 按源字节复用，未合并其业务历史。既有 pipeline 的显式 `DAILYCHECK_PIPELINE_REPO`
@@ -1372,8 +1372,24 @@ delivered 必须同时有 linked typed report、当前成功 outcome/anchor 和�
 ordinary pipeline 的报告失败现在返回29，保留既有非零首错及真实 deployed/outcome；
 `aborted`/未知失败有 typed 公共 stage，candidate/ownership drift 映射到有限 stage。
 Gitea best-effort 兼容路径保留。`release_config.py` 只在既有 publication_config_transaction
-内 CAS PR20 binding，安装前拒绝 unsafe path/硬链接/漂移，回退不得覆盖独立变化；
-没有新 daemon/timer、全局 scheduler patch、生产安装、grant、dispatch 或 tracker 恢复。
+内 CAS 一个显式 PR 的 binding（默认20），安装前拒绝 unsafe path/硬链接/漂移，回退不得
+覆盖独立变化。binding 可携带两个真实 Issue ID 与公开工程 Issue number；元数据加入原
+binding digest，旧格式 digest 保持不变。实际安装/CI/生产终态以独立回执为准。
+
+**通用自动入口（本地实现，尚待独立审查与采用）**：不可变 `release_automatic.py`
+只接受原生 trigger，不接受调用方指定 PR/H/CI/Issue/权限。在原 process fence 下从签名
+ready claim、实时精确仓/H/B/workflow/App CI、当前 deployed base、自动 policy 和 native
+双 Issue binding 生成一次私有 exact profile；capability v3 保留 v2 的可信 CI 冻结协议。
+每个 admission 独立目录与 O_EXCL intent/receipt；review/execute 从既有 Hermes background
+process checkpoint 核对实际父链 PID/kernel start、固定命令及 task/session 绑定，不依赖
+未导出的环境变量、不修改共享 gateway。缺绑定、
+串单、部分准备、旧 UNKNOWN、并发锁或身份漂移不 mint/send。固定 inspect/file 接口供
+Prod 逐文件独立审查，并验证 Git blob；GitHub files 分页只在该端点按 filename 去重，
+其他列表仍要求 numeric ID。改动已安装 authority 的 PR 必须与 reviewed engine 同字节，
+否则要求新 engine，不能悄悄使用旧部署权威。原 review/parent/pipeline/report/Issues
+完成协议不另建一套，晚期 helper 校验严格对应 pipeline 复制的八个 native consumers，
+renderer/自动入口/templates 在不可变 engine 另行全量 pin。status 只投射去密完成结果，
+没有远端 Orca push、新 daemon/timer 或全局 scheduler 修改。
 
 
 运维目的地必须显式设置 `DAILYCHECK_GITHUB_OPERATIONS_REPO`、`_REPO_ID` 和

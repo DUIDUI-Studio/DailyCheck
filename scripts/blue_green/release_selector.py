@@ -13,6 +13,15 @@ from pathlib import Path
 
 PROFILE = None  # BUILD_PROFILE
 
+# The existing pipeline copies exactly these native consumers into its private
+# helper runtime. Renderer/factory code remains pinned in the immutable engine.
+NATIVE_HELPER_PINS = frozenset({
+    "scripts/blue_green/deploy_state.py", "scripts/blue_green/deploy_report.py",
+    "scripts/blue_green/deploy_merge.py", "scripts/blue_green/deploy_triage_pure.py",
+    "scripts/blue_green/publication_authority.py", "scripts/hosting.py",
+    "scripts/prod_agent/github_readiness.py", "scripts/prod_agent/github_intake.py",
+})
+
 
 def require(ok, reason):
     if not ok:
@@ -109,6 +118,7 @@ def source_admission():
             "private_source_binding_invalid",
             "private_source_binding_ambiguous",
             "private_revision_binding_invalid",
+            "private_issue_binding_invalid",
         }
         raise ValueError(reason if reason in allowed else "source-admission-failed") from None
 
@@ -142,7 +152,7 @@ def review_admission(*, require_approval=True):
         and set(capability)
         == {"version", "owner", "ci_run_id", "ci_attempt", "policy_sha256", "since_ms"}
         and type(capability["version"]) is int
-        and capability["version"] in {1, 2}
+        and capability["version"] in {1, 2, 3}
         and isinstance(capability["owner"], str)
         and bool(capability["owner"]),
         "whole-run-capability-missing",
@@ -150,10 +160,10 @@ def review_admission(*, require_approval=True):
     require(
         all(
             type(capability[k]) is int and capability[k] > 0
-            for k in (("since_ms",) if capability["version"] == 2 else
+            for k in (("since_ms",) if capability["version"] >= 2 else
                       ("ci_run_id", "ci_attempt", "since_ms"))
         )
-        and (capability["version"] != 2 or
+        and (capability["version"] == 1 or
              capability["ci_run_id"] is None and capability["ci_attempt"] is None),
         "whole-run-capability-invalid",
     )
@@ -161,27 +171,40 @@ def review_admission(*, require_approval=True):
     require(
         rule.digest == capability["policy_sha256"]
         and rule.epoch == capability["since_ms"]
-        and rule.targets == frozenset({(PROFILE["pr"], PROFILE["head"])})
-        and rule.pr_range is None
+        and (rule.mode == "automatic" and rule.accepts(PROFILE["pr"], PROFILE["head"])
+             if capability["version"] == 3 else
+             rule.targets == frozenset({(PROFILE["pr"], PROFILE["head"])}) and rule.pr_range is None)
         and rule.review_actors,
         "whole-run-policy-changed",
     )
     with sqlite3.connect(Path(PROFILE["reducer_db"]).as_uri() + "?mode=ro", uri=True) as connection:
         rows = connection.execute(
-            """SELECT payload_json FROM trigger_queue
+            """SELECT payload_json,last_error FROM trigger_queue
             WHERE repo=? AND pr_number=? AND head_sha=? AND event='check_suite'
             AND (state='claimed' OR (state='done' AND last_error IN
                 ('review_approved','awaiting_agent_receipt','delivery_unknown')))""",
             (github_intake.REPO.lower(), PROFILE["pr"], PROFILE["head"]),
         ).fetchall()
     require(len(rows) == 1, "single-review-claim-required")
+    if capability["version"] == 3:
+        require(rows[0][1] != "delivery_unknown", "review-delivery-unknown")
+        from scripts.blue_green import publication_authority
+        from scripts.blue_green.release_issues import issue, validate_protocol
+        from scripts.hosting import HostingClient, HostingConfig
+
+        with state_module().state_transaction(Path(PROFILE["state"])):
+            binding = publication_authority.resolve_source_binding(Path(PROFILE["state"]), PROFILE["pr"])
+        require(binding.issue_identities is not None
+                and binding.binding_sha256 == PROFILE["binding_sha256"], "automatic-issue-binding-required")
+        targets = validate_protocol(PROFILE["issue_protocol"], binding)
+        issue(HostingClient(HostingConfig.from_environment()), targets[0])
     payload = json.loads(rows[0][0])
     require(github_intake.authentic(payload, frozenset({"ready"})), "review-claim-unauthenticated")
     require(
         payload.get("pr_base_sha") == PROFILE["base"]
         and all(type(payload.get(k)) is int and payload[k] > 0
                 for k in ("observed_ci_run_id", "observed_ci_attempt"))
-        and (capability["version"] == 2 or
+        and (capability["version"] >= 2 or
              payload.get("observed_ci_run_id") == capability["ci_run_id"]
              and payload.get("observed_ci_attempt") == capability["ci_attempt"]),
         "review-ci-changed",
@@ -199,7 +222,7 @@ def review_admission(*, require_approval=True):
         and gate.get("run_attempt") == payload["observed_ci_attempt"],
         "current-ci-not-ready",
     )
-    if capability["version"] == 2:
+    if capability["version"] >= 2:
         # First use binds the *actual* trusted CI after the natural final push.
         # The signed native claim plus live repository/workflow/App check are
         # authorities; an incoming hint, Agent argv or a later operator edit is not.
@@ -287,14 +310,8 @@ def late_binding(kind, args):
     private_dir(p.parent.parent.parent)
     private_dir(p.parent.parent)
     private_dir(p.parent)
-    for relative, digest in PROFILE["pins"].items():
-        if relative not in {
-            "scripts/blue_green/deploy_pipeline.sh",
-            "scripts/blue_green/release_finish.py",
-            "scripts/blue_green/release_issues.py",
-            "scripts/blue_green/release_completion.py",
-        }:
-            regular(p.parent.parent.parent / relative, digest)
+    for relative in NATIVE_HELPER_PINS:
+        regular(p.parent.parent.parent / relative, PROFILE["pins"][relative])
     current = state._load_state(Path(PROFILE["state"]))
     require(
         type(current.get("generation")) is int

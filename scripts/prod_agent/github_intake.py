@@ -44,6 +44,7 @@ class Admission:
     review_actors: frozenset[int]
     digest: str
     key: bytes = field(repr=False)
+    mode: str = "quarantined"
 
     def accepts(self, pr: int, head: str) -> bool:
         return (type(pr) is int and isinstance(head, str)
@@ -133,7 +134,8 @@ def policy() -> Admission:
         if not 32 <= len(key) <= 4096:
             raise ValueError
         digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        return Admission(epoch, frozenset(targets), pr_range, frozenset(excluded), frozenset(actors), digest, key)
+        return Admission(epoch, frozenset(targets), pr_range, frozenset(excluded),
+                         frozenset(actors), digest, key, document["mode"])
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise HostingError("ordinary_intake_not_admitted") from exc
 

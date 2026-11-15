@@ -1,63 +1,24 @@
-# Prepared fixed release protocol
+# Exact automatic-delivery adoption contract
 
-This directory grants no production permission. Render the final profile only
-from a frozen source commit. The preview keeps real source binding, Issue
-credentials, CI run/attempt and whole-run capability null; native startup refuses
-before intent, refresh or candidate. Synthetic fixture identities are tests only.
+This source directory grants no production permission. Build from a real source commit; the preview deliberately leaves binding, Issue credentials, capability and CI identity null. It refuses before mint or candidate. Synthetic fixtures are never live identities or observation evidence. The Owner-authorized current unit remains PR20/Issue19; paused PR15/17/18 and previous failed/UNKNOWN history remain fenced.
 
-The later Owner-approved action is one finite adoption/experiment of the exact
-independently reviewed package: publish the new H and obtain its new exact-H CI;
-confirm the real private source Issue and its authenticated metadata/revision;
-install that PR20 mapping through release_config.py's native transaction;
-authorize dedicated per-repository Issue-only grants, install the immutable
-engine/preview-resolved profile/prompts and exact command allowlist; admit the
-single PR20/H policy and restore only the existing local tracker. Preserve old
-manifests, old queue rows, gen11 and failed attempts. No old profile can be replayed.
+The fixed automatic entry is `{{AUTOMATIC_ENTRY}}`, outside the candidate checkout. Its installed configuration pins engine {{HEAD}}, serving baseline {{BASE}}, interpreter, existing canonical credential broker, production environment and private work-root parent. Installation must use the reviewed closed adoption transaction, exact before-hash CAS and backups. The existing finite systemd caller owns the original canonical child beyond the cron client's 120-second timeout; manager acceptance and payload native exit are different receipts. No new timer, daemon or global scheduler patch is introduced.
 
-App 5674104, installation 180015273, code repository 1448986421
-(DUIDUI-Studio/DailyCheck), operations repository 1449125557
-(DUIDUI-Studio/DailyCheck-ops), public engineering Issue19 ID6391796319 are
-observed identities. Private source Issue number/ID remain null in previews until
-the authorized dedicated-source creation is read back and its access verified.
-Do not infer Ops Issue20 or reuse Ops1.
+For every work item, `inspect TRIGGER`, `file TRIGGER PATH`, `review TRIGGER DECISION`, `execute TRIGGER` and `status TRIGGER` resolve a native signed claim. PR/H/B/CI and both Issue identities are derived from authenticated authority, not CLI parameters or webhook approval fields. Capability v3 uses the existing v2 one-time CI binding and phase protocol. Automatic policy must explicitly admit the PR/H and eligible nonauthor actor. The first pilot stays exact; a future stable range is adopted only after the real pilot/full report and Orca receipt pass, preserving excluded15/17/18. Missing native source/Issue binding is a closed input error, never an invitation to guess or reuse PR20/Issue19.
 
-Whole-run capability version2 is installed before the final push with both CI
-identity fields null. Under the original process fence, the remote formal-review
-entry verifies the native signed ready claim and fresh exact repository/H/B/
-workflow/App checks, then atomically freezes ci-binding.json once. Candidate
-startup requires that same binding and fresh unchanged CI; a rerun or changed
-claim stops. There is no manual post-push profile editing or payload-selected CI.
-Version1 retains its explicitly pinned run/attempt contract for existing bundles.
+Authoritative code repository is1448986421 DUIDUI-Studio/DailyCheck, Ops repository1449125557 DUIDUI-Studio/DailyCheck-ops, App5674104/installation180015273/Prod actor354261992. For the real current pilot only, public Issue19 ID6391796319 and dedicated private Ops Issue2 ID6403060842 were separately read back. Future bindings require their own authoritative Issue metadata. The optional dual-Issue identity record is part of the same native binding digest; existing records remain unchanged.
 
-The dedicated Issue proposal requests only `issues:write` plus implicit
-`metadata:read`, one selected repository per token, separate from read/report/
-finalize. The approved installed shim remains the broker; the fixed adapter uses
-its JWT/request/identity checks and adds only these two explicit grants. Exact
-returned permission/repository/expiry/token-hash receipts are checked; App total
-permissions are not proof of token scopes. Current token capabilities are not
-widened by this preparation. Four finite refresh phases are review, startup,
-late finalizer and late report; the last two Issue grants renew at startup and
-late report. Budget: 4 existing three-role refreshes (12 role tokens) plus 4
-Issue-only tokens, no retries. Missing/forbidden/expired scope stops the affected
-phase; no ambient token fallback exists.
+Installation repository_selection may be selected or all. Every issued token must still prove its exact returned repository set, narrow permission set, expiry, distinct role and atomic0600 custody. Existing read/report/finalize grants stay CODE-only with their original permissions. Separate Issue-only grants have issues:write and metadata:read, one declared target repository each. Actual App permissions or installation mode never prove minted-token scopes. Four finite phases remain review/startup/late-finalizer/late-report; no refresh retry or ambient credential fallback is added.
 
-Later commands (NOT executed here; ROOT and package paths come from manifest):
+Operational commands for the reviewed later adoption (not executed by this document):
 
-- Binding install: `python -B engine/scripts/blue_green/release_config.py install --state /var/lib/dailycheck-deploy --receipt OWNER_NEW_PRIVATE_DIR --input OWNER_CONFIRMED_BINDINGS --expected-sha256 FRESH_CURRENT_BINDING_SHA`.
-- Formal review: `python -B ROOT/review.py APPROVED` or `CHANGES_REQUESTED`; only the independently inspecting remote Prod reviewer chooses this decision.
-- Start once after APPROVED: `python -B ROOT/parent.py --execute-admitted` using existing tracked terminal background, notify_on_complete=true; observe the same native call to exit.
-- Stop: do not relaunch; preserve UNKNOWN. The native pipeline's TERM/INT cleanup owns safety rollback/release/reporting. Any signal requires the exact positively observed child PID/start/PGID and later positive wait. Never kill by broad process name or clear locks.
-- Binding rollback: the same release_config.py `rollback`, new exclusive receipt directory, `--input ORIGINAL_RECEIPT/before.json`, and `--expected-sha256 ORIGINAL_RECEIPT after digest`. Native exclusion blocks behind active deployment/publication; any unrelated change refuses. Roll back only this unit's exact adopted configuration fields using the reviewed config transaction, not a global snapshot or old cron/queue. Traffic safety rollback stays the existing blue-green native responsibility; no DB rollback is authorized by this document.
+- Native binding install: `python -B engine/scripts/blue_green/release_config.py install --pr N --state /var/lib/dailycheck-deploy --receipt NEW_PRIVATE_RECEIPT --input VERIFIED_FULL_BINDINGS --expected-sha256 CURRENT_BINDINGS_SHA`. Only PR N may change. Obtain both Issue IDs from authenticated GET, include issue_identities.public.number/id and issue_identities.source.id, preserve every other row.
+- Independent Prod review: `/root/DailyCheck/.venv/bin/python -I -B {{AUTOMATIC_ENTRY}} inspect TRIGGER`, then `file TRIGGER PATH` for every changed file, then `review TRIGGER APPROVED` or `CHANGES_REQUESTED` once. Run review in existing tracked terminal background with notify_on_complete=true and its exact fixed command. The entry verifies the existing root-owned processes.json against the live ancestor PID/kernel start and task/session key. The actual independent Prod reviewer chooses the decision; no Dev/Root unlock review.
+- Start after confirmed APPROVED, same Hermes session: `/root/DailyCheck/.venv/bin/python -I -B {{AUTOMATIC_ENTRY}} execute TRIGGER` once using tracked terminal background and notify_on_complete=true. Keep the same call until actual native wait/ECHILD and terminal completion notification. No artificial one-hour release deadline.
+- Observe: `status TRIGGER` returns a declassified completion projection. Confirm live forge/native runtime/anchor and existing Orca tracker callback separately. Neither manager0, HTTP202, fixture observation nor CIgreen is delivery.
+- Stop/contain: close new admission through the reviewed native configuration transaction with exact current CAS; never clear work intents, queue claims or native locks. Preserve the original process owner and safety cleanup. Signals require exact positively observed PID/start/PGID and later positive settlement; no broad process-name/group kill or duplicate invocation after timeout.
+- Binding rollback: the same release_config.py rollback with --pr N, a new exclusive receipt directory, original before.json and exact current after digest. Native exclusion blocks active publication/deployment; unrelated drift refuses. Roll back only this unit's reviewed fields. Traffic rollback remains the existing blue-green native protocol; no database/history rollback.
 
-The retained parent has no artificial one-hour deadline. Actual Popen ownership,
-wait/ECHILD, inherited flock and phase identity survive renewals. Terminal and
-SSH custody still need actual runtime observation; offline tests cannot prove
-that the production Hermes terminal will retain or notify the remote caller.
+The normal command chain is original review -> retained parent -> candidate/full eight-check verification -> promote/switch -> REAL monotonic >=600-second observation -> protected expectedOID/nonforce FF -> durable outcome -> typed report -> exact dual-Issue reconciliation -> completion. Any failed/aborted/report-write/Issue/notification error keeps its first cause and honest nonzero/UNKNOWN; uncertain writes are not replayed. Private diagnostics/source identities never enter public projection.
 
-The fixed producer also publishes a declassified completion comment after the
-bound Issue protocol, under the same native outcome/publication fence. The
-existing forge-only Orca tracker must adopt orca-tracker.prompt.md and require
-that exact producer/H/receipt/status; it cannot infer whole-run delivered from
-core deploy rc0 plus public Issue19 closed. Missing/UNKNOWN completion stays
-unconfirmed. Completion POST uncertainty is durable and never replayed; no new
-token scope, timer or direct remote-to-Orca push is added.
+Retain the existing forge-only tracker and its current owner/schedule. Its actual prompt read-back must recognize numeric producer354261992, first-line deploy-report:v1 and complete second-line deploy-publication:v1/v2 repo/PR/fullH/canonical UUID, full schema and matched dailycheck-release-completion:v1. A filename in prose is not a report. Remote terminal output and local Orca callback are separate proven results; no direct remote-Orca push is claimed. This template never establishes that a real tracker adopted it.

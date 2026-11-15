@@ -441,6 +441,25 @@ def test_malformed_or_partial_pagination_never_returns_partial_success(api, monk
         client.pages(ROOT + "/labels", **kw)
 
 
+def test_github_pr_files_paginate_by_filename_without_relaxing_other_identities(api, monkeypatch):
+    client = api.client()
+    monkeypatch.setattr(client, "PER_PAGE", 1)
+    path = ROOT + "/pulls/160/files"
+    api.write({path + "?page=1": response([{"filename": "app.py"}]),
+               path + "?page=2": response([{"filename": "scripts/hosting.py"}]),
+               path + "?page=3": response([])})
+    assert [row["filename"] for row in client.pages(path, item_key="filename")] == [
+        "app.py", "scripts/hosting.py"]
+    with pytest.raises(HostingError, match="invalid_or_repeated_page_item"):
+        client.pages(path)  # Ordinary lists still require numeric IDs.
+    with pytest.raises(HostingError, match="invalid_page_identity"):
+        client.pages(ROOT + "/labels", item_key="filename")
+    api.write({path + "?page=1": response([{"filename": "app.py"}]),
+               path + "?page=2": response([{"filename": "app.py"}])})
+    with pytest.raises(HostingError, match="invalid_or_repeated_page_item"):
+        client.pages(path, item_key="filename")
+
+
 def test_feedback_raw_creation_without_private_receipt_is_rejected(api, monkeypatch):
     from blueprints import feedback_dispatch
 

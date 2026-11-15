@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -46,6 +47,12 @@ def run(argv, env, **kwargs):
         child = subprocess.Popen(
             argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs
         )
+        if env.get("SYNTHETIC_HERMES_REGISTRY"):
+            put(Path(env["SYNTHETIC_HERMES_REGISTRY"]), json.dumps([dict(
+                pid=child.pid, pid_scope="host",
+                started_at=time.time() + (100 if env.get("SYNTHETIC_HERMES_STALE_PID") else 0),
+                command=shlex.join(argv),
+                task_id=env["SYNTHETIC_HERMES_TASK"], session_key="synthetic-webhook-session")]))
         out, err = child.communicate(timeout=60)
     finally:
         if child is not None and child.poll() is None:
@@ -56,7 +63,9 @@ def run(argv, env, **kwargs):
     return child.returncode, out.decode(), err.decode()
 
 
-def make_bundle(tmp_path, lane, case):
+def make_bundle(tmp_path, lane, case, *, work=None, render_now=True):
+    pr_number, head, code_number, code_id, ops_number, ops_id = work or (
+        160, SHA, 19, 6391796319, 7, 7001)
     engine, repo, root = (tmp_path / name for name in ("engine", "serving", "bundle"))
     for relative in PINS:
         put(engine / relative, (SOURCE / relative).read_text())
@@ -98,7 +107,7 @@ import sys
 args=sys.argv[1:]
 if args[:1]==['-C']:args=args[2:]
 if args==['remote','get-url','origin']: print('https://github.com/{REPO}.git')
-elif args and args[0]=='rev-parse': print({BASE!r} if args[-1]=='origin/main' else {SHA!r})
+elif args and args[0]=='rev-parse': print({BASE!r} if args[-1]=='origin/main' else {head!r})
 elif args and args[0] in ('fetch','checkout','merge-base','diff-index'):pass
 else:raise SystemExit(128)
 """,
@@ -123,6 +132,7 @@ print(n);p.write_text(str(n+300))
 from pathlib import Path
 root=Path({str(tmp_path)!r})
 def jwt():return 'synthetic-app-jwt'
+def configure_egress():pass
 def request(method,path,bearer,payload=None):
  req=urllib.request.Request('http://127.0.0.1:{lane.port}'+path,
   data=json.dumps(payload).encode() if payload is not None else None,
@@ -150,7 +160,7 @@ def main():
         "version": 1,
         "bindings": [
             {
-                "pr": 160,
+                "pr": pr_number,
                 "public": {
                     "provider": "github",
                     "host": "github.com",
@@ -163,23 +173,51 @@ def main():
                     "repository_id": 1449125557,
                     "repository": OPS,
                     "kind": "issue",
-                    "number": 7,
+                    "number": ops_number,
                 },
             }
         ],
     }
-    put(state / "bindings.json", json.dumps(document))
+    if work is not None:
+        document["bindings"][0]["issue_identities"] = {
+            "public": {"number": code_number, "id": code_id}, "source": {"id": ops_id}}
+        from scripts.blue_green.release_config import change
+
+        before = json.dumps({"version": 1, "bindings": []}).encode()
+        put(state / "bindings.json", before.decode())
+        change(state, tmp_path / "binding-install", hashlib.sha256(before).hexdigest(),
+               json.dumps(document).encode(), "install", pr=pr_number)
+        # Both work identities coexist in the SAME native binding authority.
+        # Installing one must preserve the other byte-for-byte through CAS.
+        other_pr, other_code, other_code_id, other_ops, other_ops_id = (
+            (161, 72, 72001, 8, 88001) if pr_number == 160 else (160, 71, 71001, 7, 77001))
+        other = json.loads(json.dumps(document["bindings"][0]))
+        other["pr"] = other_pr
+        other["source"]["number"] = other_ops
+        other["issue_identities"] = {
+            "public": {"number": other_code, "id": other_code_id},
+            "source": {"id": other_ops_id}}
+        before = (state / "bindings.json").read_bytes()
+        document["bindings"].append(other)
+        change(state, tmp_path / "binding-install-other", hashlib.sha256(before).hexdigest(),
+               json.dumps(document).encode(), "install", pr=other_pr)
+    else:
+        put(state / "bindings.json", json.dumps(document))
     from scripts.blue_green.publication_authority import resolve_source_binding
 
-    binding = resolve_source_binding(state, 160)
+    binding = resolve_source_binding(state, pr_number)
+    if work is not None:
+        assert binding.source[-1] == ops_number
+        assert binding.issue_identities["public"] == {"number": code_number, "id": code_id}
+        assert resolve_source_binding(state, other_pr).source[-1] == other_ops
     policy = {
         "version": 1,
         "repository_id": REPO_ID,
         "repository": REPO,
         "mode": "automatic",
         "since_ms": int(time.time() * 1000) - 10000,
-        "review_targets": [{"pr": 160, "head": SHA}],
-        "automatic_pr_range": None,
+        "review_targets": [] if work is not None else [{"pr": pr_number, "head": head}],
+        "automatic_pr_range": {"min": 160, "max": 161} if work is not None else None,
         "excluded_open_prs": [15, 17, 18],
         "review_actor_ids": [11],
     }
@@ -191,8 +229,8 @@ def main():
     ).hexdigest()
     targets = []
     for role, repository, rid, number, ident in [
-        ("code", REPO, REPO_ID, 19, 6391796319),
-        ("ops", OPS, 1449125557, 7, 7001),
+        ("code", REPO, REPO_ID, code_number, code_id),
+        ("ops", OPS, 1449125557, ops_number, ops_id),
     ]:
         targets.append(
             dict(
@@ -217,8 +255,8 @@ def main():
         log=str(root / "pipeline.log"),
         shim=str(shim),
         shim_sha=digest(shim),
-        pr=160,
-        head=SHA,
+        pr=pr_number,
+        head=head,
         base=BASE,
         generation=11,
         deployed_generation=10,
@@ -250,8 +288,39 @@ def main():
         DAILYCHECK_DEPLOY_EVENT_LOG=str(tmp_path / "events.jsonl"),
         DAILYCHECK_PROD_AGENT_INBOX=str(tmp_path / "result-inbox.jsonl"),
     )
-    render(profile, root)
+    if render_now:
+        render(profile, root)
     return profile, env
+
+
+def automatic_bootstrap(profile, env, tmp_path):
+    from scripts.blue_green.release_automatic import render_bootstrap
+
+    roots = tmp_path / "automatic"
+    roots.mkdir(mode=0o700)
+    production = {
+        "DAILYCHECK_HOSTING_PROVIDER": "github", "DAILYCHECK_GITHUB_LANE": "ordinary",
+        "DAILYCHECK_GITHUB_REPO": REPO, "DAILYCHECK_PROD_REPO": profile["repo"],
+        "DAILYCHECK_DEPLOY_STATE_DIR": profile["state"],
+        "DAILYCHECK_DEPLOY_EVENT_LOG": env["DAILYCHECK_DEPLOY_EVENT_LOG"],
+        "DAILYCHECK_PROD_AGENT_INBOX": env["DAILYCHECK_PROD_AGENT_INBOX"],
+    }
+    for role in ("read", "report", "finalize"):
+        path = tmp_path / (role + ".token")
+        put(path, role + "-phase-0")
+        production["DAILYCHECK_GITHUB_" + role.upper() + "_TOKEN_FILE"] = str(path)
+    environment = tmp_path / "production.env"
+    put(environment, "".join(key + "=" + value + "\n" for key, value in production.items()))
+    template = dict(profile, binding_sha256=None, capability=None, issue_protocol=None)
+    config = dict(profile=template, roots=str(roots), production_env=str(environment),
+                  production_env_sha256=digest(environment), curl=env["DAILYCHECK_CURL"],
+                  curl_sha256=digest(Path(env["DAILYCHECK_CURL"])),
+                  hermes_processes=str(tmp_path / "synthetic-hermes-processes.json"))
+    entry = tmp_path / "automatic.py"
+    render_bootstrap(config, entry)
+    env["SYNTHETIC_HERMES_REGISTRY"] = config["hermes_processes"]
+    env["SYNTHETIC_HERMES_TASK"] = "synthetic-hermes-" + str(profile["pr"])
+    return entry, roots
 
 
 @pytest.mark.skipif(
@@ -277,9 +346,30 @@ def main():
     ],
 )
 def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tmp_path, case):
+    exercise_fullchain(lane, tmp_path, case)
+
+
+def exercise_fullchain(lane, tmp_path, case, *, work=None):
+    pr_number, head = work[:2] if work else (160, SHA)
+    if work is not None:
+        def adapt(value):
+            if isinstance(value, dict):
+                return {adapt(key): (pr_number if key == "number" and item == 160 else adapt(item))
+                        for key, item in value.items()}
+            if isinstance(value, list):
+                return [adapt(item) for item in value]
+            if isinstance(value, str):
+                return (value.replace(SHA, head)
+                        .replace("/pulls/160", "/pulls/" + str(pr_number))
+                        .replace("/pull/160", "/pull/" + str(pr_number))
+                        .replace("/issues/160", "/issues/" + str(pr_number)))
+            return value
+        updated = adapt(lane.table)
+        lane.table.clear()
+        lane.table.update(updated)
     # Real repository numbers here identify SYNTHETIC HTTP fixture objects only.
     lane.port = int(lane.env["DAILYCHECK_HERMES_WEBHOOK_URL"].rsplit(":", 1)[1])
-    profile, env = make_bundle(tmp_path, lane, case)
+    profile, env = make_bundle(tmp_path, lane, case, work=work, render_now=work is None)
     lane.table[ROOT]["data"].update(
         node_id="R_kgDOVl3HNQ",
         private=False,
@@ -290,10 +380,10 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
         url="https://api.github.com" + ROOT,
         html_url="https://github.com/" + REPO,
     )
-    lane.table[ROOT + "/pulls/160"]["data"].update(
-        user={"id": 99}, node_id="PR_synthetic", merged=False
+    lane.table[ROOT + f"/pulls/{pr_number}"]["data"].update(
+        user={"id": 99}, node_id="PR_synthetic", merged=False, changed_files=1
     )
-    lane.table[ROOT + "/compare/" + BASE + "..." + SHA + "?page=2"] = {
+    lane.table[ROOT + "/compare/" + BASE + "..." + head + "?page=2"] = {
         "data": dict(
             status="ahead",
             base_commit={"sha": BASE},
@@ -333,9 +423,9 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
                 html_url="https://github.com/" + target["repository"] + "/issues/" + str(number),
             )
         }
-    lane.table[ROOT + "/issues/160/comments?page=1"] = {"data": []}
-    lane.table[ROOT + "/pulls/160/files?page=1"] = {
-        "data": [{"filename": "scripts/blue_green/deploy_report.py"}]
+    lane.table[ROOT + f"/issues/{pr_number}/comments?page=1"] = {"data": []}
+    lane.table[ROOT + f"/pulls/{pr_number}/files?page=1"] = {
+        "data": [{"filename": "blueprints/items.py" if work is not None else "scripts/blue_green/deploy_report.py"}]
     }
     lane.table["/fixture/advance"] = {"data": {}}
     mutations = []
@@ -366,15 +456,15 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             data = body["variables"]["input"]
             assert (
                 data["refUpdates"][0]["beforeOid"] == BASE
-                and data["refUpdates"][0]["afterOid"] == SHA
+                and data["refUpdates"][0]["afterOid"] == head
             )
             assert all(row["force"] is False for row in data["refUpdates"])
-            lane.table[ROOT + "/pulls/160"]["data"].update(
-                state="closed", merged=True, merge_commit_sha=SHA
+            lane.table[ROOT + f"/pulls/{pr_number}"]["data"].update(
+                state="closed", merged=True, merge_commit_sha=head
             )
-            lane.table[ROOT + "/git/ref/heads/main"]["data"]["object"]["sha"] = SHA
+            lane.table[ROOT + "/git/ref/heads/main"]["data"]["object"]["sha"] = head
             return 200, {"data": {"updateRefs": {"clientMutationId": data["clientMutationId"]}}}
-        if path == ROOT + "/issues/160/comments":
+        if path == ROOT + f"/issues/{pr_number}/comments":
             assert headers["Authorization"] == "Bearer report-phase-" + (
                 "3" if case in ("up-failure", "aborted") else "4"
             )
@@ -386,11 +476,11 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             row = dict(
                 id=202 if completion else 201,
                 body=body["body"],
-                issue_url="https://api.github.com" + ROOT + "/issues/160",
+                issue_url="https://api.github.com" + ROOT + f"/issues/{pr_number}",
             )
-            lane.table[ROOT + "/issues/160/comments?page=1"]["data"].append(row)
+            lane.table[ROOT + f"/issues/{pr_number}/comments?page=1"]["data"].append(row)
             return 201, row
-        if path == ROOT + "/pulls/160/reviews":
+        if path == ROOT + f"/pulls/{pr_number}/reviews":
             assert headers["Authorization"] == "Bearer report-phase-1"
             lane.table[path + "?page=1"]["data"] = [
                 dict(
@@ -421,13 +511,76 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             }
 
     if case == "wrong-issue":
-        lane.table[ROOT + "/issues/19"]["data"]["id"] = 123
+        lane.table[ROOT + "/issues/" + str(profile["issue_protocol"]["targets"][0]["number"])]["data"]["id"] = 123
+    if case == "wrong-ops":
+        target = profile["issue_protocol"]["targets"][1]
+        lane.table["/repos/" + OPS + "/issues/" + str(target["number"])]["data"]["id"] = 123
     lane.transport["authorize"] = authorize
     lane.transport["mutation"] = mutation
+    if work is not None:
+        automatic_entry, automatic_roots = automatic_bootstrap(profile, env, tmp_path)
+    if case == "unknown-delivery":
+        lane.transport["drop"] = True
     # Real poll -> adapter -> SQLite claim -> signed owned HTTP delivery.
     result = dispatch(lane)
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(lane.posts) == 1
+    payload = lane.posts[0]["body"]
+    trigger = payload["trigger_id"]
+    if work is not None and case in {"inspect", "blob-drift"}:
+        import base64
+
+        content = b"# SYNTHETIC candidate source\nprint('reviewed full file')\n"
+        blob = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest()
+        lane.table[ROOT + f"/pulls/{pr_number}/files?page=1"]["data"][0].update(
+            sha=blob, status="modified")
+        lane.table[ROOT + "/contents/blueprints/items.py?ref=" + head] = {"data": dict(
+            type="file", path="blueprints/items.py", sha=blob, encoding="base64",
+            content=base64.b64encode(content if case == "inspect" else b"wrong bytes").decode())}
+        rc, out, err = run([sys.executable, "-I", "-B", str(automatic_entry), "inspect", trigger], env)
+        assert rc == 0, (out, err)
+        info = json.loads(out)
+        assert (info["pr"], info["head"], info["engineering_issue"]) == (pr_number, head, work[2])
+        rc, out, err = run([sys.executable, "-I", "-B", str(automatic_entry), "file", trigger,
+                            "blueprints/items.py"], env)
+        assert rc == (0 if case == "inspect" else 78), (out, err)
+        if case == "inspect":
+            assert json.loads(out)["text"] == content.decode()
+        assert not mutations and not list(automatic_roots.iterdir())
+        assert not (tmp_path / "refresh-count").exists()
+        save_proof("automatic-inspect-" + str(pr_number) + "-" + case,
+                   dict(synthetic=True, native_rc=rc, stdout=out, stderr=err,
+                        no_profile=True, no_grant=True, no_candidate=True))
+        return
+    if work is not None and case == "unsafe-parent":
+        automatic_roots.chmod(0o777)
+    if work is not None and case == "partial-prepare":
+        put(automatic_roots / (payload["admission_id"] + ".intent.json"),
+            '{"synthetic_unknown_preparation":true}\n')
+    if work is not None and case == "unregistered":
+        env.pop("SYNTHETIC_HERMES_REGISTRY")
+        env["HERMES_SESSION_ID"] = "invented-env-must-not-grant-session-custody"
+    if work is not None and case == "stale-pid":
+        env["SYNTHETIC_HERMES_STALE_PID"] = "1"
+    if work is not None and case == "binding-swap":
+        from scripts.blue_green.release_config import change
+
+        path = Path(profile["state"]) / "bindings.json"
+        before = path.read_bytes()
+        value = json.loads(before)
+        target, other = sorted(value["bindings"], key=lambda row: row["pr"] != pr_number)
+        target["issue_identities"] = other["issue_identities"]
+        change(Path(profile["state"]), tmp_path / "binding-swap", hashlib.sha256(before).hexdigest(),
+               json.dumps(value).encode(), "install", pr=pr_number)
+    if case == "missing-binding":
+        from scripts.blue_green.release_config import change
+
+        path = Path(profile["state"]) / "bindings.json"
+        before = path.read_bytes()
+        value = json.loads(before)
+        value["bindings"] = [row for row in value["bindings"] if row["pr"] != pr_number]
+        change(Path(profile["state"]), tmp_path / "binding-remove", hashlib.sha256(before).hexdigest(),
+               json.dumps(value).encode(), "install", pr=pr_number)
     if case in {"forged-ci", "unsigned-ci"}:
         import sqlite3
 
@@ -442,31 +595,80 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
                                (json.dumps(payload), row[0]))
     time.sleep(1.1)  # Formal review timestamp must be after the actual dispatch claim.
     decision = "CHANGES_REQUESTED" if case == "blocker" else "APPROVED"
+    review_args = ([sys.executable, "-I", "-B", str(automatic_entry), "review", trigger, decision]
+                   if work is not None else
+                   [sys.executable, "-B", str(Path(profile["root"]) / "review.py"), decision])
+    if work is not None and case == "native-busy":
+        import fcntl
+
+        with (Path(profile["state"]) / ".attempt.lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rc, out, err = run(review_args, env)
+            assert rc == 10, (rc, out, err)
+            assert not mutations and not list(automatic_roots.iterdir())
+            assert not (tmp_path / "refresh-count").exists()
+            save_proof("automatic-native-busy-" + str(pr_number),
+                       dict(synthetic=True, native_rc=rc, no_grant=True, no_candidate=True))
+        return
     review_rc, review_out, review_err = run(
-        [sys.executable, "-B", str(Path(profile["root"]) / "review.py"), decision], env
+        review_args, env
     )
+    if work is not None and case in {"missing-binding", "wrong-issue", "unknown-delivery",
+                                     "binding-swap", "unsafe-parent", "partial-prepare",
+                                     "unregistered", "stale-pid"}:
+        assert review_rc == 78, (review_rc, review_out, review_err)
+        assert not mutations
+        assert len(list(automatic_roots.iterdir())) == (1 if case == "partial-prepare" else 0)
+        assert not (tmp_path / "refresh-count").exists()
+        if case == "unknown-delivery":
+            assert dispatch(lane).returncode == 0 and len(lane.posts) == 1
+        save_proof("automatic-closed-" + str(pr_number) + "-" + case,
+                   dict(synthetic=True, native_rc=review_rc, stderr=review_err,
+                        no_profile=True, no_grant=True, no_candidate=True, posts=lane.posts))
+        return
     if case in {"forged-ci", "unsigned-ci"}:
         assert review_rc == 78, (review_rc, review_out, review_err)
         assert not (Path(profile["root"]) / "ci-binding.json").exists()
         assert not mutations
         assert not (tmp_path / "calls").exists()
-        save_proof("release-fullchain-" + case, dict(synthetic=True, review_rc=review_rc,
+        save_proof("release-fullchain-" + (str(pr_number) + "-" if work else "") + case, dict(synthetic=True, review_rc=review_rc,
                    no_review_write=True, no_candidate=True, no_ci_binding=True))
         return
     assert review_rc == (31 if case == "blocker" else 0), (review_rc, review_out, review_err)
-    if case in {"automatic-ci", "ci-drift"}:
+    if work is not None:
+        root = automatic_roots / payload["admission_id"]
+        profile = json.loads((root / "profile.private.json").read_bytes())
+        assert (profile["pr"], profile["head"]) == work[:2]
+        assert [(row["number"], row["issue_id"]) for row in profile["issue_protocol"]["targets"]] == [
+            (work[2], work[3]), (work[4], work[5])]
+        assert profile["capability"]["version"] == 3
+        assert profile["pr"] != 20 and profile["issue_protocol"]["targets"][0]["number"] != 19
+        if case == "duplicate-review":
+            before = len(mutations)
+            assert run(review_args, env)[0] == 78
+            assert len(mutations) == before
+        if case == "cross-session":
+            env["SYNTHETIC_HERMES_TASK"] = "synthetic-different-hermes-session"
+    if work is not None or case in {"automatic-ci", "ci-drift"}:
         ci = json.loads((Path(profile["root"]) / "ci-binding.json").read_bytes())
         assert ci["observed_ci_run_id"] == 40 and ci["observed_ci_attempt"] == 2
-        assert ci["pr_head_sha"] == SHA and ci["pr_base_sha"] == BASE
+        assert ci["pr_head_sha"] == head and ci["pr_base_sha"] == BASE
     if case == "ci-drift":
         # Mutate the actual external authority after review, without editing profile/claim.
         matches = [value["data"]["workflow_runs"] for key, value in lane.table.items()
                    if "/actions/workflows/" in key and "/runs?" in key]
         assert len(matches) == 1
         matches[0][0]["run_attempt"] += 1
-    rc, out, err = run(
-        [sys.executable, "-B", str(Path(profile["root"]) / "parent.py"), "--execute-admitted"], env
-    )
+    execute_args = ([sys.executable, "-I", "-B", str(automatic_entry), "execute", trigger]
+                    if work is not None else
+                    [sys.executable, "-B", str(Path(profile["root"]) / "parent.py"), "--execute-admitted"])
+    rc, out, err = run(execute_args, env)
+    if case == "cross-session":
+        assert rc == 78 and not (tmp_path / "calls").exists(), (rc, out, err)
+        assert (tmp_path / "refresh-count").read_text() == "1"
+        save_proof("automatic-cross-session-" + str(pr_number),
+                   dict(synthetic=True, native_rc=rc, stderr=err, no_candidate=True))
+        return
     expected = {
         "happy": 0,
         "blocker": 78,
@@ -475,9 +677,11 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
         "report-failure": 29,
         "forbidden-scope": 1,
         "wrong-issue": 78,
+        "wrong-ops": 78,
         "issue-unknown": 29,
         "completion-failure": 29,
         "automatic-ci": 0,
+        "duplicate-review": 0,
         "ci-drift": 78,
     }[case]
     assert rc == expected, (
@@ -498,24 +702,32 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
     assert all(row["pgid"] == rows[1]["pgid"] for row in rows[1:])
     assert len(rows) == (
         2
-        if case in ("blocker", "forbidden-scope", "wrong-issue", "ci-drift")
+        if case in ("blocker", "forbidden-scope", "wrong-issue", "wrong-ops", "ci-drift")
         else 3
         if case in ("up-failure", "aborted")
         else 4
     )
-    if case not in ("blocker", "forbidden-scope", "wrong-issue", "ci-drift"):
+    if case not in ("blocker", "forbidden-scope", "wrong-issue", "wrong-ops", "ci-drift"):
         receipt = json.loads((Path(profile["root"]) / "completion-receipt.json").read_text())
+        if work is not None:
+            status_rc, status_out, status_err = run(
+                [sys.executable, "-I", "-B", str(automatic_entry), "status", trigger], env)
+            assert status_rc == 0, (status_out, status_err)
+            observed = json.loads(status_out)
+            assert observed["completion"]["status"] == receipt["status"]
+            assert observed["pr"] == pr_number and observed["head"] == head
+            assert "issue_results" not in observed["completion"] and OPS not in status_out
         assert receipt["remote_orca_push"] is False
         assert receipt["status"] == (
             "delivered"
-            if case in ("happy", "automatic-ci")
+            if case in ("happy", "automatic-ci", "duplicate-review")
             else "deploy_failed"
             if case in ("up-failure", "aborted")
             else "UNKNOWN"
         )
         state = json.loads((Path(profile["state"]) / "state.json").read_text())
         assert state["generation"] == 12 and state["lock"] is None
-        if case in ("happy", "automatic-ci", "completion-failure"):
+        if case in ("happy", "automatic-ci", "duplicate-review", "completion-failure"):
             assert len([row for row in mutations if row["method"] == "PATCH"]) == 2
             assert len([row for row in mutations if row["path"] == "/graphql"]) == 1
         elif case == "issue-unknown":
@@ -526,10 +738,10 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             }
         else:
             assert not [row for row in mutations if row["method"] == "PATCH"]
-    if case not in ("blocker", "forbidden-scope", "wrong-issue", "ci-drift"):
+    if case not in ("blocker", "forbidden-scope", "wrong-issue", "wrong-ops", "ci-drift"):
         completion_rows = [
             row
-            for row in lane.table[ROOT + "/issues/160/comments?page=1"]["data"]
+            for row in lane.table[ROOT + f"/issues/{pr_number}/comments?page=1"]["data"]
             if row["body"].startswith("<!-- dailycheck-release-completion:v1 -->")
         ]
         if case in ("report-failure", "completion-failure"):
@@ -543,7 +755,7 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
             assert facts["status"] == receipt["status"]
             assert facts["public_receipt"] == receipt["public_receipt"]
             assert (
-                OPS not in completion_rows[0]["body"] and "7001" not in completion_rows[0]["body"]
+                OPS not in completion_rows[0]["body"] and str(profile["issue_protocol"]["targets"][1]["issue_id"]) not in completion_rows[0]["body"]
             )
         notifications = [
             json.loads(line) for line in (tmp_path / "result-inbox.jsonl").read_text().splitlines()
@@ -559,14 +771,14 @@ def test_actual_poll_review_fixed_entry_native_pipeline_report_observer(lane, tm
     before = len(mutations)
     assert (
         run(
-            [sys.executable, "-B", str(Path(profile["root"]) / "parent.py"), "--execute-admitted"],
+            execute_args,
             env,
         )[0]
         != 0
     )
     assert len(mutations) == before
     save_proof(
-        "release-fullchain-" + case,
+        "release-fullchain-" + (str(pr_number) + "-" if work else "") + case,
         dict(
             synthetic=True,
             native_rc=rc,

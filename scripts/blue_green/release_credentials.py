@@ -31,6 +31,13 @@ PINS = frozenset(
         "scripts/blue_green/release_finish.py",
         "scripts/blue_green/release_issues.py",
         "scripts/blue_green/release_completion.py",
+        "scripts/blue_green/release_credentials.py",
+        "scripts/blue_green/release_automatic.py",
+        "scripts/blue_green/release_refresh.py",
+        "scripts/blue_green/release_selector.py",
+        "scripts/blue_green/release_entry.py",
+        "scripts/blue_green/release_parent.py",
+        "scripts/blue_green/release_review.py",
     }
 )
 FIELDS = frozenset(
@@ -140,7 +147,12 @@ def validate(profile: dict, destination: Path) -> None:
             "issue",
             protocol["targets"][1].get("number"),
         )
-        validate_protocol(protocol, SourceBinding(profile["pr"], source, ""))
+        validate_protocol(protocol, SourceBinding(
+            profile["pr"], source, "", issue_identities={
+                "public": {"number": protocol["targets"][0].get("number"),
+                           "id": protocol["targets"][0].get("issue_id")},
+                "source": {"id": protocol["targets"][1].get("issue_id")},
+            }))
     if profile["tmp"] != str(root / "scratch/tmp"):
         raise ValueError("private-scratch-required")
     for key in ("session", "task", "dispatch"):

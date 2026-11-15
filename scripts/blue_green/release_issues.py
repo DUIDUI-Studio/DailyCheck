@@ -98,7 +98,15 @@ def validate_protocol(protocol: object, binding) -> list[dict]:
         OPS,
     ):
         raise HostingError("issue_source_transport_unapproved")
-    identities = {(CODE, 1448986421, 19, 6391796319), (OPS, 1449125557, source["number"], None)}
+    bound = binding.issue_identities
+    if bound is None:
+        # Existing finite profiles retain their original explicit engineering
+        # identity. Automatic profiles require the native identities extension.
+        identities = {(CODE, 1448986421, 19, 6391796319),
+                      (OPS, 1449125557, source["number"], None)}
+    else:
+        identities = {(CODE, 1448986421, bound["public"]["number"], bound["public"]["id"]),
+                      (OPS, 1449125557, source["number"], bound["source"]["id"])}
     if not isinstance(targets, list) or len(targets) != 2:
         raise HostingError("issue_targets_missing")
     actual = set()
@@ -124,7 +132,7 @@ def validate_protocol(protocol: object, binding) -> list[dict]:
                 row["repository"],
                 row["repository_id"],
                 row["number"],
-                row["issue_id"] if row["repository"] == CODE else None,
+                row["issue_id"] if row["repository"] == CODE or bound is not None else None,
             )
         )
     if actual != identities:

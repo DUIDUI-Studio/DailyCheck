@@ -1,4 +1,4 @@
-"""Freeze exact Git sources and an INERT PR20 adoption preview, without network."""
+"""Freeze exact Git sources and an inert automatic-release engine, without network."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ TEMPLATES = (
     "release_parent.py",
     "release_refresh.py",
     "release_review.py",
+    "release_automatic.py",
 )
 
 
@@ -122,7 +123,7 @@ def build(head: str, base: str, output: Path):
                 number=19,
                 id=6391796319,
             ),
-            later_owner_action="Approve one exact reviewed adoption and bounded experiment after binding, scope grants and new exact-H CI are confirmed",
+            remaining_action="Adopt the independently reviewed closure under existing delivery authority only after native binding, actual narrow grants and exact-H CI are confirmed",
         ),
     )
     policy = dict(
@@ -145,7 +146,9 @@ def build(head: str, base: str, output: Path):
     ):
         text = git("show", head + ":deploy/prod-release/" + name).decode()
         for key, value in dict(
-            HEAD=head, BASE=base, ROOT=root, CI_RUN="PENDING_EXACT_H_CI", CI_ATTEMPT="null"
+            HEAD=head, BASE=base, ROOT=root,
+            AUTOMATIC_ENTRY="/var/lib/dailycheck-deploy/automatic-" + head + ".py",
+            CI_RUN="PENDING_EXACT_H_CI", CI_ATTEMPT="null"
         ).items():
             text = text.replace("{{" + key + "}}", value)
         put("config/" + name, text.encode())

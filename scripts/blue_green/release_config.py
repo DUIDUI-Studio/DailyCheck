@@ -82,7 +82,9 @@ def sync(directory):
         os.close(fd)
 
 
-def change(state: Path, receipt: Path, expected: str, new: bytes, operation: str):
+def change(state: Path, receipt: Path, expected: str, new: bytes, operation: str, *, pr: int = 20):
+    if type(pr) is not int or pr <= 0:
+        raise ValueError("invalid-binding-pr")
     safe_directory(state)
     safe_directory(receipt.parent)
     checked_document(new)
@@ -97,9 +99,10 @@ def change(state: Path, receipt: Path, expected: str, new: bytes, operation: str
         if digest(before) != expected:
             raise ValueError("binding-cas-drift")
         old, changed = checked_document(before), checked_document(new)
-        # This finite installer only adds/removes PR20; unrelated mappings survive.
-        if [r for r in old["bindings"] if r["pr"] != 20] != [
-            r for r in changed["bindings"] if r["pr"] != 20
+        # One explicitly identified work item per native transaction. The
+        # default preserves the existing finite installer interface.
+        if [r for r in old["bindings"] if r["pr"] != pr] != [
+            r for r in changed["bindings"] if r["pr"] != pr
         ]:
             raise ValueError("unrelated-binding-change")
         durable_create(receipt / "before.json", before)
@@ -109,6 +112,7 @@ def change(state: Path, receipt: Path, expected: str, new: bytes, operation: str
             json.dumps(
                 {
                     "operation": operation,
+                    "pr": pr,
                     "before_sha256": digest(before),
                     "after_sha256": digest(new),
                     "state": str(state),
@@ -117,7 +121,7 @@ def change(state: Path, receipt: Path, expected: str, new: bytes, operation: str
             ).encode(),
         )
         sync(receipt)
-        temporary = state / (".bindings-pr20-" + uuid.uuid4().hex)
+        temporary = state / (f".bindings-pr{pr}-" + uuid.uuid4().hex)
         try:
             durable_create(temporary, new)
             os.replace(temporary, path)
@@ -142,8 +146,9 @@ def main():
         help="New full binding document; rollback uses the original before.json",
     )
     parser.add_argument("--expected-sha256", required=True)
+    parser.add_argument("--pr", type=int, default=20)
     args = parser.parse_args()
-    change(args.state, args.receipt, args.expected_sha256, regular(args.input), args.operation)
+    change(args.state, args.receipt, args.expected_sha256, regular(args.input), args.operation, pr=args.pr)
 
 
 if __name__ == "__main__":

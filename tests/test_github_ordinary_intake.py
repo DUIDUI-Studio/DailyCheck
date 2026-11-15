@@ -60,6 +60,8 @@ def lane(tmp_path, request, private_audit):
             url = urlsplit(self.path)
             query = parse_qs(url.query)
             key = url.path + ("?page=" + query["page"][0] if "page" in query else "")
+            if "/contents/" in url.path and "ref" in query:
+                key = url.path + "?ref=" + query["ref"][0]
             reads.append(key)
             if "authorize" in transport:
                 transport["authorize"](key, self.headers)
