@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}确认 Token 权限{% endblock %}
+{% block content %}
+<h2>确认新 Token 权限</h2>
+{% if error %}
+<p role="alert">{{ error }}</p>
+{% else %}
+<p>尚未创建 Token。请逐项核对；空路径列表表示无权限。</p>
+<dl>
+  <dt>名称</dt><dd>{{ acl.name }}</dd>
+  <dt>读取路径（包含子路径）</dt><dd><code>{{ acl.read }}</code></dd>
+  <dt>写入路径（包含子路径）</dt><dd><code>{{ acl.write }}</code></dd>
+  <dt>仓库范围</dt><dd>{% if acl.warehouses == 'null' %}全部仓库（null，包含未来新增仓库）{% elif acl.warehouses == '[]' %}无仓库（[]）{% else %}{{ acl.warehouses }}{% endif %}</dd>
+</dl>
+<form method="post" action="{{ url_for('agent_tokens.create_token') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="review" value="{{ review }}">
+  {% if broad %}
+  <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="confirm_broad" value="yes" required style="width:auto;margin:0">我确认授予上面列出的全部仓库或通配路径权限</label>
+  {% endif %}
+  <button type="submit" class="btn primary">确认并创建 Token</button>
+</form>
+{% endif %}
+<p><a href="{{ url_for('agent_tokens.list_tokens') }}">返回修改</a>（预览 10 分钟有效）</p>
+{% endblock %}

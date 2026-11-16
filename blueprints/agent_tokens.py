@@ -10,7 +10,19 @@ import secrets
 import sqlite3
 from datetime import datetime
 
-from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
+from flask import (
+    Blueprint,
+    abort,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from werkzeug.security import generate_password_hash
 
 from config import AGENT_TOKEN_PREFIX_LEN, SECRET_KEY
@@ -55,7 +67,15 @@ def _parse_paths(s: str) -> str:
         return "[]"
     if s == "*":
         return '["*"]'
-    return json.dumps([p.strip() for p in s.split(",") if p.strip()])
+    paths = list(dict.fromkeys(p.strip() for p in s.split(",") if p.strip()))
+    if any(
+        p != "*" and (not p.startswith("/api/v1/") or "?" in p or "#" in p
+                      or ".." in p or any(c.isspace() for c in p)
+                      or "*" in p.rstrip("*"))
+        for p in paths
+    ):
+        raise ValueError("路径须为 /api/v1/ 开头的路径，可在末尾使用 *；或单独使用 *")
+    return json.dumps(paths)
 
 
 def _parse_warehouses(s: str) -> str:
@@ -63,6 +83,46 @@ def _parse_warehouses(s: str) -> str:
     if not s:
         return "null"
     return json.dumps([w.strip() for w in s.split(",") if w.strip()])
+
+
+def _review_signer():
+    return URLSafeTimedSerializer(current_app.secret_key, salt="agent-token-create-review-v1")
+
+
+def _creation_acl(form, db):
+    """Parse only new-token input; never rewrite an existing token's ACL."""
+    name = form.get("name", "").strip()
+    if not name or len(name) > 100:
+        raise ValueError("Token 名称必填，最多 100 字符")
+    read = _parse_paths(form.get("read_paths", ""))
+    write = _parse_paths(form.get("write_paths", ""))
+    # Old callers keep empty-input -> null. The new UI explicitly defaults to none.
+    mode = form.get("warehouse_scope", "legacy")
+    codes = list(dict.fromkeys(
+        code.strip() for value in form.getlist("warehouses")
+        for code in value.split(",") if code.strip()
+    ))
+    known = {r["code"] for r in db.execute("SELECT code FROM warehouses")}
+    if not set(codes) <= known:
+        raise ValueError("存在未知仓库，请重新选择")
+    if mode == "legacy":
+        warehouses = _parse_warehouses(",".join(codes))
+    elif mode == "all" and not codes:
+        warehouses = "null"
+    elif mode == "none" and not codes:
+        warehouses = "[]"
+    elif mode == "selected" and codes:
+        warehouses = json.dumps(codes)
+    else:
+        raise ValueError("仓库范围与选择不一致；指定仓库至少选择一项")
+    return dict(name=name, read=read, write=write, warehouses=warehouses, actor=g.user["id"])
+
+
+def _broad_acl(acl):
+    return acl["warehouses"] == "null" or any(
+        p == "*" or p.endswith("*") or p.rstrip("/") == "/api/v1"
+        for key in ("read", "write") for p in json.loads(acl[key])
+    )
 
 
 @bp.route("/admin/agent-tokens", methods=["GET"])
@@ -103,21 +163,37 @@ def list_tokens():
 @bp.route("/admin/agent-tokens/create", methods=["POST"])
 @require_platform_admin
 def create_token():
-    name = request.form.get("name", "").strip()
-    read_paths = request.form.get("read_paths", "*").strip()
-    write_paths = request.form.get("write_paths", "").strip()
-    warehouses = request.form.get("warehouses", "").strip()
-
-    if not name:
-        flash("Token 名称必填")
-        return redirect(url_for("agent_tokens.list_tokens"))
+    db = get_master_db()
+    if "review" in request.form:
+        try:
+            acl = _review_signer().loads(request.form["review"], max_age=600)
+        except BadSignature:
+            abort(400, "权限确认已失效，请重新预览")
+        if acl["actor"] != g.user["id"]:
+            abort(403)
+        # Revalidate warehouse existence at confirmation, without taking unsigned ACL fields.
+        known = {r["code"] for r in db.execute("SELECT code FROM warehouses")}
+        if not set(json.loads(acl["warehouses"]) or []) <= known:
+            abort(400, "仓库已变更，请重新预览")
+        if _broad_acl(acl) and request.form.get("confirm_broad") != "yes":
+            abort(400, "请明确确认全部仓库或通配路径权限")
+    else:
+        try:
+            acl = _creation_acl(request.form, db)
+        except ValueError as error:
+            return render_template("agent_token_review.html", error=str(error)), 400
+        return render_template(
+            "agent_token_review.html", acl=acl, review=_review_signer().dumps(acl),
+            broad=_broad_acl(acl),
+        )
+    name = acl["name"]
+    _ensure_encrypted_token_col(db)
 
     raw_token = secrets.token_urlsafe(32)
     token_hash = generate_password_hash(raw_token, method="pbkdf2:sha256")
     encrypted = _encrypt_token(raw_token)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db = get_master_db()
     try:
         db.execute(
             """INSERT INTO agent_tokens
@@ -132,9 +208,9 @@ def create_token():
                 encrypted,
                 g.user["id"],
                 now,
-                _parse_paths(read_paths),
-                _parse_paths(write_paths),
-                _parse_warehouses(warehouses),
+                acl["read"],
+                acl["write"],
+                acl["warehouses"],
             ),
         )
         db.commit()
@@ -145,7 +221,7 @@ def create_token():
     flash(f"已创建 Token '{name}'", "token-created")
     session["_new_token"] = raw_token
     session["_new_token_name"] = name
-    _log_admin_action(f"create token '{name}'")
+    _log_admin_action(f"create token '{name}' read={acl['read']} write={acl['write']} warehouses={acl['warehouses']}")
     return redirect(url_for("agent_tokens.list_tokens"))
 
 

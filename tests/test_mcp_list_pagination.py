@@ -354,8 +354,9 @@ class TestPaginationTypeGuards:
 
         monkeypatch.setattr(protocol, "Server", CaptureServer)
         server = protocol.build_server()
-        result = asyncio.run(server.handler(name, {"warehouse_code": WAREHOUSE_CODE, field: value}))
-        assert json.loads(result[0].text) == {
+        with pytest.raises(protocol._SerializedToolError) as error:
+            asyncio.run(server.handler(name, {"warehouse_code": WAREHOUSE_CODE, field: value}))
+        assert json.loads(str(error.value)) == {
             "error": "validation_error", "message": f"{field} must be an integer"
         }
 

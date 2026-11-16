@@ -119,8 +119,10 @@ def _call(client, token, name, warehouse="allowed"):
     })
     assert response.status_code == 200, response.text
     result = response.json()["result"]
-    assert not result.get("isError"), result
-    return json.loads(result["content"][0]["text"])
+    payload = json.loads(result["content"][0]["text"])
+    assert result.get("isError", False) == (isinstance(payload, dict) and "error" in payload)
+    assert "error" not in response.json()
+    return payload
 
 
 def _assert_audit(env, token_id, name, status):

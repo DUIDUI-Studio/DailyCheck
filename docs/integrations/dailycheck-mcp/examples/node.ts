@@ -123,7 +123,7 @@ export class DailyCheckMcp {
       }
     }
 
-    // Some tools forget isError — detect by inner JSON envelope
+    // Keep inner-error detection for pre-#24 servers during mixed-version rollout.
     const inner = result.content?.[0]?.text;
     if (typeof inner === "string") {
       try {

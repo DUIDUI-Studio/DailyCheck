@@ -175,16 +175,17 @@ def test_schema_tool_passthrough_and_error_serialization(env, monkeypatch):
         first = json.loads(asyncio.run(call_tool("restock_create", args))[0].text)
         assert first["quantity"] == 1.25 and first["input_quantity"] == 0.125
         args["factor"] = 1
-        conflict = json.loads(asyncio.run(call_tool("restock_create", args))[0].text)
+        with pytest.raises(protocol._SerializedToolError) as error:
+            asyncio.run(call_tool("restock_create", args))
+        conflict = json.loads(str(error.value))
         assert conflict == {
             "error": "document_conflict",
             "message": "document_line_payload_mismatch",
         }
         args["factor"] = None
-        assert (
-            json.loads(asyncio.run(call_tool("restock_create", args))[0].text)["error"]
-            == "validation_error"
-        )
+        with pytest.raises(protocol._SerializedToolError) as error:
+            asyncio.run(call_tool("restock_create", args))
+        assert json.loads(str(error.value))["error"] == "validation_error"
     finally:
         set_current_auth(None)
 
