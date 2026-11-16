@@ -25,6 +25,14 @@ from pathlib import Path
 CONFIG = None  # BUILD_CONFIG
 
 
+class CurrentReadinessBlocked(ValueError):
+    """Closed public facts, without provider bodies or private source identities."""
+
+    def __init__(self, reason, evidence):
+        super().__init__(reason)
+        self.evidence = evidence
+
+
 def require(ok, reason):
     if not ok:
         raise ValueError(reason)
@@ -231,12 +239,21 @@ def plan(config, trigger):
     require(binding.source[:5] == ("github", "github.com", 1449125557, OPS, "issue"),
             "automatic-source-transport")
     gate = github_intake.readiness(payload)
-    require(gate.get("ready") is True and gate.get("actual_head") == payload["pr_head_sha"]
-            and gate.get("base_sha") == payload.get("pr_base_sha")
-            and gate.get("run_id") == payload.get("observed_ci_run_id")
-            and gate.get("run_attempt") == payload.get("observed_ci_attempt")
-            and state.get("deployed", {}).get("sha") == gate.get("base_sha"),
-            "automatic-current-ci-or-base-changed")
+    if gate.get("ready") is not True:
+        cause = gate.get("reason")
+        if not isinstance(cause, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,79}", cause) is None:
+            cause = "UNKNOWN"
+        raise CurrentReadinessBlocked("automatic-current-readiness-unconfirmed",
+                                      dict(ready=False, cause=cause, identity_matches=None))
+    matches = dict(head=gate.get("actual_head") == payload["pr_head_sha"],
+                   base=gate.get("base_sha") == payload.get("pr_base_sha"),
+                   ci_run=gate.get("run_id") == payload.get("observed_ci_run_id"),
+                   ci_attempt=gate.get("run_attempt") == payload.get("observed_ci_attempt"),
+                   deployed_base=state.get("deployed", {}).get("sha") == gate.get("base_sha"))
+    if not all(matches.values()):
+        raise CurrentReadinessBlocked("automatic-current-ci-or-base-changed",
+                                      dict(ready=True, cause="identity_mismatch",
+                                           identity_matches=matches))
     root = Path(config["roots"]) / payload["admission_id"]
     targets = []
     for role, repository, rid, number, ident in (
@@ -486,5 +503,8 @@ if __name__ == "__main__":
         reason = str(error)
         if re.fullmatch(r"[a-z][a-z0-9_-]{0,79}", reason) is None:
             reason = type(error).__name__
-        print(json.dumps({"status": "BLOCKER", "reason": reason, "deployment_proven": False}), file=sys.stderr)
+        result = {"status": "BLOCKER", "reason": reason, "deployment_proven": False}
+        if isinstance(error, CurrentReadinessBlocked):
+            result["readiness"] = error.evidence
+        print(json.dumps(result), file=sys.stderr)
         raise SystemExit(78) from None

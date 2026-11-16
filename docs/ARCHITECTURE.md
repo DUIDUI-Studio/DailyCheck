@@ -1354,6 +1354,9 @@ preview，实际入口在任何 intent/refresh 前拒绝。PR18 续期 ABI 与�
 把不可变 bootstrap helper 与承流 checkout 分开，蓝绿阶段/完整 verify/真实 monotonic
 >=600s/保护 FF 顺序不变。selector 同时核对私有 binding、当前 H/B/CI、signed SQLite claim、
 policy 和 eligible formal APPROVED；BLOCKER/UNKNOWN/重复 intent 均不启动候选。
+automatic 入口把当前 readiness 未确认与已确认后的 H/B/CI 身份漂移分开报告；前者只输出
+白名单安全 cause，身份比较保留 null，不把 HTTP/mergeability 未确认误报为 CI 变化。
+后者保留逐项身份比较结果。两种 BLOCKER 都在 profile/grant/candidate 前停止，不隐式重试。
 whole-run capability v2 可在最终 push 前保持 CI run/attempt 同时为 null；正式 review 入口
 在原 process fence 内验证 ready 信封、实时精确仓/H/B/workflow/App/checks，然后只创建一次
 私有 ci-binding.json。后续 candidate 必须复核同一 claim/run/attempt 和实时 CI，漂移即停，

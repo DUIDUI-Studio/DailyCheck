@@ -527,6 +527,37 @@ def exercise_fullchain(lane, tmp_path, case, *, work=None):
     assert len(lane.posts) == 1
     payload = lane.posts[0]["body"]
     trigger = payload["trigger_id"]
+    if work is not None and case.startswith("readiness-"):
+        secret = "SYNTHETIC-provider-body-not-public"
+        if case == "readiness-http":
+            lane.table[ROOT + f"/pulls/{pr_number}"] = {
+                "status": 503, "data": {"message": secret}}
+        elif case == "readiness-unmergeable":
+            lane.table[ROOT + f"/pulls/{pr_number}"]["data"]["mergeable"] = None
+        else:
+            matches = [value["data"]["workflow_runs"] for key, value in lane.table.items()
+                       if "/actions/workflows/" in key and "/runs?" in key]
+            assert len(matches) == 1
+            matches[0][0]["run_attempt"] += 1
+        rc, out, err = run([sys.executable, "-I", "-B", str(automatic_entry), "inspect", trigger], env)
+        assert rc == 78 and secret not in out + err, (out, err)
+        result = json.loads(err)
+        assert result["status"] == "BLOCKER" and result["deployment_proven"] is False
+        if case == "readiness-attempt-drift":
+            assert result["reason"] == "automatic-current-ci-or-base-changed"
+            assert result["readiness"]["identity_matches"]["ci_attempt"] is False
+        else:
+            assert result["reason"] == "automatic-current-readiness-unconfirmed"
+            assert result["readiness"]["cause"] == (
+                "hosting_http_error" if case == "readiness-http" else "not_mergeable")
+            assert result["readiness"]["identity_matches"] is None
+        assert not mutations and not list(automatic_roots.iterdir())
+        assert not (tmp_path / "refresh-count").exists()
+        save_proof("automatic-" + str(pr_number) + "-" + case,
+                   dict(synthetic=True, native_rc=rc, stdout=out, stderr=err,
+                        api_reads=lane.reads, no_profile=True, no_grant=True, no_candidate=True,
+                        positive_wait=True, actual_ECHILD=True))
+        return
     if work is not None and case.startswith("files-"):
         path = ROOT + f"/pulls/{pr_number}/files"
         lane.table[ROOT + f"/pulls/{pr_number}"]["data"]["changed_files"] = 101
