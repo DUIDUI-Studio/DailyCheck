@@ -2900,6 +2900,7 @@ MCP、Bot、配置/权限路径及运行时依赖清单（含 requirements*.txt/
 原 TextContent JSON `{error,message,...details}` 与业务审计 status 保持不变。
 HTTP 传输仍为 200；SDK 参数/未知工具错误仍由 SDK 标记，可能是纯文本。
 混合版本调用方继续检查内层 error，不能仅凭 HTTP 200 判断业务成功。
+绕过 SDK 装饰器的测试需断言序列化异常；真实 SDK/HTTP 契约测试负责确认 wire isError。
 
 `service.procurement` 无论 `AuthContext.read_only` 或写 ACL 如何，均走无缓存只读
 adapter：master/warehouse `mode=ro`，显式配置计算，不读写采购缓存，不初始化 schema。

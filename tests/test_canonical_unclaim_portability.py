@@ -107,6 +107,9 @@ def test_unclaim_default_note_and_repeat_preserve_stock(unclaim_env):
     cancelled = next(row for row in rows(master, 'canonical_claim_requests') if row['id'] == 3)
     assert cancelled['review_note'] == 'unclaimed'
     before = rows(master, 'canonical_claim_requests')
-    assert call(route)['error'] == 'validation_error'
+    # CapturingServer bypasses the SDK's exception-to-isError adapter.
+    with pytest.raises(server._SerializedToolError) as error:
+        call(route)
+    assert json.loads(str(error.value))['error'] == 'validation_error'
     assert rows(master, 'canonical_claim_requests') == before
     assert rows(warehouse, 'items')[0]['quantity'] == 100
