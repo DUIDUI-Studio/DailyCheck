@@ -30,7 +30,6 @@ from tests.test_release_bundle import automatic_bootstrap, make_bundle, put, run
 
 lane = ordinary_lane
 SOURCE = Path(__file__).resolve().parents[1]
-CONFIG = Path("/etc/dailycheck/github-review-feedback.json")
 
 
 def owned_terminal(lane, tmp):
@@ -167,8 +166,7 @@ def owned_terminal(lane, tmp):
     ],
 )
 def test_terminal_blocker_feedback_requires_native_settlement(lane, tmp_path, case):
-    prior = CONFIG.read_bytes() if CONFIG.exists() else None
-    CONFIG.parent.mkdir(mode=0o700, exist_ok=True)
+    config = tmp_path / "feedback-config.json"
     child = None
     release = tmp_path / "release-child"
     try:
@@ -176,7 +174,7 @@ def test_terminal_blocker_feedback_requires_native_settlement(lane, tmp_path, ca
             lane, tmp_path
         )
         trigger = payload["trigger_id"]
-        put(CONFIG, json.dumps({"version": 1, "state_dir": str(state), "hermes_home": str(home)}))
+        put(config, json.dumps({"version": 1, "state_dir": str(state), "hermes_home": str(home)}))
         db = Path(env["DAILYCHECK_EVENT_REDUCER_DB"])
         if case in {"claimed", "unknown", "forged-mac", "cross-head"}:
             # Only owned test data; this is not a production recovery interface.
@@ -257,6 +255,14 @@ def test_terminal_blocker_feedback_requires_native_settlement(lane, tmp_path, ca
             sys.executable,
             "-I",
             "-B",
+            "-c",
+            "import runpy,sys;from pathlib import Path;"
+            "sys.path.insert(0,sys.argv.pop(1));"
+            "from scripts.prod_agent import github_review_feedback;"
+            "github_review_feedback.CONFIG=Path(sys.argv.pop(1));"
+            "runpy.run_path(sys.argv.pop(1),run_name='__main__')",
+            str(SOURCE),
+            str(config),
             str(SOURCE / "scripts/prod_agent/event_reducer.py"),
             "--db",
             str(db),
@@ -344,7 +350,4 @@ def test_terminal_blocker_feedback_requires_native_settlement(lane, tmp_path, ca
             assert child.wait() == 0
             with pytest.raises(ChildProcessError):
                 os.waitpid(child.pid, os.WNOHANG)
-        if prior is None:
-            CONFIG.unlink(missing_ok=True)
-        else:
-            put(CONFIG, prior)
+        config.unlink(missing_ok=True)

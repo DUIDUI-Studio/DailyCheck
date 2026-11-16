@@ -1867,6 +1867,10 @@ CHANGES_REQUESTED 或部署成功。仍在途、delivery_unknown、串任务/版
 已创建 candidate 的状态均不解除。配置缺失或证据不确定时保持等待；新 H 仍需原 CI、
 签名准入、独立正式审查及完整发布验证，不以该回执重放旧 H。
 
+反馈回归的 synthetic 配置只放在 owned test scratch；测试子进程在调用原 reducer CLI 前
+仅替换该进程内的配置路径，绝不读取、覆盖或恢复真实 `/etc/dailycheck` 配置。
+Root/Linux 回归还须在固定生产配置路径只读挂载 canary 时通过，以覆盖真实配置已存在的场景。
+
 ordinary 结果由现有 publication authority/source binding/current generation/receipt 重新解析，
 且 outcome 时间不得早于激活 epoch，才签发 `result_reconcile` → dailycheck-deploy；旧 gen11
 或 shadow 报告不改名重发。typed public receipt 与私有诊断分离，publication 未 linked 显式
