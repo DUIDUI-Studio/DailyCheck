@@ -3,8 +3,8 @@
 > **任务入口**：先读 [`AGENT.md`](AGENT.md) 和
 > [`workflow.md`](docs/agent-framework/workflow.md) 的角色、权限与交付规则。
 > 改子系统前读 [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的概览与相关章节；
-> 环境操作前查 [`DEV_ENV.md`](docs/DEV_ENV.md)。选择执行方式或新 agent/model 时查
-> [`orca-model-orchestration.md`](docs/agent-framework/orca-model-orchestration.md)。
+> 环境操作前查 [`DEV_ENV.md`](docs/DEV_ENV.md)。执行方式遵循 `~/.agents/AGENTS.md`；
+> 确需新 agent/model 时只查 `~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`。
 > 按任务读取必要内容；不把读取文档、使用技能或验证变成独立派单。
 
 ## 协作工作流速记（细节以 workflow.md 为准）

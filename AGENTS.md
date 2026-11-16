@@ -1,11 +1,12 @@
 # DailyCheck Agent Entry
 
-At task entry, read `AGENT.md` and the role, authority and delivery rules in
+At task entry, read `~/.agents/AGENTS.md`, `AGENT.md` and the role, authority and delivery rules in
 `docs/agent-framework/workflow.md`. Before changing a subsystem, read the
 architecture overview and relevant sections of `docs/ARCHITECTURE.md`; consult
 `CLAUDE.md` and `docs/DEV_ENV.md` for the affected stack and environment.
-Read `docs/agent-framework/orca-model-orchestration.md` when choosing an execution
-mode or a new agent/model. These references do not create separate work stages.
+Choose a new agent/model only when needed, using the user-global
+`~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`. These references
+do not create separate work stages or require another agent.
 
 Default to one main executor owning investigation, design, related implementation,
 repair, validation and delivery follow-up. Use helpers only for a useful independent
@@ -15,8 +16,8 @@ review, plus explicit Owner limits and production authority. Do not resume HOLD 
 
 `workflow.md` is authoritative for issue intake, branch naming, PR gates, merge
 responsibility, deployment, and owner red lines. Explicit Owner decisions take
-precedence and must be recorded for red-line changes. The Orca routing document
-adopts the user-global model policy; the project routing JSON is deprecated.
+precedence and must be recorded for red-line changes. The Owner retired the project
+model-orchestration document; the project routing JSON remains deprecated.
 
 ## Delivery lifecycle terminal state (global)
 
