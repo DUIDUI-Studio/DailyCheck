@@ -195,6 +195,41 @@ def authentic(payload: object, stages: frozenset[str] = STAGES) -> bool:
         return False
 
 
+def historical_review_authentic(payload: object) -> bool:
+    """Authenticate an old review claim only for terminal feedback, never admission.
+
+    A policy change must not erase a delivered review's waiting state. The
+    original MAC still binds its old epoch/H/CI/claim; current acceptance remains
+    mandatory in authentic() and every work consumer.
+    """
+    try:
+        rule = policy()
+        body = {k: v for k, v in payload.items() if k != "ordinary_provenance"}
+        proof = payload["ordinary_provenance"]
+        if (set(proof) != {"version", "stage", "epoch", "mac"}
+                or type(proof["version"]) is not int or proof["version"] != 1
+                or proof["stage"] != "ready" or type(proof["epoch"]) is not int
+                or payload["repo_full_name"] != REPO or payload["repository_id"] != REPOSITORY_ID
+                or type(payload["repository_id"]) is not int
+                or payload["hosting_host"] != "github.com"
+                or payload["hosting_provider"] != "github" or payload["intake_mode"] != "ordinary"
+                or payload["event"] != "check_suite" or payload["dispatch_phase"] != "prod_review"
+                or type(payload["pr_number"]) is not int or payload["pr_number"] <= 0
+                or any(not isinstance(payload[k], str) or not re.fullmatch(r"[0-9a-f]{40}", payload[k])
+                       for k in ("pr_head_sha", "pr_base_sha"))
+                or any(type(payload[k]) is not int or payload[k] <= 0
+                       for k in ("observed_ci_run_id", "observed_ci_attempt"))
+                or not 0 < proof["epoch"] <= payload["received_at_ms"]
+                    <= payload["dispatch_claimed_at_ms"] <= int(time.time() * 1000)
+                or not re.fullmatch(r"[0-9a-f]{64}", payload["policy_sha256"])):
+            return False
+        binding = f"{body['policy_sha256']}|{body['pr_number']}|{body['pr_head_sha']}|prod_review"
+        return (body["admission_id"] == hashlib.sha256(binding.encode()).hexdigest()
+                and hmac.compare_digest(proof["mac"], _mac(body, "ready", proof["epoch"], rule.key)))
+    except (HostingError, AttributeError, ValueError, TypeError, KeyError):
+        return False
+
+
 def work_payload(value: object) -> object:
     if isinstance(value, dict) and value.get("decision") in {"trigger", "defer"}:
         return value.get("payload")

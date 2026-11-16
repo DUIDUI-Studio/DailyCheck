@@ -1858,6 +1858,15 @@ sender 拒绝时，其原始闭门诊断写入 adapter 私有 stderr；未跨 se
 run/attempt 对齐后结束审查等待；仅 APPROVED/CHANGES_REQUESTED，且 actor 不得是 PR author。
 BLOCKER 允许修复后新 H 重新审查；旧 H 不重放。无证据保持 UNKNOWN；TTL 不证明进程退出。
 
+部署前 `inspect`/`file` 的真实 BLOCKER 另由 `github_review_feedback.py` 回读现有
+Hermes 会话、工具退出、进程登记和 gateway 已完成响应记录；只接受受保护原任务签名及
+已钉扎只读入口。`event_reducer reconcile-reviews` 在原 attempt fence 内两次读取相同证据，
+以 SQLite 原子事务保存 `review_terminal_receipts`，仅将原 done/awaiting 行标为
+`review_terminal_blocker`；原 payload、lease、attempt 次数和历史保留，不产生 APPROVED、
+CHANGES_REQUESTED 或部署成功。仍在途、delivery_unknown、串任务/版本、无真实退出或
+已创建 candidate 的状态均不解除。配置缺失或证据不确定时保持等待；新 H 仍需原 CI、
+签名准入、独立正式审查及完整发布验证，不以该回执重放旧 H。
+
 ordinary 结果由现有 publication authority/source binding/current generation/receipt 重新解析，
 且 outcome 时间不得早于激活 epoch，才签发 `result_reconcile` → dailycheck-deploy；旧 gen11
 或 shadow 报告不改名重发。typed public receipt 与私有诊断分离，publication 未 linked 显式

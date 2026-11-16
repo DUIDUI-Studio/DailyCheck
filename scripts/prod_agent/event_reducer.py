@@ -136,6 +136,12 @@ CREATE INDEX IF NOT EXISTS idx_trigger_queue_pr
 CREATE UNIQUE INDEX IF NOT EXISTS one_claimed_trigger_per_pr
     ON trigger_queue(repo, pr_number) WHERE state = 'claimed';
 
+CREATE TABLE IF NOT EXISTS review_terminal_receipts (
+    trigger_id TEXT PRIMARY KEY REFERENCES trigger_queue(trigger_id),
+    receipt_json TEXT NOT NULL,
+    observed_at_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS provider_state (
     provider TEXT PRIMARY KEY,
     state TEXT NOT NULL,
@@ -287,7 +293,57 @@ class EventReducer:
                 for suffix in ("", "-wal", "-shm", "-journal"):
                     require_shadow_path(Path(str(self.config.db_path) + suffix))
 
-    def reconcile_reviews(self, repo: str, pr: int, *, now_ms: int) -> None:
+    def reconcile_terminal_reviews(self, repo: str, pr: int, *, now_ms: int) -> list[dict]:
+        """End a positively settled pre-candidate review, without approving it."""
+        if provider() is not Provider.GITHUB or not github_intake.enabled():
+            return []
+        from scripts.blue_green import deploy_state
+        from scripts.prod_agent import github_review_feedback
+
+        receipts = []
+        try:
+            with deploy_state.attempt_lock(deploy_state.state_dir()) as fence:
+                conn = self._connect()
+                try:
+                    rows = conn.execute("""SELECT * FROM trigger_queue
+                        WHERE repo=? AND pr_number=? AND event='check_suite' AND route='wdg-ci'
+                        AND state='done' AND last_error='awaiting_agent_receipt'""",
+                        (repo.lower(), pr)).fetchall()
+                    for row in rows:
+                        try:
+                            payload = strict_json_loads(row["payload_json"])
+                            if (payload.get("repo_full_name", "").lower() != row["repo"]
+                                    or payload.get("pr_number") != row["pr_number"]
+                                    or payload.get("pr_head_sha") != row["head_sha"]
+                                    or payload.get("trigger_id") != row["trigger_id"]):
+                                continue
+                            observed = github_review_feedback.observation(payload, fence)
+                            conn.execute("BEGIN IMMEDIATE")
+                            current = conn.execute("SELECT * FROM trigger_queue WHERE trigger_id=?",
+                                                   (row["trigger_id"],)).fetchone()
+                            if (current is None or dict(current) != dict(row)
+                                    or github_review_feedback.observation(payload, fence) != observed):
+                                conn.execute("ROLLBACK")
+                                continue
+                            conn.execute("""INSERT INTO review_terminal_receipts
+                                (trigger_id,receipt_json,observed_at_ms) VALUES(?,?,?)""",
+                                (row["trigger_id"], json.dumps(observed, sort_keys=True), now_ms))
+                            conn.execute("""UPDATE trigger_queue SET last_error='review_terminal_blocker',
+                                updated_at_ms=? WHERE trigger_id=?""", (now_ms, row["trigger_id"]))
+                            conn.execute("COMMIT")
+                            receipts.append({key: observed[key] for key in
+                                             ("kind", "trigger_id", "pr", "head", "no_candidate", "formal_review")})
+                        except (HostingError, OSError, ValueError, TypeError, KeyError, AttributeError):
+                            if conn.in_transaction:
+                                conn.execute("ROLLBACK")
+                finally:
+                    conn.close()
+        except BlockingIOError:
+            pass
+        return receipts
+
+    def reconcile_reviews(self, repo: str, pr: int, *, now_ms: int) -> list[dict]:
+        receipts = self.reconcile_terminal_reviews(repo, pr, now_ms=now_ms)
         conn = self._connect()
         try:
             rows = conn.execute("""SELECT trigger_id,payload_json FROM trigger_queue
@@ -323,6 +379,7 @@ class EventReducer:
                 raise
             finally:
                 conn.close()
+        return receipts
 
     def _connect(self) -> sqlite3.Connection:
         self._validate_state_path()
@@ -2210,6 +2267,9 @@ def build_parser() -> Any:
     sub.add_parser("status", help="show queue and provider state")
     inspect = sub.add_parser("inspect", help="show one PR state and queue history")
     inspect.add_argument("--pr", type=int, required=True)
+    reconcile = sub.add_parser("reconcile-reviews", help="observe trusted terminal review feedback")
+    reconcile.add_argument("--repo", required=True)
+    reconcile.add_argument("--pr", type=int, required=True)
     return parser
 
 
@@ -2263,6 +2323,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "inspect":
             decision = reducer.inspect(pr=args.pr)
+        elif args.command == "reconcile-reviews":
+            if args.repo != github_intake.REPO or args.pr <= 0:
+                raise ValueError("invalid review reconciliation identity")
+            decision = {"decision": "reconciled", "terminal_review_receipts":
+                        reducer.reconcile_reviews(args.repo, args.pr, now_ms=now_ms)}
         else:
             decision = reducer.status(now_ms=now_ms)
     except HostingError as exc:
