@@ -2,12 +2,44 @@
 from __future__ import annotations
 
 import os
+import pwd
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
+def create_test_directory() -> Path:
+    """Keep test-owned state outside the caller's deployment authority tree."""
+    protected = [Path("/var/lib/dailycheck-deploy"), Path("/var/lib/dailycheck-prod-agent")]
+    if configured := os.environ.get("DAILYCHECK_DEPLOY_STATE_DIR"):
+        protected.append(Path(configured))
+    protected = [path.resolve() for path in protected]
+    parents = [Path(tempfile.gettempdir())]
+    try:
+        parents.append(Path(pwd.getpwuid(os.geteuid()).pw_dir))
+    except KeyError:
+        pass
+    parents.append(Path("/tmp"))
+    for parent in dict.fromkeys(parents):
+        if any(parent.resolve().is_relative_to(root) for root in protected):
+            continue
+        try:
+            directory = Path(tempfile.mkdtemp(prefix="dailycheck-tests-", dir=parent)).resolve()
+        except OSError:
+            continue
+        if any(directory.is_relative_to(root) or root.is_relative_to(directory)
+               for root in protected):
+            directory.rmdir()
+            continue
+        return directory
+    raise OSError("isolated pytest directory unavailable")
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--create-directory"]:
+        print(create_test_directory())
+        return 0
     directory = Path(sys.argv[1]).absolute()
     env = {key: os.environ[key] for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ")
            if key in os.environ}

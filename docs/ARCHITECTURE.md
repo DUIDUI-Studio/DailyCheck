@@ -1245,6 +1245,11 @@ ordinary verify check1 只在 pytest 子进程重建测试环境并关闭继承�
 attempt/state/蓝绿锁、hosting/role 配置及 check2–8 不变。DB/TMP/状态/报告/收件箱均指向
 该次私有测试目录，移除 live 身份/凭据/native 上下文；子 PATH 前置所选解释器目录以发现
 同 venv 已安装工具。完整 tests/、session evidence 与 strict known14 门禁保留，native 分支不变。
+check1 的目录分配排除两个固定生产控制树及调用者实际 state 树，不能继承普通发布入口
+位于该树内的 TMPDIR；按系统临时目录、当前账号 home、系统 /tmp 寻找可用位置，创建唯一
+0700 测试目录后才启动 pytest。证据仍交原 strict gate，结束后清理；无可用隔离目录直接失败。
+`test_verify_pytest_boundary.py` 以真实父级持锁、受控 state 内 TMPDIR 和子进程验证路径隔离、
+安全守卫、权限/FD 隔离及目录清理，不通过跳过测试或放宽 shadow 路径检查消除新增失败。
 
 compare 证明只使用 `ahead` 与精确 B/base/merge-base，测试记录完整查询，不能由分页归一化掩盖差异。
 请求固定 `?per_page=1&page=2` 以避开首分页 files/patch；缺失或无效 metadata 仍拒绝，无回退请求。
@@ -3855,6 +3860,10 @@ flowchart TB
 ```bash
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
+
+**发布中的测试目录**：check1 经 `verify_pytest.py --create-directory` 创建独立 0700 根，
+不能把发布会话的 control-tree TMPDIR 原样用作测试 DB/basetemp/shadow 根。目录迁移只作用于
+测试子进程；父级状态、凭据和锁不变，目录不可用与真实测试失败仍由原严格门禁拒绝。
 
 **基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。`feat/user-admin-v2`（PR #17，2026-10-12）新增 `test_users_admin_v2.py` 40 用例，基线升至 **18 failed / 796 passed**，零新增失败。
 
