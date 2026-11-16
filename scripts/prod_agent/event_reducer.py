@@ -38,6 +38,7 @@ from scripts.hosting import (
 from scripts.hosting import (
     validate_json_tree as _validate_json_tree,
 )
+from scripts.prod_agent import github_intake  # noqa: E402
 from scripts.prod_agent.merge_readiness import (  # noqa: E402
     DEFAULT_REQUIRED_CONTEXTS,
     DEFAULT_REQUIRED_CONTEXTS_ENV,
@@ -135,6 +136,12 @@ CREATE INDEX IF NOT EXISTS idx_trigger_queue_pr
 CREATE UNIQUE INDEX IF NOT EXISTS one_claimed_trigger_per_pr
     ON trigger_queue(repo, pr_number) WHERE state = 'claimed';
 
+CREATE TABLE IF NOT EXISTS review_terminal_receipts (
+    trigger_id TEXT PRIMARY KEY REFERENCES trigger_queue(trigger_id),
+    receipt_json TEXT NOT NULL,
+    observed_at_ms INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS provider_state (
     provider TEXT PRIMARY KEY,
     state TEXT NOT NULL,
@@ -166,7 +173,7 @@ class Rejected:
 
 @dataclass(frozen=True)
 class NotEligible:
-    pass
+    reason: str = "active_lease"
 
 
 def _text(value: Any, *, field: str, limit: int = 512, required: bool = True) -> str:
@@ -228,6 +235,8 @@ def event_key(event: dict[str, Any]) -> str:
         event["action"],
         event["conclusion"].lower(),
     ]
+    if event["event"] == "deploy_result" and github_intake.authentic(event):
+        canonical.extend([event["outcome_id"], event["generation"], event["public_receipt"]])
     encoded = json.dumps(canonical, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -265,6 +274,8 @@ class EventReducer:
             client = GiteaReadinessClient(readiness_config)
 
             def check_readiness(repo: str, pr_number: int, head_sha: str) -> dict[str, Any]:
+                if base.hosting is not None and github_intake.enabled():
+                    return github_intake.readiness({"pr_number": pr_number, "pr_head_sha": head_sha})
                 result = client.check(pr_number, head_sha, repo=repo)
                 if base.hosting is not None:
                     return {**result, "ready": False, "reason": "github_shadow_only"}
@@ -276,8 +287,99 @@ class EventReducer:
 
     def _validate_state_path(self) -> None:
         if provider() is Provider.GITHUB:
-            for suffix in ("", "-wal", "-shm", "-journal"):
-                require_shadow_path(Path(str(self.config.db_path) + suffix))
+            if github_intake.enabled():
+                github_intake.policy()
+            else:
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    require_shadow_path(Path(str(self.config.db_path) + suffix))
+
+    def reconcile_terminal_reviews(self, repo: str, pr: int, *, now_ms: int) -> list[dict]:
+        """End a positively settled pre-candidate review, without approving it."""
+        if provider() is not Provider.GITHUB or not github_intake.enabled():
+            return []
+        from scripts.blue_green import deploy_state
+        from scripts.prod_agent import github_review_feedback
+
+        receipts = []
+        try:
+            with deploy_state.attempt_lock(deploy_state.state_dir()) as fence:
+                conn = self._connect()
+                try:
+                    rows = conn.execute("""SELECT * FROM trigger_queue
+                        WHERE repo=? AND pr_number=? AND event='check_suite' AND route='wdg-ci'
+                        AND state='done' AND last_error='awaiting_agent_receipt'""",
+                        (repo.lower(), pr)).fetchall()
+                    for row in rows:
+                        try:
+                            payload = strict_json_loads(row["payload_json"])
+                            if (payload.get("repo_full_name", "").lower() != row["repo"]
+                                    or payload.get("pr_number") != row["pr_number"]
+                                    or payload.get("pr_head_sha") != row["head_sha"]
+                                    or payload.get("trigger_id") != row["trigger_id"]):
+                                continue
+                            observed = github_review_feedback.observation(payload, fence)
+                            conn.execute("BEGIN IMMEDIATE")
+                            current = conn.execute("SELECT * FROM trigger_queue WHERE trigger_id=?",
+                                                   (row["trigger_id"],)).fetchone()
+                            if (current is None or dict(current) != dict(row)
+                                    or github_review_feedback.observation(payload, fence) != observed):
+                                conn.execute("ROLLBACK")
+                                continue
+                            conn.execute("""INSERT INTO review_terminal_receipts
+                                (trigger_id,receipt_json,observed_at_ms) VALUES(?,?,?)""",
+                                (row["trigger_id"], json.dumps(observed, sort_keys=True), now_ms))
+                            conn.execute("""UPDATE trigger_queue SET last_error='review_terminal_blocker',
+                                updated_at_ms=? WHERE trigger_id=?""", (now_ms, row["trigger_id"]))
+                            conn.execute("COMMIT")
+                            receipts.append({key: observed[key] for key in
+                                             ("kind", "trigger_id", "pr", "head", "no_candidate", "formal_review")})
+                        except (HostingError, OSError, ValueError, TypeError, KeyError, AttributeError):
+                            if conn.in_transaction:
+                                conn.execute("ROLLBACK")
+                finally:
+                    conn.close()
+        except BlockingIOError:
+            pass
+        return receipts
+
+    def reconcile_reviews(self, repo: str, pr: int, *, now_ms: int) -> list[dict]:
+        receipts = self.reconcile_terminal_reviews(repo, pr, now_ms=now_ms)
+        conn = self._connect()
+        try:
+            rows = conn.execute("""SELECT trigger_id,payload_json FROM trigger_queue
+                WHERE repo=? AND pr_number=? AND event='check_suite' AND
+                (state='claimed' OR last_error IN ('awaiting_agent_receipt','delivery_unknown'))""",
+                (repo.lower(), pr)).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            try:
+                payload = strict_json_loads(row["payload_json"])
+            except ValidationError:
+                continue
+            observed = github_intake.review_completion(payload)
+            if observed is None:
+                continue
+            recorded = github_intake.seal({**payload, "review_observation": observed}, "ready")
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("""UPDATE trigger_queue SET state='done',last_error=?,payload_json=?,updated_at_ms=?
+                    WHERE trigger_id=? AND payload_json=?""", (
+                    "review_blocker" if observed["state"] == "CHANGES_REQUESTED" else "review_approved",
+                    json.dumps(recorded, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                    now_ms, row["trigger_id"], row["payload_json"]))
+                conn.execute("""UPDATE pr_state SET review_status=?,next_action=?,updated_at_ms=?
+                    WHERE repo=? AND pr_number=? AND head_sha=?""", (observed["state"],
+                    "review_blocker" if observed["state"] == "CHANGES_REQUESTED" else "await_candidate",
+                    now_ms, repo.lower(), pr, payload["pr_head_sha"]))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        return receipts
 
     def _connect(self) -> sqlite3.Connection:
         self._validate_state_path()
@@ -536,11 +638,22 @@ class EventReducer:
         except ValidationError:
             reason = "invalid_stored_payload"
         else:
-            reason = (
-                "shadow_rejected"
-                if is_shadow_event({"repo": row["repo"], "payload": payload})
-                else ""
-            )
+            try:
+                github_intake.require_work(payload)
+                ordinary = github_intake.authentic(payload)
+                if not ordinary and is_shadow_event({"repo": row["repo"], "payload": payload}):
+                    raise HostingError("github_shadow_only")
+                if ordinary and (payload["repo_full_name"].lower() != row["repo"]
+                        or payload["pr_number"] != row["pr_number"]
+                        or payload["pr_head_sha"] != row["head_sha"]
+                        or payload["event"] != row["event"]
+                        or row["route"] != ROUTES.get(payload["event"])):
+                    raise HostingError("github_shadow_only")
+                if ordinary and payload["ordinary_provenance"]["stage"] not in {"ready", "outcome"}:
+                    raise HostingError("github_shadow_only")
+                reason = ""
+            except HostingError:
+                reason = "shadow_rejected"
         if not reason:
             return None
         conn.execute(
@@ -555,8 +668,8 @@ class EventReducer:
         )
         return Rejected(row["trigger_id"], reason)
 
-    @staticmethod
     def _claim_specific(
+        self,
         conn: sqlite3.Connection,
         *,
         trigger_id: str,
@@ -575,6 +688,29 @@ class EventReducer:
             return rejected
         if not allow_claim or row["due_at_ms"] > now_ms:
             return NotEligible()
+        payload = strict_json_loads(row["payload_json"])
+        if github_intake.authentic(payload, frozenset({"ready"})):
+            if conn.execute("""SELECT 1 FROM trigger_queue WHERE repo=? AND pr_number=?
+                AND trigger_id<>? AND event='check_suite' AND (state='claimed' OR last_error IN
+                ('awaiting_agent_receipt','delivery_unknown'))""",
+                (row["repo"], row["pr_number"], trigger_id)).fetchone():
+                return NotEligible()
+            gate = github_intake.readiness(payload)
+            if gate.get("ready") is not True:
+                reason = str(gate.get("reason"))
+                if reason in {"head_changed", "pr_not_open_or_not_ready", "failed", "reconcile-needed"}:
+                    conn.execute("UPDATE trigger_queue SET state='done', last_error=?, updated_at_ms=? WHERE trigger_id=?",
+                                 ("ordinary_not_ready:" + reason, now_ms, trigger_id))
+                    return Rejected(trigger_id, reason)
+                return NotEligible("ordinary_readiness_wait:" + reason)
+            # No send happened yet. Bind the claim to the fresh CI version, never a stale queued hint.
+            payload = github_intake.seal({**payload, "pr_base_sha": gate["base_sha"],
+                "observed_ci_run_id": gate["run_id"], "observed_ci_attempt": gate["run_attempt"],
+                "merge_ready_contexts": gate.get("contexts", {})}, "ready")
+        if github_intake.authentic(payload, frozenset({"outcome"})) and not github_intake.current_outcome(payload):
+            conn.execute("UPDATE trigger_queue SET state='done', last_error='outcome_superseded', updated_at_ms=? WHERE trigger_id=?",
+                         (now_ms, trigger_id))
+            return Rejected(trigger_id, "outcome_superseded")
         active = conn.execute(
             """SELECT 1 FROM trigger_queue
                WHERE repo = ? AND pr_number = ? AND state = 'claimed'""",
@@ -584,14 +720,20 @@ class EventReducer:
             return NotEligible()
         attempts = int(row["attempts"]) + 1
         lease = hashlib.sha256(f"{trigger_id}|{attempts}|{now_ms}|lease".encode()).hexdigest()[:40]
+        if github_intake.authentic(payload):
+            payload = github_intake.seal({**payload, "dispatch_claimed_at_ms": now_ms},
+                                        payload["ordinary_provenance"]["stage"])
         conn.execute(
             """
             UPDATE trigger_queue
             SET state = 'claimed', attempts = ?, lease_token = ?,
-                lease_expires_ms = ?, updated_at_ms = ?
+                lease_expires_ms = ?, updated_at_ms = ?, payload_json = ?,
+                last_error = CASE WHEN ? THEN '' ELSE last_error END
             WHERE trigger_id = ? AND state = 'pending'
             """,
-            (attempts, lease, now_ms + lease_ttl_ms, now_ms, trigger_id),
+            (attempts, lease, now_ms + lease_ttl_ms, now_ms,
+             json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+             1 if github_intake.authentic(payload) else 0, trigger_id),
         )
         row = conn.execute(
             "SELECT * FROM trigger_queue WHERE trigger_id = ?",
@@ -644,13 +786,23 @@ class EventReducer:
     def _recover_expired(self, conn: sqlite3.Connection, *, now_ms: int) -> list[str]:
         rows = conn.execute(
             """
-            SELECT trigger_id FROM trigger_queue
+            SELECT trigger_id, payload_json FROM trigger_queue
             WHERE state = 'claimed' AND lease_expires_ms <= ?
             ORDER BY trigger_id
             """,
             (now_ms,),
         ).fetchall()
-        trigger_ids = [row["trigger_id"] for row in rows]
+        trigger_ids = []
+        for row in rows:
+            try:
+                payload = strict_json_loads(row["payload_json"])
+            except ValidationError:
+                payload = {}
+            if payload.get("intake_mode") == "ordinary" and isinstance(payload.get("ordinary_provenance"), dict):
+                conn.execute("UPDATE trigger_queue SET state='done', last_error='delivery_unknown', updated_at_ms=? WHERE trigger_id=?",
+                             (now_ms, row["trigger_id"]))
+            else:
+                trigger_ids.append(row["trigger_id"])
         if trigger_ids:
             conn.execute(
                 """
@@ -867,14 +1019,32 @@ class EventReducer:
 
     def ingest(self, payload: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         event = self.normalize(payload)
-        if provider() is Provider.GITHUB or is_shadow_event(event):
+        try:
+            github_intake.require_work(payload)
+        except HostingError:
             return {
                 "decision": "silent",
                 "reason": "github_shadow_only",
                 "delivery_id": event["delivery_id"],
             }
+        ordinary = github_intake.authentic(payload)
+        if ordinary:
+            stage = payload["ordinary_provenance"]["stage"]
+            if (event["event"] == "deploy_result") != (stage == "outcome") or stage == "ready":
+                return {"decision": "suppress", "reason": "invalid_ordinary_stage"}
+            if stage == "outcome" and not github_intake.current_outcome(payload):
+                return {"decision": "suppress", "reason": "outcome_superseded"}
+            if stage == "receiver":
+                self.reconcile_reviews(event["repo_full_name"], event["pr_number"], now_ms=now_ms)
+            event = github_intake.seal(event, stage)
         if event["event"] == "pull_request":
-            return self._ingest_pull_request(event, now_ms=now_ms)
+            result = self._ingest_pull_request(event, now_ms=now_ms)
+            if not ordinary or result["reason"] == "delivery_already_recorded":
+                return result
+            # ready_for_review/reopen may be the last transition after checks completed.
+            event = github_intake.seal({**event, "event": "check_suite", "action": "completed",
+                "delivery_id": event["delivery_id"] + ":readiness", "conclusion": "success",
+                "check_conclusion": "success"}, "receiver")
         if event["event"] == "check_suite":
             return self._ingest_check_suite(event, now_ms=now_ms)
         return self._ingest_deploy_result(event, now_ms=now_ms)
@@ -923,11 +1093,12 @@ class EventReducer:
                     UPDATE trigger_queue
                     SET state = 'done', lease_token = NULL,
                         lease_expires_ms = NULL, completed_at_ms = ?,
-                        last_error = 'superseded_head', updated_at_ms = ?
+                        last_error = CASE WHEN state='claimed' AND ? THEN 'delivery_unknown'
+                                          ELSE 'superseded_head' END, updated_at_ms = ?
                     WHERE repo = ? AND pr_number = ?
                       AND state IN ('pending', 'claimed')
                     """,
-                    (now_ms, now_ms, repo, event["pr_number"]),
+                    (now_ms, 1 if github_intake.authentic(event) else 0, now_ms, repo, event["pr_number"]),
                 )
                 for trigger_id in old_trigger_ids:
                     conn.execute(
@@ -1089,6 +1260,13 @@ class EventReducer:
                 "SELECT * FROM pr_state WHERE repo = ? AND pr_number = ?",
                 (repo, event["pr_number"]),
             ).fetchone()
+            if github_intake.authentic(event) and conn.execute(
+                """SELECT 1 FROM trigger_queue WHERE repo=? AND pr_number=? AND event='check_suite'
+                   AND (state='claimed' OR last_error IN ('awaiting_agent_receipt','delivery_unknown'))""",
+                (repo, event["pr_number"]),
+            ).fetchone():
+                return {"decision": "suppress", "reason": "ordinary_agent_receipt_unconfirmed",
+                        "delivery_id": event["delivery_id"], "deployment_actionable": False}
         finally:
             conn.close()
         if state is not None and state["head_sha"] != event["pr_head_sha"]:
@@ -1215,6 +1393,11 @@ class EventReducer:
             event["repo_full_name"], event["pr_number"], event["pr_head_sha"]
         )
         trigger_id = self._trigger_id(ready_key)
+        if github_intake.authentic(event):
+            ready_event.update(review_phase="independent_prod_after_wake", trigger_id=trigger_id,
+                pr_base_sha=gate["base_sha"], observed_ci_run_id=gate["run_id"],
+                observed_ci_attempt=gate["run_attempt"])
+            ready_event = github_intake.seal(ready_event, "ready")
         payload_json = json.dumps(
             ready_event,
             ensure_ascii=True,
@@ -1392,6 +1575,8 @@ class EventReducer:
 
     def _ingest_deploy_result(self, event: dict[str, Any], *, now_ms: int) -> dict[str, Any]:
         key = event_key(event)
+        if github_intake.authentic(event):
+            event = github_intake.seal({**event, "trigger_id": self._trigger_id(key)}, "outcome")
         route = ROUTES[event["event"]]
         try:
             payload_json = json.dumps(
@@ -1510,6 +1695,7 @@ class EventReducer:
                 state is not None
                 and event["event"] != "pull_request"
                 and state["head_sha"] != event["pr_head_sha"]
+                and not github_intake.authentic(event, frozenset({"outcome"}))
             ):
                 self._record_delivery(conn, event, key, None, "stale_head", now_ms)
                 conn.execute("COMMIT")
@@ -1577,12 +1763,14 @@ class EventReducer:
                     "route": route,
                 }
 
-            self._upsert_pr_state(
-                conn,
-                event,
-                now_ms=now_ms,
-                head_changed=state is None or state["head_sha"] != event["pr_head_sha"],
-            )
+            if state is None or state["head_sha"] == event["pr_head_sha"]:
+                self._upsert_pr_state(conn, event, now_ms=now_ms, head_changed=state is None)
+            if github_intake.authentic(event, frozenset({"outcome"})):
+                conn.execute("""UPDATE trigger_queue SET state='done', last_error='outcome_observed',
+                             updated_at_ms=? WHERE repo=? AND pr_number=? AND head_sha=?
+                             AND event='check_suite' AND (state='claimed' OR last_error IN
+                             ('awaiting_agent_receipt','delivery_unknown'))""",
+                             (now_ms, event["repo_full_name"].lower(), event["pr_number"], event["pr_head_sha"]))
 
             pending = conn.execute(
                 """
@@ -1672,7 +1860,7 @@ class EventReducer:
         )
 
     def drain(self, *, now_ms: int) -> dict[str, Any]:
-        if provider() is Provider.GITHUB:
+        if provider() is Provider.GITHUB and not github_intake.enabled():
             return {"decision": "silent", "reason": "github_shadow_only"}
         conn = self._connect()
         try:
@@ -1742,7 +1930,7 @@ class EventReducer:
                 conn.execute("COMMIT")
                 return {
                     "decision": "silent",
-                    "reason": "active_lease",
+                    "reason": outcome.reason,
                     "recovered": recovered,
                     "rejected": rejected,
                 }
@@ -1787,6 +1975,9 @@ class EventReducer:
                 """,
                 (now_ms, now_ms, trigger_id),
             )
+            if github_intake.authentic(strict_json_loads(row["payload_json"])):
+                conn.execute("UPDATE trigger_queue SET last_error='awaiting_agent_receipt' WHERE trigger_id=?",
+                             (trigger_id,))
             conn.execute(
                 "UPDATE deliveries SET disposition = 'triggered' WHERE trigger_id = ?",
                 (trigger_id,),
@@ -1853,6 +2044,20 @@ class EventReducer:
                     "failed": False,
                 }
             safe_reason = redact_sensitive(_text(reason, field="reason", limit=400, required=False))
+            if github_intake.authentic(strict_json_loads(row["payload_json"])):
+                if row["last_error"] != "dispatch_sending" and row["attempts"] < 3:
+                    conn.execute("UPDATE trigger_queue SET state='pending', last_error='', lease_token=NULL, lease_expires_ms=NULL, due_at_ms=?, updated_at_ms=? WHERE trigger_id=?",
+                                 (now_ms + 500, now_ms, trigger_id))
+                    conn.execute("COMMIT")
+                    return {"decision": "defer", "reason": "ordinary_not_sent",
+                            "trigger_id": trigger_id, "failed": True, "due_at_ms": now_ms + 500,
+                            "failure_reason": safe_reason,
+                            "payload": strict_json_loads(row["payload_json"])}
+                conn.execute("UPDATE trigger_queue SET state='done', last_error='delivery_unknown', updated_at_ms=? WHERE trigger_id=?",
+                             (now_ms, trigger_id))
+                conn.execute("COMMIT")
+                return {"decision": "suppress", "reason": "delivery_unknown",
+                        "trigger_id": trigger_id, "failed": True, "reconcile_required": True}
             if quota_exhausted:
                 delay = (
                     retry_after_ms
@@ -1988,10 +2193,11 @@ class EventReducer:
 
 
 def _emit(decision: dict[str, Any]) -> None:
-    if decision.get("decision") in {"trigger", "defer"} and (
-        provider() is Provider.GITHUB or is_shadow_event(decision)
-    ):
-        decision = {"decision": "suppress", "reason": "github_shadow_only"}
+    if decision.get("decision") in {"trigger", "defer"}:
+        try:
+            github_intake.require_work(decision)
+        except HostingError:
+            decision = {"decision": "suppress", "reason": "github_shadow_only"}
     print(
         json.dumps(
             decision,
@@ -2061,6 +2267,9 @@ def build_parser() -> Any:
     sub.add_parser("status", help="show queue and provider state")
     inspect = sub.add_parser("inspect", help="show one PR state and queue history")
     inspect.add_argument("--pr", type=int, required=True)
+    reconcile = sub.add_parser("reconcile-reviews", help="observe trusted terminal review feedback")
+    reconcile.add_argument("--repo", required=True)
+    reconcile.add_argument("--pr", type=int, required=True)
     return parser
 
 
@@ -2114,6 +2323,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "inspect":
             decision = reducer.inspect(pr=args.pr)
+        elif args.command == "reconcile-reviews":
+            if args.repo != github_intake.REPO or args.pr <= 0:
+                raise ValueError("invalid review reconciliation identity")
+            decision = {"decision": "reconciled", "terminal_review_receipts":
+                        reducer.reconcile_reviews(args.repo, args.pr, now_ms=now_ms)}
         else:
             decision = reducer.status(now_ms=now_ms)
     except HostingError as exc:

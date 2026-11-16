@@ -15,6 +15,7 @@ import pytest
 
 from scripts.hosting import AccessRole, HostingClient, HostingConfig, HostingError
 from scripts.prod_agent.github_readiness import GitHubReadinessClient
+from tests.conftest import candidate_python_env
 
 REPO = "DUIDUI-Studio/DailyCheck"
 ROOT = f"/repos/{REPO}"
@@ -934,19 +935,17 @@ def test_ordinary_credential_is_file_only_separate_and_transport_is_finite(api, 
     assert not api.log()
 
 
-def test_ordinary_poller_cli_uses_readiness_and_missing_auth_alerts(api, tmp_path, monkeypatch):
+def test_ordinary_poller_cli_keeps_unactivated_intake_inert(api, tmp_path, monkeypatch):
     api.write(ordinary(api, tmp_path, monkeypatch))
     root = Path(__file__).resolve().parents[1]
-    # No production checkout: unavailable catchup must alert, never silently mean zero work.
+    # Intake OFF must precede provider calls and any mutation-capable cron agent.
     monkeypatch.setenv("DAILYCHECK_PROD_REPO", str(tmp_path / "absent-prod"))
     command = [sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")]
     result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0 and "GitHub ordinary Prod" in result.stdout
-    assert f"head={SHA} base={BASE} checks=ready" in result.stdout
-    assert "_catchup_block" in result.stdout and "异常" in result.stdout
+    assert result.returncode == 0 and result.stdout == "" and api.log() == []
     monkeypatch.delenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE")
     missing = subprocess.run(command, capture_output=True, text=True, timeout=30)
-    assert missing.returncode == 0 and "异常" in missing.stdout and "checks=ready" not in missing.stdout
+    assert missing.returncode == 0 and missing.stdout == "" and api.log() == []
     proof("poll-cli", {"native_exit": result.returncode, "stdout": result.stdout,
                        "missing_auth_stdout": missing.stdout})
 
@@ -997,8 +996,8 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
     result = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert '"status": "behind"' in result.stdout and main in result.stdout
-    assert f"head={SHA} base={BASE} checks=ready" in result.stdout
+    assert '"status": "behind"' not in result.stdout and "checks=ready" not in result.stdout
+    assert api.log() == [], "Inactive intake cannot query/wake the ordinary provider"
     assert "report publication failed or unconfirmed" in result.stdout
     proof("poll-catchup", {"native_exit": result.returncode, "stdout": result.stdout,
                            "deployed": deployed, "main": main})
@@ -1042,7 +1041,10 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
               "gitea_command": attempted[-1], "helper_args": json.loads(receipt.read_text())})
     # A broken schedule helper can exit zero without producing its required facts.
     (bg / "deploy_state.py").write_text("raise SystemExit(0)\n")
-    missing = subprocess.run([sys.executable, "-B", str(root / "scripts/prod_agent/pr_poll.py")],
+    missing = subprocess.run([sys.executable, "-B", "-c",
+                             "from scripts.prod_agent.pr_poll import _catchup_block; print(_catchup_block())"],
+                             cwd=root,
+                             env={**candidate_python_env(root), "PYTHONSAFEPATH": "1"},
                              capture_output=True, text=True, timeout=30)
     assert missing.returncode == 0 and "invalid or absent facts" in missing.stdout
     proof("poll-no-output", {"native_exit": missing.returncode, "stdout": missing.stdout})
@@ -1307,8 +1309,14 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
     source = subprocess.check_output(
         ["git", "show", "origin/main:deploy/scripts/dailycheck_pr_poll.py"], cwd=root, text=True
     )
-    reference = tmp_path / "original-poller.py"
+    # The launcher resolves the repo root as ``Path(__file__).parents[2]``, so run the
+    # reference from an equivalent ``<root>/deploy/scripts`` layout whose ``scripts``
+    # package resolves to this checkout instead of from a bare temp file.
+    sandbox = tmp_path / "legacy-repo"
+    reference = sandbox / "deploy/scripts/original-poller.py"
+    reference.parent.mkdir(parents=True)
     reference.write_text(source)
+    (sandbox / "scripts").symlink_to(root / "scripts", target_is_directory=True)
     env = {
         **os.environ,
         "GITEA_URL": host + url_root,
@@ -1329,6 +1337,7 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
         text=True,
         timeout=20,
     )
+    reference_requests = list(requests)
     requests.clear()
     current = subprocess.run(
         [sys.executable, str(root / "deploy/scripts/dailycheck_pr_poll.py")],
@@ -1340,11 +1349,13 @@ def test_legacy_launcher_preserves_source_url_auth_precedence_and_output(
     )
     assert current.returncode == before.returncode == 0
     assert current.stdout == before.stdout and "30 分钟兜底轮询" in current.stdout
-    assert len(requests) == 2
     prefix = url_root.rstrip("/") + "/api/v1/repos/legacy/fixture/"
-    assert all(
-        r["path"].startswith(prefix) and r["auth"] == "token legacy-file-token" for r in requests
-    )
+    assert len(reference_requests) == len(requests) == 2
+    for recorded in (reference_requests, requests):
+        assert all(
+            r["path"].startswith(prefix) and r["auth"] == "token legacy-file-token"
+            for r in recorded
+        )
 
 
 def test_legacy_launcher_explicit_github_selects_canonical_without_gitea(

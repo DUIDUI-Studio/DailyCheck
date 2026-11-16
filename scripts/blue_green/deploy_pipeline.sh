@@ -32,7 +32,8 @@ set -uo pipefail
 ORIGINAL_ARGS=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+HELPER_SOURCE="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="${DAILYCHECK_PIPELINE_REPO:-${HELPER_SOURCE}}"
 DS="${SCRIPT_DIR}/deploy_state.py"
 # F4（2026-10-18 复盘）：优先仓库 venv 的 python，而非裸 python3。
 # 根因：VPS 系统 python3 的 dist-packages/scripts 是**常规包**，import 时
@@ -86,6 +87,10 @@ FROZEN_BASE=""
 HELPER_ROOT=""
 REPORTER="${SCRIPT_DIR}/deploy_report.py"
 MERGER="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
+DEFAULT_MERGER="${SCRIPT_DIR}/deploy_merge.py"
+# A fixed reviewed bootstrap may run the existing algorithm against the serving
+# checkout. Helpers stay in its immutable source; traffic scripts follow checkout.
+SCRIPT_DIR="${REPO_ROOT}/scripts/blue_green"
 
 log()  { printf '[pipeline] %s\n' "$*"; }
 die()  { local code=$1; shift; log "ERROR: $*"; exit "${code}"; }
@@ -243,7 +248,8 @@ _writeback_pr() {
   local reporter="${REPORTER}"
   if [[ ! -f "${reporter}" ]]; then
     log "WARN: deploy_report.py 缺失，跳过 PR 回写（不影响部署结果）"
-    return 0
+    [[ "${GITHUB_ORDINARY}" -eq 0 ]] && return 0
+    return 29
   fi
   # 事件文件与唤醒队列都跟着状态目录走：STATE_DIR 在测试/演练里会被指到
   # 临时目录；此时若收件箱仍是生产默认值，就把它改投到 STATE_DIR 下。显式
@@ -264,6 +270,7 @@ _writeback_pr() {
     log "PR #${PR} 部署结果已写回（rc=${rc}）"
   else
     log "WARN: PR 回写失败（不影响部署结果）"
+    [[ "${GITHUB_ORDINARY}" -eq 0 ]] || return 29
   fi
   return 0
 }
@@ -287,7 +294,9 @@ cleanup() {
   fi
   # 放最后：release 会再写几行日志，先回写就漏掉它们。且 _writeback_pr 内部
   # 全程 best-effort —— 回写失败绝不能把一次成功部署变成红。
-  if [[ "${NATIVE_CANDIDATE}" -eq 0 ]]; then _writeback_pr "${rc}"; fi
+  if [[ "${NATIVE_CANDIDATE}" -eq 0 ]]; then
+    _writeback_pr "${rc}" || { [[ "${rc}" -ne 0 ]] || rc=29; }
+  fi
   if [[ -n "${HELPER_ROOT}" ]] && ! rm -rf -- "${HELPER_ROOT}"; then
     log "ERROR: helper runtime cleanup failed: ${HELPER_ROOT}"
     _audit_event "helper-cleanup-failed" "owned helper material retained: ${HELPER_ROOT}"
@@ -304,7 +313,7 @@ trap 'exit 143' TERM
 # Keep the finite import closure private until heartbeat, release and report exit.
 if [[ "${NATIVE_CANDIDATE}" -eq 0 ]]; then
   REPORTER=""
-  if ! HELPER_ROOT="$("${PY}" - "${REPO_ROOT}" <<'PY'
+  if ! HELPER_ROOT="$("${PY}" - "${HELPER_SOURCE}" <<'PY'
 import os, pathlib, tempfile
 os.umask(0o077)
 source = pathlib.Path(__import__('sys').argv[1])
@@ -313,7 +322,8 @@ print(root, flush=True)
 bg = "scripts/blue_green/"
 paths = [bg + name for name in ("deploy_state.py", "deploy_report.py", "deploy_merge.py",
                                "deploy_triage_pure.py", "publication_authority.py")]
-paths += ["scripts/hosting.py", "scripts/prod_agent/github_readiness.py"]
+paths += ["scripts/hosting.py", "scripts/prod_agent/github_readiness.py",
+          "scripts/prod_agent/github_intake.py"]
 required = {bg + "deploy_state.py"}
 if (source / (bg + "deploy_report.py")).is_file():
     required.update([bg + "deploy_report.py", bg + "deploy_triage_pure.py",
@@ -342,7 +352,7 @@ PY
 )"; then die 11 "cannot preserve ordinary helper closure"; fi
   DS="${HELPER_ROOT}/scripts/blue_green/deploy_state.py"
   REPORTER="${HELPER_ROOT}/scripts/blue_green/deploy_report.py"
-  if [[ "${MERGER}" == "${SCRIPT_DIR}/deploy_merge.py" ]]; then
+  if [[ "${MERGER}" == "${DEFAULT_MERGER}" ]]; then
     MERGER="${HELPER_ROOT}/scripts/blue_green/deploy_merge.py"
   fi
   log "ordinary helper runtime=${HELPER_ROOT}"
@@ -797,5 +807,9 @@ render_dashboard() {
 }
 render_dashboard
 
-log "✅ 全链完成 PR #${PR} sha=${SHA:0:12}"
+if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
+  log "部署与保护合并完成 PR #${PR} sha=${SHA:0:12}；交付报告仍待 EXIT finalization 核验"
+else
+  log "✅ 全链完成 PR #${PR} sha=${SHA:0:12}"
+fi
 exit 0

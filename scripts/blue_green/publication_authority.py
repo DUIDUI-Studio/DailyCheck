@@ -36,8 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import deploy_state
-
+from scripts.blue_green import deploy_state
 from scripts.hosting import HostingError
 
 BINDINGS_FILENAME = "bindings.json"
@@ -89,6 +88,7 @@ class SourceBinding:
     source: tuple[str, str, int, str, str, int]
     binding_sha256: str
     source_revision: dict | None = None
+    issue_identities: dict | None = None
 
 
 # ── durable outcome ───────────────────────────────────────────────────────
@@ -225,7 +225,8 @@ def _binding_path(directory: Path) -> Path:
 
 def _validate_binding_entry(entry: object) -> dict:
     if (not isinstance(entry, dict)
-            or set(entry) not in ({"pr", "public", "source"}, {"pr", "public", "source", "source_revision"})):
+            or not {"pr", "public", "source"} <= set(entry)
+            or not set(entry) <= {"pr", "public", "source", "source_revision", "issue_identities"}):
         raise HostingError("private_source_binding_invalid")
     source = entry["source"]
     public = entry["public"]
@@ -245,6 +246,19 @@ def _validate_binding_entry(entry: object) -> dict:
         raise HostingError("private_source_binding_invalid")
     if provider == "github" and (host, rid, repo) != GITHUB_SOURCE_IDENTITY:
         raise HostingError("private_source_binding_invalid")
+    if "issue_identities" in entry:
+        identities = entry["issue_identities"]
+        if (provider != "github" or not isinstance(identities, dict)
+                or set(identities) != {"public", "source"}
+                or not isinstance(identities["public"], dict)
+                or set(identities["public"]) != {"number", "id"}
+                or not isinstance(identities["source"], dict)
+                or set(identities["source"]) != {"id"}
+                or any(type(value) is not int or value <= 0 for value in (
+                    identities["public"]["number"], identities["public"]["id"],
+                    identities["source"]["id"]))
+                or identities["public"]["id"] == identities["source"]["id"]):
+            raise HostingError("private_issue_binding_invalid")
     if "source_revision" in entry:
         revision = entry["source_revision"]
         if (not isinstance(revision, dict) or set(revision) != {
@@ -292,7 +306,8 @@ def resolve_source_binding(directory: Path, pr: int) -> SourceBinding:
     ).hexdigest()
     source = tuple(entry["source"][key] for key in SOURCE_KEYS)
     return SourceBinding(pr=pr, source=source, binding_sha256=digest,
-                         source_revision=entry.get("source_revision"))
+                         source_revision=entry.get("source_revision"),
+                         issue_identities=entry.get("issue_identities"))
 
 
 # ── adapter ───────────────────────────────────────────────────────────────

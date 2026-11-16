@@ -1249,6 +1249,11 @@ ordinary verify check1 只在 pytest 子进程重建测试环境并关闭继承�
 attempt/state/蓝绿锁、hosting/role 配置及 check2–8 不变。DB/TMP/状态/报告/收件箱均指向
 该次私有测试目录，移除 live 身份/凭据/native 上下文；子 PATH 前置所选解释器目录以发现
 同 venv 已安装工具。完整 tests/、session evidence 与 strict known14 门禁保留，native 分支不变。
+check1 的目录分配排除两个固定生产控制树及调用者实际 state 树，不能继承普通发布入口
+位于该树内的 TMPDIR；按系统临时目录、当前账号 home、系统 /tmp 寻找可用位置，创建唯一
+0700 测试目录后才启动 pytest。证据仍交原 strict gate，结束后清理；无可用隔离目录直接失败。
+`test_verify_pytest_boundary.py` 以真实父级持锁、受控 state 内 TMPDIR 和子进程验证路径隔离、
+安全守卫、权限/FD 隔离及目录清理，不通过跳过测试或放宽 shadow 路径检查消除新增失败。
 
 compare 证明只使用 `ahead` 与精确 B/base/merge-base，测试记录完整查询，不能由分页归一化掩盖差异。
 请求固定 `?per_page=1&page=2` 以避开首分页 files/patch；缺失或无效 metadata 仍拒绝，无回退请求。
@@ -1345,6 +1350,59 @@ GitHub 人类 PR URL 用 `/pull/N`；Gitea 仍用 `/pulls/N`，保留原同 SHA 
 反馈的缺凭据降级继续保留，外部失败不丢已保存草稿/管理员评论。
 
 #### 3.17.1 私有反馈与公开投影（Issue #162；本地实现，未启用）
+
+**PR20 自动交付协议**：`release_credentials.py` 从精确 source/helper
+闭包生成受保护的 review/parent/entry/selector/refresh 文件；允许空 live inputs 的 inert
+preview，实际入口在任何 intent/refresh 前拒绝。PR18 续期 ABI 与独立 R1/R2 caller 修复
+按源字节复用，未合并其业务历史。既有 pipeline 的显式 `DAILYCHECK_PIPELINE_REPO`
+把不可变 bootstrap helper 与承流 checkout 分开，蓝绿阶段/完整 verify/真实 monotonic
+>=600s/保护 FF 顺序不变。selector 同时核对私有 binding、当前 H/B/CI、signed SQLite claim、
+policy 和 eligible formal APPROVED；BLOCKER/UNKNOWN/重复 intent 均不启动候选。
+automatic 入口把当前 readiness 未确认与已确认后的 H/B/CI 身份漂移分开报告；前者只输出
+白名单安全 cause，身份比较保留 null，不把 HTTP/mergeability 未确认误报为 CI 变化。
+后者保留逐项身份比较结果。两种 BLOCKER 都在 profile/grant/candidate 前停止，不隐式重试。
+whole-run capability v2 可在最终 push 前保持 CI run/attempt 同时为 null；正式 review 入口
+在原 process fence 内验证 ready 信封、实时精确仓/H/B/workflow/App/checks，然后只创建一次
+私有 ci-binding.json。后续 candidate 必须复核同一 claim/run/attempt 和实时 CI，漂移即停，
+无 post-push Root 填参步骤；v1 仍保留显式固定 CI 身份。无签名 SQLite row 不提供绑定权威。
+`release_review.py` 的固定 declassified review 只允许单次 exact-H 写与真实回读；
+`release_parent.py` 保留唯一 Popen，所有 postlaunch 错误路径先正向 wait/ECHILD，再记次错。
+late finalizer/report 在同一 FD/PID/PGID/attempt identity 下刷新既有 App 角色；显式获批的
+Issue-only 两仓 grant 由原 shim 的精确 adapter 在 startup/late report 更新，不扩大现有角色。
+`release_issues.py` 用 native state/publication/process fence 关联真实成功、linked receipt、
+source tuple 与已确认 Issue19/source Issue；PATCH 前 durable uncertain，丢 ACK 后只准 GET，
+没有第二次 PATCH。无 source/token scope/expiry/repository identity 即 fail closed。
+`release_finish.py` 把 native deploy rc、report rc、Issue 结果、UNKNOWN 和 remote_orca_push=false
+分开记录；远端文件/终端输出与既有本机 Orca forge tracker 回执是独立证据。
+Issue reconciliation 的首个有限协议错误码保留在私有 receipt，后续报告错误不得覆盖部署首错；
+不把外部响应正文或任意异常文本投射为公开事实。
+`release_completion.py` 在同一 native process/state/publication 域下，另发固定去密终态评论；
+delivered 必须同时有 linked typed report、当前成功 outcome/anchor 和两个绑定 Issue 的原生 closed
+记录。先落 uncertain，再单次 POST，丢 ACK 不重发；notification 失败保留 UNKNOWN/非零。
+既有 forge-only Orca tracker 的提示模板必须要求该 producer/完整 H/public receipt 的 completion
+评论，缺失或 UNKNOWN 时不能仅凭 core rc0 和 public Issue19 closed 报 delivered。
+ordinary pipeline 的报告失败现在返回29，保留既有非零首错及真实 deployed/outcome；
+`aborted`/未知失败有 typed 公共 stage，candidate/ownership drift 映射到有限 stage。
+Gitea best-effort 兼容路径保留。`release_config.py` 只在既有 publication_config_transaction
+内 CAS 一个显式 PR 的 binding（默认20），安装前拒绝 unsafe path/硬链接/漂移，回退不得
+覆盖独立变化。binding 可携带两个真实 Issue ID 与公开工程 Issue number；元数据加入原
+binding digest，旧格式 digest 保持不变。实际安装/CI/生产终态以独立回执为准。
+
+**通用自动入口（本地实现，尚待独立审查与采用）**：不可变 `release_automatic.py`
+只接受原生 trigger，不接受调用方指定 PR/H/CI/Issue/权限。在原 process fence 下从签名
+ready claim、实时精确仓/H/B/workflow/App CI、当前 deployed base、自动 policy 和 native
+双 Issue binding 生成一次私有 exact profile；capability v3 保留 v2 的可信 CI 冻结协议。
+每个 admission 独立目录与 O_EXCL intent/receipt；review/execute 从既有 Hermes background
+process checkpoint 核对实际父链 PID/kernel start、固定命令及 task/session 绑定，不依赖
+未导出的环境变量、不修改共享 gateway。缺绑定、
+串单、部分准备、旧 UNKNOWN、并发锁或身份漂移不 mint/send。固定 inspect/file 接口供
+Prod 逐文件独立审查，并验证 Git blob；GitHub files 分页由 ordinary release 边界按 filename 去重，保留有界分页、路径与错误校验；
+共享 hosting transport 恢复精确 approved producer bytes，其他列表仍要求 numeric ID。改动已安装 authority 的 PR 必须与 reviewed engine 同字节，
+否则要求新 engine，不能悄悄使用旧部署权威。原 review/parent/pipeline/report/Issues
+完成协议不另建一套，晚期 helper 校验严格对应 pipeline 复制的八个 native consumers，
+renderer/自动入口/templates 在不可变 engine 另行全量 pin。status 只投射去密完成结果，
+没有远端 Orca push、新 daemon/timer 或全局 scheduler 修改。
+
 
 运维目的地必须显式设置 `DAILYCHECK_GITHUB_OPERATIONS_REPO`、`_REPO_ID` 和
 `_EXPECT_PRIVATE=true`；不提供缺省公共 fallback。私有 mutation 前由 transport
@@ -1767,6 +1825,64 @@ shadow / publication / fencing 兼容回归保留；全仓测试由 Coordinator 
 GitHub main push 跳过冗余的 full test job；H/G 两个 required context 与 reports 复用、Gitea
 push 行为不变，workflow_dispatch 仍可手动触发。本次未改分支保护、发布或部署设置。
 
+**Ordinary intake（2026-11-14，source preparation；默认 OFF）**：
+`scripts/hosting.py` 保持 B 的字节和 producer pin 不变，其原 `require_production_work` 继续
+拒绝所有 GitHub 工作，且不导入 ordinary 模块。只有新接入 consumer 调用独立
+`github_intake.require_work`，其余原 caller 不扩权；新模块不进入受信 CI producer import closure。
+`tests/test_github_ordinary_intake.py` 用实际 HTTP receiver、adapter/reducer/sender 进程和
+owned loopback GitHub/Hermes 端点复现：签名与 exact-H checks 有效，仍被
+`github_shadow_only` 拒绝（0 POST，期望 1）；回归 commit 保留此失败，修复后同一 consumer
+恰好收到一次请求。新增 `github_intake.py` 私有 HMAC 信封覆盖固定 github.com / 仓 ID
+1448986421 / DUIDUI-Studio/DailyCheck、阶段、epoch、policy hash、PR/full H；只由验签 receiver、
+实时 readiness reducer、durable reporter 及受审 cron 前门生成。仅切换 lane/env 不能升级
+历史无签名、shadow、旧 epoch 或撤销准入的 payload/SQLite row。receiver 限 1 MiB、严格 JSON、
+typed 仓 ID 和事件/action 白名单；发送给 router 的身份/结果字段不含 PR 标题、正文、日志路径。
+
+准入配置见 [`github-ordinary-intake.md`](agent-framework/github-ordinary-intake.md)。默认关闭、
+quarantine 空清单；Owner-protected policy 后续可选择有限 PR 区间的 automatic 模式，按稳定规则
+自动选择未来 current H，无须 Owner 逐 PR 手批。暂停 15/17/18 与原 failed-H/native fence 保留。
+CI exact-H 两项成功可唤醒 `dispatch_phase=prod_review`；预唤醒不要求尚未产出的 Prod approval，
+允许 GitHub 因缺审批显示 blocked，但核对保护/可信 checks/App/workflow/run 及当前 H/B，当前 H
+已有 CHANGES_REQUESTED 则不派发。candidate/merge 仍须原 Prod 独立审批与完整发布门禁。
+
+`github_dispatch.py` 是既有 cron 的有限前门，不 refresh、不创建 scheduler；纯
+`--policy-preflight` 在任何 refresh/API/claim 前校验策略，cron 随后复用同一 reducer DB、阶段
+去重与 Hermes routes。安装要求 cron `no_agent=true`，不再由巡检输出另起有修改职责的 agent。
+sender 还须原 claimed row 完整 payload 匹配，并原子写一次 send intent；202 仅记录
+awaiting_agent_receipt，丢响应/过期 claim 保留 delivery_unknown，均不自动重发或并发重唤醒。
+cron 的 `github_dispatch` 在解析 adapter stdout 或处理非零退出前，将 phase/native rc、
+stdout/stderr 原始 bytes 的有界副本（每流64KiB）、总长度与 SHA256 写到既有私有 invocation
+audit 目录；固定前门通过 `DAILYCHECK_GITHUB_DISPATCH_AUDIT_DIR` 传递该0700目录。记录为
+0600/nosymlink 文件，公共状态只给安全分类和证据 basename/hash；子进程 reason/raw 不转发。
+目录或记录失败显式停止，保留已知 child phase/rc，不再运行下一个 ingest/drain 补日志。
+sender 拒绝时，其原始闭门诊断写入 adapter 私有 stderr；未跨 send intent 的
+`ordinary_not_sent` 保留原签名 payload 与脱敏 failure_reason，使输出仍通过既有 authority
+校验并保留首因，不把已知未发送遮成 shadow rejection，也不改变 claim/send 重试边界。
+固定 numeric review actor 的正式 exact dispatched-H review 回读，可在 claim 时间与原 CI
+run/attempt 对齐后结束审查等待；仅 APPROVED/CHANGES_REQUESTED，且 actor 不得是 PR author。
+BLOCKER 允许修复后新 H 重新审查；旧 H 不重放。无证据保持 UNKNOWN；TTL 不证明进程退出。
+
+部署前 `inspect`/`file` 的真实 BLOCKER 另由 `github_review_feedback.py` 回读现有
+Hermes 会话、工具退出、进程登记和 gateway 已完成响应记录；只接受受保护原任务签名及
+已钉扎只读入口。`event_reducer reconcile-reviews` 在原 attempt fence 内两次读取相同证据，
+以 SQLite 原子事务保存 `review_terminal_receipts`，仅将原 done/awaiting 行标为
+`review_terminal_blocker`；原 payload、lease、attempt 次数和历史保留，不产生 APPROVED、
+CHANGES_REQUESTED 或部署成功。仍在途、delivery_unknown、串任务/版本、无真实退出或
+已创建 candidate 的状态均不解除。配置缺失或证据不确定时保持等待；新 H 仍需原 CI、
+签名准入、独立正式审查及完整发布验证，不以该回执重放旧 H。
+
+反馈回归的 synthetic 配置只放在 owned test scratch；测试子进程在调用原 reducer CLI 前
+仅替换该进程内的配置路径，绝不读取、覆盖或恢复真实 `/etc/dailycheck` 配置。
+Root/Linux 回归还须在固定生产配置路径只读挂载 canary 时通过，以覆盖真实配置已存在的场景。
+
+ordinary 结果由现有 publication authority/source binding/current generation/receipt 重新解析，
+且 outcome 时间不得早于激活 epoch，才签发 `result_reconcile` → dailycheck-deploy；旧 gen11
+或 shadow 报告不改名重发。typed public receipt 与私有诊断分离，publication 未 linked 显式
+unconfirmed，由原 poll `_report_block` 和 cron 对账报告显示；结果提示不许可 redeploy/grant。
+pipeline 的冻结 helper closure 增加该模块，避免 checkout/restore 后丢失 reporter 导入。
+上述源码验证不证明远端安装、router prompt、凭据刷新、保护对齐或生产验收；Gitea 与默认 shadow
+边界保持原行为。下文 shadow 路径限制适用于未显式激活 ordinary 的 GitHub。
+
 **Webhook shadow**：GitHub 原生 `pull_request`、`check_suite`、`check_run`、`workflow_run`、
 `status` 均先 HMAC-SHA256 验签，再按 repository ID/full name 和当前 PR H/base 关联。
 check payload 缺 PR 列表也不猜第一个；分页查当前 open PR，同 H 的多个 PR 分别归一化。
@@ -1801,7 +1917,10 @@ event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 
 证明远端 Gitea/GitHub runner 执行已成功，真实两端 CI 必须在后续授权发布后验证。
 
 测试：`tests/test_github_transport.py` 经 fake curl 子进程覆盖 credential roles、HTTP/auth、分页、
-malformed/stale/producer/rerun、各 caller 和原生签名 webhook；`tests/test_ci_portability.py`
+malformed/stale/producer/rerun、各 caller 和原生签名 webhook；legacy launcher 对照把
+`origin/main` 版本放入临时 `<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout），
+使其按 `parents[2]` 解析仓库根后与当前 launcher 各自真跑 HTTP fixture，比较 stdout、请求路径与
+auth 优先级；`tests/test_ci_portability.py`
 对本机认证 Git HTTP endpoint 真执行 source checkout，并验证 job 隔离；
 `tests/test_github_shadow_boundary.py` 真跑 receiver→CLI、adapter→sender、本机 HTTP 捕获器与
 预存未标记 SQLite row，断言零 shadow POST / 零越界写，且 Gitea 正控仍恰好投递一次；
@@ -3476,6 +3595,25 @@ flowchart LR
 旧库初始化 → master 注册 → 实际 UoW 打开，并保留旧注册、绝对行和显式 Bot
 根在实际 inventory/只读 procurement 调用中的优先级。仅夹具打开既有 rollout。
 
+`tests/test_github_transport.py` 的 legacy launcher 对照把 `origin/main` 版本放进临时
+`<root>/deploy/scripts/` 等价布局（`scripts` 指向本 checkout）运行，使 `parents[2]`
+解析到含 `scripts` 的仓库根，再与当前 launcher 各自真跑 HTTP fixture 比较 stdout 和
+请求 path/auth；不得把参考脚本丢在裸临时目录里执行。
+同文件的 ordinary catchup 空输出控制显式给被测 `python -c` 子进程传入 candidate
+导入根并固定 `PYTHONSAFEPATH=1`，保留父环境的只读 evidence plugin 路径；因此真正调用
+`_catchup_block` 验证缺失事实告警，不把找不到 `scripts` 的 fixture 导入失败当作产品回归。
+该环境只作用于被测子进程，不改变 producer/verifier 或 ordinary 准入与报告行为。
+`test_github_dispatch_diagnostics.py` 用实际 failing child 验证解析/异常前的私有诊断、字节截断/
+完整hash、写失败停止与 secret 不外泄；operator fixed-launcher 的 argv 验证另保留，不以裸
+Python 的 SOURCE 边界测试替代。两组测试共用 `tests/private_audit_testenv.py` 的每例唯一0700
+私有 audit fixture，先验证全部祖先的 owner/mode；Linux 可用 root-owned sticky `/dev/shm`，
+Mac 使用解析后的合格临时祖先。这里只存小型诊断数据，执行脚本、DB 与 pytest basetemp
+仍在原磁盘 scratch；依赖 fixture 先实等候 children/HTTP 退出，再清理 audit。missing/symlink/
+public 负控先证明合格路径可接纳，再只改变目标条件；另核非sticky0777祖先/private0700叶子
+仍在 provider/child 前拒绝，不放宽产品 guard 或 approved producer 的 `/tmp` 契约。
+ordinary fixture 另显式构造历史终态，核对真实新H lifecycle
+和CI产生新trigger时旧行/旧delivery逐字段不变，同H不重发，claimed/UNKNOWN仍阻跨H。
+
 Issue #144 的 test_order_changes_{migration,claims,money,route} 以真实临时库
 覆盖 init/runner 原子迁移、完整 payload、独立进程 Event barrier 的扣库前/仓库锁内/
 扣库后 fence 交错、冲销后主库未回写、同键并发重放、Decimal 半分及原能力回归。
@@ -3742,6 +3880,10 @@ flowchart TB
 ```bash
 ~/.local/bin/python3.12 -m pytest --basetemp=/tmp/pytest-dc   # 必须带 basetemp
 ```
+
+**发布中的测试目录**：check1 经 `verify_pytest.py --create-directory` 创建独立 0700 根，
+不能把发布会话的 control-tree TMPDIR 原样用作测试 DB/basetemp/shadow 根。目录迁移只作用于
+测试子进程；父级状态、凭据和锁不变，目录不可用与真实测试失败仍由原严格门禁拒绝。
 
 **基线（2026-10-10）**：18 failed / 750 passed — 失败集与各次新开发严格逐行一致（owner SOP「零新增对比法」）。`feat/inline-form-ajax`（2026-10-11）新增 `test_ajax_form.py` 6 用例全过，零新增失败。`feat/user-admin-v2`（PR #17，2026-10-12）新增 `test_users_admin_v2.py` 40 用例，基线升至 **18 failed / 796 passed**，零新增失败。
 
@@ -4047,7 +4189,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - [`docs/DEV_ENV.md`](DEV_ENV.md) — wdg-systemd 容器部署细节
 - [`docs/mcp-configuration.md`](mcp-configuration.md) — MCP 接入
 - [`docs/agent-framework/workflow.md`](agent-framework/workflow.md) — Dev/Prod/Owner 三方协作工作流（角色、门禁、merge 政策、蓝绿部署、应急）
-- [`docs/agent-framework/orca-model-orchestration.md`](agent-framework/orca-model-orchestration.md) — 完整任务执行、条件辅助与全局模型策略采纳
+- 全局执行政策 `~/.agents/AGENTS.md` 与模型策略 `~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}` — 项目模型编排文档已按 Owner 要求移除；不从旧项目表派生执行阶段或模型门禁
 
 ### 部署 / 运维
 

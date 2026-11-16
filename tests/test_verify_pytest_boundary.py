@@ -112,7 +112,7 @@ def _record(name, value):
         (Path(directory) / (name + ".json")).write_text(json.dumps(value, indent=2) + "\n")
 
 
-def _case(tmp_path, mode="representatives", dirty=True):
+def _case(tmp_path, mode="representatives", dirty=True, *, tmp_in_state=False):
     base = tmp_path
     repo = base / "repo"
     (repo / "tests").mkdir(parents=True)
@@ -121,6 +121,8 @@ def _case(tmp_path, mode="representatives", dirty=True):
         shutil.copy2(ROOT / name, repo / name)
     for name in ("tmp", "clean-home", "parent-state"):
         (base / name).mkdir()
+    caller_tmp = base / "parent-state/tmp" if tmp_in_state else base / "tmp"
+    caller_tmp.mkdir(exist_ok=True)
     source = (BG / "verify.sh").read_text()
     start = source.index("_verify_check1_pytest() {")
     end = source.index("\n}\n", start) + 3
@@ -153,6 +155,18 @@ def test_observed_child():
 '''
     if mode == "representatives":
         observations += f"\nSOURCE_ROOT={str(ROOT)!r}\n" + REPRESENTATIVES
+    elif mode == "shadow":
+        observations += f'''
+def test_shadow_path_is_independent(monkeypatch):
+    import sys, tempfile
+    sys.path.insert(0, {str(ROOT)!r})
+    from scripts.hosting import require_shadow_path
+    root = Path(tempfile.gettempdir())
+    monkeypatch.setenv("DAILYCHECK_GITHUB_SHADOW_DIR", str(root))
+    assert require_shadow_path(root / "shadow-events.jsonl") == root
+    assert not root.is_relative_to(BASE / "parent-state")
+    assert root.stat().st_mode & 0o777 == 0o700
+'''
     elif mode == "failed":
         observations += "\ndef test_failed():\n    assert False, 'owned failing case'\n"
     elif mode == "collection":
@@ -171,7 +185,7 @@ def test_observed_child():
     env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ") if k in os.environ}
     env.update(DAILYCHECK_DEPLOY_STATE_DIR=str(base / "parent-state"),
                DAILYCHECK_CURL=str(deny),PYTHONDONTWRITEBYTECODE="1",
-               PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",PYTHONPATH=str(ROOT),TMPDIR=str(base / "tmp"),
+               PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",PYTHONPATH=str(ROOT),TMPDIR=str(caller_tmp),
                HOME=str(base / "clean-home"))
     command = [sys.executable, "-B", str(BG / "deploy_state.py"), "run", "--",
                sys.executable, "-B", str(base / "owner.py"), str(BG), str(base),
@@ -235,3 +249,26 @@ def test_check1_uses_child_creation_mask_without_changing_parent(tmp_path):
     assert result["parent_umask"] == 0o077
     assert result["parent_environment_unchanged"] and result["parent_fds_unchanged"]
     assert result["competitor_codes"] == [10, 10, 10]
+
+
+def test_check1_moves_tests_out_of_live_state_without_changing_parent(tmp_path):
+    result = _case(tmp_path, "shadow", tmp_in_state=True)
+    assert result["check1_rc"] == result["native_exit"] == 0, result["pytest_log"]
+    assert result["gate_evidence"]["native_exit"] == 0
+    assert result["child"]["authority_fds"] == []
+    assert result["competitor_codes"] == [10, 10, 10]
+    assert result["parent_environment_unchanged"] and result["parent_fds_unchanged"]
+    directory = Path(result["child"]["environment"]["TMPDIR"])
+    assert not directory.is_relative_to(tmp_path / "parent-state")
+    assert not directory.exists()  # check1 owns and removes its test scratch.
+
+
+def test_check1_refuses_when_no_directory_can_be_isolated():
+    env = {"PATH": os.defpath, "DAILYCHECK_DEPLOY_STATE_DIR": "/"}
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", str(BG / "verify_pytest.py"), "--create-directory"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert not result.stdout
+    assert "isolated pytest directory unavailable" in result.stderr

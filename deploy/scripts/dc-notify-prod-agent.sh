@@ -211,6 +211,12 @@ if [ "$sender_rc" -eq 0 ] && [ "$sender_accepted" = "true" ]; then
     exit 0
 fi
 
+# Preserve the sender's original closed diagnostic in the private adapter audit.
+# The reducer failure result describes reconciliation, not the transport cause.
+if [ -n "$sender_result" ]; then
+    printf 'dc-notify-prod-agent sender: %s\n' "$sender_result" >&2
+fi
+
 if [ "$sender_rc" -eq 3 ] || [ "$sender_status" -eq 429 ]; then
     reason="http_status=429; retry_after_ms=${sender_retry_after_ms}"
 elif [ "$sender_status" -gt 0 ]; then

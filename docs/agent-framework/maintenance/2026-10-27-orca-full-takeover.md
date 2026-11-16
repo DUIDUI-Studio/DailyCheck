@@ -1,8 +1,8 @@
 # DailyCheck Orca 全自动接管记录 — 2026-10-27
 
 > Orchestration Run：`run_9fe9fbd21e6a`
-> 人读路由：[`../orca-model-orchestration.md`](../orca-model-orchestration.md)
-> 机器路由：[`../orca-model-routing.json`](../orca-model-routing.json)
+> 历史人读路由文档已于 2026-11-15 按 Owner 要求移除；当前采用 `~/.agents/AGENTS.md` 和全局 `orca-model-routing` 策略。
+> 历史机器路由：[`../orca-model-routing.json`](../orca-model-routing.json)（deprecated，仅供审计，不产生执行路由）
 > 流程权威：[`../workflow.md`](../workflow.md)
 
 本文是 2026-10-26 至 10-27 Orca 接管 DailyCheck 开发维护后的当前运维基线。历史过程文档如与本文冲突，以本文记录的 merged main、线上 anchor 和实时检查结果为准。

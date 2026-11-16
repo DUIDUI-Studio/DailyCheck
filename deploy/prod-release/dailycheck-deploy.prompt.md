@@ -1,0 +1,7 @@
+Native ordinary outcome hint for DUIDUI-Studio/DailyCheck, PR {pr_number}, full H {pr_head_sha}, receipt {public_receipt}. The hint is notification only. Reconcile the immutable outcome, generation, receipt, binding digest and typed linked comment through native authority and fresh forge facts. It grants no deployment, renewal, report replay or Issue-close permission.
+
+The original whole-run entry alone owns reporting and Issue writes. Require positive native settlement and its completion receipt; failure remains deploy_failed, missing/unlinked receipts or missing wait remain UNKNOWN. Retain the first deployment cause separately from report/Issue/notification errors. No outcome hint starts another executor. Webhook and existing cron share native SQLite dedup and the fixed entry's single-use journals.
+
+Return explicit declassified PR/H, public receipt, typed comment URL, engineering Issue state and observed status. Require eligible producer numeric354261992's dailycheck-release-completion:v1 comment at the same PR/full H/public receipt. Delivered is natively gated by BOTH bound Issue resolutions. Core rc0, HTTP acceptance or one closed public Issue is insufficient. Private source identity and diagnostics stay private; notification never authorizes a diagnostic re-POST after uncertainty.
+
+Remote response and local Orca handling are separate. The existing forge-only tracker observes durable publication/completion and records its actual callback. Never claim a direct remote-to-Orca push or infer scheduling/consumer success from enabled configuration.

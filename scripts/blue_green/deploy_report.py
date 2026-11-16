@@ -19,8 +19,8 @@
    来处理」的推送：consumer 是 agent 的**事件文件**（JSONL，append-only），
    agent 自己轮询/被唤醒，不需要有人被喊醒。人也拿不到一个「请去处理」的
    请求 —— 人该看的时候会去 PR 上看，那是留档，不是工单。
-4. **best-effort，永不抛错**。Gitea 挂了 / token 过期 / 网络不通都只写日志，
-   因为这是部署收尾路径 —— 让「回写失败」把一次成功部署变成红，本末倒置。
+4. Gitea 保留 best-effort 兼容路径；显式 GitHub ordinary 对公开回写或私有
+   反馈 sink 失败返回非零，pipeline 保留部署首错及真实 outcome 并区分交付未确认。
 
 ## 三条通道各管什么
 
@@ -98,6 +98,7 @@ from scripts.hosting import (  # noqa: E402
     provider,
     require_shadow_path,
 )
+from scripts.prod_agent import github_intake  # noqa: E402
 
 MARKER = "<!-- deploy-report:v1 -->"
 DEFAULT_TOKEN_FILE = "/etc/dailycheck/gitea-token"
@@ -401,7 +402,9 @@ def append_event(event: dict[str, Any]) -> bool:
         except HostingError:
             print("[deploy-report] GitHub event log requires shadow isolation", file=sys.stderr)
             return False
-        event = {**event, "hosting_provider": "github", "intake_mode": "shadow", "repo_full_name": _repo()}
+        event = {**event, "hosting_provider": "github",
+                 "intake_mode": "ordinary-audit" if github_intake.enabled() else "shadow",
+                 "repo_full_name": _repo()}
     line = json.dumps(event, ensure_ascii=False) + "\n"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -425,6 +428,7 @@ def push_inbox_event(
     nxt: str,
     comment_id: int = 0,
     log_path: str = "",
+    publication_rc: int = 0,
 ) -> bool:
     """把部署结果投进 prod-agent 的唤醒队列（Hermes ``inbox.jsonl``）。
 
@@ -469,10 +473,22 @@ def push_inbox_event(
     if provider() is Provider.GITHUB:
         payload.update(hosting_provider="github", intake_mode="shadow")
         try:
-            if not github_ordinary_enabled():
+            if github_intake.enabled():
+                facts = github_intake.outcome_facts(pr, sha)
+                # Forward only typed identity/result facts. Private log/reasons stay private.
+                payload = {k: payload[k] for k in (
+                    "event", "action", "received_at_ms", "repo_full_name", "pr_number",
+                    "pr_head_sha", "pr_url", "pr_base_ref")}
+                payload.update(facts, delivery_id=f"outcome-{facts['outcome_id']}-{facts['generation']}",
+                               publication_rc=publication_rc,
+                               feedback_action="reconcile_report" if facts["publication_state"] != "linked"
+                               else "record_success" if facts["deploy_rc"] == 0 else "route_failure",
+                               deployment_actionable=False)
+                payload = github_intake.seal(payload, "outcome")
+            elif not github_ordinary_enabled():
                 require_shadow_path(p)
-        except HostingError:
-            print("[deploy-report] GitHub production intake unsupported", file=sys.stderr)
+        except (HostingError, OSError, ValueError, TypeError) as exc:
+            print(f"[deploy-report] GitHub feedback unavailable; reconcile required: {type(exc).__name__}", file=sys.stderr)
             return False
     line = json.dumps(payload, ensure_ascii=False) + "\n"
     try:
@@ -600,7 +616,7 @@ class PublicDeployFacts:
             raise HostingError("invalid_public_native_identity")
         enums = {
             "stage": {"acquire", "candidate", "up", "verify", "promote", "switch",
-                      "observe", "merge", "release", "complete"},
+                      "observe", "merge", "release", "complete", "aborted", "unknown"},
             "kind": {"success", "usage", "lock", "code", "drift", "env", "unknown"},
             "scope": {"in-scope", "out-of-scope", "undetermined"},
             "verdict": {"aligned", "drifted", "unverifiable", "unknown"},
@@ -814,6 +830,8 @@ def _public_stage(tr: dict, rc: int) -> str:
     stage = tr["stage"]
     if stage == "verify-drift":
         return "verify"
+    if stage in {"candidate-drift", "ownership"}:
+        return "candidate"
     if stage == "unknown" and rc == 0:
         return "complete"
     return stage
@@ -851,6 +869,9 @@ def _cmd_write_github(args, tail: str, authority):
         try:
             outcome_info = publication_authority.load_durable_outcome(
                 deploy_state.state_dir(), args.pr, args.sha)
+            if github_intake.enabled():
+                # Admission never turns historical publication recovery into a new ordinary send.
+                github_intake.outcome_facts(args.pr, args.sha)
         except (HostingError, OSError, ValueError, TypeError) as exc:
             resolve_error = exc
 
@@ -993,11 +1014,15 @@ def cmd_write(args: argparse.Namespace, *, authority: PublicationAuthority | Non
     pushed = push_inbox_event(
         args.pr, args.sha, tr, align, nxt, comment_id,
         str(Path(args.log).resolve()) if args.log else "",
+        publication_rc=write_rc,
     )
     if pushed:
         message = "GitHub private inbox recorded; poll reconciliation required" \
             if provider() is Provider.GITHUB else "已唤醒 prod-agent"
         print(f"[deploy-report] {message} next={nxt}", file=sys.stderr)
+    if provider() is Provider.GITHUB and github_ordinary_enabled() and (not appended or not pushed):
+        print("[deploy-report] ordinary feedback sink unconfirmed", file=sys.stderr)
+        return write_rc or 1
     return write_rc
 
 

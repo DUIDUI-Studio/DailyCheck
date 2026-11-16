@@ -32,8 +32,8 @@ from scripts.hosting import (  # noqa: E402
     HostingError,
     PayloadError,
     parse_json_object,
-    require_production_work,
 )
+from scripts.prod_agent import github_intake  # noqa: E402
 
 ROUTES = frozenset({"wdg-ci", "dailycheck-deploy"})
 EVENTS = frozenset({"check_suite", "deploy_result"})
@@ -114,7 +114,7 @@ def send(
 ) -> tuple[int, dict[str, Any]]:
     try:
         payload = parse_json_object(body)
-        require_production_work(payload)
+        github_intake.require_work(payload)
     except PayloadError:
         return 5, {"accepted": False, "reason": "invalid_payload"}
     except HostingError as exc:
@@ -125,6 +125,20 @@ def send(
         }
     if route not in ROUTES or event not in EVENTS:
         return 5, {"accepted": False, "reason": "invalid_route_or_event"}
+    if github_intake.authentic(payload):
+        expected_stage = "ready" if event == "check_suite" else "outcome"
+        if (not github_intake.authentic(payload, frozenset({expected_stage}))
+                or payload.get("event") != event
+                or route != ("wdg-ci" if event == "check_suite" else "dailycheck-deploy")):
+            return 5, {"accepted": False, "reason": "invalid_ordinary_decision"}
+        if event == "check_suite":
+            gate = github_intake.readiness(payload)
+            if (gate.get("ready") is not True or gate.get("base_sha") != payload.get("pr_base_sha")
+                    or gate.get("run_id") != payload.get("observed_ci_run_id")
+                    or gate.get("run_attempt") != payload.get("observed_ci_attempt")):
+                return 5, {"accepted": False, "reason": "ordinary_readiness_invalidated"}
+        if event == "deploy_result" and not github_intake.current_outcome(payload):
+            return 5, {"accepted": False, "reason": "outcome_superseded"}
     if not delivery_id or len(delivery_id) > 256:
         return 5, {"accepted": False, "reason": "invalid_delivery_id"}
     if len(body) > MAX_BODY_BYTES:
@@ -134,6 +148,9 @@ def send(
         normalized_base_url = _base_url(base_url)
     except ValueError as exc:
         return 5, {"accepted": False, "reason": str(exc)}
+
+    if github_intake.authentic(payload) and not github_intake.claim_send(payload, route):
+        return 5, {"accepted": False, "reason": "ordinary_dispatch_not_claimed"}
 
     signature = "sha256=" + hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     try:
@@ -198,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             raw = sys.stdin.buffer.read(MAX_BODY_BYTES + 1)
             # Only an actually absent body is the explicit config-only drain guard.
             payload = parse_json_object(raw) if raw else None
-            require_production_work(payload)
+            github_intake.require_work(payload)
         except PayloadError:
             _emit({"decision": "suppress", "reason": "invalid_payload"})
             return 5

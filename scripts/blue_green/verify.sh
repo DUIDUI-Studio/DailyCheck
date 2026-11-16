@@ -238,7 +238,7 @@ _verify_check1_pytest() {
   if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then _native_operation pytest; return $?; fi
   cd "${REPO_ROOT}" || return 1
   local test_db_dir
-  test_db_dir="$(mktemp -d "${TMPDIR:-/tmp}/dailycheck-tests.XXXXXX")" || return 1
+  test_db_dir="$("${DC_PYTHON_BIN}" -I -B "${REPO_ROOT}/scripts/blue_green/verify_pytest.py" --create-directory)" || return 1
   "${DC_PYTHON_BIN}" -I -B "${REPO_ROOT}/scripts/blue_green/verify_pytest.py" "${test_db_dir}" \
     tests/ --basetemp="${test_db_dir}/pytest" -q --tb=line -rfE --color=no \
     -p scripts.ci.pytest_evidence --dc-evidence="${test_db_dir}/session.json" \
