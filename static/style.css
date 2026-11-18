@@ -504,6 +504,18 @@ button:disabled {
 .ctx-user small { color: #6b7280; font-weight: 400; }
 .ctx-link { color: #0f766e; text-decoration: none; }
 .ctx-link:hover { text-decoration: underline; }
+.help-nav { display: inline-flex; flex: 0 0 auto; }
+.help-nav a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 8px;
+  font-weight: 600;
+}
+.help-nav a:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.auth-card .help-nav { display: flex; justify-content: flex-end; margin-bottom: 8px; }
 
 /* auth pages */
 .auth-page {

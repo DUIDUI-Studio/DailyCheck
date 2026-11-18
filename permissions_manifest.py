@@ -173,6 +173,7 @@ ROUTE_MATRIX: dict[str, str] = {
     # ---- core ----
     "core.dashboard": LOGIN,
     "core.land": LOGIN,
+    "core.help_page": PUBLIC,
     "core.summary": LOGIN,                      # 终裁④：不脱敏
     "core.categories": LOGIN,
     "core.delete_category": f"{ROLE_PREFIX}staff",

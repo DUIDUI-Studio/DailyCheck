@@ -10,7 +10,7 @@
   <title>{{ title or "轻量库存管理" }}</title>
   <link rel="manifest" href="{{ url_for('pwa.webmanifest') }}" />
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-192.png') }}" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=145" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=146" />
   {% block extra_css %}{% endblock %}
 </head>
 <body{% if no_sidebar %} class="no-sidebar"{% endif %}>
@@ -143,8 +143,9 @@
       <h1>轻量库存管理</h1>
     </header>
 
-    {% if g.user %}
     <div class="ctx-bar">
+      {% include "_help_nav.html" %}
+      {% if g.user %}
       {% if g.warehouse %}
       <span class="ctx-warehouse">{{ g.warehouse['name'] }} <small>({{ g.warehouse['code'] }})</small></span>
       <a class="ctx-link" href="{{ url_for('auth.warehouse_picker') }}">切换</a>
@@ -157,8 +158,8 @@
       <a class="ctx-link" href="{{ url_for('feedback.new_feedback', page=request.path) }}"
          data-feedback-open>反馈</a>
       <a class="ctx-link" href="{{ url_for('auth.logout') }}">注销</a>
+      {% endif %}
     </div>
-    {% endif %}
 
     <main>
       {% with messages = get_flashed_messages() %}
@@ -176,6 +177,7 @@
     {# 移动底栏（2026-10-13）：收敛为 ≤5 个高频模块入口 + 「更多」→ /land 全模块页。
        原 15 项平铺已超载；其余模块/子页一律从「更多」进入 —— 因此 /land 必须列全
        各模块内该角色可见的每一个页面（见 templates/land.html 顶部注释）。 #}
+    {% if g.user %}
     <nav class="mobile-nav mobile-only">
       <a href="{{ url_for('core.dashboard') }}">总览</a>
       {% if is_admin or is_storefront %}
@@ -190,6 +192,7 @@
       {% endif %}
       <a href="{{ url_for('core.land') }}">更多</a>
     </nav>
+    {% endif %}
   </div>
   {% include "_feedback_widget.html" %}
   <script src="{{ url_for('static', filename='ajax-form.js') }}?v=2" defer></script>

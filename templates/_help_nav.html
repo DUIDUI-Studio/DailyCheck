@@ -1,0 +1,3 @@
+<nav class="help-nav" aria-label="帮助导航">
+  <a class="ctx-link" href="{{ url_for('core.help_page') }}"{% if request.endpoint == 'core.help_page' %} aria-current="page"{% endif %}>帮助</a>
+</nav>

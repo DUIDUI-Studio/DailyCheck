@@ -137,6 +137,7 @@ def _restore_last_warehouse(master, user) -> int | None:
 PUBLIC_ENDPOINTS = {
     "auth.login", "auth.logout", "static",
     "pwa.service_worker", "pwa.webmanifest",
+    "core.help_page",
     # /health is an operator probe (subproject 1 §3.6) — must be
     # reachable without auth, so monitoring tools can hit it.
     "health",
@@ -177,6 +178,8 @@ def load_user_and_warehouse():
     ).fetchone()
     if g.user is None:
         session.clear()
+        if request.endpoint in PUBLIC_ENDPOINTS:
+            return None
         return redirect(url_for("auth.login", next=current_relative_path()))
 
     # P0-1 多租户 PoC：平台管理员（is_admin=1）跨租户；普通用户锁定本租户。

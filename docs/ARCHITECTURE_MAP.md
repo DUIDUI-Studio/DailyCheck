@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 25 个（已装配 24 / 未装配 1）
-- 路由 **198** 条（按鉴权强度：平台超管 65 · 登录 53 · 权限点 31 · 角色 29 · 配送中心 10 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **199** 条（按鉴权强度：平台超管 65 · 登录 53 · 权限点 31 · 角色 29 · 配送中心 10 · 公开 7 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **66** 张，`WAREHOUSE_SCHEMA_VERSION = 7`
 - MCP 工具域 9 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -30,10 +30,10 @@
 | `users` | `users.py` | 12 | 在役 |
 | `feedback` | `feedback.py` | 11 | 在役 |
 | `items` | `items.py` | 11 | 在役 |
+| `core` | `core.py` | 7 | 在役 |
 | `forecast` | `forecast.py` | 7 | 在役 |
 | `reports` | `reports.py` | 7 | 在役 |
 | `auth / pwa` | `auth.py` | 6 | 在役 |
-| `core` | `core.py` | 6 | 在役 |
 | `outbound` | `outbound.py` | 6 | 在役 |
 | `restock` | `restock.py` | 6 | 在役 |
 | `adjustment` | `adjustment.py` | 5 | **未装配** |
@@ -104,6 +104,7 @@
 | `core.categories` | GET | `/categories` | 登录 |  |
 | `core.dashboard` | GET | `/dashboard` | 登录 |  |
 | `core.delete_category` | POST | `/categories/<int:category_id>/delete` | 角色 | staff |
+| `core.help_page` | GET | `/help` | 公开 |  |
 | `core.land` | GET | `/land` | 登录 |  |
 | `core.summary` | GET | `/summary` | 登录 |  |
 

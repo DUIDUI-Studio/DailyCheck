@@ -4,10 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>登录 · 库存管理</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=13" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=146" />
 </head>
 <body class="auth-page">
   <main class="auth-card">
+    {% include "_help_nav.html" %}
     <h1>登录</h1>
     {% with messages = get_flashed_messages() %}
       {% if messages %}
