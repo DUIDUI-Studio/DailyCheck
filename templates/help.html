@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block extra_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='help.css') }}?v=1" />
+{% endblock %}
+{% block sidebar %}{% endblock %}
+{% block content %}
+<article class="help-page" aria-labelledby="help-title">
+  <header class="help-heading">
+    <p class="help-eyebrow">DAILYCHECK</p>
+    <h1 id="help-title">帮助</h1>
+  </header>
+
+  <section class="help-intro" aria-labelledby="help-intro-title">
+    <h2 id="help-intro-title">项目介绍</h2>
+    <p class="help-name">DailyCheck</p>
+    <p class="help-description">手机端优先的轻量库存管理系统</p>
+  </section>
+
+  <section class="help-section" aria-labelledby="help-features-title">
+    <h2 id="help-features-title">功能列表</h2>
+    <ol class="help-features">
+      <li>品类管理</li>
+      <li>库存品管理</li>
+      <li>出库及回滚</li>
+      <li>盘点差异记录</li>
+      <li>库存搜索和低库存提示</li>
+      <li>补货申请及状态流转</li>
+      <li>配方驱动的生产录入</li>
+      <li>面向 AI 的 MCP 数据访问服务</li>
+    </ol>
+  </section>
+
+  <section id="help-feedback" class="help-feedback" aria-labelledby="help-feedback-title">
+    <div>
+      <h2 id="help-feedback-title">意见反馈</h2>
+      <p>遇到问题或有改进建议？通过反馈窗口告诉我们。</p>
+      {% if not g.user %}
+      <p class="help-login-note">提交反馈前，请先登录并选择有权限的仓库。</p>
+      {% endif %}
+    </div>
+    <a class="btn primary" href="{{ url_for('feedback.new_feedback', page=url_for('core.help_page')) }}"{% if g.user %} data-feedback-open{% endif %}>反馈</a>
+  </section>
+</article>
+{% endblock %}

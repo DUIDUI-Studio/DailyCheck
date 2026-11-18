@@ -267,6 +267,12 @@ def _compute_top_consumed(db, range_param):
     ).fetchall()
 
 
+@bp.route("/help")
+def help_page():
+    """Public product information; feedback keeps its existing auth gates."""
+    return render("help.html", title="帮助 · DailyCheck", no_sidebar=True)
+
+
 @bp.route("/dashboard")
 @require_login
 def dashboard():

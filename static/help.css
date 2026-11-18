@@ -1,0 +1,32 @@
+/* Help is an informational page; keep its layout separate from inventory views. */
+.help-page {
+  max-width: 880px;
+  margin: 12px auto 28px;
+  padding: 24px 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+}
+.help-heading { padding-bottom: 22px; border-bottom: 1px solid var(--border); }
+.help-eyebrow { margin: 0 0 8px; color: var(--brand); font-size: 12px; letter-spacing: .18em; font-weight: 700; }
+.help-heading h1 { margin: 0; font-size: 30px; color: var(--brand-ink); }
+.help-intro { padding: 28px 0; }
+.help-page h2 { margin: 0 0 16px; font-size: 16px; color: var(--brand-ink); }
+.help-name { margin: 0 0 10px; font-size: 32px; font-weight: 700; letter-spacing: -.02em; }
+.help-description { margin: 0; max-width: 28em; font-size: 20px; line-height: 1.6; }
+.help-section { padding: 24px 0; border-top: 1px solid var(--border); }
+.help-features { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 28px; list-style: none; margin: 0; padding: 0; counter-reset: feature; }
+.help-features li { display: flex; align-items: baseline; gap: 14px; padding: 17px 0; border-bottom: 1px solid var(--border); line-height: 1.6; overflow-wrap: anywhere; }
+.help-features li::before { counter-increment: feature; content: counter(feature, decimal-leading-zero); flex: 0 0 auto; color: var(--brand); font-size: 12px; font-variant-numeric: tabular-nums; }
+.help-feedback { display: flex; flex-direction: column; align-items: flex-start; gap: 20px; margin-top: 8px; padding: 22px; border-radius: 12px; background: #edf7f4; }
+.help-feedback h2 { margin-bottom: 10px; }
+.help-feedback p { margin: 0; line-height: 1.7; }
+.help-feedback .help-login-note { margin-top: 8px; color: var(--brand-ink); font-size: 13px; }
+.help-feedback .btn { width: auto; min-width: 96px; min-height: 44px; flex: 0 0 auto; }
+.help-feedback .btn:focus-visible { outline: 2px solid var(--brand-ink); outline-offset: 3px; }
+@media (min-width: 721px) {
+  .help-page { padding: 36px 40px; }
+  .help-features { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .help-feedback { flex-direction: row; align-items: center; justify-content: space-between; }
+}

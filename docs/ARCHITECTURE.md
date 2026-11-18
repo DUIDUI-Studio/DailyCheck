@@ -2228,6 +2228,14 @@ master_connection不迁移warehouse。软链共享真实路径锁，绿副本独
 
 ## 5. 应用层模块图
 
+**公开帮助页（Issue #28，r0.1.7）**：`core.help_page` 注册 `GET /help`，在
+`auth.PUBLIC_ENDPOINTS` 与 `permissions_manifest.ROUTE_MATRIX` 中明确标记公开。
+`help.html` 展示已确认的介绍、八项功能及底部「意见反馈」。登录页和通用顶部栏
+复用 `_help_nav.html`，导航不受角色或选仓限制。登录后底部按钮沿用
+`data-feedback-open` 打开唯一的 `#feedback-modal`，无脚本时走已注册的
+`GET /feedback/new?page=/help`。匿名点击同一链接，由原登录、同源 next 和选仓
+守卫进入既有反馈表单。未新增反馈 API、匿名提交或业务数据权限。
+
 **外仓 Web 查询（Issue #136）**：`app.py` 注册 `blueprints/wms.py`，配送中心的
 「库存管理 → 外仓信息」在桌面侧栏与移动「更多」页同步出现。`templates/wms.html`
 提供仓库/货主选择、库存及入/出库单据的服务端分页；`wms_detail.html` 展示按方向+唯一 ID
@@ -2255,7 +2263,7 @@ flowchart TB
 
     subgraph Blueprints["蓝图层 (视图 + 表单处理)"]
         Auth["auth.py<br/>login/logout/warehouse_picker<br/>PWA manifest+sw"]
-        Core["core.py<br/>仪表盘 + 品类管理"]
+        Core["core.py<br/>仪表盘 + 品类管理 + 公开帮助"]
         Items["items.py<br/>库存品 CRUD + 库存视图"]
         Canonical["canonical.py<br/>主数据 CRUD + 扇出"]
         StoreOrdering["store_ordering.py<br/>门店↔DC 订货 + 审批 + 发货 + 收货<br/>catalog 展示本店现有库存"]
@@ -2320,6 +2328,10 @@ Web单据撤销/删除接线（#87）：outbound rollback/delete、restock statu
 新增MCP身份不进入Web表单，Web新行仍保留NULL身份/input和factor默认1。
 
 ## 6. 蓝图依赖关系
+
+帮助页继续使用既有 `core` 蓝图与公共 `render` helper；模板通过 endpoint 链接
+复用 `feedback`，不新增蓝图或反馈处理依赖。`auth` 只精确公开 `core.help_page`，
+既有业务蓝图的守卫与仓库上下文依赖不变。
 
 `wms.py` Web 蓝图调用 `mcp_server.service.wms_web`，只复用旧 `wms` 的连接/配置/安全错误
 包装；Web 多货主权限不进入 MCP 票据或 Bot，旧 MCP 单货主函数/参数/输出/工具声明保持不变。
@@ -2397,6 +2409,9 @@ MCP与Web单据写路径通过同一SQLite写锁协调（#87），不新增蓝�
 request物理删除只撤销库存/流水，不删除永久journal，避免后续MCP重放复活。
 
 ## 7. 请求生命周期
+
+`GET /help` 是公开说明页，匿名或登录但未选仓时均可访问，不触发登录或选仓跳转。
+反馈链接仍经过既有 `/feedback/new` 登录与选仓流程。
 
 ### 7.1 Web（Cookie 会话）
 
@@ -2558,6 +2573,9 @@ receipt 补库并回填，已存在流水则只标记 applied。收货表单隐�
 ---
 
 ## 8. 鉴权架构
+
+`core.help_page` 是按 endpoint 精确声明的公开例外，仅承载固定说明性文案。
+反馈、库存与管理路由的登录、仓库绑定、角色及 CSRF 保护不变。
 
 外仓 Web 使用 `@require_login` + `@distribution_center_only`，并登记
 `permissions_manifest.ROUTE_MATRIX`。DC viewer 可读，普通门店/R&D 返回 403；
@@ -3486,6 +3504,11 @@ canonical 时，非来源仓用自己的出库史算水位、不承接门店需�
 
 ## 11. PWA / 移动端
 
+帮助页使用限定 `.help-*` 的 `static/help.css`：手机单列，721px 起含 Pad 中屏双列，
+反馈区在内容末尾；导航和反馈按钮的最小触控高度为 44px。顶部「帮助」导航在
+所有屏宽公开显示，登录页同样提供入口。共享样式引用升级至 `style.css?v=146`，
+帮助样式使用 `help.css?v=1`；不改变 SW 缓存策略或 APP_SHELL。
+
 外仓页使用限定 `.wms-*` 的 `static/wms.css`，复用主题与裸表格的全局
 `.table-scroll` 包装；窄屏筛选单列，平板双列，桌面横排。`base.html` 新增
 `extra_css` 槽，资源查询版本与 SW cache 名同步更新。外仓页响应均为
@@ -3584,6 +3607,12 @@ flowchart LR
 ---
 
 ## 12. 测试架构
+
+`tests/test_help_page.py` 验证匿名公开内容、八项清单、登录页入口、三类仓库与
+五种角色的导航、未选仓可读、复用唯一反馈弹层及原表单、登录和选仓回跳，
+并确认反馈 CSRF、匿名提交和业务页保护没有放开。浏览器验证另检查手机及
+Pad 布局、原脚本开关弹层、无脚本兜底和反馈真实落库；截图与运行结果作为
+任务验收材料保留，测试通过不代替 BA 技术验收或 Eric 业务验收。
 
 `test_external_warehouse_paths.py` 以真实 SQLite 验证相对注册的替换候选、预览及
 持久方案快照均取配置价 7（代码根诱饵价 99 保持不变）。独立子进程覆盖默认
