@@ -242,16 +242,15 @@ CI 两必需 check 全绿后，Prod Agent 会自动接手独立审查和候选�
 - pre-push hook（`core.hooksPath` → `~/.workbuddy/git-hooks`）2026-10-19 起是**黑名单**：只拦「删除远程分支」和「非快进覆盖」，新分支/快进照常放行。
   仍建议 `git push --no-verify`（避开 hook 里的网络调用），但不再强制。
 
-## 三″、平台命令对照（2026-10-22 迁至自托管 Gitea）
+## 三″、Gitea 兼容路径命令对照（2026-10-22 迁移时记录）
 
-CI/CD 已从 GitHub 迁到 hub1 上的 Gitea 28.1（`http://172.28.129.216:3000`，VPC 内网）。
-agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <token>`）。
+本节记录 hub1 上自托管 Gitea 的 REST API 用法（`Authorization: token <token>`）。当前 GitHub 路径按 [GitHub PR 提交检查](#github-pr-提交检查) 创建草稿并转待审。
 
-| 动作 | 原 GitHub 命令 | 现在（Gitea API） |
+| 动作 | GitHub 命令 | Gitea API |
 |---|---|---|
 | 列 open PR | `gh pr list --state open` | `GET /api/v1/repos/{o}/{r}/pulls?state=open` |
 | 看单个 PR | `gh pr view N` | `GET /api/v1/repos/{o}/{r}/pulls/N` |
-| 建 PR | `gh pr create --draft` | `POST /api/v1/repos/{o}/{r}/pulls`，body `{head, base, title, body}` |
+| 建 PR | `python -m scripts.agent_framework.pr_submission draft` | `POST /api/v1/repos/{o}/{r}/pulls`，body `{head, base, title, body}` |
 | 改 PR body | `gh pr edit N --body` | `PATCH /api/v1/repos/{o}/{r}/pulls/N`，body `{"body": "..."}` |
 | 查 check 状态 | `gh pr checks` | `GET /api/v1/repos/{o}/{r}/commits/{sha}/status` |
 | merge | `gh pr merge N --merge` | `POST /api/v1/repos/{o}/{r}/pulls/N/merge`，body `{"do":"merge"}`（**小写**，swagger 的 required 字段名就是 `do`） |
