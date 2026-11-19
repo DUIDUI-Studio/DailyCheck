@@ -1,15 +1,17 @@
 # DailyCheck — 轻量库存管理系统
 
-> **每次 session 启动按顺序先读**：
-> 1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — **项目技术架构图（系统拓扑/数据/模块/请求生命周期/鉴权/MCP/业务领域/部署/PWA/测试/约定）**。改动任何子系统前必须先读。
-> 2. [`docs/DEV_ENV.md`](docs/DEV_ENV.md) — 记录了当前 dev 环境的部署方式(wdg-systemd 容器)、入口、调试命令和已知坑。错误的部署模型会导致走错方向(例如以为有独立 Dockerfile)。
-> 3. [`docs/agent-framework/workflow.md`](docs/agent-framework/workflow.md) — **Dev/Prod/Owner 三方协作工作流（权威口径）**：角色分工、push/merge 政策、PR 模板与门禁、蓝绿部署、应急。任何提交代码 / 提 PR / 部署动作前必须对齐。
-> 4. 全局执行政策 `~/.agents/AGENTS.md` 与模型策略 `~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`；项目不再维护独立模型编排文档。
+> **任务入口**：先读 [`AGENT.md`](AGENT.md) 和
+> [`workflow.md`](docs/agent-framework/workflow.md) 的角色、权限与交付规则。
+> 改子系统前读 [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的概览与相关章节；
+> 环境操作前查 [`DEV_ENV.md`](docs/DEV_ENV.md)。执行方式遵循 `~/.agents/AGENTS.md`；
+> 确需新 agent/model 时只查 `~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`。
+> 按任务读取必要内容；不把读取文档、使用技能或验证变成独立派单。
 
 ## 协作工作流速记（细节以 workflow.md 为准）
 
-- **角色**：Dev Agent = 开发/测试/提 PR（**不 merge**）；Prod Agent = merge 判定 + 蓝绿部署；Eric = 需求拍板 + 红线。
-- **push 已放开**（2026-10-15）：普通 push 不需 Eric 事先确认（hook 恒 exit 1，用 `git push --no-verify` 是既定姿势）；`--force`/删远程分支/改保护规则仍需确认。
+- **角色**：Dev 主执行者连续完成诊断、设计、相关修改、验证、PR 和交付跟进（**不 merge**）；独立 Reviewer 只读；Prod Agent = merge 判定 + 蓝绿部署；Eric = 需求拍板 + 红线。专职 Coordinator 仅在多个独立工作流确需协调时使用。
+- **辅助与恢复**：紧密关联的工作由主执行者完成；有独立辅助产物时可用原生 subagent，跨 CLI/环境或正式独立生命周期时才用 Orca worker。新任务的可恢复本地迭代不套用通用一次/三次上限；显式预算、生产 fence 和 HOLD 保留。
+- **push 已放开**（2026-10-15）：普通新分支/快进 push 不需重复确认，显式指定 `origin <branch>`；非快进、删除远程分支和保护修改遵守 workflow.md §三。按实际 hook 处理，不假定必须绕过。
 - **提 PR 必含三段**（`check_reports.py` 门禁强制）：`## 报告 1/4`（R 表 ❌ 待填全消解）+ `## Checklist` + `## 生产侧事项`（只写规范流程粒度，不写操作脚本）；body 全文禁字面「❌」字符。
 - **红线**（须 Eric 拍板）：扩张 `tests/known_failures.txt`、改 CI workflow、改分支保护、删 ARCHITECTURE 铁律、改 workflow.md 自身。
 - **汇报必须给 PR 终态**（Eric 硬要求，2026-10-19）：任务收尾回复**必须显式写清三件事** —— ① PR 是否已合并（给出 PR 号 + merged/仍 open）；② 对应 issue 是否已关闭；③ CI 与部署是否成功（未部署/部署中要说明卡在哪一步、何时有结论）。禁止「已交付，等 CI」这类看不出终态的表述。
@@ -250,7 +252,7 @@ pytest tests/mcp_server/ -v
 | `DAILYCHECK_MCP_TOKEN` | MCP HTTP 模式 Bearer Token |
 
 ## 提交前验证
-1. **必读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** —— 改子系统前先看，确认你对设计的理解与文档一致
+1. **必读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的概览与相关章节** —— 改子系统前先看，确认你对设计的理解与文档一致
 2. 测试通过：`pytest`
 3. Lint 检查：`ruff check .`
 4. 关键页面可访问：`/`、`/items`、`/stock-in`、`/stocktake`、`/restock`

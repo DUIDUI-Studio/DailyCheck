@@ -1,13 +1,23 @@
 # DailyCheck Agent Entry
 
-Read `~/.agents/AGENTS.md` for the owner-approved global execution policy.
-Before changing code, read `AGENT.md`, `CLAUDE.md`, `docs/ARCHITECTURE.md`,
-`docs/DEV_ENV.md`, and `docs/agent-framework/workflow.md`.
+At task entry, read `~/.agents/AGENTS.md`, `AGENT.md` and the role, authority and delivery rules in
+`docs/agent-framework/workflow.md`. Before changing a subsystem, read the
+architecture overview and relevant sections of `docs/ARCHITECTURE.md`; consult
+`CLAUDE.md` and `docs/DEV_ENV.md` for the affected stack and environment.
+Choose a new agent/model only when needed, using the user-global
+`~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`. These references
+do not create separate work stages or require another agent.
+
+Default to one main executor owning investigation, design, related implementation,
+repair, validation and delivery follow-up. Use helpers only for a useful independent
+result. A dedicated Coordinator is conditional; managing a helper does not remove
+the main executor's write ownership. Preserve one writer and independent read-only
+review, plus explicit Owner limits and production authority. Do not resume HOLD tasks.
 
 `workflow.md` is authoritative for issue intake, branch naming, PR gates, merge
-responsibility, deployment, and owner red lines. Model selection follows only
-`~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`; the project model
-orchestration document has been retired by the Owner.
+responsibility, deployment, and owner red lines. Explicit Owner decisions take
+precedence and must be recorded for red-line changes. The Owner retired the project
+model-orchestration document; the project routing JSON remains deprecated.
 
 ## Delivery lifecycle terminal state (global)
 
@@ -17,8 +27,9 @@ scheduled automation.
 - CI green is an intermediate state, not delivery completion. CI green
   automatically hands the PR to the Prod Agent for independent review,
   candidate deployment, merge, and production verification.
-- The Coordinator or initiating agent must keep following the same work item
-  until a terminal state is proven from live Gitea/CI/deployment evidence.
+- The main executor or explicitly assigned Coordinator must keep following the
+  same work item until a terminal state is proven from the active Git host,
+  CI and deployment evidence. An open PR is not an implicit transfer of ownership.
 - A successful delivery is terminal only when the PR is merged, the linked
   Issue is closed, both required CI checks are successful, and the Prod Agent
   has written a successful deployment result after its verification and
