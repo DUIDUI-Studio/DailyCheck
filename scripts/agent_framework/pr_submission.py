@@ -206,7 +206,7 @@ def _verify_binding(binding: dict, number: int, public: int, public_id: int,
 
 def prepare_draft(args) -> str:
     body = args.body_file.read_text(encoding="utf-8")
-    first_line = next(iter(body.lstrip().splitlines()), "")
+    first_line = body.partition("\n")[0]
     if (":" in args.branch or branch_issue_number(args.branch) != args.issue
             or first_line != f"Closes #{args.issue}" or CLOSES.findall(body) != [str(args.issue)]):
         raise SubmissionBlocked(f"分支和正文必须对应同一公开工单，正文第一行写 Closes #{args.issue}")

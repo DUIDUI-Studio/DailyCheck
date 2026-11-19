@@ -115,6 +115,9 @@ def test_draft_requires_real_issues_and_draft_flag(fixture, tmp_path):
     body.write_text("```\nCloses #30\n```\n")
     with pytest.raises(gate.SubmissionBlocked, match="Closes #30"):
         gate.prepare_draft(args)
+    body.write_text("    Closes #30\n```\nCloses #30\n```\n")
+    with pytest.raises(gate.SubmissionBlocked, match="Closes #30"):
+        gate.prepare_draft(args)
     assert not fixture.calls
     body.write_text("Closes #30\n")
     gate.prepare_draft(args)
