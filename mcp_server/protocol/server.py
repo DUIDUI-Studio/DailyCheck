@@ -23,6 +23,14 @@ _ACCESS_LOG_PATH = "/api/mcp/"
 _MAX_TOOL_NAME_LEN = 128
 
 
+class _SerializedToolError(Exception):
+    """The SDK turns exception text into an isError=true tool result.
+
+    Use its supported exception path: older 1.x SDKs cannot accept a returned
+    CallToolResult, but preserve exception text without changing HTTP status.
+    """
+
+
 def _access_log_token_id() -> int | None:
     """Return the request-scoped token id without authenticating anything.
 
@@ -83,7 +91,7 @@ def build_server() -> Server:
                 logger.info("call_tool %r raised McpError %s: %s", name, e.code, e.message)
                 payload = json.dumps(e.to_dict(), ensure_ascii=False)
                 status = e.http_status
-                return [TextContent(type="text", text=payload)]
+                raise _SerializedToolError(payload) from None
 
             # Return the result as a JSON string so the caller can deserialize it
             payload = json.dumps(result, ensure_ascii=False, default=str)

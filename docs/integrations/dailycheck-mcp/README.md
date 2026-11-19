@@ -86,7 +86,7 @@ flask create-agent-token juleng-sync \
 |---|---|---|
 | Missing `Authorization` | 401 | `{"error":"unauthorized","message":"Invalid or missing token"}` |
 | Wrong token (middleware) | 401 | same as above |
-| Right token, not in `agent_tokens` | 200 | `result.content` is JSON `{"error":"unauthorized","message":"invalid token"}` with `isError:false` |
+| Right token, not in `agent_tokens` | 200 | `result.content` is JSON `{"error":"unauthorized","message":"invalid token"}` with `isError:true` |
 
 **The token is a shared secret.** It must be passed via TLS in production and never logged. Rotate via [integration-checklist.md](./integration-checklist.md#rotating-the-token).
 
@@ -295,7 +295,25 @@ See [errors.md](./errors.md) for the full catalog. Two distinct envelopes exist:
 - **JSON-RPC envelope errors** (protocol-level: bad JSON, missing Accept, wrong method): appear at the **top level** of the response with `error.code` ∈ {-32700, -32600, -32601, -32602, -32603}.
 - **Tool errors** (validation failures, unauthorized, not_found, etc.): appear inside `result.content[0].text` as a **JSON string** with `result.isError=true`. HTTP is still 200.
 
-Always check **both**: HTTP status, JSON-RPC top-level error, AND `result.isError`.
+Always check HTTP status, JSON-RPC top-level error, AND `result.isError`.
+
+Issue #24 preserves the existing JSON `{error, message, ...details}` inside TextContent and HTTP 200,
+but now marks all caught `McpError` results `isError=true` on HTTP/SSE and stdio.
+The adapter uses the SDK exception path to preserve JSON text even on older 1.x SDKs
+which do not accept a returned `CallToolResult`.
+During mixed-version rollout, also inspect a parsed object for a nonempty string `error`: older
+servers returned the same business errors with `isError=false`. SDK validation/unknown-tool
+errors may be plain text; check `isError` before assuming the text is JSON. Never retry a write
+merely because an error flag is set; inspect `committed` / `retry_safe` and reconcile its identity.
+
+Both procurement MCP GETs now always compute through read-only SQLite connections, bypassing
+cache reads/writes and schema initialization even when the token also has write ACLs.
+The ledger warning about legacy cache writes records historical behavior; procurement now
+uses this cache-free path. No refresh permission or refresh tool is introduced. Other legacy read tools can still run
+schema migrations; this change does not claim that all historical GET implementations are
+physically write-free. Audit metadata is still appended as documented.
+
+Admin creation and deferred ACL update/template design: [permission-management.md](./permission-management.md).
 
 ## 7. Operational guarantees
 

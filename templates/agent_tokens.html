@@ -37,32 +37,33 @@
       <input name="name" placeholder="例如: claude-code-prod" required autocomplete="off" />
     </label>
 
-    <label style="margin-top:10px">允许仓库</label>
+    <label>允许读取路径
+      <input name="read_paths" placeholder="例如 /api/v1/items,/api/v1/warehouses" autocomplete="off" />
+    </label>
+    <label>允许写入路径
+      <input name="write_paths" placeholder="留空表示无写权限" autocomplete="off" />
+    </label>
+    <p class="muted">默认无读写权限。逗号分隔；路径包含子路径，末尾 * 表示通配，单独 * 表示全部路径。</p>
+    <label>仓库范围
+      <select name="warehouse_scope">
+        <option value="none" selected>无仓库（[]，默认）</option>
+        <option value="selected">仅指定仓库（请勾选）</option>
+        <option value="all">全部仓库（null，包含未来新增仓库）</option>
+      </select>
+    </label>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px">
-      <label style="display:flex;align-items:center;gap:4px;font-weight:normal;cursor:pointer">
-        <input type="checkbox" name="warehouses" value="" id="wh_all" onclick="
-          document.querySelectorAll('[name=warehouses]').forEach(el=>{if(el!==document.getElementById('wh_all')) el.checked=this.checked});
-        " />
-        全部仓库
-      </label>
       {% for w in warehouses %}
-      <label style="display:flex;align-items:center;gap:4px;font-weight:normal;cursor:pointer;background:#f3f4f6;border:1px solid #d1d5db;border-radius:6px;padding:4px 10px;font-size:13px">
-        <input type="checkbox" name="warehouses" value="{{ w.code }}" onclick="
-          const all = document.getElementById('wh_all');
-          const checked = [...document.querySelectorAll('[name=warehouses]')].filter(el=>el.value&&el.checked).length;
-          all.checked = checked == {{ warehouses|length }};
-        " />
-        {{ w.name }} ({{ w.code }})
+      <label style="display:flex;align-items:center;gap:6px;font-weight:normal">
+        <input type="checkbox" name="warehouses" value="{{ w.code }}" style="width:auto;margin:0">{{ w.name }} ({{ w.code }})
       </label>
       {% endfor %}
     </div>
-    <small class="muted">留空 = 所有仓库</small>
-
+    <small class="muted">选择“仅指定仓库”时勾选；选择“无仓库”或“全部仓库”时请清空勾选。</small>
     <div style="background:#fef9c3;border:1px solid #eab308;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:13px;color:#854d0e">
       <strong>安全提示：</strong>Token 创建后只能看到一次，无法再次查看，请立即复制并妥善保管。
     </div>
 
-    <button type="submit" class="btn primary" style="margin-top:12px">创建 Token</button>
+    <button type="submit" class="btn primary" style="margin-top:12px">预览权限</button>
   </form>
 </details>
 
@@ -74,6 +75,7 @@
       <th style="text-align:left">名称</th>
       <th style="text-align:left">Token</th>
       <th style="text-align:left">仓库权限</th>
+      <th style="text-align:left">读取 / 写入路径</th>
       <th style="text-align:left">创建时间</th>
       <th>状态</th>
       <th>操作</th>
@@ -108,11 +110,14 @@
       <td>
         {% set whs = t.allowed_warehouse_codes_json %}
         {% if whs == 'null' %}
-        <span class="muted">全部仓库</span>
+        <span class="muted">全部仓库（null）</span>
+        {% elif whs == '[]' %}
+        <span class="muted">无仓库（[]）</span>
         {% else %}
         <small>{{ whs }}</small>
         {% endif %}
       </td>
+      <td><small>读取：{{ t.allowed_read_paths_json }}<br>写入：{{ t.allowed_write_paths_json }}</small></td>
       <td>
         <small>{{ t.created_at }}</small>
       </td>

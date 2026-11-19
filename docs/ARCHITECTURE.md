@@ -2893,6 +2893,27 @@ MCP、Bot、配置/权限路径及运行时依赖清单（含 requirements*.txt/
 `docs/agent-framework/mcp-impact.md`；缺声明/非法字段/未知工具/无理由或证据均拒绝。
 纯页面新增可以说明不变或暂不开放，无自动开放 MCP 的要求；批准池与运行时 ACL 不变。
 
+### Issue #24：工具错误与采购 GET 边界
+
+`protocol/server.py` 将捕获的 `McpError` 序列化为 JSON 异常文本，由 SDK 的标准
+异常处理生成 `isError=true` 工具结果（兼容不支持直接返回 CallToolResult 的旧 1.x SDK），
+原 TextContent JSON `{error,message,...details}` 与业务审计 status 保持不变。
+HTTP 传输仍为 200；SDK 参数/未知工具错误仍由 SDK 标记，可能是纯文本。
+混合版本调用方继续检查内层 error，不能仅凭 HTTP 200 判断业务成功。
+绕过 SDK 装饰器的测试需断言序列化异常；真实 SDK/HTTP 契约测试负责确认 wire isError。
+
+`service.procurement` 无论 `AuthContext.read_only` 或写 ACL 如何，均走无缓存只读
+adapter：master/warehouse `mode=ro`，显式配置计算，不读写采购缓存，不初始化 schema。
+Web 采购缓存行为不在本次变更范围；其他旧 GET 的迁移行为也未被整体改写。
+真实 token 认证 + 临时 SQLite + loopback HTTP 测试覆盖冷缓存、过期和失效缓存，
+对比数据/schema/sidecars/backups 原始字节（仅排除审计日志）。不作生产采购调用。
+
+管理页新建默认 read/write=[]、warehouse=[]；历史空仓输入继续是 null=全部仓，
+多仓使用 getlist。管理员先预览规范化 ACL，再提交绑定当前管理员、10 分钟有效的签名确认；
+全部仓/通配路径需额外确认。保存后列表显示 read/write 与 null/[]，创建审计包含 ACL，
+不更新既有 token。创建/列表/撤销的管理员与 CSRF 边界保留。
+模板及原地更新只给设计建议，见 integrations/dailycheck-mcp/permission-management.md。
+
 ### 9.3 双传输模式
 
 | 模式 | 入口 | 鉴权 | 用途 |

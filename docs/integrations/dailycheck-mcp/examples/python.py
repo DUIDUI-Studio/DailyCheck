@@ -114,10 +114,8 @@ def call(method: str, params: dict[str, Any] | None = None, *, _id: int = 1) -> 
         except json.JSONDecodeError:
             raise ToolError("unknown_tool_or_unparseable", text) from None
 
-    # Some tool implementations skip the `isError=true` flag and instead
-    # deliver an error JSON inside the payload. The §5 demo relies on this
-    # branch — but real callers can usually ignore it; the surfaced exception
-    # is the same ToolError either way.
+    # Keep inner-error detection for pre-#24 servers during mixed-version rollout.
+    # Current servers mark business errors isError=true without changing the JSON.
     content = result.get("content") or []
     if content:
         text = content[0].get("text", "")

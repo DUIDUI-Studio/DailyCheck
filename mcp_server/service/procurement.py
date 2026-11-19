@@ -10,11 +10,11 @@ from mcp_server.service.auth import AuthContext, check_warehouse
 from warehouse_paths import resolve_warehouse_path
 
 
-def _get_store_procurement_json():
-    """Lazy import of _store_procurement_json from blueprints.procurement."""
+def _get_readonly_store():
+    """Load the cache-free adapter; never expose the Web cache-writing path."""
     try:
-        from blueprints.procurement import _store_procurement_json
-        return _store_procurement_json
+        from blueprints.procurement import compute_store_procurement  # noqa: F401
+        return _readonly_store
     except (ImportError, ModuleNotFoundError):
         return None
 
@@ -24,10 +24,10 @@ def procurement_store(warehouse_code: str, ctx: AuthContext) -> dict:
         raise ValidationError("warehouse_code_required")
     if not check_warehouse(ctx, warehouse_code):
         raise ForbiddenError("forbidden_warehouse")
-    store_func = _get_store_procurement_json()
+    store_func = _get_readonly_store()
     if store_func is None:
         raise NotFoundError("procurement_not_available")
-    body = _readonly_store(warehouse_code, ctx) if ctx.read_only else store_func(warehouse_code)
+    body = store_func(warehouse_code, ctx)
     if body is None:
         raise NotFoundError("warehouse_not_found")
     return body
@@ -39,7 +39,7 @@ def procurement_hub(
 ) -> list[dict]:
     if warehouse_code and not check_warehouse(ctx, warehouse_code):
         raise ForbiddenError("forbidden_warehouse")
-    store_func = _get_store_procurement_json()
+    store_func = _get_readonly_store()
     if store_func is None:
         return []
     if warehouse_code:
@@ -51,7 +51,7 @@ def procurement_hub(
     for wh in whs:
         if wh is None or not check_warehouse(ctx, wh["code"]):
             continue
-        body = _readonly_store(wh["code"], ctx) if ctx.read_only else store_func(wh["code"])
+        body = store_func(wh["code"], ctx)
         if body:
             result.append(body)
     return aggregate_hub(result)

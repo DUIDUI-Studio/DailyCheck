@@ -22,7 +22,7 @@ class TestProcurementStore:
             procurement_store("WH999", ctx)
 
     @patch("mcp_server.service.procurement.check_warehouse")
-    @patch("mcp_server.service.procurement._get_store_procurement_json")
+    @patch("mcp_server.service.procurement._get_readonly_store")
     def test_procurement_store_success(self, mock_get_func, mock_check):
         """测试成功获取采购建议"""
         mock_check.return_value = True
@@ -42,7 +42,7 @@ class TestProcurementStore:
         assert len(result["items"]) == 1
 
     @patch("mcp_server.service.procurement.check_warehouse")
-    @patch("mcp_server.service.procurement._get_store_procurement_json")
+    @patch("mcp_server.service.procurement._get_readonly_store")
     def test_procurement_store_warehouse_not_found(self, mock_get_func, mock_check):
         """测试仓库不存在"""
         mock_check.return_value = True
@@ -59,7 +59,7 @@ class TestProcurementStore:
         """测试服务不可用"""
         mock_check.return_value = True
 
-        with patch("mcp_server.service.procurement._get_store_procurement_json", return_value=None):
+        with patch("mcp_server.service.procurement._get_readonly_store", return_value=None):
             ctx = AuthContext(1, [], [], None)
             with pytest.raises(NotFoundError) as exc_info:
                 procurement_store("WH001", ctx)
@@ -75,7 +75,7 @@ class TestProcurementHub:
 
     @patch("mcp_server.service.procurement.check_warehouse")
     @patch("mcp_server.service.procurement.list_all_warehouses")
-    @patch("mcp_server.service.procurement._get_store_procurement_json")
+    @patch("mcp_server.service.procurement._get_readonly_store")
     @patch("mcp_server.service.procurement.aggregate_hub")
     def test_procurement_hub_all_warehouses(
         self, mock_aggregate, mock_get_func, mock_list, mock_check
@@ -104,7 +104,7 @@ class TestProcurementHub:
 
     @patch("mcp_server.service.procurement.check_warehouse")
     @patch("mcp_server.service.procurement.resolve_warehouse")
-    @patch("mcp_server.service.procurement._get_store_procurement_json")
+    @patch("mcp_server.service.procurement._get_readonly_store")
     @patch("mcp_server.service.procurement.aggregate_hub")
     def test_procurement_hub_specific_warehouse(
         self, mock_aggregate, mock_get_func, mock_resolve, mock_check
@@ -130,7 +130,7 @@ class TestProcurementHub:
 
     @patch("mcp_server.service.procurement.check_warehouse")
     @patch("mcp_server.service.procurement.resolve_warehouse")
-    @patch("mcp_server.service.procurement._get_store_procurement_json")
+    @patch("mcp_server.service.procurement._get_readonly_store")
     @patch("mcp_server.service.procurement.aggregate_hub")
     def test_procurement_hub_specific_warehouse_not_found(
         self, mock_aggregate, mock_get_func, mock_resolve, mock_check
@@ -150,7 +150,7 @@ class TestProcurementHub:
     def test_procurement_hub_not_available(self, warehouse_code):
         """Missing procurement implementation must degrade before any warehouse DB lookup."""
         with (
-            patch("mcp_server.service.procurement._get_store_procurement_json", return_value=None),
+            patch("mcp_server.service.procurement._get_readonly_store", return_value=None),
             patch("mcp_server.service.procurement.list_all_warehouses") as list_warehouses,
             patch("mcp_server.service.procurement.resolve_warehouse") as resolve_warehouse,
         ):

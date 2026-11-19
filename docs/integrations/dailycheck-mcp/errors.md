@@ -1,6 +1,7 @@
 # DailyCheck MCP — Error Reference
 
-Every response from the MCP server is **either** a top-level JSON-RPC error **or** an HTTP 200 success whose `result` may carry a tool error. Clients must check both layers.
+For `tools/call`, check the HTTP status, the JSON-RPC top-level `error`, and the tool result.
+A tool failure can return HTTP 200 with `result.isError=true`.
 
 ```text
                   ┌─────────────────────────────────────┐
@@ -45,7 +46,7 @@ These appear at the **top level** of the response (`response["error"]`) and **ne
 | 202 | — | (notification accepted) | empty body | Sent `method:"notifications/..."` | None, idempotent |
 | 401 | — | (envelope — not JSON-RPC) | `{"error":"unauthorized","message":"Invalid or missing token"}` | Missing or wrong `Authorization` header | Add/correct token |
 
-The 401 case **is not JSON-RPC** — it is the DailyCheck auth middleware responding before MCP even sees the request. `response["error"]` is **not** present; the body shape is the raw middleware response.
+The 401 case **is not JSON-RPC** — it is the DailyCheck auth middleware responding before MCP even sees the request. The body shape is the raw middleware response with a string `error`, rather than a JSON-RPC error object.
 
 ### Example: missing Accept
 
@@ -114,9 +115,9 @@ A tool call that reaches the handler but fails for business reasons returns **HT
 
 The `text` field is itself a JSON string with `{"error": "<code>", "message": "<human>"}`. **Both layers must be parsed.**
 
-### 2.1 — Tool error codes (validated against live server)
+### 2.1 — Tool error codes (service contract; flags covered by local tests)
 
-| `error.code` (string) | `error.message` | Triggered by | Client action |
+| `error` (string) | `message` | Triggered by | Client action |
 |---|---|---|---|
 | `unauthorized` | `invalid token` | Token reaches middleware, but its hash is not in `agent_tokens` | Rotate / re-grant token; do not retry |
 | `unauthorized` | `DAILYCHECK_MCP_TOKEN not set` | Server admin misconfiguration | Server-side bug; not client-fixable |
@@ -143,7 +144,7 @@ The `text` field is itself a JSON string with `{"error": "<code>", "message": "<
 
 The text is **not JSON here** — it is plain. Always check `isError` before JSON-parsing `text`.
 
-### 2.3 — Real examples from the live server
+### 2.3 — Current contract examples (local SDK/HTTP tests)
 
 **Validation error (missing required arg):**
 
@@ -160,15 +161,17 @@ The text is **not JSON here** — it is plain. Always check `isError` before JSO
 **Forbidden path:**
 
 ```json
-{"content":[{"type":"text","text":"{\"error\": \"forbidden\", \"message\": \"forbidden_path\"}"}],"isError":false}
+{"content":[{"type":"text","text":"{\"error\": \"forbidden\", \"message\": \"forbidden_path\"}"}],"isError":true}
 ```
 
-> **Trap**: `isError` here is **false** even though the inner payload is an error. Always parse `text` and inspect its own `error` key.
+> **Compatibility**: before Issue #24, these business errors had `isError=false`.
+> During rollout, also inspect the inner JSON `error` key. That historical observation
+> does not describe the new contract. No production retest was performed for this fix.
 
 **Not found (missing item):**
 
 ```json
-{"content":[{"type":"text","text":"{\"error\": \"not_found\", \"message\": \"not_found\"}"}],"isError":false}
+{"content":[{"type":"text","text":"{\"error\": \"not_found\", \"message\": \"not_found\"}"}],"isError":true}
 ```
 
 ---
@@ -187,12 +190,20 @@ if "error" in body:
     # JSON-RPC envelope error (§1)
     raise JsonRpcError(body["error"])
 
-if body.get("result", {}).get("isError"):
-    payload = json.loads(body["result"]["content"][0]["text"])
-    raise ToolError(payload["error"], payload["message"])
+result = body["result"]
+text = result["content"][0]["text"]
+try:
+    data = json.loads(text)
+except JSONDecodeError:
+    if result.get("isError"):
+        raise ToolError("sdk_error", text)
+    raise InvalidToolResponse(text)
 
-# success path: parse the data out of result.content[0].text
-data = json.loads(body["result"]["content"][0]["text"])
+# Inner error detection remains for older servers in a mixed-version rollout.
+if result.get("isError") or (isinstance(data, dict) and isinstance(data.get("error"), str)):
+    raise ToolError(data)
+
+return data
 ```
 
 Always treat **HTTP 200 with `isError=true`** as a failure. Treat **HTTP 401 as never-retry-without-fix**. Everything else (HTTP 400/406) is a request-shape bug, not a server problem.
@@ -210,7 +221,7 @@ Always treat **HTTP 200 with `isError=true`** as a failure. Treat **HTTP 401 as 
 
 The service's 409/503 below are **business status attributes**, not promises of
 MCP HTTP transport codes. Always parse the text JSON `error` even when HTTP=200
-and `isError=false`.
+and an older server reports `isError=false`. New servers set `isError=true`.
 
 | `error` | `message` / fields | Action |
 |---|---|---|

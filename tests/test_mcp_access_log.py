@@ -118,7 +118,14 @@ def auth_ctx():
 
 
 def _call(route, name, arguments=None):
-    return asyncio.run(route(name, arguments))
+    from mcp.types import TextContent
+
+    try:
+        return asyncio.run(route(name, arguments))
+    except protocol._SerializedToolError as error:
+        # CapturingServer bypasses the SDK's exception-to-isError adapter.
+        # Real SDK and HTTP assertions live in test_issue24_contract.py.
+        return [TextContent(type="text", text=str(error))]
 
 
 def _entries(log_path):
