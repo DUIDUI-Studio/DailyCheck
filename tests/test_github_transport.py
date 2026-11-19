@@ -9,10 +9,13 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from deploy.scripts import dailycheck_github_app_shim as shim
 from scripts.hosting import AccessRole, HostingClient, HostingConfig, HostingError
 from scripts.prod_agent.github_readiness import GitHubReadinessClient
 from tests.conftest import candidate_python_env
@@ -108,6 +111,139 @@ def api(tmp_path, monkeypatch):
 
 def response(data, **extra):
     return {"data": data, **extra}
+
+
+@pytest.fixture
+def app_issuer(tmp_path, monkeypatch):
+    monkeypatch.setattr(shim, "KEY", tmp_path / "app.pem")
+    monkeypatch.setattr(shim, "ENV", tmp_path / "production.env")
+    monkeypatch.setattr(shim, "SETTINGS", tmp_path / "shim.env")
+    monkeypatch.setattr(shim, "active_settings", {})
+    # The test workstation is unprivileged. The production check requires root.
+    monkeypatch.setattr(shim, "private_file", lambda path: path.stat())
+    monkeypatch.setattr(shim, "jwt", lambda: "fixture-jwt")
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    values = {key: str(tmp_path / key) for key in shim.ENV_KEYS}
+    values.update({shim.FILES[role]: str(shim.token_file(role)) for role in shim.CODE_ROLES})
+    values.update(DAILYCHECK_HOSTING_PROVIDER="github", DAILYCHECK_GITHUB_LANE="ordinary",
+                  DAILYCHECK_GITHUB_REPO=REPO)
+    shim.ENV.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+
+    class Issuer:
+        calls = []
+        unauthorized = False
+        corrupt = None
+
+        def request(self, method, route, bearer, payload=None):
+            assert bearer == "fixture-jwt"
+            self.calls.append((method, route, payload))
+            if route == "/app":
+                return {"id": 5674104, "slug": "dailycheck-prod-gate-duidui"}
+            if method == "GET":
+                if self.unauthorized and route.endswith("DailyCheck-ops/installation"):
+                    raise urllib.error.HTTPError(route, 404, "fixture", None, None)
+                return {"id": 180015273, "app_id": 5674104, "suspended_at": None,
+                        "repository_selection": "selected",
+                        "account": {"id": 353610181, "login": "DUIDUI-Studio",
+                                    "type": "Organization"}}
+            repo_id, = payload["repository_ids"]
+            permissions = payload["permissions"]
+            grant = {"repositories": [{"id": repo_id}], "token": f"fixture-{len(self.calls)}",
+                     "permissions": {**permissions, "metadata": "read"},
+                     "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1))
+                     .strftime("%Y-%m-%dT%H:%M:%SZ")}
+            if self.corrupt and repo_id == 1449125557 and permissions == {"issues": "write"}:
+                grant.update(self.corrupt)
+            return grant
+
+        def enable_ops(self):
+            shim.SETTINGS.write_text("DAILYCHECK_APP_OPS_ENABLED=1\n")
+
+    issuer = Issuer()
+    monkeypatch.setattr(shim, "request", issuer.request)
+    return issuer
+
+
+def test_app_shim_without_ops_preserves_code_refresh(app_issuer, monkeypatch):
+    app_issuer.unauthorized = True
+    monkeypatch.setattr(sys, "argv", ["shim", "--refresh"])
+    shim.main()
+    posts = [body for verb, _, body in app_issuer.calls if verb == "POST"]
+    assert len(posts) == 3
+    assert all(body["repository_ids"] == [1448986421] for body in posts)
+    assert posts[1]["permissions"] == {"pull_requests": "write"}
+    assert not any("DailyCheck-ops" in path for _, path, _ in app_issuer.calls)
+    assert not shim.token_file("ops_read").exists()
+
+
+def test_app_shim_passes_scoped_roles_to_hosting_client(api, app_issuer, monkeypatch):
+    app_issuer.enable_ops()
+    monkeypatch.setattr(sys, "argv", ["shim", "--exec", "fixture-consumer"])
+    ops_root = "/repos/DUIDUI-Studio/DailyCheck-ops"
+    api.write({ops_root: response({
+                   "id": 1449125557, "full_name": "DUIDUI-Studio/DailyCheck-ops",
+                   "private": True, "visibility": "private", "has_issues": True,
+                   "archived": False, "disabled": False,
+                   "url": f"https://api.github.com{ops_root}",
+                   "html_url": "https://github.com/DUIDUI-Studio/DailyCheck-ops",
+               }),
+               f"{ops_root}/issues/6": response({"number": 6}),
+               f"{ops_root}/issues": response({"number": 7}, status=201)})
+
+    def exec_consumer(path, argv):
+        assert (path, argv) == ("fixture-consumer", ["fixture-consumer"])
+        read = api.client(AccessRole.OPS_READ)
+        feedback = api.client(AccessRole.FEEDBACK)
+        report = api.client(AccessRole.REPORT)
+        assert read.verify_repository()["id"] == 1449125557
+        assert read.get(f"{ops_root}/issues/6") == {"number": 6}
+        payload = {"title": "fixture", "body": "fixture", "labels": ["user-feedback"]}
+        with pytest.raises(HostingError, match="read_role_cannot_write"):
+            read.request("POST", f"{ops_root}/issues", payload)
+        with pytest.raises(HostingError):
+            report.request("POST", f"{ops_root}/issues", payload)
+        assert feedback.request("POST", f"{ops_root}/issues", payload)[0] == {"number": 7}
+        actual = api.log()
+        assert [item["method"] for item in actual] == ["GET", "GET", "GET", "POST"]
+        assert "Bearer fixture-8" in actual[0]["config"]
+        assert "Bearer fixture-9" in actual[3]["config"]
+
+    monkeypatch.setattr(os, "execvp", exec_consumer)
+    shim.main()
+    _, _, read = app_issuer.calls[-2]
+    _, _, write = app_issuer.calls[-1]
+    assert read == {"repository_ids": [1449125557], "permissions": {"issues": "read"}}
+    assert write == {"repository_ids": [1449125557], "permissions": {"issues": "write"}}
+    assert shim.token_file("ops_issue").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("fault", [
+    {"repositories": [{"id": 1448986421}]},
+    {"repositories": [{"id": 1449125557}, {"id": 1448986421}]},
+    {"permissions": {"issues": "write", "metadata": "read", "contents": "write"}},
+    {"expires_at": "2000-01-01T00:00:00Z"},
+    {"token": "fixture-8"},
+    {"token": "fixture\ncredential"},
+])
+def test_app_shim_rejects_invalid_ops_grant_before_writing(app_issuer, monkeypatch, fault):
+    app_issuer.enable_ops()
+    app_issuer.corrupt = fault
+    monkeypatch.setattr(sys, "argv", ["shim", "--refresh"])
+    shim.token_file("read").write_text("prior-code-token\n")
+    with pytest.raises(ValueError, match="credential"):
+        shim.main()
+    assert shim.token_file("read").read_text() == "prior-code-token\n"
+    assert not shim.token_file("ops_issue").exists()
+
+
+def test_app_shim_enabled_without_entitlement_does_not_mint(app_issuer, monkeypatch):
+    app_issuer.enable_ops()
+    app_issuer.unauthorized = True
+    monkeypatch.setattr(sys, "argv", ["shim", "--refresh"])
+    with pytest.raises(urllib.error.HTTPError, match="404"):
+        shim.main()
+    assert all(method == "GET" for method, _, _ in app_issuer.calls)
+    assert not shim.token_file("read").exists()
 
 
 def pr(number=160):
