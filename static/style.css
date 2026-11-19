@@ -1628,6 +1628,27 @@ table.bom-table td .bom-temp-price {
   box-sizing: border-box;
 }
 
+/* Ice-cream recipes have nine columns. Reserve room for ingredient names;
+   base.html's .table-scroll wrapper handles narrow screens. */
+.app-shell:has(.bom-table[data-bom-variant="ic"]) {
+  min-width: 0;
+}
+table.bom-table[data-bom-variant="ic"] {
+  min-width: 1120px;
+}
+table.bom-table[data-bom-variant="ic"] thead th:first-child {
+  width: min(320px, calc(100vw - 28px));
+}
+.bom-item-name {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* Compact del-flag label so delete checkbox + word don't overflow */
 .del-flag {
   display: inline-flex;

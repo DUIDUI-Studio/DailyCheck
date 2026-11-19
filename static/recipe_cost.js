@@ -224,10 +224,26 @@
 
   // --- event bindings ---
 
+  function updateItemName(row, sel) {
+    if (getVariant() !== 'ic') return;
+    var name = row.querySelector('.bom-item-name');
+    if (!name) {
+      name = document.createElement('small');
+      name.className = 'bom-item-name';
+      name.setAttribute('aria-hidden', 'true');
+      sel.parentNode.appendChild(name);
+    }
+    var opt = sel.options[sel.selectedIndex];
+    name.textContent = opt ? opt.textContent.trim() : '';
+    sel.title = name.textContent;
+  }
+
   function bindItemSelChange(row) {
     var sel = row.querySelector('.bom-item-sel');
     if (!sel) return;
+    updateItemName(row, sel);
     sel.addEventListener('change', function() {
+      updateItemName(row, sel);
       // 品项切换时：把调整售价重置为新品项的默认销售单价
       var opt = sel.options[sel.selectedIndex];
       var sp = parseFloat(opt.getAttribute('data-sp') || '0');
