@@ -63,7 +63,7 @@
 | B2 | 起点固定 `origin/main`，不用本地分支、不用 `HEAD` |
 | B3 | 建完立刻验 upstream：`git rev-parse --abbrev-ref @{u}` 不得是 `github-legacy/*`。本仓 `origin` = Gitea、`github-legacy` 已废弃，无参数 `git push` 会推错地方（2026-10-24 实际发生） |
 | B4 | 分支命名 `{fix\|feat\|chore\|docs\|ci\|test\|refactor\|perf}/issue-<N>-<slug>` **[机验 H1]** |
-| B5 | 一个 issue 一个分支：分支号必须与 body 的 `Closes #N` 或 `Part-Of: #N` 一致 **[机验 H2]**；不带号的杂活必须写 `No-Issue: <理由>` **[机验 H3]** |
+| B5 | 一个 issue 一个分支：分支号必须与 body 的 `Closes #N` 或 `Part-Of: #N` 一致 **[机验 H2]**；历史 CI 接受 `No-Issue: <理由>` **[机验 H3]**。新 GitHub PR 须先补建工单，见下方提交检查 |
 | B6 | 开工先跑一次全量测试并记下失败数（本地基线 14 条 known），否则分不清后面的红是不是自己造成的 |
 
 #### 分支卫生
@@ -109,6 +109,17 @@
 | F2 / F3 / F4 | merge 权与本地清理都在 CI 之外 |
 
 ### ③ 提 PR（模板强制）
+
+#### GitHub PR 提交检查
+
+每张 GitHub PR 都需要开放的公开需求 Issue 和私有运维来源 Issue。缺少任一工单时，先在对应仓库补单，再准备分支和正文。分支使用公开 Issue 的号码，正文第一行写 `Closes #N`。正式提交入口要求 GitHub 实际识别该关联。
+
+- 创建草稿用 `python -m scripts.agent_framework.pr_submission draft --issue N --ops-issue M --branch BRANCH --title TITLE --body-file BODY`。入口先查两份工单。
+- 用草稿号请 Root 通过现有安装流程登记来源。生产登记须包含该 PR、私有来源和两份工单的真实 ID。
+- 正式转待审用 `python -m scripts.agent_framework.pr_submission ready --pr PR --issue N --ops-issue M --expect-head SHA`。该入口在 GitHub 上回读 PR 及工单，并通过已配对的 Orca `wdg_vps` 只读核对生产登记。任何一项缺失、关闭、冲突或读回失败时停止。将子命令换成 `check` 可只读核验已有 PR。
+
+GitHub 网页允许作者直接把草稿转待审。团队统一使用项目提交入口，Prod 引擎在独立审查前仍会核对实际登记。源登记写入归 Root，正式审查、合并及部署归 Prod。生产只读核对需要已有授权的配对连接。
+
 
 - 新建 PR 自动带出 `.github/PULL_REQUEST_TEMPLATE.md`
 - body 必含 h2 级「**## 报告 1/4：需求对齐**」+「**## Checklist**」+「**## 生产侧事项**」；R 表占位为「红叉 + 待填」，**没填 = 门禁红，全部换成对勾 = 门禁绿**
