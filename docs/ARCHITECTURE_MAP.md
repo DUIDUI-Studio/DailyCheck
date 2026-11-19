@@ -13,7 +13,7 @@
 ## 0. 一览
 
 - 蓝图 25 个（已装配 24 / 未装配 1）
-- 路由 **198** 条（按鉴权强度：平台超管 65 · 登录 53 · 权限点 31 · 角色 29 · 配送中心 10 · 公开 6 · Agent 令牌 3 · 任一权限 1）
+- 路由 **199** 条（按鉴权强度：平台超管 65 · 登录 53 · 权限点 31 · 角色 29 · 配送中心 11 · 公开 6 · Agent 令牌 3 · 任一权限 1）
 - 数据表 **66** 张，`WAREHOUSE_SCHEMA_VERSION = 7`
 - MCP 工具域 9 个
 - ⚠️ 静态解析到但矩阵未登记的路由 5 条（见 §5）
@@ -22,7 +22,7 @@
 
 | 蓝图 | 文件 | 路由数 | 装配 |
 |---|---|---|---|
-| `store_ordering` | `store_ordering.py` | 29 | 在役 |
+| `store_ordering` | `store_ordering.py` | 30 | 在役 |
 | `recipe_cost` | `recipe_cost.py` | 25 | 在役 |
 | `canonical` | `canonical.py` | 20 | 在役 |
 | `production` | `production.py` | 12 | 在役 |
@@ -353,6 +353,7 @@
 | `store_ordering.review_order_route` | POST | `/orders/<int:order_id>/review` | 配送中心 | perm:order.approve |
 | `store_ordering.set_dc_item_multiple` | POST | `/dc/items/multiple` | 配送中心 | role:manager |
 | `store_ordering.ship_order_route` | POST | `/orders/<int:order_id>/ship` | 配送中心 | role:staff |
+| `store_ordering.shipment_export_download` | GET | `/orders/<int:order_id>/deliveries/<int:batch_id>/export.xlsx` | 配送中心 | role:staff |
 | `store_ordering.shipment_list` | GET | `/shipments` | 配送中心 | role:staff |
 | `store_ordering.store_orders_list` | GET | `/orders` | 登录 |  |
 | `store_ordering.submit_order_route` | GET,POST | `/cart/submit` | 权限点 | order.create |

@@ -375,6 +375,7 @@ ROUTE_MATRIX: dict[str, str] = {
     # 兼容层：DC staff 发货是既有行为（order.ship 归 manager 包，迁移会让 DC
     # staff 失去发货能力 → 非白名单行为变化）。施工图 §1.2-E 修正说明。
     "store_ordering.ship_order_route": f"{DC_PREFIX}{ROLE_PREFIX}staff",
+    "store_ordering.shipment_export_download": f"{DC_PREFIX}{ROLE_PREFIX}staff",
     "store_ordering.deliver_order_route": perm("order.ship"),
     # 守卫层记录为 perm:order.receive；但函数体 inline `role not in ("manager","admin")`
     # 使实际放行 manager+（偏严、非漏洞，行为与 main 一致）——留阶段 2 统一。见施工图 §7 R2。
