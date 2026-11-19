@@ -1365,6 +1365,13 @@ whole-run capability v2 可在最终 push 前保持 CI run/attempt 同时为 nul
 `release_parent.py` 保留唯一 Popen，所有 postlaunch 错误路径先正向 wait/ECHILD，再记次错。
 late finalizer/report 在同一 FD/PID/PGID/attempt identity 下刷新既有 App 角色；显式获批的
 Issue-only 两仓 grant 由原 shim 的精确 adapter 在 startup/late report 更新，不扩大现有角色。
+Root 采用的 GitHub App shim 源码见 `deploy/scripts/dailycheck_github_app_shim.py`。
+其生产环境 ABI 保持固定；独立 root-owned `0600` shim 设置显式启用 ops 后才检查私有仓安装，
+签发并验证仅该仓的 `ops_read`（`issues:read`）和 `ops_issue`（`issues:write`）。
+App 安装可为 `selected` 或 `all`，两种模式都按角色校验签发结果中的单仓范围。
+代码仓权限映射保持原样，每个返回凭据都校验单仓、权限、期限和角色独立性。
+正常启动及 `--exec` 将私有仓身份和文件路径交给 `OPS_READ` / `FEEDBACK`；后者仍通过
+现有私有 Issue 建单约束。独立应用进程由其服务配置分别交付凭据。部署采用及摘要批准见下文。
 `release_issues.py` 用 native state/publication/process fence 关联真实成功、linked receipt、
 source tuple 与已确认 Issue19/source Issue；PATCH 前 durable uncertain，丢 ACK 后只准 GET，
 没有第二次 PATCH。无 source/token scope/expiry/repository identity 即 fail closed。
