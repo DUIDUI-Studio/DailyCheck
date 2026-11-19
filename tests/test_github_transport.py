@@ -133,6 +133,7 @@ def app_issuer(tmp_path, monkeypatch):
         calls = []
         unauthorized = False
         corrupt = None
+        selection = "selected"
 
         def request(self, method, route, bearer, payload=None):
             assert bearer == "fixture-jwt"
@@ -143,7 +144,7 @@ def app_issuer(tmp_path, monkeypatch):
                 if self.unauthorized and route.endswith("DailyCheck-ops/installation"):
                     raise urllib.error.HTTPError(route, 404, "fixture", None, None)
                 return {"id": 180015273, "app_id": 5674104, "suspended_at": None,
-                        "repository_selection": "selected",
+                        "repository_selection": self.selection,
                         "account": {"id": 353610181, "login": "DUIDUI-Studio",
                                     "type": "Organization"}}
             repo_id, = payload["repository_ids"]
@@ -176,8 +177,10 @@ def test_app_shim_without_ops_preserves_code_refresh(app_issuer, monkeypatch):
     assert not shim.token_file("ops_read").exists()
 
 
-def test_app_shim_passes_scoped_roles_to_hosting_client(api, app_issuer, monkeypatch):
+@pytest.mark.parametrize("selection", ["selected", "all"])
+def test_app_shim_passes_scoped_roles_to_hosting_client(api, app_issuer, monkeypatch, selection):
     app_issuer.enable_ops()
+    app_issuer.selection = selection
     monkeypatch.setattr(sys, "argv", ["shim", "--exec", "fixture-consumer"])
     ops_root = "/repos/DUIDUI-Studio/DailyCheck-ops"
     api.write({ops_root: response({

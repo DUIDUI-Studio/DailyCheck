@@ -1368,6 +1368,7 @@ Issue-only 两仓 grant 由原 shim 的精确 adapter 在 startup/late report �
 Root 采用的 GitHub App shim 源码见 `deploy/scripts/dailycheck_github_app_shim.py`。
 其生产环境 ABI 保持固定；独立 root-owned `0600` shim 设置显式启用 ops 后才检查私有仓安装，
 签发并验证仅该仓的 `ops_read`（`issues:read`）和 `ops_issue`（`issues:write`）。
+App 安装可为 `selected` 或 `all`，两种模式都按角色校验签发结果中的单仓范围。
 代码仓权限映射保持原样，每个返回凭据都校验单仓、权限、期限和角色独立性。
 正常启动及 `--exec` 将私有仓身份和文件路径交给 `OPS_READ` / `FEEDBACK`；后者仍通过
 现有私有 Issue 建单约束。独立应用进程由其服务配置分别交付凭据。部署采用及摘要批准见下文。
