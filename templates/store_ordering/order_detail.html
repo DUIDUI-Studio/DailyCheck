@@ -355,9 +355,12 @@
 {# —— 发货历史（如有）—— #}
 {% if order.deliveries %}
 <h3>发货历史</h3>
+{% if exportable_batches %}
+<p class="muted">文件名标记「资料待补」时，请先核对外部编码、规格和收货资料。</p>
+{% endif %}
 <div class="table-scroll"><table class="data-table">
   <thead>
-    <tr><th>配送单号</th><th>出库人</th><th>出库时间</th><th>物流备注</th></tr>
+    <tr><th>配送单号</th><th>出库人</th><th>出库时间</th><th>物流备注</th>{% if exportable_batches %}<th>订货单</th>{% endif %}</tr>
   </thead>
   <tbody>
     {% for d in order.deliveries %}
@@ -366,6 +369,9 @@
       <td>{{ d.shipped_by_username or d.shipped_by }}</td>
       <td>{{ d.shipped_at }}</td>
       <td>{{ d.tracking_note or '—' }}</td>
+      {% if exportable_batches %}
+      <td>{% if d.id in exportable_batches %}<a class="btn-sm" href="{{ url_for('store_ordering.shipment_export_download', order_id=order.id, batch_id=d.id) }}">下载订货单 Excel</a>{% else %}—{% endif %}</td>
+      {% endif %}
     </tr>
     {% endfor %}
   </tbody>

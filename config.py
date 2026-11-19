@@ -21,6 +21,9 @@ DB_DIR = Path(_DB_DIR_ENV) if _DB_DIR_ENV else BASE_DIR / "db"
 MASTER_DB = DB_DIR / "master.db"
 WAREHOUSE_DB_DIR = DB_DIR / "warehouses"
 
+# Optional private mappings for DC shipment workbooks, kept outside the checkout.
+SHIPMENT_EXPORT_PROFILE_PATH = os.environ.get("DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH")
+
 IS_PRODUCTION = os.environ.get("DAILYCHECK_ENV") == "production"
 SECRET_KEY = os.environ.get("DAILYCHECK_SECRET_KEY")
 # Known-insecure values that must never be accepted in production.

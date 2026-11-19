@@ -1,10 +1,14 @@
 """Route tests for distribution-center store-ordering flows."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
+from io import BytesIO
+from urllib.parse import unquote
 
 import pytest
+from openpyxl import load_workbook
 
 from db import init_master_db, init_warehouse_db
 
@@ -178,6 +182,149 @@ def test_review_approve(dc_env):
     status = master.execute("SELECT status FROM store_orders WHERE id=?", (dc_env["order_id"],)).fetchone()["status"]
     master.close()
     assert status == "approved"
+
+
+def test_shipment_workbook_uses_each_committed_batch(dc_env, tmp_path, monkeypatch):
+    import config
+
+    client = dc_env['client']
+    order_id = dc_env['order_id']
+    detail = f'/store-ordering/orders/{order_id}'
+    label = '下载订货单 Excel'.encode()
+    profile = tmp_path / 'shipment-profile.json'
+    profile.write_text(json.dumps({'dc_test': {
+        'stores': {'store_test': {'code': 'STORE-001', 'brand': '测试品牌',
+                                  'recipient': '示例收货人', 'phone': '01234567890',
+                                  'address': '示例地址'}},
+        'items': {'IC-000101': {'code': 'ITEM-001', 'spec': '2 件/箱', 'unit': '箱',
+                                'base_unit': '件', 'base_units_per_order_unit': '2'}},
+    }}, ensure_ascii=False), encoding='utf-8')
+    monkeypatch.setattr(config, 'SHIPMENT_EXPORT_PROFILE_PATH', str(profile))
+    master = sqlite3.connect(dc_env['master_path'])
+    try:
+        item_id = master.execute('SELECT id FROM store_order_items WHERE order_id=?',
+                                 (order_id,)).fetchone()[0]
+        master.execute("UPDATE store_orders SET note='=1+1' WHERE id=?", (order_id,))
+        master.commit()
+
+        _login_as(client, 2, 1)
+        assert label not in client.get(detail).data
+        assert client.get(f'{detail}/deliveries/1/export.xlsx').status_code == 404
+        assert client.post(f'{detail}/review', data={'decision': 'approved'}).status_code == 302
+        assert label not in client.get(detail).data
+        assert client.get(f'{detail}/deliveries/1/export.xlsx').status_code == 404
+
+        _login_as(client, 3, 1)
+        first = {'op_no': 'first-export-batch', f'shipped_items[{item_id}]': '1.5'}
+        assert client.post(f'{detail}/ship', data=first, follow_redirects=True).data.count(label) == 1
+        assert client.post(f'{detail}/ship', data=first, follow_redirects=True).data.count(label) == 1
+        second = {'op_no': 'second-export-batch', f'shipped_items[{item_id}]': '3.5'}
+        assert client.post(f'{detail}/ship', data=second, follow_redirects=True).data.count(label) == 2
+
+        order_no = master.execute('SELECT order_no FROM store_orders WHERE id=?',
+                                  (order_id,)).fetchone()[0]
+        batches = master.execute('SELECT id, delivery_no FROM store_order_deliveries ORDER BY id').fetchall()
+        assert len(batches) == 2
+        for (batch_id, delivery_no), quantity in zip(batches, (0.75, 1.75), strict=True):
+            response = client.get(f'{detail}/deliveries/{batch_id}/export.xlsx')
+            assert response.status_code == 200
+            assert response.mimetype == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            assert 'attachment' in response.headers['Content-Disposition']
+            assert delivery_no in response.headers['Content-Disposition']
+            assert '资料待补' not in unquote(response.headers['Content-Disposition'])
+            assert response.headers['Cache-Control'] == 'private, no-store'
+            workbook = load_workbook(BytesIO(response.data))
+            assert workbook.sheetnames == ['门店订货单模板']
+            sheet = workbook.active
+            assert (sheet.max_row, sheet.max_column) == (2, 18)
+            assert [cell.value for cell in sheet[1]] == [
+                '序号', '来源单号', '订货单号', '序号', '门店编码', '品牌', '门店名称', '收货人',
+                '收件人电话', '收货地址', '品项名称', '品项编码', '规格', '订货单位', '订货数量',
+                '期望到货日期', '是否加急', '备注',
+            ]
+            assert [cell.value for cell in sheet[2][:15]] == [
+                1, delivery_no, order_no, 1, 'STORE-001', '测试品牌', '测试门店', '示例收货人',
+                '01234567890', '示例地址', '测试包材A', 'ITEM-001', '2 件/箱', '箱', quantity,
+            ]
+            assert sheet['P2'].is_date
+            assert sheet['Q2'].value is None
+            assert sheet['R2'].value == '=1+1'
+            assert sheet['R2'].data_type == 's'
+            assert sheet['F1'].fill.fgColor.rgb.endswith('FFFF00')
+            assert sheet.column_dimensions['J'].width == 52.5
+
+        url = f'{detail}/deliveries/{batches[0][0]}/export.xlsx'
+        for user, warehouse, status in ((1, 2, 403), (4, 4, 404), (5, 2, 403), (5, 4, 404)):
+            _login_as(client, user, warehouse)
+            assert client.get(url).status_code == status
+            assert label not in client.get(detail).data
+        _login_as(client, 5, 1)
+        assert client.get(url).status_code == 200
+        assert client.get(f'/store-ordering/orders/{order_id + 1}/deliveries/{batches[0][0]}/export.xlsx').status_code == 404
+        _login_as(client, 3, 1)
+        master.execute("UPDATE users SET is_active=0 WHERE id=3")
+        master.commit()
+        assert client.get(url).status_code == 403
+        assert label not in client.get(detail).data
+        master.execute("UPDATE users SET is_active=1 WHERE id=3")
+        master.execute("INSERT INTO tenants (id, name, created_at) VALUES (2, '测试租户', datetime('now'))")
+        master.execute("UPDATE warehouses SET tenant_id=2 WHERE code='store_test'")
+        master.commit()
+        assert client.get(url).status_code == 403
+        assert label not in client.get(detail).data
+        assert master.execute('SELECT COUNT(*) FROM store_order_deliveries').fetchone()[0] == 2
+        with sqlite3.connect(dc_env['dc_path']) as dc:
+            assert dc.execute('SELECT quantity FROM items WHERE canonical_id=101').fetchone()[0] == 95
+    finally:
+        master.close()
+
+
+@pytest.mark.parametrize('ineligible', ['history_without_lines', 'dc_transfer', 'not_approved'])
+def test_shipment_workbook_requires_approved_store_order_and_batch_lines(dc_env, ineligible):
+    client = dc_env['client']
+    order_id = dc_env['order_id']
+    detail = f'/store-ordering/orders/{order_id}'
+    _login_as(client, 2, 1)
+    assert client.post(f'{detail}/review', data={'decision': 'approved'}).status_code == 302
+    assert client.post(f'{detail}/ship').status_code == 302
+    with sqlite3.connect(dc_env['master_path']) as master:
+        batch_id = master.execute('SELECT id FROM store_order_deliveries').fetchone()[0]
+        if ineligible == 'dc_transfer':
+            master.execute("UPDATE store_orders SET flow_type='dc_transfer' WHERE id=?", (order_id,))
+        elif ineligible == 'not_approved':
+            master.execute('UPDATE store_orders SET approved_at=NULL WHERE id=?', (order_id,))
+        else:
+            master.execute('DELETE FROM store_order_delivery_items WHERE delivery_id=?', (batch_id,))
+    assert '下载订货单 Excel'.encode() not in client.get(detail).data
+    assert client.get(f'{detail}/deliveries/{batch_id}/export.xlsx').status_code == 404
+
+
+def test_shipment_workbook_flags_missing_data_and_invalid_unit_conversion(dc_env, tmp_path, monkeypatch):
+    import config
+
+    client = dc_env['client']
+    detail = f'/store-ordering/orders/{dc_env["order_id"]}'
+    _login_as(client, 2, 1)
+    assert client.post(f'{detail}/review', data={'decision': 'approved'}).status_code == 302
+    assert client.post(f'{detail}/ship').status_code == 302
+    with sqlite3.connect(dc_env['master_path']) as master:
+        batch_id = master.execute('SELECT id FROM store_order_deliveries').fetchone()[0]
+    url = f'{detail}/deliveries/{batch_id}/export.xlsx'
+    monkeypatch.setattr(config, 'SHIPMENT_EXPORT_PROFILE_PATH', None)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert '资料待补' in unquote(response.headers['Content-Disposition'])
+    sheet = load_workbook(BytesIO(response.data)).active
+    assert (sheet['E2'].value, sheet['H2'].value, sheet['L2'].value) == ('store_test', None, 'IC-000101')
+    assert (sheet['N2'].value, sheet['O2'].value) == ('件', 5)
+
+    path = tmp_path / 'invalid-shipment-profile.json'
+    monkeypatch.setattr(config, 'SHIPMENT_EXPORT_PROFILE_PATH', str(path))
+    for factor in ('1e+500', '1e-500', '1e-1000000'):
+        path.write_text(json.dumps({'dc_test': {'items': {'IC-000101': {
+            'unit': '箱', 'base_unit': '件', 'base_units_per_order_unit': factor,
+        }}}}), encoding='utf-8')
+        assert client.get(url).status_code == 503
 
 
 def test_admin_without_warehouse_binding_sees_ship_form(dc_env):

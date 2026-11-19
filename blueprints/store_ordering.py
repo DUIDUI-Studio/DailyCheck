@@ -30,6 +30,7 @@ import config as config_module
 from blueprints import dc_transfer_pure as dtp
 from blueprints import order_changes_pure as ocp
 from blueprints import payment_proofs_pure as ppp
+from blueprints import shipment_export
 from blueprints import store_ordering_pure as sop
 from blueprints import wecom_notify_pure as wecom_notify
 from blueprints._helpers import parse_qty
@@ -193,6 +194,14 @@ def _assert_order_belongs_to_current_dc(master: sqlite3.Connection, order_id: in
     # 历史无明细行的单据只有头仓可用（与订单板兜底一致）。
     if head_dc != current:
         abort(403)
+
+
+def _can_download_shipment(master: sqlite3.Connection, order, dc_code: str) -> bool:
+    try:
+        ocp.assert_ship_permission(master, order, int(g.user['id']), dc_code)
+    except ValueError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1016,12 @@ def order_detail(order_id: int) -> str:
     is_dc_receiver = wh_type == sop.WAREHOUSE_TYPE_DC and is_receiving
     is_dc_view = wh_type == sop.WAREHOUSE_TYPE_DC and not is_dc_receiver
     current_wh_code = _current_warehouse_code()
+    can_ship = is_dc_view and (is_admin or role in ("staff", "manager", "admin"))
+    exportable_batches = (
+        shipment_export.exportable_batch_ids(master, order_id, current_wh_code)
+        if (can_ship and current_wh_code and order['deliveries']
+            and _can_download_shipment(master, order, current_wh_code)) else set()
+    )
 
     # 多仓履约（Task 8 / D4）：审批按钮按「全部参与仓 order.approve」展示；
     # 缺权时把缺失仓清单显示在页面上，而不是只给一个无信息的 403。
@@ -1128,10 +1143,8 @@ def order_detail(order_id: int) -> str:
         # 保持同一判定（permissions.py:212 — is_admin 一律放行）。缺这个分支
         # 会出现「路由允许写、界面不给按钮」：管理员进了未绑 warehouse_users 的
         # 配送中心仓时 g.role 为 None，发货区整块不渲染（2026-11-02 蓝天大厦）。
-        can_ship=(
-            is_dc_view
-            and (is_admin or role in ("staff", "manager", "admin"))
-        ),
+        can_ship=can_ship,
+        exportable_batches=exportable_batches,
         can_propose_change=(config_module.ORDER_CHANGES_ENABLED and order['status'] in ('pending','approved') and not any(p['status']=='pending' for p in order['change_history']) and ocp.can_propose(master, order, int(g.user['id']), current_wh_code)),
         current_warehouse_code=current_wh_code,
         ship_progress=ship_progress,
@@ -1146,6 +1159,45 @@ def order_detail(order_id: int) -> str:
         # 付款凭证（Issue #135）：门店提交时上传，DC/财务审批时在详情页查看。
         payment_proofs=ppp.list_proofs(master, order_id),
     )
+
+
+@bp.route("/orders/<int:order_id>/deliveries/<int:batch_id>/export.xlsx")
+@require_login
+@require_warehouse_type("distribution_center")
+@require_role("staff")
+def shipment_export_download(order_id: int, batch_id: int):
+    # As with shipment submission, even admins must select the actual sending DC.
+    dc_code = _current_warehouse_code()
+    if _current_warehouse_type() != sop.WAREHOUSE_TYPE_DC or dc_code is None:
+        abort(403)
+    master = get_master_db()
+    batch = shipment_export.get_batch(master, order_id, dc_code, batch_id)
+    if batch is None:
+        abort(404)
+    if not _can_download_shipment(master, batch, dc_code):
+        abort(403)
+    lines = shipment_export.get_batch_lines(master, batch_id, order_id, dc_code)
+    if not lines:
+        abort(404)
+    try:
+        profile = shipment_export.shipment_profile(config_module.SHIPMENT_EXPORT_PROFILE_PATH, dc_code)
+        workbook, complete = shipment_export.make_workbook(batch, lines, profile)
+    except (OSError, ValueError):
+        logger.warning("Unable to render shipment export for order %s batch %s", order_id, batch_id)
+        abort(503, description="暂时无法生成订货单，请核对发货导出配置后重试。")
+
+    shipment_date = batch['shipped_at'][:10].replace('-', '')
+    suffix = "" if complete else "-资料待补"
+    response = send_file(
+        workbook,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=(
+            f"门店订货单{shipment_date}-{batch['order_no']}-{batch['delivery_no']}{suffix}.xlsx"
+        ),
+    )
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
 
 
 @bp.route("/orders/<int:order_id>/payment-proofs/<int:proof_id>")
