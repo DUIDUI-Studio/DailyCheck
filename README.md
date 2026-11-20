@@ -56,4 +56,6 @@ DAILYCHECK_SECRET_KEY=dev-key-change-me flask --app app run --host 0.0.0.0 --por
 
 ## 生产部署
 
-CI 由 hub1 上的 **Gitea Actions** 执行（`.github/workflows/ci.yml`），合并后由 Prod Agent 走蓝绿流程部署到 VPS，详情见 `CLAUDE.md`。
+正式仓库为 `DUIDUI-Studio/DailyCheck`。GitHub Actions 执行 `test` 与 `agent-framework-reports` 两项必需检查。
+Prod Agent 独立审查后执行候选蓝绿部署，验证与观察通过后才执行合并。交付还须核对工单关闭及生产成功回报。
+参见 [协作工作流](docs/agent-framework/workflow.md)。

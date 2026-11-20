@@ -57,6 +57,8 @@
 
 #### 工作区隔离（硬要求）
 
+GitHub 工作项按 §三″ 核对 `origin` 和 upstream。B3 中的 Gitea 远端是 2026-10-24 的旧平台记录。
+
 | # | 规则 |
 |---|------|
 | B1 | 一律独立 worktree，**禁止在主工作树提交**：`git worktree add /tmp/dc-<N> -b <branch> origin/main` |
@@ -155,13 +157,18 @@ PR body 的「生产侧事项」段落是 Dev 留给 Prod Agent 的**唯一**部
 - **允许 Dev 声明风险**：可以写"本次触及 X，生产验证时该类变更常见的失败模式是 Y 类"，这是提示不是指令。
 - Prod Agent 对 PR 内容本身有异议（设计/风险/范围）：**不 merge**，在 PR 评论打回并开 Issue 转 Dev；merge 判定权含否决权。
 
-### ④ CI 门禁（Gitea 分支保护 `main` 强制）
+### ④ CI 门禁（按当前 Git 平台的受保护 `main` 核对）
+
+下表保留 Gitea 的 check 全名；GitHub 以实际 workflow/check/run 身份核验 `test` 与
+`agent-framework-reports`。切换 hosting 不降低检查内容，也不证明生产 lane 已获授权或激活。
 
 | check | 内容 | 全绿标准 |
 |-------|------|---------|
 | `CI / test (pull_request)` | pytest 全量 + 零新增门禁 | `check_known_failures.py` exit 0（失败集 ⊆ known_failures.txt） |
 | `CI / agent-framework-reports (pull_request)` | 四报告齐全性 + MCP 台账/影响评估 | 报告 01（body 段落）+ 02（pytest gate）+ 03（ruff/bandit）+ 04（CI 自动生成）+ MCP 台账/文档一致、影响声明有效 |
-| `CI / deploy (pull_request)` | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：至少一次手动 workflow_dispatch 演练跑通） |
+| `CI / deploy (pull_request)`（Gitea 历史） | 生产部署 | **永不自动触发**（2026-10-11 Eric 拍板禁用，仅 workflow_dispatch；正式启用前置：至少一次手动 workflow_dispatch 演练跑通） |
+
+当前 GitHub PR 由 [CI 工作流](../../.github/workflows/ci.yml) 运行两项必需检查。`workflow_dispatch` 只运行 `test`。生产蓝绿流程按 §四、§五执行。
 
 报告体系：01 需求对齐（Dev 填）/ 02 测试（CI）/ 03 代码质量（CI）/ 04 本地部署预演（CI 占位）/ 05 生产验证（Prod Agent 的 verify.sh 自动落盘 `backups/prod-verifications/`）。
 
@@ -177,7 +184,7 @@ pytest 仅由 test 运行一次，reports 复用 exact repo/workflow blob/run/at
 member manifest 和 digest 绑定的原 native/session/hash proof，实际执行全部报告/成员门禁。
 reports always 运行并显式拒绝缺失/失败/跳过 upstream；其 attestation 链接实际可信 test
 artifact/envelope，不创建自己的 pytest session 或退出码。成员四报告/body/MCP/redline/hygiene
-义务不减。现有 main push/workflow_dispatch test 开销保留，本次不改触发器或分片。
+义务不减。GitHub 的 main push 跳过这两个 job。旧 Gitea 的 main push test 和手动 CI 入口保留。
 Prod 验证 approved workflow/check/run/attempt/App/evidence identity，不只看同名 green。
 approved producer 还必须包含实际执行的 helper closure、known baseline 与固定 runtime。
 protected policy pin 和 approved YAML literal pin 独立固定 manifest Git blob；不从 candidate
@@ -231,19 +238,22 @@ CI 两必需 check 全绿后，Prod Agent 会自动接手独立审查和候选�
 - pre-push hook（`core.hooksPath` → `~/.workbuddy/git-hooks`）2026-10-19 起是**黑名单**：只拦「删除远程分支」和「非快进覆盖」，新分支/快进照常放行。
   仍建议 `git push --no-verify`（避开 hook 里的网络调用），但不再强制。
 
-## 三″、平台命令对照（2026-10-22 迁至自托管 Gitea）
+## 三″、平台命令对照（按实际 origin 选用）
 
-CI/CD 已从 GitHub 迁到 hub1 上的 Gitea 28.1（`http://172.28.129.216:3000`，VPC 内网）。
-agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <token>`）。
+2026-11-15 本工作区 `origin` 为 `https://github.com/DUIDUI-Studio/DailyCheck.git`。
+GitHub 工作项使用可用的 GitHub 连接器或既有 `gh` 登录；旧 Gitea 工作项使用 Gitea
+REST API。先核对 remote、仓库、Issue/PR 身份；不同平台同号不是同一工作项。
+以下 Gitea 地址与 API 仅为旧部署的兼容说明，不要求新 GitHub 任务返回 Gitea。
+生产 hosting、受保护策略与发布 lane 以已授权的实时配置为准；本流程调整不激活它们。
 
-| 动作 | 原 GitHub 命令 | 现在（Gitea API） |
+| 动作 | GitHub | Gitea（旧平台） |
 |---|---|---|
 | 列 open PR | `gh pr list --state open` | `GET /api/v1/repos/{o}/{r}/pulls?state=open` |
 | 看单个 PR | `gh pr view N` | `GET /api/v1/repos/{o}/{r}/pulls/N` |
 | 建 PR | `gh pr create --draft` | `POST /api/v1/repos/{o}/{r}/pulls`，body `{head, base, title, body}` |
 | 改 PR body | `gh pr edit N --body` | `PATCH /api/v1/repos/{o}/{r}/pulls/N`，body `{"body": "..."}` |
 | 查 check 状态 | `gh pr checks` | `GET /api/v1/repos/{o}/{r}/commits/{sha}/status` |
-| merge | `gh pr merge N --merge` | `POST /api/v1/repos/{o}/{r}/pulls/N/merge`，body `{"do":"merge"}`（**小写**，swagger 的 required 字段名就是 `do`） |
+| merge（仅 Prod Agent） | ordinary 路径按 §四、§五执行受保护的 deploy-first FF-only 流程 | `POST /api/v1/repos/{o}/{r}/pulls/N/merge`，body `{"do":"merge"}`（**小写**，swagger 的 required 字段名就是 `do`） |
 | 发评论 | `gh pr comment N` | `POST /api/v1/repos/{o}/{r}/issues/N/comments` |
 | 开 issue | `gh issue create` | `POST /api/v1/repos/{o}/{r}/issues` |
 
@@ -256,7 +266,7 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 3. **没有 `check_suite` 事件**。Gitea 用 `status` 事件代替（每次 commit status 变化触发一次），
    payload 里没有 PR 关联信息，需按 `sha` 反查 open PR。
 
-### 三″.1 地址与凭据（选错地址会直接 000）
+### 三″.1 旧 Gitea 地址与凭据（仅适用于该平台）
 
 | 你在哪 | API 根 | 判断方法 |
 |---|---|---|
@@ -274,7 +284,7 @@ agent 侧不再用 `gh`，改为直连 Gitea REST API（`Authorization: token <t
 - 分支保护 `main`：禁止直推（`enable_push=false`），必需 check =
   `CI / test (pull_request)` + `CI / agent-framework-reports (pull_request)`。
 
-### 三″.2 五个高频坑（都实测过）
+### 三″.2 旧 Gitea 故障经验（不是当前 GitHub 配置）
 
 1. **别从旧分支开 PR**。GitHub 时代的旧分支自带旧 `ci.yml`（其中一步要去 github.com 下载 Python），
    在 hub1 上会超时重试，CI 能跑 1.5 小时。开 PR 前先 `git rebase origin/main`。
@@ -390,8 +400,12 @@ Agent、部署主机和 §五 deploy-first exact-H FF-only 蓝绿链路；本次
 观察、原 attempt fence 均保留。最终仅允许 Prod 专用显式 finalization 凭据执行单次
 GraphQL `updateRefs` 原子 batch：main B→H、同仓 head ref H→H，均 expected OID /
 force=false；还须实际重读 PR merged 且 main=H 才收成功。间接 merged 不替代 review /
-checks；当前 GitHub main 保护未证明激活，生产切换前须独立对齐保护，不得绕过。
+checks。生产切换前须独立对齐 GitHub main 保护，不得绕过。
 这只授权本地 adapter 与本段说明，不授权安装凭据、修改保护、push、merge 或部署。
+
+**2026-11-13 核心生产切换。** GitHub ordinary 路径完成候选部署与生产验证，[PR #13](https://github.com/DUIDUI-Studio/DailyCheck/pull/13) 合入 main，同一提交的[两项必需检查](https://github.com/DUIDUI-Studio/DailyCheck/actions/runs/43414938873)通过，Prod 发布[成功回报](https://github.com/DUIDUI-Studio/DailyCheck/pull/13#issuecomment-6853951834)。
+这是当次切换的记录。后续生产版本按实际部署回报核对。
+下述 Issue164 native-only merge queue 的生产放行仍需独立证明准入与激活。
 
 Prod 独立 review → 在既有 attempt fence 下 checkout G → 全部现有蓝绿 verification /
 切流量 / ≥10min 真实观察 → durable verified journal → 最终 live 重读 → durable grant_intent
