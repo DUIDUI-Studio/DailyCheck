@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp import types
 
 import mcp_server.data.unit_of_work as uow
 import mcp_server.infra.access_log as access_log_module
@@ -39,13 +40,18 @@ class CapturingServer:
     def __init__(self, name: str) -> None:
         self.name = name
         self.handler = None
+        self.request_handlers = {}
 
     def list_tools(self):
-        return lambda handler: handler
+        def register(handler):
+            self.request_handlers[types.ListToolsRequest] = handler
+            return handler
+        return register
 
     def call_tool(self):
         def register(handler):
             self.handler = handler
+            self.request_handlers[types.CallToolRequest] = handler
             return handler
 
         return register

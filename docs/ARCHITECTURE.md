@@ -2211,7 +2211,7 @@ flowchart LR
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v8**（私有反馈回执表；仓库仍为 v7，互不混用）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v9**（MCP 策略预设及身份绑定；仓库仍为 v7，互不混用）。
 
 ---
 
@@ -2910,6 +2910,26 @@ CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确�
 `--transport http --host 0.0.0.0 --port 5100`。StreamableHTTP manager配置
 `json_response=True, stateless=True`；legacy SSE端点仍挂载。health的DB检查仅`SELECT 1`，
 不证明schema完整或工具成功；所有HTTP路由都经过AuthMiddleware。MCP代码变动须重启进程。
+
+#### 按令牌绑定的门店只读策略（GitHub #39）
+
+既有 `/api/mcp/` 的同一 MCP Server 与 StreamableHTTP 管理器接受独立的策略令牌。
+身份验证使用 `agent_tokens` 的哈希、前缀、吊销及配额。策略令牌使用独立命名空间，
+旧读路径、写路径和仓库授权都保存为 `[]`。限定身份只在该入口解析，始终绕过共享
+环境凭据。每次请求读取该令牌 ID 的明确绑定和相应预设版本。缺失、撤销、停用或不
+符合策略契约的记录拒绝认证。
+
+同一授权判定决定工具发现和调用；现有 `items_detail` 与 `store_order_list` 使用
+策略允许的工具集合、明确门店和字段投影。限定视图不写入 SDK 的普通工具缓存，
+普通客户端和 Bot 的工具登记、输入契约和授权逻辑沿用原有路径。限定数据只从已存在
+的 SQLite 文件读取，使用 `mode=ro`、`query_only` 和只读 SQL authorizer。
+限定连接拒绝 WAL 模式，避免 SQLite 只读连接改动辅助文件。
+
+管理员在原 Token 页面发布预设新版本，从明确的版本和门店集合生成预览。签名确认
+绑定操作者、登录会话、完整授权快照和一次性编号。签发在同一事务写入令牌和不可变
+绑定，作出签发决定时重新校验预设和门店。短期确认重放和同名有效限定身份被拒绝。
+明文只进入签发响应；事务在绑定中保留签发和撤销的人及时间。发布新版本不改动旧绑定。
+详见 [MCP 配置与策略预设](mcp-configuration.md#storefront-read-policy-presets)。
 
 ### 9.4 鉴权回退链
 

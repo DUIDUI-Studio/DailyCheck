@@ -134,6 +134,63 @@ curl -H "Authorization: Bearer your_token" http://YOUR_HOST_IP:5100/health
 
 ---
 
+## Storefront read policy presets
+
+Policy tokens use the same StreamableHTTP endpoint, `/api/mcp/`. On
+**Agent Token 管理**, a platform administrator publishes a named preset by
+selecting return fields for `inventory.read`, `orders.read`, or both.
+Publishing the same name creates another immutable version. Each action
+requires at least one safe field.
+
+In **创建受限策略令牌**, select the exact preset version and each storefront.
+The preview shows the actions, returned fields, and order ownership scope.
+Confirm within ten minutes from the same signed-in session. The confirmation
+binds the exact operator, version, fields and storefronts. The new token is
+shown once on a private, no-store page. The database stores its hash,
+lookup prefix, immutable policy binding, and the issuing administrator and
+timestamp. The bearer is kept out of the Flask session and the recoverable
+legacy token field.
+
+| Action | Existing MCP tool | Scope |
+|---|---|---|
+| `inventory.read` | `items_detail` | Exact authorized `warehouse_code` and positive `item_id`. Possible fields are `sku`, book quantity `current_stock`, `unit`, and source `updated_at`. |
+| `orders.read` | `store_order_list` | Ordinary orders whose initiating `store_warehouse_code` is authorized. Optional exact warehouse, status, limit and offset filters. The policy controls order number, initiating store, status, order dates and `fulfillment`. |
+
+An omitted order warehouse filters to all explicitly bound storefronts.
+Requests can use only declared input arguments. Disallowed actions, extra
+arguments and foreign warehouse filters return tool errors. Amounts, costs,
+line details, tracking, people and notes are outside the policy vocabulary.
+
+When selected, `fulfillment` returns authorized warehouse names and source
+timestamps. Shipments use the batch's recorded shipment time. Receipts use
+an applied receipt's recorded time and its same-order line's explicit
+source. An applied receipt has no direct delivery-batch link. Known
+out-of-scope facts are suppressed. A corroborated legacy single-source
+outside warehouse suppresses otherwise unassigned facts on that order.
+Mixed orders retain genuinely unassigned timestamps at order level, even
+when the primary warehouse is outside the policy. Empty event arrays mean
+no confirmed fact is available in this scope.
+
+Publishing a replacement preset version leaves existing bindings intact.
+To rotate a token, preview and issue a new binding, confirm its scope with
+the client, then revoke the old row through **Agent Token 管理**. A replayed
+confirmation or a second active policy token with the same name is refused.
+The next request using a revoked token receives HTTP 401.
+
+The reserved bearer namespace is accepted through StreamableHTTP only.
+All three legacy ACL columns are empty, so earlier versions may advertise
+their static catalog but cannot use the bearer to read business fields or
+warehouse names. Revoke policy tokens before rolling back across the new
+behavior and verify rejection on both versions. Master schema v9 is additive
+and retains policy and revoke provenance during code rollback.
+
+Existing source databases use rollback-journal mode for scoped access.
+SQLite read-only WAL connections can update sidecars, so the guard checks
+the database header before connecting. Keep the journal mode and registered
+paths stable during requests. The pre-open check cannot synchronize a
+concurrent operator change. Routine tool metadata may be appended to the
+existing access log.
+
 ## Available Tools
 
 The live server registers **29 tools**: 14 inventory/document/analysis tools,

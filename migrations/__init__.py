@@ -16,6 +16,8 @@ from collections.abc import Callable
 
 from migrations.feedback_receipts import registered_down as feedback_receipts_down
 from migrations.feedback_receipts import registered_up as feedback_receipts_up
+from migrations.mcp_policy_presets import registered_down as mcp_policies_down
+from migrations.mcp_policy_presets import registered_up as mcp_policies_up
 from migrations.multi_warehouse_fulfillment import (
     migrate_multi_warehouse_fulfillment,
     registered_down,
@@ -120,4 +122,6 @@ MIGRATIONS: list[Migration] = [
      order_changes_up, order_changes_down),
     (8, "private feedback delivery receipts（Issue #162）",
      feedback_receipts_up, feedback_receipts_down),
+    (9, "versioned MCP policy presets and durable token bindings",
+     mcp_policies_up, mcp_policies_down),
 ]
