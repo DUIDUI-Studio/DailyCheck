@@ -74,6 +74,9 @@ pip install -r requirements.txt
 DAILYCHECK_SECRET_KEY=dev-key-change-me flask --app app run --host 0.0.0.0 --port 5001 --debug
 ```
 
+开发环境的 Web 健康响应只确认当前进程可用。MCP 匿名请求返回 401
+确认鉴权入口会拒绝匿名访问。正式发布另从实际生产路由读回在服版本和部署回执。
+
 ## 已知坑
 
 ### 1. systemd unit 容器重建后丢失
