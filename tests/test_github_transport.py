@@ -536,6 +536,30 @@ def write_ci_only_authority(directory, pr=160, base=BASE):
     }]}))
 
 
+def test_ci_only_authority_tolerates_own_heartbeat_lock(tmp_path, monkeypatch):
+    import fcntl
+    from threading import Timer
+
+    from scripts.blue_green import deploy_merge, deploy_state
+
+    write_ci_only_authority(tmp_path)
+    monkeypatch.setenv("DAILYCHECK_DEPLOY_STATE_DIR", str(tmp_path))
+    lock = tmp_path / ".state.lock"
+    with lock.open("rb") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(HostingError, match="github_ci_only_authority_unavailable"):
+            deploy_merge._ci_only_authority(160, BASE, None)
+        monkeypatch.setattr(deploy_state, "process_lock_fd", lambda: held.fileno())
+        settlement = Timer(0.1, fcntl.flock, args=(held, fcntl.LOCK_UN))
+        settlement.start()
+        try:
+            assert deploy_merge._ci_only_authority(160, BASE, None)["serving_generation"] == 1
+        finally:
+            settlement.cancel()
+            settlement.join()
+    assert lock.stat().st_size == 0
+
+
 def review_policy(count):
     return {"required_approving_review_count": count, "dismiss_stale_reviews": True,
             "require_code_owner_reviews": False}

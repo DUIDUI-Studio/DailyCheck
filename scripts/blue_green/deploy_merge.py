@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -162,7 +163,16 @@ def _ci_only_authority(pr: int, base: str, locked_dir: Path | None) -> dict:
     try:
         fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            # The current pipeline's own heartbeat briefly takes the exclusive state lock.
+            deadline = time.monotonic() + (3 if deploy_state.process_lock_fd() is not None else 0)
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
             return read(directory)
     except OSError as exc:
         raise HostingError("github_ci_only_authority_unavailable") from exc

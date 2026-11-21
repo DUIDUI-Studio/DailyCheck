@@ -1274,7 +1274,7 @@ finalizer 在既有 process/state fence 下重读精确 repo ID/node、PR node/r
 classic 明确未启用审批保护或要求零次审批时，无需查询审批；要求正数时继续核验
 当前 H 的足量审批及 stale-review dismissal。CODEOWNERS 或 last-push approval
 等额外审批条件未由此入口建模，保守拒绝。零审批分支同时要求生产基线代数、
-实际在服 B 和权威双工单绑定。候选前生成证据摘要，覆盖 H/B、策略、CI run/attempt、
+记录的部署锚点 B 和权威双工单绑定。真实承流 B 由正式操作者独立读回。候选前生成证据摘要，覆盖 H/B、策略、CI run/attempt、
 check、基线代数及绑定。finalizer 在写入前两次重验，缺少摘要或有漂移时拒绝。
 自动 Prod review/execute 路径仍使用原身份和审批条件。本实现不写 GitHub 保护，仍由 GitHub 核验实际合并请求。
 仅 `FINALIZE` 角色读取显式 `DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE`，不得复用
