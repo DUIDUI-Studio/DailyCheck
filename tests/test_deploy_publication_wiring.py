@@ -263,7 +263,8 @@ import json, sys
 args = sys.argv[1:]
 base = args[args.index("--base") + 1]
 print(json.dumps({{"merged": args[0] == "merge", "sha": {SHA!r}, "merged_sha": {SHA!r},
-                  "main_sha": {SHA!r}, "base": base}}))
+                  "main_sha": {SHA!r}, "base": base,
+                  "required_approvals": 1, "ci_only_evidence": ""}}))
 ''')
     helper.chmod(0o755)
     journal = tools / "journalctl"
