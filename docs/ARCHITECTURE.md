@@ -1246,8 +1246,12 @@ attempt/state/蓝绿锁、hosting/role 配置及 check2–8 不变。DB/TMP/状�
 该次私有测试目录，移除 live 身份/凭据/native 上下文；子 PATH 前置所选解释器目录以发现
 同 venv 已安装工具。完整 tests/、session evidence 与 strict known14 门禁保留，native 分支不变。
 check1 的目录分配排除两个固定生产控制树及调用者实际 state 树，不能继承普通发布入口
-位于该树内的 TMPDIR；按系统临时目录、当前账号 home、系统 /tmp 寻找可用位置，创建唯一
-0700 测试目录后才启动 pytest。证据仍交原 strict gate，结束后清理；无可用隔离目录直接失败。
+位于该树内的 TMPDIR；按系统临时目录、当前账号 home、系统 /tmp 寻找可用位置。
+Linux/root check1 还要求候选父目录及其祖先均由 root 持有、组和其他用户不可写，
+且候选位于允许执行的挂载。即使 /tmp 带 sticky 位，从其下创建私有目录也无法满足
+生产协议回归的祖先校验，此时尝试合规的账号 home。非 root 生产器的既有容器 scratch
+规则继续适用。创建唯一 0700 目录后运行同一 pytest 和 strict gate，结束后清理；
+无可用隔离目录直接失败。
 `test_verify_pytest_boundary.py` 以真实父级持锁、受控 state 内 TMPDIR 和子进程验证路径隔离、
 安全守卫、权限/FD 隔离及目录清理，不通过跳过测试或放宽 shadow 路径检查消除新增失败。
 

@@ -272,3 +272,25 @@ def test_check1_refuses_when_no_directory_can_be_isolated():
     assert result.returncode != 0
     assert not result.stdout
     assert "isolated pytest directory unavailable" in result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.geteuid() != 0, reason="Linux/root protocol")
+def test_check1_uses_executable_custody_safe_parent_for_root(tmp_path):
+    from scripts.blue_green.release_config import safe_directory
+
+    public = tmp_path / "public"
+    public.mkdir(mode=0o700)
+    public.chmod(0o1777)
+    proc = subprocess.run(
+        [sys.executable, "-I", "-B", str(BG / "verify_pytest.py"), "--create-directory"],
+        env={"PATH": os.defpath, "TMPDIR": str(public)},
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    allocated = Path(proc.stdout.strip())
+    try:
+        assert not allocated.is_relative_to(public)
+        safe_directory(allocated)
+        assert not os.statvfs(allocated).f_flag & os.ST_NOEXEC
+    finally:
+        allocated.rmdir()
