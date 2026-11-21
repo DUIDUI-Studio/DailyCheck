@@ -1460,6 +1460,7 @@ private identity 参数；保留 `deploy-report:v1`、短 Commit 字段和 dashb
 GitHub 发布 ABI 为 `publish_public(facts, context, *, authority)`。CLI 的
 `--publication-context` 仅保留给可信代码注入方；真实 CLI 路径从 durable outcome +
 `bindings.json` 内部构造 context 与 adapter（见下）。
+开发侧 GitHub PR 创建草稿时要求正文第一行直接写公开工单关联，正式转待审前通过 [提交检查](agent-framework/workflow.md#github-pr-提交检查) 回读 GitHub 确认的关联、两份工单和生产来源绑定。
 `PublicationContext.parse` 严格字段为 provider/host/repository_id/repository/pr/sha、
 真实私有 attempt_id、单调 generation、不可变 outcome_at、nonsecret public_receipt、
 private_source 六字段 identity 和精确 `{"body": render_public(facts)}` canonical JSON SHA256。
