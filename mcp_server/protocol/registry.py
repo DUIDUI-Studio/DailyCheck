@@ -23,6 +23,7 @@ from mcp_server.protocol.tools import (
     store_order,
     wms,
 )
+from mcp_server.service.policy import SAFE_FIELDS
 
 
 def obj(**properties: dict) -> dict:
@@ -80,6 +81,7 @@ class ToolRegistration:
     bot_approved: bool
     tests: tuple[str, ...]
     compatibility: str = "preserved-input-description-and-TextContent-JSON"
+    policy_action: str | None = None
 
     @property
     def name(self) -> str:
@@ -155,6 +157,7 @@ REGISTRY = (
         output_shape=array(ITEM),
         external_subset=True, bot_approved=True,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[items_detail]",),
+        policy_action="inventory.read",
     ),
     ToolRegistration(
         tool=Tool(
@@ -968,6 +971,7 @@ REGISTRY = (
         output_shape=page("orders", obj(id=INTEGER, order_no=STRING, store_warehouse_code=STRING, dc_warehouse_code=STRING, status=STRING)),
         external_subset=True, bot_approved=True,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[store_order_list]",),
+        policy_action="orders.read",
     ),
     ToolRegistration(
         tool=Tool(
@@ -1092,6 +1096,7 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
         registrations = REGISTRY
     names = set()
     handlers = set()
+    policy_actions = set()
     for entry in registrations:
         if entry.name in names:
             raise ValueError(f"duplicate tool name: {entry.name}")
@@ -1112,6 +1117,11 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
             entry.access.path_enforcement, entry.access.warehouse_scope,
         )):
             raise ValueError(f"incomplete access contract: {entry.name}")
+        action = entry.policy_action
+        if action is not None:
+            if entry.mode != "read" or action not in SAFE_FIELDS or action in policy_actions:
+                raise ValueError(f"invalid scoped policy action: {entry.name}")
+            policy_actions.add(action)
 
 
 def get_tools() -> list[Tool]:
@@ -1121,6 +1131,10 @@ def get_tools() -> list[Tool]:
 
 def get_handlers() -> dict[str, Callable]:
     return {entry.name: entry.handler for entry in REGISTRY}
+
+
+def get_policy_actions() -> dict[str, str]:
+    return {entry.name: entry.policy_action for entry in REGISTRY if entry.policy_action is not None}
 
 
 validate_registry()

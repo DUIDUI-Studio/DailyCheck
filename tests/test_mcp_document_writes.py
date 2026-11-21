@@ -18,6 +18,7 @@ from mcp_server.infra.errors import McpError, ValidationError, WriteError
 from mcp_server.protocol.tools import get_tools
 from mcp_server.service import inbound, outbound
 from mcp_server.service.auth import AuthContext, set_current_auth
+from tests.test_mcp_access_log import CapturingServer
 
 CTX = AuthContext(1, ["/api/v1/*"], ["/api/v1/*"], None)
 KEY = {"doc_no": "juleng:JL-1", "line_no": "01"}
@@ -153,21 +154,7 @@ def test_schema_published_matches_runtime():
 def test_schema_tool_passthrough_and_error_serialization(env, monkeypatch):
     from mcp_server.protocol import server as protocol
 
-    class CaptureServer:
-        def __init__(self, *_):
-            pass
-
-        def list_tools(self):
-            return lambda fn: fn
-
-        def call_tool(self):
-            def register(fn):
-                self.handler = fn
-                return fn
-
-            return register
-
-    monkeypatch.setattr(protocol, "Server", CaptureServer)
+    monkeypatch.setattr(protocol, "Server", CapturingServer)
     call_tool = protocol.build_server().handler
     set_current_auth(CTX)
     try:

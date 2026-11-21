@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from mcp_server.protocol.server import build_server
+from mcp_server.service.auth import reserved_credential
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,13 +81,15 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
-        auth = headers.get("authorization", "")
+        values = [v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"authorization"]
+        auth = values[-1] if values else ""
+        policy_bearer = any(value.startswith("Bearer ") and reserved_credential(value[7:].strip())
+                            for value in values)
 
         # Branch 1: legacy env-based shared secret (dev only, but kept for
         # zero-friction local testing without provisioning a token).
         expected = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
-        if expected and auth.startswith("Bearer ") and auth[7:].strip() == expected:
+        if not policy_bearer and expected and auth.startswith("Bearer ") and auth[7:].strip() == expected:
             await self.app(scope, receive, send)
             return
 
@@ -94,8 +97,20 @@ class AuthMiddleware:
         # Lazy import to avoid loading SQLite connection machinery for the
         # env-only dev path (and to keep cold-start minimal).
         try:
-            from mcp_server.service.auth import authenticate, set_current_auth
-            ctx = authenticate(auth) if auth.startswith("Bearer ") else None
+            from starlette.concurrency import run_in_threadpool
+
+            from mcp_server.service.auth import authenticate, request_auth
+
+            if policy_bearer:
+                root = scope.get("root_path", "")
+                path = scope["path"]
+                if root and path.startswith(root + "/"):
+                    path = path[len(root):]
+                ctx = await run_in_threadpool(authenticate, auth, allow_policy=True) if (
+                    len(values) == 1 and path == STREAMABLE_HTTP_PATH
+                ) else None
+            else:
+                ctx = authenticate(auth) if auth.startswith("Bearer ") else None
             if ctx is not None:
                 # P0-4: per-token 滑动窗口配额（默认 MCP_DEFAULT_RATE_LIMIT/分钟）。
                 from rate_limit_pure import SlidingWindowLimiter, mcp_quota_limit
@@ -119,11 +134,14 @@ class AuthMiddleware:
                 # with no access to scope, so the ContextVar is what actually
                 # reaches them.
                 scope.setdefault("state", {})["auth"] = ctx
-                set_current_auth(ctx)
-                await self.app(scope, receive, send)
+                with request_auth(ctx):
+                    await self.app(scope, receive, send)
                 return
         except Exception as e:
-            logger.warning("agent_tokens lookup failed: %s", e)
+            if policy_bearer:
+                logger.warning("MCP policy identity lookup failed")
+            else:
+                logger.warning("agent_tokens lookup failed: %s", e)
 
         resp = JSONResponse(
             {"error": "unauthorized", "message": "Invalid or missing token"},

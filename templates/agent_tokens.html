@@ -3,6 +3,24 @@
 {% block content %}
 <h2>Agent Token 管理</h2>
 
+{% macro policy_permissions(tools, legacy_empty=true) %}
+{% if tools and legacy_empty %}
+  <p>允许的 MCP 工具和返回字段</p>
+  <ul>
+  {% for tool, permission in tools.items() %}
+    <li><code>{{ tool }}</code> · {{ permission.action }} · {{ permission.fields|join(', ') }}</li>
+  {% endfor %}
+  </ul>
+  {% if 'items_detail' in tools %}<p>库存限所选门店的库存品。</p>{% endif %}
+  {% if 'store_order_list' in tools %}<p>订单限所选门店发起的普通订单。</p>{% endif %}
+  <p>所有写入均拒绝。</p>
+  <p>旧版读取路径 <code>[]</code> · 旧版写入路径 <code>[]</code> · 旧版仓库范围 <code>[]</code>。</p>
+  <p>回退到旧版本时，即使仍显示工具目录，此令牌也无法读取业务数据和仓库名称，或执行写入。</p>
+{% else %}
+  <p>绑定的字段策略或旧版 ACL 无效，当前版本拒绝认证。</p>
+{% endif %}
+{% endmacro %}
+
 <!-- Token just created — show prominently -->
 {% if new_token %}
 <div style="background:#f0fdf4;border:1px solid #22c55e;border-radius:10px;padding:16px 20px;margin-bottom:20px">
@@ -26,6 +44,72 @@
     ">复制</button>
   </div>
 </div>
+{% endif %}
+
+{% if policy_preview %}
+<section class="card" id="mcp-policy-effective">
+  <h3>确认策略令牌</h3>
+  <p>{{ policy_preview.token_name }} · {{ policy_preview.preset }} v{{ policy_preview.version }}</p>
+  <p>签发人 #{{ policy_preview.user_id }}</p>
+  <p>数据范围限所选门店 {{ policy_preview.warehouses|join(', ') }}。</p>
+  {{ policy_permissions(policy_preview.tools) }}
+  <form id="mcp-policy-confirm" method="post" action="{{ url_for('agent_tokens.create_token') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="policy_action" value="confirm">
+    <input type="hidden" name="confirmation" value="{{ policy_confirmation }}">
+    <button type="submit" class="btn primary">确认签发</button>
+    <a href="{{ url_for('agent_tokens.list_tokens') }}">取消</a>
+  </form>
+</section>
+{% elif policy_issued_id %}
+<p id="mcp-policy-token-id" data-token-id="{{ policy_issued_id }}">
+  Token #{{ policy_issued_id }} · <a href="{{ url_for('agent_tokens.list_tokens') }}">返回 Token 管理</a>
+</p>
+{% else %}
+{% if policy_fields is defined %}
+<details class="card" style="margin-bottom:16px">
+  <summary><strong>发布读取策略预设</strong></summary>
+  <form id="mcp-policy-publish" method="post" action="{{ url_for('agent_tokens.create_token') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="policy_action" value="publish">
+    <label>预设名称 <input name="preset_name" required pattern="[a-z][a-z0-9-]{0,63}" /></label>
+    <p class="muted">选择允许返回的字段。再次发布同名预设会创建新版本。</p>
+    {% for action, fields in policy_fields.items() %}
+    <fieldset>
+      <legend>{{ action }}</legend>
+      {% for field in fields %}
+      <label><input type="checkbox" name="field_{{ action }}" value="{{ field }}" /> {{ field }}</label>
+      {% endfor %}
+    </fieldset>
+    {% endfor %}
+    <button type="submit" class="btn primary">发布预设版本</button>
+  </form>
+</details>
+<details class="card" style="margin-bottom:16px" open>
+  <summary><strong>创建受限策略令牌</strong></summary>
+  <form id="mcp-policy-preview" method="post" action="{{ url_for('agent_tokens.create_token') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="policy_action" value="preview">
+    <label>令牌名称 <input name="token_name" maxlength="100" required autocomplete="off" /></label>
+    <label>预设版本
+      <select name="preset" required>
+        <option value="">选择预设版本</option>
+        {% for preset in policy_presets if not preset.disabled_at %}
+        <option value="{{ preset.name }}:{{ preset.version }}">{{ preset.name }} v{{ preset.version }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <fieldset>
+      <legend>门店范围</legend>
+      {% for warehouse in policy_storefronts %}
+      <label><input type="checkbox" name="policy_warehouses" value="{{ warehouse.code }}" />
+        {{ warehouse.name }} ({{ warehouse.code }})
+      </label>
+      {% endfor %}
+    </fieldset>
+    <button type="submit" class="btn primary">预览权限</button>
+  </form>
+</details>
 {% endif %}
 
 <!-- Create form -->
@@ -106,8 +190,22 @@
         {% endif %}
       </td>
       <td>
+        {% set binding = policy_bindings.get(t.id) if policy_bindings is defined else none %}
         {% set whs = t.allowed_warehouse_codes_json %}
-        {% if whs == 'null' %}
+        {% if binding %}
+        <span class="policy-binding" data-token-id="{{ t.id }}" data-preset="{{ binding.preset_name }}"
+              data-version="{{ binding.preset_version }}">{{ binding.preset_name }} v{{ binding.preset_version }}</span>
+        <small>{{ binding.warehouse_codes_json }}</small>
+        <details>
+          <summary>绑定权限</summary>
+          <p>签发人 #{{ binding.created_by }}</p>
+          {% if binding.revoked_at %}
+          <p class="policy-revocation">撤销人 #{{ binding.revoked_by }} · {{ binding.revoked_at }}</p>
+          {% endif %}
+          {{ policy_permissions(binding.tools, t.allowed_read_paths_json == '[]' and
+              t.allowed_write_paths_json == '[]' and t.allowed_warehouse_codes_json == '[]') }}
+        </details>
+        {% elif whs == 'null' %}
         <span class="muted">全部仓库</span>
         {% else %}
         <small>{{ whs }}</small>
@@ -140,5 +238,6 @@
 </table>
 {% else %}
 <p class="muted" style="margin-top:12px">暂无 Token，请先创建一个。</p>
+{% endif %}
 {% endif %}
 {% endblock %}

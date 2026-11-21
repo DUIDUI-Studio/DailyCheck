@@ -3,10 +3,21 @@ from __future__ import annotations
 
 import os
 import pwd
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+
+def _root_test_parent(parent: Path) -> bool:
+    """Linux/root protocol fixtures execute files and enforce custody of all ancestors."""
+    for directory in (parent, *parent.parents):
+        metadata = directory.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_mode & 0o022):
+            return False
+    return not bool(os.statvfs(parent).f_flag & os.ST_NOEXEC)
 
 
 def create_test_directory() -> Path:
@@ -21,10 +32,14 @@ def create_test_directory() -> Path:
     except KeyError:
         pass
     parents.append(Path("/tmp"))
+    root_protocol = sys.platform == "linux" and os.geteuid() == 0
     for parent in dict.fromkeys(parents):
-        if any(parent.resolve().is_relative_to(root) for root in protected):
-            continue
         try:
+            parent = parent.resolve(strict=True)
+            if any(parent.is_relative_to(root) for root in protected):
+                continue
+            if root_protocol and not _root_test_parent(parent):
+                continue
             directory = Path(tempfile.mkdtemp(prefix="dailycheck-tests-", dir=parent)).resolve()
         except OSError:
             continue

@@ -4,11 +4,16 @@ from __future__ import annotations
 import contextvars
 import json
 import os
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from werkzeug.security import check_password_hash
 
-from mcp_server.data.unit_of_work import master_connection
+from mcp_server.data.unit_of_work import master_connection, policy_master_connection
+from mcp_server.infra.errors import UnauthorizedError
+from mcp_server.service.policy import POLICY_TOKEN_PREFIX, BoundPolicy, load_binding
 
 # Plaintext prefix length kept for an indexed lookup. 8 chars of a
 # token_urlsafe(32) secret reveal nothing usable, while turning the lookup
@@ -21,6 +26,12 @@ _SELECT_COLS = (
     "allowed_write_paths_json, allowed_warehouse_codes_json, rate_limit "
     "FROM agent_tokens "
 )
+_BY_PREFIX = _SELECT_COLS + "WHERE token_prefix = ? AND revoked_at IS NULL"
+_POLICY_CREDENTIAL = re.compile(re.escape(POLICY_TOKEN_PREFIX) + r"[A-Za-z0-9_-]{43}")
+
+
+def reserved_credential(raw: str) -> bool:
+    return raw.lower().startswith(POLICY_TOKEN_PREFIX)
 
 
 def token_prefix(raw: str) -> str:
@@ -37,9 +48,27 @@ class AuthContext:
     rate_limit: int | None = None  # 每分钟配额，None = 默认（rate_limit_pure）
     read_only: bool = False  # Explicit bot query connection boundary.
     warehouse_base_dir: str | None = None  # Bot data root, independent of code/CWD.
+    policy: BoundPolicy | None = None
 
 
-def authenticate(authorization_header: str) -> AuthContext | None:
+def _authenticate_policy(raw: str) -> AuthContext | None:
+    with policy_master_connection() as conn:
+        rows = conn.execute(_BY_PREFIX, (token_prefix(raw),)).fetchall()
+        matches = [row for row in rows if row["token_hash"] and check_password_hash(row["token_hash"], raw)]
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        if any(row[key] != "[]" for key in (
+            "allowed_read_paths_json", "allowed_write_paths_json", "allowed_warehouse_codes_json",
+        )):
+            return None
+        policy = load_binding(conn, row["id"])
+        if policy is None:
+            return None
+        return AuthContext(row["id"], [], [], [], row["rate_limit"], read_only=True, policy=policy)
+
+
+def authenticate(authorization_header: str, *, allow_policy: bool = False) -> AuthContext | None:
     """验证 Bearer token，返回 AuthContext 或 None。
 
     快路径：按 token_prefix 索引等值查 → 最多一次 pbkdf2 校验。
@@ -48,12 +77,17 @@ def authenticate(authorization_header: str) -> AuthContext | None:
     """
     if not authorization_header.startswith("Bearer "):
         return None
-    raw = authorization_header[len("Bearer "):].strip()
+    presented = authorization_header[len("Bearer "):]
+    raw = presented.strip()
+    if reserved_credential(raw):
+        if allow_policy and _POLICY_CREDENTIAL.fullmatch(presented):
+            return _authenticate_policy(raw)
+        return None
     if not raw:
         return None
     with master_connection() as conn:
         rows = conn.execute(
-            _SELECT_COLS + "WHERE token_prefix = ? AND revoked_at IS NULL",
+            _BY_PREFIX,
             (token_prefix(raw),),
         ).fetchall()
         if not rows:
@@ -120,6 +154,15 @@ def set_current_auth(ctx: AuthContext | None) -> None:
     _current_auth.set(ctx)
 
 
+@contextmanager
+def request_auth(ctx: AuthContext) -> Iterator[None]:
+    token = _current_auth.set(ctx)
+    try:
+        yield
+    finally:
+        _current_auth.reset(token)
+
+
 def resolve_ctx() -> AuthContext:
     """Return the AuthContext governing the current tool call.
 
@@ -135,8 +178,9 @@ def resolve_ctx() -> AuthContext:
     """
     ctx = _current_auth.get()
     if ctx is not None:
+        if ctx.policy is not None:
+            raise UnauthorizedError("Use the bound MCP policy")
         return ctx
-    from mcp_server.infra.errors import UnauthorizedError
     token = os.environ.get("DAILYCHECK_MCP_TOKEN", "")
     if not token:
         raise UnauthorizedError("no auth context; DAILYCHECK_MCP_TOKEN not set")

@@ -10,11 +10,28 @@ import secrets
 import sqlite3
 from datetime import datetime
 
-from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
+from flask import (
+    Blueprint,
+    abort,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from werkzeug.security import generate_password_hash
 
+from blueprints.agent_token_policies import (
+    handle_policy_action,
+    management_context,
+    revoke_policy_token,
+)
 from config import AGENT_TOKEN_PREFIX_LEN, SECRET_KEY
 from db import get_master_db
+from mcp_server.service.auth import reserved_credential
 from permissions import require_platform_admin
 
 
@@ -97,12 +114,15 @@ def list_tokens():
         warehouses=warehouses,
         new_token=new_token,
         new_token_name=new_token_name,
+        **management_context(db),
     )
 
 
 @bp.route("/admin/agent-tokens/create", methods=["POST"])
 @require_platform_admin
 def create_token():
+    if "policy_action" in request.form:
+        return handle_policy_action(get_master_db())
     name = request.form.get("name", "").strip()
     read_paths = request.form.get("read_paths", "*").strip()
     write_paths = request.form.get("write_paths", "").strip()
@@ -154,15 +174,27 @@ def create_token():
 def revoke_token(token_id: int):
     db = get_master_db()
     row = db.execute(
-        "SELECT id, name, revoked_at FROM agent_tokens WHERE id=?", (token_id,)
+        "SELECT id, name, revoked_at, token_prefix FROM agent_tokens WHERE id=?", (token_id,)
     ).fetchone()
     if row is None:
         abort(404)
+    policy_token = reserved_credential(row["token_prefix"] or "")
+    if policy_token and current_app.config.get("DRY_RUN"):
+        abort(409, "演练模式未撤销策略令牌。")
     if row["revoked_at"] is not None:
         flash(f"Token '{row['name']}' 已经是 revoked 状态")
         return redirect(url_for("agent_tokens.list_tokens"))
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if policy_token:
+        if revoke_policy_token(db, token_id, now):
+            flash(f"Token '{row['name']}' 已撤销", "token-revoked")
+        else:
+            current = db.execute("SELECT revoked_at FROM agent_tokens WHERE id = ?", (token_id,)).fetchone()
+            if current is None or current["revoked_at"] is None:
+                abort(409, "策略令牌未撤销。")
+            flash(f"Token '{row['name']}' 已经撤销")
+        return redirect(url_for("agent_tokens.list_tokens"))
     db.execute(
         "UPDATE agent_tokens SET revoked_at=? WHERE id=?",
         (now, token_id),

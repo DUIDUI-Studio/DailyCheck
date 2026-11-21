@@ -10,6 +10,7 @@ from mcp.types import TextContent, Tool
 
 from mcp_server.infra.access_log import write_mcp_access_log
 from mcp_server.infra.errors import McpError
+from mcp_server.protocol.policy import bind_policy_dispatch
 from mcp_server.protocol.registry import get_handlers
 from mcp_server.protocol.tools import get_tools
 
@@ -41,6 +42,21 @@ def _bounded_tool_name(name: str) -> str:
     if not isinstance(name, str):
         name = str(name)
     return name[:_MAX_TOOL_NAME_LEN]
+
+
+def _audit(name: str, status: int, started_ns: int) -> None:
+    duration_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
+    try:
+        write_mcp_access_log(
+            token_id=_access_log_token_id(),
+            method=_ACCESS_LOG_METHOD,
+            path=_ACCESS_LOG_PATH,
+            status=status,
+            duration_ms=duration_ms,
+            tool_name=_bounded_tool_name(name),
+        )
+    except Exception:
+        logger.debug("call_tool: access log write failed", exc_info=True)
 
 
 _tool_map = get_handlers()
@@ -90,17 +106,7 @@ def build_server() -> Server:
             status = 200
             return [TextContent(type="text", text=payload)]
         finally:
-            duration_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
-            try:
-                write_mcp_access_log(
-                    token_id=_access_log_token_id(),
-                    method=_ACCESS_LOG_METHOD,
-                    path=_ACCESS_LOG_PATH,
-                    status=status,
-                    duration_ms=duration_ms,
-                    tool_name=_bounded_tool_name(name),
-                )
-            except Exception:
-                logger.debug("call_tool: access log write failed", exc_info=True)
+            _audit(name, status, started_ns)
 
+    bind_policy_dispatch(server, _audit)
     return server

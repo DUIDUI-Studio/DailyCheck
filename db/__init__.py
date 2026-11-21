@@ -830,8 +830,56 @@ CREATE TABLE IF NOT EXISTS feedback_delivery_receipts (
 )
 """
 
+MCP_POLICY_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS mcp_policy_presets (
+        name TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version > 0),
+        grants_json TEXT NOT NULL,
+        created_by INTEGER NOT NULL REFERENCES users(id),
+        created_at TEXT NOT NULL,
+        disabled_by INTEGER REFERENCES users(id),
+        disabled_at TEXT,
+        CHECK ((disabled_by IS NULL) = (disabled_at IS NULL)),
+        PRIMARY KEY (name, version)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mcp_policy_bindings (
+        token_id INTEGER PRIMARY KEY REFERENCES agent_tokens(id),
+        preset_name TEXT NOT NULL,
+        preset_version INTEGER NOT NULL CHECK (typeof(preset_version) = 'integer' AND preset_version > 0),
+        grants_json TEXT NOT NULL,
+        warehouse_codes_json TEXT NOT NULL,
+        confirmation_id TEXT NOT NULL UNIQUE,
+        created_by INTEGER NOT NULL REFERENCES users(id),
+        created_at TEXT NOT NULL,
+        revoked_by INTEGER REFERENCES users(id),
+        revoked_at TEXT,
+        CHECK ((revoked_by IS NULL) = (revoked_at IS NULL)),
+        FOREIGN KEY (preset_name, preset_version) REFERENCES mcp_policy_presets(name, version)
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS mcp_policy_preset_version_immutable
+    BEFORE UPDATE OF name, version, grants_json, created_by, created_at ON mcp_policy_presets
+    BEGIN
+        SELECT RAISE(ABORT, 'MCP preset versions are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS mcp_policy_binding_immutable
+    BEFORE UPDATE OF token_id, preset_name, preset_version, grants_json,
+                     warehouse_codes_json, confirmation_id, created_by, created_at ON mcp_policy_bindings
+    BEGIN
+        SELECT RAISE(ABORT, 'MCP policy bindings are immutable');
+    END
+    """,
+)
+
 MASTER_SCHEMA += DELIVERY_ITEMS_DDL + ";\n" + ITEM_ROUTING_DDL + ";\n"
 MASTER_SCHEMA += FEEDBACK_DELIVERY_RECEIPTS_DDL + ";\n"
+MASTER_SCHEMA += ";\n".join(MCP_POLICY_DDL) + ";\n"
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
 WAREHOUSE_SCHEMA = """

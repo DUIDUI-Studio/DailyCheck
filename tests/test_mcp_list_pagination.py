@@ -29,6 +29,7 @@ from mcp_server.protocol.tools.outbound import outbound_list_impl
 from mcp_server.service.auth import AuthContext, set_current_auth
 from mcp_server.service.inbound import list_restock
 from mcp_server.service.outbound import list_outbound
+from tests.test_mcp_access_log import CapturingServer
 
 TS = "2026-10-25 09:00:00"
 WAREHOUSE_CODE = "WH001"
@@ -338,21 +339,7 @@ class TestPaginationTypeGuards:
     ):
         import mcp_server.protocol.server as protocol
 
-        class CaptureServer:
-            """只替换 SDK 装饰器注册；执行真实 call_tool、工具、service 与 SQL。"""
-            def __init__(self, name):
-                pass
-
-            def list_tools(self):
-                return lambda handler: handler
-
-            def call_tool(self):
-                def register(handler):
-                    self.handler = handler
-                    return handler
-                return register
-
-        monkeypatch.setattr(protocol, "Server", CaptureServer)
+        monkeypatch.setattr(protocol, "Server", CapturingServer)
         server = protocol.build_server()
         result = asyncio.run(server.handler(name, {"warehouse_code": WAREHOUSE_CODE, field: value}))
         assert json.loads(result[0].text) == {
