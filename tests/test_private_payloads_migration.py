@@ -6,6 +6,7 @@ import sqlite3
 
 from db import FEEDBACK_DELIVERY_RECEIPTS_DDL, MASTER_SCHEMA, init_master_db
 from migrations import MIGRATIONS
+from migrations.feedback_receipts import registered_up as feedback_receipts_up
 
 EXPECTED_COLUMNS = {
     "ticket_id", "provider", "host", "repository_id", "repository", "kind",
@@ -13,6 +14,7 @@ EXPECTED_COLUMNS = {
     "comment_id", "state", "owner", "generation", "lease_until", "remote_id",
     "remote_number", "remote_url", "updated_at",
 }
+POLICY_TABLES = {"mcp_policy_bindings", "mcp_policy_presets"}
 
 
 def _prepare(monkeypatch, tmp_path):
@@ -47,7 +49,7 @@ def _table_state(path):
 
 def test_master_schema_uses_the_registered_receipt_ddl():
     assert FEEDBACK_DELIVERY_RECEIPTS_DDL.strip() in MASTER_SCHEMA
-    assert MIGRATIONS[-1][0] == 8
+    assert [migration[0] for migration in MIGRATIONS if migration[2] is feedback_receipts_up] == [8]
 
 
 def test_registered_migration_up_installs_receipt_table_on_pre162_master(
@@ -77,10 +79,13 @@ def test_registered_migration_up_installs_receipt_table_on_pre162_master(
     with sqlite3.connect(legacy) as db:
         sqlite3.connect(master).backup(db)
         db.execute("DROP TABLE feedback_delivery_receipts")
+        db.execute("DROP TABLE mcp_policy_bindings")
+        db.execute("DROP TABLE mcp_policy_presets")
         db.execute("PRAGMA user_version=7")
         db.commit()
-    _, _, legacy_version, expected_ticket, expected_comment = _table_state(legacy)
+    legacy_tables, _, legacy_version, expected_ticket, expected_comment = _table_state(legacy)
     assert legacy_version == 7
+    assert not legacy_tables & (POLICY_TABLES | {"feedback_delivery_receipts"})
 
     cli_base = tmp_path / "owned-cli-base"
     monkeypatch.setattr(cli, "BASE_DIR", cli_base)
@@ -107,17 +112,25 @@ def test_registered_migration_up_installs_receipt_table_on_pre162_master(
     print(json.dumps(observed, indent=2))
 
     assert status.exit_code == up.exit_code == 0
-    assert "待应用: [8]" in status.output
-    assert "applied: [8]" in up.output
+    assert "待应用: [8, 9]" in status.output
+    assert "applied: [8, 9]" in up.output
     assert "feedback_delivery_receipts" in tables
+    assert POLICY_TABLES <= tables
     assert columns == EXPECTED_COLUMNS
-    assert version == 8
+    assert version == 9
     assert pending_versions(legacy, MIGRATIONS) == []
-    assert len(backups) == 1
+    assert len(backups) == 2
     assert ticket == expected_ticket
     assert comment == expected_comment
+    backups_by_version = {state[2]: state for state in map(_table_state, backups)}
+    assert set(backups_by_version) == {7, 8}
+    intermediate_tables, intermediate_columns, _, intermediate_ticket, intermediate_comment = backups_by_version[8]
+    assert "feedback_delivery_receipts" in intermediate_tables
+    assert not POLICY_TABLES & intermediate_tables
+    assert intermediate_columns == EXPECTED_COLUMNS
+    assert (intermediate_ticket, intermediate_comment) == (expected_ticket, expected_comment)
 
-    # Repeating up is a no-op: no second backup, no schema or row churn.
+    # Repeating up is a no-op: no additional backup, schema change, or row churn.
     again = runner.invoke(args=["migrate", "--db", str(legacy), "up"])
     tables_again, columns_again, version_again, ticket_again, comment_again = \
         _table_state(legacy)
@@ -126,7 +139,7 @@ def test_registered_migration_up_installs_receipt_table_on_pre162_master(
     assert "（无待应用迁移）" in again.output
     assert (tables_again, columns_again, version_again) == (tables, columns, version)
     assert (ticket_again, comment_again) == (ticket, comment)
-    assert len(backups_again) == 1
+    assert backups_again == backups
 
     # Startup initialization remains the idempotent no-op fallback.
     init_master_db()

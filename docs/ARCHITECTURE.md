@@ -2215,6 +2215,9 @@ flowchart LR
 
 ---
 
+master 从 v7 显式升级时，v8 送达回执表先落库，随后以包含该表和既有反馈的 v8 快照
+备份，再应用 v9 MCP 策略迁移。每步的备份和版本独立于仓库迁移。
+
 **warehouse v7（Issue #87）**：独立 `migrations/warehouse.py:WAREHOUSE_MIGRATIONS`
 （不进入 master MIGRATIONS/v6），`db/warehouse_migrate.py` 为显式单仓 status/up/down 入口，
 必须传 `--db`；禁止用 master 的 `flask migrate --db <warehouse> up`。
