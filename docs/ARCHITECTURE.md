@@ -1268,10 +1268,15 @@ verify 后每个 promote/switch/观察/finalize/release 边界复核 HEAD=H 与 
 关联 PR/repository、job 与 check/app 数字绑定，先校验再选择、比较或构建快照；
 最新 run 重读也执行同一检查，metadata ID 不能替代对原始 producer ID 的校验。
 finalizer 在既有 process/state fence 下重读精确 repo ID/node、PR node/ref/H/B、最新
-两必需 CI producer/run/attempt、review 和 protection；要求 classic main protection
-enforce-admins、stale-review dismissal、至少一项当前 H approval 和两个 Actions App
-绑定 context。缺失/其他未证明保护形状一律拒绝，Prod 需先独立完成保护对齐。
-当前 main 保护**未证明激活**，本实现不改保护，也不提供 bypass。
+两必需 CI producer/run/attempt、review 和 protection。普通受控入口要求 classic main
+保护启用管理员约束和 strict status checks，两项 context 均绑定指定 Actions App。
+同时读取该分支的生效 ruleset 规则；读取失败、无法确认完整或有未建模规则时停止。
+classic 明确未启用审批保护或要求零次审批时，无需查询审批；要求正数时继续核验
+当前 H 的足量审批及 stale-review dismissal。CODEOWNERS 或 last-push approval
+等额外审批条件未由此入口建模，保守拒绝。零审批分支同时要求生产基线代数、
+实际在服 B 和权威双工单绑定。候选前生成证据摘要，覆盖 H/B、策略、CI run/attempt、
+check、基线代数及绑定。finalizer 在写入前两次重验，缺少摘要或有漂移时拒绝。
+自动 Prod review/execute 路径仍使用原身份和审批条件。本实现不写 GitHub 保护，仍由 GitHub 核验实际合并请求。
 仅 `FINALIZE` 角色读取显式 `DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE`，不得复用
 read/report/ambient 凭据；唯一新写操作是固定 GraphQL `updateRefs`，原子校验并
 非强制写 main B→H 与同仓 head H→H。HTTP child 继承两个 fence；单次无重试，

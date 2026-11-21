@@ -521,6 +521,26 @@ def test_github_finalization_is_rejected_without_transport(api):
     assert not api.log()
 
 
+def write_ci_only_authority(directory, pr=160, base=BASE):
+    directory.mkdir(exist_ok=True)
+    (directory / ".state.lock").touch()
+    (directory / "state.json").write_text(json.dumps({
+        "generation": 2, "deployed": {"sha": base, "generation": 1, "pr": 20, "at": 1},
+    }))
+    (directory / "bindings.json").write_text(json.dumps({"version": 1, "bindings": [{
+        "pr": pr, "public": {"provider": "github", "host": "github.com",
+                            "repository": REPO, "repository_id": REPO_ID},
+        "source": {"provider": "github", "host": "github.com", "repository_id": 1449125557,
+                   "repository": "DUIDUI-Studio/DailyCheck-ops", "kind": "issue", "number": 9},
+        "issue_identities": {"public": {"number": 41, "id": 101}, "source": {"id": 102}},
+    }]}))
+
+
+def review_policy(count):
+    return {"required_approving_review_count": count, "dismiss_stale_reviews": True,
+            "require_code_owner_reviews": False}
+
+
 def ordinary(api, tmp_path, monkeypatch):
     token = tmp_path / "finalize-token"
     token.write_text("synthetic-prod-finalize")
@@ -529,6 +549,7 @@ def ordinary(api, tmp_path, monkeypatch):
     monkeypatch.setenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE", str(token))
     monkeypatch.setenv("DAILYCHECK_DEPLOY_STATE_DIR", str(tmp_path / "deploy-state"))
     monkeypatch.setenv("DAILYCHECK_DEPLOY_EVENT_LOG", str(tmp_path / "private-events.jsonl"))
+    write_ci_only_authority(tmp_path / "deploy-state")
     table = evidence()
     table[ROOT]["data"]["node_id"] = "R_kgDOVl3HNQ"
     before = pr()
@@ -541,11 +562,13 @@ def ordinary(api, tmp_path, monkeypatch):
     table[ROOT + "/git/ref/heads/main"] = response({
         "ref": "refs/heads/main", "object": {"sha": BASE}})
     table[ROOT + "/branches/main/protection"] = response({
+        "url": "https://api.github.com" + ROOT + "/branches/main/protection",
         "enforce_admins": {"enabled": True},
-        "required_status_checks": {"checks": [
-            {"context": n, "app_id": 15368} for n in ("test", "agent-framework-reports")]},
-        "required_pull_request_reviews": {
-            "required_approving_review_count": 1, "dismiss_stale_reviews": True}})
+        "required_status_checks": {"strict": True, "contexts": ["test", "agent-framework-reports"],
+                                   "checks": [{"context": n, "app_id": 15368}
+                                              for n in ("test", "agent-framework-reports")]},
+        "required_pull_request_reviews": review_policy(1)})
+    table[ROOT + "/rules/branches/main?page=1"] = response([])
     table[ROOT + "/pulls/160/reviews?page=1"] = response([
         {"id": 91, "user": {"id": 11}, "state": "APPROVED", "commit_id": SHA}])
     table["/graphql"] = {"echo_mutation": True}
@@ -598,6 +621,8 @@ elif args != ["-C", {str(candidate)!r}, "diff-index", "--quiet", {SHA!r}, "--"]:
 ''')
     git.chmod(0o700)
     env.update(DAILYCHECK_PROD_REPO=str(candidate), PATH=str(tools) + os.pathsep + env["PATH"])
+    if owned and command == "merge":
+        env.setdefault("DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE", "")
     return subprocess.run(cli, env=env, text=True, capture_output=True, timeout=30)
 
 
@@ -753,6 +778,165 @@ def test_ordinary_finalization_cli_checks_and_atomic_exact_h_postfacts(api, tmp_
           "merge_stdout": out, "operation": payload,
           "http_child_retained_fences": posts[0]["retained_fences"],
           "post_read_paths": [r["path"] for r in api.log()[-3:]]})
+
+
+@pytest.mark.parametrize("mode", ["missing", "explicit_zero"])
+def test_ordinary_ci_only_reads_policy_and_never_reads_reviews(
+    api, tmp_path, monkeypatch, mode
+):
+    table = ordinary(api, tmp_path, monkeypatch)
+    protection = table[ROOT + "/branches/main/protection"]["data"]
+    if mode == "missing":
+        protection.pop("required_pull_request_reviews")
+    else:
+        protection["required_pull_request_reviews"] = review_policy(0)
+    table.pop(ROOT + "/pulls/160/reviews?page=1")
+    api.write(table)
+    check = merge_cli(tmp_path, command="check")
+    assert check.returncode == 0, check.stdout
+    facts = json.loads(check.stdout)
+    assert facts["required_approvals"] == 0
+    monkeypatch.setenv("DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE", facts["ci_only_evidence"])
+    assert not [row for row in api.log() if row["method"] == "POST"]
+    api.write(merged_table(table))
+    merged = merge_cli(tmp_path)
+    assert merged.returncode == 0, merged.stdout
+    assert json.loads(merged.stdout)["required_approvals"] == 0
+    log = api.log()
+    assert not [row for row in log if row["path"].endswith("/reviews")]
+    assert len([row for row in log if row["path"] == ROOT + "/rules/branches/main"]) == 3
+    posts = [row for row in log if row["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["retained_fences"] == {".attempt.lock": True, ".state.lock": True}
+
+
+@pytest.mark.parametrize(("case", "reason"), [
+    ("approval_missing", "github_review_required"),
+    ("active_required_review", "github_active_rules_unproven"),
+    ("active_unknown_rule", "github_active_rules_unproven"),
+    ("unreadable_rules", "hosting_http_error"),
+    ("rules_page_unproven", "github_active_rules_unproven"),
+    ("unreadable_classic", "hosting_http_error"),
+    ("unknown_classic", "github_required_protection_unproven"),
+    ("null_classic", "github_required_protection_unproven"),
+    ("missing_binding", "private_source_binding_missing"),
+    ("wrong_serving_base", "github_ci_only_serving_base_unproven"),
+    ("previous_attempt_unresolved", "github_ci_only_previous_attempt_unresolved"),
+    ("missing_state_lock", "github_ci_only_authority_unavailable"),
+    ("conflicting_contexts", "github_required_protection_unproven"),
+    ("code_owner", "github_required_protection_unproven"),
+    ("last_push", "github_required_protection_unproven"),
+    ("strict_disabled", "github_required_protection_unproven"),
+    ("checks_pending", "github_not_ready:"),
+    ("checks_failure", "github_not_ready:"),
+    ("checks_old_head", "github_not_ready:"),
+    ("wrong_ci_app", "github_not_ready:"),
+])
+def test_ordinary_unproven_policy_or_ci_stops_before_mutation(
+    api, tmp_path, monkeypatch, case, reason
+):
+    table = ordinary(api, tmp_path, monkeypatch)
+    classic = ROOT + "/branches/main/protection"
+    rules = ROOT + "/rules/branches/main?page=1"
+    table[classic]["data"]["required_pull_request_reviews"] = review_policy(0)
+    if case == "approval_missing":
+        table[classic]["data"]["required_pull_request_reviews"] = review_policy(1)
+        table[ROOT + "/pulls/160/reviews?page=1"] = response([])
+    elif case.startswith("active_"):
+        kind = "pull_request" if case == "active_required_review" else "unknown"
+        table[rules] = response([{"type": kind, "parameters": {"required_approving_review_count": 1}}])
+    elif case == "unreadable_rules":
+        table[rules] = response({}, status=403)
+    elif case == "rules_page_unproven":
+        table[rules] = response([], headers='Link: <https://api.github.com/next>; rel="next"\r\n')
+    elif case == "unreadable_classic":
+        table[classic] = response({}, status=404)
+    elif case in {"unknown_classic", "null_classic"}:
+        table[classic]["data"]["required_pull_request_reviews"] = {} if case == "unknown_classic" else None
+    elif case == "missing_binding":
+        (tmp_path / "deploy-state" / "bindings.json").unlink()
+    elif case == "wrong_serving_base":
+        write_ci_only_authority(tmp_path / "deploy-state", base=SHA)
+    elif case == "previous_attempt_unresolved":
+        state_path = tmp_path / "deploy-state" / "state.json"
+        state = json.loads(state_path.read_text())
+        state["last_evicted"] = {"generation": 2, "phase": "switch"}
+        state_path.write_text(json.dumps(state))
+    elif case == "missing_state_lock":
+        (tmp_path / "deploy-state" / ".state.lock").unlink()
+    elif case == "conflicting_contexts":
+        table[classic]["data"]["required_status_checks"]["contexts"] = ["test"]
+    elif case in {"code_owner", "last_push"}:
+        field = "require_code_owner_reviews" if case == "code_owner" else "require_last_push_approval"
+        table[classic]["data"]["required_pull_request_reviews"][field] = True
+    elif case == "strict_disabled":
+        table[classic]["data"]["required_status_checks"]["strict"] = False
+    else:
+        check = table[ROOT + f"/commits/{SHA}/check-runs?page=1"]["data"]["check_runs"][0]
+        if case == "checks_old_head":
+            check["head_sha"] = BASE
+        elif case == "wrong_ci_app":
+            check["app"]["id"] = 999
+        elif case == "checks_pending":
+            check.update(status="in_progress", conclusion=None)
+        else:
+            check["conclusion"] = "failure"
+    api.write(table)
+    for cmd in ("check", "merge"):
+        result = merge_cli(tmp_path, command=cmd)
+        assert result.returncode == 32 and json.loads(result.stdout)["reason"].startswith(reason), result.stdout
+        if case == "missing_state_lock":
+            assert not (tmp_path / "deploy-state" / ".state.lock").exists()
+            break
+    assert not [row for row in api.log() if row["method"] == "POST"]
+
+
+def test_ordinary_policy_change_under_finalizer_lock_stops_merge(api, tmp_path, monkeypatch):
+    table = ordinary(api, tmp_path, monkeypatch)
+    key = ROOT + "/branches/main/protection"
+    requires_review = table[key]
+    ci_only = response(dict(requires_review["data"]))
+    ci_only["data"].pop("required_pull_request_reviews")
+    table[key] = ci_only
+    api.write(table)
+    checked = merge_cli(tmp_path, command="check")
+    assert checked.returncode == 0, checked.stdout
+    monkeypatch.setenv("DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE", json.loads(checked.stdout)["ci_only_evidence"])
+    table[key] = [ci_only, requires_review]
+    api.write(table)
+    result = merge_cli(tmp_path)
+    assert result.returncode == 32, result.stdout
+    assert json.loads(result.stdout)["reason"] == "github_finalization_facts_changed"
+    assert not [row for row in api.log() if row["method"] == "POST"]
+
+
+@pytest.mark.parametrize("change", ["missing_preflight", "binding_changed", "policy_changed"])
+def test_zero_approval_cannot_finalize_without_same_candidate_precheck(
+    api, tmp_path, monkeypatch, change
+):
+    table = ordinary(api, tmp_path, monkeypatch)
+    classic = table[ROOT + "/branches/main/protection"]["data"]
+    classic.pop("required_pull_request_reviews")
+    api.write(table)
+    checked = merge_cli(tmp_path, command="check")
+    assert checked.returncode == 0, checked.stdout
+    if change != "missing_preflight":
+        evidence = json.loads(checked.stdout)["ci_only_evidence"]
+        monkeypatch.setenv("DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE", evidence)
+    if change == "binding_changed":
+        path = tmp_path / "deploy-state" / "bindings.json"
+        bindings = json.loads(path.read_text())
+        bindings["bindings"][0]["source"]["number"] = 10
+        path.write_text(json.dumps(bindings))
+    if change == "policy_changed":
+        classic["required_pull_request_reviews"] = review_policy(1)
+        api.write(table)
+    if change == "missing_preflight":
+        monkeypatch.setenv("DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE", "")
+    result = merge_cli(tmp_path)
+    assert result.returncode == 32, result.stdout
+    assert json.loads(result.stdout)["reason"] == "github_ci_only_candidate_evidence_changed"
+    assert not [row for row in api.log() if row["method"] == "POST"]
 
 
 def test_compare_metadata_empty_second_page_retains_exact_ff_proof(api, tmp_path, monkeypatch):
