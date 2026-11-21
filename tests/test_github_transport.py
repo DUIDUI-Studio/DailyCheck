@@ -566,6 +566,7 @@ def review_policy(count):
 
 
 def ordinary(api, tmp_path, monkeypatch):
+    """Configure the ordinary forge and credentials; callers own their state fixtures."""
     token = tmp_path / "finalize-token"
     token.write_text("synthetic-prod-finalize")
     token.chmod(0o600)
@@ -573,7 +574,6 @@ def ordinary(api, tmp_path, monkeypatch):
     monkeypatch.setenv("DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE", str(token))
     monkeypatch.setenv("DAILYCHECK_DEPLOY_STATE_DIR", str(tmp_path / "deploy-state"))
     monkeypatch.setenv("DAILYCHECK_DEPLOY_EVENT_LOG", str(tmp_path / "private-events.jsonl"))
-    write_ci_only_authority(tmp_path / "deploy-state")
     table = evidence()
     table[ROOT]["data"]["node_id"] = "R_kgDOVl3HNQ"
     before = pr()
@@ -809,6 +809,7 @@ def test_ordinary_ci_only_reads_policy_and_never_reads_reviews(
     api, tmp_path, monkeypatch, mode
 ):
     table = ordinary(api, tmp_path, monkeypatch)
+    write_ci_only_authority(tmp_path / "deploy-state")
     protection = table[ROOT + "/branches/main/protection"]["data"]
     if mode == "missing":
         protection.pop("required_pull_request_reviews")
@@ -863,6 +864,8 @@ def test_ordinary_unproven_policy_or_ci_stops_before_mutation(
     classic = ROOT + "/branches/main/protection"
     rules = ROOT + "/rules/branches/main?page=1"
     table[classic]["data"]["required_pull_request_reviews"] = review_policy(0)
+    if case in {"missing_binding", "previous_attempt_unresolved", "missing_state_lock"}:
+        write_ci_only_authority(tmp_path / "deploy-state")
     if case == "approval_missing":
         table[classic]["data"]["required_pull_request_reviews"] = review_policy(1)
         table[ROOT + "/pulls/160/reviews?page=1"] = response([])
@@ -917,6 +920,7 @@ def test_ordinary_unproven_policy_or_ci_stops_before_mutation(
 
 def test_ordinary_policy_change_under_finalizer_lock_stops_merge(api, tmp_path, monkeypatch):
     table = ordinary(api, tmp_path, monkeypatch)
+    write_ci_only_authority(tmp_path / "deploy-state")
     key = ROOT + "/branches/main/protection"
     requires_review = table[key]
     ci_only = response(dict(requires_review["data"]))
@@ -939,6 +943,7 @@ def test_zero_approval_cannot_finalize_without_same_candidate_precheck(
     api, tmp_path, monkeypatch, change
 ):
     table = ordinary(api, tmp_path, monkeypatch)
+    write_ci_only_authority(tmp_path / "deploy-state")
     classic = table[ROOT + "/branches/main/protection"]["data"]
     classic.pop("required_pull_request_reviews")
     api.write(table)

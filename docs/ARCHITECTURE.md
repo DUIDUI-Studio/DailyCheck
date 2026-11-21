@@ -1277,7 +1277,9 @@ classic 明确未启用审批保护或要求零次审批时，无需查询审批
 记录的部署锚点 B 和权威双工单绑定。真实承流 B 由正式操作者独立读回。候选前生成证据摘要，覆盖 H/B、策略、CI run/attempt、
 check、基线代数及绑定。finalizer 在写入前两次重验，缺少摘要或有漂移时拒绝。
 自动 Prod review/execute 路径仍使用原身份和审批条件。
-普通发布仍按 durable outcome 生成既有报告，报告校验与正式在服读回各自留证。本实现不写 GitHub 保护，仍由 GitHub 核验实际合并请求。
+普通发布仍按 durable outcome 生成既有报告，报告校验与正式在服读回各自留证。
+发布测试的普通 GitHub 夹具只准备请求证据及环境，各用例自行初始化临时状态。
+零审批用例单独建立基线和绑定，轮询用例保留空目录、损坏状态与失败历史各自的前置。本实现不写 GitHub 保护，仍由 GitHub 核验实际合并请求。
 仅 `FINALIZE` 角色读取显式 `DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE`，不得复用
 read/report/ambient 凭据；唯一新写操作是固定 GraphQL `updateRefs`，原子校验并
 非强制写 main B→H 与同仓 head H→H。HTTP child 继承两个 fence；单次无重试，
