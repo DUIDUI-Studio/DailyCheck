@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 POLICY_TOKEN_PREFIX = "mp."
 MAX_SQLITE_ID = 2**63 - 1
-TOOL_ACTIONS = {"items_detail": "inventory.read", "store_order_list": "orders.read"}
 
 # Values are trusted SQL fragments. An administrator selects keys only.
 INVENTORY_COLUMNS = {"sku": "sku", "current_stock": "quantity AS current_stock",
@@ -67,8 +66,7 @@ class BoundPolicy:
     warehouses: tuple[str, ...]
     grants: tuple[tuple[str, tuple[str, ...]], ...]
 
-    def fields(self, tool_name: str) -> tuple[str, ...]:
-        action = TOOL_ACTIONS.get(tool_name)
+    def fields(self, action: str | None) -> tuple[str, ...]:
         return next((fields for permitted, fields in self.grants if permitted == action), ())
 
 

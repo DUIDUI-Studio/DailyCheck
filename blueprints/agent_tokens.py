@@ -10,7 +10,18 @@ import secrets
 import sqlite3
 from datetime import datetime
 
-from flask import Blueprint, abort, flash, g, redirect, render_template, request, session, url_for
+from flask import (
+    Blueprint,
+    abort,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from werkzeug.security import generate_password_hash
 
 from blueprints.agent_token_policies import (
@@ -167,14 +178,22 @@ def revoke_token(token_id: int):
     ).fetchone()
     if row is None:
         abort(404)
+    policy_token = reserved_credential(row["token_prefix"] or "")
+    if policy_token and current_app.config.get("DRY_RUN"):
+        abort(409, "演练模式未撤销策略令牌。")
     if row["revoked_at"] is not None:
         flash(f"Token '{row['name']}' 已经是 revoked 状态")
         return redirect(url_for("agent_tokens.list_tokens"))
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if reserved_credential(row["token_prefix"] or ""):
-        revoke_policy_token(db, token_id, now)
-        flash(f"Token '{row['name']}' 已撤销", "token-revoked")
+    if policy_token:
+        if revoke_policy_token(db, token_id, now):
+            flash(f"Token '{row['name']}' 已撤销", "token-revoked")
+        else:
+            current = db.execute("SELECT revoked_at FROM agent_tokens WHERE id = ?", (token_id,)).fetchone()
+            if current is None or current["revoked_at"] is None:
+                abort(409, "策略令牌未撤销。")
+            flash(f"Token '{row['name']}' 已经撤销")
         return redirect(url_for("agent_tokens.list_tokens"))
     db.execute(
         "UPDATE agent_tokens SET revoked_at=? WHERE id=?",

@@ -23,10 +23,12 @@ from itsdangerous import BadData, URLSafeTimedSerializer
 from werkzeug.security import generate_password_hash
 
 from blueprints.audit_pure import append_admin_audit
+from mcp_server.protocol.registry import get_policy_actions
 from mcp_server.service.auth import token_prefix
 from mcp_server.service.policy import (
     POLICY_TOKEN_PREFIX,
     SAFE_FIELDS,
+    canonical_grants,
     encode_grants,
     storefront_scope,
 )
@@ -98,6 +100,19 @@ def policy_tables_present(db) -> bool:
     ).fetchone()[0] == 2
 
 
+def _effective_tools(grants_json: str) -> dict:
+    try:
+        grants = canonical_grants(json.loads(grants_json))
+    except (TypeError, ValueError):
+        return {}
+    if encode_grants(grants) != grants_json:
+        return {}
+    return {
+        name: {"action": action, "fields": grants[action]}
+        for name, action in get_policy_actions().items() if action in grants
+    }
+
+
 def management_context(db) -> dict:
     if not policy_tables_present(db):
         return {}
@@ -107,8 +122,9 @@ def management_context(db) -> dict:
             "SELECT name, version, disabled_at FROM mcp_policy_presets ORDER BY name, version DESC"
         ).fetchall(),
         "policy_bindings": {
-            row["token_id"]: row for row in db.execute(
-                "SELECT token_id, preset_name, preset_version, warehouse_codes_json FROM mcp_policy_bindings"
+            row["token_id"]: {**row, "tools": _effective_tools(row["grants_json"])} for row in db.execute(
+                "SELECT token_id, preset_name, preset_version, warehouse_codes_json, "
+                "grants_json, created_by, revoked_by, revoked_at FROM mcp_policy_bindings"
             )
         },
         "policy_storefronts": db.execute(
@@ -167,7 +183,7 @@ def _preview(db):
         "confirmation_id": secrets.token_urlsafe(24),
     }
     return _no_store(
-        policy_preview={**snapshot, "grants": json.loads(grants)},
+        policy_preview={**snapshot, "tools": _effective_tools(grants)},
         policy_confirmation=_serializer().dumps(snapshot),
     )
 

@@ -21,7 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from mcp_server import main
 from mcp_server.data.unit_of_work import policy_read_connection
-from mcp_server.protocol.registry import REGISTRY
+from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import authenticate
 from mcp_server.service.policy import POLICY_TOKEN_PREFIX, SAFE_FIELDS
 
@@ -398,6 +398,10 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     assert 'id="mcp-policy-effective"' in effective
     assert all(word in effective for word in (*STORES, "inventory.read", "orders.read", "stock-and-orders v1",
                                                "current_stock", "fulfillment"))
+    assert all(word in effective for word in (
+        "签发人 #1", "items_detail", "store_order_list", "所有写入均拒绝", "旧版读取路径",
+        "旧版写入路径", "旧版仓库范围", "回退到旧版本时", "仓库名称",
+    ))
     assert 'id="token-display"' not in effective and _snapshot(env["root"]) == before_preview
     assert _confirm(other_admin, preview).status_code == 403
     assert _confirm(other_session, preview).status_code == 403
@@ -428,6 +432,15 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     )
     assert first_id != second_id and first_raw != second_raw
     assert _db_update(master, "SELECT * FROM mcp_policy_bindings WHERE token_id=?", (first_id,)) == first_snapshot
+    listing = admin.get(ADMIN).get_data(as_text=True)
+    second_listing = re.search(
+        fr'class="policy-binding" data-token-id="{second_id}".*?</td>', listing, re.S,
+    )[0]
+    assert all(word in second_listing for word in (
+        "stock-and-orders v2", STORES[1], "签发人 #1", "store_order_list", "order_no", "status",
+        "所有写入均拒绝", "旧版读取路径", "旧版写入路径", "旧版仓库范围", "回退到旧版本时",
+    ))
+    assert "items_detail" not in second_listing and "fulfillment" not in second_listing
     for token_id, raw, version, codes in (
         (first_id, first_raw, 1, STORES), (second_id, second_raw, 2, STORES[1:2]),
     ):
@@ -479,7 +492,7 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
             assert {order["order_no"] for order in page["orders"]} == {"own-A", "own-B", "own-C", "own-D"}
             assert "fulfillment" in page["orders"][0]
             assert (await _call(second, "store_order_list", {}))["orders"] == [{"order_no": "own-B", "status": "pending"}]
-            await _call(second, "items_detail", ITEM_ARGS, error="forbidden")
+            await _call(second, "items_detail", {**ITEM_ARGS, "warehouse_code": STORES[1]}, error="forbidden")
             await _call(second, "store_order_list", {"warehouse_code": STORES[0]}, error="forbidden")
             await _call(first, "store_order_list", {"warehouse_code": OUTSIDE}, error="forbidden")
             await _call(first, "store_order_list", {"fields": ["note"]}, error="validation_error")
@@ -504,6 +517,96 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     revoked = _db_update(master, "SELECT a.revoked_at, b.revoked_at, b.revoked_by FROM agent_tokens a "
                          "JOIN mcp_policy_bindings b ON b.token_id=a.id WHERE a.id=?", (first_id,))
     assert revoked[0] and revoked[0] == revoked[1] and revoked[2] == 1
+    listing = admin.get(ADMIN).get_data(as_text=True)
+    revoked_listing = re.search(fr'class="policy-binding" data-token-id="{first_id}".*?</td>', listing, re.S)[0]
+    assert f'class="policy-revocation">撤销人 #1 · {revoked[0]}' in revoked_listing
+
+
+def test_order_status_filter_requires_status_in_policy_mask(issued_policy, policy_admin, monkeypatch):
+    from mcp_server.protocol import policy as dispatch
+
+    env, _, full, _ = issued_policy
+    _, admin = policy_admin
+    assert _publish(admin, "order-number", {"orders.read": ["order_no"]}).status_code == 302
+    restricted, _ = _read_receipt(_confirm(
+        admin, _preview(admin, "order numbers only", "order-number:1", [STORES[1]]),
+    ))
+    called = []
+    handler = dispatch._HANDLERS["store_order_list"]
+
+    def track_query(policy, fields, **arguments):
+        called.append((policy.token_id, arguments))
+        return handler(policy, fields, **arguments)
+
+    monkeypatch.setitem(dispatch._HANDLERS, "store_order_list", track_query)
+    before = _snapshot(env["root"])
+
+    async def exercise(url):
+        async with _session(url, full) as full_session, _session(url, restricted) as limited:
+            full_tool = next(t for t in (await full_session.list_tools()).tools if t.name == "store_order_list")
+            assert "status" in full_tool.inputSchema["properties"]
+            page = await _call(full_session, "store_order_list", {"status": "pending", "warehouse_code": STORES[1]})
+            assert page["total"] == 1 and page["orders"][0]["status"] == "pending"
+
+            limited_tools = (await limited.list_tools()).tools
+            assert [tool.name for tool in limited_tools] == ["store_order_list"]
+            assert set(limited_tools[0].inputSchema["properties"]) == {"warehouse_code", "limit", "offset"}
+            page = await _call(limited, "store_order_list", {"warehouse_code": STORES[1]})
+            assert page["orders"] == [{"order_no": "own-B"}]
+            count_before = len(called)
+            for status in ("pending", "delivered"):
+                data = await _call(limited, "store_order_list", {"status": status}, error="validation_error")
+                assert data == {"error": "validation_error", "message": "invalid_arguments"}
+            assert len(called) == count_before
+            assert "status" in next(
+                tool for tool in (await full_session.list_tools()).tools if tool.name == "store_order_list"
+            ).inputSchema["properties"]
+
+    with _listener() as url:
+        asyncio.run(exercise(url))
+    assert _snapshot(env["root"]) == before
+
+
+def test_registered_policy_actions_match_read_adapters():
+    from mcp_server.protocol import policy as dispatch
+
+    expected = {"items_detail": "inventory.read", "store_order_list": "orders.read"}
+    assert get_policy_actions() == expected
+    assert {entry.name: entry.mode for entry in REGISTRY if entry.policy_action} == dict.fromkeys(expected, "read")
+    assert dispatch._HANDLERS.keys() == dispatch._INPUT_SCHEMAS.keys() == expected.keys()
+
+
+def test_policy_dry_run_revoke_refuses_without_changes(issued_policy, policy_admin, monkeypatch):
+    env, _, raw, token_id = issued_policy
+    app, admin = policy_admin
+    csrf = _hidden(admin.get(ADMIN), "csrf_token")
+    before = _snapshot(env["root"])
+
+    async def usable(url):
+        async with _session(url, raw) as session:
+            assert await _call(session, "items_detail", ITEM_ARGS)
+
+    with _listener() as url, httpx.Client(trust_env=False, timeout=10) as http:
+        app.config["DRY_RUN"] = True
+        try:
+            response = admin.post(f"{ADMIN}/{token_id}/revoke", data={"csrf_token": csrf})
+            assert response.status_code == 409 and "演练模式未撤销策略令牌" in response.get_data(as_text=True)
+            assert _snapshot(env["root"]) == before
+            asyncio.run(usable(url))
+        finally:
+            app.config["DRY_RUN"] = False
+        with monkeypatch.context() as absent_write:
+            absent_write.setattr("blueprints.agent_tokens.revoke_policy_token", lambda *_args: False)
+            response = admin.post(f"{ADMIN}/{token_id}/revoke", data={"csrf_token": csrf})
+            assert response.status_code == 409 and "未撤销" in response.get_data(as_text=True)
+        assert _snapshot(env["root"]) == before
+        assert admin.post(f"{ADMIN}/{token_id}/revoke", data={"csrf_token": csrf}).status_code == 302
+        assert http.post(url, json=INITIALIZE, headers=_headers(raw)).status_code == 401
+    agent_at, binding_at, revoker = _db_update(
+        env["master"], "SELECT a.revoked_at, b.revoked_at, b.revoked_by "
+        "FROM agent_tokens a JOIN mcp_policy_bindings b ON b.token_id=a.id WHERE a.id=?", (token_id,),
+    )
+    assert agent_at and binding_at == agent_at and revoker == 1
 
 
 def test_policy_admission_fails_closed_for_legacy_grants_invalid_scopes_and_unavailable_sources(issued_policy, monkeypatch):

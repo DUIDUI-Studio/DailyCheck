@@ -143,7 +143,11 @@ Publishing the same name creates another immutable version. Each action
 requires at least one safe field.
 
 In **创建受限策略令牌**, select the exact preset version and each storefront.
-The preview shows the actions, returned fields, and order ownership scope.
+The preview and binding details show the registered MCP tools, actions,
+returned fields, explicit storefronts, and ownership scope. The preview
+identifies the issuing administrator and shows the three empty legacy ACLs
+and their effect if the application is rolled back. After revocation the
+binding details show its administrator and recorded time.
 Confirm within ten minutes from the same signed-in session. The confirmation
 binds the exact operator, version, fields and storefronts. The new token is
 shown once on a private, no-store page. The database stores its hash,
@@ -158,7 +162,9 @@ legacy token field.
 
 An omitted order warehouse filters to all explicitly bound storefronts.
 Requests can use only declared input arguments. Disallowed actions, extra
-arguments and foreign warehouse filters return tool errors. Amounts, costs,
+arguments and foreign warehouse filters return tool errors. The order status
+filter is declared and accepted only when the policy includes the status
+field. Amounts, costs,
 line details, tracking, people and notes are outside the policy vocabulary.
 
 When selected, `fulfillment` returns authorized warehouse names and source
@@ -175,7 +181,9 @@ Publishing a replacement preset version leaves existing bindings intact.
 To rotate a token, preview and issue a new binding, confirm its scope with
 the client, then revoke the old row through **Agent Token 管理**. A replayed
 confirmation or a second active policy token with the same name is refused.
-The next request using a revoked token receives HTTP 401.
+The next request using a revoked token receives HTTP 401. In dry-run mode,
+the policy revoke route returns HTTP 409 and leaves the token in its existing
+state.
 
 The reserved bearer namespace is accepted through StreamableHTTP only.
 All three legacy ACL columns are empty, so earlier versions may advertise
