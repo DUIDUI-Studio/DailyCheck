@@ -88,11 +88,21 @@ def test_nonfixture_facts_have_no_candidate_shell_fallback(native_base):
 def test_changed_fixed_helper_rejects_before_tools_or_candidate_work(bridge):
     b = bridge
     p = b["policy"]
+    authority = b["root"] / "pipeline-authority"
+    authority.mkdir(mode=0o700)
+    helper_pins = {}
+    for name in HELPERS:
+        content = (p.authority / name).read_bytes()
+        helper = authority / name
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(content)
+        helper_pins[name] = hashlib.sha256(content).hexdigest()
+    p.authority = authority
     keys = ("app_python", "source_db", "green_db", "scratch_root", "log_directory", "backup_directory",
             "unit_directory", "nginx_conf", "app_environment_file", "blue_access_log", "green_access_log")
     p.value["pipeline"] = {**dict.fromkeys(keys, str(b["root"])), "version": 1, "app_gid": 65532,
         "app_runtime": {}, "tools": dict.fromkeys(TOOL_NAMES, "0" * 64),
-        "helpers": {name: hashlib.sha256((p.authority / name).read_bytes()).hexdigest() for name in HELPERS}}
+        "helpers": helper_pins}
     p.value["pipeline"]["helpers"][HELPERS[0]] = "f" * 64
     with pytest.raises(ValueError, match="helper changed"):
         ProtectedPipeline(p)

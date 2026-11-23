@@ -1328,7 +1328,9 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 的 bundle 核验。未配置匿名代理时显式使用 bundle。对象图验证完成后才进入受保护的
 `up → verify → promote → switch → observe`。verify 保留八项检查，生产观察须达到
 600 单调秒。relay 的 Check 1 使用独立、root 构建的本地 H/B Git 测试视图，仍由无权限
-提升的应用 UID 执行。实例目录保持 literal；OpenSSH 根权限测试走单独的离线精确 ID 门禁，要求每个已批准用例的 setup、call、teardown 均通过。
+提升的应用 UID 执行。测试视图保留 Git 常规文件模式，应用 UID 只能编辑自己复制的
+测试文件。实例目录保持 literal 只读；OpenSSH 根权限测试走单独的离线精确 ID 门禁，
+要求每个已批准用例的 setup、call、teardown 均通过。
 观测与固定切换共用生产蓝、绿 unit 名称，校验进程实际身份、两路探活及各自落点、
 工作目录和批准数据在进程挂载视图内的物理身份。绿 H 转正后、切流前校验挂载可写性。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
 两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及

@@ -14,6 +14,7 @@ from pathlib import Path
 from scripts.blue_green import deploy_state as ds
 from scripts.prod_agent import relay_git
 from scripts.prod_agent.native_pipeline import (
+    RELEASE_MODES,
     ProtectedPipeline,
     literal_tree,
     parse_application_environment,
@@ -137,6 +138,13 @@ def prepare_test_checkout(repo, expected, checkout):
     write_literal_release(repo, head, tree, checkout, entries)
     checkout.chmod(0o755)
     (checkout / "release.json").unlink()
+    # Preserve usual Git working-tree modes on the test view. The root owner
+    # is still the only writer, and tests can mutate their own copies of blobs.
+    for path in checkout.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o755)
+    for row in entries:
+        (checkout / row["path"]).chmod(RELEASE_MODES[row["mode"]] | stat.S_IWUSR)
     relay_git.git(checkout, "init", "--template=")
     metadata = checkout / ".git"
     # No local clone, external alternate, hardlinks, transport, hooks or candidate
@@ -153,7 +161,6 @@ def prepare_test_checkout(repo, expected, checkout):
     for path in metadata.rglob("*"):
         path.chmod(0o555 if path.is_dir() else 0o444)
     metadata.chmod(0o555)
-    checkout.chmod(0o555)
 
 
 def candidate_operation(operation):
