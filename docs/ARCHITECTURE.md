@@ -1327,9 +1327,10 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 候选对象先经固定匿名 HTTPS 通道核验，或在已批准代理不可达时从同一 attempt
 的 bundle 核验。未配置匿名代理时显式使用 bundle。对象图验证完成后才进入受保护的
 `up → verify → promote → switch → observe`。verify 保留八项检查，生产观察须达到
-600 单调秒。relay 的 Check 1 使用独立、root 构建的本地 H/B Git 测试视图，仍由无权限
-提升的应用 UID 执行。测试视图保留 Git 常规文件模式，应用 UID 只能编辑自己复制的
-测试文件。实例目录保持 literal 只读；OpenSSH 根权限测试走单独的离线精确 ID 门禁，
+600 单调秒。relay 的 Check 1 以独立的验证 UID 执行，通过私网和单元挂载屏蔽生产路径。
+它使用由 root 构建的本地 H/B Git 测试视图，保留 Git 常规文件模式。测试进程只能编辑
+自己复制的测试文件。绿 Web 和 MCP 在预演时使用该验证 UID 和独立库副本。Check 6
+读回两个运行进程、真实挂载和副本身份。正式转正时才恢复服务 UID 和原库路径。实例目录保持 literal 只读；OpenSSH 根权限测试走单独的离线精确 ID 门禁，
 要求每个已批准用例的 setup、call、teardown 均通过。
 观测与固定切换共用生产蓝、绿 unit 名称，校验进程实际身份、两路探活及各自落点、
 工作目录和批准数据在进程挂载视图内的物理身份。绿 H 转正后、切流前校验挂载可写性。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
@@ -1337,7 +1338,8 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 切流前再核对实际进程的路径和 inode。Check 1 使用独立临时审计文件；普通部署沿用既有默认落点。
 两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及
 阶段回执，供独立对账。Worker 预先落盘 arm 与 POST 分界。观察期只读探活失败按原蓝路由
-回切，副作用子进程未证实退出时保留护栏。Worker 用独立 report 凭据发布原有 typed PR
+回切，先以实际请求核对 Web 和 MCP 均落到原蓝进程，再停两个绿服务。绿未确认退出或
+停后蓝未通过复核时保留护栏。Worker 用独立 report 凭据发布原有 typed PR
 结果。VPS 的 `publications` 先记 intent，Worker 真实读到同作者、正文和 comment ID
 后才链接回执。部署终态和 publication 状态独立。安装和 Peter 首次试运行见
 [本地 Worker 发布 relay](agent-framework/local-worker-relay.md)。
@@ -1629,7 +1631,7 @@ MCP token 必须等于 protected health token 且不同于 GitHub read token。�
 文件由专用 Web 组只读，该组与 MCP 和发布前测试使用的主组不同。Web 以专用主组启动，
 且不继承辅助组。Relay 在同一轮观测中校验各 unit 的实际 GID、Web 的配置值和只读文件
 身份，并检查 MCP 未收到这两个 Web 配置。
-Web 审计日志匹配 Web 的实际 UID/GID。Check 1 仍以原测试身份写自己的隔离审计日志。
+Web 审计日志匹配 Web 的实际 UID/GID。Check 1 和绿预演各使用独立临时审计日志。
 Relay 只为物理身份验证匹配的外仓链接增加其实际父目录的 systemd 写路径，以便 SQLite
 维护 WAL/SHM。数据库文件和目录的实际访问仍由正式文件权限控制。
 `FEEDBACK_GITEA_TOKEN` 仅为应用建单凭据，不放行任何 Gitea Prod/merge、GitHub/App、read 或

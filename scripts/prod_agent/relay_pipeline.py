@@ -190,9 +190,7 @@ class RelayPipeline(ProtectedPipeline):
 
     def prepare_services(self):
         self._owned()
-        require(_route(self.path("nginx_conf").read_text()) == "blue",
-                "preview services may only replace an idle route")
-        self._stop_green()
+        self._stop_green_on_blue()
         # The unit manager reads this file before applying the namespace. Preview
         # processes get new local credentials and only the same feature switches.
         preview = {"DAILYCHECK_SECRET_KEY": secrets.token_urlsafe(48),
@@ -240,6 +238,12 @@ class RelayPipeline(ProtectedPipeline):
             values = dict(line.split("=", 1) for line in properties.splitlines())
             require(values["ActiveState"] in {"inactive", "failed"} and values["MainPID"] == "0",
                     "green service still has an active process")
+
+    def _stop_green_on_blue(self):
+        row, _ = self.server.owned(self.server.state())
+        require(self.server.runtime("blue") == row["rollback_runtime"],
+                "confirmed Web and MCP traffic on the original blue runtime required")
+        self._stop_green()
 
     def _stop_green(self):
         subprocess.run(["/usr/bin/systemctl", "stop", *UNITS["green"]], env=SYSTEM_ENV, check=True)
@@ -386,9 +390,7 @@ class RelayPipeline(ProtectedPipeline):
             raise StageFailure(name)
         require(result.returncode == 0, "stage died without a normal exit")
         if name == "rollback":
-            require(_route(self.path("nginx_conf").read_text()) == "blue",
-                    "cannot stop green until both routes return to blue")
-            self._stop_green()
+            self._stop_green_on_blue()
 
 
 def prepare_test_checkout(repo, expected, checkout):

@@ -95,6 +95,26 @@ def test_relay_preview_and_live_units_use_separate_database_and_access_log(tmp_p
         assert (str(audit) in content) == (key == port.UNITS["green"][0])
 
 
+def test_relay_requires_the_confirmed_blue_runtime_before_stopping_green(monkeypatch):
+    pipeline = object.__new__(port.RelayPipeline)
+    calls = []
+    state = {}
+    standby = {"sha": "base", "route": "blue", "identity": "expected"}
+    actual = {**standby, "identity": "different"}
+    pipeline.server = SimpleNamespace(
+        state=lambda: state,
+        owned=lambda record: ({"rollback_runtime": standby}, None),
+        runtime=lambda role: calls.append(role) or actual,
+    )
+    monkeypatch.setattr(pipeline, "_stop_green", lambda: calls.append("stop green"))
+    with pytest.raises(ValueError, match="confirmed Web and MCP traffic"):
+        pipeline._stop_green_on_blue()
+    assert calls == ["blue"]
+    actual.update(standby)
+    pipeline._stop_green_on_blue()
+    assert calls == ["blue", "blue", "stop green"]
+
+
 APP = r"""
 import http.server, os, sys
 port, mcp, logfile = int(sys.argv[1]), sys.argv[2] == 'mcp', sys.argv[3]
