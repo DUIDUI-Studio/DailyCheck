@@ -245,8 +245,10 @@ policy. Existing credentials retain their previous tool access.
   manual input, including zero. `planned_default=1` is classified as
   `system_default` when its unique outbound link corroborates the item,
   batch, completed production outbound status and absence of rollback.
-  Remaining sources are `unknown`. Summing outbound or stock-movement
-  quantities would duplicate these production facts.
+  The planned, booked and linked outbound quantities must also agree
+  with the writer's defaulting invariant. Quantity equality alone does
+  not establish the source. Remaining sources are `unknown`. Summing
+  outbound or stock-movement quantities would duplicate these production facts.
 - Summary sorts by warehouse, period start and local item ID. Lines sort by
   warehouse, created time, batch ID and line ID. Each call opens one read
   snapshot per warehouse in sequence. The page size is 1–200 (default 50)
@@ -262,8 +264,12 @@ policy. Existing credentials retain their previous tool access.
   page one. No database snapshot is kept open between requests.
 - An invalid or unauthorized request returns a protocol tool error.
   Missing, unreadable, incompatible-schema and WAL sources return
-  `source_unavailable` for the entire request. Reads use existing-only
-  SQLite policy connections. MCP calls append to the normal access log.
+  `source_unavailable` for the entire request. Before any warehouse opens,
+  the server uses file metadata to compare the targets of all four registered
+  stores. It rejects a requested store that shares a physical file with
+  another, including hard links. External symlinks to distinct files work.
+  Reads use existing-only SQLite policy connections. MCP calls append to
+  the normal access log.
 
 ## Available Tools
 

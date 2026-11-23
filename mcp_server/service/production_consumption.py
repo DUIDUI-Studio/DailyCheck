@@ -44,17 +44,30 @@ def _date_range(start_date: str, end_date: str, view: str) -> None:
 
 
 def _warehouse_paths(codes: tuple[str, ...]) -> dict:
-    placeholders = ", ".join("?" for _ in codes)
+    approved = tuple(sorted(PRODUCTION_STORES))
+    placeholders = ", ".join("?" for _ in approved)
     with policy_master_connection() as conn:
         rows = conn.execute(
-            f"SELECT code, db_path FROM warehouses WHERE code COLLATE BINARY IN ({placeholders}) "
-            "AND warehouse_type = 'storefront'", codes,
-        )
-        paths = {
-            row["code"]: resolve_warehouse_path(row["db_path"], config.BASE_DIR, db_dir=config.DB_DIR).resolve()
-            for row in rows
-        }
-    if paths.keys() != set(codes) or len(set(paths.values())) != len(paths):
+            f"SELECT code, db_path, warehouse_type FROM warehouses WHERE code COLLATE BINARY IN ({placeholders})",
+            approved,
+        ).fetchall()
+    paths, identities, conflicts = {}, {}, set()
+    for row in rows:
+        code = row["code"]
+        try:
+            path = resolve_warehouse_path(row["db_path"], config.BASE_DIR, db_dir=config.DB_DIR).resolve(strict=True)
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        # Compare the resolved targets of all four registrations, including
+        # stores outside this token's scope. Only open admitted stores below.
+        identity = info.st_dev, info.st_ino
+        if identity in identities:
+            conflicts.update((code, identities[identity]))
+        identities[identity] = code
+        if code in codes and row["warehouse_type"] == "storefront":
+            paths[code] = path
+    if paths.keys() != set(codes) or conflicts.intersection(codes):
         raise ValueError("Invalid production warehouse paths")
     return paths
 
@@ -70,7 +83,9 @@ def _source_expression(conn: sqlite3.Connection) -> tuple[str, str]:
         return "CASE WHEN li.planned_default = 0 THEN 'manual' ELSE 'unknown' END", ""
     return (
         """CASE WHEN li.planned_default = 0 THEN 'manual'
-                WHEN li.planned_default = 1 AND ob.id IS NOT NULL THEN 'system_default'
+                WHEN li.planned_default = 1 AND ob.id IS NOT NULL
+                 AND li.planned_qty = li.actual_qty AND li.actual_qty = ob.requested_quantity
+                THEN 'system_default'
                 ELSE 'unknown' END""",
         """LEFT JOIN outbound_requests ob
                   ON ob.id = li.outbound_req_id AND ob.item_id = li.item_id

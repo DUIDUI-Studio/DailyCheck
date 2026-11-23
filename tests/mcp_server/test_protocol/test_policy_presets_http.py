@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import secrets
 import socket
@@ -640,7 +641,14 @@ def production_stores(storefronts, policy_admin):
                 (4, 4, 4, 1, 41), (5, 5, 4, 0, None), (6, 6, 4, 1, None), (7, 7, 4, 0, None),
                 (8, 4, 4, 1, 42), (9, 4, 4, 1, 43), (10, 4, 4, 1, 44), (11, 4, 4, 1, 45),
                 (12, 4, 4, 1, 46), (13, 4, 4, 1, 46), (14, 4, 5, 1, 99),
+                (15, 4, 5, 1, 48), (16, 4, 4, 1, 49),
             ],
+        )
+        conn.executemany(
+            "INSERT INTO outbound_requests "
+            "(id, item_id, requested_quantity, reason, status, rolled_back, created_at, source_type) "
+            "VALUES (?, 1, 5, '生产领料(run=#4)', '出库', 0, '2026-11-17 00:00:00', 'production')",
+            [(48,), (49,)],
         )
         conn.execute(
             "INSERT INTO stock_movements (item_id, action, delta, note, created_at) "
@@ -731,24 +739,26 @@ def test_production_consumption_sdk(production_tokens, monkeypatch):
                 assert all(group[key] == sum(row[key] for row in day["summary"]
                                             if row["warehouse_code"] == group["warehouse_code"])
                            for key in counts)
-            assert [week["summary"][0][key] for key in counts] == [11, 2, 1, 8]
+            assert [week["summary"][0][key] for key in counts] == [13, 2, 1, 10]
             assert [week["summary"][-1][key] for key in counts] == [1, 0, 0, 1]
             assert [(group["period_start"], group["planned_count"]) for group in day["summary"][:3]] == [
-                ("2026-11-16", 2), ("2026-11-17", 8), ("2026-11-22", 1),
+                ("2026-11-16", 2), ("2026-11-17", 10), ("2026-11-22", 1),
             ]
 
             line_args = {**PRODUCTION_ARGS, "view": "lines", "warehouse_code": "wh_002"}
             lines = await _call(session, PRODUCTION_TOOL, line_args)
             validate(lines, PRODUCTION_SHAPE)
             records = {row["line_id"]: row for row in lines["lines"]}
-            assert list(records) == [1, 3, 4, 8, 9, 10, 11, 12, 13, 14, 6]
+            assert list(records) == [1, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 6]
             assert records[1]["created_at"] == "2026-11-16T00:00:00+08:00"
             assert records[1]["booked_qty"] == 0 and records[1]["booked_source"] == "manual"
             assert records[3]["planned_qty"] == records[3]["booked_qty"] == 4
             assert records[3]["booked_source"] == "manual"
             assert records[4]["planned_qty"] == records[4]["booked_qty"] == 4
             assert records[4]["booked_source"] == "system_default"
-            assert all(records[i]["booked_source"] == "unknown" for i in (6, 8, 9, 10, 11, 12, 13, 14))
+            assert all(records[i]["booked_source"] == "unknown" for i in (6, 8, 9, 10, 11, 12, 13, 14, 15, 16))
+            assert (records[15]["planned_qty"], records[15]["booked_qty"]) == (4, 5)
+            assert (records[16]["planned_qty"], records[16]["booked_qty"]) == (4, 4)
             assert records[14]["booked_qty"] == 5
             assert all(set(row) == {
                 "warehouse_code", "item_id", "unit", "run_id", "line_id", "created_at",
@@ -858,6 +868,47 @@ def test_production_consumption_scope_and_source_fail_closed(production_tokens, 
             before = _snapshot(env["root"])
             await _call(session, PRODUCTION_TOOL, args, error="source_unavailable")
             assert _snapshot(env["root"]) == before
+
+    with _listener() as url:
+        asyncio.run(exercise(url))
+
+
+def test_production_consumption_rejects_physical_alias_before_read(production_tokens, monkeypatch):
+    env, paths, _, full, partial, _ = production_tokens
+    configured, other = paths["wh_002"], paths["wh_003"]
+    target = env["root"] / "external-warehouse.db"
+    configured.rename(target)
+    configured.symlink_to(target)
+
+    async def exercise(url):
+        async with _session(url, full) as session, _session(url, partial) as narrow:
+            args = {**PRODUCTION_ARGS, "view": "lines", "warehouse_code": "wh_002"}
+            before = _snapshot(env["root"])
+            page = await _call(session, PRODUCTION_TOOL, args)
+            assert page["lines"][0]["booked_qty"] == 0
+            assert _snapshot(env["root"]) == before
+
+            other.rename(other.with_suffix(".original"))
+            os.link(target, other)
+            assert other.resolve() != target.resolve()
+            assert other.samefile(configured)
+            before = _snapshot(env["root"])
+            original_open = sqlite3.connect
+
+            def master_only(database, *args, **kwargs):
+                assert env["master"].as_uri() in str(database), database
+                return original_open(database, *args, **kwargs)
+
+            with monkeypatch.context() as guarded:
+                guarded.setattr(sqlite3, "connect", master_only)
+                await _call(narrow, PRODUCTION_TOOL, PRODUCTION_ARGS, error="source_unavailable")
+                await _call(session, PRODUCTION_TOOL, args, error="source_unavailable")
+                await _call(session, PRODUCTION_TOOL, PRODUCTION_ARGS, error="source_unavailable")
+            assert _snapshot(env["root"]) == before
+            unaffected = await _call(session, PRODUCTION_TOOL, {
+                **PRODUCTION_ARGS, "warehouse_code": "wh_004",
+            })
+            assert unaffected["summary"][0]["warehouse_code"] == "wh_004"
 
     with _listener() as url:
         asyncio.run(exercise(url))
