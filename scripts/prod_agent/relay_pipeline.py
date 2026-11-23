@@ -7,6 +7,7 @@ import re
 import secrets
 import stat
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from scripts.prod_agent.native_ports import SystemdObserver, protected_path
 from scripts.prod_agent.relay_protocol import STATE_PATH, SYSTEM_ENV, digest, require
 
 UNITS = {
-    "blue": ["dailycheck-app.service", "dailycheck-mcp.service"],
+    "blue": ["dailycheck.service", "dailycheck-mcp.service"],
     "green": ["dailycheck-green.service", "dailycheck-green-mcp.service"],
 }
 
@@ -76,7 +77,22 @@ class RelayPipeline(ProtectedPipeline):
                              "subject_pr_number": expected["pr"]}}
 
     def _control_env(self, candidate):
-        return {**super()._control_env(candidate), "DC_RELAY_MODE": "1"}
+        return {**super()._control_env(candidate), "DC_RELAY_MODE": "1",
+                "BLUE_SERVICE_UNIT": UNITS["blue"][0], "GREEN_SERVICE_UNIT": UNITS["green"][0]}
+
+    def _pytest(self, scratch):
+        self._owned()
+        # This sibling of the UID-owned scratch is root-prepared and root-owned.
+        # Runtime and control paths, including the repo's seed alternate, stay private.
+        with tempfile.TemporaryDirectory(prefix="relay-check1-", dir=self.path("scratch_root")) as tmp:
+            parent = Path(tmp)
+            checkout = parent / "source"
+            prepare_test_checkout(self.policy.location("repo"), self.server.expected, checkout)
+            parent.chmod(0o711)
+            return super()._pytest(scratch, cwd=checkout, extra={
+                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": str(checkout),
+            })
 
     def prepare(self, repo):
         candidate = self._owned()
@@ -110,6 +126,34 @@ class RelayPipeline(ProtectedPipeline):
         if result.returncode > 0:
             raise StageFailure(name)
         require(result.returncode == 0, "stage died without a normal exit")
+
+
+def prepare_test_checkout(repo, expected, checkout):
+    """Build an independent local Git view using only literal bytes and Git plumbing."""
+    head, base = expected["head"], expected["base"]
+    relay_git.check_objects(repo, expected)
+    tree, entries = literal_tree(repo, head)
+    require(tree == expected["tree"], "test checkout candidate tree changed")
+    write_literal_release(repo, head, tree, checkout, entries)
+    checkout.chmod(0o755)
+    (checkout / "release.json").unlink()
+    relay_git.git(checkout, "init", "--template=")
+    metadata = checkout / ".git"
+    # No local clone, external alternate, hardlinks, transport, hooks or candidate
+    # checkout/filter execution. Copy H's object graph, including exact ancestor B.
+    relay_git.git(repo, "pack-objects", "--revs", str(metadata / "objects/pack/pack"),
+                  input=(head + "\n").encode())
+    for key, value in (("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false"),
+                       ("credential.helper", ""), ("protocol.allow", "never")):
+        relay_git.git(checkout, "config", key, value)
+    relay_git.git(checkout, "update-ref", "--no-deref", "HEAD", head)
+    relay_git.git(checkout, "update-ref", "refs/remotes/origin/main", base)
+    relay_git.git(checkout, "read-tree", head)
+    relay_git.check_objects(checkout, expected)
+    for path in metadata.rglob("*"):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    metadata.chmod(0o555)
+    checkout.chmod(0o555)
 
 
 def candidate_operation(operation):
@@ -154,10 +198,15 @@ def _tail(path):
 
 def _route(config):
     result = []
+    config = re.sub(r"(?m)#[^\n]*", "", config)
     for name, blue, green in (("dailycheck", 8090, 8091), ("dailycheck-mcp", 5100, 5101)):
         body = re.findall(r"(?m)^\s*upstream " + name + r"\s*\{([^{}]+)\}", config)
         require(len(body) == 1, "unknown Nginx upstream")
-        matches = re.findall(r"(?m)^\s*server\s+127\.0\.0\.1:(\d+)\s+(down|weight=100);", body[0])
+        server_line = r"server\s+127\.0\.0\.1:(\d+)\s+(down|weight=100)"
+        directives = body[0].strip().split(";")
+        matches = [re.fullmatch(server_line, line.strip()) for line in directives[:-1]]
+        require(not directives[-1].strip() and all(matches), "unexpected upstream directive")
+        matches = [match.groups() for match in matches]
         require(len(matches) == 2 and {p for p, _ in matches} == {str(blue), str(green)}
                 and {mode for _, mode in matches} == {"down", "weight=100"},
                 "upstream must be pinned at 100 percent")
@@ -167,34 +216,125 @@ def _route(config):
     return result[0]
 
 
+def database_identity(path, external=None, *, view=Path("/")):
+    """Physical identity of the approved directory, Master and each warehouse DB."""
+    def entry(file, file_type):
+        info = file.lstat()
+        require(stat.S_IFMT(info.st_mode) == file_type, "unexpected DB layout or symlink")
+        return [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)]
+
+    external = external if external is not None else {}
+    require(isinstance(external, dict), "invalid external warehouse registration")
+    path = view / path.relative_to("/")
+    for parent in path.parents:
+        if parent == view:
+            break
+        entry(parent, stat.S_IFDIR)
+    warehouses = path / "warehouses"
+    for directory in (path, warehouses):
+        require(not os.statvfs(directory).f_flag & os.ST_RDONLY, "runtime DB mount is read-only")
+    master = path / "master.db"
+    require(not os.statvfs(master).f_flag & os.ST_RDONLY, "master DB mount is read-only")
+    identity = {".": entry(path, stat.S_IFDIR), "master.db": entry(master, stat.S_IFREG),
+                "warehouses": entry(warehouses, stat.S_IFDIR)}
+    physical = {tuple(identity["master.db"][:2])}
+    files = {file.name: file for file in warehouses.glob("*.db")}
+    require(external.keys() <= files.keys(), "registered external warehouse absent")
+    for name, file in sorted(files.items()):
+        key = "warehouses/" + name
+        if name in external:
+            target = Path(external[name])
+            require(target.is_absolute() and ".." not in target.parts,
+                    "canonical external warehouse path required")
+            lexical = os.readlink(file)
+            declared = Path(lexical)
+            if not declared.is_absolute():
+                declared = Path(os.path.normpath(str(Path("/") / warehouses.relative_to(view) / declared)))
+            require(declared == target, "external warehouse target changed")
+            actual = view / target.relative_to("/")
+            for parent in actual.parents:
+                if parent == view:
+                    break
+                entry(parent, stat.S_IFDIR)
+            info = entry(actual, stat.S_IFREG)
+            require(not os.statvfs(actual).f_flag & os.ST_RDONLY
+                    and not os.statvfs(actual.parent).f_flag & os.ST_RDONLY,
+                    "external warehouse mount is read-only")
+            identity[key] = [entry(file, stat.S_IFLNK), lexical, str(target), info]
+        else:
+            info = entry(file, stat.S_IFREG)
+            require(not os.statvfs(file).f_flag & os.ST_RDONLY, "warehouse DB mount is read-only")
+            identity[key] = info
+        device_inode = tuple(info[:2])
+        require(device_inode not in physical, "duplicate physical database")
+        physical.add(device_inode)
+    return digest(identity)
+
+
+def _journal(unit, since):
+    result = subprocess.run(
+        ["/usr/bin/journalctl", "-q", "-u", unit, "--since", "@" + str(since),
+         "--lines=5000", "--no-pager"], env=SYSTEM_ENV, timeout=15, capture_output=True,
+         check=True)
+    require(not result.stderr, "runtime journal unavailable")
+    require(len(result.stdout.splitlines()) < 5000, "runtime journal window overflow")
+    return result.stdout
+
+
 def live_route(server, role):
     policy = Policy(server)
     pipeline = policy.value["pipeline"]
     config = protected_path(Path(pipeline["nginx_conf"]), 0)
     active = _route(config.read_text())
-    color = active if role == "previous" else "blue" if role == "standby" else role
-    require(role == "standby" or active == color, "wrong live route")
+    candidate = role in {"green", "candidate-standby"}
+    color = {"previous": active, "standby": "blue", "candidate-standby": "green"}.get(role, role)
+    if role == "candidate-standby":
+        require(active == "blue", "candidate standby requires blue traffic")
+    else:
+        require(role == "standby" or active == color, "wrong live route")
     expected = server.expected
-    sha = expected["head"] if role == "green" else expected["base"]
-    if role == "green":
+    sha = expected["head"] if candidate else expected["base"]
+    if candidate:
         repo, release = policy.location("repo"), policy.location("release_root") / sha
     else:
         repo = server.seed
         release = server.path("baseline_" + color)
     protected_path(release, 0)
     tree, entries = literal_tree(repo, sha)
+    if candidate:
+        require(tree == expected["tree"], "live candidate tree changed")
     verify_literal_release(repo, sha, tree, release, entries)
+    require(all(path.lstat().st_uid == 0 for path in (release, *release.rglob("*")))
+            and not release.stat().st_mode & 0o222, "live release ownership or mode changed")
     policy.value = {**policy.value, "units": UNITS[color]}
-    observer = SystemdObserver()
+    require(type(policy.value["app_uid"]) is int and policy.value["app_uid"] > 0
+            and type(pipeline["app_gid"]) is int and pipeline["app_gid"] > 0,
+            "nonroot runtime principal required")
+    observer = SystemdObserver(exact_unit=True)
     processes = observer.observe(policy)
-    require(len(processes) == 2 and all(row["cwd"] == str(release) for row in processes),
+    require(len({row["pid"] for row in processes}) == 2
+            and all(row["cwd"] == str(release) for row in processes),
             "serving processes are not the exact protected release")
-    if role == "green":
+    source_db = Path(pipeline["source_db"])
+    require(source_db.is_absolute() and source_db.resolve() == source_db
+            and not source_db.is_relative_to(release), "canonical external DB required")
+    db_identity = policy.value["source_db_identity"]
+    external = policy.value.get("external_warehouse_dbs")
+
+    def verify_data():
+        require(database_identity(source_db, external) == db_identity, "approved DB identity changed")
         for row in processes:
-            environment = (Path("/proc") / str(row["pid"]) / "environ").read_bytes().split(b"\0")
-            require(b"DRY_RUN=false" in environment and
-                    os.fsencode("DAILYCHECK_DB_DIR=" + pipeline["source_db"]) in environment,
-                    "green runtime was not promoted to the approved write route")
+            proc = Path("/proc") / str(row["pid"])
+            environment = (proc / "environ").read_bytes().split(b"\0")
+            for key, value in (("DRY_RUN", "false"), ("DAILYCHECK_ENV", "production"),
+                               ("DAILYCHECK_DB_DIR", str(source_db))):
+                prefix = os.fsencode(key + "=")
+                require([x for x in environment if x.startswith(prefix)] ==
+                        [prefix + os.fsencode(value)], "runtime is not on the approved write route")
+            require(database_identity(source_db, external, view=proc / "root") == db_identity,
+                    "process mount DB identity changed")
+
+    verify_data()
     app_port, mcp_port = (8090, 5100) if color == "blue" else (8091, 5101)
     env_path = protected_path(Path(pipeline["app_environment_file"]), 0, private=True)
     app_env = parse_application_environment(env_path.read_bytes())
@@ -202,7 +342,8 @@ def live_route(server, role):
     for port, credential in ((app_port, None), (mcp_port, token)):
         code, body = _http(port, "/health", credential)
         require(code == 200 and len(body) <= 65536, "direct app/MCP health failed")
-    if role != "standby":
+    require(_http(mcp_port, "/health")[0] == 401, "direct MCP auth exclusion failed")
+    if role not in {"standby", "candidate-standby"}:
         nonce = ("dc_relay_" + secrets.token_hex(16)).encode()
         code, body = _http(8080, "/health?" + nonce.decode() + "=1")
         require(code == 200 and len(body) <= 65536, "public app route unhealthy")
@@ -214,15 +355,25 @@ def live_route(server, role):
         require(nonce in _tail(Path(pipeline[color + "_access_log"]))
                 and nonce not in _tail(Path(pipeline[other + "_access_log"])),
                 "public route landing unproven")
-        code, body = _http(8080, "/api/mcp/", token)
+        since = int(time.time())
+        path = "/api/mcp/?" + nonce.decode() + "=1"
+        require(_http(8080, path)[0] == 401, "public MCP auth exclusion failed")
+        code, body = _http(8080, path, token)
         require(code in {200, 400, 405, 406} and len(body) <= 65536, "public MCP route unhealthy")
+        for _ in range(10):
+            if nonce in _journal(UNITS[color][1], since):
+                break
+            time.sleep(0.2)
+        else:
+            raise ValueError("public MCP route landing unproven")
+        require(nonce not in _journal(UNITS[other][1], since), "public MCP reached standby")
     if role == "green":
         row = server.state()["worker_relay"]
         switch = next(s for s in row["journal"] if s["stage"] == "switch")
-        journal = subprocess.check_output(
-            ["/usr/bin/journalctl", "-u", UNITS["green"][0], "--since",
-             "@" + str(switch["started_at"]), "--no-pager"], env=SYSTEM_ENV, timeout=15)
-        require(b"[dry_run] BLOCKED" not in journal, "live writes blocked")
+        require(b"[dry_run] BLOCKED" not in _journal(UNITS["green"][0], switch["started_at"]),
+                "live writes blocked")
     require(observer.observe(policy) == processes and _route(config.read_text()) == active,
             "runtime changed during observation")
-    return {"sha": sha, "route": color, "identity": digest({"tree": tree, "processes": processes})}
+    verify_data()
+    return {"sha": sha, "route": color,
+            "identity": digest({"tree": tree, "processes": processes, "database": db_identity})}

@@ -494,7 +494,7 @@ class ProtectedPipeline:
                 "GREEN_MCP_ENV_FILE": str(p.location("directory") / "unused-mcp.env"),
                 "NGINX_DAILYCHECK_CONF": str(self.path("nginx_conf"))}
 
-    def _lower(self, args, *, db, scratch, input=None, extra=None, output=None):
+    def _lower(self, args, *, db, scratch, input=None, extra=None, output=None, cwd=None):
         """The only candidate process boundary; no inherited descriptors/environment."""
         p = self.policy
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(scratch),
@@ -504,7 +504,8 @@ class ProtectedPipeline:
                    "--regid=" + str(self.value["app_gid"]), "--clear-groups",
                    "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
                    "--no-new-privs", str(self.python), "-I", "-B", *args]
-        child = subprocess.Popen(command, cwd=self._release(self._owned()), env=env,
+        candidate = self._owned()
+        child = subprocess.Popen(command, cwd=cwd or self._release(candidate), env=env,
             close_fds=True, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=output if output is not None else subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True)
@@ -691,7 +692,7 @@ class ProtectedPipeline:
         finally:
             shutil.rmtree(scratch)
 
-    def _pytest(self, scratch):
+    def _pytest(self, scratch, *, cwd=None, extra=None):
         log = self.path("log_directory") / "native-pytest.log"
         session = scratch / "session.json"
         code = ("import importlib.util,runpy,sys; "
@@ -702,7 +703,8 @@ class ProtectedPipeline:
             result = self._lower(["-c", code, str(self.policy.authority / "scripts/ci/pytest_evidence.py"),
                 "tests/", "--basetemp=" + str(scratch / "pytest"),
                 "-q", "--tb=line", "-rfE", "--color=no", "-p", "no:cacheprovider", "-p", "dc_approved_evidence",
-                "--dc-evidence=" + str(session)], db=scratch / "db", scratch=scratch, output=output)
+                "--dc-evidence=" + str(session)], db=scratch / "db", scratch=scratch, output=output,
+                cwd=cwd, extra=extra)
         # Only the trusted checker decides from native exit and captured files.
         return subprocess.run([str(self.policy.python), "-I", "-B",
             str(self.policy.authority / "scripts/check_known_failures.py"), str(log),

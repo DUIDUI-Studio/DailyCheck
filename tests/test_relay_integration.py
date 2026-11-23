@@ -26,6 +26,7 @@ from scripts.blue_green.publication_authority import (
     SOURCE_KEYS,
     resolve_source_binding,
 )
+from scripts.ci.relay_exact import offline
 from scripts.hosting import github_ff_payload
 from scripts.prod_agent.relay_protocol import COMMAND, SIGNER, WORKER_PATH, canonical, sign
 from scripts.prod_agent.relay_vps import ENTRY
@@ -36,6 +37,7 @@ CANARY = "synthetic_gh_secret_never_crosses_relay_"
 SSHD = "/usr/sbin/sshd"
 REF = "refs/heads/chore/issue-160-test"
 ID = "PR_synthetic_160"
+SSH_LANE = "DAILYCHECK_RELAY_SSH_INTEGRATION"
 
 
 def cmd(*args, **kwargs):
@@ -102,7 +104,7 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
                 return
             status = 201
         elif path == route:
-            value = rows
+            value = [] if options.get("hide_report") else rows
         elif path == ROOT + "/issues/comments/456" and rows:
             value = rows[0]
         else:
@@ -117,8 +119,12 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
 
 @pytest.fixture
 def relay(tmp_path):
-    if not Path(SSHD).exists() or not Path("/usr/bin/ssh").exists():
-        pytest.skip("OpenSSH client and server required for isolated relay integration")
+    if os.environ.get(SSH_LANE) != "1":
+        pytest.skip("requires the isolated Linux/root relay SSH lane")
+    assert sys.platform == "linux" and os.geteuid() == 0, "isolated Linux/root required"
+    assert Path(SSHD).is_file() and Path("/usr/bin/ssh").is_file(), "OpenSSH required"
+    assert offline(), "offline lane required"
+    assert Path("/run/sshd").is_dir(), "OpenSSH privilege separation directory required"
     root = tmp_path.resolve()
     root.chmod(0o700)
     state, worker, source, web = [root / x for x in ("state", "worker", "source", "web")]
@@ -251,8 +257,20 @@ expiry = now + (10 if phase == 'preflight' else 120)
 if phase == 'finalize' and control.get('expired_finalize'):
     expiry = now - 1
 token = {CANARY!r} + phase + '_' + os.urandom(12).hex()
+if control.get('reuse'):
+    token = {CANARY!r} + 'preflight_0123456789'
+grant = dict(request, repo_id=1448986421, installation_id=123, expires=expiry, token=token)
+field = control.get('bad_grant')
+if field in ('head', 'base', 'source'):
+    grant['target'][field] = 'a' * len(grant['target'][field])
+elif field == 'missing':
+    del grant['token']
+elif field == 'expires':
+    grant['expires'] = now - 1
+elif field:
+    grant[field] = 'incorrect'
 write(root / (phase + '.expiry'), expiry)
-print(json.dumps(dict(request, repo_id=1448986421, installation_id=123, expires=expiry, token=token)))
+print(json.dumps(grant))
 """)
     curl = root / "curl"
     curl_pin = executable(curl, common + f"""
@@ -702,3 +720,50 @@ def test_public_report_requires_verified_comment_and_never_reposts(relay, mode):
     publication = read(relay.state / "state.json")["publications"][attempt_id]
     assert publication["comment_id"] == (456 if success else 0)
     assert relay.legacy().returncode == (0 if success else 10)
+
+
+@pytest.mark.parametrize("field", ["missing", "expires", "installation_id", "repo_id",
+                                  "phase", "head", "base", "source", "issuer_pin"])
+def test_phase_auth_contract_denies_before_admission(relay, field):
+    if field == "issuer_pin":
+        with (relay.root / "auth").open("a") as stream:
+            stream.write("# different issuer bytes\n")
+    else:
+        relay.options(bad_grant=field)
+    relay.call("start", success=False)
+    assert relay.call("status")["phase"] == "absent"
+    state = read(relay.state / "state.json")
+    assert state["generation"] == 20 and state["last_attempt"]["pr"] == 43
+    assert not relay.journal() and not relay.posts()
+
+
+def test_phase_grant_reuse_stops_before_merge(relay):
+    relay.options(reuse=True)
+    relay.call("start")
+    relay.wait("verified")
+    relay.call("finalize", success=False)
+    assert relay.call("status")["phase"] == "verified"
+    assert not relay.posts()
+
+
+def test_unknown_report_ambiguity_holds_then_exact_readback_links(relay):
+    relay.call("start")
+    relay.wait("verified")
+    relay.call("finalize")
+    relay.options(report_mode="lost", hide_report=True)
+    assert relay.call("report", success=False)["publication"]["state"] == "uncertain"
+    first = read(relay.state / "state.json")
+    comment, = read(relay.root / "comments.json")
+    assert relay.legacy().returncode == 10
+    relay.options()
+    write(relay.root / "comments.json", [comment, {**comment, "id": 457}])
+    relay.call("report", success=False)
+    assert relay.legacy().returncode == 10
+    assert read(relay.state / "state.json") == first
+    write(relay.root / "comments.json", [comment])
+    assert relay.call("report")["publication"] == {"state": "linked", "comment_id": 456}
+    assert relay.legacy().returncode == 0
+    assert (relay.root / "report-posts.log").read_text().splitlines() == ["POST"]
+    after = read(relay.state / "state.json")
+    for field in ("deployed", "outcomes", "generation", "last_attempt"):
+        assert first[field] == after[field]

@@ -67,6 +67,8 @@ class Server:
         else:
             require(sys.platform == "linux" and os.geteuid() == 0, "protected Linux VPS required")
             require(self.authority == Path(__file__).resolve().parents[2], "authority path changed")
+            require(hex_id(self.profile.get("source_db_identity"), 64),
+                    "protected live DB identity required")
         os.environ.clear()
         os.environ.update(SYSTEM_ENV, DAILYCHECK_DEPLOY_STATE_DIR=str(self.directory))
 
@@ -130,17 +132,18 @@ class Server:
             from scripts.prod_agent.relay_pipeline import live_route
             value = live_route(self, role)
         require(isinstance(value, dict) and set(value) == {"sha", "route", "identity"}
-                and value["sha"] == self.expected["head" if role == "green" else "base"]
+                and value["sha"] == self.expected["head" if role in {"green", "candidate-standby"} else "base"]
                 and value["route"] in ({"blue", "green"} if role == "previous" else
-                                    {"blue"} if role == "standby" else {role})
+                                    {"blue"} if role == "standby" else
+                                    {"green"} if role == "candidate-standby" else {role})
                 and hex_id(value["identity"], 64), "runtime route/version unproven")
         return value
 
-    def observe_green(self):
+    def observe_green(self, role="green"):
         # This boundary runs after the positively waited switch. Read-only probe
         # failure is evidence of unhealthy observation, unlike an interrupted write.
         try:
-            return self.runtime("green")
+            return self.runtime(role)
         except (OSError, ValueError, http.client.HTTPException, subprocess.SubprocessError) as exc:
             raise StageFailure("observation read failed") from exc
 
@@ -270,6 +273,8 @@ class Server:
             for stage in STAGES:
                 journal.append({"stage": stage, "started_at": ds.now_epoch()})
                 self._set(journal=journal)
+                if stage == "switch" and not self.fixture:
+                    self.observe_green("candidate-standby")
                 self.stage(stage)
                 journal[-1]["completed_at"] = ds.now_epoch()
                 self._set(journal=journal)

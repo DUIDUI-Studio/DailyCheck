@@ -23,7 +23,7 @@ def _limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_EXPANDED, MAX_EXPANDED))
 
 
-def git(repo, *args, network=False, ca=None, proxy=None):
+def git(repo, *args, network=False, ca=None, proxy=None, input=None):
     env = {**GIT_ENV, "GIT_ALLOW_PROTOCOL": "https" if network else ""}
     command = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                "-c", "credential.helper=", "-c", "http.followRedirects=false",
@@ -33,10 +33,11 @@ def git(repo, *args, network=False, ca=None, proxy=None):
     if proxy:
         command += ["-c", "http.proxy=" + proxy]
     command += ["-C", str(repo), *args]
-    with subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    stdin = subprocess.DEVNULL if input is None else subprocess.PIPE
+    with subprocess.Popen(command, env=env, stdin=stdin, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, start_new_session=True, preexec_fn=_limits) as child:
         try:
-            output, error = child.communicate(timeout=90)
+            output, error = child.communicate(input, timeout=90)
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.communicate()
