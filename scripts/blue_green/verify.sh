@@ -541,7 +541,10 @@ _run_check "5" "资源与依赖 (systemctl status + journalctl + ss -tn)" \
 # ============================================================
 # 6. dry_run 隔离证据（调 prod_dryrun_evidence.sh）
 # ============================================================
-if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+if [[ "${DC_RELAY_MODE:-0}" == "1" ]]; then
+  _run_check "6" "绿环境存储隔离（运行账号、数据库副本、生产路径屏蔽）" \
+    "_native_operation preview-storage"
+elif [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
   _run_check "6" "dry_run 隔离证据 (protected intended green UPDATE)" \
     "bash '${DC_NATIVE_AUTHORITY}/scripts/agent_framework/prod_dryrun_evidence.sh'"
 else

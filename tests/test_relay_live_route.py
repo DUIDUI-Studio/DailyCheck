@@ -26,6 +26,75 @@ from scripts.prod_agent.relay_vps import Server, StageFailure
 UID, GID = 4001, 4002
 TOKEN = "synthetic_fixture_token_" + "a" * 32
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_relay_write_paths_include_only_the_pinned_external_warehouse_parent(tmp_path):
+    root = tmp_path.resolve()
+    source = root / "source"
+    warehouses = source / "warehouses"
+    warehouses.mkdir(parents=True)
+    (source / "master.db").touch()
+    external = root / "warehouse-volume" / "wh_002.db"
+    external.parent.mkdir()
+    external.touch()
+    (warehouses / external.name).symlink_to(external)
+    green = root / "green"
+    registration = {external.name: str(external)}
+    pipeline = object.__new__(port.RelayPipeline)
+    pipeline.value = {"source_db": str(source), "green_db": str(green)}
+    pipeline.server = SimpleNamespace(
+        authority=root / "authority", directory=root / "state", seed=root / "seed",
+        profile={"external_warehouse_dbs": registration,
+                 "source_db_identity": port.database_identity(source, registration)},
+    )
+    assert pipeline._database_write_paths() == (green, source, external.parent)
+    pipeline.server.seed = external.parent
+    with pytest.raises(ValueError, match="overlaps control paths"):
+        pipeline._database_write_paths()
+    pipeline.server.seed = root / "seed"
+    external.rename(external.with_suffix(".previous"))
+    external.touch()
+    with pytest.raises(ValueError, match="approved external warehouse identity changed"):
+        pipeline._database_write_paths()
+
+
+def test_relay_preview_and_live_units_use_separate_database_and_access_log(tmp_path, monkeypatch):
+    root = tmp_path.resolve()
+    source, green, external = (root / name for name in ("source", "green", "warehouse-volume"))
+    audit, access = root / "logs" / "admin_audit.log", root / "logs" / "green-access.log"
+    live_env = root / "control" / "live.env"
+    pipeline = object.__new__(port.RelayPipeline)
+    pipeline.server = SimpleNamespace(work=root / "control" / "attempt")
+    pipeline.policy = SimpleNamespace(value={"app_uid": 996}, owner=0, anchor=None)
+    pipeline.python = Path("/usr/bin/python3")
+    pipeline.value = {"source_db": str(source), "green_db": str(green), "app_gid": 988,
+                      "green_access_log": str(access), "app_environment_file": str(live_env)}
+    monkeypatch.setattr(pipeline, "_release", lambda _: root / "literal-release")
+    monkeypatch.setattr(pipeline, "_preview_uid", lambda: 993)
+    monkeypatch.setattr(pipeline, "_admin_audit_log", lambda: audit)
+    monkeypatch.setattr(pipeline, "_private_paths", lambda: [str(root / "control")])
+    monkeypatch.setattr(pipeline, "_database_write_paths", lambda: (green, source, external))
+    preview = dict(pipeline._candidate_units({}))
+    live = dict(pipeline._candidate_units({}, promoted=True))
+    for key, content in preview.items():
+        assert "ProtectProc=invisible" in content
+        assert f"InaccessiblePaths={root / 'control'} {source} {external}" in content
+        assert f"Environment=DAILYCHECK_DB_DIR={green}" in content
+        assert "Environment=DRY_RUN=true" in content and "--reuid=993" in content
+        assert f"EnvironmentFile={pipeline.server.work / 'preview.env'}" in content
+        assert f"ReadWritePaths={green} {access.with_name('dailycheck-relay-preview-access.log')}" in content
+        assert str(live_env) not in content and str(audit) not in content
+        if key == port.UNITS["green"][0]:
+            assert "--access-logfile " + str(pipeline._candidate_access_log(promoted=False)) in content
+    for key, content in live.items():
+        assert f"EnvironmentFile={live_env}" in content
+        assert f"Environment=DAILYCHECK_DB_DIR={source}" in content
+        assert "Environment=DRY_RUN=false" in content and "--reuid=996" in content
+        assert f"ReadWritePaths={source} {external} {access}" in content
+        assert str(green) not in content
+        assert (str(audit) in content) == (key == port.UNITS["green"][0])
+
+
 APP = r"""
 import http.server, os, sys
 port, mcp, logfile = int(sys.argv[1]), sys.argv[2] == 'mcp', sys.argv[3]

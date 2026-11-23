@@ -71,6 +71,9 @@ class Server:
                     "protected live DB identity required")
             require(isinstance(self.profile.get("admin_audit_log"), str),
                     "protected Web admin audit path required")
+            from scripts.prod_agent.relay_pipeline import verification_uid
+
+            verification_uid(self.profile)
         os.environ.clear()
         os.environ.update(SYSTEM_ENV, DAILYCHECK_DEPLOY_STATE_DIR=str(self.directory))
 

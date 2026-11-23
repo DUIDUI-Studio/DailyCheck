@@ -47,6 +47,9 @@ RELEASE_MODES = {"100644": 0o444, "100755": 0o555}
 RELEASE_EXCLUDED_PARTS = frozenset({".git", ".venv"})
 CAPABILITY_BOUNDING_SET = "CAP_SETUID CAP_SETGID CAP_SETPCAP"
 REQUIRED_APPLICATION_KEYS = ("DAILYCHECK_SECRET_KEY", "DAILYCHECK_MCP_TOKEN")
+SHIPMENT_EXPORT_PROFILE_KEY = "DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH"
+SHIPMENT_EXPORT_PROFILE_SOURCE = Path("/etc/dailycheck-application/shipment_export_profile.json")
+SHIPMENT_EXPORT_WEB_PROFILE = Path("/run/dailycheck-web/shipment_export_profile.json")
 WMS_APPLICATION_KEYS = (
     "DAILYCHECK_WMS_HOST",
     "DAILYCHECK_WMS_PORT",
@@ -57,6 +60,8 @@ WMS_APPLICATION_KEYS = (
 )
 APP_APPLICATION_KEYS = (
     "DAILYCHECK_MULTI_WAREHOUSE",
+    "DAILYCHECK_ORDER_CHANGES",
+    SHIPMENT_EXPORT_PROFILE_KEY,
     *WMS_APPLICATION_KEYS,
     "FEEDBACK_GITEA_TOKEN",
     "FEEDBACK_LLM_API_KEY",
@@ -75,6 +80,8 @@ _APPLICATION_CREDENTIAL = re.compile(r"[A-Za-z0-9_.:@+/=-]{8,256}")
 _APPLICATION_URL = re.compile(r"[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,512}")
 _OPTIONAL_VALUE_FORMATS = {
     "DAILYCHECK_MULTI_WAREHOUSE": re.compile(r"(?i:1|true|yes|on|0|false|no|off)"),
+    "DAILYCHECK_ORDER_CHANGES": re.compile(r"(?i:1|true|yes|0|false|no)"),
+    SHIPMENT_EXPORT_PROFILE_KEY: re.compile(re.escape(str(SHIPMENT_EXPORT_WEB_PROFILE))),
     "DAILYCHECK_WMS_HOST": re.compile(r"[A-Za-z0-9._:-]{1,255}"),
     "DAILYCHECK_WMS_PORT": re.compile(r"[0-9]{1,5}"),
     "DAILYCHECK_WMS_USER": re.compile(r"[A-Za-z0-9_.@/\\-]{1,128}"),
@@ -151,6 +158,19 @@ def validate_application_environment(raw: bytes, *, mcp_health_token: str,
                    for key in APPLICATION_CREDENTIAL_KEYS)):
         raise ValueError("separate application environment required")
     return values
+
+
+def shipment_export_web_gid(environment: dict[str, str], app_gid: int, *,
+                            owner: int = 0, anchor: Path | None = None) -> int:
+    if SHIPMENT_EXPORT_PROFILE_KEY not in environment:
+        return app_gid
+    profile = protected_path(SHIPMENT_EXPORT_PROFILE_SOURCE, owner, anchor=anchor)
+    info = profile.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_gid in {0, app_gid} or stat.S_IMODE(info.st_mode) != 0o440
+            or stat.S_IMODE(profile.parent.stat().st_mode) != 0o700):
+        raise ValueError("protected shipment export profile and separate Web group required")
+    return info.st_gid
 
 
 def application_runtime(python: Path) -> dict:
@@ -268,12 +288,16 @@ def render_unit(*, description: str, working_directory: str, environment_file: s
                 user: int = 0, group: int = 0,
                 capability_bounding_set: str = CAPABILITY_BOUNDING_SET,
                 protect_home: str = "yes", protect_system: str = "strict",
-                private_tmp: str = "yes", restart: str = "on-failure") -> str:
+                private_tmp: str = "yes", restart: str = "on-failure",
+                protect_proc: str = "default") -> str:
     """Fixed protected unit recipe; no caller-supplied unit/command is consumed."""
     allowed = APPLICATION_ROLE_KEYS.get(application_role)
     if (allowed is None or len(set(application_inputs)) != len(application_inputs)
             or not set(application_inputs) <= set(allowed)):
         raise ValueError("invalid application input selection")
+    profile_mount = ""
+    if SHIPMENT_EXPORT_PROFILE_KEY in application_inputs:
+        profile_mount = f"BindReadOnlyPaths={SHIPMENT_EXPORT_PROFILE_SOURCE}:{SHIPMENT_EXPORT_WEB_PROFILE}\n"
     conditions = "".join(f"{line}\n" for line in unit_conditions)
     pretests = "".join(f"ExecStartPre={line}\n" for line in exec_start_pre)
     environment = "".join(f"Environment={key}={value}\n" for key, value in environment_lines)
@@ -308,11 +332,12 @@ AmbientCapabilities=
 ProtectSystem={protect_system}
 ProtectHome={protect_home}
 PrivateTmp={private_tmp}
+ProtectProc={protect_proc}
 InaccessiblePaths={inaccessible_paths}
 ReadWritePaths={read_write_paths}
 WorkingDirectory={working_directory}
 {environment}EnvironmentFile={environment_file}
-{pretests}ExecStart=/usr/bin/env -i {exec_environment} /usr/bin/setpriv --reuid={app_uid} --regid={app_gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs {python} -B -m {module}
+{profile_mount}{pretests}ExecStart=/usr/bin/env -i {exec_environment} /usr/bin/setpriv --reuid={app_uid} --regid={app_gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs {python} -B -m {module}
 Restart={restart}
 [Install]
 WantedBy=multi-user.target
@@ -411,6 +436,9 @@ class ProtectedPipeline:
     def _admin_audit_log(self):
         return None
 
+    def _database_write_paths(self):
+        return (self.path("green_db"), self.path("source_db"))
+
     def path(self, key):
         path = Path(self.value[key])
         if not path.is_absolute() or ".." in path.parts or not re.fullmatch(r"[/a-zA-Z0-9_.-]+", str(path)):
@@ -466,6 +494,8 @@ class ProtectedPipeline:
                 raise ValueError("application write path overlaps protected control inputs")
         self.app_env = self._application_environment(
             read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor))
+        shipment_export_web_gid(
+            self.app_env, self.value["app_gid"], owner=p.owner, anchor=p.anchor)
 
     def _owned(self, candidate=None):
         active = deploy_state._native_owned(deploy_state.load_state(self.policy.location("directory")))
@@ -525,7 +555,7 @@ class ProtectedPipeline:
 
     def _scratch(self):
         scratch = Path(tempfile.mkdtemp(prefix="native-G-", dir=self.path("scratch_root")))
-        os.chown(scratch, self.policy.value["app_uid"], self.value["app_gid"])
+        os.chown(scratch, self._preview_uid(), self.value["app_gid"])
         scratch.chmod(0o700)
         return scratch
 
@@ -556,29 +586,70 @@ class ProtectedPipeline:
         if deploy_state.cmd_native_stage(argparse.Namespace(stage=name, action=action)):
             raise ValueError("native journal rejected actual stage completion")
 
+    def _candidate_units(self, candidate, *, promoted=False):
+        p = self.policy
+        release = self._release(candidate)
+        app_env = getattr(self, "app_env", {})
+        web_gid = shipment_export_web_gid(app_env, self.value["app_gid"], owner=p.owner, anchor=p.anchor)
+        access = self._candidate_access_log(promoted=promoted)
+        config = {
+            "environment_file": str(self.path("app_environment_file")),
+            "read_write_paths": " ".join(str(path) for path in (*self._database_write_paths(), access)),
+            "inaccessible_paths": " ".join(self._private_paths()),
+            "app_uid": p.value["app_uid"],
+            "admin_audit_log": self._admin_audit_log(),
+        }
+        database = self.path("source_db" if promoted else "green_db")
+        for unit, module, role in (
+                ("dailycheck-green.service", "gunicorn --workers 2 --bind 127.0.0.1:8091 --access-logfile " + str(access) + " app:create_app()", "app"),
+                ("dailycheck-green-mcp.service", "mcp_server --transport http --host 127.0.0.1 --port 5101", "mcp")):
+            settings = {**config, "app_gid": web_gid if role == "app" else self.value["app_gid"]}
+            if role != "app":
+                settings["admin_audit_log"] = None
+            settings = self._candidate_role_settings(settings, role, promoted=promoted)
+            yield unit, render_unit(
+                description="DailyCheck protected native candidate",
+                working_directory=str(release),
+                environment_lines=[("PATH", "/usr/bin:/bin"), ("PYTHONDONTWRITEBYTECODE", "1"),
+                                   ("DAILYCHECK_ENV", "production"),
+                                   ("DRY_RUN", "false" if promoted else "true"),
+                                   ("DAILYCHECK_DB_DIR", str(database))],
+                module=module,
+                python=str(self.python),
+                application_role=role,
+                application_inputs=tuple(key for key in APPLICATION_ROLE_KEYS[role] if key in app_env),
+                **settings,
+            )
+
+    def _candidate_role_settings(self, settings, role, *, promoted):
+        return settings
+
+    def _candidate_access_log(self, *, promoted):
+        return self.path("green_access_log")
+
+    def _prepare_access_log(self, *, promoted):
+        access = self._candidate_access_log(promoted=promoted)
+        uid = self.policy.value["app_uid"] if promoted else self._preview_uid()
+        fd = os.open(access, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("green access log is not a dedicated file")
+            os.fchown(fd, uid, self.value["app_gid"])
+        finally:
+            os.close(fd)
+
     def prepare_services(self):
         """Fixed startup recipes; no candidate-provided unit/command is consumed."""
         candidate = self._owned()
         p = self.policy
-        release = self._release(candidate)
-        admin_audit_log = self._admin_audit_log()
         if git(p.location("repo"), "rev-parse", "HEAD") != candidate["manifest"]["group_sha"]:
             raise ValueError("service release differs from fenced G")
-        access = self.path("green_access_log")
-        fd = os.open(access, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            if os.fstat(fd).st_nlink != 1:
-                raise ValueError("green access log is not a dedicated file")
-            os.fchown(fd, p.value["app_uid"], self.value["app_gid"])
-        finally:
-            os.close(fd)
-        for unit, module, role in (
-                ("dailycheck-green.service", "gunicorn --workers 2 --bind 127.0.0.1:8091 --access-logfile " + str(access) + " app:create_app()", "app"),
-                ("dailycheck-green-mcp.service", "mcp_server --transport http --host 127.0.0.1 --port 5101", "mcp")):
+        self._prepare_access_log(promoted=False)
+        for unit, content in self._candidate_units(candidate):
             path = self.path("unit_directory") / unit
             previous = read_protected(path, p.owner, anchor=p.anchor, private=False)
-            # Existing backup semantics remain; this extra copy preserves the
-            # pre-native startup recipe before replacing candidate import paths.
+            # Preserve the pre-native recipe before replacing candidate import paths.
             backup = self.path("backup_directory") / (unit + ".native-" + candidate["manifest"]["group_sha"])
             if backup.exists():
                 raise ValueError("service preparation already attempted; reconcile required")
@@ -586,30 +657,19 @@ class ProtectedPipeline:
             backup.chmod(0o600)
             if any((self.path("unit_directory") / (unit + ".d")).glob("*.conf")):
                 raise ValueError("unreviewed service drop-ins require installation reconciliation")
-            private = " ".join(self._private_paths())
-            content = render_unit(
-                description="DailyCheck protected native candidate",
-                working_directory=str(release),
-                environment_file=str(self.path("app_environment_file")),
-                environment_lines=[("PATH", "/usr/bin:/bin"), ("PYTHONDONTWRITEBYTECODE", "1"),
-                                   ("DAILYCHECK_ENV", "production"), ("DRY_RUN", "true"),
-                                   ("DAILYCHECK_DB_DIR", str(self.path("green_db")))],
-                read_write_paths=f"{self.path('green_db')} {self.path('source_db')} {access}",
-                inaccessible_paths=private,
-                module=module,
-                python=str(self.python),
-                app_uid=p.value["app_uid"],
-                app_gid=self.value["app_gid"],
-                application_role=role,
-                admin_audit_log=admin_audit_log if role == "app" else None,
-                application_inputs=tuple(
-                    key for key in APPLICATION_ROLE_KEYS[role]
-                    if key in getattr(self, "app_env", {})),
-            )
             path.write_text(content)
             path.chmod(0o644)
         subprocess.run(["/usr/bin/systemctl", "daemon-reload"],
                        env={"PATH": "/usr/bin:/bin"}, check=True)
+
+    def _preview_uid(self):
+        return self.policy.value["app_uid"]
+
+    def _copy_candidate_database(self, db, scratch):
+        code = "import shutil,sys; shutil.copytree(sys.argv[1],sys.argv[2],dirs_exist_ok=True,symlinks=False)"
+        result = self._lower(["-c", code, str(self.path("source_db")), str(db)], db=db, scratch=scratch)
+        if result.returncode:
+            raise ValueError("application-authority DB copy failed")
 
     def copy_db(self):
         """Dereference the existing DB tree only with application read authority."""
@@ -623,10 +683,7 @@ class ProtectedPipeline:
         os.chown(db, self.policy.value["app_uid"], self.value["app_gid"])
         scratch = self._scratch()
         try:
-            code = "import shutil,sys; shutil.copytree(sys.argv[1],sys.argv[2],dirs_exist_ok=True,symlinks=False)"
-            result = self._lower(["-c", code, str(self.path("source_db")), str(db)], db=db, scratch=scratch)
-            if result.returncode:
-                raise ValueError("application-authority DB copy failed")
+            self._copy_candidate_database(db, scratch)
         finally:
             shutil.rmtree(scratch)
 
@@ -763,7 +820,7 @@ class ProtectedPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db"}))
+    parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db", "preview-storage", "promote-services"}))
     args = parser.parse_args()
     if os.environ.get("DC_RELAY_MODE") == "1":
         from scripts.prod_agent.relay_pipeline import candidate_operation

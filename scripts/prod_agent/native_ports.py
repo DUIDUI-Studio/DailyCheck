@@ -350,8 +350,9 @@ def probe_health(policy, role: str, url: str) -> None:
 
 
 class SystemdObserver:
-    def __init__(self, *, exact_unit=False):
+    def __init__(self, *, exact_unit=False, expected_gids=None):
         self.exact_unit = exact_unit
+        self.expected_gids = expected_gids or {}
 
     def observe(self, policy):
         if sys.platform != "linux":
@@ -382,7 +383,8 @@ class SystemdObserver:
                 raise ValueError("runtime UID/cgroup/checkout mismatch")
             if self.exact_unit:
                 gids = re.search(r"^Gid:\s+(.+)$", status, re.M)
-                if not gids or set(map(int, gids[1].split())) != {policy.value["pipeline"]["app_gid"]}:
+                expected_gid = self.expected_gids.get(unit, policy.value["pipeline"]["app_gid"])
+                if not gids or set(map(int, gids[1].split())) != {expected_gid}:
                     raise ValueError("runtime GID mismatch")
             result.append({"unit": unit, "pid": pid, "uid": uids[0], "cwd": cwd,
                            "exe": exe, "start_ticks": start, "cgroup": fields["ControlGroup"]})

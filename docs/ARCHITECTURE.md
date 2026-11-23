@@ -1617,13 +1617,21 @@ capabilities 并切换低身份；可信 launcher 仅暂留 SETUID/SETGID/SETPCA
 受限写路径；原 unit 另存私有备份，up/promote 的 DB 隔离、备份/恢复及 switch 回滚继续执行。
 应用环境边界由 `render_unit` 与 G EnvironmentFile validator 共用同一固定契约：必填
 `DAILYCHECK_SECRET_KEY`/`DAILYCHECK_MCP_TOKEN` 保持未加引号的 `[A-Za-z0-9_-]{32,200}`，
-MCP token 必须等于 protected health token 且不同于 GitHub read token；仅允许十三个已测量
-业务键（`DAILYCHECK_MULTI_WAREHOUSE`、六个 `DAILYCHECK_WMS_*`、`FEEDBACK_GITEA_TOKEN`、
-`FEEDBACK_LLM_*` 三项与 `WECOM_*_WEBHOOK` 两项），以 `KEY='value'` 单引号形式逐字传递
+MCP token 必须等于 protected health token 且不同于 GitHub read token。可选业务键包括
+`DAILYCHECK_MULTI_WAREHOUSE`、`DAILYCHECK_ORDER_CHANGES`、`DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH`、
+六个 `DAILYCHECK_WMS_*`、`FEEDBACK_GITEA_TOKEN`、`FEEDBACK_LLM_*` 三项与 `WECOM_*_WEBHOOK` 两项，
+以 `KEY='value'` 单引号形式逐字传递
 （无转义处理）。记录仅按 LF 或 CRLF 分隔；裸 CR、VT、FF、FS、GS、RS 及其他 ASCII
 控制字节在推导键存在性前拒绝，不能充当隐藏记录边界。角色投影固定不可由调用方选择：app unit
-得到十三项，MCP unit 只得到实测
-六个 WMS 名；feedback/LLM/webhook 与多仓键不进入 MCP/controller/helper/test 环境。
+得到已配置的业务键，MCP unit 只得到六个 WMS 名。订单变更开关和发货导出配置仅传给 Web。
+导出配置由 root 保存在模式为 0700 的 `/etc/dailycheck-application` 目录。仅 Web unit
+将单链接只读配置绑定到其私有挂载命名空间的 `/run/dailycheck-web/shipment_export_profile.json`。
+文件由专用 Web 组只读，该组与 MCP 和发布前测试使用的主组不同。Web 以专用主组启动，
+且不继承辅助组。Relay 在同一轮观测中校验各 unit 的实际 GID、Web 的配置值和只读文件
+身份，并检查 MCP 未收到这两个 Web 配置。
+Web 审计日志匹配 Web 的实际 UID/GID。Check 1 仍以原测试身份写自己的隔离审计日志。
+Relay 只为物理身份验证匹配的外仓链接增加其实际父目录的 systemd 写路径，以便 SQLite
+维护 WAL/SHM。数据库文件和目录的实际访问仍由正式文件权限控制。
 `FEEDBACK_GITEA_TOKEN` 仅为应用建单凭据，不放行任何 Gitea Prod/merge、GitHub/App、read 或
 MCP health token 的复用。缺失的可选键不会写入 `env -i` 固定词表，因此应用源码默认值
 （含数值 WMS 默认、关闭的 feedback/webhook 通道与多仓关闭）保持不变；未知/重复/畸形键、
@@ -3774,8 +3782,8 @@ H13 的 CI 世界可写祖先不是产品缺陷：`render-preparation` 测试为
 不带 anchor 的既有拒绝行为不变，另有一条根内可写组件拒绝控制。
 
 `tests/test_native_application_environment.py` 锁定 native application EnvironmentFile
-契约：原始两键文件仍可用；十三个已测量可选键以单引号逐字传递，缺失时不进入 `env -i`
-词表；app 得到全部十三项而 MCP 只得到六个 WMS 名（feedback/LLM/webhook/多仓键不跨角色）；
+契约：原始两键文件仍可用。可选键以单引号逐字传递，缺失时不进入 `env -i`
+词表。测试核对 Web 收到订单变更开关及私有只读导出挂载，MCP 只得到六个 WMS 名。
 未知/重复/控制键、畸形与非 ASCII、非 LF/CRLF 分隔符、端口/长度边界及值诊断不泄漏均拒绝；真实 lower child
 观察（setpriv 在 macOS 移除）保留合成口令/URL 标点与空格，并确认 control env/fence FD
 不继承。该 fixture 只模拟文档化的 `${FOO}` 单参数展开，不证明 systemd 执行。
