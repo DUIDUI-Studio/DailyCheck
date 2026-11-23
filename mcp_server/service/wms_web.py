@@ -2,6 +2,7 @@
 
 Schema: coordinator's SELECT evidence, 2026-11-03 (Issue #140).
 Only resolve_scope creates a Web scope from a requested warehouse selection.
+The document-line query is shared with the separately authorized MCP read.
 """
 from __future__ import annotations
 
@@ -223,6 +224,67 @@ def documents_page(scope: WebScope, cfg: wms.WmsConfig, direction: Direction, *,
                  "sort_date DESC, doc_id DESC", number, size, cfg)
 
 
+def _document_lines_sql(t: DocumentTables, header_source: str, *, scoped_reference: bool = False) -> str:
+    if scoped_reference:
+        metadata = "s.owner_verified, s.match_count, "
+        lots = ""
+        join = "LEFT JOIN"
+        lock = " WITH (HOLDLOCK)"
+    else:
+        metadata = ""
+        lots = ", d.lotNo AS lot_no, d.storeLotNo AS store_lot_no"
+        join = "JOIN"
+        lock = ""
+    return f"""
+SELECT TOP {MAX_DETAIL_ROWS + 1} {metadata}d.{t.line_key} AS line_id,
+g.goodsCode AS goods_code, g.goodsName AS goods_name, g.unit,
+CONVERT(varchar(80), CAST(d.qty AS DECIMAL(18,4))) AS qty{lots}
+FROM {header_source}
+{join} {t.detail} d{lock} ON d.{t.key}=s.{t.key}
+LEFT JOIN sy_goods g{lock} ON g.goodsID=d.goodsID AND g.customerID=s.customerID
+"""
+
+
+def _exact_text(column: str) -> str:
+    # Binary collation preserves case. SQL Server still pads string comparisons,
+    # so compare the UTF-16 byte length as well, including any trailing spaces.
+    value = f"CONVERT(nvarchar(max), {column})"
+    return (
+        f"{value} COLLATE Latin1_General_BIN2 = CONVERT(nvarchar(max), %s) "
+        f"AND DATALENGTH({value}) = DATALENGTH(CONVERT(nvarchar(max), %s))"
+    )
+
+
+def document_lines_by_number(
+    cfg: wms.WmsConfig, direction: Direction, doc_no: str, *, warehouse_id: int, owner_code: str,
+) -> list[dict]:
+    """Resolve and read a unique header within the already-authorized fixed scope."""
+    t = _DOCUMENTS[direction]
+    # SQL Server can use lock-based READ COMMITTED. Hold range locks through
+    # this read transaction so the unique match and its line set stay consistent.
+    return wms._run(f"""
+WITH candidates AS (
+    SELECT TOP 2 s.{t.key} AS doc_id, s.customerID
+    FROM {t.header} s WITH (HOLDLOCK)
+    WHERE s.warehouseID=%s AND s.customerID=%s AND {_exact_text(f's.{t.number}')}
+), matched AS (
+    SELECT COUNT_BIG(*) AS match_count, MAX(doc_id) AS doc_id, MAX(customerID) AS customerID
+    FROM candidates
+), owner_check AS (
+    SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM sy_customer c WITH (HOLDLOCK)
+        WHERE c.customerID=%s AND {_exact_text('c.customerCode')}
+    ) THEN 1 ELSE 0 END AS owner_verified
+), document_scope AS (
+    SELECT matched.match_count, owner_check.owner_verified, matched.customerID,
+        CASE WHEN matched.match_count=1 AND owner_check.owner_verified=1 THEN matched.doc_id END AS {t.key}
+    FROM matched CROSS JOIN owner_check
+)
+{_document_lines_sql(t, 'document_scope s', scoped_reference=True)}
+ORDER BY d.{t.line_key}
+""", (warehouse_id, cfg.customer_id, doc_no, doc_no, cfg.customer_id, owner_code, owner_code), cfg)
+
+
 def document_detail(scope: WebScope, cfg: wms.WmsConfig, key: DocumentKey) -> DocumentDetail | None:
     t = _DOCUMENTS[key.direction]
     where, params = _scope_predicate(scope, "s.warehouseID", "s.customerID")
@@ -232,14 +294,10 @@ def document_detail(scope: WebScope, cfg: wms.WmsConfig, key: DocumentKey) -> Do
                        tuple(params), cfg)
     if not headers:
         return None
-    lines = wms._run(f"""
-SELECT TOP {MAX_DETAIL_ROWS + 1} d.{t.line_key} AS line_id,
-g.goodsCode AS goods_code, g.goodsName AS goods_name, g.unit,
-CAST(d.qty AS DECIMAL(18,4)) AS qty, d.lotNo AS lot_no, d.storeLotNo AS store_lot_no
-FROM {t.detail} d JOIN {t.header} s ON s.{t.key}=d.{t.key}
-LEFT JOIN sy_goods g ON g.goodsID=d.goodsID
-WHERE {where} ORDER BY d.{t.line_key}
-""", tuple(params), cfg)
+    lines = wms._run(
+        f"{_document_lines_sql(t, t.header + ' s')} WHERE {where} ORDER BY d.{t.line_key}",
+        tuple(params), cfg,
+    )
     locations = wms._run(f"""
 SELECT TOP {MAX_LOCATION_ROWS + 1} d.{t.line_key} AS line_id,
 p.zone, p.position, CAST(a.qty AS DECIMAL(18,4)) AS qty, a.lotNo AS lot_no

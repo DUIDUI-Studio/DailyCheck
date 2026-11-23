@@ -419,7 +419,7 @@
 | `outbound` | 3 |
 | `procurement` | 2 |
 | `store_order` | 2 |
-| `wms` | 3 |
+| `wms` | 4 |
 
 ## 5. 未装配 / 未登记（死代码与漏网）
 

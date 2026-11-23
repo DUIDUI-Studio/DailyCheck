@@ -99,7 +99,7 @@ def test_real_document_links_detail_and_original_filters(nav_client_factory, web
     for text in ("SAME-DISPLAY-NUMBER", "夹具货主乙", "乙的商品", "袋", "LOT-A", "STORE-A", "A01", "B02"):
         assert text in html
     assert "不重复累加" in html
-    assert f'<td class="wms-qty">{10 if direction == "in" else 20}</td>' in html
+    assert f'<td class="wms-qty">{10 if direction == "in" else 20}.0000</td>' in html
     back = next(url for url in _links(html) if url.startswith("/wms?view="))
     assert parse_qs(urlsplit(back).query) == parse_qs(urlsplit(links[0]).query)
     assert client.get(back).status_code == 200

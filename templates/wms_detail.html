@@ -17,7 +17,7 @@
   {% if detail.lines %}
   <p class="muted wms-scroll-hint">表格可左右滑动。库位分配数量单独展示，不重复累加到货物明细数量。</p>
   <table class="wms-table"><caption class="wms-visually-hidden">单据货物及库位分配明细</caption><thead><tr><th scope="col">行标识</th><th scope="col">货品编码</th><th scope="col">货品名称</th><th scope="col">单位</th><th scope="col">数量</th><th scope="col">批次</th><th scope="col">库存批次</th><th scope="col">库位分配</th></tr></thead><tbody>
-    {% for line in detail.lines %}<tr><td>#{{ line.line_id }}</td><td>{{ line.goods_code or '—' }}</td><td>{{ line.goods_name or '—' }}</td><td>{{ line.unit or '—' }}</td><td class="wms-qty">{{ line.qty | fmt_qty }}</td><td>{{ line.lot_no or '—' }}</td><td>{{ line.store_lot_no or '—' }}</td><td>{% for location in line.locations %}<div>{{ location.zone or '—' }} / {{ location.position or '—' }} · {{ location.qty | fmt_qty }} {{ line.unit or '' }} · {{ location.lot_no or '—' }}</div>{% else %}上游未返回库位分配{% endfor %}</td></tr>{% endfor %}
+    {% for line in detail.lines %}<tr><td>#{{ line.line_id }}</td><td>{{ line.goods_code or '—' }}</td><td>{{ line.goods_name or '—' }}</td><td>{{ line.unit or '—' }}</td><td class="wms-qty">{{ line.qty if line.qty is not none else '—' }}</td><td>{{ line.lot_no or '—' }}</td><td>{{ line.store_lot_no or '—' }}</td><td>{% for location in line.locations %}<div>{{ location.zone or '—' }} / {{ location.position or '—' }} · {{ location.qty | fmt_qty }} {{ line.unit or '' }} · {{ location.lot_no or '—' }}</div>{% else %}上游未返回库位分配{% endfor %}</td></tr>{% endfor %}
   </tbody></table>
   {% else %}<div class="wms-state"><h3>单据无明细行</h3><p>上游返回了单据头，但没有货物明细；此状态不代表库存为零。</p></div>{% endif %}
   {% endif %}

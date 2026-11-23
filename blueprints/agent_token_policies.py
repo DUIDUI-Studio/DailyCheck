@@ -27,10 +27,12 @@ from mcp_server.protocol.registry import get_policy_actions
 from mcp_server.service.auth import token_prefix
 from mcp_server.service.policy import (
     POLICY_TOKEN_PREFIX,
+    PUYU_WAREHOUSE_ID,
     SAFE_FIELDS,
+    WMS_LINES_ACTION,
+    binding_scope,
     canonical_grants,
     encode_grants,
-    storefront_scope,
 )
 
 _PRESET_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
@@ -118,6 +120,8 @@ def management_context(db) -> dict:
         return {}
     return {
         "policy_fields": SAFE_FIELDS,
+        "policy_wms_action": WMS_LINES_ACTION,
+        "policy_wms_warehouse": PUYU_WAREHOUSE_ID,
         "policy_presets": db.execute(
             "SELECT name, version, disabled_at FROM mcp_policy_presets ORDER BY name, version DESC"
         ).fetchall(),
@@ -162,7 +166,7 @@ def _publish(db):
 
 
 def _preview(db):
-    _form({"token_name", "preset", "policy_warehouses"})
+    _form({"token_name", "preset", "policy_warehouses", "policy_wms_warehouse"})
     name = _one("token_name").strip()
     preset, sep, version_text = _one("preset").partition(":")
     if not name or len(name) > 100 or not sep or not _PRESET_NAME.fullmatch(preset):
@@ -170,16 +174,23 @@ def _preview(db):
     try:
         version = int(version_text)
         grants = _preset(db, preset, version)
-        codes = storefront_scope(db, request.form.getlist("policy_warehouses"))
+        storefronts = request.form.getlist("policy_warehouses")
+        external = request.form.getlist("policy_wms_warehouse")
+        selection = storefronts
+        if external:
+            if external != [str(PUYU_WAREHOUSE_ID)] or storefronts:
+                raise ValueError("Invalid external WMS selection")
+            selection = {"wms_warehouse_id": PUYU_WAREHOUSE_ID}
+        scope = binding_scope(db, json.loads(grants), selection)
     except (ValueError, OverflowError):
-        abort(400, "预设或门店范围无效。")
+        abort(400, "预设或仓库范围无效。")
     snapshot = {
         **_operator(),
         "token_name": name,
         "preset": preset,
         "version": version,
         "grants_json": grants,
-        "warehouses": list(codes),
+        "warehouses": scope,
         "confirmation_id": secrets.token_urlsafe(24),
     }
     return _no_store(
@@ -206,8 +217,8 @@ def _issue(db):
         name = snapshot["token_name"]
         preset, version = snapshot["preset"], snapshot["version"]
         confirmed = _preset(db, preset, version)
-        codes = storefront_scope(db, snapshot["warehouses"])
-        if confirmed != snapshot["grants_json"] or list(codes) != snapshot["warehouses"]:
+        scope = binding_scope(db, json.loads(confirmed), snapshot["warehouses"])
+        if confirmed != snapshot["grants_json"] or scope != snapshot["warehouses"]:
             raise ValueError("Confirmed scope changed")
         if db.execute(
             "SELECT 1 FROM mcp_policy_bindings WHERE confirmation_id = ?",
@@ -227,7 +238,7 @@ def _issue(db):
         db.execute(
             "INSERT INTO mcp_policy_bindings (token_id, preset_name, preset_version, grants_json, "
             "warehouse_codes_json, confirmation_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (identity, preset, version, confirmed, json.dumps(codes), snapshot["confirmation_id"], g.user["id"], now),
+            (identity, preset, version, confirmed, json.dumps(scope), snapshot["confirmation_id"], g.user["id"], now),
         )
         db.commit()
     except (KeyError, TypeError, ValueError, OverflowError, sqlite3.IntegrityError):

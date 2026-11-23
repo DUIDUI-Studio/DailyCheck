@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from decimal import ROUND_HALF_UP, Decimal
 
 import pytest
 
@@ -12,8 +13,14 @@ from mcp_server.service import wms_web as web
 
 @pytest.fixture
 def web_sql(monkeypatch):
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.create_function("DATALENGTH", 1, lambda value: len(value.encode("utf-16-le")) if value is not None else None)
+    conn.create_function(
+        "WMS_DECIMAL_TEXT", 1,
+        lambda value: str(Decimal(value).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+        if value is not None else None,
+    )
     conn.executescript("""
     CREATE TABLE sy_warehouse(warehouseID INTEGER PRIMARY KEY, warehouse TEXT);
     CREATE TABLE sy_customer(customerID INTEGER PRIMARY KEY, customerCode TEXT, customerName TEXT);
@@ -22,7 +29,7 @@ def web_sql(monkeypatch):
     CREATE TABLE biz_goodsBalance(goodsBalanceID INTEGER PRIMARY KEY, warehouseID INT, positionID INT,
         goodsID INT, qty NUMERIC, lotNo TEXT, inactive INT);
     INSERT INTO sy_warehouse VALUES (1,'朴宇冷库'),(2,'测试仓'),(3,'朴宇仓'),(4,'畅饮仓');
-    INSERT INTO sy_customer VALUES (155,'A','夹具货主甲'),(200,'B','夹具货主乙'),(999,'X','范围外货主');
+    INSERT INTO sy_customer VALUES (155,'RTS012','夹具货主甲'),(200,'B','夹具货主乙'),(999,'X','范围外货主');
     INSERT INTO sy_goods VALUES (1,155,'SAME','甲的商品','箱'),(2,200,'SAME','乙的商品','袋'),(3,999,'OTHER','范围外商品','件');
     INSERT INTO sy_position VALUES (1,1,'A区','A01'),(2,1,'B区','B02');
     """)
@@ -31,7 +38,7 @@ def web_sql(monkeypatch):
         CREATE TABLE biz_store{direction}(store{direction}ID INTEGER PRIMARY KEY, store{direction}No TEXT,
             bizDate TEXT, warehouseID INT, customerID INT, qty NUMERIC, {party} TEXT, issusedBy TEXT);
         CREATE TABLE biz_store{direction}Detail(store{direction}DetailID INTEGER PRIMARY KEY,
-            store{direction}ID INT, goodsID INT, qty NUMERIC, lotNo TEXT, storeLotNo TEXT);
+            store{direction}ID INT, goodsID INT, qty TEXT, lotNo TEXT, storeLotNo TEXT);
         CREATE TABLE biz_store{direction}Position(store{direction}PositionID INTEGER PRIMARY KEY,
             store{direction}DetailID INT, positionID INT, qty NUMERIC, lotNo TEXT);
         INSERT INTO biz_store{direction} VALUES
@@ -60,6 +67,10 @@ def web_sql(monkeypatch):
         assert sql.lstrip().split()[0] in {"SELECT", "WITH"}
         translated = sql.replace("%s", "?").replace("ISNULL(", "IFNULL(").replace("COUNT_BIG(", "COUNT(")
         translated = translated.replace("CONVERT(varchar(10),s.bizDate,120)", "substr(s.bizDate,1,10)")
+        translated = translated.replace("CONVERT(varchar(80), CAST(d.qty AS DECIMAL(18,4)))", "WMS_DECIMAL_TEXT(d.qty)")
+        translated = re.sub(r"CONVERT\(nvarchar\(max\), ([\w.?]+)\)", r"CAST(\1 AS TEXT)", translated)
+        translated = translated.replace("Latin1_General_BIN2", "BINARY").replace(" WITH (HOLDLOCK)", "")
+        translated = re.sub(r"SELECT TOP 2 (.*?)\n\), matched AS", r"SELECT \1 LIMIT 2\n), matched AS", translated, flags=re.S)
         top = re.search(r"SELECT TOP (\d+)", translated)
         if top:
             translated = translated.replace(top[0], "SELECT", 1) + " LIMIT " + top[1]
@@ -132,7 +143,7 @@ def test_document_identity_scope_and_allocations_do_not_multiply_qty(web_sql, di
     assert page.rows[0]["doc_id"] == 9
     detail = web.document_detail(scope, cfg, web.DocumentKey(direction, 7))
     assert detail.header["owner_id"] == 200 and detail.header["doc_no"] == "SAME-DISPLAY-NUMBER"
-    assert len(detail.lines) == 1 and detail.lines[0]["qty"] == (10 if direction == web.Direction.IN else 20)
+    assert len(detail.lines) == 1 and detail.lines[0]["qty"] == ("10.0000" if direction == web.Direction.IN else "20.0000")
     assert [p["qty"] for p in detail.lines[0]["locations"]] == ([4, 6] if direction == web.Direction.IN else [8, 12])
     assert detail.lines[0]["store_lot_no"] == "STORE-A"
     assert detail.state == web.DetailState.COMPLETE
@@ -159,7 +170,7 @@ def test_literals_are_bound_and_truncation_is_explicit(web_sql, monkeypatch):
     assert hostile in calls[-1][1] and hostile not in calls[-1][0]
     monkeypatch.setattr(web, "MAX_LOCATION_ROWS", 1)
     detail = web.document_detail(scope, cfg, web.DocumentKey(web.Direction.IN, 7))
-    assert detail.state == web.DetailState.TRUNCATED and detail.lines[0]["qty"] == 10
+    assert detail.state == web.DetailState.TRUNCATED and detail.lines[0]["qty"] == "10.0000"
 
 
 @pytest.mark.parametrize("direction,identity", [("in", 1), (web.Direction.IN, 0), (web.Direction.OUT, 2147483648)])

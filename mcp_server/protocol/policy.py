@@ -9,7 +9,7 @@ from mcp.server import Server
 from starlette.concurrency import run_in_threadpool
 
 from mcp_server.infra.errors import ForbiddenError, McpError, ValidationError
-from mcp_server.protocol.registry import get_policy_actions
+from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import _current_auth
 from mcp_server.service.policy import MAX_SQLITE_ID, BoundPolicy
 from mcp_server.service.policy_reads import get_inventory, list_orders
@@ -40,6 +40,7 @@ _INPUT_SCHEMAS = {
     },
 }
 _HANDLERS = {"items_detail": get_inventory, "store_order_list": list_orders}
+_POLICY_ONLY = {entry.name: entry for entry in REGISTRY if entry.policy_only}
 
 
 def _validate_arguments(schema: dict, arguments: dict) -> None:
@@ -66,6 +67,9 @@ def _policy_tools(policy: BoundPolicy, actions: dict[str, str]) -> list[types.To
     tools = []
     for name, action in actions.items():
         if fields := policy.fields(action):
+            if name in _POLICY_ONLY:
+                tools.append(_POLICY_ONLY[name].tool.model_copy(deep=True))
+                continue
             tools.append(types.Tool(
                 name=name, inputSchema=_input_schema(name, fields),
                 description=f"Read authorized storefront data. Returned record fields: {', '.join(fields)}.",
@@ -75,7 +79,7 @@ def _policy_tools(policy: BoundPolicy, actions: dict[str, str]) -> list[types.To
 
 def bind_policy_dispatch(server: Server, audit) -> None:
     actions = get_policy_actions()
-    if actions.keys() != _INPUT_SCHEMAS.keys() or actions.keys() != _HANDLERS.keys():
+    if actions.keys() != _INPUT_SCHEMAS.keys() | _POLICY_ONLY.keys() or _INPUT_SCHEMAS.keys() != _HANDLERS.keys():
         raise RuntimeError("Scoped policy adapters must match registered read tools")
     # Scoped declarations never get written to SDK's shared legacy tool cache.
     legacy_list = server.request_handlers[types.ListToolsRequest]
@@ -89,12 +93,14 @@ def bind_policy_dispatch(server: Server, audit) -> None:
 
     async def call_tool(request: types.CallToolRequest):
         ctx = _current_auth.get()
-        if ctx is None or ctx.policy is None:
+        name = request.params.name
+        policy = ctx.policy if ctx is not None else None
+        scoped = _POLICY_ONLY.get(name)
+        if policy is None and scoped is None:
             return await legacy_call(request)
 
         started_ns = time.perf_counter_ns()
-        name = request.params.name
-        fields = ctx.policy.fields(actions.get(name))
+        fields = policy.fields(actions.get(name)) if policy is not None else ()
         status = 500
         try:
             if not fields:
@@ -102,8 +108,12 @@ def bind_policy_dispatch(server: Server, audit) -> None:
             arguments = request.params.arguments or {}
             if request.params.model_extra:
                 raise ValidationError("invalid_arguments")
-            _validate_arguments(_input_schema(name, fields), arguments)
-            payload = await run_in_threadpool(_HANDLERS[name], ctx.policy, fields, **arguments)
+            if scoped is not None:
+                _validate_arguments(scoped.tool.inputSchema, arguments)
+                payload = await run_in_threadpool(scoped.handler, arguments, ctx=ctx)
+            else:
+                _validate_arguments(_input_schema(name, fields), arguments)
+                payload = await run_in_threadpool(_HANDLERS[name], policy, fields, **arguments)
             status = 200
         except McpError as exc:
             payload = exc.to_dict()

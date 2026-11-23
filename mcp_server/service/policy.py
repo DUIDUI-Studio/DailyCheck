@@ -7,6 +7,9 @@ from dataclasses import dataclass
 
 POLICY_TOKEN_PREFIX = "mp."
 MAX_SQLITE_ID = 2**63 - 1
+WMS_LINES_ACTION = "wms.document_lines.read"
+WMS_LINES_FIELDS = ("goods_code", "goods_name", "qty", "unit")
+PUYU_WAREHOUSE_ID = 3
 
 # Values are trusted SQL fragments. An administrator selects keys only.
 INVENTORY_COLUMNS = {"sku": "sku", "current_stock": "quantity AS current_stock",
@@ -18,6 +21,7 @@ ORDER_COLUMNS = {
 SAFE_FIELDS = {
     "inventory.read": tuple(INVENTORY_COLUMNS),
     "orders.read": (*ORDER_COLUMNS, "fulfillment"),
+    WMS_LINES_ACTION: WMS_LINES_FIELDS,
 }
 
 
@@ -35,6 +39,8 @@ def canonical_grants(grants: object) -> dict[str, list[str]]:
         ):
             raise ValueError("Invalid policy fields")
         result[action] = [field for field in allowed if field in fields]
+    if WMS_LINES_ACTION in result and result != {WMS_LINES_ACTION: list(WMS_LINES_FIELDS)}:
+        raise ValueError("WMS lines require a standalone preset with the fixed projection")
     return result
 
 
@@ -65,9 +71,23 @@ class BoundPolicy:
     token_id: int
     warehouses: tuple[str, ...]
     grants: tuple[tuple[str, tuple[str, ...]], ...]
+    wms_warehouse_id: int | None = None
 
     def fields(self, action: str | None) -> tuple[str, ...]:
         return next((fields for permitted, fields in self.grants if permitted == action), ())
+
+
+def binding_scope(conn: sqlite3.Connection, grants: dict, selection: object) -> list[str] | dict:
+    """Storefront scopes keep their original list. External WMS uses a distinct snapshot."""
+    if WMS_LINES_ACTION not in grants:
+        return list(storefront_scope(conn, selection))
+    if (
+        not isinstance(selection, dict) or selection.keys() != {"wms_warehouse_id"}
+        or type(selection["wms_warehouse_id"]) is not int
+        or selection["wms_warehouse_id"] != PUYU_WAREHOUSE_ID
+    ):
+        raise ValueError("Invalid external WMS warehouse selection")
+    return {"wms_warehouse_id": PUYU_WAREHOUSE_ID}
 
 
 def load_binding(conn: sqlite3.Connection, token_id: int) -> BoundPolicy | None:
@@ -84,7 +104,11 @@ def load_binding(conn: sqlite3.Connection, token_id: int) -> BoundPolicy | None:
         grants = canonical_grants(json.loads(row["grants_json"]))
         if row["grants_json"] != encode_grants(grants) or row["preset_grants"] != row["grants_json"]:
             return None
-        warehouses = storefront_scope(conn, json.loads(row["warehouse_codes_json"]))
+        scope = binding_scope(conn, grants, json.loads(row["warehouse_codes_json"]))
     except (TypeError, ValueError):
         return None
-    return BoundPolicy(token_id, warehouses, tuple((action, tuple(fields)) for action, fields in grants.items()))
+    return BoundPolicy(
+        token_id, tuple(scope) if isinstance(scope, list) else (),
+        tuple((action, tuple(fields)) for action, fields in grants.items()),
+        scope["wms_warehouse_id"] if isinstance(scope, dict) else None,
+    )

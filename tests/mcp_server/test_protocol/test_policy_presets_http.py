@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, closing, contextmanager
 import httpx
 import pytest
 import uvicorn
+from jsonschema import validate
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from werkzeug.datastructures import MultiDict
@@ -23,7 +24,15 @@ from mcp_server import main
 from mcp_server.data.unit_of_work import policy_read_connection
 from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import authenticate
-from mcp_server.service.policy import POLICY_TOKEN_PREFIX, SAFE_FIELDS
+from mcp_server.service.policy import (
+    POLICY_TOKEN_PREFIX,
+    SAFE_FIELDS,
+    WMS_LINES_ACTION,
+    WMS_LINES_FIELDS,
+)
+from tests.test_wms_web_service import web_sql as web_sql
+
+STOREFRONT_FIELDS = {key: SAFE_FIELDS[key] for key in ("inventory.read", "orders.read")}
 
 STORES = ("store_a", "store_b", "store_c", "store_d")
 OUTSIDE = "other_store"
@@ -371,7 +380,7 @@ def policy_admin(storefronts, monkeypatch):
 def issued_policy(storefronts, policy_admin):
     env, paths = storefronts
     _, admin = policy_admin
-    assert _publish(admin, "stock-and-orders", SAFE_FIELDS).status_code == 302
+    assert _publish(admin, "stock-and-orders", STOREFRONT_FIELDS).status_code == 302
     raw, identity = _read_receipt(_confirm(admin, _preview(admin, "four stores", "stock-and-orders:1", STORES)))
     return env, paths, raw, identity
 
@@ -383,10 +392,10 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     member = _login(app, "member")
     other_admin = _login(app, "another-admin")
     other_session = _login(app)
-    assert _publish(member, "stock-and-orders", SAFE_FIELDS).status_code == 403
+    assert _publish(member, "stock-and-orders", STOREFRONT_FIELDS).status_code == 403
     assert _publish(admin, "stock-and-orders", {"inventory.read": ["unit_cost"]}).status_code == 400
     assert _publish(admin, "stock-and-orders", {}).status_code == 400
-    assert _publish(admin, "stock-and-orders", SAFE_FIELDS).status_code == 302
+    assert _publish(admin, "stock-and-orders", STOREFRONT_FIELDS).status_code == 302
     assert _post(admin, "preview", [("token_name", "empty"), ("preset", "stock-and-orders:1")]).status_code == 400
     assert _preview(admin, "broad", "stock-and-orders:1", [*STORES, DC]).status_code == 400
     assert _preview(admin, "duplicated", "stock-and-orders:1", [STORES[0]] * 2).status_code == 400
@@ -476,7 +485,7 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     async def exercise(url):
         async with (_session(url, first_raw) as first, _session(url, second_raw) as second,
                     _session(url, "synthetic-shared-secret") as legacy):
-            assert {t.name for t in (await legacy.list_tools()).tools} == {entry.name for entry in REGISTRY}
+            assert {t.name for t in (await legacy.list_tools()).tools} == {entry.name for entry in REGISTRY if not entry.policy_only}
             assert {t.name for t in (await first.list_tools()).tools} == {"items_detail", "store_order_list"}
             second_tools = (await second.list_tools()).tools
             assert [t.name for t in second_tools] == ["store_order_list"]
@@ -570,10 +579,11 @@ def test_order_status_filter_requires_status_in_policy_mask(issued_policy, polic
 def test_registered_policy_actions_match_read_adapters():
     from mcp_server.protocol import policy as dispatch
 
-    expected = {"items_detail": "inventory.read", "store_order_list": "orders.read"}
+    legacy = {"items_detail": "inventory.read", "store_order_list": "orders.read"}
+    expected = {**legacy, "wms_document_lines": WMS_LINES_ACTION}
     assert get_policy_actions() == expected
     assert {entry.name: entry.mode for entry in REGISTRY if entry.policy_action} == dict.fromkeys(expected, "read")
-    assert dispatch._HANDLERS.keys() == dispatch._INPUT_SCHEMAS.keys() == expected.keys()
+    assert dispatch._HANDLERS.keys() == dispatch._INPUT_SCHEMAS.keys() == legacy.keys()
 
 
 def test_policy_dry_run_revoke_refuses_without_changes(issued_policy, policy_admin, monkeypatch):
@@ -699,3 +709,157 @@ def test_version_and_binding_snapshots_cannot_be_updated(issued_policy):
     with pytest.raises(sqlite3.IntegrityError, match="versions.*immutable"):
         _db_update(env["master"], "UPDATE mcp_policy_presets SET grants_json='{}'")
     assert _snapshot(env["root"]) == before
+
+
+@pytest.mark.parametrize("direction", ["in", "out"])
+def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, direction):
+    """Join the real admin routes, MCP protocol, and rendered Web page on the same source."""
+    from html import unescape
+
+    from mcp_server.infra.errors import ForbiddenError
+    from mcp_server.protocol.tools.wms import wms_document_lines_impl
+    from mcp_server.service import wms, wms_web
+
+    env, _, storefront, _ = issued_policy
+    _, admin = policy_admin
+    _, source, sql_calls = web_sql
+    master = env["master"]
+    tool = "wms_document_lines"
+    grants = {WMS_LINES_ACTION: WMS_LINES_FIELDS}
+    slug = "puyu-lines"
+    args = {"direction": direction, "doc_no": "原单-A_001%*?[] "}
+    expected_qty = "12345678901234.1234" if direction == "out" else "123456.2345"
+
+    for suffix in ("In", "Out"):
+        source.executemany(
+            f"INSERT INTO biz_store{suffix} VALUES (?, ?, '2026-11-03', ?, ?, 1, 'hidden', 'hidden')",
+            [
+                (21, args["doc_no"], 3, 155), (22, args["doc_no"], 3, 200), (23, args["doc_no"], 1, 155),
+                (24, "foreign-only", 3, 200), (25, "cold-only", 1, 155),
+                (26, "duplicate", 3, 155), (27, "duplicate", 3, 155),
+                (28, "only-in" if suffix == "In" else "only-out", 3, 155),
+            ],
+        )
+        source.executemany(
+            f"INSERT INTO biz_store{suffix}Detail VALUES (?, ?, ?, ?, 'hidden', 'hidden')",
+            [(216, 21, 1, "0.0000"), (211, 21, 1, "12345678901234.1234" if suffix == "Out" else "123456.2345"),
+             (212, 21, 1, "2.0001"), (213, 21, 2, None), (214, 22, 2, "9000"), (215, 23, 1, "8000")],
+        )
+
+    assert _publish(admin, slug, {**grants, **STOREFRONT_FIELDS}).status_code == 400
+    assert _publish(admin, slug, {WMS_LINES_ACTION: ["qty"]}).status_code == 400
+    assert _publish(admin, slug, grants).status_code == 302
+    selection = [("token_name", "external reader"), ("preset", f"{slug}:1")]
+    assert _post(admin, "preview", selection).status_code == 400
+    for value in ("1", "*", "03"):
+        assert _post(admin, "preview", [*selection, ("policy_wms_warehouse", value)]).status_code == 400
+    external = ("policy_wms_warehouse", "3")
+    assert _post(admin, "preview", [*selection, external, ("policy_warehouses", STORES[0])]).status_code == 400
+    assert _post(admin, "preview", [*selection[:1], ("preset", "stock-and-orders:1"), external]).status_code == 400
+    preview = _post(admin, "preview", [*selection, external])
+    assert preview.status_code == 200
+    for text in (tool, "朴宇仓（3）", "155 / RTS012", *WMS_LINES_FIELDS, "所有写入均拒绝"):
+        assert text in preview.get_data(as_text=True)
+    raw, identity = _read_receipt(_confirm(admin, preview))
+    assert _confirm(admin, preview).status_code == 409
+    assert _db_update(
+        master, "SELECT allowed_read_paths_json, allowed_write_paths_json, allowed_warehouse_codes_json "
+        "FROM agent_tokens WHERE id=?", (identity,),
+    ) == ("[]", "[]", "[]")
+    scope_json = _db_update(master, "SELECT warehouse_codes_json FROM mcp_policy_bindings WHERE token_id=?", (identity,))[0]
+    assert json.loads(scope_json) == {"wms_warehouse_id": 3}
+    assert authenticate(f"Bearer {raw}") is None  # legacy admission and stdio fallback
+    with pytest.raises(ForbiddenError):
+        wms_document_lines_impl(args, ctx=authenticate(f"Bearer {raw}", allow_policy=True))
+
+    ordinary = secrets.token_urlsafe(32)
+    _db_update(
+        master, "INSERT INTO agent_tokens (name, token_hash, token_prefix, created_by, created_at, "
+        "allowed_read_paths_json, allowed_write_paths_json, allowed_warehouse_codes_json) "
+        """VALUES ('legacy wms', ?, ?, 1, 'test', '["/api/v1/wms/*"]', '[]', 'null')""",
+        (generate_password_hash(ordinary, method="pbkdf2:sha256:1000"), ordinary[:8]),
+    )
+    shared = "synthetic-wildcard"
+    monkeypatch.setenv("DAILYCHECK_MCP_TOKEN", shared)
+    large_row = dict(goods_code="SAME", goods_name="甲的商品", qty=expected_qty, unit="箱")
+    expected = [
+        large_row,
+        {**large_row, "qty": "2.0001"},
+        dict(goods_code=None, goods_name=None, qty=None, unit=None),
+        {**large_row, "qty": "0.0000"},
+    ]
+
+    def page_rows():
+        response = admin.get(f"/wms/documents/{direction}/21?warehouse=3&owner=155")
+        assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
+        html = response.get_data(as_text=True)
+        rows = []
+        for row in re.findall(r"<tr>(.*?)</tr>", re.search(r"<tbody>(.*?)</tbody>", html, re.S)[1], re.S):
+            cells = [None if value == "—" else unescape(value) for value in re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)]
+            rows.append(dict(zip(("goods_code", "goods_name", "unit", "qty"), cells[1:5], strict=True)))
+        return html, rows
+
+    async def exercise(url):
+        for credential in ordinary, shared, storefront:
+            async with _session(url, credential) as denied:
+                assert tool not in {t.name for t in (await denied.list_tools()).tools}
+                before = len(sql_calls)
+                errors = [await _call(denied, tool, {**args, "doc_no": number}, error="forbidden")
+                          for number in (args["doc_no"], "absent")]
+                assert errors[0] == errors[1] and len(sql_calls) == before
+        async with _session(url, raw) as allowed:
+            assert [t.name for t in (await allowed.list_tools()).tools] == [tool]
+            before = len(sql_calls)
+            for bad in (
+                {"warehouse_id": 1}, {"warehouse_id": 3}, {"owner_id": 200}, {"header_id": 21},
+                {"direction": "OUT"}, {"doc_no": " "}, {"doc_no": "A\u0000"},
+                {"doc_no": 21}, {"doc_no": "x" * 257},
+            ):
+                await _call(allowed, tool, args | bad, error="validation_error")
+            await _call(allowed, "wms_documents_list", {"direction": direction}, error="forbidden")
+            assert len(sql_calls) == before
+            result = await _call(allowed, tool, args)
+            assert len(sql_calls) == before + 1
+            sql, params = sql_calls[-1]
+            assert "WITH (HOLDLOCK)" in sql and "Latin1_General_BIN2" in sql and "DATALENGTH" in sql
+            assert f"biz_store{'In' if direction == 'in' else 'Out'}Detail" in sql
+            assert args["doc_no"] not in sql and params[:2] == (3, 155)
+            validate(result, next(e.output_shape for e in REGISTRY if e.name == tool))
+            assert result == {"status": "complete", "document": args, "lines": expected}
+            html, rows = page_rows()
+            assert args["doc_no"] in html and rows == result["lines"]
+
+            for number in (args["doc_no"].lower(), args["doc_no"].rstrip(), "原单-%", "%", "*", "原单-A_001?",
+                           "foreign-only", "cold-only", "absent", "only-out" if direction == "in" else "only-in"):
+                miss = await _call(allowed, tool, args | {"doc_no": number})
+                assert miss == {"status": "not_found", "document": None, "lines": []}
+            assert (await _call(allowed, tool, args | {"doc_no": "duplicate"})) == {
+                "status": "ambiguous", "document": None, "lines": [],
+            }
+            empty = args | {"doc_no": "EMPTY-LINES"}
+            assert await _call(allowed, tool, empty) == {"status": "empty", "document": empty, "lines": []}
+
+            with monkeypatch.context() as temporary:
+                temporary.setattr(wms_web, "MAX_DETAIL_ROWS", 3)
+                limited = await _call(allowed, tool, args)
+                html, rows = page_rows()
+                assert limited == {"status": "truncated", "document": args, "lines": expected[:3]}
+                assert "wms-limit-notice" in html and rows == limited["lines"]
+
+            with monkeypatch.context() as temporary:
+                before = len(sql_calls)
+                for wrong in ("200", "invalid"):
+                    temporary.setenv("DAILYCHECK_WMS_CUSTOMER_ID", wrong)
+                    await _call(allowed, tool, args, error="wms_owner_unconfirmed")
+                assert len(sql_calls) == before
+                assert wms.load_config().customer_id == 155  # legacy fallback preserved
+            source.execute("UPDATE sy_customer SET customerCode='rts012' WHERE customerID=155")
+            await _call(allowed, tool, args, error="wms_owner_unconfirmed")
+
+    with _listener() as url, httpx.Client(trust_env=False, timeout=10) as http:
+        asyncio.run(exercise(url))
+        assert http.post(url.replace("/api/mcp/", "/sse"), json=INITIALIZE, headers=_headers(raw)).status_code == 401
+        assert admin.post(f"{ADMIN}/{identity}/revoke", data={
+            "csrf_token": _hidden(admin.get(ADMIN), "csrf_token"),
+        }).status_code == 302
+        assert http.post(url, json=INITIALIZE, headers=_headers(raw)).status_code == 401

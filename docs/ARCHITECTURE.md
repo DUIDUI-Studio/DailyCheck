@@ -74,7 +74,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["32 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail / wms_stock_list)"]
+        Tools["33 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail / wms_stock_list)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -2733,7 +2733,7 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 UoW 与无缓存采购在默认应用分支显式提供代码根和配置数据根，使已有嵌套目录的
 代码相对注册可逆；显式 Bot 根仍关闭配置根映射，SQLite 只读和 ACL 边界不变。
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（32 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（33 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -2754,7 +2754,7 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 32 个 MCP 工具
+### 9.2 33 个 MCP 工具
 
 **Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 32 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
@@ -2846,7 +2846,7 @@ MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁�
 warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
 retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
 
-#### 9.2.1 外部 WMS 只读桥接（3 项）
+#### 9.2.1 外部 WMS 只读桥接（4 项）
 
 **Issue #140 Web 独立范围**：新增 `mcp_server/service/wms_web.py`，只复用 WMS
 连接、环境配置与安全错误包装，不改变下述 MCP 单货主函数、注册、schema 或 Bot 池。
@@ -2883,6 +2883,22 @@ ROW_NUMBER 分页及 CTE 同范围计数支持超过 500 条，编码/货主筛�
 标为不完整。有效头无明细单独提示；缺失或越界单据 404；无效条件 400；未配置/缺驱动/
 连接或范围不可用详情 503、查询失败详情 502。列表页在上游故障时仍 200 展示错误状态以保持
 导航可达，全部固定安全提示/no-store，不展示半次结果或上游错误。
+
+**GitHub #47 朴宇单据明细**：`wms_document_lines` 只由 `/api/mcp/` 策略调度器发现
+和执行。独立动作 `wms.document_lines.read` 固定四个行字段，禁止与门店动作合并。
+管理员在既有预设页选择外部朴宇仓 3，经预览与签名确认写入不可变绑定。外仓快照保存为
+`{"wms_warehouse_id": 3}`，门店快照沿用编码列表。令牌的三项旧 ACL 全为空，旧版预设校验
+拒绝未知动作。普通目录仍为 32 项，原 3 项 WMS 工具的契约和权限沿用原实现。
+
+方向只选择固定入库或出库表。按仓 3、配置需匹配的货主 155 和原单号精确匹配，
+在同一条 SELECT 验证 RTS012，唯一头才读行。二进制排序规则和 Unicode 字节长度保留
+大小写与尾空格，通配符号按字面比较。新查询用 HOLDLOCK 保护匹配和明细读取，重复检测
+最多取两个候选。Web 与 MCP 共用行表、
+按货主限定的货品关联、基础单位及源明细 ID 排序。行数量沿用 Web 的 DECIMAL(18,4)
+口径，以 SQL 十进制文本保留精度，
+缺值为 null，Web 明细用破折号展示。MCP 仅返回方向、原号和四个字段
+`goods_code`、`goods_name`、`qty`、`unit`。完整、空单、未找到、范围内重号及截断
+各有独立状态。最多 2000 行，无续查参数。拒绝发生在上游查询前。
 
 ### MCP 变更影响门禁（Issue #105）
 

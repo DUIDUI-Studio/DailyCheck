@@ -23,7 +23,7 @@ from mcp_server.protocol.tools import (
     store_order,
     wms,
 )
-from mcp_server.service.policy import SAFE_FIELDS
+from mcp_server.service.policy import SAFE_FIELDS, WMS_LINES_ACTION, WMS_LINES_FIELDS
 
 
 def obj(**properties: dict) -> dict:
@@ -82,6 +82,7 @@ class ToolRegistration:
     tests: tuple[str, ...]
     compatibility: str = "preserved-input-description-and-TextContent-JSON"
     policy_action: str | None = None
+    policy_only: bool = False
 
     @property
     def name(self) -> str:
@@ -1087,6 +1088,44 @@ REGISTRY = (
         external_subset=True, bot_approved=False,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_documents_list]",),
     ),
+    ToolRegistration(
+        tool=Tool(
+            name="wms_document_lines",
+            title="Read Puyu WMS document lines",
+            description=(
+                "Read original inbound (in) or outbound (out) lines in authorized Puyu warehouse 3. "
+                "Use the exact case-sensitive original document number. Lines are in source order, "
+                "with base-unit quantities as decimal strings or null. Status: complete, empty, "
+                "not_found, ambiguous, or truncated. At most 2000 lines, with no continuation."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["in", "out"]},
+                    "doc_no": {"type": "string", "minLength": 1, "maxLength": wms.MAX_DOC_NO_LENGTH},
+                },
+                "required": ["direction", "doc_no"],
+                "additionalProperties": False,
+            },
+        ),
+        domain="wms", handler=wms.wms_document_lines_impl,
+        access=AccessContract(
+            "GET", "/api/v1/wms/document-lines", "StreamableHTTP bound policy only",
+            "explicit external WMS warehouse 3 and fixed tenant 155 / RTS012",
+        ),
+        output_shape=obj(
+            status={"enum": ["complete", "empty", "not_found", "ambiguous", "truncated"]},
+            document={"anyOf": [obj(direction=STRING, doc_no=STRING), {"type": "null"}]},
+            lines=array({
+                **obj(**dict.fromkeys(WMS_LINES_FIELDS, NULLABLE_STRING)),
+                "additionalProperties": False,
+            }),
+        ),
+        external_subset=False, bot_approved=False,
+        compatibility="new read-only bound-policy tool; legacy catalogs and ACLs unchanged",
+        policy_action=WMS_LINES_ACTION, policy_only=True,
+        tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_puyu_document_lines",),
+    ),
 )
 
 
@@ -1118,6 +1157,8 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
         )):
             raise ValueError(f"incomplete access contract: {entry.name}")
         action = entry.policy_action
+        if entry.policy_only and (not action or entry.bot_approved or entry.external_subset):
+            raise ValueError(f"invalid policy-only tool: {entry.name}")
         if action is not None:
             if entry.mode != "read" or action not in SAFE_FIELDS or action in policy_actions:
                 raise ValueError(f"invalid scoped policy action: {entry.name}")
@@ -1126,11 +1167,11 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
 
 def get_tools() -> list[Tool]:
     """Keep declarations independent between callers, as before the registry."""
-    return [entry.tool.model_copy(deep=True) for entry in REGISTRY]
+    return [entry.tool.model_copy(deep=True) for entry in REGISTRY if not entry.policy_only]
 
 
 def get_handlers() -> dict[str, Callable]:
-    return {entry.name: entry.handler for entry in REGISTRY}
+    return {entry.name: entry.handler for entry in REGISTRY if not entry.policy_only}
 
 
 def get_policy_actions() -> dict[str, str]:

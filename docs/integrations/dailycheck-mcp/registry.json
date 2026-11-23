@@ -3,7 +3,7 @@
     "bot_approved": 22,
     "canonical": 13,
     "external_subset": 19,
-    "runtime": 32,
+    "runtime": 33,
     "writes": 10
   },
   "generated_from": "mcp_server/protocol/registry.py",
@@ -2649,6 +2649,131 @@
         "tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_documents_list]"
       ],
       "title": "List WMS Documents (external)"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/v1/wms/document-lines",
+        "path_enforcement": "StreamableHTTP bound policy only",
+        "warehouse_scope": "explicit external WMS warehouse 3 and fixed tenant 155 / RTS012"
+      },
+      "bot_approved": false,
+      "compatibility": "new read-only bound-policy tool; legacy catalogs and ACLs unchanged",
+      "description": "Read original inbound (in) or outbound (out) lines in authorized Puyu warehouse 3. Use the exact case-sensitive original document number. Lines are in source order, with base-unit quantities as decimal strings or null. Status: complete, empty, not_found, ambiguous, or truncated. At most 2000 lines, with no continuation.",
+      "domain": "wms",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.wms:wms_document_lines_impl",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "enum": [
+              "in",
+              "out"
+            ],
+            "type": "string"
+          },
+          "doc_no": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "direction",
+          "doc_no"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "wms_document_lines",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "properties": {
+            "document": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "direction": {
+                      "type": "string"
+                    },
+                    "doc_no": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "direction",
+                    "doc_no"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "lines": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "goods_code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "goods_name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "qty": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "unit": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "goods_code",
+                  "goods_name",
+                  "qty",
+                  "unit"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "status": {
+              "enum": [
+                "complete",
+                "empty",
+                "not_found",
+                "ambiguous",
+                "truncated"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "document",
+            "lines"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_puyu_document_lines"
+      ],
+      "title": "Read Puyu WMS document lines"
     }
   ]
 }
