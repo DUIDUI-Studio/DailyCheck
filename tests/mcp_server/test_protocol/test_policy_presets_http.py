@@ -730,6 +730,10 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
     args = {"direction": direction, "doc_no": "原单-A_001%*?[] "}
     expected_qty = "12345678901234.1234" if direction == "out" else "123456.2345"
 
+    source.executemany("INSERT INTO sy_goods VALUES (?, 155, ?, ?, ?)", [
+        (4, "", " \t\u3000", "  "),
+        (5, " SKU ", " 品名 ", " 箱 "),
+    ])
     for suffix in ("In", "Out"):
         source.executemany(
             f"INSERT INTO biz_store{suffix} VALUES (?, ?, '2026-11-03', ?, ?, 1, 'hidden', 'hidden')",
@@ -743,7 +747,8 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
         source.executemany(
             f"INSERT INTO biz_store{suffix}Detail VALUES (?, ?, ?, ?, 'hidden', 'hidden')",
             [(216, 21, 1, "0.0000"), (211, 21, 1, "12345678901234.1234" if suffix == "Out" else "123456.2345"),
-             (212, 21, 1, "2.0001"), (213, 21, 2, None), (214, 22, 2, "9000"), (215, 23, 1, "8000")],
+             (212, 21, 1, "2.0001"), (213, 21, 2, None), (214, 21, 4, "4.0000"),
+             (215, 21, 5, None), (217, 22, 2, "9000"), (218, 23, 1, "8000")],
         )
 
     assert _publish(admin, slug, {**grants, **STOREFRONT_FIELDS}).status_code == 400
@@ -786,6 +791,8 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
         large_row,
         {**large_row, "qty": "2.0001"},
         dict(goods_code=None, goods_name=None, qty=None, unit=None),
+        dict(goods_code=None, goods_name=None, qty="4.0000", unit=None),
+        dict(goods_code=" SKU ", goods_name=" 品名 ", qty=None, unit=" 箱 "),
         {**large_row, "qty": "0.0000"},
     ]
 
@@ -840,10 +847,10 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
             assert await _call(allowed, tool, empty) == {"status": "empty", "document": empty, "lines": []}
 
             with monkeypatch.context() as temporary:
-                temporary.setattr(wms_web, "MAX_DETAIL_ROWS", 3)
+                temporary.setattr(wms_web, "MAX_DETAIL_ROWS", 4)
                 limited = await _call(allowed, tool, args)
                 html, rows = page_rows()
-                assert limited == {"status": "truncated", "document": args, "lines": expected[:3]}
+                assert limited == {"status": "truncated", "document": args, "lines": expected[:4]}
                 assert "wms-limit-notice" in html and rows == limited["lines"]
 
             with monkeypatch.context() as temporary:

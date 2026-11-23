@@ -245,6 +245,16 @@ LEFT JOIN sy_goods g{lock} ON g.goodsID=d.goodsID AND g.customerID=s.customerID
 """
 
 
+def _run_document_lines(sql: str, params: tuple, cfg: wms.WmsConfig) -> list[dict]:
+    rows = wms._run(sql, params, cfg)
+    for row in rows:
+        for field in ("goods_code", "goods_name", "unit"):
+            value = row[field]
+            if isinstance(value, str) and not value.strip():
+                row[field] = None
+    return rows
+
+
 def _exact_text(column: str) -> str:
     # Binary collation preserves case. SQL Server still pads string comparisons,
     # so compare the UTF-16 byte length as well, including any trailing spaces.
@@ -262,7 +272,7 @@ def document_lines_by_number(
     t = _DOCUMENTS[direction]
     # SQL Server can use lock-based READ COMMITTED. Hold range locks through
     # this read transaction so the unique match and its line set stay consistent.
-    return wms._run(f"""
+    return _run_document_lines(f"""
 WITH candidates AS (
     SELECT TOP 2 s.{t.key} AS doc_id, s.customerID
     FROM {t.header} s WITH (HOLDLOCK)
@@ -294,7 +304,7 @@ def document_detail(scope: WebScope, cfg: wms.WmsConfig, key: DocumentKey) -> Do
                        tuple(params), cfg)
     if not headers:
         return None
-    lines = wms._run(
+    lines = _run_document_lines(
         f"{_document_lines_sql(t, t.header + ' s')} WHERE {where} ORDER BY d.{t.line_key}",
         tuple(params), cfg,
     )
