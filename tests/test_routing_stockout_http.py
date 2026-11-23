@@ -648,6 +648,16 @@ def test_empty_v10_authorization_to_live_token_and_irreversible_revocation(tmp_p
                "--reference", "MULTIPLE-PAIRS", *scope, "--pair", "207", "dc_beta").returncode != 0
     assert master.read_bytes() == after_preset
 
+    _sql(master, "INSERT INTO tenants (id, name, created_at) VALUES (2, 'Synthetic other tenant', 'test')")
+    _sql(master, "UPDATE canonical_items SET tenant_id=2 WHERE id=201")
+    foreign_snapshot = master.read_bytes()
+    foreign = cmd("authorization-preview", "--operation", "approve", "--issuer", "2",
+                  "--reference", "OTHER-TENANT-ITEM", *scope)
+    assert foreign.returncode != 0 and "Canonical item must belong" in foreign.stderr
+    assert master.read_bytes() == foreign_snapshot
+    _sql(master, "UPDATE canonical_items SET tenant_id=1 WHERE id=201")
+    after_preset = master.read_bytes()
+
     approval_proof = prepare("approve", "FIXTURE-PETER-DECISION-18", *scope)
     assert confirm(approval_proof, password="wrong").returncode != 0
     assert master.read_bytes() == after_preset
@@ -693,8 +703,16 @@ def test_empty_v10_authorization_to_live_token_and_irreversible_revocation(tmp_p
         assert master.read_bytes() == after_revoke
         with httpx.Client(trust_env=False, timeout=5) as client:
             assert client.post(mcp + "/api/mcp/", headers=_headers(raw), json=INITIALIZE).status_code == 401
-            new = applied(confirm(prepare("approve", "FIXTURE-PETER-DECISION-20", *scope)))["approval_id"]
-            assert new != approval
+            stale = prepare("approve", "FIXTURE-PETER-STALE-20", *scope)
+            concurrent = prepare("approve", "FIXTURE-PETER-CONCURRENT-21", *scope)
+            intervening = applied(confirm(concurrent))["approval_id"]
+            revoke_again = prepare("revoke", "FIXTURE-PETER-REVOCATION-22", *scope)
+            assert applied(confirm(revoke_again))["approval_id"] == intervening
+            after_intervening_generation = master.read_bytes()
+            assert confirm(stale).returncode != 0
+            assert master.read_bytes() == after_intervening_generation
+            new = applied(confirm(prepare("approve", "FIXTURE-PETER-DECISION-23", *scope)))["approval_id"]
+            assert len({approval, intervening, new}) == 3
             assert client.post(mcp + "/api/mcp/", headers=_headers(raw), json=INITIALIZE).status_code == 401
         assert check_rollback(["--db", str(master)]) == 1
         assert _sql(master, "SELECT pause_id FROM item_routing_stockout_state WHERE canonical_id=201") == [
@@ -707,7 +725,9 @@ def test_empty_v10_authorization_to_live_token_and_irreversible_revocation(tmp_p
         ("install-preset", 2, "FIXTURE-CONFIG-17", None),
         ("approve", 2, "FIXTURE-PETER-DECISION-18", approval),
         ("revoke", 2, "FIXTURE-PETER-REVOCATION-19", approval),
-        ("approve", 2, "FIXTURE-PETER-DECISION-20", new),
+        ("approve", 2, "FIXTURE-PETER-CONCURRENT-21", intervening),
+        ("revoke", 2, "FIXTURE-PETER-REVOCATION-22", intervening),
+        ("approve", 2, "FIXTURE-PETER-DECISION-23", new),
     ]
     assert all(datetime.fromisoformat(event[3]).tzinfo is not None for event in audit)
     assert _sql(master, "SELECT p.actor_id, a.canonical_id, a.warehouse_code FROM mcp_policy_routing_approvals a "

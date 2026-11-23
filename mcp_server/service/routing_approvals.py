@@ -1,6 +1,8 @@
 """One source-referenced authorization decision per confirmed host command."""
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -32,6 +34,11 @@ def _source_version(conn, db_path, actor, cid, code):
     tenant = conn.execute("SELECT 1 FROM tenants WHERE id=1 AND status='active'").fetchone()
     if user is None or tenant is None:
         raise ValueError("An active Gene subject in tenant 1 is required")
+    canonical = conn.execute(
+        "SELECT 1 FROM canonical_items WHERE id=? AND tenant_id=1", (cid,),
+    ).fetchone()
+    if canonical is None:
+        raise ValueError("Canonical item must belong to the Gene principal's tenant")
     source = conn.execute(
         "SELECT db_path FROM warehouses WHERE code=? AND tenant_id=1 AND warehouse_type='distribution_center'",
         (code,),
@@ -62,12 +69,12 @@ def preview(conn, db_path, *, operation, actor, pair, reference):
     if principal and principal["actor_id"] != actor:
         raise ValueError("Another Gene subject is already registered")
     principal_id = principal["id"] if principal else None
-    approval = conn.execute(
-        "SELECT id FROM mcp_policy_routing_approvals "
-        "WHERE principal_id=? AND canonical_id=? AND warehouse_code=? AND revoked_at IS NULL",
+    history = [tuple(row) for row in conn.execute(
+        "SELECT id, revoked_at FROM mcp_policy_routing_approvals "
+        "WHERE principal_id=? AND canonical_id=? AND warehouse_code=? ORDER BY id",
         (principal_id, cid, code),
-    ).fetchone()
-    approval_id = approval[0] if approval else None
+    )]
+    approval_id = next((identity for identity, revoked_at in history if revoked_at is None), None)
     if operation == "revoke":
         if approval_id is None:
             raise ValueError("No live approval matches the subject and exact pair")
@@ -82,7 +89,14 @@ def preview(conn, db_path, *, operation, actor, pair, reference):
              AND a.canonical_id=? AND a.warehouse_code=?""", (reference, actor, cid, code),
     ).fetchone():
         raise ValueError("A new approval generation requires a new business decision reference")
-    return {"principal_id": principal_id, "route_version": _source_version(conn, db_path, actor, cid, code)}
+    # A grant followed by revocation returns to "no active approval", but
+    # must change the signed version before a different grant can proceed.
+    history_version = hashlib.sha256(json.dumps(history, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "principal_id": principal_id,
+        "history_version": history_version,
+        "route_version": _source_version(conn, db_path, actor, cid, code),
+    }
 
 
 def apply(conn, db_path, *, issuer, operation, actor, pair, reference, state, confirmation_id):
