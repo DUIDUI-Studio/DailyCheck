@@ -1340,7 +1340,8 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及
 阶段回执，供独立对账。Worker 预先落盘 arm 与 POST 分界。观察期只读探活失败按原蓝路由
 回切，先以实际请求核对 Web 和 MCP 均落到原蓝进程，再停两个绿服务。绿未确认退出或
-停后蓝未通过复核时保留护栏。Worker 用独立 report 凭据发布原有 typed PR
+停后蓝未通过复核时保留护栏。Linux 切换回归在实际本地 HTTP 入口核对两条蓝落点，再检查停绿顺序。
+Worker 用独立 report 凭据发布原有 typed PR
 结果。VPS 的 `publications` 先记 intent，Worker 真实读到同作者、正文和 comment ID
 后才链接回执。部署终态和 publication 状态独立。安装和 Peter 首次试运行见
 [本地 Worker 发布 relay](agent-framework/local-worker-relay.md)。

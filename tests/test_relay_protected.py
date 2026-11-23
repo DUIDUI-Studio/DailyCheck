@@ -9,6 +9,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.request import urlopen
 
 import pytest
 
@@ -42,11 +43,13 @@ def test_protected_relay_runs_real_switch_with_native_identity(tmp_path, monkeyp
 
     state = ds._empty_state()
     deployed = {"sha": "b" * 40, "generation": 3}
+    standby = {"sha": "base", "route": "blue", "identity": "a" * 64}
     state.update(generation=4, deployed=deployed,
                  lock={"attempt_id": vps.expected["attempt"], "sha": head, "generation": 4,
                        "session": "test-relay", "pr": 123, "token": "synthetic-lock",
                        "heartbeat_at": ds.now_epoch()},
-                 worker_relay={"target": vps.expected, "previous_deployed": deployed, "phase": "staging"})
+                 worker_relay={"target": vps.expected, "previous_deployed": deployed, "phase": "staging",
+                               "rollback_runtime": standby})
     ds.native_guard(vps.directory, vps.marker)
     ds.save_state(vps.directory, state)
 
@@ -76,6 +79,21 @@ def test_protected_relay_runs_real_switch_with_native_identity(tmp_path, monkeyp
             port = object.__new__(RelayPipeline)
             port.server = vps
             port.policy = SimpleNamespace(authority=ROOT, location=lambda _: repo)
+            calls = []
+
+            def blue_runtime(role):
+                assert role == "blue"
+                for route in ("/health", "/api/mcp/"):
+                    marker = route + "?relay-verified-blue"
+                    with urlopen(f"http://127.0.0.1:{endpoint.server_port}" + marker, timeout=2) as response:
+                        assert response.status == 200
+                    assert marker in logs["blue"].read_text()
+                    assert marker not in logs["green"].read_text()
+                calls.append("blue observed")
+                return standby
+
+            monkeypatch.setattr(vps, "runtime", blue_runtime)
+            monkeypatch.setattr(port, "_stop_green", lambda: calls.append("green stopped"))
             env = {"PATH": f"{bin_dir}:{Path(sys.executable).parent}:/usr/bin:/bin",
                    "BACKUP_DIR": str(tmp_path / "backups"),
                    "BLUE_ACCESS_LOG": str(logs["blue"]), "GREEN_ACCESS_LOG": str(logs["green"]),
@@ -98,6 +116,7 @@ def test_protected_relay_runs_real_switch_with_native_identity(tmp_path, monkeyp
                     vps._set(phase="rollback_started")
                     port.stage("rollback")
                     assert _route(conf.read_text()) == "blue"
+                    assert calls == ["blue observed", "green stopped"]
                 except StageFailure as failure:
                     pytest.fail((vps.work / (str(failure) + ".log")).read_text())
             assert all("dc_probe_" in path.read_text() for path in logs.values())
