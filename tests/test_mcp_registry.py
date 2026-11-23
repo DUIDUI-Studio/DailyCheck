@@ -28,7 +28,7 @@ from tests.test_mcp_access_log import CapturingServer
 registry_db = bot_setup_db
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = [entry.name for entry in registry.REGISTRY]
+NAMES = [entry.name for entry in registry.REGISTRY if not entry.policy_only]
 CANONICAL_WRITES = {
     "canonical_create", "canonical_update", "canonical_claim", "canonical_unclaim",
     "canonical_fanout", "canonical_resolve_conflict", "canonical_set_binding_active",
@@ -41,9 +41,12 @@ WMS_READS = {"wms_stock_list", "wms_stock_summary", "wms_documents_list"}
 def test_registry_matches_every_implementation_and_dispatch():
     mcp_contracts.validate_implementation_set()
     assert len(NAMES) == len(set(NAMES)) == 32
+    assert {e.name for e in registry.REGISTRY if e.policy_only} == {"production_consumption"}
     assert {tool.name for tool in get_tools()} == set(server._tool_map) == set(NAMES)
     assert server._tool_map == registry.get_handlers()
-    assert {e.name for e in registry.REGISTRY if not e.bot_approved} == CANONICAL_WRITES | WMS_READS
+    assert {e.name for e in registry.REGISTRY if not e.bot_approved} == (
+        CANONICAL_WRITES | WMS_READS | {"production_consumption"}
+    )
     assert sum(e.external_subset for e in registry.REGISTRY) == 19
     assert sum(e.bot_approved for e in registry.REGISTRY) == 22
     assert {e.name for e in registry.REGISTRY if e.mode == 'write'} == CANONICAL_WRITES | {
@@ -52,7 +55,8 @@ def test_registry_matches_every_implementation_and_dispatch():
     for entry in registry.REGISTRY:
         Draft202012Validator.check_schema(entry.output_shape)
         assert "outputSchema" not in entry.tool.model_dump(mode="json", exclude_none=True)
-        assert entry.tests == (f"tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[{entry.name}]",)
+        if not entry.policy_only:
+            assert entry.tests == (f"tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[{entry.name}]",)
 
 
 
@@ -107,8 +111,8 @@ def test_registry_rejects_missing_duplicate_and_orphan_implementations(monkeypat
 
 
 def copy_maintenance_files(target_root):
-    for name in ("AGENT.md", "CLAUDE.md", "tests/test_mcp_registry.py",
-                 "docs/integrations/dailycheck-mcp/calculation-logic.md"):
+    test_files = {reference.split("::", 1)[0] for entry in registry.REGISTRY for reference in entry.tests}
+    for name in ("AGENT.md", "CLAUDE.md", "docs/integrations/dailycheck-mcp/calculation-logic.md", *sorted(test_files)):
         target = target_root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text((ROOT / name).read_text())
@@ -387,7 +391,7 @@ def test_documented_health_auth_and_db_status_use_actual_app(registry_db, monkey
 
 
 @pytest.mark.parametrize('old,new', [
-    ('实时 32 项', '合计 27 项'),
+    ('实时 33 项', '合计 27 项'),
     ('`store_order_list` / `store_order_detail`', '未说明订单范围'),
     ('[完整工具台账](./registry.md)', '没有权威台账链接'),
 ])

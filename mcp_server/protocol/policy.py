@@ -9,10 +9,11 @@ from mcp.server import Server
 from starlette.concurrency import run_in_threadpool
 
 from mcp_server.infra.errors import ForbiddenError, McpError, ValidationError
-from mcp_server.protocol.registry import get_policy_actions
+from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import _current_auth
 from mcp_server.service.policy import MAX_SQLITE_ID, BoundPolicy
 from mcp_server.service.policy_reads import get_inventory, list_orders
+from mcp_server.service.production_consumption import VIEW_FIELDS
 from mcp_server.service.store_order import DEFAULT_LIMIT, MAX_LIMIT
 
 _INPUT_SCHEMAS = {
@@ -40,6 +41,9 @@ _INPUT_SCHEMAS = {
     },
 }
 _HANDLERS = {"items_detail": get_inventory, "store_order_list": list_orders}
+_POLICY_ONLY = {entry.name: entry for entry in REGISTRY if entry.policy_only}
+_INPUT_SCHEMAS.update({name: entry.tool.inputSchema for name, entry in _POLICY_ONLY.items()})
+_HANDLERS.update({name: entry.handler for name, entry in _POLICY_ONLY.items()})
 
 
 def _validate_arguments(schema: dict, arguments: dict) -> None:
@@ -51,7 +55,11 @@ def _validate_arguments(schema: dict, arguments: dict) -> None:
         if spec["type"] == "integer":
             if type(value) is not int or not spec["minimum"] <= value <= spec["maximum"]:
                 raise ValidationError("invalid_arguments")
-        elif not isinstance(value, str) or not value or ("enum" in spec and value not in spec["enum"]):
+        elif (
+            not isinstance(value, str) or not value
+            or ("enum" in spec and value not in spec["enum"])
+            or ("maxLength" in spec and len(value) > spec["maxLength"])
+        ):
             raise ValidationError("invalid_arguments")
 
 
@@ -66,9 +74,15 @@ def _policy_tools(policy: BoundPolicy, actions: dict[str, str]) -> list[types.To
     tools = []
     for name, action in actions.items():
         if fields := policy.fields(action):
+            entry = _POLICY_ONLY.get(name)
             tools.append(types.Tool(
                 name=name, inputSchema=_input_schema(name, fields),
-                description=f"Read authorized storefront data. Returned record fields: {', '.join(fields)}.",
+                description=(
+                    f"{entry.tool.description} Granted views: "
+                    f"{', '.join(view for view, field in VIEW_FIELDS.items() if field in fields)}."
+                    if entry else
+                    f"Read authorized storefront data. Returned record fields: {', '.join(fields)}."
+                ),
             ))
     return tools
 

@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, closing, contextmanager
 import httpx
 import pytest
 import uvicorn
+from jsonschema import validate
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from werkzeug.datastructures import MultiDict
@@ -23,11 +24,12 @@ from mcp_server import main
 from mcp_server.data.unit_of_work import policy_read_connection
 from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import authenticate
-from mcp_server.service.policy import POLICY_TOKEN_PREFIX, SAFE_FIELDS
+from mcp_server.service.policy import POLICY_TOKEN_PREFIX, PRODUCTION_CONSUMPTION_READ, SAFE_FIELDS
 
 STORES = ("store_a", "store_b", "store_c", "store_d")
 OUTSIDE = "other_store"
 DC = "distribution"
+LEGACY_GRANTS = {action: SAFE_FIELDS[action] for action in ("inventory.read", "orders.read")}
 ITEM_ARGS = {"item_id": 1, "warehouse_code": STORES[0]}
 INITIALIZE = {
     "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -371,7 +373,7 @@ def policy_admin(storefronts, monkeypatch):
 def issued_policy(storefronts, policy_admin):
     env, paths = storefronts
     _, admin = policy_admin
-    assert _publish(admin, "stock-and-orders", SAFE_FIELDS).status_code == 302
+    assert _publish(admin, "stock-and-orders", LEGACY_GRANTS).status_code == 302
     raw, identity = _read_receipt(_confirm(admin, _preview(admin, "four stores", "stock-and-orders:1", STORES)))
     return env, paths, raw, identity
 
@@ -383,10 +385,10 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     member = _login(app, "member")
     other_admin = _login(app, "another-admin")
     other_session = _login(app)
-    assert _publish(member, "stock-and-orders", SAFE_FIELDS).status_code == 403
+    assert _publish(member, "stock-and-orders", LEGACY_GRANTS).status_code == 403
     assert _publish(admin, "stock-and-orders", {"inventory.read": ["unit_cost"]}).status_code == 400
     assert _publish(admin, "stock-and-orders", {}).status_code == 400
-    assert _publish(admin, "stock-and-orders", SAFE_FIELDS).status_code == 302
+    assert _publish(admin, "stock-and-orders", LEGACY_GRANTS).status_code == 302
     assert _post(admin, "preview", [("token_name", "empty"), ("preset", "stock-and-orders:1")]).status_code == 400
     assert _preview(admin, "broad", "stock-and-orders:1", [*STORES, DC]).status_code == 400
     assert _preview(admin, "duplicated", "stock-and-orders:1", [STORES[0]] * 2).status_code == 400
@@ -476,7 +478,9 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     async def exercise(url):
         async with (_session(url, first_raw) as first, _session(url, second_raw) as second,
                     _session(url, "synthetic-shared-secret") as legacy):
-            assert {t.name for t in (await legacy.list_tools()).tools} == {entry.name for entry in REGISTRY}
+            assert {t.name for t in (await legacy.list_tools()).tools} == {
+                entry.name for entry in REGISTRY if not entry.policy_only
+            }
             assert {t.name for t in (await first.list_tools()).tools} == {"items_detail", "store_order_list"}
             second_tools = (await second.list_tools()).tools
             assert [t.name for t in second_tools] == ["store_order_list"]
@@ -570,10 +574,293 @@ def test_order_status_filter_requires_status_in_policy_mask(issued_policy, polic
 def test_registered_policy_actions_match_read_adapters():
     from mcp_server.protocol import policy as dispatch
 
-    expected = {"items_detail": "inventory.read", "store_order_list": "orders.read"}
+    expected = {
+        "items_detail": "inventory.read", "store_order_list": "orders.read",
+        "production_consumption": PRODUCTION_CONSUMPTION_READ,
+    }
     assert get_policy_actions() == expected
     assert {entry.name: entry.mode for entry in REGISTRY if entry.policy_action} == dict.fromkeys(expected, "read")
     assert dispatch._HANDLERS.keys() == dispatch._INPUT_SCHEMAS.keys() == expected.keys()
+
+
+PRODUCTION_TOOL = "production_consumption"
+PRODUCTION_CODES = ("wh_002", "wh_003", "wh_004", "wh_006")
+PRODUCTION_ARGS = {"start_date": "2026-11-16", "end_date": "2026-11-23", "view": "day"}
+PRODUCTION_SHAPE = next(entry.output_shape for entry in REGISTRY if entry.name == PRODUCTION_TOOL)
+
+
+@pytest.fixture
+def production_stores(storefronts, policy_admin):
+    env, paths = storefronts
+    _, admin = policy_admin
+    for index, (old, code) in enumerate(zip(STORES, PRODUCTION_CODES, strict=True)):
+        _db_update(env["master"], "UPDATE warehouses SET code=? WHERE code=?", (code, old))
+        path = paths[code] = paths[old]
+        with closing(sqlite3.connect(path)) as conn, conn:
+            # Same current label/identity across stores, but no historical unit or mapping.
+            conn.execute("UPDATE items SET sku='shared', canonical_id=101, unit=?", ("kg" if index == 0 else "g",))
+            conn.execute(
+                "INSERT INTO production_runs (id, product_id, output_qty, note, created_by, created_at) "
+                "VALUES (1, 1, 10, 'private run note', 'private creator', '2026-11-16 00:00:00')"
+            )
+            conn.execute(
+                "INSERT INTO production_run_items (id, run_id, item_id, planned_qty, actual_qty, planned_default) "
+                "VALUES (1, 1, 1, 4, ?, 0)", (0 if index == 0 else 4,),
+            )
+    path = paths[PRODUCTION_CODES[0]]
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.executemany(
+            "INSERT INTO production_runs (id, product_id, output_qty, rolled_back, created_at) VALUES (?, 1, 10, ?, ?)",
+            [
+                (2, 0, "2026-11-15 23:59:59"), (3, 0, "2026-11-16 23:59:59"),
+                (4, 0, "2026-11-17 00:00:00"), (5, 1, "2026-11-17 00:00:01"),
+                (6, 0, "2026-11-22 23:59:59"), (7, 0, "2026-11-23 00:00:00"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO outbound_requests "
+            "(id, item_id, requested_quantity, reason, status, rolled_back, created_at, source_type) "
+            "VALUES (?, ?, 4, ?, '出库', ?, '2026-11-17 00:00:00', ?)",
+            [
+                (41, 1, "生产领料(run=#4)", 0, "production"),
+                (42, 2, "生产领料(run=#4)", 0, "production"),  # different material
+                (43, 1, "生产领料(run=#3)", 0, "production"),  # different batch
+                (44, 1, "生产领料(run=#4)", 1, "production"),  # rolled back
+                (45, 1, "生产领料(run=#4)", 0, "manual"),      # wrong source
+                (46, 1, "生产领料(run=#4)", 0, "production"),  # reused link
+                (47, 1, "生产领料(run=#6)", 0, "production"),  # no structured link
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO production_run_items "
+            "(id, run_id, item_id, planned_qty, actual_qty, planned_default, outbound_req_id) "
+            "VALUES (?, ?, 1, 4, ?, ?, ?)",
+            [
+                (2, 2, 4, 0, None), (3, 3, 4, 0, None),
+                (4, 4, 4, 1, 41), (5, 5, 4, 0, None), (6, 6, 4, 1, None), (7, 7, 4, 0, None),
+                (8, 4, 4, 1, 42), (9, 4, 4, 1, 43), (10, 4, 4, 1, 44), (11, 4, 4, 1, 45),
+                (12, 4, 4, 1, 46), (13, 4, 4, 1, 46), (14, 4, 5, 1, 99),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO stock_movements (item_id, action, delta, note, created_at) "
+            "VALUES (1, '生产消耗', -4, 'private movement', '2026-11-17 00:00:00')"
+        )
+    # An earlier schema must remain readable without a migration or backfill.
+    path = paths["wh_006"]
+    _db_update(path, "DROP INDEX IF EXISTS idx_pruni_outbound")
+    _db_update(path, "ALTER TABLE production_run_items DROP COLUMN outbound_req_id")
+    _db_update(path, "ALTER TABLE production_run_items DROP COLUMN planned_default")
+    return env, paths, admin
+
+
+@pytest.fixture
+def production_tokens(production_stores):
+    env, paths, admin = production_stores
+    action = PRODUCTION_CONSUMPTION_READ
+    assert _publish(admin, "production", {action: ["summary", "lines"]}).status_code == 302
+    preview = _preview(admin, "four production stores", "production:1", PRODUCTION_CODES)
+    assert preview.status_code == 200
+    assert all(value in preview.get_data(as_text=True) for value in (PRODUCTION_TOOL, action, *PRODUCTION_CODES))
+    full, identity = _read_receipt(_confirm(admin, preview))
+    assert _db_update(
+        env["master"], "SELECT allowed_read_paths_json, allowed_write_paths_json, "
+        "allowed_warehouse_codes_json FROM agent_tokens WHERE id=?", (identity,),
+    ) == ("[]", "[]", "[]")
+    assert _publish(admin, "production", {action: ["summary"]}).status_code == 302
+    partial, _ = _read_receipt(_confirm(admin, _preview(admin, "one store", "production:2", ["wh_003"])))
+    return env, paths, admin, full, partial, identity
+
+
+def test_production_consumption_sdk(production_tokens, monkeypatch):
+    env, paths, admin, full, partial, identity = production_tokens
+    ordinary = secrets.token_urlsafe(32)
+    _db_update(
+        env["master"], "INSERT INTO agent_tokens "
+        "(name, token_hash, token_prefix, created_by, created_at, allowed_read_paths_json, "
+        "allowed_write_paths_json, allowed_warehouse_codes_json) "
+        "VALUES ('synthetic-wide', ?, ?, 1, 'test', '[\"*\"]', '[\"*\"]', '[\"*\"]')",
+        (generate_password_hash(ordinary, method="pbkdf2:sha256:1000"), ordinary[:8]),
+    )
+    assert authenticate(f"Bearer {full}") is None
+    assert not next(entry for entry in REGISTRY if entry.name == PRODUCTION_TOOL).bot_approved
+    with closing(sqlite3.connect(paths["wh_002"])) as writer, writer:
+        assert writer.execute("PRAGMA journal_mode=PERSIST").fetchone()[0] == "persist"
+        writer.execute("UPDATE items SET unit='box' WHERE id=1")
+        writer.commit()
+    before = _snapshot(env["root"])
+    assert any(name.endswith("-journal") for name in before)
+
+    async def exercise(url):
+        async with (_session(url, full) as session, _session(url, partial) as narrow,
+                    _session(url, ordinary) as legacy):
+            assert [tool.name for tool in (await session.list_tools()).tools] == [PRODUCTION_TOOL]
+            assert PRODUCTION_TOOL not in {tool.name for tool in (await legacy.list_tools()).tools}
+            legacy_call = await legacy.call_tool(PRODUCTION_TOOL, PRODUCTION_ARGS)
+            assert legacy_call.isError
+            original_open = sqlite3.connect
+
+            def no_warehouse_open(database, *args, **kwargs):
+                assert all(path.name.split(" ")[0] not in str(database) for path in paths.values()), database
+                return original_open(database, *args, **kwargs)
+
+            with monkeypatch.context() as guarded:
+                guarded.setattr(sqlite3, "connect", no_warehouse_open)
+                await _call(narrow, PRODUCTION_TOOL, {**PRODUCTION_ARGS, "warehouse_code": "wh_002"}, error="forbidden")
+                await _call(session, PRODUCTION_TOOL, {**PRODUCTION_ARGS, "warehouse_code": OUTSIDE}, error="forbidden")
+                await _call(narrow, PRODUCTION_TOOL, {**PRODUCTION_ARGS, "view": "lines"}, error="forbidden")
+                await _call(session, "outbound_create", {}, error="forbidden")
+            page = await _call(narrow, PRODUCTION_TOOL, PRODUCTION_ARGS)
+            assert page["warehouses"] == ["wh_003"] and len(page["summary"]) == 1
+
+            day = await _call(session, PRODUCTION_TOOL, PRODUCTION_ARGS)
+            week = await _call(session, PRODUCTION_TOOL, {**PRODUCTION_ARGS, "view": "week"})
+            for page in (day, week):
+                validate(page, PRODUCTION_SHAPE)
+                assert page["warehouses"] == list(PRODUCTION_CODES)
+                assert page["timezone"] == "Asia/Shanghai"
+                assert page["unit_status"] == "historical_unit_unavailable"
+                assert page["cross_store_rollup"] == "historical_mapping_unavailable"
+                assert all(g["unit"] is None for g in page["summary"])
+                assert all(g[key] is None for key in ("planned_qty", "manual_qty", "system_default_qty", "unknown_qty")
+                           for g in page["summary"])
+            assert len(week["summary"]) == 4
+            counts = ("planned_count", "manual_count", "system_default_count", "unknown_count")
+            for group in week["summary"]:
+                assert group["period_start"] == "2026-11-16"
+                assert all(group[key] == sum(row[key] for row in day["summary"]
+                                            if row["warehouse_code"] == group["warehouse_code"])
+                           for key in counts)
+            assert [week["summary"][0][key] for key in counts] == [11, 2, 1, 8]
+            assert [week["summary"][-1][key] for key in counts] == [1, 0, 0, 1]
+            assert [(group["period_start"], group["planned_count"]) for group in day["summary"][:3]] == [
+                ("2026-11-16", 2), ("2026-11-17", 8), ("2026-11-22", 1),
+            ]
+
+            line_args = {**PRODUCTION_ARGS, "view": "lines", "warehouse_code": "wh_002"}
+            lines = await _call(session, PRODUCTION_TOOL, line_args)
+            validate(lines, PRODUCTION_SHAPE)
+            records = {row["line_id"]: row for row in lines["lines"]}
+            assert list(records) == [1, 3, 4, 8, 9, 10, 11, 12, 13, 14, 6]
+            assert records[1]["created_at"] == "2026-11-16T00:00:00+08:00"
+            assert records[1]["booked_qty"] == 0 and records[1]["booked_source"] == "manual"
+            assert records[3]["planned_qty"] == records[3]["booked_qty"] == 4
+            assert records[3]["booked_source"] == "manual"
+            assert records[4]["planned_qty"] == records[4]["booked_qty"] == 4
+            assert records[4]["booked_source"] == "system_default"
+            assert all(records[i]["booked_source"] == "unknown" for i in (6, 8, 9, 10, 11, 12, 13, 14))
+            assert records[14]["booked_qty"] == 5
+            assert all(set(row) == {
+                "warehouse_code", "item_id", "unit", "run_id", "line_id", "created_at",
+                "planned_qty", "booked_qty", "booked_source",
+            } for row in records.values())
+            sample = day["summary"][0]["sample"]
+            linked = await _call(session, PRODUCTION_TOOL, {
+                **line_args, "run_id": sample["run_id"], "line_id": sample["line_id"],
+            })
+            assert linked["lines"] == [records[1]]
+            first_lines = await _call(session, PRODUCTION_TOOL, {**line_args, "limit": 4})
+            next_lines = await _call(session, PRODUCTION_TOOL, {
+                **line_args, "limit": 4, "cursor": first_lines["next_cursor"],
+            })
+            assert first_lines["lines"] + next_lines["lines"] == lines["lines"][:8]
+            next_week = await _call(session, PRODUCTION_TOOL, {
+                **line_args, "start_date": "2026-11-23", "end_date": "2026-11-30",
+            })
+            assert [row["line_id"] for row in next_week["lines"]] == [7]
+            empty = await _call(session, PRODUCTION_TOOL, {**line_args, "run_id": 5})
+            assert empty["range_empty"] and empty["page_empty"] and not empty["truncated"]
+            assert empty["lines"] == [] and empty["next_cursor"] is None
+            for changes in (
+                {"start_date": "2026-11-17", "view": "week"}, {"start_date": "2026-11-23"},
+                {"start_date": "20261116"}, {"end_date": "2027-03-01"}, {"limit": 201}, {"run_id": 1},
+            ):
+                await _call(session, PRODUCTION_TOOL, {**PRODUCTION_ARGS, **changes}, error="validation_error")
+
+            page = await _call(session, PRODUCTION_TOOL, {**PRODUCTION_ARGS, "limit": 1})
+            assert page["truncated"] and page["summary"] == day["summary"][:1]
+            first_cursor = page["next_cursor"]
+            await _call(session, PRODUCTION_TOOL, {
+                **PRODUCTION_ARGS, "limit": 1, "cursor": "bad" + first_cursor,
+            }, error="validation_error")
+            for changes in ({"limit": 2}, {"warehouse_code": "wh_002"}, {"start_date": "2026-11-15"}):
+                await _call(session, PRODUCTION_TOOL, {
+                    **PRODUCTION_ARGS, "limit": 1, "cursor": first_cursor, **changes,
+                }, error="validation_error")
+            await _call(narrow, PRODUCTION_TOOL, {
+                **PRODUCTION_ARGS, "limit": 1, "cursor": first_cursor,
+            }, error="validation_error")
+            collected = page["summary"].copy()
+            while page["truncated"]:
+                page = await _call(session, PRODUCTION_TOOL, {
+                    **PRODUCTION_ARGS, "limit": 1, "cursor": page["next_cursor"],
+                })
+                collected.extend(page["summary"])
+            assert collected == day["summary"] and page["next_cursor"] is None and not page["page_empty"]
+
+    with _listener() as url, httpx.Client(trust_env=False, timeout=10) as http:
+        asyncio.run(exercise(url))
+        assert _snapshot(env["root"]) == before
+        audit = [json.loads(line) for line in env["log"].read_text().splitlines()]
+        assert {row["status"] for row in audit if row["tool_name"] == PRODUCTION_TOOL} >= {200, 400, 403}
+        assert not any(raw in env["log"].read_text() for raw in (full, partial, ordinary))
+        for endpoint in ("/sse", "/messages/"):
+            assert http.post(url.replace("/api/mcp/", endpoint), headers=_headers(full), json=INITIALIZE).status_code == 401
+        assert admin.post(f"{ADMIN}/{identity}/revoke", data={
+            "csrf_token": _hidden(admin.get(ADMIN), "csrf_token"),
+        }).status_code == 302
+        assert http.post(url, headers=_headers(full), json=INITIALIZE).status_code == 401
+        assert http.post(url, headers=_headers(partial), json=INITIALIZE).status_code == 200
+
+
+def test_production_consumption_scope_and_source_fail_closed(production_tokens, monkeypatch):
+    env, paths, admin, full, _, _ = production_tokens
+    app = admin.application
+    member = _login(app, "member")
+    assert _publish(member, "forbidden", {PRODUCTION_CONSUMPTION_READ: ["lines"]}).status_code == 403
+    assert _publish(admin, "too-much", {PRODUCTION_CONSUMPTION_READ: ["unit_cost"]}).status_code == 400
+    assert _preview(admin, "outside", "production:1", ["wh_002", OUTSIDE]).status_code == 400
+    assert _preview(admin, "dc", "production:1", ["wh_002", DC]).status_code == 400
+    preview = _preview(admin, "role changed", "production:1", ["wh_002"])
+    master = env["master"]
+    _db_update(master, "UPDATE warehouses SET warehouse_type='distribution_center' WHERE code='wh_002'")
+    assert _confirm(admin, preview).status_code == 409
+    with _listener() as url, httpx.Client(trust_env=False, timeout=10) as http:
+        assert http.post(url, headers=_headers(full), json=INITIALIZE).status_code == 401
+    _db_update(master, "UPDATE warehouses SET warehouse_type='storefront' WHERE code='wh_002'")
+
+    async def exercise(url):
+        args = {**PRODUCTION_ARGS, "limit": 1}
+        path = paths["wh_002"]
+        async with _session(url, full) as session:
+            first = await _call(session, PRODUCTION_TOOL, args)
+            more = {**args, "cursor": first["next_cursor"]}
+            _db_update(path, "UPDATE production_run_items SET actual_qty=1 WHERE id=1")
+            before = _snapshot(env["root"])
+            await _call(session, PRODUCTION_TOOL, more, error="stale_cursor")
+            assert _snapshot(env["root"]) == before
+            with monkeypatch.context() as budget:
+                budget.setattr("mcp_server.service.production_consumption.MAX_SOURCE_LINES", 1)
+                await _call(session, PRODUCTION_TOOL, args, error="range_too_dense")
+            _db_update(path, "UPDATE production_runs SET created_at='2026-11-16T00:00:00Z' WHERE id=1")
+            await _call(session, PRODUCTION_TOOL, args, error="source_unavailable")
+            _db_update(path, "UPDATE production_runs SET created_at='2026-11-16 00:00:00' WHERE id=1")
+            with closing(sqlite3.connect(path)) as writer, writer:
+                assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+                writer.execute("UPDATE production_run_items SET actual_qty=3 WHERE id=1")
+                writer.commit()
+                before = _snapshot(env["root"])
+                assert any(name.endswith("-wal") for name in before)
+                assert any(name.endswith("-shm") for name in before)
+                await _call(session, PRODUCTION_TOOL, args, error="source_unavailable")
+                assert _snapshot(env["root"]) == before
+            path.unlink()
+            before = _snapshot(env["root"])
+            await _call(session, PRODUCTION_TOOL, args, error="source_unavailable")
+            assert _snapshot(env["root"]) == before
+
+    with _listener() as url:
+        asyncio.run(exercise(url))
 
 
 def test_policy_dry_run_revoke_refuses_without_changes(issued_policy, policy_admin, monkeypatch):

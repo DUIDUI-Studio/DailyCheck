@@ -2754,7 +2754,7 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 32 个 MCP 工具
+### 9.2 33 个 MCP 工具
 
 **Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 32 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
@@ -2763,7 +2763,8 @@ flowchart LR
 内部可验证输出 JSON shape、外部子集/Bot批准状态及回归引用。`tools.get_tools()` 深复制声明，
 `server._tool_map` 从登记派生；启动时拒绝重名/无效handler，检查命令另扫描全部工具模块，
 拒绝漏注册实现、漏实现和错误绑定。Bot 的显式批准白名单仍由 `bot/tool_contract.py` 独立持有，
-仅做一致性核对，不从动态发现授予权限；32运行项、19外部集成子集、22 Bot批准项、七canonical写禁用不变。
+仅做一致性核对，不从动态发现授予权限。33 项登记含 32 项普通工具和 1 项仅策略工具；
+外部集成子集 19 项、Bot 批准 22 项。
 
 完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
 及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留19项子集，不是完整注册表。
@@ -2939,6 +2940,22 @@ CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确�
 明文只进入签发响应；事务在绑定中保留签发和撤销的人及时间。演练模式拒绝撤销，
 保留原有令牌状态。发布新版本不改动旧绑定。
 详见 [MCP 配置与策略预设](mcp-configuration.md#storefront-read-policy-presets)。
+
+#### 四店生产耗料只读（GitHub #48）
+
+`production_consumption.read` 复用该策略预设和同一 StreamableHTTP dispatcher。
+预览、签发、认证均验证实际 storefront，范围限 `wh_002`、`wh_003`、`wh_004`、
+`wh_006` 的非空子集。调用在打开仓库文件前验证所请求仓及视图权限。
+`summary` 授权按日/周查看计数和样本引用，`lines` 授权按仓、批次和行追溯原始量。
+仅策略工具登记排除在普通 MCP 发现和调用、外部工具子集及 Bot 批准池之外。
+
+使用 `resolve_warehouse_path` 和策略只读连接，每个仓库每次请求固定各自的 SQLite
+读事务。仓之间各自取快照。事实来自未回滚的生产批次及耗料行。现代结构化出库关联
+只验证代填来源，库存流水不参与。原始行没有历史单位或跨店映射快照，分组数量返回
+`null`，分店保留来源计数和批次引用，原始计划量和入账量在明细逐行返回。
+按北京时间日期半开范围读取服务端本地秒级时间文本，生产启用前核实源时间口径。
+整组计算后分页，游标签名绑定身份、请求和明细指纹，数据变化或进程重启须从首
+页重查。范围、来源、字段和错误契约见 [生产耗料配置](mcp-configuration.md#production-consumption)。
 
 ### 9.4 鉴权回退链
 

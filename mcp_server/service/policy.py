@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 POLICY_TOKEN_PREFIX = "mp."
 MAX_SQLITE_ID = 2**63 - 1
+PRODUCTION_CONSUMPTION_READ = "production_consumption.read"
+PRODUCTION_STORES = frozenset({"wh_002", "wh_003", "wh_004", "wh_006"})
 
 # Values are trusted SQL fragments. An administrator selects keys only.
 INVENTORY_COLUMNS = {"sku": "sku", "current_stock": "quantity AS current_stock",
@@ -18,6 +20,7 @@ ORDER_COLUMNS = {
 SAFE_FIELDS = {
     "inventory.read": tuple(INVENTORY_COLUMNS),
     "orders.read": (*ORDER_COLUMNS, "fulfillment"),
+    PRODUCTION_CONSUMPTION_READ: ("summary", "lines"),
 }
 
 
@@ -42,7 +45,7 @@ def encode_grants(grants: object) -> str:
     return json.dumps(canonical_grants(grants), sort_keys=True, separators=(",", ":"))
 
 
-def storefront_scope(conn: sqlite3.Connection, codes: object) -> tuple[str, ...]:
+def storefront_scope(conn: sqlite3.Connection, codes: object, grants: dict) -> tuple[str, ...]:
     if (
         not isinstance(codes, list) or not codes
         or not all(isinstance(code, str) and code and code.strip() == code and "*" not in code
@@ -57,6 +60,8 @@ def storefront_scope(conn: sqlite3.Connection, codes: object) -> tuple[str, ...]
     )
     if {row[0] for row in rows} != set(codes):
         raise ValueError("Invalid storefront selection")
+    if PRODUCTION_CONSUMPTION_READ in grants and not PRODUCTION_STORES.issuperset(codes):
+        raise ValueError("Invalid production consumption storefront selection")
     return tuple(sorted(codes))
 
 
@@ -84,7 +89,7 @@ def load_binding(conn: sqlite3.Connection, token_id: int) -> BoundPolicy | None:
         grants = canonical_grants(json.loads(row["grants_json"]))
         if row["grants_json"] != encode_grants(grants) or row["preset_grants"] != row["grants_json"]:
             return None
-        warehouses = storefront_scope(conn, json.loads(row["warehouse_codes_json"]))
+        warehouses = storefront_scope(conn, json.loads(row["warehouse_codes_json"]), grants)
     except (TypeError, ValueError):
         return None
     return BoundPolicy(token_id, warehouses, tuple((action, tuple(fields)) for action, fields in grants.items()))

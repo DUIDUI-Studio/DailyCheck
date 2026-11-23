@@ -20,10 +20,11 @@ from mcp_server.protocol.tools import (
     inventory,
     outbound,
     procurement,
+    production_consumption,
     store_order,
     wms,
 )
-from mcp_server.service.policy import SAFE_FIELDS
+from mcp_server.service.policy import PRODUCTION_CONSUMPTION_READ, SAFE_FIELDS
 
 
 def obj(**properties: dict) -> dict:
@@ -41,6 +42,20 @@ STRING = {"type": "string"}
 BOOLEAN = {"type": "boolean"}
 NULLABLE_STRING = {"type": ["string", "null"]}
 ROW = {"type": "object"}
+NULLABLE_NUMBER = {"type": ["number", "null"]}
+PRODUCTION_REFERENCE = obj(run_id=INTEGER, line_id=INTEGER, created_at=STRING)
+PRODUCTION_SUMMARY = obj(
+    warehouse_code=STRING, period_start=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
+    planned_count=INTEGER, manual_count=INTEGER, system_default_count=INTEGER, unknown_count=INTEGER,
+    planned_qty=NULLABLE_NUMBER, manual_qty=NULLABLE_NUMBER,
+    system_default_qty=NULLABLE_NUMBER, unknown_qty=NULLABLE_NUMBER, sample=PRODUCTION_REFERENCE,
+)
+PRODUCTION_LINE = obj(
+    warehouse_code=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
+    planned_qty=NUMBER, booked_qty=NUMBER,
+    booked_source={"type": "string", "enum": ["manual", "system_default", "unknown"]},
+    **PRODUCTION_REFERENCE["properties"],
+)
 ITEM = obj(id=INTEGER, name=STRING, current_stock=NUMBER)
 CANONICAL = obj(id=INTEGER, canonical_sku=STRING, name=STRING, unit=STRING, status=STRING)
 DOCUMENT = obj(
@@ -82,6 +97,7 @@ class ToolRegistration:
     tests: tuple[str, ...]
     compatibility: str = "preserved-input-description-and-TextContent-JSON"
     policy_action: str | None = None
+    policy_only: bool = False
 
     @property
     def name(self) -> str:
@@ -1087,6 +1103,36 @@ REGISTRY = (
         external_subset=True, bot_approved=False,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_documents_list]",),
     ),
+    ToolRegistration(
+        tool=Tool(
+            name="production_consumption",
+            title="Read Store Production Consumption",
+            description=(
+                "Read production consumption by Beijing day, Monday-based week, or batch line "
+                "within an explicit half-open date range (up to 92 days). Separate results per "
+                "authorized store. Group counts and traceable raw quantities preserve unknown provenance "
+                "and historical units. Use the same request with next_cursor to continue."
+            ),
+            inputSchema=production_consumption.INPUT_SCHEMA,
+        ),
+        domain="production_consumption", handler=production_consumption.production_consumption_impl,
+        access=AccessContract(
+            "GET", "/api/mcp/", "StreamableHTTP bound policy action and view grant only",
+            "granted storefronts within wh_002, wh_003, wh_004, wh_006",
+        ),
+        output_shape={
+            **obj(
+                view=STRING, warehouses=array(STRING), start_date=STRING, end_date=STRING, timezone=STRING,
+                unit_status=STRING, cross_store_rollup=STRING, range_empty=BOOLEAN, page_empty=BOOLEAN,
+                limit=INTEGER, truncated=BOOLEAN, next_cursor=NULLABLE_STRING,
+            ),
+            "oneOf": [obj(summary=array(PRODUCTION_SUMMARY)), obj(lines=array(PRODUCTION_LINE))],
+        },
+        external_subset=False, bot_approved=False,
+        tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk",),
+        compatibility="new-policy-only-StreamableHTTP-TextContent-JSON; legacy discovery and calls unchanged",
+        policy_action=PRODUCTION_CONSUMPTION_READ, policy_only=True,
+    ),
 )
 
 
@@ -1113,11 +1159,13 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
         if not entry.tests or not entry.compatibility or not entry.output_shape:
             raise ValueError(f"incomplete contract: {entry.name}")
         if entry.access.method not in {"GET", "POST"} or not all((
-            entry.access.path.startswith("/api/v1/"),
+            entry.access.path == "/api/mcp/" if entry.policy_only else entry.access.path.startswith("/api/v1/"),
             entry.access.path_enforcement, entry.access.warehouse_scope,
         )):
             raise ValueError(f"incomplete access contract: {entry.name}")
         action = entry.policy_action
+        if entry.policy_only and (action is None or entry.external_subset or entry.bot_approved):
+            raise ValueError(f"invalid policy-only exposure: {entry.name}")
         if action is not None:
             if entry.mode != "read" or action not in SAFE_FIELDS or action in policy_actions:
                 raise ValueError(f"invalid scoped policy action: {entry.name}")
@@ -1126,11 +1174,11 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
 
 def get_tools() -> list[Tool]:
     """Keep declarations independent between callers, as before the registry."""
-    return [entry.tool.model_copy(deep=True) for entry in REGISTRY]
+    return [entry.tool.model_copy(deep=True) for entry in REGISTRY if not entry.policy_only]
 
 
 def get_handlers() -> dict[str, Callable]:
-    return {entry.name: entry.handler for entry in REGISTRY}
+    return {entry.name: entry.handler for entry in REGISTRY if not entry.policy_only}
 
 
 def get_policy_actions() -> dict[str, str]:

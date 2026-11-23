@@ -170,7 +170,7 @@ def _preview(db):
     try:
         version = int(version_text)
         grants = _preset(db, preset, version)
-        codes = storefront_scope(db, request.form.getlist("policy_warehouses"))
+        codes = storefront_scope(db, request.form.getlist("policy_warehouses"), json.loads(grants))
     except (ValueError, OverflowError):
         abort(400, "预设或门店范围无效。")
     snapshot = {
@@ -206,7 +206,7 @@ def _issue(db):
         name = snapshot["token_name"]
         preset, version = snapshot["preset"], snapshot["version"]
         confirmed = _preset(db, preset, version)
-        codes = storefront_scope(db, snapshot["warehouses"])
+        codes = storefront_scope(db, snapshot["warehouses"], json.loads(confirmed))
         if confirmed != snapshot["grants_json"] or list(codes) != snapshot["warehouses"]:
             raise ValueError("Confirmed scope changed")
         if db.execute(
