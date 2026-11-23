@@ -392,6 +392,15 @@ class ProtectedPipeline:
         self.python = Path(value["app_python"])
         self._validate_installation()
 
+    def _application_environment(self, raw):
+        return validate_application_environment(
+            raw, mcp_health_token=self.policy.mcp_health_token(), read_token=self.policy.read_token())
+
+    def _private_paths(self):
+        return [str(self.policy.location(k)) for k in (
+            "directory", "review_directory", "key_file", "read_token_file", "runtime_file",
+            "bootstrap_file")]
+
     def path(self, key):
         path = Path(self.value[key])
         if not path.is_absolute() or ".." in path.parts or not re.fullmatch(r"[/a-zA-Z0-9_.-]+", str(path)):
@@ -445,9 +454,8 @@ class ProtectedPipeline:
         for mutable in (self.path(k) for k in ("source_db", "green_db", "scratch_root", "green_access_log")):
             if any(mutable == path or mutable.is_relative_to(path) or path.is_relative_to(mutable) for path in private):
                 raise ValueError("application write path overlaps protected control inputs")
-        self.app_env = validate_application_environment(
-            read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor),
-            mcp_health_token=p.mcp_health_token(), read_token=p.read_token())
+        self.app_env = self._application_environment(
+            read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor))
 
     def _owned(self, candidate=None):
         active = deploy_state._native_owned(deploy_state.load_state(self.policy.location("directory")))
@@ -566,8 +574,7 @@ class ProtectedPipeline:
             backup.chmod(0o600)
             if any((self.path("unit_directory") / (unit + ".d")).glob("*.conf")):
                 raise ValueError("unreviewed service drop-ins require installation reconciliation")
-            private = " ".join(str(p.location(k)) for k in ("directory", "review_directory"))
-            private += " " + " ".join(str(p.location(k)) for k in ("key_file", "read_token_file", "runtime_file", "bootstrap_file"))
+            private = " ".join(self._private_paths())
             content = render_unit(
                 description="DailyCheck protected native candidate",
                 working_directory=str(release),
@@ -744,6 +751,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db"}))
     args = parser.parse_args()
+    if os.environ.get("DC_RELAY_MODE") == "1":
+        from scripts.prod_agent.relay_pipeline import candidate_operation
+        return candidate_operation(args.operation)
     # Policy path is fixed by the installed controller. This private helper is
     # never installed setuid or exposed to candidate code as a privileged RPC.
     from scripts.prod_agent.native_controller import POLICY_PATH

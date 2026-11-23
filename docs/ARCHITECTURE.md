@@ -1315,6 +1315,23 @@ Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置
 `merge_readiness.py` 保留 Gitea 入口；现有 reducer 对 GitHub 证据强制 `ready=false`，
 `deploy_merge.py` 在缺省 shadow lane 明确拒绝 GitHub finalization；ordinary opt-in 见上，
 不引入 merge queue / group delivery。
+
+**Local Worker release relay（#41，手动入口）**。Worker 绑定同仓 PR 身份、H、B、ref、
+树、source digest 和新一代 attempt，复用 exact-H Actions 证据及已装 ordinary 的
+classic protection 和 review 约束。阶段凭据由本地受保护的 authority 签发，在
+preflight、merge-read、finalize 或对账时使用。VPS 入口仅收固定命令、签名阶段动作和
+有界单 ref incremental bundle。SSH host key、传输 key 和动作签名分别校验。
+
+VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard 在接收时落盘。
+即使 SSH 已退出或 staging 进程丢失，未完成的 attempt 仍挡住旧 release 路径。
+候选对象先经固定匿名 HTTPS 通道核验，或在已批准代理不可达时从同一 attempt
+的 bundle 核验。未配置匿名代理时显式使用 bundle。对象图验证完成后才进入受保护的
+`up → verify → promote → switch → observe`。verify 保留八项检查，生产观察须达到
+600 单调秒。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
+两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及
+阶段回执，供独立对账。安装和 Peter 首次试运行见
+[本地 Worker 发布 relay](agent-framework/local-worker-relay.md)。
+
 Shadow 边界不依赖 readiness helper：`hosting.py` 统一严格 JSON object 解析与 policy 分类。
 raw sender、shell ingress/output guard、reducer 和存储行共用重复键、finite number、UTF-8、
 1 MiB、深度 100 保护；body 错误与 hosting config 错误分离，不能把解析失败当成缺省输入。
