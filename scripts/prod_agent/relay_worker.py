@@ -90,7 +90,8 @@ class Worker:
                 and grant["installation_id"] == self.profile["installation_id"]
                 and type(grant["expires"]) is int and time.time() + 2 < grant["expires"] <= time.time() + 3700
                 and isinstance(grant["token"], str)
-                and re.fullmatch(r"[A-Za-z0-9_-]{20,256}", grant["token"]), "fresh scoped auth unavailable")
+                and re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", grant["token"]),
+                "fresh scoped auth unavailable")
         token_key = hashlib.sha256(grant["token"].encode()).hexdigest()
         used = read_file(self.grants) if self.grants.exists() else []
         require(token_key not in used and len(used) < 128, "reused role credential")

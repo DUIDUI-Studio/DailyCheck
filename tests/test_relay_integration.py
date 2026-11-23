@@ -257,6 +257,8 @@ expiry = now + (10 if phase == 'preflight' else 120)
 if phase == 'finalize' and control.get('expired_finalize'):
     expiry = now - 1
 token = {CANARY!r} + phase + '_' + os.urandom(12).hex()
+if control.get('stateless_grants'):
+    token = 'ghs_123_' + token + '.' + ('a' * 420) + '.signature'
 if control.get('reuse'):
     token = {CANARY!r} + 'preflight_0123456789'
 grant = dict(request, repo_id=1448986421, installation_id=123, expires=expiry, token=token)
@@ -461,7 +463,7 @@ class Fixture:
 
 @pytest.mark.parametrize("merge_mode", ["ack", "lost", "unknown", "bare_ack", "drift"])
 def test_merge_and_uncertain_response(relay, merge_mode):
-    relay.options(merge_mode=merge_mode)
+    relay.options(merge_mode=merge_mode, stateless_grants=merge_mode == "ack")
     assert relay.call("start")["phase"] == "accepted"
     observed = relay.wait("verified")
     assert observed["source_method"] == "incremental_bundle" and observed["observation_seconds"] >= 1

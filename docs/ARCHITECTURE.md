@@ -1319,7 +1319,9 @@ Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置
 **Local Worker release relay（#41，手动入口）**。Worker 绑定同仓 PR 身份、H、B、ref、
 树、source digest 和新一代 attempt，复用 exact-H Actions 证据及已装 ordinary 的
 classic protection 和 review 约束。阶段凭据由本地受保护的 authority 签发，在
-preflight、merge-read、finalize 或对账时使用。VPS 入口仅收固定命令、签名阶段动作和
+preflight、merge-read、finalize 或对账时使用。Worker 将 GitHub 令牌视为不透明的
+Bearer 值，只校验传输字符和消息边界，支持 GitHub App 旧版和新版安装令牌。
+VPS 入口仅收固定命令、签名阶段动作和
 有界单 ref incremental bundle。SSH host key、传输 key 和动作签名分别校验。
 
 VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard 在接收时落盘。
