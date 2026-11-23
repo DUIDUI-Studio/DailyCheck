@@ -71,9 +71,27 @@ TMPDIR="$task_tmp" DAILYCHECK_DB_DIR="$task_tmp/db" \
 
 ## 部署和回退边界
 
-v10 走已注册的 master 迁移及 SQLite 备份，仓库库不需要新迁移。预先登记租户 1 的
-Gene 主体、批准的品项与原仓对、不可变预设版本。生产主体、具体配对和登记渠道由
-Peter 核定。普通 Web Token 管理页保留原来的权限范围。
+v10 走已注册的 master 迁移及 SQLite 备份，仓库库不需要新迁移。早期草稿的 v10 合成库
+可通过本版 Web 初始化补齐追加审计表。普通 Web Token 管理页
+继续使用原有的门店只读授权。生产主体、具体配对和业务决定来源由 Peter 核定。
+
+负责登记的管理员在受控主机使用以下同一入口完成三种决定的只读预览。每次均提交
+`--issuer`（核准的管理员 ID）和独立的 `--reference`（配置决定或已批准业务决定的
+可追溯编号），并交互验证管理员本人密码：
+
+- `python -m scripts.routing_policy_token --db <当前主库> authorization-preview --operation install-preset`
+  登记固定的 `dailycheck.gene-routing` 预设和版本。预设只有已发布的停订工具动作，独立于
+  主体、配对和令牌。
+- 同一命令使用 `--operation approve --actor <Gene ID> --pair <canonical_id> <原仓码>`，
+  为单一活跃 Gene 主体登记一对有效来源。确认第一对时可登记该主体，之后新增配对
+  保留同一主体的既有批准。当前源仓、绑定资格和路由版本均参与确认。
+- 同一命令使用 `--operation revoke` 和同样精确的主体及配对，撤销当前审批代次。撤销
+  不移除原有暂停，Gene 需要新的业务批准及有效凭据才能通过 MCP 执行恢复。
+
+执行同一命令的 `authorization-confirm --issuer <同一管理员> --confirmation <预览确认值>`
+提交明示确认，预览结果和已消耗的确认均无法覆盖既有历史。主库保存登记操作者、UTC 时间、
+来源引用和对应的预设版本或审批代次。引用真实性由负责登记的管理员依据已批准的独立业务
+记录核对。重新批准同一对需要新的决定引用和新的代次。
 
 批准后使用 `python -m scripts.routing_policy_token --db <当前主库> preview`，带
 `--issuer`（核准的发放人 ID）、`--actor`（Gene ID）、`--name`、`--preset`、

@@ -41,6 +41,32 @@ ROUTING_DDL = (
     BEGIN SELECT RAISE(ABORT, 'MCP routing scope is immutable'); END
     """,
     """
+    CREATE TABLE IF NOT EXISTS mcp_policy_routing_admin_events (
+        confirmation_id TEXT PRIMARY KEY NOT NULL,
+        operation TEXT NOT NULL CHECK (operation IN ('install-preset', 'approve', 'revoke')),
+        issuer_id INTEGER NOT NULL REFERENCES users(id),
+        decision_ref TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        approval_id TEXT REFERENCES mcp_policy_routing_approvals(id),
+        preset_name TEXT,
+        preset_version INTEGER,
+        FOREIGN KEY (preset_name, preset_version) REFERENCES mcp_policy_presets(name, version),
+        UNIQUE (operation, approval_id),
+        CHECK ((operation = 'install-preset' AND approval_id IS NULL
+                    AND preset_name IS NOT NULL AND preset_version IS NOT NULL)
+               OR (operation IN ('approve', 'revoke') AND approval_id IS NOT NULL
+                    AND preset_name IS NULL AND preset_version IS NULL))
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS mcp_policy_routing_admin_event_no_replace
+    BEFORE INSERT ON mcp_policy_routing_admin_events
+    WHEN EXISTS (SELECT 1 FROM mcp_policy_routing_admin_events
+                 WHERE confirmation_id=NEW.confirmation_id
+                    OR (operation=NEW.operation AND approval_id=NEW.approval_id))
+    BEGIN SELECT RAISE(ABORT, 'Routing authorization audit is immutable'); END
+    """,
+    """
     CREATE TABLE IF NOT EXISTS item_routing_stockout_events (
         id TEXT PRIMARY KEY,
         tenant_id INTEGER NOT NULL,
@@ -117,24 +143,35 @@ def _route_triggers():
         """
 
 
-ROUTING_DDL += tuple(_revocation_triggers()) + tuple(_route_triggers()) + tuple(
-    f"""CREATE TRIGGER IF NOT EXISTS {table}_routing_no_unrevoke
+def _revoked_token_trigger(table, key):
+    return f"""CREATE TRIGGER IF NOT EXISTS {table}_routing_no_unrevoke
         BEFORE UPDATE OF revoked_at ON {table}
         WHEN OLD.revoked_at IS NOT NULL
            AND EXISTS (SELECT 1 FROM mcp_policy_routing_scopes WHERE token_id=OLD.{key})
         BEGIN SELECT RAISE(ABORT, 'Revoked routing credential cannot be reactivated'); END"""
-    for table, key in (("agent_tokens", "id"), ("mcp_policy_bindings", "token_id"))
+
+
+_AGENT_TOKEN_TRIGGER = _revoked_token_trigger("agent_tokens", "id")
+ROUTING_DDL += tuple(_revocation_triggers()) + tuple(_route_triggers()) + (
+    _AGENT_TOKEN_TRIGGER, _revoked_token_trigger("mcp_policy_bindings", "token_id"),
 ) + tuple(
-    f"""CREATE TRIGGER IF NOT EXISTS item_routing_stockout_events_no_{operation}
-        BEFORE {operation} ON item_routing_stockout_events
-        BEGIN SELECT RAISE(ABORT, 'Stockout history is immutable'); END"""
+    f"""CREATE TRIGGER IF NOT EXISTS {table}_no_{operation}
+        BEFORE {operation} ON {table}
+        BEGIN SELECT RAISE(ABORT, 'Routing history is immutable'); END"""
+    for table in ("item_routing_stockout_events", "mcp_policy_routing_admin_events")
     for operation in ("UPDATE", "DELETE")
 )
 
 
 def registered_up(conn):
+    token_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_tokens'",
+    ).fetchone()
     for ddl in ROUTING_DDL:
-        conn.execute(ddl)
+        # Reduced legacy masters can lack the optional identity table. Full Web
+        # initialization creates it before installing the same trigger.
+        if ddl != _AGENT_TOKEN_TRIGGER or token_table:
+            conn.execute(ddl)
 
 
 def registered_down(conn):

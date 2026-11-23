@@ -23,6 +23,7 @@ from werkzeug.security import generate_password_hash
 
 from mcp_server.protocol.registry import REGISTRY
 from mcp_server.service.policy import ROUTING_FIELDS, encode_grants
+from mcp_server.service.routing_approvals import FIXED_PRESET
 from migrations import MIGRATIONS
 from migrations.routing_stockout import ROUTING_DDL
 from migrations_runner import migrate_down, migrate_up
@@ -67,7 +68,7 @@ make_server('127.0.0.1', 0, app, threaded=True, fd=int(sys.argv[2])).serve_forev
 """
 
 
-def _seed(db_dir, monkeypatch):
+def _seed(db_dir, monkeypatch, *, approvals=True):
     env = multi_warehouse_env.build(db_dir, monkeypatch)
     master = env["master_path"]
     credentials = {}
@@ -77,10 +78,15 @@ def _seed(db_dir, monkeypatch):
             "UPDATE users SET password_hash=?, last_warehouse_id=3, is_admin=(id=2) WHERE id IN (1, 2)",
             (pw,),
         )
-        conn.execute("INSERT INTO mcp_policy_routing_principals VALUES ('fixture-principal', 1, 3, NULL)")
-        conn.executemany("INSERT INTO mcp_policy_routing_approvals VALUES (?, 'fixture-principal', ?, ?, NULL)",
-                         [("approval-a", 201, "dc_alpha"), ("approval-g", 207, "dc_beta")])
-        for name, actor in (("gene", 3), ("non_gene", 2), ("legacy", 2), ("read_subset", 3)):
+        subjects = [("legacy", 2)]
+        if approvals:
+            conn.execute("INSERT INTO mcp_policy_routing_principals VALUES ('fixture-principal', 1, 3, NULL)")
+            conn.executemany(
+                "INSERT INTO mcp_policy_routing_approvals VALUES (?, 'fixture-principal', ?, ?, NULL)",
+                [("approval-a", 201, "dc_alpha"), ("approval-g", 207, "dc_beta")],
+            )
+            subjects += [("gene", 3), ("non_gene", 2), ("read_subset", 3)]
+        for name, actor in subjects:
             routing = name != "legacy"
             token = ("mp." if routing else "") + secrets.token_urlsafe(32)
             credentials[name] = token
@@ -104,7 +110,10 @@ def _seed(db_dir, monkeypatch):
                     "INSERT INTO mcp_policy_routing_scopes VALUES (?, 1, ?, ?)",
                     (token_id, actor, '[[201,"dc_alpha","approval-a"],[207,"dc_beta","approval-g"]]'),
                 )
-        conn.execute("PRAGMA user_version=10")
+        if approvals:
+            conn.execute("PRAGMA user_version=10")
+    if not approvals:
+        assert migrate_up(master, MIGRATIONS, db_dir.parent / "master-bootstrap-backups")[-1] == 10
     return env, credentials
 
 
@@ -586,6 +595,127 @@ def test_routing_token_approved_preview_issue_revoke(lab):
         row, = _sql(master, "SELECT a.revoked_at, b.revoked_at, b.revoked_by FROM agent_tokens a "
                             "JOIN mcp_policy_bindings b ON a.id=b.token_id WHERE a.id=?", (identity,))
         assert row[0] and row[0] == row[1] and row[2] == 2
+
+
+def test_empty_v10_authorization_to_live_token_and_irreversible_revocation(tmp_path, monkeypatch):
+    root = tmp_path
+    db_dir = root / "db"
+    db_dir.mkdir()
+    env, tokens = _seed(db_dir, monkeypatch, approvals=False)
+    master = env["master_path"]
+    secret = secrets.token_urlsafe(32)
+
+    def cmd(*args, **kwargs):
+        return _issuance_command(root, master, secret, *args, **kwargs)
+
+    def prepare(operation, reference, *scope):
+        before = master.read_bytes()
+        result = cmd("authorization-preview", "--operation", operation, "--issuer", "2",
+                     "--reference", reference, *scope)
+        assert result.returncode == 0, result.stderr
+        assert master.read_bytes() == before
+        return json.loads(result.stdout)["confirmation"]
+
+    def confirm(proof, *options, **kwargs):
+        return cmd("authorization-confirm", "--issuer", "2", "--confirmation", proof, *options, **kwargs)
+
+    def applied(result):
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    for table in ("mcp_policy_presets", "mcp_policy_routing_principals", "mcp_policy_routing_approvals",
+                  "mcp_policy_routing_admin_events"):
+        assert _sql(master, f"SELECT COUNT(*) FROM {table}") == [(0,)]
+    scope = ("--actor", "3", "--pair", "201", "dc_alpha")
+    selection = ("preview", "--issuer", "2", "--actor", "3", "--pair", "201", "dc_alpha",
+                 "--name", "real-entry-gene-fixture", "--preset", FIXED_PRESET, "--version", "1")
+    assert cmd(*selection).returncode != 0
+    preset_proof = prepare("install-preset", "FIXTURE-CONFIG-17")
+    preset = applied(confirm(preset_proof))
+    assert preset == {"operation": "install-preset", "preset_name": FIXED_PRESET, "preset_version": 1}
+    after_preset = master.read_bytes()
+    assert cmd(*selection).returncode != 0  # A preset alone cannot issue a credential.
+    assert confirm(preset_proof).returncode != 0
+    for invalid_scope in [
+        ("--actor", "999", "--pair", "201", "dc_alpha"),
+        ("--actor", "3", "--pair", "201", "dc_beta"),
+    ]:
+        assert cmd("authorization-preview", "--operation", "approve", "--issuer", "2",
+                   "--reference", "BAD-FIXTURE-DECISION", *invalid_scope).returncode != 0
+    assert cmd("authorization-preview", "--operation", "approve", "--issuer", "3",
+               "--reference", "NOT-ADMIN", *scope).returncode != 0
+    assert cmd("authorization-preview", "--operation", "approve", "--issuer", "2",
+               "--reference", "MULTIPLE-PAIRS", *scope, "--pair", "207", "dc_beta").returncode != 0
+    assert master.read_bytes() == after_preset
+
+    approval_proof = prepare("approve", "FIXTURE-PETER-DECISION-18", *scope)
+    assert confirm(approval_proof, password="wrong").returncode != 0
+    assert master.read_bytes() == after_preset
+    # A normal route write refreshes the opaque version even when the warehouse is the same.
+    _sql(master, "UPDATE item_routing SET updated_by=2 WHERE canonical_id=201")
+    after_route_revision = master.read_bytes()
+    assert confirm(approval_proof).returncode != 0
+    assert master.read_bytes() == after_route_revision
+    approval_proof = prepare("approve", "FIXTURE-PETER-DECISION-18", *scope)
+    # Fail the final audit write and verify that neither the principal nor the pair persists.
+    _sql(master, "CREATE TRIGGER fixture_no_approval_audit BEFORE INSERT ON mcp_policy_routing_admin_events "
+                 "BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END")
+    assert confirm(approval_proof).returncode != 0
+    assert _sql(master, "SELECT COUNT(*) FROM mcp_policy_routing_principals") == [(0,)]
+    assert _sql(master, "SELECT COUNT(*) FROM mcp_policy_routing_approvals") == [(0,)]
+    _sql(master, "DROP TRIGGER fixture_no_approval_audit")
+
+    approval = applied(confirm(approval_proof))["approval_id"]
+    after_approval = master.read_bytes()
+    assert confirm(approval_proof).returncode != 0
+    assert master.read_bytes() == after_approval
+    assert _sql(master, "SELECT is_admin FROM users WHERE id=3") == [(0,)]
+    assert _sql(master, "SELECT COUNT(*) FROM mcp_policy_bindings") == [(0,)]
+    other_subject = cmd("authorization-preview", "--operation", "approve", "--issuer", "2",
+                        "--reference", "OTHER-SUBJECT", "--actor", "2", "--pair", "207", "dc_beta")
+    assert other_subject.returncode != 0
+
+    issuance = applied(cmd(*selection))["confirmation"]
+    private = root / "issued-token"
+    private.mkdir(mode=0o700)
+    token_file = private / "bearer"
+    applied(cmd("issue", "--issuer", "2", "--confirmation", issuance, "--token-file", str(token_file)))
+    raw = token_file.read_text().strip()
+    with _services(root, tokens) as (_, mcp):
+        info = _run(mcp, raw, READ, TARGET)
+        _run(mcp, raw, READ, {"canonical_id": 207, "warehouse_code": "dc_beta"}, error="forbidden")
+        pause = _run(mcp, raw, PAUSE, _arguments(info, PAUSE))
+        assert (pause["actor_id"], pause["after_state"]) == (3, "paused")
+        revoke_proof = prepare("revoke", "FIXTURE-PETER-REVOCATION-19", *scope)
+        assert applied(confirm(revoke_proof))["approval_id"] == approval
+        after_revoke = master.read_bytes()
+        assert confirm(revoke_proof).returncode != 0
+        assert master.read_bytes() == after_revoke
+        with httpx.Client(trust_env=False, timeout=5) as client:
+            assert client.post(mcp + "/api/mcp/", headers=_headers(raw), json=INITIALIZE).status_code == 401
+            new = applied(confirm(prepare("approve", "FIXTURE-PETER-DECISION-20", *scope)))["approval_id"]
+            assert new != approval
+            assert client.post(mcp + "/api/mcp/", headers=_headers(raw), json=INITIALIZE).status_code == 401
+        assert check_rollback(["--db", str(master)]) == 1
+        assert _sql(master, "SELECT pause_id FROM item_routing_stockout_state WHERE canonical_id=201") == [
+            (pause["pause_id"],),
+        ]
+
+    audit = _sql(master, "SELECT operation, issuer_id, decision_ref, decided_at, approval_id "
+                         "FROM mcp_policy_routing_admin_events ORDER BY decided_at")
+    assert [(op, issuer, ref, aid) for op, issuer, ref, _, aid in audit] == [
+        ("install-preset", 2, "FIXTURE-CONFIG-17", None),
+        ("approve", 2, "FIXTURE-PETER-DECISION-18", approval),
+        ("revoke", 2, "FIXTURE-PETER-REVOCATION-19", approval),
+        ("approve", 2, "FIXTURE-PETER-DECISION-20", new),
+    ]
+    assert all(datetime.fromisoformat(event[3]).tzinfo is not None for event in audit)
+    assert _sql(master, "SELECT p.actor_id, a.canonical_id, a.warehouse_code FROM mcp_policy_routing_approvals a "
+                        "JOIN mcp_policy_routing_principals p ON p.id=a.principal_id WHERE a.id=?", (approval,)) == [
+        (3, 201, "dc_alpha"),
+    ]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        _sql(master, "DELETE FROM mcp_policy_routing_admin_events WHERE operation='revoke'")
 
 
 def main():

@@ -13,19 +13,21 @@ from itsdangerous import BadData, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash
 
 from blueprints.item_routing_pure import get_routing
+from mcp_server.data.unit_of_work import require_policy_read_file
+from mcp_server.service import routing_approvals
 from mcp_server.service.policy import MAX_SQLITE_ID, approved_routing_pairs, encode_grants
 from mcp_server.service.policy_issuance import insert_bound_token
 
 _CONFIRMATION_AGE = 600
 
 
-def _signer():
+def _signer(salt="dailycheck-routing-issuance-v1"):
     secret = os.environ.get("DAILYCHECK_ROUTING_ISSUANCE_SECRET", "")
     if len(secret) < 32:
         raise click.ClickException("Routing issuance requires an independent confirmation secret")
     if os.environ.get("DRY_RUN", "").lower() == "true":
         raise click.ClickException("Routing issuance disabled in dry run")
-    return URLSafeTimedSerializer(secret, salt="dailycheck-routing-issuance-v1")
+    return URLSafeTimedSerializer(secret, salt=salt)
 
 
 def _database_identity(path):
@@ -35,22 +37,30 @@ def _database_identity(path):
 
 def _open(path, *, mode):
     path = path.resolve(strict=True)
+    if mode == "ro":
+        require_policy_read_file(path)
     conn = sqlite3.connect(path.as_uri() + f"?mode={mode}", uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    if mode == "ro":
+        conn.execute("PRAGMA query_only=ON")
     return closing(conn)
 
 
-def _validate(conn, password, *, issuer, actor, name, preset, version, pairs):
+def _validate_operator(conn, issuer, password):
     if conn.execute("PRAGMA user_version").fetchone()[0] < 10:
         raise ValueError("Master v10 required")
-    if not name or name != name.strip() or len(name) > 100:
-        raise ValueError("Invalid credential name")
     operator = conn.execute(
         "SELECT password_hash FROM users WHERE id=? AND tenant_id=1 AND is_admin=1 AND is_active=1", (issuer,),
     ).fetchone()
     if operator is None or not check_password_hash(operator[0], password):
         raise ValueError("Authenticated active issuance operator required")
+
+
+def _validate(conn, password, *, issuer, actor, name, preset, version, pairs):
+    _validate_operator(conn, issuer, password)
+    if not name or name != name.strip() or len(name) > 100:
+        raise ValueError("Invalid credential name")
     allowed = approved_routing_pairs(conn, 1, actor)
     if not pairs or len(pairs) != len(set(pairs)) or not set(pairs) <= allowed.keys():
         raise ValueError("Active Gene principal and approved exact scope required")
@@ -158,6 +168,56 @@ def issue(path, issuer, confirmation, token_file):
             created.unlink(missing_ok=True)
         raise click.ClickException("Issuance refused: invalid authorization or unavailable private token file") from exc
     click.echo(json.dumps({"token_id": token_id}))
+
+
+@main.command("authorization-preview")
+@click.option("--operation", required=True, type=click.Choice(["install-preset", "approve", "revoke"]))
+@click.option("--issuer", required=True, type=_ID)
+@click.option("--actor", type=_ID)
+@click.option("--pair", type=(_ID, str), multiple=True)
+@click.option("--reference", required=True)
+@click.pass_obj
+def authorization_preview(path, issuer, operation, actor, pair, reference):
+    """Preview a fixed preset or one exact Gene approval decision without writing."""
+    if len(pair) > 1:
+        raise click.BadParameter("Only one exact pair may be reviewed", param_hint="--pair")
+    signer = _signer("dailycheck-routing-approval-v1")
+    password = click.prompt("Issuing operator password", hide_input=True, err=True)
+    decision = {"operation": operation, "actor": actor, "pair": list(pair[0]) if pair else None,
+                "reference": reference}
+    try:
+        with _open(path, mode="ro") as conn:
+            conn.execute("BEGIN")
+            _validate_operator(conn, issuer, password)
+            current = routing_approvals.preview(conn, path, **decision)
+        snapshot = {
+            **decision, "issuer": issuer, "state": current,
+            "confirmation_id": secrets.token_urlsafe(24), "database": _database_identity(path),
+        }
+        click.echo(json.dumps({**snapshot, "confirmation": signer.dumps(snapshot)}, ensure_ascii=False))
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@main.command("authorization-confirm")
+@click.option("--issuer", required=True, type=_ID)
+@click.option("--confirmation", required=True)
+@click.pass_obj
+def authorization_confirm(path, issuer, confirmation):
+    """Recheck and atomically record the confirmed authorization decision."""
+    signer = _signer("dailycheck-routing-approval-v1")
+    password = click.prompt("Issuing operator password", hide_input=True, err=True)
+    try:
+        snapshot = signer.loads(confirmation, max_age=_CONFIRMATION_AGE)
+        if snapshot.pop("issuer") != issuer or snapshot.pop("database") != _database_identity(path):
+            raise ValueError("Confirmation belongs to another operator or database")
+        with _open(path, mode="rw") as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _validate_operator(conn, issuer, password)
+            result = routing_approvals.apply(conn, path, issuer=issuer, **snapshot)
+    except (BadData, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+        raise click.ClickException("Authorization refused: invalid, expired or changed decision") from exc
+    click.echo(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

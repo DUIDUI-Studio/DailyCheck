@@ -20,9 +20,8 @@ def _select_only(action: int, _arg1, _arg2, _db, _source) -> int:
     return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
 
 
-@contextmanager
-def policy_read_connection(path: Path) -> Generator[sqlite3.Connection, None, None]:
-    """Open an existing rollback-journal database with read-only SQL access."""
+def require_policy_read_file(path: Path) -> None:
+    """Reject database formats whose read-only open can modify sidecars."""
     if not path.is_file() or path.resolve(strict=True) != path:
         raise sqlite3.OperationalError("MCP policy database unavailable")
     # WAL readers can create sidecars or update read marks even with mode=ro.
@@ -31,6 +30,12 @@ def policy_read_connection(path: Path) -> Generator[sqlite3.Connection, None, No
         header = source.read(20)
         if header[:16] != b"SQLite format 3\x00" or header[18:20] != b"\x01\x01":
             raise sqlite3.OperationalError("MCP policy requires a rollback-journal database")
+
+
+@contextmanager
+def policy_read_connection(path: Path) -> Generator[sqlite3.Connection, None, None]:
+    """Open an existing rollback-journal database with read-only SQL access."""
+    require_policy_read_file(path)
     conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row

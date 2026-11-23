@@ -244,15 +244,17 @@ def test_target_master_future_missing_schema_cli(tmp_path, monkeypatch):
     from migrations.feedback_receipts import registered_up as master_feedback_receipts_up
     from migrations.mcp_policy_presets import registered_up as master_mcp_policy_presets_up
     from migrations.order_changes import registered_up as master_order_changes_up
+    from migrations.routing_stockout import registered_up as master_routing_stockout_up
     from migrations.warehouse import up_document_lines
-    assert [m[0] for m in MIGRATIONS] == list(range(1, 10))
+    assert [m[0] for m in MIGRATIONS] == list(range(1, 11))
     master_migrations = {version: up for version, _, up, _ in MIGRATIONS}
     assert master_migrations[8] is master_feedback_receipts_up
     assert master_migrations[9] is master_mcp_policy_presets_up
+    assert master_migrations[10] is master_routing_stockout_up
     assert WAREHOUSE_MIGRATIONS[0][2] is up_document_lines
     assert all(m[2] is not up_document_lines for m in MIGRATIONS)
     assert all(m[2] is not master_order_changes_up for m in WAREHOUSE_MIGRATIONS)
-    assert all(m[2] is not master_mcp_policy_presets_up for m in WAREHOUSE_MIGRATIONS)
+    assert all(m[2] not in (master_mcp_policy_presets_up, master_routing_stockout_up) for m in WAREHOUSE_MIGRATIONS)
     assert db.WAREHOUSE_SCHEMA_VERSION == 7
     assert WAREHOUSE_MIGRATIONS[0][0] == 7
     assert "doc_no" not in db.WAREHOUSE_SCHEMA and "document_write_keys" not in db.WAREHOUSE_SCHEMA

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 
 from db import FEEDBACK_DELIVERY_RECEIPTS_DDL, MASTER_SCHEMA, init_master_db
 from migrations import MIGRATIONS
 from migrations.feedback_receipts import registered_up as feedback_receipts_up
+from migrations.routing_stockout import ROUTING_DDL
 
 EXPECTED_COLUMNS = {
     "ticket_id", "provider", "host", "repository_id", "repository", "kind",
@@ -78,6 +80,9 @@ def test_registered_migration_up_installs_receipt_table_on_pre162_master(
     legacy = tmp_path / "pre162-v7-master.db"
     with sqlite3.connect(legacy) as db:
         sqlite3.connect(master).backup(db)
+        for ddl in reversed(ROUTING_DDL):
+            kind, name = re.search(r"CREATE (?:UNIQUE )?(TABLE|TRIGGER|INDEX) IF NOT EXISTS (\w+)", ddl).groups()
+            db.execute(f"DROP {kind} {name}")
         db.execute("DROP TABLE feedback_delivery_receipts")
         db.execute("DROP TABLE mcp_policy_bindings")
         db.execute("DROP TABLE mcp_policy_presets")
@@ -112,18 +117,20 @@ def test_registered_migration_up_installs_receipt_table_on_pre162_master(
     print(json.dumps(observed, indent=2))
 
     assert status.exit_code == up.exit_code == 0
-    assert "待应用: [8, 9]" in status.output
-    assert "applied: [8, 9]" in up.output
+    assert "待应用: [8, 9, 10]" in status.output
+    assert "applied: [8, 9, 10]" in up.output
     assert "feedback_delivery_receipts" in tables
     assert POLICY_TABLES <= tables
     assert columns == EXPECTED_COLUMNS
-    assert version == 9
+    assert version == 10
     assert pending_versions(legacy, MIGRATIONS) == []
-    assert len(backups) == 2
+    assert len(backups) == 3
     assert ticket == expected_ticket
     assert comment == expected_comment
     backups_by_version = {state[2]: state for state in map(_table_state, backups)}
-    assert set(backups_by_version) == {7, 8}
+    assert set(backups_by_version) == {7, 8, 9}
+    assert "mcp_policy_routing_admin_events" in tables
+    assert "mcp_policy_routing_admin_events" not in backups_by_version[9][0]
     intermediate_tables, intermediate_columns, _, intermediate_ticket, intermediate_comment = backups_by_version[8]
     assert "feedback_delivery_receipts" in intermediate_tables
     assert not POLICY_TABLES & intermediate_tables
