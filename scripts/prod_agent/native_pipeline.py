@@ -263,6 +263,7 @@ def render_unit(*, description: str, working_directory: str, environment_file: s
                 environment_lines: list[tuple[str, str]], read_write_paths: str,
                 inaccessible_paths: str, module: str, python: str, app_uid: int, app_gid: int,
                 application_role: str, application_inputs: tuple[str, ...] = (),
+                admin_audit_log: Path | None = None,
                 exec_start_pre: tuple[str, ...] = (), unit_conditions: tuple[str, ...] = (),
                 user: int = 0, group: int = 0,
                 capability_bounding_set: str = CAPABILITY_BOUNDING_SET,
@@ -281,6 +282,12 @@ def render_unit(*, description: str, working_directory: str, environment_file: s
     # projection keeps app-only feedback/webhook credentials out of MCP units.
     application_environment = "".join(
         f" {key}=${{{key}}}" for key in allowed if key in application_inputs)
+    if admin_audit_log is not None:
+        if application_role != "app" or not re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(admin_audit_log)):
+            raise ValueError("invalid Web admin audit path")
+        environment += f"Environment=DAILYCHECK_ADMIN_AUDIT_LOG={admin_audit_log}\n"
+        application_environment += " DAILYCHECK_ADMIN_AUDIT_LOG=${DAILYCHECK_ADMIN_AUDIT_LOG}"
+        read_write_paths += f" {admin_audit_log}"
     exec_environment = ("PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 "
                         "DAILYCHECK_ENV=production DRY_RUN=${DRY_RUN} "
                         "DAILYCHECK_DB_DIR=${DAILYCHECK_DB_DIR} "
@@ -400,6 +407,9 @@ class ProtectedPipeline:
         return [str(self.policy.location(k)) for k in (
             "directory", "review_directory", "key_file", "read_token_file", "runtime_file",
             "bootstrap_file")]
+
+    def _admin_audit_log(self):
+        return None
 
     def path(self, key):
         path = Path(self.value[key])
@@ -551,6 +561,7 @@ class ProtectedPipeline:
         candidate = self._owned()
         p = self.policy
         release = self._release(candidate)
+        admin_audit_log = self._admin_audit_log()
         if git(p.location("repo"), "rev-parse", "HEAD") != candidate["manifest"]["group_sha"]:
             raise ValueError("service release differs from fenced G")
         access = self.path("green_access_log")
@@ -590,6 +601,7 @@ class ProtectedPipeline:
                 app_uid=p.value["app_uid"],
                 app_gid=self.value["app_gid"],
                 application_role=role,
+                admin_audit_log=admin_audit_log if role == "app" else None,
                 application_inputs=tuple(
                     key for key in APPLICATION_ROLE_KEYS[role]
                     if key in getattr(self, "app_env", {})),

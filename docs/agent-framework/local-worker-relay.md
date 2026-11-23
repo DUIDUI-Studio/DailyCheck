@@ -19,7 +19,7 @@ Both profiles use a `target` with `pr`, `pr_id`, `pr_node`, `head`, `base`, `ref
 | Profile | Other required fields |
 | --- | --- |
 | Worker | `worker_state`, `worker_binding`, `approved_body_sha256`, `auth`, `auth_sha256`, `installation_id`, `ssh_host`, `ssh_user`, `ssh_port`, `ssh_identity`, `ssh_known_hosts`, `worker_signing_key`, and `report_actor_id` |
-| VPS | `state`, `seed`, `authority`, `worker_signers`, `baseline_blue`, `baseline_green` when green serves B, `release_root`, `control_python`, `app_uid`, `source_db_identity`, `pipeline`, optional `external_warehouse_dbs`, `report_actor_id`, and optional `anonymous_proxy` |
+| VPS | `state`, `seed`, `authority`, `worker_signers`, `baseline_blue`, `baseline_green` when green serves B, `release_root`, `control_python`, `app_uid`, `source_db_identity`, `admin_audit_log`, `pipeline`, optional `external_warehouse_dbs`, `report_actor_id`, and optional `anonymous_proxy` |
 
 Use the protected `pipeline` schema in [the existing protected executor](../../scripts/prod_agent/native_pipeline.py). Its helper and tool entries are hashes of installed bytes. Use its application environment schema for app data-plane settings. Keep release credentials outside that file. The relay has no VPS issuer input. Verify its access to the approved nginx config, the instance-specific app access logs, and the B and H service identities.
 
@@ -55,6 +55,13 @@ For `source_db_identity`, Peter records canonical source root and warehouse dire
 The protected green recipe uses `ProtectSystem=strict`. An approved external target outside the writable source subtree must also have a qualified service-namespace mapping for its SQLite file and sidecars. Registration alone confers no access. The relay checks the promoted green process mount view before switching traffic and blocks read-only mounts. Peter and Eric own any new writable mount or unit permission authority.
 
 The baseline implementation was rehearsed offline via the existing protected observer. Installed `status` for an absent attempt only describes absence. `start` records admission before baseline layout validation. A separate read-only installed preflight would need the existing authority or an explicitly approved interface scoped to the protected B/profile and true route, coordinated under the existing trust boundary. It must leave the generation, attempt ledger, locks and traffic unchanged. No new remote action is exposed by this revision.
+
+
+## Web audit storage and rollback
+
+The relay's protected Web unit requires a dedicated `admin_audit_log` path outside code, control, credentials and data trees. Peter supplies an existing regular `admin_audit.log` with one link, mode 0600 and the reviewed Web UID/GID. Its canonical parent and ancestors are root-protected. The Web unit grants write access to that exact file and starts only if it can open it for append. The observer checks the file identity and writable mount view before the green switch and during the observation window. The MCP unit receives neither the setting nor the write exception. Check 1 uses its own application-owned file under scratch. Existing standalone and ordinary deployments keep the original fallback. Unavailable storage after startup can still fail a request after its SQLite commit. The change preserves the existing JSONL record format and commit-then-append semantics.
+
+The exact serving B at `638dd0b` ignores the new environment key. Its shared audit implementation still opens `admin_audit.log` relative to source. Immutable blue B is an adoption and rollback hold until Peter can prove an approved adapter for its exact old imports and the same durable audit boundary. An isolated trial can demonstrate a pinned B-only bootstrap that changes just the central audit destination, with the B literal release bytes intact. A runtime namespace exception would need separate review and an actual unchanged-literal proof. Treat the existing scoped audit history, stable producer/reader ownership, retention and rotation across B/H as operator obligations. Preserve the original records and stop if storage continuity or old-code rollback behavior remains unverified.
 
 ## Separate exact relay evidence
 

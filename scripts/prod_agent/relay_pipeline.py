@@ -30,6 +30,42 @@ UNITS = {
 }
 
 
+def _audit_inode(path, uid, gid):
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            and (info.st_uid, info.st_gid) == (uid, gid) and stat.S_IMODE(info.st_mode) == 0o600,
+            "private application-owned admin audit file required")
+    require(not os.statvfs(path).f_flag & os.ST_RDONLY, "admin audit mount is read-only")
+    return info.st_dev, info.st_ino
+
+
+def admin_audit_path(server):
+    profile = server.profile
+    pipeline = profile["pipeline"]
+    path = Path(profile["admin_audit_log"])
+    require(path.name == "admin_audit.log" and path == path.resolve() and ".." not in path.parts
+            and re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(path)), "canonical admin audit path required")
+    protected_path(path.parent, 0)
+    other = [server.authority, server.directory, server.seed, STATE_PATH.parent,
+             Path("/root"), Path("/etc/dailycheck-native"), Path("/etc/dailycheck-release"),
+             Path("/var/lib/dailycheck-release")]
+    other += [Path(profile[key]) for key in ("release_root", "baseline_blue", "baseline_green",
+              "worker_signers", "control_python")
+              if key in profile]
+    other += [Path(pipeline[key]) for key in ("source_db", "green_db", "scratch_root",
+              "unit_directory", "backup_directory", "log_directory") if key in pipeline]
+    other += [Path(pipeline[key]) for key in ("app_environment_file", "app_python",
+              "nginx_conf", "blue_access_log", "green_access_log") if key in pipeline]
+    external = profile.get("external_warehouse_dbs", {})
+    require(isinstance(external, dict) and all(isinstance(value, str) for value in external.values()),
+            "invalid external warehouse registration")
+    other += [Path(value).parent for value in external.values()]
+    require(not any(path.parent.is_relative_to(item) or item.is_relative_to(path.parent)
+                    for item in other), "admin audit directory overlaps a protected or data domain")
+    _audit_inode(path, profile["app_uid"], pipeline["app_gid"])
+    return path
+
+
 class Policy:
     fixture = anchor = None
     owner = 0
@@ -81,8 +117,15 @@ class RelayPipeline(ProtectedPipeline):
         return {**super()._control_env(candidate), "DC_RELAY_MODE": "1",
                 "BLUE_SERVICE_UNIT": UNITS["blue"][0], "GREEN_SERVICE_UNIT": UNITS["green"][0]}
 
+    def _admin_audit_log(self):
+        return admin_audit_path(self.server)
+
     def _pytest(self, scratch):
         self._owned()
+        audit = scratch / "admin_audit.log"
+        fd = os.open(audit, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as sink:
+            os.fchown(sink.fileno(), self.policy.value["app_uid"], self.value["app_gid"])
         # This sibling of the UID-owned scratch is root-prepared and root-owned.
         # Runtime and control paths, including the repo's seed alternate, stay private.
         with tempfile.TemporaryDirectory(prefix="relay-check1-", dir=self.path("scratch_root")) as tmp:
@@ -91,12 +134,14 @@ class RelayPipeline(ProtectedPipeline):
             prepare_test_checkout(self.policy.location("repo"), self.server.expected, checkout)
             parent.chmod(0o711)
             return super()._pytest(scratch, cwd=checkout, extra={
+                "DAILYCHECK_ADMIN_AUDIT_LOG": str(audit),
                 "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory",
                 "GIT_CONFIG_VALUE_0": str(checkout),
             })
 
     def prepare(self, repo):
         candidate = self._owned()
+        self._admin_audit_log()
         expected = self.server.expected
         require(repo == self.policy.location("repo"), "wrong protected source store")
         tree, entries = literal_tree(repo, expected["head"])
@@ -327,14 +372,25 @@ def live_route(server, role):
             and not source_db.is_relative_to(release), "canonical external DB required")
     db_identity = policy.value["source_db_identity"]
     external = policy.value.get("external_warehouse_dbs")
+    audit = admin_audit_path(server) if candidate else None
+    audit_id = _audit_inode(audit, policy.value["app_uid"], pipeline["app_gid"]) if audit else None
 
     def verify_data():
         require(database_identity(source_db, external) == db_identity, "approved DB identity changed")
         for row in processes:
             proc = Path("/proc") / str(row["pid"])
             environment = (proc / "environ").read_bytes().split(b"\0")
-            for key, value in (("DRY_RUN", "false"), ("DAILYCHECK_ENV", "production"),
-                               ("DAILYCHECK_DB_DIR", str(source_db))):
+            options = {"DRY_RUN": "false", "DAILYCHECK_ENV": "production",
+                       "DAILYCHECK_DB_DIR": str(source_db)}
+            if audit is not None and row["unit"] == UNITS[color][0]:
+                options["DAILYCHECK_ADMIN_AUDIT_LOG"] = str(audit)
+                uid, gid = policy.value["app_uid"], pipeline["app_gid"]
+                require(_audit_inode(proc / "root" / audit.relative_to("/"), uid, gid) == audit_id,
+                        "process admin audit inode differs")
+            elif audit is not None:
+                require(not any(field.startswith(b"DAILYCHECK_ADMIN_AUDIT_LOG=")
+                                for field in environment), "admin audit input reached MCP")
+            for key, value in options.items():
                 prefix = os.fsencode(key + "=")
                 require([x for x in environment if x.startswith(prefix)] ==
                         [prefix + os.fsencode(value)], "runtime is not on the approved write route")
@@ -383,4 +439,5 @@ def live_route(server, role):
             "runtime changed during observation")
     verify_data()
     return {"sha": sha, "route": color,
-            "identity": digest({"tree": tree, "processes": processes, "database": db_identity})}
+            "identity": digest({"tree": tree, "processes": processes, "database": db_identity,
+                                "admin_audit": audit_id})}

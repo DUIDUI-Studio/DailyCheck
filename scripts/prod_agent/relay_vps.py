@@ -69,6 +69,8 @@ class Server:
             require(self.authority == Path(__file__).resolve().parents[2], "authority path changed")
             require(hex_id(self.profile.get("source_db_identity"), 64),
                     "protected live DB identity required")
+            require(isinstance(self.profile.get("admin_audit_log"), str),
+                    "protected Web admin audit path required")
         os.environ.clear()
         os.environ.update(SYSTEM_ENV, DAILYCHECK_DEPLOY_STATE_DIR=str(self.directory))
 

@@ -66,8 +66,10 @@ def exercise_live_route(monkeypatch, root):
             "commit", "-qm", name)
     head = git(repo, "rev-parse", "HEAD").decode().strip()
     base = git(repo, "rev-parse", "HEAD^").decode().strip()
-    release = root / head
-    baseline = root / base
+    release_root = root / "releases"
+    release_root.mkdir()
+    release = release_root / head
+    baseline = release_root / base
     for sha, dest in ((head, release), (base, baseline)):
         tree, entries = literal_tree(repo, sha)
         write_literal_release(repo, sha, tree, dest, entries)
@@ -82,7 +84,8 @@ def exercise_live_route(monkeypatch, root):
     for directory in (db, db / "warehouses"):
         os.chown(directory, UID, GID)
         directory.chmod(0o700)
-    external = root / "external.db"
+    external = root / "external" / "store.db"
+    external.parent.mkdir()
     (db / "warehouses/store.db").rename(external)
     link = db / "warehouses/store.db"
     link.symlink_to(external)
@@ -98,6 +101,10 @@ def exercise_live_route(monkeypatch, root):
     for file in log.values():
         file.touch(mode=0o600)
         os.chown(file, UID, GID)
+    audit = root / "audit" / "admin_audit.log"
+    audit.parent.mkdir()
+    audit.touch(mode=0o600)
+    os.chown(audit, UID, GID)
     server = object.__new__(Server)
     server.fixture = None
     server.directory = root / "state"
@@ -107,13 +114,14 @@ def exercise_live_route(monkeypatch, root):
     server.expected = {"head": head, "base": base, "tree": tree}
     server.profile = {"control_python": "/usr/bin/python3", "app_uid": UID,
                       "baseline_blue": str(baseline), "baseline_green": str(baseline),
+                      "release_root": str(release_root), "admin_audit_log": str(audit),
                       "source_db_identity": port.database_identity(db, registration),
                       "external_warehouse_dbs": registration,
                       "pipeline": {"source_db": str(db), "app_gid": GID, "nginx_conf": str(config),
                                    "app_environment_file": str(env),
                                    "blue_access_log": str(log[port.UNITS["blue"][0]]),
                                    "green_access_log": str(log[port.UNITS["green"][0]])}}
-    monkeypatch.setattr(port.Policy, "location", lambda self, key: repo if key == "repo" else root)
+    monkeypatch.setattr(port.Policy, "location", lambda self, key: repo if key == "repo" else release_root)
     monkeypatch.setattr(server, "state", lambda: {"worker_relay": {"journal": [
         {"stage": "switch", "started_at": int(time.time()) - 1}]}})
     processes, override = {}, {}
@@ -175,7 +183,7 @@ def exercise_live_route(monkeypatch, root):
         process.wait(timeout=5)
 
     def launch(color, role, cwd, *, user=UID, group=GID, dry="false", mode="production",
-               data=db, token=TOKEN):
+               data=db, token=TOKEN, audit_path=audit):
         index = int(role == "mcp")
         unit = port.UNITS[color][index]
         if unit in processes:
@@ -185,8 +193,10 @@ def exercise_live_route(monkeypatch, root):
                 "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
                 "--no-new-privs", sys.executable, "-I", "-B", "-c", APP,
                 str(number), role, str(log[unit])]
-        child = subprocess.Popen(args, env={"DAILYCHECK_ENV": mode, "DRY_RUN": dry,
-                                             "DAILYCHECK_DB_DIR": str(data), "TOKEN": token}, cwd=cwd)
+        env = {"DAILYCHECK_ENV": mode, "DRY_RUN": dry, "DAILYCHECK_DB_DIR": str(data), "TOKEN": token}
+        if color == "green" and role == "app" and cwd == release:
+            env["DAILYCHECK_ADMIN_AUDIT_LOG"] = str(audit_path)
+        child = subprocess.Popen(args, env=env, cwd=cwd)
         processes[unit] = child, cwd
         end = time.monotonic() + 5
         while time.monotonic() < end and child.poll() is None:
@@ -220,6 +230,14 @@ def exercise_live_route(monkeypatch, root):
             launch("green", "mcp", release)
             standby = server.observe_green("candidate-standby")
             assert standby["sha"] == head and standby["route"] == "green"
+            audit.chmod(0o644)
+            with pytest.raises(ValueError, match="private application-owned admin audit"):
+                server.runtime("candidate-standby")
+            audit.chmod(0o600)
+            server.profile["admin_audit_log"] = str(release / audit.name)
+            with pytest.raises(ValueError, match="overlaps a protected or data domain"):
+                server.runtime("candidate-standby")
+            server.profile["admin_audit_log"] = str(audit)
             real_statvfs = os.statvfs
 
             def readonly_external(path):
@@ -256,6 +274,7 @@ def exercise_live_route(monkeypatch, root):
                 ({"dry": "true"}, "approved write route"),
                 ({"mode": "development"}, "approved write route"),
                 ({"data": root}, "approved write route"),
+                ({"audit_path": root / "wrong.log"}, "approved write route"),
             ):
                 launch("green", "app", **({"cwd": release} | changes))
                 with pytest.raises(ValueError, match=reason):

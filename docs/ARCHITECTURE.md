@@ -1333,6 +1333,8 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 要求每个已批准用例的 setup、call、teardown 均通过。
 观测与固定切换共用生产蓝、绿 unit 名称，校验进程实际身份、两路探活及各自落点、
 工作目录和批准数据在进程挂载视图内的物理身份。绿 H 转正后、切流前校验挂载可写性。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
+受保护 Web H 的管理审计使用 profile 明确绑定的独立 JSONL 文件。以 Web UID 检查追加权限，
+切流前再核对实际进程的路径和 inode。Check 1 使用独立临时审计文件；普通部署沿用既有默认落点。
 两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及
 阶段回执，供独立对账。Worker 预先落盘 arm 与 POST 分界。观察期只读探活失败按原蓝路由
 回切，副作用子进程未证实退出时保留护栏。Worker 用独立 report 凭据发布原有 typed PR
