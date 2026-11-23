@@ -1331,7 +1331,8 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 它使用由 root 构建的本地 H/B Git 测试视图，保留 Git 常规文件模式。测试进程只能编辑
 自己复制的测试文件。绿 Web 和 MCP 在预演时使用该验证 UID 和独立库副本。Check 6
 读回两个运行进程、真实挂载和副本身份。正式转正时才恢复服务 UID 和原库路径。实例目录保持 literal 只读；OpenSSH 根权限测试走单独的离线精确 ID 门禁，
-要求每个已批准用例的 setup、call、teardown 均通过。
+要求每个已批准用例的 setup、call、teardown 均通过。精确清单也包含外仓写路径、绿预演与
+正式挂载分隔，以及实际落蓝才停绿的三项回归用例。
 观测与固定切换共用生产蓝、绿 unit 名称，校验进程实际身份、两路探活及各自落点、
 工作目录和批准数据在进程挂载视图内的物理身份。绿 H 转正后、切流前校验挂载可写性。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
 受保护 Web H 的管理审计使用 profile 明确绑定的独立 JSONL 文件。以 Web UID 检查追加权限，
