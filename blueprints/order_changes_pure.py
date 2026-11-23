@@ -607,7 +607,11 @@ def _readonly_warehouse(conn, code: str):
 
 
 def _candidate_master(conn, order: dict, canonical_id: int) -> dict:
+    from blueprints.item_routing_pure import stockout_state
+
     tenant = _tenant(conn, order)
+    if stockout_state(conn, canonical_id, tenant_id=tenant)[1] is not None:
+        raise ValueError("替换品项缺货停订")
     row = conn.execute('''SELECT ci.*,r.fulfillment_warehouse_code AS source,w.db_path AS source_path,
         w.tenant_id AS source_tenant,w.warehouse_type AS source_type
         FROM canonical_items ci JOIN item_routing r ON r.canonical_id=ci.id AND r.tenant_id=?

@@ -134,11 +134,11 @@ docs/
   superpowers/             # 开发计划文档
 ```
 
-## MCP 服务器（32 个工具）
+## MCP 服务器（35 个工具）
 
 权威登记：`mcp_server/protocol/registry.py`；完整生成台账与实调输出契约见
 [`registry.md`](docs/integrations/dailycheck-mcp/registry.md) / `registry.json`。
-`python -m scripts.mcp_contracts --check` 校验32项与实现/生成文档，外部 `tools.json`
+`python -m scripts.mcp_contracts --check` 校验35项与实现/生成文档，外部 `tools.json`
 明确仅19项；Bot批准池仍22项，七项canonical写禁止Bot执行。
 
 通过 Model Context Protocol 提供 AI Agent 数据访问能力。支持两种传输模式：
@@ -179,6 +179,9 @@ docs/
 | `wms_stock_list` | 外部 WMS（朴宇冷库）本货主当前库存明细（只读） |
 | `wms_stock_summary` | 外部 WMS 本货主分仓汇总（只读） |
 | `wms_documents_list` | 外部 WMS 本货主出入库单据（只读） |
+| `routing_item_status` | 按 Gene 精确策略查询主品项、授权仓绑定、路由和模式 |
+| `routing_pause_item` | 核实无可配量后暂停原仓新订货 |
+| `routing_restore_item` | 按暂停记录和新可配确认恢复原仓 |
 
 门店订单只读域（Issue #73）：`store_order_list` / `store_order_detail` 走路径级 ACL
 （`GET /api/v1/store-orders`、`GET /api/v1/store-orders/<id>`），token 的

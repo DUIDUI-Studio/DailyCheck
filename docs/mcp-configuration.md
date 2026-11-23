@@ -248,3 +248,9 @@ If remote agents cannot reach the HTTP server:
 - Ensure the server is bound to `0.0.0.0` (not `127.0.0.1`)
 - Check firewall rules allow inbound TCP on the configured port
 - For internet access, put behind HTTPS via nginx/cloudflare
+
+
+## Gene 单品缺货停订
+
+`routing_item_status`、`routing_pause_item` 和 `routing_restore_item` 仅向精确策略令牌开放。
+权限、客户端复验、人工确认和安全回退见 [单品停订运行手册](mcp-routing-stockout.md)。

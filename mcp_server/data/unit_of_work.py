@@ -77,3 +77,18 @@ def warehouse_connection(
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def routing_write_connection() -> Generator[sqlite3.Connection, None, None]:
+    """Dedicated write path that can never initialize or migrate a database."""
+    path = Path(MASTER_DB).resolve(strict=True)
+    conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()

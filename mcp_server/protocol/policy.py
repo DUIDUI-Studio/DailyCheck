@@ -9,7 +9,7 @@ from mcp.server import Server
 from starlette.concurrency import run_in_threadpool
 
 from mcp_server.infra.errors import ForbiddenError, McpError, ValidationError
-from mcp_server.protocol.registry import get_policy_actions
+from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import _current_auth
 from mcp_server.service.policy import MAX_SQLITE_ID, BoundPolicy
 from mcp_server.service.policy_reads import get_inventory, list_orders
@@ -40,18 +40,24 @@ _INPUT_SCHEMAS = {
     },
 }
 _HANDLERS = {"items_detail": get_inventory, "store_order_list": list_orders}
+_POLICY_ONLY = {entry.name: entry for entry in REGISTRY if entry.policy_only}
+_INPUT_SCHEMAS.update({name: entry.tool.inputSchema for name, entry in _POLICY_ONLY.items()})
+_HANDLERS.update({name: entry.handler for name, entry in _POLICY_ONLY.items()})
 
 
 def _validate_arguments(schema: dict, arguments: dict) -> None:
     properties = schema["properties"]
-    if not set(schema["required"]) <= arguments.keys() <= properties.keys():
+    if not isinstance(arguments, dict) or not set(schema["required"]) <= arguments.keys() <= properties.keys():
         raise ValidationError("invalid_arguments")
     for key, value in arguments.items():
         spec = properties[key]
         if spec["type"] == "integer":
             if type(value) is not int or not spec["minimum"] <= value <= spec["maximum"]:
                 raise ValidationError("invalid_arguments")
-        elif not isinstance(value, str) or not value or ("enum" in spec and value not in spec["enum"]):
+        elif spec["type"] == "object":
+            _validate_arguments(spec, value)
+        elif (not isinstance(value, str) or not value or len(value) > spec.get("maxLength", float("inf"))
+              or ("enum" in spec and value not in spec["enum"])):
             raise ValidationError("invalid_arguments")
 
 
@@ -66,6 +72,9 @@ def _policy_tools(policy: BoundPolicy, actions: dict[str, str]) -> list[types.To
     tools = []
     for name, action in actions.items():
         if fields := policy.fields(action):
+            if name in _POLICY_ONLY:
+                tools.append(_POLICY_ONLY[name].tool.model_copy(deep=True))
+                continue
             tools.append(types.Tool(
                 name=name, inputSchema=_input_schema(name, fields),
                 description=f"Read authorized storefront data. Returned record fields: {', '.join(fields)}.",
@@ -76,7 +85,7 @@ def _policy_tools(policy: BoundPolicy, actions: dict[str, str]) -> list[types.To
 def bind_policy_dispatch(server: Server, audit) -> None:
     actions = get_policy_actions()
     if actions.keys() != _INPUT_SCHEMAS.keys() or actions.keys() != _HANDLERS.keys():
-        raise RuntimeError("Scoped policy adapters must match registered read tools")
+        raise RuntimeError("Scoped policy adapters must match registered tools")
     # Scoped declarations never get written to SDK's shared legacy tool cache.
     legacy_list = server.request_handlers[types.ListToolsRequest]
     legacy_call = server.request_handlers[types.CallToolRequest]
@@ -89,12 +98,13 @@ def bind_policy_dispatch(server: Server, audit) -> None:
 
     async def call_tool(request: types.CallToolRequest):
         ctx = _current_auth.get()
-        if ctx is None or ctx.policy is None:
+        name = request.params.name
+        policy = ctx.policy if ctx else None
+        if policy is None and name not in _POLICY_ONLY:
             return await legacy_call(request)
 
         started_ns = time.perf_counter_ns()
-        name = request.params.name
-        fields = ctx.policy.fields(actions.get(name))
+        fields = policy.fields(actions.get(name)) if policy else ()
         status = 500
         try:
             if not fields:
@@ -103,7 +113,7 @@ def bind_policy_dispatch(server: Server, audit) -> None:
             if request.params.model_extra:
                 raise ValidationError("invalid_arguments")
             _validate_arguments(_input_schema(name, fields), arguments)
-            payload = await run_in_threadpool(_HANDLERS[name], ctx.policy, fields, **arguments)
+            payload = await run_in_threadpool(_HANDLERS[name], policy, fields, **arguments)
             status = 200
         except McpError as exc:
             payload = exc.to_dict()

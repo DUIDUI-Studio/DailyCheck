@@ -20,10 +20,11 @@ from mcp_server.protocol.tools import (
     inventory,
     outbound,
     procurement,
+    routing,
     store_order,
     wms,
 )
-from mcp_server.service.policy import SAFE_FIELDS
+from mcp_server.service.policy import ROUTING_FIELDS, SAFE_FIELDS
 
 
 def obj(**properties: dict) -> dict:
@@ -84,12 +85,57 @@ class ToolRegistration:
     policy_action: str | None = None
 
     @property
+    def policy_only(self) -> bool:
+        return self.policy_action in ROUTING_FIELDS
+
+    @property
     def name(self) -> str:
         return self.tool.name
 
     @property
     def mode(self) -> str:
         return "read" if self.access.method == "GET" else "write"
+
+
+_ROUTING_READ_OUTPUT = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "canonical": obj(id=INTEGER, canonical_sku=STRING, name=STRING, status=STRING, unit=STRING,
+                         gram_per_unit=NUMBER, aux_unit=NULLABLE_STRING, aux_rate=NUMBER),
+        "binding": obj(warehouse_code=STRING, items=array(obj(
+            id=INTEGER, sku=STRING, unit=STRING, is_active=INTEGER, is_alias=INTEGER, is_orderable=INTEGER,
+        ))),
+        "routing": obj(
+            configured_source=NULLABLE_STRING, effective_source=NULLABLE_STRING, orderable=BOOLEAN,
+            reason=STRING, version=STRING, pause_id=NULLABLE_STRING, availability=STRING, existing_open_orders=INTEGER,
+        ),
+        "mode": obj(mcp_multi_warehouse=BOOLEAN, web_multi_warehouse={"type": ["boolean", "null"]},
+                    writes_enabled=BOOLEAN),
+    },
+    "minProperties": 1,
+}
+_ROUTING_RECEIPT = obj(
+    event_id=STRING, pause_id=STRING, canonical_id=INTEGER, warehouse_code=STRING, actor_id=INTEGER,
+    decided_at=STRING, operation=STRING, before_state=STRING, after_state=STRING,
+    before_version=STRING, version=STRING,
+    evidence=obj(kind=STRING, reference=STRING, observed_at=STRING, quantity=STRING, unit=STRING),
+)
+
+
+def _routing_entry(name, action, handler, schema, description, shape):
+    return ToolRegistration(
+        tool=Tool(name=name, description=description, inputSchema=schema),
+        domain="routing", handler=handler,
+        access=AccessContract(
+            "GET" if action == "read" else "POST", f"/api/v1/item-routing/{action}",
+            "bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint",
+            "exact authorized tenant/canonical/warehouse pair; transitions require original source",
+        ),
+        output_shape=shape, external_subset=False, bot_approved=False,
+        tests=("tests/test_routing_stockout_http.py::test_gene_storefront_stockout",),
+        policy_action=f"routing.{action}",
+    )
 
 
 REGISTRY = (
@@ -1087,6 +1133,21 @@ REGISTRY = (
         external_subset=True, bot_approved=False,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[wms_documents_list]",),
     ),
+    _routing_entry(
+        "routing_item_status", "read", routing.routing_item_status_impl, routing.READ_INPUT,
+        "Read approved canonical fields, warehouse binding, current route and verified Web/MCP mode.",
+        _ROUTING_READ_OUTPUT,
+    ),
+    _routing_entry(
+        "routing_pause_item", "pause", routing.routing_pause_item_impl, routing.PAUSE_INPUT,
+        "Pause new orders at the original warehouse after manual confirmation of zero allocatable stock.",
+        _ROUTING_RECEIPT,
+    ),
+    _routing_entry(
+        "routing_restore_item", "restore", routing.routing_restore_item_impl, routing.RESTORE_INPUT,
+        "Restore the original warehouse against its active pause and a new positive allocatable confirmation.",
+        _ROUTING_RECEIPT,
+    ),
 )
 
 
@@ -1119,18 +1180,20 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
             raise ValueError(f"incomplete access contract: {entry.name}")
         action = entry.policy_action
         if action is not None:
-            if entry.mode != "read" or action not in SAFE_FIELDS or action in policy_actions:
+            if (action not in SAFE_FIELDS | ROUTING_FIELDS or action in policy_actions
+                    or (not entry.policy_only and entry.mode != "read")
+                    or (entry.policy_only and (entry.bot_approved or entry.external_subset))):
                 raise ValueError(f"invalid scoped policy action: {entry.name}")
             policy_actions.add(action)
 
 
 def get_tools() -> list[Tool]:
     """Keep declarations independent between callers, as before the registry."""
-    return [entry.tool.model_copy(deep=True) for entry in REGISTRY]
+    return [entry.tool.model_copy(deep=True) for entry in REGISTRY if not entry.policy_only]
 
 
 def get_handlers() -> dict[str, Callable]:
-    return {entry.name: entry.handler for entry in REGISTRY}
+    return {entry.name: entry.handler for entry in REGISTRY if not entry.policy_only}
 
 
 def get_policy_actions() -> dict[str, str]:

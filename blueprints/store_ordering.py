@@ -465,6 +465,7 @@ def cart_add_batch() -> str:
     added = 0
     skipped = 0
     rejected: list[str] = []
+    routing_errors: list[str] = []
     for cid_raw, qty_raw, unit_raw in zip(selected_list, qty_list, unit_list, strict=False):
         qty = parse_qty(qty_raw)
         if qty <= 0:
@@ -478,6 +479,9 @@ def cart_add_batch() -> str:
         unit = (unit_raw or "base").strip() or "base"
         try:
             sop.add_cart_item(master, cart["id"], cid, qty, unit)
+        except sop.CartRoutingError as e:
+            routing_errors.append(str(e))
+            continue
         except sop.OrderMultipleError as e:
             # 起订倍数不符：不再静默吞掉，逐项告诉门店要改成什么数量。
             rejected.append(
@@ -493,7 +497,9 @@ def cart_add_batch() -> str:
         flash(f"已加入购物车 {added} 项")
     if rejected:
         flash("以下品项未加入（数量不符合起订倍数）：" + "；".join(rejected))
-    if not added and not rejected:
+    if routing_errors:
+        flash("；".join(routing_errors))
+    if not added and not rejected and not routing_errors:
         flash("没有可加入购物车的品项（请先在卡片弹窗中填写数量）")
     return redirect(url_for("store_ordering.cart_view"))
 
@@ -689,6 +695,9 @@ def submit_order_route() -> str:
     else:
         unorderable = sop.list_unorderable_cart_canonicals(master, dc_code, cart_canonicals)
 
+    paused_ids = sop.paused_canonical_ids(master)
+    stockouts = [it["name"] for it in items if it["canonical_id"] in paused_ids]
+
     expected_date = _tomorrow()
     note = ""
     errors: dict[str, Any] = {
@@ -705,6 +714,8 @@ def submit_order_route() -> str:
         confirm_price_change = request.form.get("confirm_price_change") == "1"
         if expected_date < _today():
             flash("期望到货日期不能早于今天")
+        elif stockouts:
+            flash("以下品项缺货停订，请移除后再提交：" + "、".join(stockouts))
         elif unorderable:
             flash("以下品项已被下架，请移除后再提交：" + "、".join(
                 u["canonical_name"] for u in unorderable

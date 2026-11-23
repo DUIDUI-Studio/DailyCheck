@@ -2,7 +2,7 @@
 
 Source: `mcp_server/protocol/registry.py`. Regenerate with `python -m scripts.mcp_contracts --write`; verify in CI with `python -m scripts.mcp_contracts --check`.
 
-Runtime: **32** tools; external integration subset: **19**; Bot approved: **22**; business writes: **10**.
+Runtime: **35** tools; external integration subset: **19**; Bot approved: **22**; business writes: **12**.
 
 `registry.json` contains every input declaration, handler, minimum output JSON shape, ACL enforcement/scope, test reference and compatibility status. `tools.json` intentionally publishes only the external integration subset. Neither file grants permissions.
 
@@ -42,3 +42,6 @@ Read/write classifies business intent; legacy HTTP/stdio reads may run migration
 | `wms_stock_list` | wms | read | `GET /api/v1/wms/stock` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
 | `wms_stock_summary` | wms | read | `GET /api/v1/wms/stock/summary` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
 | `wms_documents_list` | wms | read | `GET /api/v1/wms/documents` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
+| `routing_item_status` | routing | read | `GET /api/v1/item-routing/read` | bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint | exact authorized tenant/canonical/warehouse pair; transitions require original source | no | no |
+| `routing_pause_item` | routing | write | `POST /api/v1/item-routing/pause` | bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint | exact authorized tenant/canonical/warehouse pair; transitions require original source | no | no |
+| `routing_restore_item` | routing | write | `POST /api/v1/item-routing/restore` | bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint | exact authorized tenant/canonical/warehouse pair; transitions require original source | no | no |

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "DailyCheck external integration subset: 19 tools; runtime registry: 32 tools including 13 canonical tools. Subset membership is documentation, not authorization. Full maintenance ledger: registry.json.",
+  "description": "DailyCheck external integration subset: 19 tools; runtime registry: 35 tools including 13 canonical tools. Subset membership is documentation, not authorization. Full maintenance ledger: registry.json.",
   "server": null,
   "tools": [
     {

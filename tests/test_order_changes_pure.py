@@ -444,6 +444,7 @@ def test_proposer_must_have_new_source_endorsement(change_env):
     [
         "price",
         "route",
+        "stockout",
         "alias",
         "inactive",
         "orderable",
@@ -487,6 +488,10 @@ def test_accept_stale_is_durable_and_never_partially_applies(change_env, mutatio
                 + " WHERE canonical_id=207"
             )
             wh.commit()
+    elif mutation == "stockout":
+        # The replacement was quoted before the hold; no new order line may be accepted.
+        m.execute("UPDATE item_routing_stockout_state SET pause_id='fixture-hold' WHERE canonical_id=207")
+        assert m.execute("SELECT changes()").fetchone()[0] == 1
     elif mutation == "route":
         m.execute(
             "UPDATE item_routing SET fulfillment_warehouse_code='dc_gamma' WHERE canonical_id=207"

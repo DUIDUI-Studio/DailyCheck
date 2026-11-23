@@ -476,7 +476,7 @@ def test_two_issued_preset_versions_share_the_existing_route_and_legacy_catalog(
     async def exercise(url):
         async with (_session(url, first_raw) as first, _session(url, second_raw) as second,
                     _session(url, "synthetic-shared-secret") as legacy):
-            assert {t.name for t in (await legacy.list_tools()).tools} == {entry.name for entry in REGISTRY}
+            assert {t.name for t in (await legacy.list_tools()).tools} == {entry.name for entry in REGISTRY if not entry.policy_only}
             assert {t.name for t in (await first.list_tools()).tools} == {"items_detail", "store_order_list"}
             second_tools = (await second.list_tools()).tools
             assert [t.name for t in second_tools] == ["store_order_list"]
@@ -570,9 +570,16 @@ def test_order_status_filter_requires_status_in_policy_mask(issued_policy, polic
 def test_registered_policy_actions_match_read_adapters():
     from mcp_server.protocol import policy as dispatch
 
-    expected = {"items_detail": "inventory.read", "store_order_list": "orders.read"}
+    expected = {
+        "items_detail": "inventory.read", "store_order_list": "orders.read",
+        "routing_item_status": "routing.read", "routing_pause_item": "routing.pause",
+        "routing_restore_item": "routing.restore",
+    }
     assert get_policy_actions() == expected
-    assert {entry.name: entry.mode for entry in REGISTRY if entry.policy_action} == dict.fromkeys(expected, "read")
+    assert {entry.name: entry.mode for entry in REGISTRY if entry.policy_action} == {
+        name: "write" if action in {"routing.pause", "routing.restore"} else "read"
+        for name, action in expected.items()
+    }
     assert dispatch._HANDLERS.keys() == dispatch._INPUT_SCHEMAS.keys() == expected.keys()
 
 
@@ -678,8 +685,8 @@ def test_v8_upgrade_and_binding_triggers_preserve_legacy_metadata(mcp_test_env):
             "VALUES ('historical', 'existing-hash', NULL, 1, 'test', '[\"*\"]', '[\"*\"]', 'null')",
         )
     metadata = _db_update(master, "SELECT * FROM agent_tokens WHERE name='historical'")
-    assert migrate_up(master, MIGRATIONS, env["root"] / "migration-backup") == [9]
-    assert _db_update(master, "PRAGMA user_version") == (9,)
+    assert migrate_up(master, MIGRATIONS, env["root"] / "migration-backup") == [9, 10]
+    assert _db_update(master, "PRAGMA user_version") == (10,)
     assert _db_update(master, "SELECT * FROM agent_tokens WHERE name='historical'") == metadata
     assert migrate_up(master, MIGRATIONS, env["root"] / "migration-backup") == []
     original_schema = _snapshot(env["root"])

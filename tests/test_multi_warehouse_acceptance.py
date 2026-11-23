@@ -374,6 +374,9 @@ def test_routing_missing_and_exclusive_reject_whole_order(env):
 
 def test_routing_duplicate_binding_fails_closed(env):
     """重复绑定（同一仓两行 active 绑定）不得猜首行，整单失败关闭。"""
+    # The cart predates the source binding change.
+    _login(env, 1, 3)
+    _add(env, 201, 1)
     conn = env_builder.connect(env["paths"]["dc_alpha"])
     category_id = conn.execute("SELECT id FROM categories ORDER BY id LIMIT 1").fetchone()[0]
     conn.execute(
@@ -384,8 +387,6 @@ def test_routing_duplicate_binding_fails_closed(env):
     conn.commit()
     conn.close()
 
-    _login(env, 1, 3)
-    _add(env, 201, 1)
     body = _submit(env).data.decode()
     assert "无法解析履约行" in body
     assert "2 active fulfillment rows" in body
@@ -394,13 +395,14 @@ def test_routing_duplicate_binding_fails_closed(env):
 
 def test_routing_unit_conflict_fails_closed(env):
     """单位冲突（本地单位 != 主数据单位）不得静默换算，整单失败关闭。"""
+    # The cart predates the source binding change.
+    _login(env, 1, 3)
+    _add(env, 203, 1)
     conn = env_builder.connect(env["paths"]["dc_alpha"])
     conn.execute("UPDATE items SET unit='kg' WHERE canonical_id=203")
     conn.commit()
     conn.close()
 
-    _login(env, 1, 3)
-    _add(env, 203, 1)
     body = _submit(env).data.decode()
     assert "无法解析履约行" in body
     assert "incomparable units" in body

@@ -118,10 +118,14 @@ def set_route(canonical_id):
     _tenant_one()
     master = get_master_db()
     dc_code = request.form.get("dc_code", "").strip()
-    previous = routing.routing_snapshot(master, canonical_id)
     try:
+        master.execute("BEGIN IMMEDIATE")
+        previous = routing.routing_snapshot(master, canonical_id)
         routing.set_routing(master, canonical_id, dc_code, actor_id=g.user["id"])
         master.commit()
+    except routing.StockoutPausedError as exc:
+        master.rollback()
+        abort(409, description=str(exc))
     except ValueError as exc:
         master.rollback()
         abort(400, description=str(exc))
@@ -137,10 +141,14 @@ def set_route(canonical_id):
 def delete_route(canonical_id):
     _tenant_one()
     master = get_master_db()
-    previous = routing.routing_snapshot(master, canonical_id)
     try:
+        master.execute("BEGIN IMMEDIATE")
+        previous = routing.routing_snapshot(master, canonical_id)
         routing.delete_routing(master, canonical_id, actor_id=g.user["id"])
         master.commit()
+    except routing.StockoutPausedError as exc:
+        master.rollback()
+        abort(409, description=str(exc))
     except ValueError as exc:
         master.rollback()
         abort(400, description=str(exc))

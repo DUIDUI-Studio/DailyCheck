@@ -107,8 +107,33 @@ def _assert_dc(master_conn, dc_code):
         raise ValueError("履约仓必须为租户 1 的配送中心")
 
 
+class StockoutPausedError(ValueError):
+    """An active business hold protects the original route."""
+
+
+def stockout_state(master_conn, canonical_id, *, tenant_id=1):
+    row = master_conn.execute(
+        "SELECT version, pause_id FROM item_routing_stockout_state "
+        "WHERE tenant_id=? AND canonical_id=?", (tenant_id, canonical_id),
+    ).fetchone()
+    return (row[0], row[1]) if row else ("initial", None)
+
+
+def paused_canonical_ids(master_conn, *, tenant_id=1):
+    return {row[0] for row in master_conn.execute(
+        "SELECT canonical_id FROM item_routing_stockout_state "
+        "WHERE tenant_id=? AND pause_id IS NOT NULL", (tenant_id,),
+    )}
+
+
+def _assert_route_mutable(master_conn, canonical_id):
+    if stockout_state(master_conn, canonical_id)[1] is not None:
+        raise StockoutPausedError("该品项缺货停订中，须先按原仓恢复")
+
+
 def set_routing(master_conn, canonical_id, dc_code, *, actor_id) -> None:
     _assert_canonical(master_conn, canonical_id)
+    _assert_route_mutable(master_conn, canonical_id)
     _assert_dc(master_conn, dc_code)
     master_conn.execute(
         "INSERT INTO item_routing "
@@ -122,6 +147,7 @@ def set_routing(master_conn, canonical_id, dc_code, *, actor_id) -> None:
 def delete_routing(master_conn, canonical_id, *, actor_id):
     """删除显式路由（不修改历史订单）；操作者审计由 HTTP 层现有日志承载。"""
     _assert_canonical(master_conn, canonical_id)
+    _assert_route_mutable(master_conn, canonical_id)
     master_conn.execute("DELETE FROM item_routing WHERE tenant_id=1 AND canonical_id=?",
                         (canonical_id,))
 
@@ -239,7 +265,10 @@ def apply_batch(master_conn, changes, *, actor_id):
     if errors:
         raise BatchRoutingError("变更校验失败，整批未写入", errors=errors)
     for change, current, no_op in plans:
-        if not no_op and current != change["baseline"]:
+        if not no_op and stockout_state(master_conn, change["canonical_id"])[1] is not None:
+            errors[str(change["canonical_id"])] = {"message": "该品项缺货停订中，须先按原仓恢复",
+                                                    "current": current}
+        elif not no_op and current != change["baseline"]:
             errors[str(change["canonical_id"])] = {"message": "保存值已被其他操作修改", "current": current}
     if errors:
         raise BatchRoutingError("存在并发冲突，整批未写入；请核对最新值", errors=errors, status=409)

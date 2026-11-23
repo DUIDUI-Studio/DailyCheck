@@ -38,6 +38,10 @@ class FulfillmentConflictError(FulfillmentError):
     """The binding has incomparable units or an unresolved blocking conflict."""
 
 
+class FulfillmentNotOrderableError(FulfillmentError):
+    """The unique route binding or its canonical item is not orderable."""
+
+
 def parse_price_and_multiple(item_row) -> tuple[float, float]:
     """Use a positive selling price, otherwise cost; normalize the order multiple.
 
@@ -123,3 +127,16 @@ def resolve_fulfillment_item(
         "order_multiple": normalize_order_multiple(item["order_multiple"]),
         "available": float(item["quantity"] or 0),
     }
+
+
+
+def resolve_orderable_fulfillment_item(master_conn, wh_conn, *, canonical_id: int, warehouse_code: str) -> dict:
+    """Apply the same source eligibility to catalogue, new orders and MCP."""
+    item = resolve_fulfillment_item(
+        master_conn, wh_conn, canonical_id=canonical_id, warehouse_code=warehouse_code,
+    )
+    orderable = wh_conn.execute("SELECT is_orderable FROM items WHERE id=?", (item["item_id"],)).fetchone()
+    status = master_conn.execute("SELECT status FROM canonical_items WHERE id=?", (canonical_id,)).fetchone()
+    if not orderable or not orderable[0] or not status or status[0] != "active":
+        raise FulfillmentNotOrderableError(canonical_id, warehouse_code, "来源品项当前不可订")
+    return item

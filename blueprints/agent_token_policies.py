@@ -20,18 +20,16 @@ from flask import (
     url_for,
 )
 from itsdangerous import BadData, URLSafeTimedSerializer
-from werkzeug.security import generate_password_hash
 
 from blueprints.audit_pure import append_admin_audit
 from mcp_server.protocol.registry import get_policy_actions
-from mcp_server.service.auth import token_prefix
 from mcp_server.service.policy import (
-    POLICY_TOKEN_PREFIX,
     SAFE_FIELDS,
     canonical_grants,
     encode_grants,
     storefront_scope,
 )
+from mcp_server.service.policy_issuance import insert_bound_token
 
 _PRESET_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _PREVIEW_MAX_AGE_SECONDS = 600
@@ -198,9 +196,6 @@ def _issue(db):
     if not isinstance(snapshot, dict) or any(snapshot.get(key) != value for key, value in operator.items()):
         abort(403, "此确认凭证不属于当前会话。")
 
-    raw = POLICY_TOKEN_PREFIX + secrets.token_urlsafe(32)
-    token_hash = generate_password_hash(raw, method="pbkdf2:sha256")
-    now = _utc_now()
     try:
         db.execute("BEGIN IMMEDIATE")
         name = snapshot["token_name"]
@@ -209,25 +204,9 @@ def _issue(db):
         codes = storefront_scope(db, snapshot["warehouses"])
         if confirmed != snapshot["grants_json"] or list(codes) != snapshot["warehouses"]:
             raise ValueError("Confirmed scope changed")
-        if db.execute(
-            "SELECT 1 FROM mcp_policy_bindings WHERE confirmation_id = ?",
-            (snapshot["confirmation_id"],),
-        ).fetchone() or db.execute(
-            "SELECT 1 FROM mcp_policy_bindings b JOIN agent_tokens a ON a.id = b.token_id "
-            "WHERE a.name COLLATE BINARY = ? AND a.revoked_at IS NULL AND b.revoked_at IS NULL",
-            (name,),
-        ).fetchone():
-            raise ValueError("Confirmation consumed or active name")
-        identity = db.execute(
-            "INSERT INTO agent_tokens (name, token_hash, token_prefix, created_by, created_at, "
-            "allowed_read_paths_json, allowed_write_paths_json, allowed_warehouse_codes_json) "
-            "VALUES (?, ?, ?, ?, ?, '[]', '[]', '[]')",
-            (name, token_hash, token_prefix(raw), g.user["id"], now),
-        ).lastrowid
-        db.execute(
-            "INSERT INTO mcp_policy_bindings (token_id, preset_name, preset_version, grants_json, "
-            "warehouse_codes_json, confirmation_id, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (identity, preset, version, confirmed, json.dumps(codes), snapshot["confirmation_id"], g.user["id"], now),
+        identity, raw = insert_bound_token(
+            db, name=name, preset=preset, version=version, grants_json=confirmed,
+            warehouses_json=json.dumps(codes), confirmation_id=snapshot["confirmation_id"], issuer=g.user["id"],
         )
         db.commit()
     except (KeyError, TypeError, ValueError, OverflowError, sqlite3.IntegrityError):

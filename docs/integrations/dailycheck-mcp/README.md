@@ -90,13 +90,14 @@ flask create-agent-token juleng-sync \
 
 **The token is a shared secret.** It must be passed via TLS in production and never logged. Rotate via [integration-checklist.md](./integration-checklist.md#rotating-the-token).
 
-## 4. External integration subset (16 of 29 tools)
+## 4. External integration subset (19 of 35 registrations)
 
-`tools/list` returns all **29 runtime tools**. [tools.json](./tools.json) is the
-intentional **16-tool external integration subset** (14 base + two store-order
-reads), excluding 13 canonical tools; subset membership is documentation, not
-permission. The complete [registry.json](./registry.json) and
-[generated contracts](./registry.md) record all 29 registrations and actual output
+Ordinary `tools/list` returns **32 legacy tools**. Three
+[scoped stockout tools](../../mcp-routing-stockout.md) are available through a separate policy credential.
+[tools.json](./tools.json) describes the **19-tool external integration subset**
+(14 base, two store-order reads and three WMS reads). Authorization comes from
+the caller's credential. The complete [registry.json](./registry.json) and
+[generated contracts](./registry.md) record all 35 registrations and actual output
 shapes. Generate/check with `python -m scripts.mcp_contracts --write` / `--check`.
 Bot approval remains independent: 22 tools, with seven canonical writes excluded.
 

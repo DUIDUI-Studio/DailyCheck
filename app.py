@@ -174,6 +174,17 @@ def create_app() -> Flask:
         page in this subproject. Lock-failure counter is read from a
         file maintained by blueprints.forecast._bump_lock_counter.
         """
+        if request.remote_addr == "127.0.0.1" and "X-DailyCheck-Routing-Nonce" in request.headers:
+            from db import MASTER_DB
+            from routing_mode import web_witness
+
+            witness = web_witness(
+                MASTER_DB, dry_run=app.config["DRY_RUN"],
+                nonce=request.headers["X-DailyCheck-Routing-Nonce"],
+                proof=request.headers.get("X-DailyCheck-Routing-Proof", ""),
+            )
+            return (witness, 200) if witness else ({"error": "forbidden"}, 403)
+
         from blueprints.forecast import _read_lock_counter
         from db import get_master_db
         last_success = None

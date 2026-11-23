@@ -27,6 +27,8 @@ from migrations.order_changes import registered_down as order_changes_down
 from migrations.order_changes import registered_up as order_changes_up
 from migrations.receipt_op_protocol import registered_down as receipt_op_down
 from migrations.receipt_op_protocol import registered_up as receipt_op_up
+from migrations.routing_stockout import registered_down as routing_stockout_down
+from migrations.routing_stockout import registered_up as routing_stockout_up
 from migrations.seed_item_routing import registered_down as seed_routing_down
 from migrations.seed_item_routing import registered_up as seed_routing_up
 
@@ -124,4 +126,6 @@ MIGRATIONS: list[Migration] = [
      feedback_receipts_up, feedback_receipts_down),
     (9, "versioned MCP policy presets and durable token bindings",
      mcp_policies_up, mcp_policies_down),
+    (10, "scoped routing stockout holds, versions and business audit",
+     routing_stockout_up, routing_stockout_down),
 ]

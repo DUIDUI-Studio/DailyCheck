@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -23,10 +24,12 @@ from blueprints import order_changes_pure as ocp
 from blueprints._helpers import now, parse_qty
 from blueprints.fulfillment_pure import (
     FulfillmentError,
+    FulfillmentNotOrderableError,
     parse_price_and_multiple,
     resolve_fulfillment_item,
+    resolve_orderable_fulfillment_item,
 )
-from blueprints.item_routing_pure import get_routing
+from blueprints.item_routing_pure import get_routing, paused_canonical_ids, stockout_state
 from blueprints.notifications_pure import emit_event
 from blueprints.procurement_pure import (
     compute_safety_stock,
@@ -385,6 +388,25 @@ def list_cart_items(
     return out
 
 
+class CartRoutingError(ValueError):
+    pass
+
+
+@contextmanager
+def _cart_write_boundary(master_conn):
+    owns_transaction = not master_conn.in_transaction
+    if owns_transaction:
+        master_conn.execute("BEGIN IMMEDIATE")
+    else:
+        # Existing callers may have started a deferred transaction.
+        master_conn.execute("UPDATE store_order_carts SET updated_at=updated_at WHERE 0")
+    try:
+        yield
+    finally:
+        if owns_transaction and master_conn.in_transaction:
+            master_conn.rollback()
+
+
 def add_cart_item(
     master_conn: sqlite3.Connection,
     cart_id: int,
@@ -397,34 +419,51 @@ def add_cart_item(
     Raises OrderMultipleError when the merged quantity is not a multiple of
     the DC item's ``order_multiple``（起订倍数）.
     """
-    master_conn.row_factory = sqlite3.Row
-    qty = parse_qty(quantity)
-    if qty <= 0:
-        raise ValueError("quantity must be positive")
-    unit = (unit or "").strip() or "件"
-    existing = master_conn.execute(
-        "SELECT id, quantity FROM store_order_cart_items WHERE cart_id=? AND canonical_id=?",
-        (cart_id, canonical_id),
-    ).fetchone()
-    new_qty = parse_qty(qty) if existing is None else parse_qty(existing["quantity"] + qty)
-    multiple = get_cart_item_multiple(master_conn, cart_id, canonical_id)
-    if not is_multiple_of(new_qty, multiple):
-        raise OrderMultipleError(_canonical_name(master_conn, canonical_id), new_qty, multiple)
-    ts = now()
-    if existing is None:
-        master_conn.execute(
-            """INSERT INTO store_order_cart_items
-               (cart_id, canonical_id, quantity, unit, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (cart_id, canonical_id, new_qty, unit, ts, ts),
-        )
-    else:
-        master_conn.execute(
-            "UPDATE store_order_cart_items SET quantity=?, unit=?, updated_at=? WHERE id=?",
-            (new_qty, unit, ts, existing["id"]),
-        )
-    _touch_cart(master_conn, cart_id)
-    master_conn.commit()
+    with _cart_write_boundary(master_conn):
+        if stockout_state(master_conn, canonical_id)[1] is not None:
+            raise CartRoutingError(f"{_canonical_name(master_conn, canonical_id)} 缺货停订，请稍后再订")
+        multiple = None
+        if multi_warehouse_enabled() and (source := get_routing(master_conn, canonical_id)):
+            warehouse = open_warehouse_db(source)
+            try:
+                warehouse.execute("BEGIN")
+                binding = resolve_orderable_fulfillment_item(
+                    master_conn, warehouse, canonical_id=canonical_id, warehouse_code=source,
+                )
+                multiple = binding["order_multiple"]
+            except FulfillmentError as exc:
+                raise CartRoutingError(f"{_canonical_name(master_conn, canonical_id)} 当前不可订") from exc
+            finally:
+                warehouse.close()
+        master_conn.row_factory = sqlite3.Row
+        qty = parse_qty(quantity)
+        if qty <= 0:
+            raise ValueError("quantity must be positive")
+        unit = (unit or "").strip() or "件"
+        existing = master_conn.execute(
+            "SELECT id, quantity FROM store_order_cart_items WHERE cart_id=? AND canonical_id=?",
+            (cart_id, canonical_id),
+        ).fetchone()
+        new_qty = parse_qty(qty) if existing is None else parse_qty(existing["quantity"] + qty)
+        if multiple is None:
+            multiple = get_cart_item_multiple(master_conn, cart_id, canonical_id)
+        if not is_multiple_of(new_qty, multiple):
+            raise OrderMultipleError(_canonical_name(master_conn, canonical_id), new_qty, multiple)
+        ts = now()
+        if existing is None:
+            master_conn.execute(
+                """INSERT INTO store_order_cart_items
+                   (cart_id, canonical_id, quantity, unit, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (cart_id, canonical_id, new_qty, unit, ts, ts),
+            )
+        else:
+            master_conn.execute(
+                "UPDATE store_order_cart_items SET quantity=?, unit=?, updated_at=? WHERE id=?",
+                (new_qty, unit, ts, existing["id"]),
+            )
+        _touch_cart(master_conn, cart_id)
+        master_conn.commit()
 
 
 def _canonical_name(master_conn: sqlite3.Connection, canonical_id: int) -> str:
@@ -542,6 +581,7 @@ def list_available_dc_items(
     category_code: str | None = None,
     keyword: str | None = None,
     store_warehouse_code: str | None = None,
+    *, routed_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """List DC items that have a non-null canonical_id and active canonical item.
 
@@ -595,12 +635,15 @@ def list_available_dc_items(
         f"SELECT id, name, category_code, unit, aux_unit, aux_rate FROM canonical_items WHERE {where}",
         params,
     ).fetchall()
+    paused = paused_canonical_ids(master_conn)
     active_canonical_map = {
         int(r["id"]): dict(r) for r in canonical_rows
     }
 
     dc_conn = open_warehouse_db(dc_warehouse_code)
     try:
+        if routed_ids is not None:
+            dc_conn.execute("BEGIN")
         dc_conn.row_factory = sqlite3.Row
         params = []
         where_parts = ["canonical_id IS NOT NULL", "is_orderable = 1"]
@@ -621,8 +664,17 @@ def list_available_dc_items(
             item = dict(r)
             canonical_id = item["canonical_id"]
             canon = active_canonical_map.get(canonical_id)
-            if canon is None:
+            if canon is None or canonical_id in paused:
                 continue
+            if routed_ids is not None:
+                if canonical_id not in routed_ids or not item["is_active"] or item["is_alias"]:
+                    continue
+                try:
+                    resolve_orderable_fulfillment_item(
+                        master_conn, dc_conn, canonical_id=canonical_id, warehouse_code=dc_warehouse_code,
+                    )
+                except FulfillmentError:
+                    continue
             if canonical_id in deactivated:
                 continue  # P0-10：该门店已单仓停用
             item["canonical_name"] = canon["name"]
@@ -689,11 +741,8 @@ def list_available_routed_items(
         allowed = by_dc[dc_code]
         for item in list_available_dc_items(
             master_conn, dc_code, category_code, keyword,
-            store_warehouse_code=store_warehouse_code,
+            store_warehouse_code=store_warehouse_code, routed_ids=allowed,
         ):
-            canonical_id = item["canonical_id"]
-            if canonical_id is None or int(canonical_id) not in allowed:
-                continue
             item["source_warehouse_code"] = dc_code
             out.append(item)
     out.sort(key=lambda item: (str(item.get("canonical_name") or ""), int(item["canonical_id"])))
@@ -710,7 +759,15 @@ def list_unorderable_routed_canonicals(
         dc_code = get_routing(master_conn, canonical_id)
         if dc_code is None:
             continue  # missing routing has its own整单退回 message
-        out.extend(list_unorderable_cart_canonicals(master_conn, dc_code, [canonical_id]))
+        wh = open_warehouse_db(dc_code)
+        try:
+            resolve_orderable_fulfillment_item(master_conn, wh, canonical_id=canonical_id, warehouse_code=dc_code)
+        except FulfillmentNotOrderableError:
+            out.append({"canonical_id": canonical_id, "canonical_name": _canonical_name(master_conn, canonical_id)})
+        except FulfillmentError:
+            continue  # The authoritative submit resolver lists the binding failure.
+        finally:
+            wh.close()
     return out
 
 
@@ -1375,7 +1432,8 @@ def _resolve_routed_cart_lines(
             continue
         wh_conn = open_warehouse_db(dc_code)
         try:
-            resolved = resolve_fulfillment_item(
+            wh_conn.execute("BEGIN")
+            resolved = resolve_orderable_fulfillment_item(
                 master_conn, wh_conn, canonical_id=canonical_id, warehouse_code=dc_code,
             )
             if ci.get('cart_unit') and ci['cart_unit'] != resolved['unit']:
@@ -1455,6 +1513,18 @@ def submit_order(
     价格/倍数与本刻重解析不一致时，返回 ``{"price_changed": [...]}``，门店
     带 ``confirm_price_change=1`` 重提交才建单（设计 §5）。
     """
+    with _cart_write_boundary(master_conn):
+        result = _submit_order_locked(
+            master_conn, cart_id, requested_by, expected_delivery_date, note,
+            price_snapshot, multiple_snapshot, confirm_price_change,
+        )
+    return get_order_detail(master_conn, result) if isinstance(result, int) else result
+
+
+def _submit_order_locked(
+    master_conn, cart_id, requested_by, expected_delivery_date, note,
+    price_snapshot, multiple_snapshot, confirm_price_change,
+):
     master_conn.row_factory = sqlite3.Row
     cart = master_conn.execute(
         "SELECT * FROM store_order_carts WHERE id=?", (cart_id,)
@@ -1462,11 +1532,15 @@ def submit_order(
     if cart is None:
         raise ValueError(f"cart_id={cart_id} not found")
     cart_dict = dict(cart)
+    cart_items = list_cart_items(master_conn, cart_id)
+    paused = paused_canonical_ids(master_conn)
+    blocked = [item["name"] for item in cart_items if item["canonical_id"] in paused]
+    if blocked:
+        raise CartRoutingError("以下品项缺货停订，请移除后再提交：" + "、".join(blocked))
     validation = validate_cart_for_submit(master_conn, cart_dict)
     if not validation["ok"]:
         raise ValueError(f"cart validation failed: {validation}")
 
-    cart_items = list_cart_items(master_conn, cart_id)
     ts = now()
     multi = multi_warehouse_enabled()
     if multi:
@@ -1552,7 +1626,7 @@ def submit_order(
     _touch_cart(master_conn, cart_id)
     _insert_status_history(master_conn, order_id, None, ORDER_STATUS_PENDING, requested_by, note)
     master_conn.commit()
-    return get_order_detail(master_conn, order_id)
+    return order_id
 
 
 # ---------------------------------------------------------------------------

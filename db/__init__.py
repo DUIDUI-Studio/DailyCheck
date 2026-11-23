@@ -22,6 +22,7 @@ from flask import g
 
 from config import MASTER_DB, WAREHOUSE_DB_DIR
 from migrations.multi_warehouse_fulfillment import DELIVERY_ITEMS_DDL, ITEM_ROUTING_DDL
+from migrations.routing_stockout import ROUTING_DDL
 from permissions_manifest import (
     BUILTIN_PACKAGE_SIZES,
     BUILTIN_ROLE_CODES,
@@ -879,7 +880,7 @@ MCP_POLICY_DDL = (
 
 MASTER_SCHEMA += DELIVERY_ITEMS_DDL + ";\n" + ITEM_ROUTING_DDL + ";\n"
 MASTER_SCHEMA += FEEDBACK_DELIVERY_RECEIPTS_DDL + ";\n"
-MASTER_SCHEMA += ";\n".join(MCP_POLICY_DDL) + ";\n"
+MASTER_SCHEMA += ";\n".join(MCP_POLICY_DDL + ROUTING_DDL) + ";\n"
 
 # Mirrors the schema that app.py shipped pre-refactor. Audit_log is new.
 WAREHOUSE_SCHEMA = """
