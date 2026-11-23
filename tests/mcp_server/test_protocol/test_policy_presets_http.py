@@ -873,24 +873,30 @@ def test_production_consumption_scope_and_source_fail_closed(production_tokens, 
         asyncio.run(exercise(url))
 
 
-def test_production_consumption_rejects_physical_alias_before_read(production_tokens, monkeypatch):
+@pytest.mark.parametrize("other_code", ("wh_002", OUTSIDE, DC))
+def test_production_consumption_rejects_physical_alias_before_read(production_tokens, monkeypatch, other_code):
     env, paths, _, full, partial, _ = production_tokens
-    configured, other = paths["wh_002"], paths["wh_003"]
+    configured, other = paths["wh_003"], paths[other_code]
     target = env["root"] / "external-warehouse.db"
     configured.rename(target)
     configured.symlink_to(target)
 
     async def exercise(url):
         async with _session(url, full) as session, _session(url, partial) as narrow:
-            args = {**PRODUCTION_ARGS, "view": "lines", "warehouse_code": "wh_002"}
+            args = {**PRODUCTION_ARGS, "view": "lines", "warehouse_code": "wh_003"}
             before = _snapshot(env["root"])
             page = await _call(session, PRODUCTION_TOOL, args)
-            assert page["lines"][0]["booked_qty"] == 0
+            assert page["lines"][0]["booked_qty"] == 4
             assert _snapshot(env["root"]) == before
 
-            other.rename(other.with_suffix(".original"))
-            os.link(target, other)
-            assert other.resolve() != target.resolve()
+            missing = other.rename(other.with_suffix(".original"))
+            before = _snapshot(env["root"])
+            assert (await _call(narrow, PRODUCTION_TOOL, PRODUCTION_ARGS))["summary"][0]["warehouse_code"] == "wh_003"
+            assert _snapshot(env["root"]) == before
+            missing.rename(other)
+            configured.rename(configured.with_suffix(".original-symlink"))
+            os.link(other, configured)
+            assert other.resolve() != configured.resolve()
             assert other.samefile(configured)
             before = _snapshot(env["root"])
             original_open = sqlite3.connect

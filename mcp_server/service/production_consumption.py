@@ -44,12 +44,9 @@ def _date_range(start_date: str, end_date: str, view: str) -> None:
 
 
 def _warehouse_paths(codes: tuple[str, ...]) -> dict:
-    approved = tuple(sorted(PRODUCTION_STORES))
-    placeholders = ", ".join("?" for _ in approved)
     with policy_master_connection() as conn:
         rows = conn.execute(
-            f"SELECT code, db_path, warehouse_type FROM warehouses WHERE code COLLATE BINARY IN ({placeholders})",
-            approved,
+            "SELECT code, db_path, warehouse_type FROM warehouses",
         ).fetchall()
     paths, identities, conflicts = {}, {}, set()
     for row in rows:
@@ -57,10 +54,10 @@ def _warehouse_paths(codes: tuple[str, ...]) -> dict:
         try:
             path = resolve_warehouse_path(row["db_path"], config.BASE_DIR, db_dir=config.DB_DIR).resolve(strict=True)
             info = path.stat()
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
-        # Compare the resolved targets of all four registrations, including
-        # stores outside this token's scope. Only open admitted stores below.
+        # An outside storefront or distribution center can share a target
+        # with an admitted store. Check every registration before any open.
         identity = info.st_dev, info.st_ino
         if identity in identities:
             conflicts.update((code, identities[identity]))

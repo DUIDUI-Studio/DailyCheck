@@ -265,9 +265,10 @@ policy. Existing credentials retain their previous tool access.
 - An invalid or unauthorized request returns a protocol tool error.
   Missing, unreadable, incompatible-schema and WAL sources return
   `source_unavailable` for the entire request. Before any warehouse opens,
-  the server uses file metadata to compare the targets of all four registered
-  stores. It rejects a requested store that shares a physical file with
-  another, including hard links. External symlinks to distinct files work.
+  the server uses file metadata to compare the targets of every registered
+  warehouse. It rejects a requested store that shares a physical file with
+  another, including hard links. External symlinks to distinct files work,
+  and an absent file for a different warehouse does not block the request.
   Reads use existing-only SQLite policy connections. MCP calls append to
   the normal access log.
 
