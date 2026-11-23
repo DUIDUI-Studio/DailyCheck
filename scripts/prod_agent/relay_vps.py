@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import http.client
 import os
 import secrets
 import signal
@@ -16,6 +17,7 @@ from scripts.blue_green import deploy_state as ds
 from scripts.blue_green.publication_authority import resolve_source_binding
 from scripts.hosting import HostingError, strict_json_loads
 from scripts.prod_agent import relay_git as objects
+from scripts.prod_agent import relay_publication
 from scripts.prod_agent.native_ports import protected_path
 from scripts.prod_agent.relay_protocol import (
     COMMAND,
@@ -107,15 +109,23 @@ class Server:
     def _set(self, **facts):
         with ds.state_transaction(self.directory):
             state = self.state()
-            row, _ = self.owned(state)
+            row, lock = self.owned(state)
             require(ds.process_lock_fd() is not None, "relay process fence lost")
             row.update(facts)
+            lock["heartbeat_at"] = ds.now_epoch()
             ds.save_state(self.directory, state)
 
     def runtime(self, role):
         if self.fixture:
             result = self._fixture_stage(role)
             value = strict_json_loads(result, max_bytes=MAX_CONTROL)
+            if role == "green" and "fixture_observation_port" in self.profile:
+                from scripts.prod_agent.relay_pipeline import _http
+
+                port = self.profile["fixture_observation_port"]
+                require(type(port) is int and 1024 <= port <= 65535, "fixture probe port")
+                code, _ = _http(port, "/health")
+                require(code == 200, "fixture HTTP probe failed")
         else:
             from scripts.prod_agent.relay_pipeline import live_route
             value = live_route(self, role)
@@ -125,6 +135,14 @@ class Server:
                                     {"blue"} if role == "standby" else {role})
                 and hex_id(value["identity"], 64), "runtime route/version unproven")
         return value
+
+    def observe_green(self):
+        # This boundary runs after the positively waited switch. Read-only probe
+        # failure is evidence of unhealthy observation, unlike an interrupted write.
+        try:
+            return self.runtime("green")
+        except (OSError, ValueError, http.client.HTTPException, subprocess.SubprocessError) as exc:
+            raise StageFailure("observation read failed") from exc
 
     def _fixture_stage(self, operation):
         path = checked_file(self.profile["fixture_executor"], anchor=self.fixture,
@@ -260,13 +278,13 @@ class Server:
             since = ds.now_epoch()
             journal.append({"stage": stage, "started_at": since})
             self._set(journal=journal)
-            route = self.runtime("green")
+            route = self.observe_green()
             samples = 1
             while True:
                 remaining = self.minimum - (time.monotonic() - started)
                 if remaining > 0:
                     time.sleep(min(30 if not self.fixture else 0.2, remaining))
-                if self.runtime("green") != route:
+                if self.observe_green() != route:
                     raise StageFailure("runtime continuity changed")
                 samples += 1
                 if time.monotonic() - started >= self.minimum:
@@ -275,7 +293,7 @@ class Server:
             self._set(phase="verified", journal=journal, observed=route,
                       observation_seconds=int(time.monotonic() - started), samples=samples,
                       fixture=self.fixture is not None)
-        except (StageFailure, ValueError):
+        except StageFailure:
             self.rollback(stage, fd)
 
     def stage_preflight(self, repo):
@@ -304,6 +322,7 @@ class Server:
                                        ds.now_epoch(), result, 0 if result == "success" else 1,
                                        stage, "relay-fixture" if self.fixture else "relay")
             require(outcome is not None, "native outcome unavailable")
+            relay_publication.freeze(outcome)
             row.update(phase=phase, finished_at=ds.now_epoch(), receipt=outcome["public_receipt"],
                        remote=remote, failed_stage=None if result == "success" else stage)
             if result == "success":
@@ -317,8 +336,9 @@ class Server:
                     "generation": self.expected["generation"], "outcome_id": self.expected["attempt"]}
             state["lock"] = None
             ds.save_state(self.directory, state)
-            (self.directory / MARKER).unlink()
-            sync_dir(self.directory)
+            if phase == "rejected":
+                (self.directory / MARKER).unlink()
+                sync_dir(self.directory)
 
     def status(self):
         with ds.state_transaction(self.directory):
@@ -330,11 +350,19 @@ class Server:
                 self.owned(state)
                 self.source()
             else:
-                require(not (self.directory / MARKER).exists(), "terminal fence cleanup unconfirmed")
+                saved = state["publications"].get(self.expected["attempt"])
+                marker = self.directory / MARKER
+                if row["phase"] == "rejected" or saved is not None and saved["state"] == "linked":
+                    require(not marker.exists(), "terminal fence cleanup unconfirmed")
+                else:
+                    require(read_file(marker) == self.marker, "pending report fence unconfirmed")
             public = dict(row)
             public.pop("previous_deployed")
             public.pop("previous_last_attempt")
         phase = row["phase"]
+        if phase in {"settled", "rolled_back"}:
+            report = relay_publication.projection(state, self.expected, row)
+            public["publication"] = {k: report[k] for k in ("state", "comment_id")}
         if phase in {"verified", "armed", "settlement_pending", "settled"}:
             public["live"] = self.runtime("green") == row["observed"]
             require(public["live"], "green readback could not corroborate observation")
@@ -350,6 +378,49 @@ class Server:
             else:
                 public["process_fence"] = "unheld_reconcile"
         return public
+
+    def publication(self, envelope):
+        operation = envelope["op"]
+        with lock_file(self.directory, ds.ATTEMPT_LOCK_FILENAME) as owner:
+            fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status = self.status()
+            require(status["phase"] in {"settled", "rolled_back"}
+                    and status.get("live") is True, "terminal route evidence required")
+            with ds.state_transaction(self.directory):
+                state = self.state()
+                self.source()
+                row = state["worker_relay"]
+                report = relay_publication.projection(state, self.expected, row)
+                marker = self.directory / MARKER
+                if operation == "report_status":
+                    return {"phase": row["phase"], "target": self.expected, "publication": report}
+                require(envelope["outcome"] == report["outcome"] and state["lock"] is None,
+                        "stale report outcome")
+                if operation == "report_intent":
+                    require(report["state"] == "ready" and read_file(marker) == self.marker,
+                            "report already sent or fenced")
+                    state["publications"][self.expected["attempt"]] = {
+                        "generation": self.expected["generation"],
+                        "payload_sha256": state["outcomes"][self.expected["attempt"]]["payload_sha256"],
+                        "binding_sha256": self.expected["source"],
+                        "relay_outcome": report["outcome"], "relay_intent": secrets.token_hex(16),
+                        "state": "uncertain", "comment_id": 0, "intent_at": ds.now_epoch(),
+                    }
+                else:
+                    require(report["state"] == "uncertain" and read_file(marker) == self.marker
+                            and envelope["intent"] == report["intent"]
+                            and positive(envelope["comment_id"])
+                            and positive(envelope["author"])
+                            and envelope["author"] == self.profile["report_actor_id"],
+                            "report readback mismatch")
+                    state["publications"][self.expected["attempt"]].update(
+                        state="linked", comment_id=envelope["comment_id"], linked_at=ds.now_epoch())
+                ds.save_state(self.directory, state)
+                if operation == "report_link":
+                    marker.unlink()
+                    sync_dir(self.directory)
+                report = relay_publication.projection(state, self.expected, row)
+                return {"phase": row["phase"], "target": self.expected, "publication": report}
 
     def action(self, envelope):
         op = envelope["op"]
@@ -392,7 +463,7 @@ class Server:
     def dispatch(self, envelope, raw):
         require(target(envelope["target"]) == self.expected, "unapproved target")
         op = envelope["op"]
-        if op != "status":
+        if op not in {"status", "report_status"}:
             signers = checked_file(self.profile["worker_signers"], anchor=self.fixture)
             verify(envelope, signers, self.directory)
         if op == "start":
@@ -401,10 +472,15 @@ class Server:
                   "abort": {"observation", "remote"},
                   "reject": {"observation", "intent", "reason", "remote"},
                   "settle": {"observation", "intent", "remote"},
-                  "confirm": {"observation", "intent", "remote"}}
+                  "confirm": {"observation", "intent", "remote"}, "report_status": set(),
+                  "report_intent": {"outcome"}, "report_link": {"outcome", "intent", "comment_id", "author"}}
         require(op in fields and not raw and set(envelope) == {"op", "target"} | fields[op],
                 "unsupported relay operation")
-        return self.status() if op == "status" else self.action(envelope)
+        if op == "status":
+            return self.status()
+        if op.startswith("report_"):
+            return self.publication(envelope)
+        return self.action(envelope)
 
 
 def unchanged_remote(expected, row):

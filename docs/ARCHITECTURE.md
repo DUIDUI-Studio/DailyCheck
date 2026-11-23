@@ -1329,7 +1329,10 @@ VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard
 `up → verify → promote → switch → observe`。verify 保留八项检查，生产观察须达到
 600 单调秒。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
 两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及
-阶段回执，供独立对账。安装和 Peter 首次试运行见
+阶段回执，供独立对账。Worker 预先落盘 arm 与 POST 分界。观察期只读探活失败按原蓝路由
+回切，副作用子进程未证实退出时保留护栏。Worker 用独立 report 凭据发布原有 typed PR
+结果。VPS 的 `publications` 先记 intent，Worker 真实读到同作者、正文和 comment ID
+后才链接回执。部署终态和 publication 状态独立。安装和 Peter 首次试运行见
 [本地 Worker 发布 relay](agent-framework/local-worker-relay.md)。
 
 Shadow 边界不依赖 readiness helper：`hosting.py` 统一严格 JSON object 解析与 policy 分类。

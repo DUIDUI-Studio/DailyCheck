@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -26,7 +27,7 @@ from scripts.blue_green.publication_authority import (
     resolve_source_binding,
 )
 from scripts.hosting import github_ff_payload
-from scripts.prod_agent.relay_protocol import COMMAND, SIGNER, canonical, sign
+from scripts.prod_agent.relay_protocol import COMMAND, SIGNER, WORKER_PATH, canonical, sign
 from scripts.prod_agent.relay_vps import ENTRY
 from tests.test_github_transport import ROOT, evidence
 
@@ -68,8 +69,50 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if urlsplit(self.path).path.startswith(ROOT + "/issues/"):
+            return self.report_http()
         assert not self.headers.get("Authorization"), "anonymous Git fetch only"
         super().do_GET()
+
+    def do_POST(self):
+        self.report_http()
+
+    def report_http(self):
+        assert self.headers["Authorization"].startswith("Bearer " + CANARY + "report_")
+        root = Path(self.directory).parent
+        path = urlsplit(self.path).path
+        ledger = root / "comments.json"
+        rows = read(ledger) if ledger.exists() else []
+        options = read(root / "control.json")
+        route = ROOT + "/issues/160/comments"
+        status = 200
+        if self.command == "POST":
+            assert path == route
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["body"]
+            assert CANARY not in body and "923751" not in body and "923752" not in body
+            with (root / "report-posts.log").open("a") as stream:
+                stream.write("POST\n")
+            value = {"id": 456, "body": body, "issue_url": "https://api.github.com" + ROOT + "/issues/160",
+                     "user": {"id": 321}}
+            mode = options.get("report_mode", "ack")
+            if mode not in {"unknown", "bare_ack"}:
+                write(ledger, [*rows, value])
+            if mode in {"unknown", "lost"}:
+                self.close_connection = True
+                return
+            status = 201
+        elif path == route:
+            value = rows
+        elif path == ROOT + "/issues/comments/456" and rows:
+            value = rows[0]
+        else:
+            status, value = 404, {}
+        raw = canonical(value)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
 
 @pytest.fixture
@@ -138,7 +181,7 @@ def configured(root, state, worker, source, seed, ca, base, head, tree, server):
     table = json.loads(json.dumps(evidence()).replace("a" * 40, head).replace("b" * 40, base))
     pr = table[ROOT + "/pulls/160"]["data"]
     pr.update(node_id=ID, merged=False, body="Independent exact-H review")
-    table[ROOT]["data"]["node_id"] = "R_kgDOVl3HNQ"
+    table[ROOT]["data"].update(node_id="R_kgDOVl3HNQ", private=False, visibility="public")
     main = ROOT + "/git/ref/heads/main"
     table[main] = {"data": {"ref": "refs/heads/main", "object": {"sha": base}}}
     table[ROOT + f"/compare/{base}...{head}?per_page=1&page=2"] = {
@@ -168,6 +211,7 @@ def write(path, value):
     stage = root / "stage"
     stage_pin = executable(stage, common + """
 import hashlib
+import signal
 operation = sys.argv[1]
 target = json.load(sys.stdin)
 assert set(os.environ) <= {'PATH', 'LANG', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'}
@@ -185,6 +229,8 @@ elif operation in ('up','verify','promote','switch','rollback'):
             or tuple(Path('bundle.git/objects/pack').glob('*.idx')))
     if operation == control.get('fail_stage'):
         sys.exit(20)
+    if operation == control.get('interrupted_stage'):
+        os.kill(os.getpid(), signal.SIGKILL)
     if operation == 'up':
         while (root / 'hold').exists():
             time.sleep(.05)
@@ -212,6 +258,7 @@ print(json.dumps(dict(request, repo_id=1448986421, installation_id=123, expires=
     curl_pin = executable(curl, common + f"""
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, parse_qs
+import subprocess
 args = sys.argv[1:]
 payload = sys.stdin.read()
 assert {CANARY!r} in payload and {CANARY!r} not in str(args) and {CANARY!r} not in str(os.environ)
@@ -220,6 +267,12 @@ expiry = json.loads((root / (phase + '.expiry')).read_text())
 table_file = root / 'api.json'
 table = json.loads(table_file.read_text())
 url = urlsplit(args[-1])
+if url.path.startswith({ROOT!r} + '/issues/'):
+    args[-1] = {f"https://127.0.0.1:{server.server_port}"!r} + url.path
+    if url.query:
+        args[-1] += '?' + url.query
+    sys.exit(subprocess.run(['/usr/bin/curl', *args[:-1], '--cacert', {str(ca)!r}, args[-1]],
+                            input=payload.encode()).returncode)
 query = parse_qs(url.query)
 path = url.path + ('?page='+query['page'][0] if 'page' in query else '')
 if '/compare/' in path:
@@ -266,7 +319,7 @@ print(row.get('status',200),end='')
     shutil.copytree(REPO / "tests", authority / "tests", dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("__pycache__"))
     vps = {"target": expected, "state": str(state), "seed": str(seed), "authority": str(authority),
-           "worker_signers": str(signers),
+           "worker_signers": str(signers), "report_actor_id": 321,
            "fixture_observation_seconds": 1, "fixture_executor": str(stage),
            "fixture_executor_sha256": stage_pin, "fixture_ca": str(ca),
            "fixture_fetch_url": f"https://127.0.0.1:{unused_port()}/fixture.git"}
@@ -277,7 +330,7 @@ print(row.get('status',200),end='')
                   "fixture_git_url": target_url, "fixture_ca": str(ca),
                   "fixture_ca_sha256": hashlib.sha256(ca.read_bytes()).hexdigest(),
                   "fixture_curl": str(curl), "fixture_curl_sha256": curl_pin, "auth": str(auth),
-                  "auth_sha256": auth_pin, "installation_id": 123,
+                  "auth_sha256": auth_pin, "installation_id": 123, "report_actor_id": 321,
                   "approved_body_sha256": hashlib.sha256(pr["body"].encode()).hexdigest()}
     write(root / "vps.json", vps)
     write(root / "worker.json", worker_cfg)
@@ -293,6 +346,8 @@ res = subprocess.run(cmd, input=raw, capture_output=True, timeout=25)
 assert {CANARY.encode()!r} not in res.stdout + res.stderr
 if raw.startswith(b'{{"bundle_sha256"') and control.get('drop_ssh_receipt'):
     time.sleep(5)
+    sys.exit(1)
+if raw and json.loads(raw.splitlines()[0])['op'] == 'arm' and control.get('drop_arm_receipt'):
     sys.exit(1)
 sys.stdout.buffer.write(res.stdout)
 sys.exit(res.returncode)
@@ -352,7 +407,7 @@ class Fixture:
 
     def request(self, op, raw=b"", target=None, signed=True, **fields):
         envelope = {"op": op, "target": target or self.expected, **fields}
-        if op != "status" and signed:
+        if op not in {"status", "report_status"} and signed:
             envelope["signature"] = sign(envelope, self.root / "sign")
         data = canonical(envelope) + b"\n" + raw
         return subprocess.run([*self.ssh_cli, COMMAND], input=data, capture_output=True, timeout=10)
@@ -402,7 +457,7 @@ def test_merge_and_uncertain_response(relay, merge_mode):
     if success:
         assert row["phase"] == "settled" and row["post_acknowledged"] is (merge_mode == "ack")
         assert row["remote"]["head"] == row["remote"]["main"] == t["head"]
-        assert relay.legacy().returncode == 0
+        assert relay.legacy().returncode == 10
         assert relay.call("reconcile")["receipt"] == row["receipt"]
     else:
         assert relay.call("status")["phase"] == "armed"
@@ -555,7 +610,7 @@ def test_definitive_post_denial_permits_exact_blue_rollback(relay):
     relay.wait("verified")
     row = relay.call("finalize", success=False)
     assert row["phase"] == "rolled_back" and row["rejection"]["reason"] == "http_401"
-    assert relay.legacy().returncode == 0 and len(relay.posts()) == 1
+    assert relay.legacy().returncode == 10 and len(relay.posts()) == 1
     assert relay.call("reconcile", success=False)["receipt"] == row["receipt"]
     assert relay.journal().count("rollback") == 1
 
@@ -575,3 +630,75 @@ def test_dead_staging_owner_leaves_legacy_fence(relay):
     assert relay.legacy().returncode == 10
     assert read(relay.state / "state.json")["worker_relay"]["previous_last_attempt"]["pr"] == 43
     relay.call("start", success=False)
+
+
+def test_profile_uses_physical_system_configuration_path():
+    expected = "/private/etc" if sys.platform == "darwin" else "/etc"
+    assert WORKER_PATH == Path(expected) / "dailycheck-relay/worker.json"
+    assert Path(expected).resolve() == Path(expected)
+
+
+def test_lost_arm_recovers_proven_prepost_failure(relay):
+    relay.options(drop_arm_receipt=True)
+    relay.call("start")
+    relay.wait("verified")
+    relay.call("finalize", success=False)
+    assert relay.call("status")["phase"] == "armed" and not relay.posts()
+    record = read(relay.worker / (relay.expected["attempt"] + ".json"))
+    assert "pre_arm_at" in record and "post_at" not in record
+    result = relay.call("reconcile", success=False)
+    assert result["phase"] == "rolled_back" and result["rejection"]["reason"] == "local_no_post"
+    assert relay.journal().count("rollback") == 1 and not relay.posts()
+
+
+def test_observation_connection_refused_rolls_back_and_publishes_failure(relay):
+    write(relay.root / "vps.json", {**relay.vps, "fixture_observation_port": unused_port()})
+    relay.call("start")
+    result = relay.wait("rolled_back")
+    assert result["failed_stage"] == "observe" and result["target"]["attempt"] == relay.expected["attempt"]
+    assert relay.journal() == ["up", "verify", "promote", "switch", "rollback"] and not relay.posts()
+    assert result["publication"] == {"state": "ready", "comment_id": 0}
+    assert relay.call("report")["publication"] == {"state": "linked", "comment_id": 456}
+    assert "失败" in read(relay.root / "comments.json")[0]["body"]
+
+
+def test_unwaitable_write_stage_cannot_authorize_rollback(relay):
+    relay.options(interrupted_stage="switch")
+    relay.call("start")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        row = relay.call("status")
+        if row.get("process_fence") == "unheld_reconcile":
+            break
+        time.sleep(.1)
+    assert row["phase"] == "staging" and row["process_fence"] == "unheld_reconcile"
+    assert row["journal"][-1]["stage"] == "switch" and "completed_at" not in row["journal"][-1]
+    assert relay.legacy().returncode == 10 and "rollback" not in relay.journal()
+
+
+@pytest.mark.parametrize("mode", ["ack", "lost", "unknown", "bare_ack", "mismatched"])
+def test_public_report_requires_verified_comment_and_never_reposts(relay, mode):
+    relay.options(report_mode=mode)
+    relay.call("start")
+    relay.wait("verified")
+    result = relay.call("finalize")
+    assert result["phase"] == "settled" and result["publication"]["state"] == "ready"
+    assert relay.legacy().returncode == 10
+    assert read(relay.state / "state.json")["generation"] == relay.expected["generation"]
+    attempt_id = relay.expected["attempt"]
+    if mode == "mismatched":
+        state = read(relay.state / "state.json")
+        state["outcomes"][attempt_id]["public_receipt"] = "00000000-0000-0000-0000-000000000000"
+        write(relay.state / "state.json", state)
+        relay.call("report", success=False)
+        assert not (relay.root / "report-posts.log").exists()
+        return
+    success = mode in {"ack", "lost"}
+    for _ in range(2):
+        row = relay.call("report", success=success)
+        assert row["phase"] == "settled"
+        assert row["publication"]["state"] == ("linked" if success else "uncertain")
+    assert (relay.root / "report-posts.log").read_text().splitlines() == ["POST"]
+    publication = read(relay.state / "state.json")["publications"][attempt_id]
+    assert publication["comment_id"] == (456 if success else 0)
+    assert relay.legacy().returncode == (0 if success else 10)

@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -20,7 +21,7 @@ SIGNER = "dailycheck-local-release-worker"
 MAX_CONTROL = 8192
 MAX_BUNDLE = 16 * 1024 * 1024
 STATE_PATH = Path("/etc/dailycheck-relay/vps.json")
-WORKER_PATH = Path("/etc/dailycheck-relay/worker.json")
+WORKER_PATH = Path("/private/etc" if sys.platform == "darwin" else "/etc") / "dailycheck-relay/worker.json"
 SYSTEM_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 
 

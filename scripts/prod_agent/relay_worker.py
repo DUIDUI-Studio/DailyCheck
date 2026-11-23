@@ -12,6 +12,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from scripts.blue_green.deploy_report import (
+    PublicDeployFacts,
+    _payload_digest,
+    publication_marker,
+    render_public,
+)
 from scripts.blue_green.publication_authority import resolve_source_binding
 from scripts.hosting import (
     GITHUB_REPOSITORY_NODE,
@@ -36,6 +42,7 @@ from scripts.prod_agent.relay_protocol import (
     digest,
     hex_id,
     lock_file,
+    positive,
     read_file,
     require,
     save_file,
@@ -126,7 +133,7 @@ class Worker:
                "-o", "ClearAllForwardings=yes", "-o", "ConnectTimeout=8",
                "--", user + "@" + host, COMMAND]
         envelope = {"op": operation, "target": self.expected, **fields}
-        if operation != "status":
+        if operation not in {"status", "report_status"}:
             signing_key = checked_file(p["worker_signing_key"], anchor=self.fixture)
             require(signing_key != key, "separate authority and SSH keys required")
             envelope["signature"] = sign(envelope, signing_key)
@@ -202,13 +209,16 @@ class Worker:
 
     def finalize(self, guard, attempt):
         record = self.record()
-        require("post_at" not in record, "prior write intent requires read-only reconciliation")
+        require("pre_arm_at" not in record and "post_at" not in record,
+                "prior write intent requires read-only reconciliation")
         before = self.ssh("status")
         receipt = self.verified(before, record, {"verified"})
         client, _ = self.client("merge-read")
         require(self.preflight(client) == record["ci"], "approval, CI or protection changed")
         writer, expires = self.client("finalize", AccessRole.FINALIZE)
         require(self.preflight(writer) == record["ci"], "fresh finalization checks failed")
+        record.update(pre_arm_at=int(time.time()), observation=receipt)
+        save_file(self.file, record)
         armed = self.ssh("arm", observation=receipt, ci=record["ci"])
         require(self.verified(armed, record, {"armed"}) == receipt
                 and hex_id(armed["intent"], 32), "unconfirmed write intent")
@@ -249,6 +259,15 @@ class Worker:
     def reconcile(self):
         record = self.record()
         if "definitive_rejection" in record:
+            return self.reject(record)
+        if "pre_arm_at" in record and "post_at" not in record:
+            row = self.ssh("status")
+            receipt = self.verified(row, record, {"armed"})
+            require(receipt == record["observation"] and hex_id(row["intent"], 32)
+                    and row["armed_at"] >= record["pre_arm_at"] - 5,
+                    "lost arm receipt did not match recorded intent")
+            record.update(intent=row["intent"], definitive_rejection="local_no_post")
+            save_file(self.file, record)
             return self.reject(record)
         require("post_at" in record, "qualifying local write intent missing")
         row = self.ssh("status")
@@ -315,10 +334,84 @@ class Worker:
         require(row["phase"] == "rolled_back" and row["live"] is True, "blue rollback unconfirmed")
         return row
 
+    def report(self, guard):
+        self.source()
+        client, _ = self.client("report", AccessRole.REPORT)
+        terminal = self.ssh("status")
+        snapshot = self.ssh("report_status")
+        phase = snapshot["phase"]
+        plan = snapshot["publication"]
+        facts = PublicDeployFacts(**plan["facts"])
+        require(phase == terminal["phase"] and phase in {"settled", "rolled_back"}
+                and terminal.get("live") is True and facts.pr == self.expected["pr"]
+                and facts.sha == self.expected["head"] and facts.receipt == terminal["receipt"]
+                and (facts.rc == 0) == (phase == "settled")
+                and terminal["publication"]["state"] == plan["state"], "report receipt differs")
+        body = render_public(facts)
+        require(plan["outcome"] == digest({"target": self.expected, "payload": _payload_digest(body),
+                                            "receipt": facts.receipt}), "typed report payload differs")
+        remote = self.remote(client, merged=phase == "settled")
+        if phase == "settled":
+            require(remote == terminal["remote"], "merge and deployment receipt differ")
+        repo = client.verify_repository()
+        require(repo.get("private") is False and repo.get("visibility") == "public",
+                "report destination is not the public code repository")
+        url = f"{self.root}/issues/{facts.pr}"
+        route = url + "/comments"
+        actor = self.profile["report_actor_id"]
+        require(positive(actor), "protected report actor required")
+        marker = publication_marker(facts)
+
+        def prior():
+            matches = [x for x in client.pages(route) if marker in str(x.get("body", ""))]
+            require(len(matches) <= 1, "report marker ambiguous")
+            if not matches:
+                return None
+            row = matches[0]
+            require(row.get("body") == body and row.get("issue_url") == client.config.api_url + url
+                    and row.get("user", {}).get("id") == actor, "report readback identity differs")
+            individual = client.get(f"{self.root}/issues/comments/{row['id']}")
+            require(all(row.get(k) == individual.get(k) for k in ("id", "body", "issue_url", "user")),
+                    "report comment changed")
+            return row["id"]
+
+        comment = prior()
+        if plan["state"] == "ready":
+            armed = self.ssh("report_intent", outcome=plan["outcome"])["publication"]
+            readback = self.ssh("report_status")["publication"]
+            require(armed == readback and armed["state"] == "uncertain"
+                    and armed["outcome"] == plan["outcome"] and hex_id(armed["intent"], 32),
+                    "report intent receipt unconfirmed")
+            plan = armed
+            require(self.remote(client, merged=phase == "settled") == remote,
+                    "report source facts changed before publication")
+            # A prior exact marker is sufficient to link. Without it, this
+            # invocation alone may POST after the durable VPS intent readback.
+            comment = prior()
+            if comment is None:
+                try:
+                    client.request("POST", route, {"body": body}, guard_fd=guard)
+                except HostingError:
+                    pass
+                comment = prior()
+        if comment is None:
+            terminal["publication"] = {"state": plan["state"], "comment_id": 0}
+            return terminal
+        if plan["state"] != "linked":
+            require(self.remote(client, merged=phase == "settled") == remote,
+                    "report source facts changed before linking")
+            self.ssh("report_link", outcome=plan["outcome"], intent=plan["intent"],
+                     comment_id=comment, author=actor)
+        terminal = self.ssh("status")
+        require(terminal["phase"] == phase and terminal.get("live") is True
+                and terminal["publication"] == {"state": "linked", "comment_id": comment}
+                and prior() == comment, "linked report not corroborated")
+        return terminal
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("op", choices=("start", "status", "finalize", "reconcile", "abort"))
+    parser.add_argument("op", choices=("start", "status", "finalize", "reconcile", "abort", "report"))
     parser.add_argument("--fixture-profile", type=Path)
     parser.add_argument("--fixture-root")
     args = parser.parse_args()
@@ -333,6 +426,8 @@ def main():
             fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.op == "finalize":
                 output = worker.finalize(guard.fileno(), attempt.fileno())
+            elif args.op == "report":
+                output = worker.report(guard.fileno())
             else:
                 output = getattr(worker, args.op)()
     output["target"] = {k: v for k, v in output["target"].items() if k != "source"}
@@ -341,6 +436,8 @@ def main():
     print(canonical(output).decode())
     if args.op in {"finalize", "reconcile"} and output["phase"] == "rolled_back":
         raise SystemExit(2)
+    if args.op == "report" and output["publication"]["state"] != "linked":
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
