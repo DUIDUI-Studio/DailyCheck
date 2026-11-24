@@ -21,6 +21,8 @@ DailyCheck dev **不跑独立 Docker 容器**,而是部署到 `wdg-data-foundati
 | Flask | http://localhost:8080 | Flask session |
 | MCP HTTP | http://localhost:5100 | Bearer `dev-mcp-token-for-testing` |
 
+开发环境核对候选代码时，记录待验证提交和对照基线的完整 Git SHA，便于把运行结果对应到具体版本。
+
 ## 启动 / 恢复
 
 ```bash
