@@ -1327,7 +1327,8 @@ VPS 入口仅收固定命令、签名阶段动作和
 VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard 在接收时落盘。
 即使 SSH 已退出或 staging 进程丢失，未完成的 attempt 仍挡住旧 release 路径。
 候选对象先经固定匿名 HTTPS 通道核验，或在已批准代理不可达时从同一 attempt
-的 bundle 核验。未配置匿名代理时显式使用 bundle。对象图验证完成后才进入受保护的
+的 bundle 核验。未配置匿名代理时显式使用 bundle。发送端显式打包 H 相对 B 的对象，
+包内 delta 不依赖 B 的对象，接收端仍校验解包对象集与候选图完全一致。验证后才进入受保护的
 `up → verify → promote → switch → observe`。verify 保留八项检查，生产观察须达到
 600 单调秒。relay 的 Check 1 以独立的验证 UID 执行，通过私网和单元挂载屏蔽生产路径。
 它使用由 root 构建的本地 H/B Git 测试视图，保留 Git 常规文件模式。测试进程只能编辑

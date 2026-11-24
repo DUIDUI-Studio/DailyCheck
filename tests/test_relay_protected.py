@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import http.server
 import os
 import subprocess
@@ -14,12 +15,41 @@ from urllib.request import urlopen
 import pytest
 
 from scripts.blue_green import deploy_state as ds
+from scripts.prod_agent import relay_git
 from scripts.prod_agent.relay_pipeline import RelayPipeline, _route
 from scripts.prod_agent.relay_protocol import lock_file
 from scripts.prod_agent.relay_vps import Server, StageFailure
 from tests.blue_green_testenv import install_fake_systemctl
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_incremental_bundle_does_not_pack_base_delta_objects(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    relay_git.git(repo, "init", "--template=")
+    payload = hashlib.shake_256(b"baseline payload").digest(128 * 1024)
+    path = repo / "payload.bin"
+
+    def commit(data, message):
+        path.write_bytes(data)
+        relay_git.git(repo, "add", path.name)
+        relay_git.git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                      "commit", "-qm", message)
+        return relay_git.git(repo, "rev-parse", "HEAD").strip().decode()
+
+    base = commit(payload, "base")
+    head = commit(payload[:-5] + b"newer", "candidate")
+    expected = {"base": base, "head": head, "ref": "refs/heads/candidate",
+                "tree": relay_git.git(repo, "rev-parse", "HEAD^{tree}").strip().decode()}
+    seed = relay_git.make_store(tmp_path / "seed.git")
+    relay_git.git(repo, "pack-objects", "--revs", str(seed / "objects/pack/pack"),
+                  input=(base + "\n").encode())
+    receiver = relay_git.make_store(tmp_path / "receiver.git", seed)
+    data = relay_git.make_bundle(repo, tmp_path / "outgoing.bundle", expected)
+
+    relay_git.import_bundle(receiver, tmp_path / "incoming.bundle", data, expected,
+                            hashlib.sha256(data).hexdigest())
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="real Linux error and shell semantics")

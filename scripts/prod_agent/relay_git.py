@@ -23,7 +23,7 @@ def _limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_EXPANDED, MAX_EXPANDED))
 
 
-def git(repo, *args, network=False, ca=None, proxy=None, input=None):
+def git(repo, *args, network=False, ca=None, proxy=None, input=None, output=None):
     env = {**GIT_ENV, "GIT_ALLOW_PROTOCOL": "https" if network else ""}
     command = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                "-c", "credential.helper=", "-c", "http.followRedirects=false",
@@ -34,17 +34,18 @@ def git(repo, *args, network=False, ca=None, proxy=None, input=None):
         command += ["-c", "http.proxy=" + proxy]
     command += ["-C", str(repo), *args]
     stdin = subprocess.DEVNULL if input is None else subprocess.PIPE
-    with subprocess.Popen(command, env=env, stdin=stdin, stdout=subprocess.PIPE,
+    stdout = subprocess.PIPE if output is None else output
+    with subprocess.Popen(command, env=env, stdin=stdin, stdout=stdout,
                           stderr=subprocess.PIPE, start_new_session=True, preexec_fn=_limits) as child:
         try:
-            output, error = child.communicate(input, timeout=90)
+            result, error = child.communicate(input, timeout=90)
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.communicate()
             raise
         if child.returncode:
             raise subprocess.CalledProcessError(child.returncode, args, stderr=error)
-    return output
+    return result
 
 
 def make_store(path, seed=None):
@@ -97,9 +98,17 @@ def fetch(repo, expected, *, url=REMOTE, fixture_root=None, ca=None, proxy=None)
 
 
 def make_bundle(repo, path, expected):
-    git(repo, "update-ref", expected["ref"], expected["head"])
-    git(repo, "bundle", "create", "--version=2", str(path),
-        expected["ref"], "^" + expected["base"])
+    base, head, ref = (expected[key] for key in ("base", "head", "ref"))
+    object_ids = git(repo, "rev-list", "--objects", "--no-object-names", head, "^" + base)
+    require(0 < object_ids.count(b"\n") <= MAX_OBJECTS, "bundle object count")
+    # Use a full pack of the incremental object set. A thin pack can depend on
+    # B for delta bases, which Git appends to the installed pack during unbundle.
+    header = f"# v2 git bundle\n-{base} approved base\n{head} {ref}\n\n".encode("ascii")
+    with path.open("xb") as stream:
+        stream.write(header)
+        stream.flush()
+        git(repo, "pack-objects", "--stdout", "--no-reuse-delta", input=object_ids, output=stream)
+    require(path.stat().st_size <= MAX_BUNDLE, "bundle size")
     raw = path.read_bytes()
     bundle_header(raw, expected)
     return raw
