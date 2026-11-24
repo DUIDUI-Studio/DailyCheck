@@ -38,6 +38,7 @@ from pathlib import Path
 
 import pytest
 from werkzeug.security import generate_password_hash
+from werkzeug.serving import make_server
 
 from tests import blue_green_testenv
 from tests.conftest import candidate_python_env
@@ -707,21 +708,26 @@ class _FakeDC(http.server.BaseHTTPRequestHandler):
 
     HEALTH_STATUS = 200
     HEALTH_REDIRECT = ""
+    INVENTORY_REDIRECT = ""
 
     def log_message(self, *args):  # 静默
         pass
 
-    def _page(self, body: str, status: int = 200) -> None:
+    def _page(self, body: str, status: int = 200, cookie: str | None = None) -> None:
         data = body.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie + "; Secure; HttpOnly; Path=/")
         self.end_headers()
         self.wfile.write(data)
 
-    def _redirect(self, location: str) -> None:
+    def _redirect(self, location: str, cookie: str | None = None) -> None:
         self.send_response(302)
         self.send_header("Location", location)
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie + "; Secure; HttpOnly; Path=/")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -731,8 +737,11 @@ class _FakeDC(http.server.BaseHTTPRequestHandler):
         return dict(urllib.parse.parse_qsl(raw))
 
     def do_GET(self):
-        if self.path == "/login":
-            self._page('<form><input type="hidden" name="csrf_token" value="T1"></form>')
+        if urllib.parse.urlsplit(self.path).path == "/login":
+            self._page('<form><input type="hidden" name="csrf_token" value="T1"></form>',
+                       cookie="session=login")
+        elif self.headers.get("Cookie") != "session=authenticated":
+            self._redirect("/login")
         elif self.path == "/select-warehouse":
             self._page(
                 '<form action="/select-warehouse/1" method="post">'
@@ -741,7 +750,10 @@ class _FakeDC(http.server.BaseHTTPRequestHandler):
         elif self.path == "/land":
             self._page("<html>land</html>")
         elif self.path == "/inventory":
-            self._page("<html>inventory</html>")
+            if self.INVENTORY_REDIRECT:
+                self._redirect(self.INVENTORY_REDIRECT)
+            else:
+                self._page("<html>inventory</html>")
         elif self.path == "/report/health":
             if self.HEALTH_REDIRECT:
                 self._redirect(self.HEALTH_REDIRECT)
@@ -753,14 +765,14 @@ class _FakeDC(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         form = self._form()
         if self.path == "/login":
-            if form.get("csrf_token") != "T1":
+            if form.get("csrf_token") != "T1" or self.headers.get("Cookie") != "session=login":
                 self._page("csrf", 400)
             elif form.get("username") == "tester" and form.get("password") == "pw":
-                self._redirect("/select-warehouse")
+                self._redirect("/select-warehouse", cookie="session=authenticated")
             else:
                 self._page("bad login", 401)
         elif self.path == "/select-warehouse/1":
-            if form.get("csrf_token") != "T1":
+            if form.get("csrf_token") != "T1" or self.headers.get("Cookie") != "session=authenticated":
                 self._page("csrf", 400)
             else:
                 self._redirect("/land")
@@ -821,6 +833,28 @@ def test_sim_user_full_flow_passes(fake_dc_server):
         assert path_name in r.stdout
 
 
+def test_sim_user_real_flask_secure_session_and_csrf(logged_client, tmp_path):
+    client, _ = logged_client
+    app = client.application
+    app.config.update(SESSION_COOKIE_SECURE=True, WTF_CSRF_FORCE_ENABLED=True, DRY_RUN=True)
+    with sqlite3.connect(tmp_path / "master.db") as connection:
+        connection.execute("UPDATE users SET password_hash=? WHERE username='admin'",
+                           (generate_password_hash("synthetic"),))
+
+    server = make_server("127.0.0.1", 0, app)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        result = _run_sim_user(f"http://localhost:{server.server_port}",
+                               {"SIM_USER_USER": "admin", "SIM_USER_PASSWORD": "synthetic"})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "5 关键路径全通" in result.stdout
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_sim_user_health_path_catches_500(fake_dc_factory):
     """Issue #38 回归网自证：/report/health 500 必须让 check 2 真红。
 
@@ -850,6 +884,15 @@ def test_sim_user_health_path_no_false_pass_on_login_redirect(fake_dc_factory):
     r = _run_sim_user(base, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
     assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert "/login" in r.stdout
+
+
+def test_sim_user_login_next_query_is_not_route_success(fake_dc_factory):
+    base = fake_dc_factory(INVENTORY_REDIRECT="/login?next=/inventory",
+                           HEALTH_REDIRECT="/login?next=/report/health")
+    r = _run_sim_user(base, {"SIM_USER_USER": "tester", "SIM_USER_PASSWORD": "pw"})
+    assert r.returncode == 1
+    assert "路径4 库存页可达" in r.stdout and "路径5 库存健康报表可达" in r.stdout
+    assert "❌ 路径4" in r.stdout and "❌ 路径5" in r.stdout
 
 
 def test_sim_user_bad_credentials_fails(fake_dc_server):

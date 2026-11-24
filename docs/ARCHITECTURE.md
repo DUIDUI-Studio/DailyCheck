@@ -185,7 +185,7 @@ Prod 专用（dev 不涉及）。`scripts/blue_green/` 6 脚本：`up.sh`（起�
 - **`verify.sh` 禁用 `set -e`** —— check 失败由 `OVERALL_PASS` 跟踪，`trap _write_report EXIT` 兜底保证任何失败路径都写报告（Issue #24 Bug B）。
 - **check 1 全量与测试隔离（Issue #103）** —— 包含 MCP 目录，pytest 的 `DAILYCHECK_DB_DIR` 与 basetemp 落独立临时目录；结束后清理测试目录，并原样返回零新增门禁结果。部署数据库隔离证据与其余七项验证保持原有语义。
 - **check 1 禁止兜底** —— 真跑 pytest（`-rf` 产出 FAILED 行）+ 复用 `scripts/check_known_failures.py` 判「失败集 ⊆ known_failures.txt」，不允许把失败兜成 PASS。
-- **check 2 禁止静默跳过** —— `scripts/playwright/sim_user.py`（纯 stdlib）真走 登录→选仓→总览→库存→健康报表 5 路径（含 CSRF 回填）；凭据走 `SIM_USER_USER` / `SIM_USER_PASSWORD` 环境变量，缺失直接 FAIL。末条 `/report/health`（Issue #38 补）需 **manager+ 账号**（平台 admin 放行），403 按失败处理不降级；同时校验落点须停在 `/report/health`——会话丢失会 302 到 `/login` 再返回 200，只看 status 会假绿。
+- **check 2 禁止静默跳过** —— `scripts/playwright/sim_user.py`（统一 curl 回环会话）真走 登录→选仓→总览→库存→健康报表 5 路径（含 CSRF 回填）；凭据走 `SIM_USER_USER` / `SIM_USER_PASSWORD` 环境变量，缺失直接 FAIL。末条 `/report/health`（Issue #38 补）需 **manager+ 账号**（平台 admin 放行），403 按失败处理不降级；同时校验落点须停在 `/report/health`——会话丢失会 302 到 `/login` 再返回 200，只看 status 会假绿。
 - **check 2 凭据必须 provision 进「绿」库（Issue #34）** —— sim_user 的 HTTP 凭据校验发生在**绿进程持有的库**上，而 verify.sh 跑的 wrapper shell 不在绿 unit 环境里。因此 `_ensure_sim_user_in_green_db()` 必须用**显式 `DAILYCHECK_DB_DIR=${GREEN_DB}` 覆盖**（子 shell 内赋值，禁止继承调用者环境）幂等 ensure 账号，且必须带 **`--admin`**（非 admin 用户在选仓页只看到 `warehouse_users` 绑定的仓，而 create-user 不写绑定 → 空选仓页 → 探针路径 3 必失败）；探针前再复核「绿库有该账号 + 密码匹配 + 未停用（`is_active`）+ 有可见仓」（覆盖 up.sh 快照里同名不同密码 / 已停用 / 非 admin 账号的情形），并在**写库之前**先用「路径形态 + inode 相异」双闸自证 `${GREEN_DB}` 不是蓝库（check 7 排在 check 2 之后，误配时否则会先把一个已知口令的 admin 写进 production 真库）。**裸跑 `flask create-user` 会写蓝库（production 真库）** —— 绿库查无此人导致路径 2 恒 401，实测见 Issue #34；任何新增的「verify 里要碰 DB 的步骤」都必须照此 pin env 到目标侧库。
 - **verify 探针凭据可移植 + 失败明细可读（Issue #123）** —— `deploy_pipeline.sh` 自动生成的探针密码必须带固定字母前缀：`secrets.token_urlsafe(18)` 约 1.5% 以 `-` 开头，会被 click 当成选项（`Error: No such option '-i'`）→ check 2 假红 → 整次部署 rc=21 并被回退（#119 实证）；`verify.sh` 的 `create-user` 一律使用 `--` 选项终止符，运营显式传入 `--sim-pass -xxx` 同样安全。verify 失败时 `_emit_failure_summary` 向 stdout 输出 `FAILED_CHECK=<n>` + 检查名 + 该 check 日志尾 3 行，使 pipeline 日志与 `deploy_report.py` 的 40 行 tail 能指出具体失败 check，而不是只有 `rc=21 / undetermined`。由 `tests/test_verify_probe_portability.py`（6 用例：生成器 300 次首字符断言、真实 Flask CLI 带/不带 `--` 的正反证、失败明细抽取真跑）钉住，两处变异（去掉字母前缀 / 去掉 `--` 终止符）各自打红。
 - **DB 隔离（Issue #28）** —— 蓝绿不许共享物理库：`config.py` 在 import 期读 `DAILYCHECK_DB_DIR` env（Flask 与 MCP 同源覆盖）；`up.sh` 从真库 `${APP_DIR}/db` 用 `cp -aL` 解软链拷独立副本，且守卫绿 unit 必须声明 `DAILYCHECK_DB_DIR` 与拷贝目标一致，否则拒启；`verify.sh` check 7 取三重证据（绿进程 environ 声明 + master.db 非软链 + 蓝/绿 inode 相异）。**改部署布局（软链/数据目录迁移）必须保持这三个语义**。**语义边界（勿与「绿转正」冲突）**：本条约束的是**验证期**（绿以 `DRY_RUN=true` 承接 0 流量）；一旦按下方 DRY_RUN 铁律走「绿转正」承接生产流量，绿必须把 `DAILYCHECK_DB_DIR` 改指生产真库 `${APP_DIR}/db` —— 转正后蓝绿同库是**设计预期**（单写者：蓝 standby 不写），此时 check 7 的「inode 相异」不再适用，写安全改由 DRY_RUN 守卫保证；转正后重跑 `verify.sh` 若 check 7 报红，属预期而非回归。**同源影响 check 2**：`_ensure_sim_user_in_green_db()` 之所以能靠「路径形态 + inode 相异」双闸拒绝写蓝库，前提同样是验证期的库隔离；转正后该前提消失（`GREEN_DB` 变量值仍在、实际库已是真库，双闸退化为假保证）。因此**转正后如需复跑 `verify.sh`，应先在蓝绿框架下回蓝（`switch.sh blue 100`）并恢复验证期布局**，或在明确「已知同库」的前提下判读 check 2 / check 7 的红。
@@ -1315,6 +1315,40 @@ Gitea 既有各入口的凭据兼容路径继续保留，不能用 GitHub 配置
 `merge_readiness.py` 保留 Gitea 入口；现有 reducer 对 GitHub 证据强制 `ready=false`，
 `deploy_merge.py` 在缺省 shadow lane 明确拒绝 GitHub finalization；ordinary opt-in 见上，
 不引入 merge queue / group delivery。
+
+**Local Worker release relay（#41，手动入口）**。Worker 绑定同仓 PR 身份、H、B、ref、
+树、source digest 和新一代 attempt，复用 exact-H Actions 证据及已装 ordinary 的
+classic protection 和 review 约束。阶段凭据由本地受保护的 authority 签发，在
+preflight、merge-read、finalize 或对账时使用。Worker 将 GitHub 令牌视为不透明的
+Bearer 值，只校验传输字符和消息边界，支持 GitHub App 旧版和新版安装令牌。
+VPS 入口仅收固定命令、签名阶段动作和
+有界单 ref incremental bundle。SSH host key、传输 key 和动作签名分别校验。
+
+VPS 与既有生产流程共用 `.attempt.lock` 和 `.state.lock`。持久 guard 在接收时落盘。
+即使 SSH 已退出或 staging 进程丢失，未完成的 attempt 仍挡住旧 release 路径。
+候选对象先经固定匿名 HTTPS 通道核验，或在已批准代理不可达时从同一 attempt
+的 bundle 核验。未配置匿名代理时显式使用 bundle。发送端显式打包 H 相对 B 的对象，
+包内 delta 不依赖 B 的对象，接收端仍校验解包对象集与候选图完全一致。验证后才进入受保护的
+`up → verify → promote → switch → observe`。verify 保留八项检查，生产观察须达到
+600 单调秒。当前 GitHub relay 在启用受保护的 hosted verification 后，Check 1 核对同一 H 的双 CI 全量证据，不重复运行全量。报告保留「集成测试」标题关键词以兼容既有报告契约。Check 2 按变更范围执行，纯开发文档不适用，其他现场检查保留。所有发布入口统一调用 curl 绿组回环登录探针，固定 localhost 会话；移除旧 urllib 客户端及环境变量分支。验证成功以实际 URL 路径为准，登录页 next 查询参数不得误判为目标页。未启用 hosted verification 的 legacy 路径仍按原 Check 1 执行。旧方案的 Check 1 以独立的验证 UID 执行，通过私网和单元挂载屏蔽生产路径。
+它使用由 root 构建的本地 H/B Git 测试视图，保留 Git 常规文件模式。测试进程只能编辑
+自己复制的测试文件。绿 Web 和 MCP 在预演时使用该验证 UID 和独立库副本。Check 6
+读回两个运行进程、真实挂载和副本身份。正式转正时才恢复服务 UID 和原库路径。实例目录保持 literal 只读；OpenSSH 根权限测试走单独的离线精确 ID 门禁，
+要求每个已批准用例的 setup、call、teardown 均通过。精确清单也包含外仓写路径、绿预演与
+正式挂载分隔，以及实际落蓝才停绿的三项回归用例。
+观测与固定切换共用生产蓝、绿 unit 名称，校验进程实际身份、两路探活及各自落点、
+工作目录和批准数据在进程挂载视图内的物理身份。绿 H 转正后、切流前校验挂载可写性。Worker 以 live H/B 和 VPS 观察回读为依据，最多提交一次精确 atomic FF。
+受保护 Web H 的管理审计使用 profile 明确绑定的独立 JSONL 文件。以 Web UID 检查追加权限，
+切流前再核对实际进程的路径和 inode。Check 1 使用独立临时审计文件；普通部署沿用既有默认落点。
+两端回读一致后才提交部署锚点和 native outcome。持久保留已签发 intent、旧路由及
+阶段回执，供独立对账。Worker 预先落盘 arm 与 POST 分界。观察期只读探活失败按原蓝路由
+回切，先以实际请求核对 Web 和 MCP 均落到原蓝进程，再停两个绿服务。绿未确认退出或
+停后蓝未通过复核时保留护栏。Linux 切换回归在实际本地 HTTP 入口核对两条蓝落点，再检查停绿顺序。
+Worker 用当前授权的 report 身份发布原有 typed PR
+结果，单独记录 HTTP 错误和明确拒绝。VPS 的 `publications` 先记 intent，Worker 真实读到同作者、正文和 comment ID
+后才链接回执。部署终态和 publication 状态独立。安装和 Peter 首次试运行见
+[本地 Worker 发布 relay](agent-framework/local-worker-relay.md)。
+
 Shadow 边界不依赖 readiness helper：`hosting.py` 统一严格 JSON object 解析与 policy 分类。
 raw sender、shell ingress/output guard、reducer 和存储行共用重复键、finite number、UTF-8、
 1 MiB、深度 100 保护；body 错误与 hosting config 错误分离，不能把解析失败当成缺省输入。
@@ -1590,13 +1624,21 @@ capabilities 并切换低身份；可信 launcher 仅暂留 SETUID/SETGID/SETPCA
 受限写路径；原 unit 另存私有备份，up/promote 的 DB 隔离、备份/恢复及 switch 回滚继续执行。
 应用环境边界由 `render_unit` 与 G EnvironmentFile validator 共用同一固定契约：必填
 `DAILYCHECK_SECRET_KEY`/`DAILYCHECK_MCP_TOKEN` 保持未加引号的 `[A-Za-z0-9_-]{32,200}`，
-MCP token 必须等于 protected health token 且不同于 GitHub read token；仅允许十三个已测量
-业务键（`DAILYCHECK_MULTI_WAREHOUSE`、六个 `DAILYCHECK_WMS_*`、`FEEDBACK_GITEA_TOKEN`、
-`FEEDBACK_LLM_*` 三项与 `WECOM_*_WEBHOOK` 两项），以 `KEY='value'` 单引号形式逐字传递
+MCP token 必须等于 protected health token 且不同于 GitHub read token。可选业务键包括
+`DAILYCHECK_MULTI_WAREHOUSE`、`DAILYCHECK_ORDER_CHANGES`、`DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH`、
+六个 `DAILYCHECK_WMS_*`、`FEEDBACK_GITEA_TOKEN`、`FEEDBACK_LLM_*` 三项与 `WECOM_*_WEBHOOK` 两项，
+以 `KEY='value'` 单引号形式逐字传递
 （无转义处理）。记录仅按 LF 或 CRLF 分隔；裸 CR、VT、FF、FS、GS、RS 及其他 ASCII
 控制字节在推导键存在性前拒绝，不能充当隐藏记录边界。角色投影固定不可由调用方选择：app unit
-得到十三项，MCP unit 只得到实测
-六个 WMS 名；feedback/LLM/webhook 与多仓键不进入 MCP/controller/helper/test 环境。
+得到已配置的业务键，MCP unit 只得到六个 WMS 名。订单变更开关和发货导出配置仅传给 Web。
+导出配置由 root 保存在模式为 0700 的 `/etc/dailycheck-application` 目录。仅 Web unit
+将单链接只读配置绑定到其私有挂载命名空间的 `/run/dailycheck-web/shipment_export_profile.json`。
+文件由专用 Web 组只读，该组与 MCP 和发布前测试使用的主组不同。Web 以专用主组启动，
+且不继承辅助组。Relay 在同一轮观测中校验各 unit 的实际 GID、Web 的配置值和只读文件
+身份，并检查 MCP 未收到这两个 Web 配置。
+Web 审计日志匹配 Web 的实际 UID/GID。Check 1 和绿预演各使用独立临时审计日志。
+Relay 只为物理身份验证匹配的外仓链接增加其实际父目录的 systemd 写路径，以便 SQLite
+维护 WAL/SHM。数据库文件和目录的实际访问仍由正式文件权限控制。
 `FEEDBACK_GITEA_TOKEN` 仅为应用建单凭据，不放行任何 Gitea Prod/merge、GitHub/App、read 或
 MCP health token 的复用。缺失的可选键不会写入 `env -i` 固定词表，因此应用源码默认值
 （含数值 WMS 默认、关闭的 feedback/webhook 通道与多仓关闭）保持不变；未知/重复/畸形键、
@@ -3767,8 +3809,8 @@ H13 的 CI 世界可写祖先不是产品缺陷：`render-preparation` 测试为
 不带 anchor 的既有拒绝行为不变，另有一条根内可写组件拒绝控制。
 
 `tests/test_native_application_environment.py` 锁定 native application EnvironmentFile
-契约：原始两键文件仍可用；十三个已测量可选键以单引号逐字传递，缺失时不进入 `env -i`
-词表；app 得到全部十三项而 MCP 只得到六个 WMS 名（feedback/LLM/webhook/多仓键不跨角色）；
+契约：原始两键文件仍可用。可选键以单引号逐字传递，缺失时不进入 `env -i`
+词表。测试核对 Web 收到订单变更开关及私有只读导出挂载，MCP 只得到六个 WMS 名。
 未知/重复/控制键、畸形与非 ASCII、非 LF/CRLF 分隔符、端口/长度边界及值诊断不泄漏均拒绝；真实 lower child
 观察（setpriv 在 macOS 移除）保留合成口令/URL 标点与空格，并确认 control env/fence FD
 不继承。该 fixture 只模拟文档化的 `${FOO}` 单参数展开，不证明 systemd 执行。

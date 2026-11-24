@@ -31,6 +31,7 @@ from scripts.prod_agent.native_pipeline import (
     literal_tree,
     parse_application_environment,
     render_unit,
+    shipment_export_web_gid,
     write_literal_release,
 )
 from scripts.prod_agent.native_ports import (
@@ -328,6 +329,7 @@ def _baseline_units(plan: PreparationPlan) -> list[dict]:
     private = " ".join(str(path) for path in plan.private_paths)
     application_environment = parse_application_environment(
         read_protected(plan.app_environment_file, os.geteuid()))
+    web_gid = shipment_export_web_gid(application_environment, plan.app_gid, owner=os.geteuid())
     recipes = (
         ("dailycheck.service", "DailyCheck production app (protected baseline)",
          8090, plan.source_db, "false", plan.blue_access_log, True, False),
@@ -354,7 +356,7 @@ def _baseline_units(plan: PreparationPlan) -> list[dict]:
                                ("DAILYCHECK_DB_DIR", str(database))],
             read_write_paths=str(database) + (f" {access_log}" if access_log else ""),
             inaccessible_paths=private, module=module, python=str(plan.app_python),
-            app_uid=plan.app_uid, app_gid=plan.app_gid,
+            app_uid=plan.app_uid, app_gid=web_gid if is_app else plan.app_gid,
             application_role=role,
             application_inputs=tuple(
                 key for key in APPLICATION_ROLE_KEYS[role] if key in application_environment),
