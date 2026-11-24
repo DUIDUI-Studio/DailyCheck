@@ -350,15 +350,21 @@ def probe_health(policy, role: str, url: str) -> None:
 
 
 class SystemdObserver:
+    def __init__(self, *, exact_unit=False, expected_gids=None):
+        self.exact_unit = exact_unit
+        self.expected_gids = expected_gids or {}
+
     def observe(self, policy):
         if sys.platform != "linux":
             raise ValueError("Linux runtime boundary unavailable")
         result = []
         for unit in policy.value["units"]:
             raw = subprocess.check_output(["/usr/bin/systemctl", "show", unit, "--no-pager",
-                "--property=MainPID,ActiveState,SubState,WorkingDirectory,ControlGroup,NoNewPrivileges"],
+                "--property=Id,LoadState,MainPID,ActiveState,SubState,WorkingDirectory,ControlGroup,NoNewPrivileges"],
                 env={"PATH": "/usr/bin:/bin", "LANG": "C"}, text=True, timeout=10)
             fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+            if self.exact_unit and (fields.get("Id") != unit or fields.get("LoadState") != "loaded"):
+                raise ValueError("runtime canonical unit mismatch")
             pid = int(fields["MainPID"])
             if fields.get("ActiveState") != "active" or fields.get("SubState") != "running" or pid <= 1:
                 raise ValueError("runtime unit not running")
@@ -375,6 +381,11 @@ class SystemdObserver:
                     or not re.search(r"^Groups:[ \t]*$", status, re.M)
                     or not any(row.endswith(":" + fields["ControlGroup"]) for row in cgroup)):
                 raise ValueError("runtime UID/cgroup/checkout mismatch")
+            if self.exact_unit:
+                gids = re.search(r"^Gid:\s+(.+)$", status, re.M)
+                expected_gid = self.expected_gids.get(unit, policy.value["pipeline"]["app_gid"])
+                if not gids or set(map(int, gids[1].split())) != {expected_gid}:
+                    raise ValueError("runtime GID mismatch")
             result.append({"unit": unit, "pid": pid, "uid": uids[0], "cwd": cwd,
                            "exe": exe, "start_ticks": start, "cgroup": fields["ControlGroup"]})
         return result

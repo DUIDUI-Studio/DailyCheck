@@ -47,6 +47,9 @@ RELEASE_MODES = {"100644": 0o444, "100755": 0o555}
 RELEASE_EXCLUDED_PARTS = frozenset({".git", ".venv"})
 CAPABILITY_BOUNDING_SET = "CAP_SETUID CAP_SETGID CAP_SETPCAP"
 REQUIRED_APPLICATION_KEYS = ("DAILYCHECK_SECRET_KEY", "DAILYCHECK_MCP_TOKEN")
+SHIPMENT_EXPORT_PROFILE_KEY = "DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH"
+SHIPMENT_EXPORT_PROFILE_SOURCE = Path("/etc/dailycheck-application/shipment_export_profile.json")
+SHIPMENT_EXPORT_WEB_PROFILE = Path("/run/dailycheck-web/shipment_export_profile.json")
 WMS_APPLICATION_KEYS = (
     "DAILYCHECK_WMS_HOST",
     "DAILYCHECK_WMS_PORT",
@@ -57,6 +60,8 @@ WMS_APPLICATION_KEYS = (
 )
 APP_APPLICATION_KEYS = (
     "DAILYCHECK_MULTI_WAREHOUSE",
+    "DAILYCHECK_ORDER_CHANGES",
+    SHIPMENT_EXPORT_PROFILE_KEY,
     *WMS_APPLICATION_KEYS,
     "FEEDBACK_GITEA_TOKEN",
     "FEEDBACK_LLM_API_KEY",
@@ -75,6 +80,8 @@ _APPLICATION_CREDENTIAL = re.compile(r"[A-Za-z0-9_.:@+/=-]{8,256}")
 _APPLICATION_URL = re.compile(r"[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,512}")
 _OPTIONAL_VALUE_FORMATS = {
     "DAILYCHECK_MULTI_WAREHOUSE": re.compile(r"(?i:1|true|yes|on|0|false|no|off)"),
+    "DAILYCHECK_ORDER_CHANGES": re.compile(r"(?i:1|true|yes|0|false|no)"),
+    SHIPMENT_EXPORT_PROFILE_KEY: re.compile(re.escape(str(SHIPMENT_EXPORT_WEB_PROFILE))),
     "DAILYCHECK_WMS_HOST": re.compile(r"[A-Za-z0-9._:-]{1,255}"),
     "DAILYCHECK_WMS_PORT": re.compile(r"[0-9]{1,5}"),
     "DAILYCHECK_WMS_USER": re.compile(r"[A-Za-z0-9_.@/\\-]{1,128}"),
@@ -151,6 +158,19 @@ def validate_application_environment(raw: bytes, *, mcp_health_token: str,
                    for key in APPLICATION_CREDENTIAL_KEYS)):
         raise ValueError("separate application environment required")
     return values
+
+
+def shipment_export_web_gid(environment: dict[str, str], app_gid: int, *,
+                            owner: int = 0, anchor: Path | None = None) -> int:
+    if SHIPMENT_EXPORT_PROFILE_KEY not in environment:
+        return app_gid
+    profile = protected_path(SHIPMENT_EXPORT_PROFILE_SOURCE, owner, anchor=anchor)
+    info = profile.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_gid in {0, app_gid} or stat.S_IMODE(info.st_mode) != 0o440
+            or stat.S_IMODE(profile.parent.stat().st_mode) != 0o700):
+        raise ValueError("protected shipment export profile and separate Web group required")
+    return info.st_gid
 
 
 def application_runtime(python: Path) -> dict:
@@ -263,16 +283,21 @@ def render_unit(*, description: str, working_directory: str, environment_file: s
                 environment_lines: list[tuple[str, str]], read_write_paths: str,
                 inaccessible_paths: str, module: str, python: str, app_uid: int, app_gid: int,
                 application_role: str, application_inputs: tuple[str, ...] = (),
+                admin_audit_log: Path | None = None,
                 exec_start_pre: tuple[str, ...] = (), unit_conditions: tuple[str, ...] = (),
                 user: int = 0, group: int = 0,
                 capability_bounding_set: str = CAPABILITY_BOUNDING_SET,
                 protect_home: str = "yes", protect_system: str = "strict",
-                private_tmp: str = "yes", restart: str = "on-failure") -> str:
+                private_tmp: str = "yes", restart: str = "on-failure",
+                protect_proc: str = "default") -> str:
     """Fixed protected unit recipe; no caller-supplied unit/command is consumed."""
     allowed = APPLICATION_ROLE_KEYS.get(application_role)
     if (allowed is None or len(set(application_inputs)) != len(application_inputs)
             or not set(application_inputs) <= set(allowed)):
         raise ValueError("invalid application input selection")
+    profile_mount = ""
+    if SHIPMENT_EXPORT_PROFILE_KEY in application_inputs:
+        profile_mount = f"BindReadOnlyPaths={SHIPMENT_EXPORT_PROFILE_SOURCE}:{SHIPMENT_EXPORT_WEB_PROFILE}\n"
     conditions = "".join(f"{line}\n" for line in unit_conditions)
     pretests = "".join(f"ExecStartPre={line}\n" for line in exec_start_pre)
     environment = "".join(f"Environment={key}={value}\n" for key, value in environment_lines)
@@ -281,6 +306,12 @@ def render_unit(*, description: str, working_directory: str, environment_file: s
     # projection keeps app-only feedback/webhook credentials out of MCP units.
     application_environment = "".join(
         f" {key}=${{{key}}}" for key in allowed if key in application_inputs)
+    if admin_audit_log is not None:
+        if application_role != "app" or not re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(admin_audit_log)):
+            raise ValueError("invalid Web admin audit path")
+        environment += f"Environment=DAILYCHECK_ADMIN_AUDIT_LOG={admin_audit_log}\n"
+        application_environment += " DAILYCHECK_ADMIN_AUDIT_LOG=${DAILYCHECK_ADMIN_AUDIT_LOG}"
+        read_write_paths += f" {admin_audit_log}"
     exec_environment = ("PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 "
                         "DAILYCHECK_ENV=production DRY_RUN=${DRY_RUN} "
                         "DAILYCHECK_DB_DIR=${DAILYCHECK_DB_DIR} "
@@ -301,11 +332,12 @@ AmbientCapabilities=
 ProtectSystem={protect_system}
 ProtectHome={protect_home}
 PrivateTmp={private_tmp}
+ProtectProc={protect_proc}
 InaccessiblePaths={inaccessible_paths}
 ReadWritePaths={read_write_paths}
 WorkingDirectory={working_directory}
 {environment}EnvironmentFile={environment_file}
-{pretests}ExecStart=/usr/bin/env -i {exec_environment} /usr/bin/setpriv --reuid={app_uid} --regid={app_gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs {python} -B -m {module}
+{profile_mount}{pretests}ExecStart=/usr/bin/env -i {exec_environment} /usr/bin/setpriv --reuid={app_uid} --regid={app_gid} --clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs {python} -B -m {module}
 Restart={restart}
 [Install]
 WantedBy=multi-user.target
@@ -335,43 +367,33 @@ def validate_dryrun(before, after, response, journal):
         raise ValueError("green intended UPDATE not proven isolated")
 
 
-# This imports only stdlib and runs under the application UID. It makes an
-# intended UPDATE to the disposable green verification user's password.
+# The separate native dry-run evidence path shares the same pinned local
+# session client. The current relay uses read-only preview-storage checks.
 DRYRUN_HTTP = r'''
-import html,http.cookiejar,json,os,re,urllib.parse,urllib.request
-opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-base='http://127.0.0.1:8091'
-def get(path):
- with opener.open(base+path,timeout=15) as r:
-  if r.status!=200: raise ValueError('green page unavailable')
-  return r.read(2*1024*1024).decode()
+import html,json,os,re,runpy,sys,tempfile,urllib.parse
+Probe=runpy.run_path(sys.argv[1])['Probe']
 def csrf(body):
  m=re.search(r'name="csrf_token"[^>]*value="([^"]+)"',body)
  if not m: raise ValueError('green CSRF unavailable')
  return html.unescape(m[1])
-def post(path,data):
- req=urllib.request.Request(base+path,data=urllib.parse.urlencode(data).encode())
- with opener.open(req,timeout=15) as r:
-  if r.status!=200 or urllib.parse.urlsplit(r.url).path!= '/users':
-   raise ValueError('green write route did not finish')
-  return r.read(2*1024*1024).decode()
-body=get('/login')
-req=urllib.request.Request(base+'/login',data=urllib.parse.urlencode({
- 'username':os.environ['SIM_USER_USER'],'password':os.environ['SIM_USER_PASSWORD'],
- 'csrf_token':csrf(body)}).encode())
-with opener.open(req,timeout=15) as r:
- if r.status!=200 or urllib.parse.urlsplit(r.url).path=='/login': raise ValueError('login failed')
-body=get('/select-warehouse')
-warehouse=re.search(r'/select-warehouse/(\d+)',body)
-if not warehouse: raise ValueError('green warehouse prerequisite absent')
-req=urllib.request.Request(base+'/select-warehouse/'+warehouse[1],data=urllib.parse.urlencode({
- 'csrf_token':csrf(body)}).encode())
-with opener.open(req,timeout=15) as r:
- if r.status!=200 or urllib.parse.urlsplit(r.url).path!='/land': raise ValueError('warehouse selection failed')
-body=get('/users')
-body=post('/users/'+os.environ['DC_PROBE_USER_ID']+'/reset-password',{
- 'password':os.environ['DC_PROBE_CHALLENGE'],'csrf_token':csrf(body)})
-if '已重置' not in body or '的密码' not in body: raise ValueError('intended reset absent')
+def checked(result,expected):
+ status,url,body=result
+ if status!=200 or urllib.parse.urlsplit(url).path!=expected:
+  raise ValueError('green route did not finish')
+ return body
+with tempfile.TemporaryDirectory(prefix='dc-native-probe-') as directory:
+ probe=Probe('http://localhost:8091',directory)
+ probe.csrf=csrf(checked(probe.get('/login'),'/login'))
+ body=checked(probe.post('/login',{
+  'username':os.environ['SIM_USER_USER'],'password':os.environ['SIM_USER_PASSWORD']}),'/select-warehouse')
+ warehouse=re.search(r'/select-warehouse/(\d+)',body)
+ if not warehouse: raise ValueError('green warehouse prerequisite absent')
+ probe.csrf=csrf(body)
+ checked(probe.post('/select-warehouse/'+warehouse[1],{}),'/land')
+ probe.csrf=csrf(checked(probe.get('/users'),'/users'))
+ body=checked(probe.post('/users/'+os.environ['DC_PROBE_USER_ID']+'/reset-password',{
+  'password':os.environ['DC_PROBE_CHALLENGE']}),'/users')
+ if '已重置' not in body or '的密码' not in body: raise ValueError('intended reset absent')
 print(json.dumps({'login':True,'reset':True}))
 '''
 
@@ -391,6 +413,21 @@ class ProtectedPipeline:
         self.value = value
         self.python = Path(value["app_python"])
         self._validate_installation()
+
+    def _application_environment(self, raw):
+        return validate_application_environment(
+            raw, mcp_health_token=self.policy.mcp_health_token(), read_token=self.policy.read_token())
+
+    def _private_paths(self):
+        return [str(self.policy.location(k)) for k in (
+            "directory", "review_directory", "key_file", "read_token_file", "runtime_file",
+            "bootstrap_file")]
+
+    def _admin_audit_log(self):
+        return None
+
+    def _database_write_paths(self):
+        return (self.path("green_db"), self.path("source_db"))
 
     def path(self, key):
         path = Path(self.value[key])
@@ -445,9 +482,10 @@ class ProtectedPipeline:
         for mutable in (self.path(k) for k in ("source_db", "green_db", "scratch_root", "green_access_log")):
             if any(mutable == path or mutable.is_relative_to(path) or path.is_relative_to(mutable) for path in private):
                 raise ValueError("application write path overlaps protected control inputs")
-        self.app_env = validate_application_environment(
-            read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor),
-            mcp_health_token=p.mcp_health_token(), read_token=p.read_token())
+        self.app_env = self._application_environment(
+            read_protected(self.path("app_environment_file"), p.owner, anchor=p.anchor))
+        shipment_export_web_gid(
+            self.app_env, self.value["app_gid"], owner=p.owner, anchor=p.anchor)
 
     def _owned(self, candidate=None):
         active = deploy_state._native_owned(deploy_state.load_state(self.policy.location("directory")))
@@ -486,7 +524,7 @@ class ProtectedPipeline:
                 "GREEN_MCP_ENV_FILE": str(p.location("directory") / "unused-mcp.env"),
                 "NGINX_DAILYCHECK_CONF": str(self.path("nginx_conf"))}
 
-    def _lower(self, args, *, db, scratch, input=None, extra=None, output=None):
+    def _lower(self, args, *, db, scratch, input=None, extra=None, output=None, cwd=None):
         """The only candidate process boundary; no inherited descriptors/environment."""
         p = self.policy
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(scratch),
@@ -496,7 +534,8 @@ class ProtectedPipeline:
                    "--regid=" + str(self.value["app_gid"]), "--clear-groups",
                    "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
                    "--no-new-privs", str(self.python), "-I", "-B", *args]
-        child = subprocess.Popen(command, cwd=self._release(self._owned()), env=env,
+        candidate = self._owned()
+        child = subprocess.Popen(command, cwd=cwd or self._release(candidate), env=env,
             close_fds=True, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=output if output is not None else subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True)
@@ -506,7 +545,7 @@ class ProtectedPipeline:
 
     def _scratch(self):
         scratch = Path(tempfile.mkdtemp(prefix="native-G-", dir=self.path("scratch_root")))
-        os.chown(scratch, self.policy.value["app_uid"], self.value["app_gid"])
+        os.chown(scratch, self._preview_uid(), self.value["app_gid"])
         scratch.chmod(0o700)
         return scratch
 
@@ -537,59 +576,92 @@ class ProtectedPipeline:
         if deploy_state.cmd_native_stage(argparse.Namespace(stage=name, action=action)):
             raise ValueError("native journal rejected actual stage completion")
 
-    def prepare_services(self):
-        """Fixed startup recipes; no candidate-provided unit/command is consumed."""
-        candidate = self._owned()
+    def _candidate_units(self, candidate, *, promoted=False):
         p = self.policy
         release = self._release(candidate)
-        if git(p.location("repo"), "rev-parse", "HEAD") != candidate["manifest"]["group_sha"]:
-            raise ValueError("service release differs from fenced G")
-        access = self.path("green_access_log")
-        fd = os.open(access, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            if os.fstat(fd).st_nlink != 1:
-                raise ValueError("green access log is not a dedicated file")
-            os.fchown(fd, p.value["app_uid"], self.value["app_gid"])
-        finally:
-            os.close(fd)
+        app_env = getattr(self, "app_env", {})
+        web_gid = shipment_export_web_gid(app_env, self.value["app_gid"], owner=p.owner, anchor=p.anchor)
+        access = self._candidate_access_log(promoted=promoted)
+        config = {
+            "environment_file": str(self.path("app_environment_file")),
+            "read_write_paths": " ".join(str(path) for path in (*self._database_write_paths(), access)),
+            "inaccessible_paths": " ".join(self._private_paths()),
+            "app_uid": p.value["app_uid"],
+            "admin_audit_log": self._admin_audit_log(),
+        }
+        database = self.path("source_db" if promoted else "green_db")
         for unit, module, role in (
                 ("dailycheck-green.service", "gunicorn --workers 2 --bind 127.0.0.1:8091 --access-logfile " + str(access) + " app:create_app()", "app"),
                 ("dailycheck-green-mcp.service", "mcp_server --transport http --host 127.0.0.1 --port 5101", "mcp")):
-            path = self.path("unit_directory") / unit
-            previous = read_protected(path, p.owner, anchor=p.anchor, private=False)
-            # Existing backup semantics remain; this extra copy preserves the
-            # pre-native startup recipe before replacing candidate import paths.
-            backup = self.path("backup_directory") / (unit + ".native-" + candidate["manifest"]["group_sha"])
-            if backup.exists():
-                raise ValueError("service preparation already attempted; reconcile required")
-            backup.write_bytes(previous)
-            backup.chmod(0o600)
-            if any((self.path("unit_directory") / (unit + ".d")).glob("*.conf")):
-                raise ValueError("unreviewed service drop-ins require installation reconciliation")
-            private = " ".join(str(p.location(k)) for k in ("directory", "review_directory"))
-            private += " " + " ".join(str(p.location(k)) for k in ("key_file", "read_token_file", "runtime_file", "bootstrap_file"))
-            content = render_unit(
+            settings = {**config, "app_gid": web_gid if role == "app" else self.value["app_gid"]}
+            if role != "app":
+                settings["admin_audit_log"] = None
+            settings = self._candidate_role_settings(settings, role, promoted=promoted)
+            yield unit, render_unit(
                 description="DailyCheck protected native candidate",
                 working_directory=str(release),
-                environment_file=str(self.path("app_environment_file")),
                 environment_lines=[("PATH", "/usr/bin:/bin"), ("PYTHONDONTWRITEBYTECODE", "1"),
-                                   ("DAILYCHECK_ENV", "production"), ("DRY_RUN", "true"),
-                                   ("DAILYCHECK_DB_DIR", str(self.path("green_db")))],
-                read_write_paths=f"{self.path('green_db')} {self.path('source_db')} {access}",
-                inaccessible_paths=private,
+                                   ("DAILYCHECK_ENV", "production"),
+                                   ("DRY_RUN", "false" if promoted else "true"),
+                                   ("DAILYCHECK_DB_DIR", str(database))],
                 module=module,
                 python=str(self.python),
-                app_uid=p.value["app_uid"],
-                app_gid=self.value["app_gid"],
                 application_role=role,
-                application_inputs=tuple(
-                    key for key in APPLICATION_ROLE_KEYS[role]
-                    if key in getattr(self, "app_env", {})),
+                application_inputs=tuple(key for key in APPLICATION_ROLE_KEYS[role] if key in app_env),
+                **settings,
             )
+
+    def _candidate_role_settings(self, settings, role, *, promoted):
+        return settings
+
+    def _candidate_access_log(self, *, promoted):
+        return self.path("green_access_log")
+
+    def _prepare_access_log(self, *, promoted):
+        access = self._candidate_access_log(promoted=promoted)
+        uid = self.policy.value["app_uid"] if promoted else self._preview_uid()
+        fd = os.open(access, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("green access log is not a dedicated file")
+            os.fchown(fd, uid, self.value["app_gid"])
+        finally:
+            os.close(fd)
+
+    def prepare_services(self, *, backup_suffix=""):
+        """Fixed startup recipes; no candidate-provided unit/command is consumed."""
+        if re.fullmatch(r"(?:|\.attempt-[0-9a-f]{32})", backup_suffix) is None:
+            raise ValueError("invalid unit backup suffix")
+        candidate = self._owned()
+        p = self.policy
+        if git(p.location("repo"), "rev-parse", "HEAD") != candidate["manifest"]["group_sha"]:
+            raise ValueError("service release differs from fenced G")
+        self._prepare_access_log(promoted=False)
+        for unit, content in self._candidate_units(candidate):
+            path = self.path("unit_directory") / unit
+            previous = read_protected(path, p.owner, anchor=p.anchor, private=False)
+            # Preserve the pre-native recipe before replacing candidate import paths.
+            backup = self.path("backup_directory") / (
+                unit + ".native-" + candidate["manifest"]["group_sha"] + backup_suffix)
+            with backup.open("xb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(previous)
+            if any((self.path("unit_directory") / (unit + ".d")).glob("*.conf")):
+                raise ValueError("unreviewed service drop-ins require installation reconciliation")
             path.write_text(content)
             path.chmod(0o644)
         subprocess.run(["/usr/bin/systemctl", "daemon-reload"],
                        env={"PATH": "/usr/bin:/bin"}, check=True)
+
+    def _preview_uid(self):
+        return self.policy.value["app_uid"]
+
+    def _copy_candidate_database(self, db, scratch):
+        code = "import shutil,sys; shutil.copytree(sys.argv[1],sys.argv[2],dirs_exist_ok=True,symlinks=False)"
+        result = self._lower(["-c", code, str(self.path("source_db")), str(db)], db=db, scratch=scratch)
+        if result.returncode:
+            raise ValueError("application-authority DB copy failed")
 
     def copy_db(self):
         """Dereference the existing DB tree only with application read authority."""
@@ -603,10 +675,7 @@ class ProtectedPipeline:
         os.chown(db, self.policy.value["app_uid"], self.value["app_gid"])
         scratch = self._scratch()
         try:
-            code = "import shutil,sys; shutil.copytree(sys.argv[1],sys.argv[2],dirs_exist_ok=True,symlinks=False)"
-            result = self._lower(["-c", code, str(self.path("source_db")), str(db)], db=db, scratch=scratch)
-            if result.returncode:
-                raise ValueError("application-authority DB copy failed")
+            self._copy_candidate_database(db, scratch)
         finally:
             shutil.rmtree(scratch)
 
@@ -684,7 +753,7 @@ class ProtectedPipeline:
         finally:
             shutil.rmtree(scratch)
 
-    def _pytest(self, scratch):
+    def _pytest(self, scratch, *, cwd=None, extra=None):
         log = self.path("log_directory") / "native-pytest.log"
         session = scratch / "session.json"
         code = ("import importlib.util,runpy,sys; "
@@ -695,7 +764,8 @@ class ProtectedPipeline:
             result = self._lower(["-c", code, str(self.policy.authority / "scripts/ci/pytest_evidence.py"),
                 "tests/", "--basetemp=" + str(scratch / "pytest"),
                 "-q", "--tb=line", "-rfE", "--color=no", "-p", "no:cacheprovider", "-p", "dc_approved_evidence",
-                "--dc-evidence=" + str(session)], db=scratch / "db", scratch=scratch, output=output)
+                "--dc-evidence=" + str(session)], db=scratch / "db", scratch=scratch, output=output,
+                cwd=cwd, extra=extra)
         # Only the trusted checker decides from native exit and captured files.
         return subprocess.run([str(self.policy.python), "-I", "-B",
             str(self.policy.authority / "scripts/check_known_failures.py"), str(log),
@@ -711,11 +781,12 @@ class ProtectedPipeline:
         if result.returncode:
             return result.returncode
         result = self._lower([str(self.policy.authority / "scripts/playwright/sim_user.py"),
-                              "--base-url", "http://127.0.0.1:8091"],
+                              "--base-url", "http://localhost:8091"],
                              db=self.path("green_db"), scratch=scratch, extra=env)
-        if result.returncode:
-            return result.returncode
-        return 0
+        # The probe logs only route outcomes, not request payloads or credentials.
+        if result.stdout:
+            print(result.stdout, end="")
+        return result.returncode
 
     def _dryrun(self, scratch):
         db = self.path("green_db")
@@ -730,7 +801,9 @@ class ProtectedPipeline:
         if len(rows) != 1:
             raise ValueError("actual green verification user required")
         since = str(int(time.time()))
-        result = self._lower(["-c", DRYRUN_HTTP], db=db, scratch=scratch, extra={**env,
+        result = self._lower(["-c", DRYRUN_HTTP,
+                              str(self.policy.authority / "scripts/playwright/sim_user.py")],
+                             db=db, scratch=scratch, extra={**env,
             "DC_PROBE_USER_ID": str(rows[0][0]), "DC_PROBE_CHALLENGE": "dc" + os.urandom(24).hex()})
         if result.returncode:
             raise ValueError("actual intended green probe failed")
@@ -742,8 +815,11 @@ class ProtectedPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db"}))
+    parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db", "preview-storage", "promote-services", "verification-plan"}))
     args = parser.parse_args()
+    if os.environ.get("DC_RELAY_MODE") == "1":
+        from scripts.prod_agent.relay_pipeline import candidate_operation
+        return candidate_operation(args.operation)
     # Policy path is fixed by the installed controller. This private helper is
     # never installed setuid or exposed to candidate code as a privileged RPC.
     from scripts.prod_agent.native_controller import POLICY_PATH

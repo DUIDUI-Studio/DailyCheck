@@ -31,6 +31,7 @@ from scripts.prod_agent.native_pipeline import (
     ProtectedPipeline,
     parse_application_environment,
     render_unit,
+    shipment_export_web_gid,
     validate_application_environment,
 )
 
@@ -39,6 +40,8 @@ TOKEN = "t" * 40
 APP_ONLY_KEYS = tuple(key for key in APP_APPLICATION_KEYS if key not in MCP_APPLICATION_KEYS)
 SYNTHETIC = {
     "DAILYCHECK_MULTI_WAREHOUSE": "1",
+    "DAILYCHECK_ORDER_CHANGES": "true",
+    "DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH": "/run/dailycheck-web/shipment_export_profile.json",
     "DAILYCHECK_WMS_HOST": "wms.internal",
     "DAILYCHECK_WMS_PORT": "1433",
     "DAILYCHECK_WMS_USER": "dc_reader",
@@ -213,7 +216,40 @@ def test_mcp_render_projects_only_observed_wms_inputs():
         assert key not in unit
     assert "DAILYCHECK_MULTI_WAREHOUSE" not in unit
     assert "FEEDBACK_GITEA_TOKEN" not in unit
+    assert "BindReadOnlyPaths=" not in unit
 
+
+def test_shipment_profile_mount_is_explicitly_web_only():
+    source = "/etc/dailycheck-application/shipment_export_profile.json"
+    profile = SYNTHETIC["DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH"]
+    assert f"BindReadOnlyPaths={source}:{profile}\n" in _render()
+    assert "BindReadOnlyPaths=" not in _render(optional=())
+    assert source not in _render(role="mcp")
+    with pytest.raises(ValueError):
+        _render(role="mcp", optional=("DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH",))
+
+
+@pytest.mark.parametrize(("group", "parent_mode", "expected"), [
+    (989, 0o700, 989),
+    (988, 0o700, None),
+    (0, 0o700, None),
+    (989, 0o710, None),
+])
+def test_shipment_profile_requires_a_private_separate_web_group(
+        monkeypatch, group, parent_mode, expected):
+    from scripts.prod_agent import native_pipeline
+
+    profile = SimpleNamespace(
+        stat=lambda: SimpleNamespace(st_mode=0o100440, st_gid=group, st_nlink=1),
+        parent=SimpleNamespace(stat=lambda: SimpleNamespace(st_mode=parent_mode)),
+    )
+    monkeypatch.setattr(native_pipeline, "protected_path", lambda *_args, **_kwargs: profile)
+    assert shipment_export_web_gid({}, 988) == 988
+    if expected is None:
+        with pytest.raises(ValueError, match="separate Web group required"):
+            shipment_export_web_gid(SYNTHETIC, 988)
+    else:
+        assert shipment_export_web_gid(SYNTHETIC, 988) == expected
 
 def test_render_rejects_role_crossing_and_unknown_roles():
     with pytest.raises(ValueError):
@@ -277,6 +313,8 @@ def test_malformed_or_duplicate_files_are_denied(raw):
 
 @pytest.mark.parametrize("key,value", [
     ("DAILYCHECK_MULTI_WAREHOUSE", "sometimes"),
+    ("DAILYCHECK_ORDER_CHANGES", "always"),
+    ("DAILYCHECK_SHIPMENT_EXPORT_PROFILE_PATH", "/etc/unrelated.json"),
     ("DAILYCHECK_WMS_PORT", "0"),
     ("DAILYCHECK_WMS_PORT", "65536"),
     ("DAILYCHECK_WMS_PORT", "1433x"),

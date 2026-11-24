@@ -20,6 +20,9 @@ csrf = CSRFProtect()
 
 
 def create_app() -> Flask:
+    from blueprints.audit_pure import check_admin_audit_sink
+
+    check_admin_audit_sink()
     app = Flask(__name__)
     app.config["SECRET_KEY"] = SECRET_KEY
     # Make sessions a bit longer-lived; default is one browser session.
