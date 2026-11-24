@@ -184,7 +184,7 @@ _write_report() {
 
 | # | 检查项 | 状态 | 备注 |
 |---|--------|------|------|
-| 1 | 集成测试 (pytest + 零新增门禁) | ${R1} | ${N1:-} |
+| 1 | 集成测试证据 (当前提交的全量测试与零新增门禁) | ${R1} | ${N1:-} |
 | 2 | 模拟用户操作 (sim_user.py 5 路径) | ${R2} | ${N2:-} |
 | 3 | 绿 vs 蓝 性能比对 (ab -n 100 -c 10) | ${R3} | ${N3:-} |
 | 4 | 回滚演练 (switch.sh blue 100 → green 0) | ${R4} | ${N4:-} |
@@ -478,6 +478,7 @@ if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then
   if ! curl -fsS "${GREEN_URL}/health" >/dev/null 2>&1; then
     echo "[verify] ❌ 绿环境未起（${GREEN_URL}/health 不可达）" >&2
     echo "[verify] 请先跑 up.sh" >&2
+    OVERALL_PASS=0
     # Issue #22 fix: 提前写失败报告（绿未起 = 整个 verify 应当 fail，
     # 写 report 留证再 exit）
     _write_report
@@ -488,15 +489,44 @@ fi
 # ============================================================
 # 1. 集成测试（真跑 + 零新增门禁；known failure 不再被兜成 PASS）
 # ============================================================
-_run_check "1" "集成测试 (pytest tests/ 全量含 MCP + check_known_failures 零新增门禁)" \
-  "_verify_check1_pytest"
+VERIFY_SCOPE=""
+if [[ "${DC_RELAY_MODE:-0}" == "1" && "${DC_RELAY_HOSTED_VERIFY:-0}" == "1" && ${DRY_RUN_FLAG} -eq 0 ]]; then
+  if PLAN="$(_native_operation verification-plan)" && [[ "$PLAN" == *$'\n'* ]]; then
+    VERIFY_SCOPE="${PLAN%%$'\n'*}"
+    case "$VERIFY_SCOPE" in
+      docs-only|user-paths)
+        R1="✅ HOSTED CI"
+        N1="${PLAN#*$'\n'}"
+        echo "[verify] 1. 已核对同一提交的两项 GitHub 检查"
+        ;;
+      *)
+        OVERALL_PASS=0
+        R1="❌ FAIL"
+        N1="无法识别受控验证范围"
+        echo "[verify] ERROR: ${N1}" >&2
+        exit 1
+        ;;
+    esac
+  else
+    OVERALL_PASS=0
+    R1="❌ FAIL"
+    N1="同一提交的 GitHub 检查证据不可用"
+    echo "[verify] ERROR: ${N1}" >&2
+    exit 1
+  fi
+else
+  _run_check "1" "集成测试 (pytest tests/ 全量含 MCP + check_known_failures 零新增门禁)" \
+    "_verify_check1_pytest"
+fi
 
-# ============================================================
-# 2. 模拟用户操作（sim_user.py 5 关键路径；凭据 SIM_USER_USER/PASSWORD；
-#    先用 DAILYCHECK_DB_DIR=绿库 ensure 账号，Issue #34）
-# ============================================================
-_run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存→健康报表)" \
-  "_verify_check2_sim_user"
+if [[ "${VERIFY_SCOPE:-}" == "docs-only" ]]; then
+  R2="➖ 不适用"
+  N2="精确提交仅改开发文档或发行说明。保留服务、数据库隔离、回滚和入口检查。"
+  echo "[verify] 2. 纯文档改动，模拟操作不适用"
+else
+  _run_check "2" "模拟用户操作 (sim_user.py: 登录→选仓→总览→库存→健康报表)" \
+    "_verify_check2_sim_user"
+fi
 
 _verify_check3_performance() {
   if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
@@ -541,7 +571,10 @@ _run_check "5" "资源与依赖 (systemctl status + journalctl + ss -tn)" \
 # ============================================================
 # 6. dry_run 隔离证据（调 prod_dryrun_evidence.sh）
 # ============================================================
-if [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
+if [[ "${DC_RELAY_MODE:-0}" == "1" ]]; then
+  _run_check "6" "绿环境存储隔离（运行账号、数据库副本、生产路径屏蔽）" \
+    "_native_operation preview-storage"
+elif [[ -n "${DC_NATIVE_POLICY:-}" ]]; then
   _run_check "6" "dry_run 隔离证据 (protected intended green UPDATE)" \
     "bash '${DC_NATIVE_AUTHORITY}/scripts/agent_framework/prod_dryrun_evidence.sh'"
 else

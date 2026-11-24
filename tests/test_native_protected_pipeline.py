@@ -88,11 +88,21 @@ def test_nonfixture_facts_have_no_candidate_shell_fallback(native_base):
 def test_changed_fixed_helper_rejects_before_tools_or_candidate_work(bridge):
     b = bridge
     p = b["policy"]
+    authority = b["root"] / "pipeline-authority"
+    authority.mkdir(mode=0o700)
+    helper_pins = {}
+    for name in HELPERS:
+        content = (p.authority / name).read_bytes()
+        helper = authority / name
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(content)
+        helper_pins[name] = hashlib.sha256(content).hexdigest()
+    p.authority = authority
     keys = ("app_python", "source_db", "green_db", "scratch_root", "log_directory", "backup_directory",
             "unit_directory", "nginx_conf", "app_environment_file", "blue_access_log", "green_access_log")
     p.value["pipeline"] = {**dict.fromkeys(keys, str(b["root"])), "version": 1, "app_gid": 65532,
         "app_runtime": {}, "tools": dict.fromkeys(TOOL_NAMES, "0" * 64),
-        "helpers": {name: hashlib.sha256((p.authority / name).read_bytes()).hexdigest() for name in HELPERS}}
+        "helpers": helper_pins}
     p.value["pipeline"]["helpers"][HELPERS[0]] = "f" * 64
     with pytest.raises(ValueError, match="helper changed"):
         ProtectedPipeline(p)
@@ -283,7 +293,7 @@ def test_green_update_collector_uses_actual_http_and_value_content(tmp_path, dam
             requests.append((self.path, body))
             if self.path == "/login":
                 self.send_response(302)
-                self.send_header("Location", "/users")
+                self.send_header("Location", "/select-warehouse")
                 self.end_headers()
                 return
             if self.path == "/select-warehouse/1":
@@ -311,14 +321,15 @@ def test_green_update_collector_uses_actual_http_and_value_content(tmp_path, dam
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     port = object.__new__(ProtectedPipeline)
+    port.policy = SimpleNamespace(authority=Path(__file__).resolve().parents[1])
     monkeypatch.setattr(port, "path", lambda key: {"green_db": green, "source_db": blue}[key])
     monkeypatch.setenv("SIM_USER_USER", "fixture")
     monkeypatch.setenv("SIM_USER_PASSWORD", "synthetic")
 
     def local_child(args, **kwargs):
-        code = args[1].replace("http://127.0.0.1:8091", f"http://127.0.0.1:{server.server_port}")
-        return subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True,
-                              env=kwargs["extra"])
+        code = args[1].replace("http://localhost:8091", f"http://localhost:{server.server_port}")
+        return subprocess.run([sys.executable, "-I", "-B", "-c", code, args[2]],
+                              capture_output=True, text=True, env=kwargs["extra"])
 
     monkeypatch.setattr(port, "_lower", local_child)
     monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: "" if damage == "missing-log" else log.getvalue())

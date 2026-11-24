@@ -3,7 +3,7 @@
     "bot_approved": 22,
     "canonical": 13,
     "external_subset": 19,
-    "runtime": 33,
+    "runtime": 34,
     "writes": 10
   },
   "generated_from": "mcp_server/protocol/registry.py",
@@ -2774,6 +2774,318 @@
         "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_puyu_document_lines"
       ],
       "title": "Read Puyu WMS document lines"
+    },
+    {
+      "access": {
+        "method": "GET",
+        "path": "/api/mcp/",
+        "path_enforcement": "StreamableHTTP bound policy action and view grant only",
+        "warehouse_scope": "granted storefronts within wh_002, wh_003, wh_004, wh_006"
+      },
+      "bot_approved": false,
+      "compatibility": "new-policy-only-StreamableHTTP-TextContent-JSON; legacy discovery and calls unchanged",
+      "description": "Read production consumption by Beijing day, Monday-based week, or batch line within an explicit half-open date range (up to 92 days). Separate results per authorized store. Group counts and traceable raw quantities preserve unknown provenance and historical units. Use the same request with next_cursor to continue.",
+      "domain": "production_consumption",
+      "external_subset": false,
+      "handler": "mcp_server.protocol.tools.production_consumption:production_consumption_impl",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "end_date": {
+            "description": "Exclusive Beijing date (YYYY-MM-DD).",
+            "format": "date",
+            "maxLength": 10,
+            "type": "string"
+          },
+          "item_id": {
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "line_id": {
+            "description": "Local production line ID, lines view only.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "run_id": {
+            "description": "Local production batch ID, lines view only.",
+            "maximum": 9223372036854775807,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "start_date": {
+            "description": "Inclusive Beijing date (YYYY-MM-DD).",
+            "format": "date",
+            "maxLength": 10,
+            "type": "string"
+          },
+          "view": {
+            "enum": [
+              "day",
+              "week",
+              "lines"
+            ],
+            "type": "string"
+          },
+          "warehouse_code": {
+            "description": "One granted storefront. Omit to read all granted storefronts separately.",
+            "maxLength": 32,
+            "type": "string"
+          }
+        },
+        "required": [
+          "start_date",
+          "end_date",
+          "view"
+        ],
+        "type": "object"
+      },
+      "mode": "read",
+      "name": "production_consumption",
+      "output_contract": {
+        "kind": "minimum-json-shape",
+        "schema": {
+          "oneOf": [
+            {
+              "properties": {
+                "summary": {
+                  "items": {
+                    "properties": {
+                      "item_id": {
+                        "type": "integer"
+                      },
+                      "manual_count": {
+                        "type": "integer"
+                      },
+                      "manual_qty": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "period_start": {
+                        "type": "string"
+                      },
+                      "planned_count": {
+                        "type": "integer"
+                      },
+                      "planned_qty": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "sample": {
+                        "properties": {
+                          "created_at": {
+                            "type": "string"
+                          },
+                          "line_id": {
+                            "type": "integer"
+                          },
+                          "run_id": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "run_id",
+                          "line_id",
+                          "created_at"
+                        ],
+                        "type": "object"
+                      },
+                      "system_default_count": {
+                        "type": "integer"
+                      },
+                      "system_default_qty": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "unit": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "unknown_count": {
+                        "type": "integer"
+                      },
+                      "unknown_qty": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "warehouse_code": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "warehouse_code",
+                      "period_start",
+                      "item_id",
+                      "unit",
+                      "planned_count",
+                      "manual_count",
+                      "system_default_count",
+                      "unknown_count",
+                      "planned_qty",
+                      "manual_qty",
+                      "system_default_qty",
+                      "unknown_qty",
+                      "sample"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "summary"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "lines": {
+                  "items": {
+                    "properties": {
+                      "booked_qty": {
+                        "type": "number"
+                      },
+                      "booked_source": {
+                        "enum": [
+                          "manual",
+                          "system_default",
+                          "unknown"
+                        ],
+                        "type": "string"
+                      },
+                      "created_at": {
+                        "type": "string"
+                      },
+                      "item_id": {
+                        "type": "integer"
+                      },
+                      "line_id": {
+                        "type": "integer"
+                      },
+                      "planned_qty": {
+                        "type": "number"
+                      },
+                      "run_id": {
+                        "type": "integer"
+                      },
+                      "unit": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "warehouse_code": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "warehouse_code",
+                      "item_id",
+                      "unit",
+                      "planned_qty",
+                      "booked_qty",
+                      "booked_source",
+                      "run_id",
+                      "line_id",
+                      "created_at"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "lines"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "cross_store_rollup": {
+              "type": "string"
+            },
+            "end_date": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer"
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "page_empty": {
+              "type": "boolean"
+            },
+            "range_empty": {
+              "type": "boolean"
+            },
+            "start_date": {
+              "type": "string"
+            },
+            "timezone": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "unit_status": {
+              "type": "string"
+            },
+            "view": {
+              "type": "string"
+            },
+            "warehouses": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "view",
+            "warehouses",
+            "start_date",
+            "end_date",
+            "timezone",
+            "unit_status",
+            "cross_store_rollup",
+            "range_empty",
+            "page_empty",
+            "limit",
+            "truncated",
+            "next_cursor"
+          ],
+          "type": "object"
+        }
+      },
+      "tests": [
+        "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk"
+      ],
+      "title": "Read Store Production Consumption"
     }
   ]
 }

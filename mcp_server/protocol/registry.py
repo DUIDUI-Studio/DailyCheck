@@ -20,10 +20,16 @@ from mcp_server.protocol.tools import (
     inventory,
     outbound,
     procurement,
+    production_consumption,
     store_order,
     wms,
 )
-from mcp_server.service.policy import SAFE_FIELDS, WMS_LINES_ACTION, WMS_LINES_FIELDS
+from mcp_server.service.policy import (
+    PRODUCTION_CONSUMPTION_READ,
+    SAFE_FIELDS,
+    WMS_LINES_ACTION,
+    WMS_LINES_FIELDS,
+)
 
 
 def obj(**properties: dict) -> dict:
@@ -41,6 +47,20 @@ STRING = {"type": "string"}
 BOOLEAN = {"type": "boolean"}
 NULLABLE_STRING = {"type": ["string", "null"]}
 ROW = {"type": "object"}
+NULLABLE_NUMBER = {"type": ["number", "null"]}
+PRODUCTION_REFERENCE = obj(run_id=INTEGER, line_id=INTEGER, created_at=STRING)
+PRODUCTION_SUMMARY = obj(
+    warehouse_code=STRING, period_start=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
+    planned_count=INTEGER, manual_count=INTEGER, system_default_count=INTEGER, unknown_count=INTEGER,
+    planned_qty=NULLABLE_NUMBER, manual_qty=NULLABLE_NUMBER,
+    system_default_qty=NULLABLE_NUMBER, unknown_qty=NULLABLE_NUMBER, sample=PRODUCTION_REFERENCE,
+)
+PRODUCTION_LINE = obj(
+    warehouse_code=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
+    planned_qty=NUMBER, booked_qty=NUMBER,
+    booked_source={"type": "string", "enum": ["manual", "system_default", "unknown"]},
+    **PRODUCTION_REFERENCE["properties"],
+)
 ITEM = obj(id=INTEGER, name=STRING, current_stock=NUMBER)
 CANONICAL = obj(id=INTEGER, canonical_sku=STRING, name=STRING, unit=STRING, status=STRING)
 DOCUMENT = obj(
@@ -1126,6 +1146,36 @@ REGISTRY = (
         policy_action=WMS_LINES_ACTION, policy_only=True,
         tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_puyu_document_lines",),
     ),
+    ToolRegistration(
+        tool=Tool(
+            name="production_consumption",
+            title="Read Store Production Consumption",
+            description=(
+                "Read production consumption by Beijing day, Monday-based week, or batch line "
+                "within an explicit half-open date range (up to 92 days). Separate results per "
+                "authorized store. Group counts and traceable raw quantities preserve unknown provenance "
+                "and historical units. Use the same request with next_cursor to continue."
+            ),
+            inputSchema=production_consumption.INPUT_SCHEMA,
+        ),
+        domain="production_consumption", handler=production_consumption.production_consumption_impl,
+        access=AccessContract(
+            "GET", "/api/mcp/", "StreamableHTTP bound policy action and view grant only",
+            "granted storefronts within wh_002, wh_003, wh_004, wh_006",
+        ),
+        output_shape={
+            **obj(
+                view=STRING, warehouses=array(STRING), start_date=STRING, end_date=STRING, timezone=STRING,
+                unit_status=STRING, cross_store_rollup=STRING, range_empty=BOOLEAN, page_empty=BOOLEAN,
+                limit=INTEGER, truncated=BOOLEAN, next_cursor=NULLABLE_STRING,
+            ),
+            "oneOf": [obj(summary=array(PRODUCTION_SUMMARY)), obj(lines=array(PRODUCTION_LINE))],
+        },
+        external_subset=False, bot_approved=False,
+        tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk",),
+        compatibility="new-policy-only-StreamableHTTP-TextContent-JSON; legacy discovery and calls unchanged",
+        policy_action=PRODUCTION_CONSUMPTION_READ, policy_only=True,
+    ),
 )
 
 
@@ -1152,13 +1202,13 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
         if not entry.tests or not entry.compatibility or not entry.output_shape:
             raise ValueError(f"incomplete contract: {entry.name}")
         if entry.access.method not in {"GET", "POST"} or not all((
-            entry.access.path.startswith("/api/v1/"),
+            entry.access.path.startswith("/api/v1/") or (entry.policy_only and entry.access.path == "/api/mcp/"),
             entry.access.path_enforcement, entry.access.warehouse_scope,
         )):
             raise ValueError(f"incomplete access contract: {entry.name}")
         action = entry.policy_action
-        if entry.policy_only and (not action or entry.bot_approved or entry.external_subset):
-            raise ValueError(f"invalid policy-only tool: {entry.name}")
+        if entry.policy_only and (action is None or entry.external_subset or entry.bot_approved):
+            raise ValueError(f"invalid policy-only exposure: {entry.name}")
         if action is not None:
             if entry.mode != "read" or action not in SAFE_FIELDS or action in policy_actions:
                 raise ValueError(f"invalid scoped policy action: {entry.name}")

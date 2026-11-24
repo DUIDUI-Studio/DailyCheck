@@ -10,6 +10,8 @@ MAX_SQLITE_ID = 2**63 - 1
 WMS_LINES_ACTION = "wms.document_lines.read"
 WMS_LINES_FIELDS = ("goods_code", "goods_name", "qty", "unit")
 PUYU_WAREHOUSE_ID = 3
+PRODUCTION_CONSUMPTION_READ = "production_consumption.read"
+PRODUCTION_STORES = frozenset({"wh_002", "wh_003", "wh_004", "wh_006"})
 
 # Values are trusted SQL fragments. An administrator selects keys only.
 INVENTORY_COLUMNS = {"sku": "sku", "current_stock": "quantity AS current_stock",
@@ -22,6 +24,7 @@ SAFE_FIELDS = {
     "inventory.read": tuple(INVENTORY_COLUMNS),
     "orders.read": (*ORDER_COLUMNS, "fulfillment"),
     WMS_LINES_ACTION: WMS_LINES_FIELDS,
+    PRODUCTION_CONSUMPTION_READ: ("summary", "lines"),
 }
 
 
@@ -48,7 +51,7 @@ def encode_grants(grants: object) -> str:
     return json.dumps(canonical_grants(grants), sort_keys=True, separators=(",", ":"))
 
 
-def storefront_scope(conn: sqlite3.Connection, codes: object) -> tuple[str, ...]:
+def storefront_scope(conn: sqlite3.Connection, codes: object, grants: dict) -> tuple[str, ...]:
     if (
         not isinstance(codes, list) or not codes
         or not all(isinstance(code, str) and code and code.strip() == code and "*" not in code
@@ -63,6 +66,8 @@ def storefront_scope(conn: sqlite3.Connection, codes: object) -> tuple[str, ...]
     )
     if {row[0] for row in rows} != set(codes):
         raise ValueError("Invalid storefront selection")
+    if PRODUCTION_CONSUMPTION_READ in grants and not PRODUCTION_STORES.issuperset(codes):
+        raise ValueError("Invalid production consumption storefront selection")
     return tuple(sorted(codes))
 
 
@@ -80,7 +85,7 @@ class BoundPolicy:
 def binding_scope(conn: sqlite3.Connection, grants: dict, selection: object) -> list[str] | dict:
     """Storefront scopes keep their original list. External WMS uses a distinct snapshot."""
     if WMS_LINES_ACTION not in grants:
-        return list(storefront_scope(conn, selection))
+        return list(storefront_scope(conn, selection, grants))
     if (
         not isinstance(selection, dict) or selection.keys() != {"wms_warehouse_id"}
         or type(selection["wms_warehouse_id"]) is not int

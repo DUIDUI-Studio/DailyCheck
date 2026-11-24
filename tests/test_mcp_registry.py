@@ -41,11 +41,14 @@ WMS_READS = {"wms_stock_list", "wms_stock_summary", "wms_documents_list", "wms_d
 def test_registry_matches_every_implementation_and_dispatch():
     mcp_contracts.validate_implementation_set()
     names = {entry.name for entry in registry.REGISTRY}
-    assert len(names) == len(registry.REGISTRY) == 33
+    assert len(names) == len(registry.REGISTRY) == 34
     assert {tool.name for tool in get_tools()} == set(server._tool_map) == set(LEGACY_NAMES)
-    assert names - set(LEGACY_NAMES) == {"wms_document_lines"}
+    assert len(LEGACY_NAMES) == 32
+    assert names - set(LEGACY_NAMES) == {"wms_document_lines", "production_consumption"}
     assert server._tool_map == registry.get_handlers()
-    assert {e.name for e in registry.REGISTRY if not e.bot_approved} == CANONICAL_WRITES | WMS_READS
+    assert {e.name for e in registry.REGISTRY if not e.bot_approved} == (
+        CANONICAL_WRITES | WMS_READS | {"production_consumption"}
+    )
     assert sum(e.external_subset for e in registry.REGISTRY) == 19
     assert sum(e.bot_approved for e in registry.REGISTRY) == 22
     assert {e.name for e in registry.REGISTRY if e.mode == 'write'} == CANONICAL_WRITES | {
@@ -390,7 +393,7 @@ def test_documented_health_auth_and_db_status_use_actual_app(registry_db, monkey
 
 
 @pytest.mark.parametrize('old,new', [
-    ('实时 33 项', '合计 27 项'),
+    ('实时 34 项', '合计 27 项'),
     ('`store_order_list` / `store_order_detail`', '未说明订单范围'),
     ('[完整工具台账](./registry.md)', '没有权威台账链接'),
 ])

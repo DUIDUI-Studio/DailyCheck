@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""模拟用户操作 —— verify.sh check 2 的 5 关键路径探针（纯 stdlib，无浏览器依赖）.
+"""模拟用户操作 —— verify.sh check 2 的 5 关键路径探针（使用 curl，无浏览器依赖）.
 
 路径（对绿环境 --base-url 依次验证）：
   1. 登录页可达          GET  /login                       → 200
@@ -16,20 +16,20 @@
 凭据：环境变量 SIM_USER_USER / SIM_USER_PASSWORD（缺失退出码 64 并提示，
 绝不允许静默跳过——check 2 的意义就是把绿环境当真实用户走一遍）。
 CSRF：自动从页面 <input name="csrf_token"> 抓取回填（页面无 token 则不带）。
-会话：urllib + CookieJar，等同浏览器 cookie 行为。
+会话：统一使用 curl 的 localhost 会话行为，仅访问独立绿组回环地址。
 
 退出码：0 全绿；1 任一路径失败；64 参数/凭据缺失。
 """
 from __future__ import annotations
 
 import argparse
-import http.cookiejar
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
-import urllib.request
 
 CSRF_RES = [
     re.compile(r'name="csrf_token"[^>]*value="([^"]+)"'),
@@ -39,39 +39,70 @@ WAREHOUSE_ID_RE = re.compile(r"/select-warehouse/(\d+)")
 
 
 class Probe:
-    def __init__(self, base_url: str) -> None:
-        self.base = base_url.rstrip("/")
-        jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(jar)
-        )
+    """One local green-service client, with a private curl session."""
+
+    def __init__(self, base_url: str, directory: str) -> None:
+        endpoint = urllib.parse.urlsplit(base_url)
+        port = endpoint.port
+        if (endpoint.scheme != "http" or endpoint.hostname not in {"localhost", "127.0.0.1"}
+                or not port or endpoint.username is not None or endpoint.password is not None
+                or endpoint.path not in {"", "/"} or endpoint.query or endpoint.fragment):
+            raise ValueError("preview endpoint must be a local green service with an explicit port")
+        self.base = f"http://localhost:{port}"
+        self.origin = f"localhost:{port}"
+        self.resolve = f"localhost:{port}:127.0.0.1"
+        self.directory = directory
         self.csrf = ""
 
-    def get(self, path: str) -> tuple[int, str, str]:
-        """GET，返回 (final_status, final_url, body)。跟随重定向。"""
-        req = urllib.request.Request(self.base + path, method="GET")
-        with self.opener.open(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return resp.status, resp.geturl(), body
+    def _request(self, path: str, data: dict[str, str] | None = None):
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("preview request requires a root-relative application path")
+        url = self.base + path
+        body_file = os.path.join(self.directory, "body")
+        jar = os.path.join(self.directory, "cookies")
+        for _ in range(10):
+            command = [
+                "/usr/bin/curl", "--disable", "--silent", "--show-error", "--max-time", "15",
+                "--ipv4", "--noproxy", "*", "--proto", "=http", "--globoff",
+                "--resolve", self.resolve,
+                "--cookie", jar, "--cookie-jar", jar, "--output", body_file,
+                "--write-out", "%{http_code}\n%{redirect_url}", "--url", url,
+            ]
+            payload = None
+            if data is not None:
+                command += ["--header", "Content-Type: application/x-www-form-urlencoded",
+                            "--data-binary", "@-"]
+                payload = urllib.parse.urlencode(data)
+            result = subprocess.run(command, input=payload, text=True, capture_output=True)
+            if result.returncode:
+                raise urllib.error.URLError("local preview request failed")
+            status_text, redirect = result.stdout.split("\n", 1)
+            status = int(status_text)
+            if status in {301, 302, 303} and redirect:
+                target = urllib.parse.urlsplit(redirect)
+                if (target.scheme, target.netloc) != ("http", self.origin):
+                    raise urllib.error.URLError("preview redirect left the local service")
+                url, data = redirect, None
+                continue
+            if status >= 400:
+                raise urllib.error.HTTPError(url, status, "preview HTTP failure", {}, None)
+            with open(body_file, encoding="utf-8", errors="replace") as response:
+                return status, url, response.read()
+        raise urllib.error.URLError("too many preview redirects")
 
-    def post(self, path: str, data: dict[str, str]) -> tuple[int, str, str]:
-        """POST 表单（自动回填 CSRF），跟随重定向。"""
+    def get(self, path: str):
+        return self._request(path)
+
+    def post(self, path: str, data: dict[str, str]):
         payload = dict(data)
         if self.csrf:
             payload.setdefault("csrf_token", self.csrf)
-        body_bytes = urllib.parse.urlencode(payload).encode()
-        req = urllib.request.Request(
-            self.base + path, data=body_bytes, method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        with self.opener.open(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return resp.status, resp.geturl(), body
+        return self._request(path, payload)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="模拟用户 5 关键路径探针")
-    ap.add_argument("--base-url", required=True, help="绿环境根 URL，如 http://127.0.0.1:8091")
+    ap.add_argument("--base-url", required=True, help="绿环境根 URL，如 http://localhost:8091")
     args = ap.parse_args()
 
     user = os.environ.get("SIM_USER_USER", "").strip()
@@ -83,7 +114,15 @@ def main() -> int:
         )
         return 64
 
-    probe = Probe(args.base_url)
+    with tempfile.TemporaryDirectory(prefix="dc-sim-user-") as directory:
+        try:
+            probe = Probe(args.base_url, directory)
+        except ValueError as error:
+            ap.error(str(error))
+        return run_paths(probe, user, password)
+
+
+def run_paths(probe: Probe, user: str, password: str) -> int:
     failures: list[str] = []
 
     def record(num: int, name: str, ok: bool, detail: str = "") -> None:
@@ -95,8 +134,8 @@ def main() -> int:
 
     # ---- 路径 1：登录页可达 + 抓 CSRF ----
     try:
-        status, _, body = probe.get("/login")
-        ok = status == 200
+        status, final_url, body = probe.get("/login")
+        ok = status == 200 and urllib.parse.urlsplit(final_url).path == "/login"
         record(1, "登录页可达", ok, f"status={status}")
         if ok:
             for rx in CSRF_RES:
@@ -113,7 +152,7 @@ def main() -> int:
         status, final_url, body = probe.post(
             "/login", {"username": user, "password": password}
         )
-        ok = status == 200 and "/select-warehouse" in final_url
+        ok = status == 200 and urllib.parse.urlsplit(final_url).path == "/select-warehouse"
         record(2, "登录成功", ok, f"final={final_url} status={status}")
         if ok:
             picker_html = body
@@ -135,7 +174,7 @@ def main() -> int:
             wid = m.group(1)
             try:
                 status, final_url, body = probe.post(f"/select-warehouse/{wid}", {})
-                ok = status == 200 and final_url.endswith("/land")
+                ok = status == 200 and urllib.parse.urlsplit(final_url).path == "/land"
                 record(3, "选仓进入总览", ok, f"warehouse={wid} final={final_url}")
             except (urllib.error.HTTPError, urllib.error.URLError) as e:
                 record(3, "选仓进入总览", False, str(e))
@@ -145,7 +184,8 @@ def main() -> int:
     # ---- 路径 4：库存页 ----
     try:
         status, final_url, _ = probe.get("/inventory")
-        record(4, "库存页可达", status == 200, f"status={status}")
+        record(4, "库存页可达", status == 200 and urllib.parse.urlsplit(final_url).path == "/inventory",
+               f"status={status} final={final_url}")
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
         record(4, "库存页可达", False, str(e))
 
@@ -154,7 +194,7 @@ def main() -> int:
         status, final_url, _ = probe.get("/report/health")
         # 同时校验落点：会话一旦丢失会 302 到 /login 并被跟随后返回 200，
         # 只看 status 会把「已掉登录」误判成通过。
-        ok = status == 200 and final_url.endswith("/report/health")
+        ok = status == 200 and urllib.parse.urlsplit(final_url).path == "/report/health"
         record(5, "库存健康报表可达", ok, f"status={status} final={final_url}")
     except urllib.error.HTTPError as e:
         # 5xx 是本次要拦的故障；403 则是角色门（凭据账号非 manager+）——

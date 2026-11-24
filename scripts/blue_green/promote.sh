@@ -272,7 +272,11 @@ _fail_and_restore() {
     "${SYSTEMCTL_BIN}" daemon-reload \
       || echo "[promote] WARN: 恢复后 daemon-reload 失败，需人工执行 systemctl daemon-reload" >&2
   fi
-  echo "[promote] 转正失败，环境已回滚到转正前状态；绿仍在写隔离态，禁止切流量。" >&2
+  if [[ "${DC_RELAY_MODE:-0}" == "1" ]]; then
+    echo "[promote] 转正失败，已尝试恢复配置。发布控制器须核对蓝承流并停止两个绿服务。" >&2
+  else
+    echo "[promote] 转正失败，已尝试恢复配置，禁止切流量。" >&2
+  fi
   exit 1
 }
 
@@ -372,15 +376,22 @@ for _f in "${GREEN_UNIT_FILE}" "${GREEN_MCP_UNIT_FILE}" "${GREEN_ENV_FILE}" "${G
 done
 
 # 4. 改写 DRY_RUN / DAILYCHECK_DB_DIR
-for _f in "${GREEN_UNIT_FILE}" "${GREEN_MCP_UNIT_FILE}" "${GREEN_ENV_FILE}" "${GREEN_MCP_ENV_FILE}"; do
-  [[ -f "${_f}" ]] || continue
-  if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
-    echo "[DRY-RUN] would rewrite ${_f}: DRY_RUN=true→false；DAILYCHECK_DB_DIR=* → ${TARGET_DB_DIR}"
-  else
-    _rewrite_in_place "${_f}" || _fail_and_restore "改写失败：${_f}"
-    echo "[promote] 已改写 ${_f}"
-  fi
-done
+if [[ "${DC_RELAY_MODE:-0}" == "1" && ${DRY_RUN_FLAG} -eq 0 ]]; then
+  "${DC_CONTROL_PYTHON:?}" -I -B -c \
+    'import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module("scripts.prod_agent.native_pipeline",run_name="__main__")' \
+    "${DC_NATIVE_AUTHORITY:?}" --operation promote-services \
+    || _fail_and_restore "发布流程无法装载正式绿环境配置"
+else
+  for _f in "${GREEN_UNIT_FILE}" "${GREEN_MCP_UNIT_FILE}" "${GREEN_ENV_FILE}" "${GREEN_MCP_ENV_FILE}"; do
+    [[ -f "${_f}" ]] || continue
+    if [[ ${DRY_RUN_FLAG} -eq 1 ]]; then
+      echo "[DRY-RUN] would rewrite ${_f}: DRY_RUN=true→false；DAILYCHECK_DB_DIR=* → ${TARGET_DB_DIR}"
+    else
+      _rewrite_in_place "${_f}" || _fail_and_restore "改写失败：${_f}"
+      echo "[promote] 已改写 ${_f}"
+    fi
+  done
+fi
 
 # 5. 改写核验（sed 未命中 = 静默失败，必须显式拦下；这正是事故的形态）
 if [[ ${DRY_RUN_FLAG} -eq 0 ]]; then

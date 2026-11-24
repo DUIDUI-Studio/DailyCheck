@@ -353,6 +353,8 @@ class DurablePublicationClaim:
         outcome = _validate_outcome(
             self._attempt_id, outcomes[self._attempt_id], self._generation)
         require_public_deployment(outcome, self._context.pr)
+        if outcome.get("relay_publication") is True:
+            raise HostingError("relay_worker_publication_required")
         if (outcome.get("pr") != self._context.pr
                 or public_head(outcome) != self._context.sha
                 or outcome.get("public_receipt") != self._context.public_receipt
