@@ -706,6 +706,8 @@ with open(os.environ["CALLS"], "a", encoding="utf-8") as fh:
     fh.write("merge_helper " + " ".join(args) + "\\n")
 if args and args[0] == "check" and os.environ.get("FAKE_CHECK_RC"):
     sys.exit(int(os.environ["FAKE_CHECK_RC"]))
+if args and args[0] == "check" and "--base" in args:
+    print(json.dumps({{"required_approvals": 1, "ci_only_evidence": ""}}))
 if args and args[0] == "merge":
     if os.environ.get("FAKE_MERGE_RC"):
         sys.exit(int(os.environ["FAKE_MERGE_RC"]))
@@ -957,7 +959,7 @@ def test_github_pipeline_rejects_disabled_or_incomplete_lane(sandbox, lane, args
     assert not _calls(sandbox) and not _state(sandbox)
 
 
-@pytest.mark.parametrize("case", ["stable", "promote", "switch", "observe", "tree",
+@pytest.mark.parametrize("case", ["stable", "ci_only", "promote", "switch", "observe", "tree",
                                    "before_write", "after_write", "lost_response"])
 def test_verified_candidate_continuity_with_actual_finalizer(ordinary_candidate, case):
     from tests import test_github_transport as t
@@ -982,6 +984,11 @@ def test_verified_candidate_continuity_with_actual_finalizer(ordinary_candidate,
     main = table[t.ROOT + "/git/ref/heads/main"]
     table[t.ROOT + "/git/ref/heads/main"] = [main] * 3 + [t.response({
         "ref": "refs/heads/main", "object": {"sha": sb["sha"]}})]
+    if case == "ci_only":
+        t.write_ci_only_authority(sb["state"], pr=42, base=sb["base"])
+        classic = table[t.ROOT + "/branches/main/protection"]["data"]
+        classic.pop("required_pull_request_reviews")
+        table.pop(t.ROOT + "/pulls/42/reviews?page=1")
     if case == "lost_response":
         table["/graphql"]["exit"] = 28
     (fake / "table").write_text(json.dumps(table))
@@ -999,8 +1006,9 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
     curl = fake / "curl"
     curl.write_text(t.FAKE_CURL.replace("PYTHON", sys.executable).replace("log = {", effect + "log = {"))
     curl.chmod(0o700)
-    (sb["state"] / "state.json").write_text(json.dumps({
-        "deployed": {"sha": sb["base"], "pr": 41, "at": 1}}))
+    if case != "ci_only":
+        (sb["state"] / "state.json").write_text(json.dumps({
+            "deployed": {"sha": sb["base"], "pr": 41, "at": 1}}))
     drift = f"git -C '{sb['repo']}' checkout -q --detach '{sb['base']}'\n"
     if case == "promote":
         (sb["dir"] / "promote.sh").write_text(
@@ -1024,8 +1032,11 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
     state = _state(sb)
     actual_main = _git(["rev-parse", "main"], sb["origin"])
     catchup = _ds(sb, "catchup", "--main-sha", actual_main)
-    posts = [r for r in map(json.loads, (fake / "log").read_text().splitlines())
-             if r["method"] == "POST"]
+    requests = [json.loads(line) for line in (fake / "log").read_text().splitlines()]
+    posts = [row for row in requests if row["method"] == "POST"]
+    if case == "ci_only":
+        assert not [row for row in requests if row["path"].endswith("/reviews")]
+        assert "观察 +5min" in result.stdout and "观察 +10min" in result.stdout
     t.proof("continuity-" + case, {"native_exit": result.returncode, "stdout": result.stdout,
         "base": sb["base"], "head": sb["sha"], "actual_main": actual_main,
         "deployed": state.get("deployed"), "last_attempt": state.get("last_attempt"),
@@ -1033,7 +1044,7 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
                      for o in state.get("outcomes", {}).values()], "post_count": len(posts),
         "catchup_exit": catchup.returncode, "catchup_stdout": catchup.stdout,
         "fences": [r["retained_fences"] for r in posts]})
-    if case == "stable":
+    if case in {"stable", "ci_only"}:
         assert result.returncode == 0 and state["deployed"]["sha"] == sb["sha"]
         assert len(posts) == 1 and actual_main == sb["sha"] and catchup.returncode == 0
         assert next(iter(state["outcomes"].values()))["verification"] == "normal"

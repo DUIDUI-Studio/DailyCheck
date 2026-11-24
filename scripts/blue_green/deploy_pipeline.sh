@@ -84,6 +84,7 @@ TREE_MOVED=0
 ORIG_REF=""
 GITHUB_ORDINARY=0
 FROZEN_BASE=""
+CI_ONLY_EVIDENCE=""
 HELPER_ROOT=""
 REPORTER="${SCRIPT_DIR}/deploy_report.py"
 MERGER="${DAILYCHECK_DEPLOY_MERGE_BIN:-${SCRIPT_DIR}/deploy_merge.py}"
@@ -506,7 +507,9 @@ run_stage() {
 _merge_helper() {
   local merger="${MERGER}"
   if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
-    DAILYCHECK_PROD_REPO="${REPO_ROOT}" "${PY}" "${merger}" "$@" --base "${FROZEN_BASE}"
+    DAILYCHECK_PROD_REPO="${REPO_ROOT}" \
+      DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE="${CI_ONLY_EVIDENCE:-}" \
+      "${PY}" "${merger}" "$@" --base "${FROZEN_BASE}"
   else
     "${PY}" "${merger}" "$@"
   fi
@@ -550,12 +553,28 @@ _prepare_candidate() {
     log "✗ 候选分支未包含 origin/main —— 先 rebase/merge main 再部署"
     return 1
   fi
-  if ! _merge_helper check --pr "${PR}" --sha "${SHA}" >>"${LOG}" 2>&1; then
-    log "✗ Gitea PR 前置校验失败（closed / draft / head sha 不符）"
+  local check_out
+  if ! check_out="$(_merge_helper check --pr "${PR}" --sha "${SHA}" 2>>"${LOG}")"; then
+    printf '%s\n' "${check_out}" >>"${LOG}"
+    log "✗ PR 前置校验失败"
     _candidate_owner "candidate-check-return failure; skip stale recovery" || return 1
     return 1
   fi
+  printf '%s\n' "${check_out}" >>"${LOG}"
   _require_candidate_owner "candidate-check-return"
+  if [[ "${GITHUB_ORDINARY}" -eq 1 ]]; then
+    CI_ONLY_EVIDENCE="$(printf '%s\n' "${check_out}" | "${PY}" -c '
+import json, re, sys
+facts = json.load(sys.stdin)
+count = facts.get("required_approvals")
+evidence = facts.get("ci_only_evidence")
+valid = (type(count) is int and count >= 0 and isinstance(evidence, str)
+         and (bool(re.fullmatch("[0-9a-f]{64}", evidence)) if count == 0 else evidence == ""))
+if not valid:
+    sys.exit(1)
+print(evidence)
+')" || return 1
+  fi
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "dry-run：候选前置校验通过，不 checkout"
     return 0

@@ -19,10 +19,13 @@ DAILYCHECK_GITEA_TOKEN_FILE / DAILYCHECK_CURL），不另起一套。
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +68,126 @@ def _candidate_intact(sha: str) -> None:
         raise HostingError("github_verified_candidate_changed")
 
 
-def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -> dict:
+def _github_protection(client: HostingClient, root: str) -> tuple[dict, int]:
+    """Read the supported classic policy and reject unmodeled rule overlays."""
+    path = f"{root}/branches/main/protection"
+    protection = client.get(path)
+    if not isinstance(protection, dict) or protection.get("url") != client.config.api_url + path:
+        raise HostingError("github_required_protection_unproven")
+    required = protection.get("required_status_checks") or {}
+    checks = required.get("checks")
+    contexts = ("test", "agent-framework-reports")
+    reported_contexts = required.get("contexts")
+    if (protection.get("enforce_admins", {}).get("enabled") is not True
+            or required.get("strict") is not True
+            or not isinstance(checks, list) or len(checks) != len(contexts)
+            or any(not isinstance(check, dict)
+                   or not _integer(check.get("app_id"), client.config.actions_app_id)
+                   for check in checks)
+            or {check.get("context") for check in checks} != set(contexts)
+            or not isinstance(reported_contexts, list)
+            or len(reported_contexts) != len(contexts)
+            or set(reported_contexts) != set(contexts)):
+        raise HostingError("github_required_protection_unproven")
+
+    # The branch-specific endpoint includes active repository and organization
+    # rules. Any overlay needs a separate supported model and reconciliation.
+    rules, headers = client.request("GET", f"{root}/rules/branches/main?per_page=100&page=1")
+    if rules != [] or any(line.lower().startswith("link:") for line in headers.splitlines()):
+        raise HostingError("github_active_rules_unproven")
+
+    # GitHub omits disabled optional settings in the complete classic response.
+    if "required_pull_request_reviews" not in protection:
+        return protection, 0
+    reviews = protection["required_pull_request_reviews"]
+    if not isinstance(reviews, dict):
+        raise HostingError("github_required_protection_unproven")
+    count = reviews.get("required_approving_review_count")
+    if (type(count) is not int or not 0 <= count <= 6
+            or type(reviews.get("dismiss_stale_reviews")) is not bool
+            or reviews.get("require_code_owner_reviews") is not False
+            or reviews.get("require_last_push_approval", False) is not False
+            or (count > 0 and reviews.get("dismiss_stale_reviews") is not True)):
+        raise HostingError("github_required_protection_unproven")
+    return protection, count
+
+
+def _github_review_evidence(client: HostingClient, root: str, pr: int, sha: str, count: int) -> dict:
+    if not count:
+        return {}
+    reviews = client.pages(f"{root}/pulls/{pr}/reviews")
+    latest = {}
+    for review in sorted(reviews, key=lambda r: r["id"]):
+        state = review.get("state")
+        if state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            user = review.get("user", {}).get("id")
+            if not _integer(user):
+                raise HostingError("github_invalid_review")
+            latest[user] = (state, review.get("commit_id"), review["id"])
+    if (any(r[0] == "CHANGES_REQUESTED" for r in latest.values())
+            or sum(r[0] == "APPROVED" and r[1] == sha for r in latest.values()) < count):
+        raise HostingError("github_review_required")
+    return latest
+
+
+def _ci_only_authority(pr: int, base: str, locked_dir: Path | None) -> dict:
+    from scripts.blue_green import deploy_state, publication_authority
+
+    def read(directory: Path) -> dict:
+        state = deploy_state.load_state(directory, strict=True)
+        deployed = state.get("deployed") or {}
+        generation = deployed.get("generation")
+        evicted = state.get("last_evicted")
+        if (deployed.get("sha") != base or not _integer(generation)
+                or generation > state["generation"] or deploy_state.native_blocked(directory, state)):
+            raise HostingError("github_ci_only_serving_base_unproven")
+        if evicted is not None and (not isinstance(evicted, dict)
+                or not _integer(evicted.get("generation")) or evicted["generation"] >= generation):
+            raise HostingError("github_ci_only_previous_attempt_unresolved")
+        lock = state.get("lock")
+        if lock is not None:
+            owner = deploy_state.AttemptIdentity.from_env()
+            if owner is None or deploy_state.process_lock_fd() is None or not owner.owns(lock):
+                raise HostingError("github_ci_only_attempt_busy")
+            if "DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE" not in os.environ:
+                raise HostingError("github_ci_only_pipeline_pair_required")
+        binding = publication_authority.resolve_source_binding(directory, pr)
+        if binding.source[0] != "github" or binding.issue_identities is None:
+            raise HostingError("github_ci_only_source_binding_unproven")
+        return {"serving_generation": generation, "binding_sha256": binding.binding_sha256}
+
+    if locked_dir is not None:
+        return read(locked_dir)
+    directory = deploy_state.state_dir()
+    lock_path = directory / deploy_state.FLOCK_FILENAME
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as lock_file:
+            # The current pipeline's own heartbeat briefly takes the exclusive state lock.
+            deadline = time.monotonic() + (3 if deploy_state.process_lock_fd() is not None else 0)
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+            return read(directory)
+    except OSError as exc:
+        raise HostingError("github_ci_only_authority_unavailable") from exc
+
+
+def _ci_only_digest(facts: dict) -> str:
+    if facts["required_approvals"] != 0:
+        return ""
+    canonical = json.dumps(facts, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _github_preconditions(
+    client: HostingClient, pr: int, sha: str, base: str, *, locked_dir: Path | None = None
+) -> dict:
     readiness = GitHubReadinessClient(client).check(pr, sha, expected_base_sha=base)
     if not readiness["ready"]:
         raise HostingError("github_not_ready:" + readiness["reason"])
@@ -95,33 +217,9 @@ def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -
             or comparison.get("merge_base_commit", {}).get("sha") != base
             or comparison.get("base_commit", {}).get("sha") != base):
         raise HostingError("github_not_fast_forward")
-    protection = client.get(f"{root}/branches/main/protection")
-    required = protection.get("required_status_checks") or {}
-    checks = required.get("checks") or []
-    reviews_policy = protection.get("required_pull_request_reviews") or {}
-    count = reviews_policy.get("required_approving_review_count")
-    # An indirect merge is not evidence that review/check protections were met.
-    # Fail closed until Prod aligns classic protection, including administrators.
-    if (protection.get("enforce_admins", {}).get("enabled") is not True
-            or not _integer(count)
-            or reviews_policy.get("dismiss_stale_reviews") is not True
-            or any(not _integer(c.get("app_id")) for c in checks)
-            or any(not any(c.get("context") == name
-                           and _integer(c.get("app_id"), client.config.actions_app_id) for c in checks)
-                   for name in ("test", "agent-framework-reports"))):
-        raise HostingError("github_required_protection_unproven")
-    reviews = client.pages(f"{root}/pulls/{pr}/reviews")
-    latest = {}
-    for review in sorted(reviews, key=lambda r: r["id"]):
-        state = review.get("state")
-        if state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
-            user = review.get("user", {}).get("id")
-            if not _integer(user):
-                raise HostingError("github_invalid_review")
-            latest[user] = (state, review.get("commit_id"), review["id"])
-    if (any(r[0] == "CHANGES_REQUESTED" for r in latest.values())
-            or sum(r[0] == "APPROVED" and r[1] == sha for r in latest.values()) < count):
-        raise HostingError("github_review_required")
+    protection, required_approvals = _github_protection(client, root)
+    latest = _github_review_evidence(client, root, pr, sha, required_approvals)
+    authority = _ci_only_authority(pr, base, locked_dir) if required_approvals == 0 else {}
     # Re-read refs after collecting review/protection facts; the mutation also CASes both refs.
     after = client.get(f"{root}/pulls/{pr}")
     main = client.get(f"{root}/git/ref/heads/main")
@@ -134,8 +232,9 @@ def _github_preconditions(client: HostingClient, pr: int, sha: str, base: str) -
         raise HostingError("github_target_changed")
     return {"pr_node": data["node_id"], "pr_id": data["id"],
             "head_ref": head_ref, "base": base, "head": sha,
-            "protection": protection, "reviews": latest,
-            "ci": {k: readiness[k] for k in ("run_id", "run_attempt", "check_evidence")}}
+            "protection": protection, "required_approvals": required_approvals, "reviews": latest,
+            "authority": authority,
+            "ci": {k: readiness[k] for k in ("workflow_id", "run_id", "run_attempt", "check_evidence")}}
 
 
 def _github(pr: int, sha: str, base: str | None, *, merge: bool, dry_run: bool = False):
@@ -147,12 +246,17 @@ def _github(pr: int, sha: str, base: str | None, *, merge: bool, dry_run: bool =
         # Freeze B explicitly; never infer it at finalization time.
         github_ff_payload(base, sha, "refs/heads/validation", "0" * 32)
         before = _github_preconditions(client, pr, sha, base)
+        evidence = _ci_only_digest(before)
         if not merge or dry_run:
-            return RC_OK, {**_payload(pr, sha, False, "check passed; no mutation"), "base": base}
+            return RC_OK, {**_payload(pr, sha, False, "check passed; no mutation"), "base": base,
+                           "required_approvals": before["required_approvals"], "ci_only_evidence": evidence}
+        if os.environ.get("DAILYCHECK_GITHUB_CI_ONLY_EVIDENCE", "") != evidence:
+            raise HostingError("github_ci_only_candidate_evidence_changed")
         import deploy_state
 
-        with deploy_state._write_lock(deploy_state.state_dir()) as boundary_fd:
-            state = deploy_state._load_state(deploy_state.state_dir())
+        directory = deploy_state.state_dir()
+        with deploy_state._write_lock(directory) as boundary_fd:
+            state = deploy_state._load_state(directory)
             lock = state.get("lock") or {}
             identity = deploy_state.AttemptIdentity.from_env()
             attempt_fd = deploy_state._process_lock_fd()
@@ -164,7 +268,7 @@ def _github(pr: int, sha: str, base: str | None, *, merge: bool, dry_run: bool =
                         "provider": "github", "host": "github.com",
                         "repository": client.config.repo, "pr": pr}):
                 raise HostingError("github_owned_verified_pipeline_required")
-            current = _github_preconditions(client, pr, sha, base)
+            current = _github_preconditions(client, pr, sha, base, locked_dir=directory)
             if current != before:
                 raise HostingError("github_finalization_facts_changed")
             _candidate_intact(sha)
@@ -197,7 +301,8 @@ def _github(pr: int, sha: str, base: str | None, *, merge: bool, dry_run: bool =
                 raise HostingError("github_finalization_postfacts_unconfirmed")
             _candidate_intact(sha)
             return RC_OK, {**_payload(pr, sha, True, "", sha), "base": base,
-                           "main_sha": sha, "pr_node": current["pr_node"]}
+                           "main_sha": sha, "pr_node": current["pr_node"],
+                           "required_approvals": current["required_approvals"]}
     except (HostingError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         reason = str(exc) if isinstance(exc, HostingError) else "github_invalid_finalization_facts"
         return RC_API, {**_payload(pr, sha, False, reason), "base": base,
