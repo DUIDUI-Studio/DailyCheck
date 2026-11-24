@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
@@ -23,6 +24,7 @@ from mcp_server.data.unit_of_work import (
 from mcp_server.infra.errors import ForbiddenError, ValidationError, WriteError
 from mcp_server.service.policy import BoundPolicy, load_binding
 from routing_mode import routing_modes
+from routing_writer_fence import routing_writer_fence
 from warehouse_paths import resolve_warehouse_path
 
 
@@ -75,7 +77,9 @@ def read_routing(policy: BoundPolicy, fields, *, canonical_id, warehouse_code):
             rows, reason = _binding(conn, canonical_id, warehouse_code, path)
             if "binding" in fields:
                 result["binding"] = {"warehouse_code": warehouse_code, "items": rows}
-        modes = routing_modes(config.MASTER_DB) if "mode" in fields or "routing" in fields else None
+        modes = None
+        if "mode" in fields or "routing" in fields:
+            modes = routing_modes(config.MASTER_DB, schema_version=conn.execute("PRAGMA user_version").fetchone()[0])
         if "routing" in fields:
             source = get_routing(conn, canonical_id)
             version, pause_id = stockout_state(conn, canonical_id)
@@ -162,9 +166,11 @@ def change_routing(policy: BoundPolicy, operation: str, arguments: dict):
     idem = arguments["idempotency_key"]
     request_json = json.dumps({"operation": operation, **arguments}, sort_keys=True, separators=(",", ":"))
     try:
-        with routing_write_connection() as conn:
+        fence = routing_writer_fence() if config.IS_PRODUCTION else nullcontext()
+        with fence, routing_write_connection() as conn:
             canonical, path = _target(conn, policy, f"routing.{operation}", cid, code)
-            if not routing_modes(config.MASTER_DB)["writes_enabled"]:
+            modes = routing_modes(config.MASTER_DB, schema_version=conn.execute("PRAGMA user_version").fetchone()[0])
+            if not modes["writes_enabled"]:
                 raise WriteError("routing_mode_unavailable", "Web and MCP must confirm matching enabled live mode")
             prior = conn.execute(
                 "SELECT * FROM item_routing_stockout_events WHERE token_id=? AND idempotency_key=?",

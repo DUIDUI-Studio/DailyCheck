@@ -34,6 +34,10 @@ class StageFailure(Exception):
     """A positively waited stage exit or a failed observation probe."""
 
 
+class RoutingSwitchBlocked(Exception):
+    """The protected routing guard refused before starting a stage helper."""
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 

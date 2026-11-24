@@ -2984,6 +2984,12 @@ CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确�
 
 #### Gene 单品停订策略（GitHub #45）
 
+生产暂停与恢复在 SQLite 事务外层持主机路由写入共享锁。受保护 relay 持同一 inode 的
+独占锁并要求持久 disabled，随后核对配置绑定的实际 master 身份和 v10 暂停状态与审计，
+然后才运行阶段脚本，锁随 helper 继承。旧 Web 无法保留暂停时，活动或未知状态均拒绝，
+回切阻断保存原尝试，结果由发布控制面验证。此门禁需要单独更新受保护 relay，独立于应用
+源码包。写者围栏和受控恢复参见 [单品停订运行手册](mcp-routing-stockout.md)。
+
 主库 v10 在既有 MCP 策略绑定上增加业务负责人和令牌的精确
 `(tenant, canonical_id, distribution_center)` 对和不可复用的审批记录。
 受控主机通过管理员本人认证、只读预览及签名确认分开记录固定预设登记、

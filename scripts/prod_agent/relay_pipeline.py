@@ -7,13 +7,17 @@ import os
 import pwd
 import re
 import secrets
+import sqlite3
 import stat
 import subprocess
 import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from routing_writer_fence import routing_writer_fence
 from scripts.blue_green import deploy_state as ds
+from scripts.check_routing_web_rollback import active_holds
 from scripts.prod_agent import relay_git
 from scripts.prod_agent.native_pipeline import (
     RELEASE_MODES,
@@ -31,6 +35,7 @@ from scripts.prod_agent.native_ports import SystemdObserver, protected_path, rea
 from scripts.prod_agent.relay_protocol import (
     STATE_PATH,
     SYSTEM_ENV,
+    RoutingSwitchBlocked,
     StageFailure,
     digest,
     hex_id,
@@ -385,6 +390,8 @@ class RelayPipeline(ProtectedPipeline):
 
     def prepare(self, repo):
         candidate = self._owned()
+        with self._routing_switch_guard("candidate"):
+            pass
         self._admin_audit_log()
         expected = self.server.expected
         require(repo == self.policy.location("repo"), "wrong protected source store")
@@ -418,8 +425,46 @@ class RelayPipeline(ProtectedPipeline):
         print(json.dumps({"commit": expected["head"], "signed_ci_sha256": ci,
                           "hosted_checks": ["test", "agent-framework-reports"]}, sort_keys=True))
 
+    def _stockout_release(self, sha):
+        repo = self.policy.location("repo")
+        return bool(relay_git.git(repo, "ls-tree", sha, "--", "migrations/routing_stockout.py").strip())
+
+    @contextmanager
+    def _routing_switch_guard(self, stage):
+        with ExitStack() as scope:
+            source = self.path("source_db")
+            external = self.server.profile.get("external_warehouse_dbs")
+            expected = self.server.profile["source_db_identity"]
+            base = self._stockout_release(self.server.expected["base"])
+            candidate = self._stockout_release(self.server.expected["head"])
+            fence = None
+            if base or candidate:
+                try:
+                    fence = scope.enter_context(routing_writer_fence(switching=True))
+                except OSError as exc:
+                    raise RoutingSwitchBlocked("writer_unfenced") from exc
+            try:
+                require(database_identity(source, external) == expected, "live DB identity changed")
+                pre_feature = not base and (
+                    not candidate or stage != "switch"
+                    and _route(self.path("nginx_conf").read_text()) == "blue"
+                )
+                count = active_holds(source / "master.db", pre_feature=pre_feature,
+                                     bootstrap=not base and candidate)
+                require(base or candidate or count is None, "stockout schema with legacy-only releases")
+                require(database_identity(source, external) == expected, "live DB identity changed")
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                raise RoutingSwitchBlocked("hold_state_unavailable") from exc
+            if count:
+                raise RoutingSwitchBlocked("active_holds")
+            yield fence
+
     def stage(self, name):
         candidate = self._owned()
+        with self._routing_switch_guard(name) as routing_fd:
+            self._run_stage(name, candidate, routing_fd)
+
+    def _run_stage(self, name, candidate, routing_fd):
         expected = self.server.expected
         if name != "rollback":
             repo = self.policy.location("repo")
@@ -436,11 +481,12 @@ class RelayPipeline(ProtectedPipeline):
             verify_dir = self.server.work / "verification"
             verify_dir.mkdir(mode=0o700)
             env.update(REPORT_DIR=str(verify_dir), DC_NATIVE_LOG_DIR=str(verify_dir))
+        inherited = (ds.process_lock_fd(),) if routing_fd is None else (ds.process_lock_fd(), routing_fd)
         with log.open("xb") as stream:
             with subprocess.Popen(
                 ["/bin/bash", str(self.policy.authority / "scripts/blue_green" / script), *argv],
                 env=env, cwd=self.policy.authority,
-                pass_fds=(ds.process_lock_fd(),), stdin=subprocess.DEVNULL,
+                pass_fds=inherited, stdin=subprocess.DEVNULL,
                 stdout=stream, stderr=subprocess.STDOUT,
             ) as child:
                 while True:

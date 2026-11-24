@@ -16,6 +16,7 @@ def _select_only(action: int, _arg1, _arg2, _db, _source) -> int:
         action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ)
         or (action == sqlite3.SQLITE_FUNCTION and _arg2 == "count")
         or (action == sqlite3.SQLITE_TRANSACTION and _arg1 == "BEGIN")
+        or (action == sqlite3.SQLITE_PRAGMA and _arg1 == "user_version" and _arg2 is None)
     )
     return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
 

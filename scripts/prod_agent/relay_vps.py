@@ -26,6 +26,7 @@ from scripts.prod_agent.relay_protocol import (
     REPO,
     STATE_PATH,
     SYSTEM_ENV,
+    RoutingSwitchBlocked,
     StageFailure,
     canonical,
     checked_file,
@@ -300,6 +301,11 @@ class Server:
             previous = self.runtime("previous")
             rollback_route = self.runtime("standby")
             self.stage_preflight(repo)
+        except RoutingSwitchBlocked as exc:
+            (self.work / "incoming.bundle").unlink(missing_ok=True)
+            self._set(routing_block={"stage": "candidate", "reason": str(exc), "at": ds.now_epoch()})
+            self.finish("rejected", "candidate", fd)
+            return
         except (ValueError, HostingError, OSError, subprocess.SubprocessError, StageFailure):
             (self.work / "incoming.bundle").unlink(missing_ok=True)
             self.finish("rejected", "candidate", fd)
@@ -337,6 +343,9 @@ class Server:
             self._set(phase="verified", journal=journal, observed=route,
                       observation_seconds=int(time.monotonic() - started), samples=samples,
                       fixture=self.fixture is not None)
+        except RoutingSwitchBlocked as exc:
+            self._set(failed_stage=stage,
+                      routing_block={"stage": stage, "reason": str(exc), "at": ds.now_epoch()})
         except StageFailure:
             self.rollback(stage, fd)
 
@@ -352,7 +361,15 @@ class Server:
                     or row["phase"] == "armed" and rejection is not None,
                     "rollback after write intent denied")
         self._set(phase="rollback_started", failed_stage=stage, rejection=rejection)
-        self.stage("rollback")
+        try:
+            self.stage("rollback")
+        except RoutingSwitchBlocked as exc:
+            # No switch helper was spawned. Preserve the same signed abort/reject
+            # path for a retry and keep the original attempt and its evidence.
+            self._set(phase=row["phase"], routing_block={
+                "stage": "rollback", "reason": str(exc), "at": ds.now_epoch(),
+            })
+            raise
         require(self.runtime("blue") == row["rollback_runtime"], "blue rollback not confirmed")
         self.finish("rolled_back", stage, fd)
 
@@ -479,6 +496,7 @@ class Server:
             require(self.runtime("green") == row["observed"], "green readback changed")
             if op == "arm":
                 require(row["phase"] == "verified" and envelope["ci"] == row["ci"], "already armed or stale CI")
+                require(not row.get("routing_block"), "rollback is blocked")
                 self._set(phase="armed", intent=secrets.token_hex(16), armed_at=ds.now_epoch())
             elif op == "abort":
                 require(row["phase"] == "verified" and unchanged_remote(self.expected, envelope["remote"]),

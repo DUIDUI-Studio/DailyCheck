@@ -9,6 +9,8 @@ import os
 import secrets
 from pathlib import Path
 
+from routing_writer_fence import routing_writer_fence
+
 
 def _key() -> bytes:
     secret = os.environ.get("DAILYCHECK_ROUTING_PROBE_SECRET", "")
@@ -70,12 +72,24 @@ def _web_mode(database: str) -> dict | None:
     return None
 
 
-def routing_modes(db_path: Path) -> dict:
+def routing_modes(db_path: Path, *, schema_version: int) -> dict:
+    from config import IS_PRODUCTION
+
     local = _snapshot(db_path, dry_run=os.environ.get("DRY_RUN", "").lower() == "true")
     web = _web_mode(local["database"])
+    enabled = bool(web and local["multi_warehouse"] and web["multi_warehouse"]
+                   and not local["dry_run"] and not web["dry_run"])
+    if enabled and IS_PRODUCTION:
+        if schema_version != 10:
+            enabled = False
+        else:
+            try:
+                with routing_writer_fence():
+                    pass
+            except OSError:
+                enabled = False
     return {
         "mcp_multi_warehouse": local["multi_warehouse"],
         "web_multi_warehouse": web["multi_warehouse"] if web else None,
-        "writes_enabled": bool(web and local["multi_warehouse"] and web["multi_warehouse"]
-                               and not local["dry_run"] and not web["dry_run"]),
+        "writes_enabled": enabled,
     }

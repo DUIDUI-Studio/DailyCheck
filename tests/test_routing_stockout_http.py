@@ -21,6 +21,7 @@ import pytest
 from jsonschema import validate
 from werkzeug.security import generate_password_hash
 
+import routing_writer_fence as writer
 from mcp_server.protocol.registry import REGISTRY
 from mcp_server.service.policy import ROUTING_FIELDS, encode_grants
 from mcp_server.service.routing_approvals import FIXED_PRESET
@@ -452,6 +453,60 @@ def test_live_hold_survives_disabled_mcp_and_web(lab):
         attempted = _post(store, CART + "/add", csrf, **TARGET, dc="dc_alpha", quantity="1", unit="件")
         assert "品项A 缺货停订" in attempted.text
     assert check_rollback(["--db", str(env["master_path"])]) == 1
+
+
+def test_production_routing_writer_shares_rollback_fence(lab, monkeypatch):
+    root, env, tokens = lab
+    master = env["master_path"]
+    fence = root / "routing-writes.lock"
+    fence.write_text("enabled\n")
+    monkeypatch.setattr(writer, "_open_fence", lambda _: os.open(fence, os.O_RDONLY))
+    key = secrets.token_urlsafe(32)
+    # Supply an isolated inode in place of the production /etc path. The
+    # production-mode MCP still exercises the real file state and flock.
+    program = """
+import os, sys, routing_writer_fence
+path, socket_fd = sys.argv[1:]
+routing_writer_fence._open_fence = lambda _: os.open(path, os.O_RDONLY)
+sys.argv = ['uvicorn', 'mcp_server.main:_build_app', '--factory', '--fd', socket_fd]
+from uvicorn import main
+main()
+"""
+    web_env = _child_env(root / "db", root, key, mode=True)
+    with _process(["-c", WEB_PROGRAM, str(root)], web_env) as web:
+        mcp_env = dict(web_env, DAILYCHECK_ENV="production",
+                       DAILYCHECK_ROUTING_WEB_PORT=web.rsplit(":", 1)[1])
+        with _process(["-c", program, str(fence)], mcp_env,
+                      headers=_headers(tokens["legacy"])) as mcp:
+            gene = tokens["gene"]
+            status = _run(mcp, gene, READ, TARGET)
+            assert status["mode"]["writes_enabled"]
+            args = _arguments(status, PAUSE)
+            fence.write_text("disabled\n")
+            with writer.routing_writer_fence(switching=True) as fd:
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import sys; sys.stdin.read(1)"],
+                    pass_fds=(fd,), stdin=subprocess.PIPE,
+                )
+            try:
+                assert child.poll() is None
+                with pytest.raises(BlockingIOError), writer.routing_writer_fence(switching=True):
+                    pytest.fail("inherited helper lost the interlock")
+                assert not _run(mcp, gene, READ, TARGET)["mode"]["writes_enabled"]
+                _run(mcp, gene, PAUSE, args, error="routing_storage_unavailable")
+                assert _sql(master, "SELECT id FROM item_routing_stockout_events") == []
+            finally:
+                child.communicate(b"x", timeout=8)
+            assert child.returncode == 0
+            _run(mcp, gene, PAUSE, args, error="routing_storage_unavailable")
+            assert _sql(master, "SELECT id FROM item_routing_stockout_events") == []
+            fence.write_text("enabled\n")
+            _sql(master, "PRAGMA user_version=9")
+            assert not _run(mcp, gene, READ, TARGET)["mode"]["writes_enabled"]
+            _run(mcp, gene, PAUSE, args, error="routing_mode_unavailable")
+            _sql(master, "PRAGMA user_version=10")
+            receipt = _run(mcp, gene, PAUSE, args)
+            assert _sql(master, "SELECT id FROM item_routing_stockout_events") == [(receipt["event_id"],)]
 
 
 @pytest.mark.parametrize("mutation", ["inactive", "alias", "unit", "duplicate", "unorderable"])
