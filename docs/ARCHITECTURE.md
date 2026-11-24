@@ -1827,13 +1827,22 @@ attestation。native capture 只在退出
 no-attestation 语义不变。
 
 hosted pytest 捕获额外以固定 `--junitxml=/candidate/.dc-junit.xml` 生成 JUnit（`-q/--tb=no`
-与完整选择不变），执行前删除候选预置的该文件。proven child exit 后由 controller 把 JUnit
-以可见名 `junit.xml`（候选输入仍为隐藏 `.dc-junit.xml`；upload-artifact v4 默认
-`include-hidden-files=false`，不启用 hidden 文件上传）、raw tail（≤1 MiB）、
-session/capture metadata（≤256 KiB）复制到固定
-`$CI_ROOT/native-diagnostics`；只允许这些固定文件名，缺失/超大/畸形/符号链接逃逸记为
-controller-owned `status.json` 的固定状态、大小与 SHA256。这些副本是 untrusted diagnostic
-data，不参与 gate/attestation，也不能把有效 native proof 变成失败。GitHub 的 test/
+与完整选择不变），执行前删除候选预置的该文件。JUnit、原始 stdout/stderr 和完整
+session 留在私有 capture，现有证据门禁继续使用原始数据。
+
+Issue #41 的失败诊断由固定插件在加载初始 conftest 前写入本次 capture 的随机路径，
+并在收集结束、用例开始、收到 teardown report 时原子替换快照。controller 取得
+wait/inspect 与原始日志后，在清理前读取最多 2 KiB 的快照。它拒绝链接、非普通文件、
+过大文件、旧 capture 标记、额外/重复字段、无效计数和时间。可展示的用例名剥去参数值，
+并对照精确被测 Git 树中已经声明的路径和符号。运行期间由测试代码动态生成的名字可能
+无法核验。快照缺失或拒绝时只记录固定状态。
+
+已确认退出、镜像及 runtime 状态匹配且已清理的 pytest 若超时或未通过证据门禁，
+controller 将 run/attempt/H 或 G/B、退出状态、单调耗时和有界进度写入
+`$CI_ROOT/native-diagnostics/status.json`。最近 60 秒的 teardown 表示接近超时时仍有推进。
+长时间没有 teardown 时，收集未结束、用例仍在执行和用例之间停留分别标记。
+快照与被测代码同进程，合规快照仍只能作诊断线索。gate、attestation 和 reports
+上游复用只接受现有正式证据。GitHub 的 test/
 agent-framework-reports job 各自只在 native producer 失败时，用固定 SHA 的
 `actions/upload-artifact` 上传该目录（retention 2 天、唯一 run/attempt/job 名、
 `if-no-files-found: ignore`）；权限、job/event/runner/runtime 与 Gitea 路径不变。
