@@ -13,7 +13,7 @@
   </ul>
   {% if 'items_detail' in tools %}<p>库存限所选门店的库存品。</p>{% endif %}
   {% if 'store_order_list' in tools %}<p>订单限所选门店发起的普通订单。</p>{% endif %}
-  {% if 'wms_document_lines' in tools %}<p>外部 WMS 范围限朴宇仓（3）、蜜可诗（155 / RTS012）的原单明细。</p>{% endif %}
+  {% if 'wms_document_lines' in tools %}<p>外部 WMS 范围限朴宇冷库（1）、蜜可诗（155 / RTS012）的原单明细。</p>{% endif %}
   <p>所有写入均拒绝。</p>
   <p>旧版读取路径 <code>[]</code> · 旧版写入路径 <code>[]</code> · 旧版仓库范围 <code>[]</code>。</p>
   <p>回退到旧版本时，即使仍显示工具目录，此令牌也无法读取业务数据和仓库名称，或执行写入。</p>
@@ -116,7 +116,7 @@
     <fieldset>
       <legend>外部 WMS 范围</legend>
       <label><input type="checkbox" name="policy_wms_warehouse" value="{{ policy_wms_warehouse }}" />
-        朴宇仓（{{ policy_wms_warehouse }}）· 蜜可诗（155 / RTS012）
+        朴宇冷库（{{ policy_wms_warehouse }}）· 蜜可诗（155 / RTS012）
       </label>
     </fieldset>
     <button type="submit" class="btn primary">预览权限</button>

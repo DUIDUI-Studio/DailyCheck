@@ -1113,7 +1113,8 @@ REGISTRY = (
             name="wms_document_lines",
             title="Read Puyu WMS document lines",
             description=(
-                "Read original inbound (in) or outbound (out) lines in authorized Puyu warehouse 3. "
+                "Read original inbound (in) or outbound (out) lines in authorized "
+                "Puyu cold-storage warehouse 1. "
                 "Use the exact case-sensitive original document number. Lines are in source order, "
                 "with base-unit quantities as decimal strings or null. Status: complete, empty, "
                 "not_found, ambiguous, or truncated. At most 2000 lines, with no continuation."
@@ -1131,7 +1132,7 @@ REGISTRY = (
         domain="wms", handler=wms.wms_document_lines_impl,
         access=AccessContract(
             "GET", "/api/v1/wms/document-lines", "StreamableHTTP bound policy only",
-            "explicit external WMS warehouse 3 and fixed tenant 155 / RTS012",
+            "explicit external WMS cold-storage warehouse 1 and fixed tenant 155 / RTS012",
         ),
         output_shape=obj(
             status={"enum": ["complete", "empty", "not_found", "ambiguous", "truncated"]},

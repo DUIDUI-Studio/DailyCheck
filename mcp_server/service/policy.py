@@ -9,7 +9,9 @@ POLICY_TOKEN_PREFIX = "mp."
 MAX_SQLITE_ID = 2**63 - 1
 WMS_LINES_ACTION = "wms.document_lines.read"
 WMS_LINES_FIELDS = ("goods_code", "goods_name", "qty", "unit")
-PUYU_WAREHOUSE_ID = 3
+# Dedicated document-lines capability reads cold storage only. The owner-confirmed
+# warehouse mapping lives with the Web scope in wms_web.MULTI_OWNER_WAREHOUSE_IDS.
+PUYU_COLD_STORAGE_WAREHOUSE_ID = 1
 PRODUCTION_CONSUMPTION_READ = "production_consumption.read"
 PRODUCTION_STORES = frozenset({"wh_002", "wh_003", "wh_004", "wh_006"})
 
@@ -89,10 +91,10 @@ def binding_scope(conn: sqlite3.Connection, grants: dict, selection: object) -> 
     if (
         not isinstance(selection, dict) or selection.keys() != {"wms_warehouse_id"}
         or type(selection["wms_warehouse_id"]) is not int
-        or selection["wms_warehouse_id"] != PUYU_WAREHOUSE_ID
+        or selection["wms_warehouse_id"] != PUYU_COLD_STORAGE_WAREHOUSE_ID
     ):
         raise ValueError("Invalid external WMS warehouse selection")
-    return {"wms_warehouse_id": PUYU_WAREHOUSE_ID}
+    return {"wms_warehouse_id": PUYU_COLD_STORAGE_WAREHOUSE_ID}
 
 
 def load_binding(conn: sqlite3.Connection, token_id: int) -> BoundPolicy | None:

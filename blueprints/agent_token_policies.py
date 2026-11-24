@@ -27,7 +27,7 @@ from mcp_server.protocol.registry import get_policy_actions
 from mcp_server.service.auth import token_prefix
 from mcp_server.service.policy import (
     POLICY_TOKEN_PREFIX,
-    PUYU_WAREHOUSE_ID,
+    PUYU_COLD_STORAGE_WAREHOUSE_ID,
     SAFE_FIELDS,
     WMS_LINES_ACTION,
     binding_scope,
@@ -121,7 +121,7 @@ def management_context(db) -> dict:
     return {
         "policy_fields": SAFE_FIELDS,
         "policy_wms_action": WMS_LINES_ACTION,
-        "policy_wms_warehouse": PUYU_WAREHOUSE_ID,
+        "policy_wms_warehouse": PUYU_COLD_STORAGE_WAREHOUSE_ID,
         "policy_presets": db.execute(
             "SELECT name, version, disabled_at FROM mcp_policy_presets ORDER BY name, version DESC"
         ).fetchall(),
@@ -178,9 +178,9 @@ def _preview(db):
         external = request.form.getlist("policy_wms_warehouse")
         selection = storefronts
         if external:
-            if external != [str(PUYU_WAREHOUSE_ID)] or storefronts:
+            if external != [str(PUYU_COLD_STORAGE_WAREHOUSE_ID)] or storefronts:
                 raise ValueError("Invalid external WMS selection")
-            selection = {"wms_warehouse_id": PUYU_WAREHOUSE_ID}
+            selection = {"wms_warehouse_id": PUYU_COLD_STORAGE_WAREHOUSE_ID}
         scope = binding_scope(db, json.loads(grants), selection)
     except (ValueError, OverflowError):
         abort(400, "预设或仓库范围无效。")

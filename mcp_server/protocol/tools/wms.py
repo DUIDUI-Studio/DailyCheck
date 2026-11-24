@@ -4,7 +4,11 @@ from __future__ import annotations
 from mcp_server.infra.errors import ForbiddenError, McpError, ValidationError
 from mcp_server.service import wms, wms_web
 from mcp_server.service.auth import _current_auth, check_path, resolve_ctx
-from mcp_server.service.policy import PUYU_WAREHOUSE_ID, WMS_LINES_ACTION, WMS_LINES_FIELDS
+from mcp_server.service.policy import (
+    PUYU_COLD_STORAGE_WAREHOUSE_ID,
+    WMS_LINES_ACTION,
+    WMS_LINES_FIELDS,
+)
 from mcp_server.service.wms import list_documents as svc_list_documents
 from mcp_server.service.wms import list_stock as svc_list_stock
 from mcp_server.service.wms import summarize_stock as svc_summarize_stock
@@ -46,7 +50,7 @@ def wms_documents_list_impl(args: dict, *, ctx=None) -> list[dict]:
 def wms_document_lines_impl(args: dict, *, ctx=None) -> dict:
     if (
         ctx is None or ctx is not _current_auth.get() or ctx.policy is None
-        or ctx.policy.wms_warehouse_id != PUYU_WAREHOUSE_ID
+        or ctx.policy.wms_warehouse_id != PUYU_COLD_STORAGE_WAREHOUSE_ID
         or ctx.policy.fields(WMS_LINES_ACTION) != WMS_LINES_FIELDS
     ):
         raise ForbiddenError("forbidden_tool")

@@ -42,5 +42,5 @@ Read/write classifies business intent; legacy HTTP/stdio reads may run migration
 | `wms_stock_list` | wms | read | `GET /api/v1/wms/stock` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
 | `wms_stock_summary` | wms | read | `GET /api/v1/wms/stock/summary` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
 | `wms_documents_list` | wms | read | `GET /api/v1/wms/documents` | handler | tenant fixed by server config; caller cannot widen it | yes | no |
-| `wms_document_lines` | wms | read | `GET /api/v1/wms/document-lines` | StreamableHTTP bound policy only | explicit external WMS warehouse 3 and fixed tenant 155 / RTS012 | no | no |
+| `wms_document_lines` | wms | read | `GET /api/v1/wms/document-lines` | StreamableHTTP bound policy only | explicit external WMS cold-storage warehouse 1 and fixed tenant 155 / RTS012 | no | no |
 | `production_consumption` | production_consumption | read | `GET /api/mcp/` | StreamableHTTP bound policy action and view grant only | granted storefronts within wh_002, wh_003, wh_004, wh_006 | no | no |

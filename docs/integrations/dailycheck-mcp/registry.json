@@ -2655,11 +2655,11 @@
         "method": "GET",
         "path": "/api/v1/wms/document-lines",
         "path_enforcement": "StreamableHTTP bound policy only",
-        "warehouse_scope": "explicit external WMS warehouse 3 and fixed tenant 155 / RTS012"
+        "warehouse_scope": "explicit external WMS cold-storage warehouse 1 and fixed tenant 155 / RTS012"
       },
       "bot_approved": false,
       "compatibility": "new read-only bound-policy tool; legacy catalogs and ACLs unchanged",
-      "description": "Read original inbound (in) or outbound (out) lines in authorized Puyu warehouse 3. Use the exact case-sensitive original document number. Lines are in source order, with base-unit quantities as decimal strings or null. Status: complete, empty, not_found, ambiguous, or truncated. At most 2000 lines, with no continuation.",
+      "description": "Read original inbound (in) or outbound (out) lines in authorized Puyu cold-storage warehouse 1. Use the exact case-sensitive original document number. Lines are in source order, with base-unit quantities as decimal strings or null. Status: complete, empty, not_found, ambiguous, or truncated. At most 2000 lines, with no continuation.",
       "domain": "wms",
       "external_subset": false,
       "handler": "mcp_server.protocol.tools.wms:wms_document_lines_impl",

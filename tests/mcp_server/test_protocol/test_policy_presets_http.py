@@ -1055,13 +1055,17 @@ def test_version_and_binding_snapshots_cannot_be_updated(issued_policy):
 
 def test_wms_and_production_policies_remain_isolated_on_the_same_server(production_tokens, web_sql):
     env, _, admin, production, _, _ = production_tokens
-    _, _, sql_calls = web_sql
+    _, source, sql_calls = web_sql
     grants = {WMS_LINES_ACTION: WMS_LINES_FIELDS}
     wms_tool = "wms_document_lines"
     wms_args = {"direction": "in", "doc_no": "EMPTY-LINES"}
+    for suffix in ("In", "Out"):
+        source.execute(
+            f"INSERT INTO biz_store{suffix} VALUES (30, 'EMPTY-LINES', '2026-11-03', 1, 155, 0, 'hidden', 'hidden')"
+        )
     assert _publish(admin, "mixed", {**grants, PRODUCTION_CONSUMPTION_READ: ["summary"]}).status_code == 400
     assert _publish(admin, "puyu-lines", grants).status_code == 302
-    external = ("policy_wms_warehouse", "3")
+    external = ("policy_wms_warehouse", "1")
     token = ("token_name", "Puyu reader")
     assert _post(admin, "preview", [token, ("preset", "production:1"), external]).status_code == 400
     assert _preview(admin, token[1], "puyu-lines:1", ["wh_002"]).status_code == 400
@@ -1113,17 +1117,21 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
         source.executemany(
             f"INSERT INTO biz_store{suffix} VALUES (?, ?, '2026-11-03', ?, ?, 1, 'hidden', 'hidden')",
             [
-                (21, args["doc_no"], 3, 155), (22, args["doc_no"], 3, 200), (23, args["doc_no"], 1, 155),
-                (24, "foreign-only", 3, 200), (25, "cold-only", 1, 155),
-                (26, "duplicate", 3, 155), (27, "duplicate", 3, 155),
-                (28, "only-in" if suffix == "In" else "only-out", 3, 155),
+                # Same original reference in cold storage, the other Puyu warehouse, and a
+                # wrong owner: only warehouse 1 + owner 155 may resolve.
+                (21, args["doc_no"], 1, 155), (22, args["doc_no"], 3, 155), (23, args["doc_no"], 1, 200),
+                (24, "warehouse3-only", 3, 155), (25, "wrong-owner-only", 1, 200),
+                (26, "duplicate", 1, 155), (27, "duplicate", 1, 155),
+                (28, "only-in" if suffix == "In" else "only-out", 1, 155),
+                (29, "EMPTY-LINES", 1, 155),
             ],
         )
         source.executemany(
             f"INSERT INTO biz_store{suffix}Detail VALUES (?, ?, ?, ?, 'hidden', 'hidden')",
             [(216, 21, 1, "0.0000"), (211, 21, 1, "12345678901234.1234" if suffix == "Out" else "123456.2345"),
              (212, 21, 1, "2.0001"), (213, 21, 2, None), (214, 21, 4, "4.0000"),
-             (215, 21, 5, None), (217, 22, 2, "9000"), (218, 23, 1, "8000")],
+             (215, 21, 5, None), (217, 22, 2, "9000"), (218, 23, 1, "8000"),
+             (219, 24, 1, "7777"), (220, 25, 1, "6666"), (221, 28, 1, "5555")],
         )
 
     assert _publish(admin, slug, {**grants, **LEGACY_GRANTS}).status_code == 400
@@ -1131,14 +1139,14 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
     assert _publish(admin, slug, grants).status_code == 302
     selection = [("token_name", "external reader"), ("preset", f"{slug}:1")]
     assert _post(admin, "preview", selection).status_code == 400
-    for value in ("1", "*", "03"):
+    for value in ("3", "*", "03"):
         assert _post(admin, "preview", [*selection, ("policy_wms_warehouse", value)]).status_code == 400
-    external = ("policy_wms_warehouse", "3")
+    external = ("policy_wms_warehouse", "1")
     assert _post(admin, "preview", [*selection, external, ("policy_warehouses", STORES[0])]).status_code == 400
     assert _post(admin, "preview", [*selection[:1], ("preset", "stock-and-orders:1"), external]).status_code == 400
     preview = _post(admin, "preview", [*selection, external])
     assert preview.status_code == 200
-    for text in (tool, "朴宇仓（3）", "155 / RTS012", *WMS_LINES_FIELDS, "所有写入均拒绝"):
+    for text in (tool, "朴宇冷库（1）", "155 / RTS012", *WMS_LINES_FIELDS, "所有写入均拒绝"):
         assert text in preview.get_data(as_text=True)
     raw, identity = _read_receipt(_confirm(admin, preview))
     assert _confirm(admin, preview).status_code == 409
@@ -1147,7 +1155,7 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
         "FROM agent_tokens WHERE id=?", (identity,),
     ) == ("[]", "[]", "[]")
     scope_json = _db_update(master, "SELECT warehouse_codes_json FROM mcp_policy_bindings WHERE token_id=?", (identity,))[0]
-    assert json.loads(scope_json) == {"wms_warehouse_id": 3}
+    assert json.loads(scope_json) == {"wms_warehouse_id": 1}
     assert authenticate(f"Bearer {raw}") is None  # legacy admission and stdio fallback
     with pytest.raises(ForbiddenError):
         wms_document_lines_impl(args, ctx=authenticate(f"Bearer {raw}", allow_policy=True))
@@ -1172,7 +1180,7 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
     ]
 
     def page_rows():
-        response = admin.get(f"/wms/documents/{direction}/21?warehouse=3&owner=155")
+        response = admin.get(f"/wms/documents/{direction}/21?warehouse=1&owner=155")
         assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
         html = response.get_data(as_text=True)
         rows = []
@@ -1205,14 +1213,15 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
             sql, params = sql_calls[-1]
             assert "WITH (HOLDLOCK)" in sql and "Latin1_General_BIN2" in sql and "DATALENGTH" in sql
             assert f"biz_store{'In' if direction == 'in' else 'Out'}Detail" in sql
-            assert args["doc_no"] not in sql and params[:2] == (3, 155)
+            assert args["doc_no"] not in sql and params[:2] == (1, 155)
             validate(result, next(e.output_shape for e in REGISTRY if e.name == tool))
             assert result == {"status": "complete", "document": args, "lines": expected}
             html, rows = page_rows()
             assert args["doc_no"] in html and rows == result["lines"]
 
             for number in (args["doc_no"].lower(), args["doc_no"].rstrip(), "原单-%", "%", "*", "原单-A_001?",
-                           "foreign-only", "cold-only", "absent", "only-out" if direction == "in" else "only-in"):
+                           "warehouse3-only", "wrong-owner-only", "absent",
+                           "only-out" if direction == "in" else "only-in"):
                 miss = await _call(allowed, tool, args | {"doc_no": number})
                 assert miss == {"status": "not_found", "document": None, "lines": []}
             assert (await _call(allowed, tool, args | {"doc_no": "duplicate"})) == {
@@ -1241,6 +1250,17 @@ def test_puyu_document_lines(issued_policy, policy_admin, web_sql, monkeypatch, 
     with _listener() as url, httpx.Client(trust_env=False, timeout=10) as http:
         asyncio.run(exercise(url))
         assert http.post(url.replace("/api/mcp/", "/sse"), json=INITIALIZE, headers=_headers(raw)).status_code == 401
+        # An old snapshot bound to warehouse 3 is rejected before any upstream query.
+        _db_update(master, "DROP TRIGGER mcp_policy_binding_immutable")
+        _db_update(
+            master, "UPDATE mcp_policy_bindings SET warehouse_codes_json=? WHERE token_id=?",
+            (json.dumps({"wms_warehouse_id": 3}), identity),
+        )
+        assert authenticate(f"Bearer {raw}", allow_policy=True) is None
+        before = len(sql_calls)
+        with pytest.raises(ForbiddenError):
+            wms_document_lines_impl(args, ctx=authenticate(f"Bearer {raw}", allow_policy=True))
+        assert len(sql_calls) == before
         assert admin.post(f"{ADMIN}/{identity}/revoke", data={
             "csrf_token": _hidden(admin.get(ADMIN), "csrf_token"),
         }).status_code == 302

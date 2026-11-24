@@ -204,8 +204,10 @@ existing access log.
 
 Publish a standalone preset for `wms.document_lines.read` with all four fields
 `goods_code`, `goods_name`, `qty`, and `unit`. In the preview select only
-external Puyu warehouse 3, which is bound to owner 155 / RTS012. Confirm and
-revoke through the same Agent Token page. Use the issued policy token on
+external Puyu cold-storage warehouse 1, which is bound to owner 155 / RTS012.
+Old bindings and previews that name any other warehouse, including warehouse 3,
+are rejected before the upstream query. Confirm and revoke through the same
+Agent Token page. Use the issued policy token on
 `/api/mcp/` to call `wms_document_lines` with `direction` (`in` or `out`) and
 the exact original `doc_no`. Quantities are decimal strings or null. The tool
 returns up to 2000 rows in source order and reports truncation explicitly.

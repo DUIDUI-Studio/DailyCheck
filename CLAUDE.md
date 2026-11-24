@@ -179,7 +179,7 @@ docs/
 | `wms_stock_list` | 外部 WMS（朴宇冷库）本货主当前库存明细（只读） |
 | `wms_stock_summary` | 外部 WMS 本货主分仓汇总（只读） |
 | `wms_documents_list` | 外部 WMS 本货主出入库单据（只读） |
-| `wms_document_lines` | 朴宇仓（3）本货主原单明细（仅 StreamableHTTP 独立策略令牌） |
+| `wms_document_lines` | 朴宇冷库（1）本货主原单明细（仅 StreamableHTTP 独立策略令牌） |
 | `production_consumption` | 按授权门店、北京时间日/周读取生产耗料计数和可追溯原始行（仅绑定策略的 StreamableHTTP） |
 
 门店订单只读域（Issue #73）：`store_order_list` / `store_order_detail` 走路径级 ACL
