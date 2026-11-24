@@ -639,8 +639,10 @@ class ProtectedPipeline:
         finally:
             os.close(fd)
 
-    def prepare_services(self):
+    def prepare_services(self, *, backup_suffix=""):
         """Fixed startup recipes; no candidate-provided unit/command is consumed."""
+        if re.fullmatch(r"(?:|\.attempt-[0-9a-f]{32})", backup_suffix) is None:
+            raise ValueError("invalid unit backup suffix")
         candidate = self._owned()
         p = self.policy
         if git(p.location("repo"), "rev-parse", "HEAD") != candidate["manifest"]["group_sha"]:
@@ -650,11 +652,11 @@ class ProtectedPipeline:
             path = self.path("unit_directory") / unit
             previous = read_protected(path, p.owner, anchor=p.anchor, private=False)
             # Preserve the pre-native recipe before replacing candidate import paths.
-            backup = self.path("backup_directory") / (unit + ".native-" + candidate["manifest"]["group_sha"])
-            if backup.exists():
-                raise ValueError("service preparation already attempted; reconcile required")
-            backup.write_bytes(previous)
-            backup.chmod(0o600)
+            backup = self.path("backup_directory") / (
+                unit + ".native-" + candidate["manifest"]["group_sha"] + backup_suffix)
+            with backup.open("xb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(previous)
             if any((self.path("unit_directory") / (unit + ".d")).glob("*.conf")):
                 raise ValueError("unreviewed service drop-ins require installation reconciliation")
             path.write_text(content)
@@ -788,12 +790,16 @@ class ProtectedPipeline:
                              db=self.path("green_db"), scratch=scratch)
         if result.returncode:
             return result.returncode
-        result = self._lower([str(self.policy.authority / "scripts/playwright/sim_user.py"),
-                              "--base-url", "http://127.0.0.1:8091"],
-                             db=self.path("green_db"), scratch=scratch, extra=env)
-        if result.returncode:
-            return result.returncode
-        return 0
+        args = [str(self.policy.authority / "scripts/playwright/sim_user.py"),
+                "--base-url", "http://127.0.0.1:8091"]
+        if os.environ.get("DC_RELAY_MODE") == "1":
+            args = [str(self.policy.authority / "scripts/playwright/sim_user.py"),
+                    "--base-url", "http://localhost:8091", "--local-preview"]
+        result = self._lower(args, db=self.path("green_db"), scratch=scratch, extra=env)
+        # The probe logs only route outcomes, not request payloads or credentials.
+        if result.stdout:
+            print(result.stdout, end="")
+        return result.returncode
 
     def _dryrun(self, scratch):
         db = self.path("green_db")
@@ -820,7 +826,7 @@ class ProtectedPipeline:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db", "preview-storage", "promote-services"}))
+    parser.add_argument("--operation", choices=sorted(OPERATIONS | {"prepare-services", "copy-db", "preview-storage", "promote-services", "verification-plan"}))
     args = parser.parse_args()
     if os.environ.get("DC_RELAY_MODE") == "1":
         from scripts.prod_agent.relay_pipeline import candidate_operation

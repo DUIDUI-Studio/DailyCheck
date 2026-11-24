@@ -30,6 +30,10 @@ def require(condition, reason):
         raise ValueError(reason)
 
 
+class StageFailure(Exception):
+    """A positively waited stage exit or a failed observation probe."""
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 

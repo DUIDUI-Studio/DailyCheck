@@ -1,6 +1,6 @@
 # Rehearse the local release relay
 
-The relay is a manually launched exact-H lane for an independently reviewed PR. Peter owns the first production invocation. Install and rehearse the control plane separately from the application candidate. A relay receipt proves release state for one attempt. Issue closure and the project delivery record still follow the existing project workflow.
+The relay is a manually launched exact-H lane for an independently reviewed PR. Current release policy and the proven #51 run are recorded in [workflow.md](workflow.md). Peter completed the first production invocation for #51. See workflow.md for the evidence and current CI/verification rules. Install and rehearse the control plane separately from the application candidate. A relay receipt proves release state for one attempt. Issue closure and the project delivery record still follow the existing project workflow.
 
 ## Prepare the protected Worker and VPS
 

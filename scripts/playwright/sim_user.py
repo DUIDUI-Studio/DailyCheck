@@ -26,7 +26,9 @@ import argparse
 import http.cookiejar
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,9 +71,63 @@ class Probe:
             return resp.status, resp.geturl(), body
 
 
+class PreviewProbe(Probe):
+    """Use curl's standard localhost cookie handling for the isolated green service."""
+
+    def __init__(self, base_url: str, directory: str) -> None:
+        if base_url != "http://localhost:8091":
+            raise ValueError("preview endpoint must be the fixed local green service")
+        super().__init__(base_url)
+        self.directory = directory
+
+    def _request(self, path: str, data: dict[str, str] | None = None):
+        url = self.base + path
+        body_file = os.path.join(self.directory, "body")
+        jar = os.path.join(self.directory, "cookies")
+        for _ in range(10):
+            command = [
+                "/usr/bin/curl", "--silent", "--show-error", "--max-time", "15",
+                "--ipv4", "--noproxy", "*", "--resolve", "localhost:8091:127.0.0.1",
+                "--cookie", jar, "--cookie-jar", jar, "--output", body_file,
+                "--write-out", "%{http_code}\n%{redirect_url}", "--url", url,
+            ]
+            payload = None
+            if data is not None:
+                command += ["--header", "Content-Type: application/x-www-form-urlencoded",
+                            "--data-binary", "@-"]
+                payload = urllib.parse.urlencode(data)
+            result = subprocess.run(command, input=payload, text=True, capture_output=True)
+            if result.returncode:
+                raise urllib.error.URLError("local preview request failed")
+            status_text, redirect = result.stdout.split("\n", 1)
+            status = int(status_text)
+            if status in {301, 302, 303} and redirect:
+                target = urllib.parse.urlsplit(redirect)
+                if (target.scheme, target.netloc) != ("http", "localhost:8091"):
+                    raise urllib.error.URLError("preview redirect left the local service")
+                url, data = redirect, None
+                continue
+            if status >= 400:
+                raise urllib.error.HTTPError(url, status, "preview HTTP failure", {}, None)
+            with open(body_file, encoding="utf-8", errors="replace") as response:
+                return status, url, response.read()
+        raise urllib.error.URLError("too many preview redirects")
+
+    def get(self, path: str):
+        return self._request(path)
+
+    def post(self, path: str, data: dict[str, str]):
+        payload = dict(data)
+        if self.csrf:
+            payload.setdefault("csrf_token", self.csrf)
+        return self._request(path, payload)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="模拟用户 5 关键路径探针")
     ap.add_argument("--base-url", required=True, help="绿环境根 URL，如 http://127.0.0.1:8091")
+    ap.add_argument("--local-preview", action="store_true",
+                    help="use the fixed green-service localhost probe")
     args = ap.parse_args()
 
     user = os.environ.get("SIM_USER_USER", "").strip()
@@ -83,7 +139,14 @@ def main() -> int:
         )
         return 64
 
-    probe = Probe(args.base_url)
+    if args.local_preview and args.base_url != "http://localhost:8091":
+        ap.error("--local-preview requires http://localhost:8091")
+    with tempfile.TemporaryDirectory(prefix="dc-sim-user-") as directory:
+        probe = PreviewProbe(args.base_url, directory) if args.local_preview else Probe(args.base_url)
+        return run_paths(probe, user, password)
+
+
+def run_paths(probe: Probe, user: str, password: str) -> int:
     failures: list[str] = []
 
     def record(num: int, name: str, ok: bool, detail: str = "") -> None:
@@ -145,7 +208,8 @@ def main() -> int:
     # ---- 路径 4：库存页 ----
     try:
         status, final_url, _ = probe.get("/inventory")
-        record(4, "库存页可达", status == 200, f"status={status}")
+        record(4, "库存页可达", status == 200 and final_url.endswith("/inventory"),
+               f"status={status} final={final_url}")
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
         record(4, "库存页可达", False, str(e))
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import pwd
 import re
@@ -27,7 +28,14 @@ from scripts.prod_agent.native_pipeline import (
     write_literal_release,
 )
 from scripts.prod_agent.native_ports import SystemdObserver, protected_path, read_protected
-from scripts.prod_agent.relay_protocol import STATE_PATH, SYSTEM_ENV, digest, require
+from scripts.prod_agent.relay_protocol import (
+    STATE_PATH,
+    SYSTEM_ENV,
+    StageFailure,
+    digest,
+    hex_id,
+    require,
+)
 
 UNITS = {
     "blue": ["dailycheck.service", "dailycheck-mcp.service"],
@@ -133,6 +141,7 @@ class RelayPipeline(ProtectedPipeline):
 
     def _control_env(self, candidate):
         return {**super()._control_env(candidate), "DC_RELAY_MODE": "1",
+                "DC_RELAY_HOSTED_VERIFY": "1" if self.server.profile.get("hosted_verify") is True else "0",
                 "BLUE_SERVICE_UNIT": UNITS["blue"][0], "GREEN_SERVICE_UNIT": UNITS["green"][0]}
 
     def _admin_audit_log(self):
@@ -171,6 +180,22 @@ class RelayPipeline(ProtectedPipeline):
         access = super()._candidate_access_log(promoted=promoted)
         return access if promoted else access.with_name("dailycheck-relay-preview-access.log")
 
+    def _candidate_units(self, candidate, *, promoted=False):
+        db = self.path("source_db" if promoted else "green_db")
+        require(re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(db)) and ".." not in db.parts,
+                "invalid protected database launch path")
+        for unit, content in super()._candidate_units(candidate, promoted=promoted):
+            # The legacy up/promote shell calls inspect both Environment and
+            # ExecStart. Render these two fixed policy values literally in both
+            # locations so neither shell changes the protected unit recipe.
+            values = {"DRY_RUN": "false" if promoted else "true", "DAILYCHECK_DB_DIR": str(db)}
+            for key, value in values.items():
+                reference = f"{key}=${{{key}}}"
+                require(content.count(reference) == 1 and f"Environment={key}={value}\n" in content,
+                        "unexpected protected unit declaration")
+                content = content.replace(reference, f"{key}={value}", 1)
+            yield unit, content
+
     def _candidate_role_settings(self, settings, role, *, promoted):
         access_log = self._candidate_access_log(promoted=promoted)
         if promoted:
@@ -203,7 +228,9 @@ class RelayPipeline(ProtectedPipeline):
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as output:
             output.writelines(f"{key}={value}\n" for key, value in preview.items())
-        super().prepare_services()
+        retry = self.server.profile.get("verified_retry") is not None
+        suffix = ".attempt-" + self.server.expected["attempt"] if retry else ""
+        super().prepare_services(backup_suffix=suffix)
 
     def _copy_candidate_database(self, db, scratch):
         # Trusted isolated Python is the only preview-stage caller allowed to
@@ -363,12 +390,35 @@ class RelayPipeline(ProtectedPipeline):
         require(repo == self.policy.location("repo"), "wrong protected source store")
         tree, entries = literal_tree(repo, expected["head"])
         require(tree == expected["tree"], "literal candidate tree changed")
-        write_literal_release(repo, expected["head"], tree, self._release(candidate), entries)
+        reuse = "verify" if self.server.profile.get("verified_retry") is not None else "reject"
+        release = self._release(candidate)
+        write_literal_release(repo, expected["head"], tree, release, entries, existing=reuse)
+        require(not release.stat().st_mode & 0o222
+                and all(path.lstat().st_uid == 0 for path in (release, *release.rglob("*"))),
+                "immutable root-owned release required")
         relay_git.git(repo, "update-ref", "--no-deref", "HEAD", expected["head"])
 
-    def stage(self, name):
-        from scripts.prod_agent.relay_vps import StageFailure
+    def verification_plan(self):
+        self._owned()
+        require(self.server.profile.get("hosted_verify") is True,
+                "hosted verification is not enabled for this lane")
+        self.server.source()
+        row, _ = self.server.owned(self.server.state())
+        expected = self.server.expected
+        repo = self.policy.location("repo")
+        ci = row["ci"]
+        require(hex_id(ci, 64)
+                and relay_git.git(repo, "rev-parse", "HEAD").strip().decode() == expected["head"],
+                "signed hosted validation or checked-out head unavailable")
+        changed = relay_git.git(repo, "diff", "--no-renames", "--name-only", "-z",
+                                expected["base"], expected["head"]).split(b"\0")
+        require(changed[-1:] == [b""] and len(changed) >= 2, "empty verification change set")
+        docs = all(path in {b"docs/DEV_ENV.md", b"README.md", b"CHANGELOG.md"} for path in changed[:-1])
+        print("docs-only" if docs else "user-paths")
+        print(json.dumps({"commit": expected["head"], "signed_ci_sha256": ci,
+                          "hosted_checks": ["test", "agent-framework-reports"]}, sort_keys=True))
 
+    def stage(self, name):
         candidate = self._owned()
         expected = self.server.expected
         if name != "rollback":
@@ -381,14 +431,27 @@ class RelayPipeline(ProtectedPipeline):
                 "rollback": ("switch.sh", "blue", "100")}[name]
         script, *argv = args
         log = self.server.work / (name + ".log")
+        env = self._control_env(candidate)
+        if name == "verify" and self.server.profile.get("hosted_verify") is True:
+            verify_dir = self.server.work / "verification"
+            verify_dir.mkdir(mode=0o700)
+            env.update(REPORT_DIR=str(verify_dir), DC_NATIVE_LOG_DIR=str(verify_dir))
         with log.open("xb") as stream:
-            result = subprocess.run(["/bin/bash", str(self.policy.authority / "scripts/blue_green" / script),
-                                     *argv], env=self._control_env(candidate), cwd=self.policy.authority,
-                                    pass_fds=(ds.process_lock_fd(),), stdin=subprocess.DEVNULL,
-                                    stdout=stream, stderr=subprocess.STDOUT, check=False)
-        if result.returncode > 0:
+            with subprocess.Popen(
+                ["/bin/bash", str(self.policy.authority / "scripts/blue_green" / script), *argv],
+                env=env, cwd=self.policy.authority,
+                pass_fds=(ds.process_lock_fd(),), stdin=subprocess.DEVNULL,
+                stdout=stream, stderr=subprocess.STDOUT,
+            ) as child:
+                while True:
+                    try:
+                        exit_code = child.wait(timeout=15)
+                        break
+                    except subprocess.TimeoutExpired:
+                        self.server._set()
+        if exit_code > 0:
             raise StageFailure(name)
-        require(result.returncode == 0, "stage died without a normal exit")
+        require(exit_code == 0, "stage died without a normal exit")
         if name == "rollback":
             self._stop_green_on_blue()
 
@@ -446,6 +509,8 @@ def candidate_operation(operation):
         pipeline.verify_preview_storage()
     elif operation == "promote-services":
         pipeline.promote_services()
+    elif operation == "verification-plan":
+        pipeline.verification_plan()
     else:
         return pipeline.operation(operation)
     return 0

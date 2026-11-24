@@ -250,6 +250,8 @@ class Worker:
                 record["github_request_id"] = ids[0]
         except HostingError as error:
             record["post_acknowledged"] = False
+            record["hosting_error_status"] = error.status
+            record["hosting_error_reason"] = str(error)
             if error.status == 401 and str(error) == "hosting_http_error":
                 record["definitive_rejection"] = "http_401"
         except (ValueError, OSError, TypeError, AttributeError):

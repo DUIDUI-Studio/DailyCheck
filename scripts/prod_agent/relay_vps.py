@@ -26,6 +26,7 @@ from scripts.prod_agent.relay_protocol import (
     REPO,
     STATE_PATH,
     SYSTEM_ENV,
+    StageFailure,
     canonical,
     checked_file,
     digest,
@@ -45,10 +46,6 @@ MARKER = ds.NATIVE_GUARD_FILENAME
 STAGES = ("up", "verify", "promote", "switch")
 MINIMUM = 600
 TERMINAL = {"settled", "rolled_back", "rejected"}
-
-
-class StageFailure(Exception):
-    """A positively waited stage exit or a failed in-window probe."""
 
 
 class Server:
@@ -192,8 +189,7 @@ class Server:
                         and previous["generation"] <= state["generation"]
                         and (state.get("last_evicted") is None
                              or (0 < state["last_evicted"]["generation"] < previous["generation"]))
-                        and not ds.failed_head_status(state, self.expected["pr"], self.expected["head"],
-                                                      self.deployment()), "baseline/fence not ready")
+                        and self._admissible_head(state, envelope["ci"]), "baseline/fence not ready")
                 self.source()
                 prior = state.get("worker_relay")
                 if prior is not None:
@@ -231,6 +227,43 @@ class Server:
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, pass_fds=(fd,))
         return {"phase": "accepted", "target": self.expected}
+
+    def _admissible_head(self, state, ci):
+        expected = self.expected
+        failed = ds.failed_head_status(state, expected["pr"], expected["head"], self.deployment())
+        retry = self.profile.get("verified_retry")
+        if retry is None:
+            return failed is None
+        if self.fixture or failed != "failed-head" or self.profile.get("hosted_verify") is not True:
+            return False
+        prior = state.get("worker_relay") or {}
+        old = prior.get("target") or {}
+        number = old.get("generation")
+        previous = old.get("attempt")
+        publication = state["publications"].get(previous) or {}
+        last = state["last_attempt"] or {}
+        journal = prior.get("journal") or []
+        stage = retry.get("failed_stage")
+        decision = retry.get("recovery_decision")
+        allowed = {"verify": ["up", "verify"], "promote": ["up", "verify", "promote"]}
+        return (
+            isinstance(decision, str) and decision.startswith("A-") and hex_id(decision[2:], 32)
+            and stage in allowed
+            and retry == {"previous_attempt": previous, "previous_receipt": prior.get("receipt"),
+                          "failed_stage": stage, "ci_sha256": ci, "recovery_decision": decision}
+            and type(number) is int and number == state["generation"] == expected["generation"] - 1
+            and hex_id(previous, 32) and previous != expected["attempt"]
+            and old == {**expected, "generation": number, "attempt": previous}
+            and prior.get("ci") == ci and prior.get("phase") == "rolled_back"
+            and prior.get("failed_stage") == stage and "intent" not in prior
+            and [entry["stage"] for entry in journal] == allowed[stage]
+            and all(type(entry.get("completed_at")) is int
+                    and entry["completed_at"] >= entry["started_at"] for entry in journal[:-1])
+            and "completed_at" not in journal[-1]
+            and previous == last.get("outcome_id") and last.get("result") == "failed"
+            and state["outcomes"][previous]["public_receipt"] == prior.get("receipt")
+            and publication.get("state") == "linked" and positive(publication.get("comment_id"))
+        )
 
     def deployment(self):
         return {"provider": "github", "host": "github.com", "repository": REPO,
@@ -296,6 +329,7 @@ class Server:
                     time.sleep(min(30 if not self.fixture else 0.2, remaining))
                 if self.observe_green() != route:
                     raise StageFailure("runtime continuity changed")
+                self._set()
                 samples += 1
                 if time.monotonic() - started >= self.minimum:
                     break

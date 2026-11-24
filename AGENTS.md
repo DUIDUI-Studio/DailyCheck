@@ -11,29 +11,18 @@ orchestration document has been retired by the Owner.
 
 ## Delivery lifecycle terminal state (global)
 
-This contract applies to every DailyCheck worktree, manual dispatch, and
-scheduled automation.
+The current GitHub release rules are in the opening section of
+`docs/agent-framework/workflow.md`.
 
-- CI green is an intermediate state, not delivery completion. CI green
-  automatically hands the PR to the Prod Agent for independent review,
-  candidate deployment, merge, and production verification.
-- The Coordinator or initiating agent must keep following the same work item
-  until a terminal state is proven from live Gitea/CI/deployment evidence.
-- A successful delivery is terminal only when the PR is merged, the linked
-  Issue is closed, both required CI checks are successful, and the Prod Agent
-  has written a successful deployment result after its verification and
-  observation window.
-- While the PR is open, follow merge conflicts, required checks, review
-  blockers, and whether the Prod Agent has started. After merge, follow the
-  deployment report; do not report "CI green", "merged", or "PR closed" as the
-  final project outcome when deployment is still pending.
-- If deployment fails, route by ownership: in-scope code failures return to the
-  original Issue writer; environment or infrastructure failures go to the Prod
-  Agent without changing PR code; review blockers return to the writer and then
-  a fresh read-only Reviewer.
-- Scheduled tasks must use persistent state and reconcile on later runs. They
-  must not mark an item complete at CI green or merge, and must distinguish
-  `awaiting_prod`, `awaiting_deploy`, `deploy_failed`, and `delivered` in their
-  reports.
-- The Coordinator must not merge, deploy, or close the Issue. Those remain Prod
-  Agent actions; the Coordinator owns tracking, evidence, and rework routing.
+- ORCA develops and independently reviews each change in a separate branch and
+  worktree. Run targeted developer checks and send the exact PR to Peter.
+- GitHub runs the full test and required report checks for the exact submitted
+  commit. Peter (or the accepted local release Worker) owns the manual release
+  handoff. The legacy VPS automatic release triggers are disabled.
+- Keep following the same work item until both required GitHub checks, the
+  merged commit, the linked Issue and the actual settled deployment receipt
+  are all verified. A green CI or merge alone is intermediate.
+- Follow the cited workflow for preview, cutover, observation, merge and
+  rollback. Report the actual stage and evidence of any failure.
+- The Coordinator tracks evidence and routes rework. Peter or the approved
+  release Worker performs deployment, merge and production verification.
