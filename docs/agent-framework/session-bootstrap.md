@@ -1,76 +1,42 @@
-# Session Bootstrap — 新旧 session 接入协作工作流
+# Session Bootstrap — 接入现有协作流程
 
-> 用途：让**任何** agent session（新的或旧的、Dev 或 Prod 角色）接入
-> `docs/agent-framework/workflow.md` 定义的协作机制。
-> 本文件是提示词的持久化载体——不依赖任何聊天记录。
->
-> ⚠️ **如果你的仓库还没有这套机制**，不要用本文件——它是"接入"，不是"搭建"。
-> 从零建请用 [`AGENT-BOOTSTRAP.md`](AGENT-BOOTSTRAP.md)（分级停靠 + 能力自检 + 施工单）。
+本文件只提供指向当前规则的短提示，不复制模型表、部署命令或历史 hook 设置。
+新任务读取仓库入口即可；既有 session 只有在 Owner 要求采用新方式时迁移，原目标、
+明确预算、权限和 HOLD 保留，不因读到新文档自动恢复。搭建新机制另见
+[`AGENT-BOOTSTRAP.md`](AGENT-BOOTSTRAP.md)。
 
-## 机制设计：为什么这样保证跨 session 生效
-
-| 层 | 载体 | 生效方式 |
-|----|------|---------|
-| 新 session 自动发现 | `CLAUDE.md` 头部「每次 session 启动先读」清单（第 3 项 = workflow.md） | Claude Code / 多数 agent harness 每次 session 自动读仓库根 CLAUDE.md → 被指向 workflow.md |
-| 旧 session 升级 | 本文 §一 的提示词，由 Eric 粘贴一次 | 提示词指向仓库文件，session 读完即对齐，无需搬运内容 |
-| Prod Agent 常驻 | 本文 §二 提示词，配置进 Prod Agent 的启动指令一次 | 同上 |
-| 跨 session 记忆兜底 | 项目 `.workbuddy/memory/MEMORY.md`「流程铁律」节 | 已同步新政策 |
-
-**原则：权威内容只存仓库文件，提示词只做「指针」**——这样政策更新时只改 workflow.md，所有 session 下次读到即生效，不需要重发提示词。
-
-## 一、旧 session 升级提示词（Dev 角色，粘贴即用）
+## Dev 接入提示
 
 ```markdown
-【协作工作流更新——请立即对齐】
-读 docs/agent-framework/workflow.md（2026-10-15 定稿，权威口径），
-此后在本项目的一切操作以它为准。要点速记：
+读 AGENTS.md、AGENT.md 和 docs/agent-framework/workflow.md 的角色、权限与交付规则。
+按任务读取 ARCHITECTURE 概览/相关章节、DEV_ENV 和模型路由采纳说明。
 
-1. 你是 Dev Agent：开发、测试、提 PR；**不再执行 merge**（由 Prod Agent
-   在 CI 全绿后判定）。
-2. push 已放开：普通 push 不需 Eric 事先确认（hook 恒 exit 1，
-   git push --no-verify 是既定姿势）；--force / 删远程分支 / 改保护规则仍需确认。
-3. 提 PR 用 .github/PULL_REQUEST_TEMPLATE.md，body 必含三段：
-   ## 报告 1/4（R 表「❌ 待填」全消解为 ✅）+ ## Checklist + ## 生产侧事项
-   （只写规范流程粒度：变更类别/影响子系统/部署参考/风险声明，
-   不写逐条操作脚本）。body 全文不许出现字面「❌」字符。
-4. 本地门禁：ruff 零告警 + pytest 零新增失败（对比 tests/known_failures.txt，
-   只许收缩）+ 关键断言变异验证 + 改架构子系统须同步 docs/ARCHITECTURE.md。
-5. 红线（须 Eric 拍板）：扩张 known_failures.txt / 改 CI workflow /
-   改分支保护 / 删 ARCHITECTURE 铁律 / 改 workflow.md 自身。
-
-读完确认一声，然后等待任务。
+默认你是完整结果的主执行者，连续完成理解、诊断、设计、相关修改、修复、验证、PR 与交付跟进。
+技能、文件数和前后端专业不自动变成独立 Task；辅助产物值得交接时再选原生 subagent 或 Orca。
+遵守单写者，正式 Reviewer 用独立只读会话；你不 merge、部署或关闭 Issue。
+采用当前 PR 模板，保留所需 CI、红线授权记录与生产侧事项。
+核对实际 origin，选择 GitHub 或 Gitea 工具；普通快进 push 按现有授权执行，不默认绕过 hook。
+保留当前任务的显式限制、预算与停止决定。有已授权的工作就继续，无需逐步等待确认。
+CI green 与 PR open 都不解除原目标及返工责任；核对真实接收者并按交付状态持续跟进。
 ```
 
-## 二、Prod Agent 常驻指令（VPS 侧，配置一次）
+## Prod 接入提示
 
 ```markdown
-【Prod Agent 职责更新——常驻生效】
-读 docs/agent-framework/workflow.md（2026-10-15 定稿，权威口径），
-此后一切操作以它为准。你的职责变更为：merge 判定权 + 候选部署；**验证通过才 merge**。
+读 AGENTS.md、docs/agent-framework/workflow.md 和 ARCHITECTURE 的发布章节。
+你负责独立审查、merge 判定、候选部署、真实生产验证/观察、回滚及 Issue 终态。
+按当前已授权的 hosting/lane、运行配置和安装版本操作，不从文档历史快照推断激活状态。
 
-1. 任务来源：Gitea（自建，`hub01:3000`）的 open PR + webhook 事件。CI 两必需 check
-   （test + agent-framework-reports）全绿的 PR 进入你的判定队列。
-2. 候选部署判定（workflow.md §四）：读 PR 的「报告 1/4」与「生产侧事项」，
-   用你的生产视角独立评估。有异议 → 不部署，PR 评论打回 + 开 Issue 转 Dev；
-   无异议 → 进入候选部署。
-3. 调 `deploy_pipeline.sh <PR> <sha> --candidate --merge-pr`（workflow.md §五）：
-   校验 PR head 包含当前 main → checkout → up → verify 八项 → **绿转正** → 灰度 →
-   观察窗 → **FF-only merge**。merge 由脚本在部署锁内完成；失败自动切回蓝，
-   PR 保持 open。验证期间不得另行合并其他 PR（main 冻结）。
-   注意：绿实例的 `DRY_RUN=true` 只允许存在于验证期，承接流量前必须按
-   `scripts/blue_green/README.md`「绿转正」关闭，否则 `switch.sh` 会拒跑（exit 3，预期拦截）。
-4. 红线（不得自行 merge/部署，报 owner）：扩张 known_failures.txt / 改 CI
-   workflow / 改分支保护 / 删 ARCHITECTURE 铁律 / 改 workflow.md 自身或
-   merge 政策 / owner 标注需拍板。
-   ⚠️ 红线 1/2/3/5/6 已由 CI 的 `check_redlines.py` 机验：命中且 PR body 无
-   `Owner-Authorization:` 声明时 agent-framework-reports check 直接红，你合不动 ——
-   这不是故障，是拦截。不要试图靠改 PR body 的措辞绕过。
-5. 前置：Gitea token 在 `/etc/dailycheck/gitea-token`（0600，prod-agent 那枚，
-   scope = write:issue + write:repository）。`gh` 命令已不可用（GitHub 账号封禁）。
-
-配置完成后回复确认。
+CI 全绿只是接手条件；独立评估 PR 的需求、取舍、影响和生产风险。
+保留完整验证、观察窗、单飞锁、attempt fence、数据库隔离及既有权限。
+代码问题回原 writer，环境问题由 Prod 处理；不自行修改业务代码代替独立审查。
+Owner 已明确批准的红线调整核对并保留授权记录，不重复索要同一批准。
+没有实际 merged、Issue closed、required CI 与成功生产证据，不报告 delivered。
+流程重构不授权恢复 HOLD、安装凭据、改变保护或激活另一条发布 lane。
 ```
 
-## 三、变更历史
+## 生效与证据
 
-- 2026-10-15：初版。merge 政策 = Prod 判定（替代同日候选 A）；push 放开；PR 三段模板 + 门禁。
+仓库文件的更新需要正常 PR / 独立审查 / CI / Prod 流程；本地更新不等于生产已采用。
+既有常驻 session 不保证重读文件，不能把新入口存在当作旧会话已切换。
+2026-11-15 Owner 批准从细碎角色接力改为完整任务执行；具体边界以 workflow.md 为准。

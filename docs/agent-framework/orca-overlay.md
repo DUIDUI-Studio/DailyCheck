@@ -1,175 +1,126 @@
 # DailyCheck × Orca Overlay
 
-> **Scope:** DailyCheck-specific only.
-> Generic Orca mechanics are defined by `~/.agents/ORCA-WORKFLOW-MAP.md` and the
-> version-matched `orca skills get orchestration`. This file must not redefine
-> Run / Task / Dispatch lifecycle.
->
-> **Authority:** `docs/agent-framework/workflow.md` > this file > global defaults.
+> Scope: DailyCheck-specific adoption. Explicit Owner decisions take precedence;
+> project authority and delivery follow [`workflow.md`](workflow.md).
+> Generic execution policy lives in `~/.agents/AGENTS.md`; Orca mechanics come
+> from the installed, version-matched `orca-cli` / `orchestration` guides.
 
----
+## 1. Complete-result ownership
 
-## 1. Roles and authority
+The current Dev normally owns investigation, design, related implementation,
+repair, validation, PR and delivery follow-up in one context. A multi-file task
+or a skill invocation does not require another agent. Frontend, backend,
+planning and testing are capabilities, not mandatory handoff stages.
 
-| Role | Runs where | Owns | Does not |
-|---|---|---|---|
-| **Coordinator** | Orca session | task classification, dispatch, settlement, delivery tracking | merge / deploy |
-| **Dev Agent** | Orca worker on the dev machine | code, tests, PR | merge |
-| **Prod Agent** | VPS `wdg_vps` | independent review, merge decision, blue-green deploy, prod verification, rollback | edit main content directly |
-| **Owner (Eric)** | human | requirements, red-line decisions | — |
+Use native helpers for worthwhile independent auxiliary results. Use Orca workers
+when cross-CLI/account/environment execution, separate workspaces, formal
+independence or supervised lifecycle is needed, or the owner explicitly requests
+Orca. Assign a complete verifiable outcome, not a sequence of command-sized tasks.
 
-Only the Prod Agent may merge, deploy or close an Issue. The Coordinator only
-tracks and routes.
-
----
+A dedicated Coordinator is conditional on multiple independent workstreams or an
+explicit assignment. It remains read-only for business code. A main executor
+managing helpers retains write ownership. One shared worktree has one writer;
+formal Review is an independent read-only session. Only Prod may merge, deploy
+or close an Issue. An open PR does not automatically transfer ownership.
 
 ## 2. Project gates
 
-- **Branch:** `{fix|feat|chore|docs|ci|test|refactor|perf}/issue-<N>-<slug>`
-  (CI gate H1). Never use an agent or user identity prefix.
-- **One issue, one branch, one PR** (CI gate H2). Check open PRs and remote
-  `*issue-<N>*` branches before dispatch.
-- **PR body:** exactly one each of `## 报告 1/4：需求对齐`, `## Checklist`,
-  `## 生产侧事项`; no literal `❌` character in the body.
-- **CI required checks:**
-  - `CI / test (pull_request)`
-  - `CI / agent-framework-reports (pull_request)`
-- **Architecture sync:** any commit touching `blueprints/`, `db/`, `mcp_server/`,
-  `app.py`, `config.py`, `permissions.py`, `templates/`, `static/`, `tests/`,
-  `.github/workflows/`, `deploy/` or `scripts/` must update
-  `docs/ARCHITECTURE.md` in the same commit.
-- **Red lines:** expanding `tests/known_failures.txt`, editing CI workflows,
-  changing branch protection, removing ARCHITECTURE iron rules, or editing
-  `workflow.md` requires Owner approval.
+- Branch: `{fix|feat|chore|docs|ci|test|refactor|perf}/issue-<N>-<slug>` (H1).
+- One Issue, one branch, one PR (H2), with workflow.md's same-root-cause exception.
+  Check current claims, branches and PRs before starting; reuse a suitable isolated
+  task worktree rather than creating another layer of workspaces.
+- PR body has exactly one each of `## 报告 1/4：需求对齐`, `## Checklist` and
+  `## 生产侧事项`; no literal red-cross placeholder remains.
+- Required checks are `test` and `agent-framework-reports`. Verify actual platform,
+  workflow/run/evidence identity; Gitea renders their full `CI / … (pull_request)` names.
+- Commits touching architecture subsystems must update `docs/ARCHITECTURE.md` in
+  the same commit. Read its overview and the affected sections before changes.
+- Expanding known failures, editing CI/protection/workflow, or weakening architecture
+  iron rules requires Owner authorization. Record an already granted decision;
+  do not ask again for the same approved change.
 
----
+## 3. Delivery and recovery
 
-## 3. Delivery state machine
-
-| State | Criterion | Next owner |
-|---|---|---|
-| `in_ci` | required checks not terminal | Coordinator |
-| `ci_failed` | any required check red | original writer |
-| `awaiting_prod` | both required checks success, PR open | Prod Agent |
-| `awaiting_deploy` | merged, production anchor not advanced | Prod Agent |
-| `deploy_failed` | deploy failed | `code` → writer; `envfix` → Prod Agent |
-| `deploy_unverified` | bounded window exhausted, no anchor | Prod Agent |
-| `delivered` | merged + Issue closed + CI success + **production anchor** | done |
-
-Deployment evidence is `deployed.sha == merge sha` on the production anchor, not
-a PR comment. Use `~/.local/state/dailycheck/automation/bin/dc_delivery.py`.
-
----
-
-## 4. Nightly Dispatch Drain
-
-| Item | Value |
+| State | Evidence / next owner |
 |---|---|
-| Automation | Orca automation `DailyCheck Nightly Dispatch Drain` |
-| Schedule | `5 20,21,22,23,0,1,2,3,4,5 * * *` Asia/Shanghai |
-| Model | DeepSeek Flash `[1M]` / high |
-| Concurrency | max 3 new workers per wave, max 6 active |
+| `in_ci` | Checks pending; main executor or assigned Coordinator follows |
+| `ci_failed` / `merge_conflict` | Original writer repairs in the same work item |
+| `review_blocker` | Writer repairs; fresh independent Reviewer verifies |
+| `awaiting_prod` | Checks pass, PR open; confirm Prod actually received the item |
+| `awaiting_deploy` | Merged without successful deployment evidence; Prod owns action |
+| `deploy_failed` | Code → original writer; environment/infrastructure → Prod |
+| `deploy_unverified` | Observation budget exhausted without verified anchor; retain unresolved state |
+| `delivered` | PR merged + Issue closed + required CI successful + successful verified deployment |
 
-Flow:
+Keep the original acceptance and actual accepting owner visible. Deployment
+claims require the active lane's production anchor and verification/observation
+evidence, not a PR comment or `worker_done`. Use existing delivery tooling only
+when it supports the selected platform and lane; do not infer live state from
+this document or a historical path.
 
-1. Acquire a per-issue claim under
-   `~/.local/state/dailycheck/automation/claims/issue-<N>/`; there is no global
-   drain lock. A fresh claim is not dispatchable; a stale claim is reclaimed only
-   after confirming the owner worker is not live.
-2. First run at/after 20:00 with no `triage.md`: skip the empty-queue NO_ACTION
-   and continue to triage.
-3. Refresh Gitea: open issues, PRs, branches, claims.
-4. Owner requests and decision sync.
-5. Planner split consumption.
-6. **Holistic triage** writes
-   `~/.local/state/dailycheck/automation/<YYYY-MM-DD>/triage.md` with:
-   - `BATCH`: 2–3 issues sharing a concrete boundary; each keeps its own branch/PR.
-   - `SPLIT`: too broad; planner first, max 5 sub-issues.
-   - `SOLO`: independent.
-   - `DEFER`: blocked, owner-decision, claimed, red-line, or high-risk.
-7. Dispatch in triage order (BATCH → SOLO → SPLIT), not raw `queue-next` order.
-8. End the turn; process Orca wakes; release claims only after the worker is
-   settled and the item reaches a round-terminal state; summarize.
+For new tasks, recoverable local debugging has no universal one/three-attempt cap.
+Continue with changed inputs or evidence; reconsider a repeatedly failing premise.
+Explicit budgets, production fences, uncertain side effects and one-writer
+constraints remain binding. A controlled stop request is distinct from proving
+exit before a replacement writer starts. Existing HOLD tasks do not resume.
 
-Dispatch logging: after every `worker-start` — drain or manual coordinator —
-append one `dc_state.py log --type dispatch` entry with `role`, `agent`,
-`model_requested`, `model_effective`, `effort`, `complexity_score`, `playbook`
-and `worktree_path`.
+## 4. Scheduled and manual dispatch
 
-Hard limits: never merge, deploy, close issues, self-authorize owner decisions,
-or combine multiple issues into one PR.
+Existing automations keep their enabled state, schedule, role authority and
+explicit budgets. Inspect live automation definitions instead of treating a
+copied cron, model or concurrency count as current configuration. This adoption
+does not enable a disabled dispatch job or repair the production handoff service.
 
----
+When an authorized dispatcher starts a new item:
 
-## 5. Model routing adoption
+1. Reconcile active Git host, Issue/PR identity, claims and real live writers.
+2. Choose an independently acceptable outcome. Split only at actual outcome or
+   ownership boundaries; broad scope alone does not mandate a Planner or fixed
+   sub-issue count. Related files and front/backend changes can stay together.
+3. Choose current execution, a native helper or an Orca worker according to §1;
+   respect an already assigned coordinator-only role.
+4. Record actual dispatch identity, model/effort/pool and worktree in the existing
+   state record. Score/playbook are optional; missing advice is not a blocker.
+5. Use runtime events and settlement per the installed guide. Persist unresolved
+   delivery states so later runs reconcile them; never mark done at CI green.
 
-DailyCheck adopts the user-global policy at
-`~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`.
+Batching may share context across separate Issues, but each keeps its required
+branch/PR. Concurrency follows actual independent work, exclusive writers,
+capacity and explicit budgets, not a universal copied worker count.
 
-- Only the legacy **model / CLI / effort / fallback table** is replaced.
-- Project permissions, review, CI, merge, deploy and all authority boundaries
-  remain unchanged.
-- Legacy routing file: `docs/agent-framework/orca-model-routing.json`
-  SHA-256: `96cd6df779692e9a51c1b682419d9853de9dd10ec0632c96db36da344a5b97bf`
-  It is marked `deprecated: true` and is retained for audit only.
-- The project-level resolver `scripts/agent_framework/model_routing.py` fails
-  closed on the deprecated file and must not generate launch commands.
-- If the legacy file changes, reconcile this adoption before dispatch.
-- The global policy does not name this project; this file is the project-side
-  record of the adoption.
+## 5. Global policy adoption
 
----
+Owner approved the execution refactor on 2026-11-15. DailyCheck adopts
+`~/.agents/AGENTS.md` and `~/.agents/skills/orca-model-routing/{SKILL.md,routing.json}`
+for new-task execution and model selection, subject to the project gates above.
+Model selection is separate from task decomposition. Codex remains on its official
+subscription; Claude Code CLI may select configured CCSwitch model IDs. Helpers
+may choose an adequate supported model without switching shared provider state.
+Scoring is advisory and cannot veto authorized work.
 
-## 6. pstack-orca overlay
+The project `orca-model-routing.json` remains deprecated audit material;
+`scripts/agent_framework/model_routing.py` still fails closed on it. No fallback
+sequence is maintained here. Existing task scopes, limits and stop decisions are
+not silently migrated by this adoption.
 
-Use the global adapter at `~/.agents/skills/pstack-orca/`.
+## 6. Optional methods
 
-Project-specific additions:
+`pstack-orca` supplies optional methods for the current executor. It does not
+require a playbook, a worker, a separate architect, Arena candidates or a chain of
+reviewers. `opening-a-pr` includes project gates and leaves the main executor
+responsible for follow-up. Independent Review remains read-only. Worker Task
+permissions continue to govern delegation; native helper availability does not
+grant recursive Orca dispatch or production authority.
 
-- Task spec must carry the branch naming and PR template gates from §2.
-- `opening-a-pr` must include the three required PR sections; the worker opens
-  the PR and stops.
-- The evidence gate in `report-template.md` applies unchanged.
-- `shipping`, `babysit`, `autopilot-*` remain disabled; merge and deploy belong
-  to the Prod Agent.
-- Every issue still gets its own branch and PR; batching changes sequencing and
-  shared context, not PR scope.
-- Read-only native subagents are allowed inside a worker. Orca worker creation
-  and Dispatch remain forbidden.
-- Host skills and CLI tools remain available: code-review agents, `codex review`,
-  ruff, semgrep, browser testing. pstack-orca does not disable them.
+CI, merge, blue-green deployment and Owner decisions are project responsibilities.
+Orca settlement only proves the worker lifecycle facts it records.
 
----
+## 7. Platform and operational references
 
-## 7. Project paths
-
-| Path / address | Use |
-|---|---|
-| `~/Documents/GitHub/DailyCheck/` | main checkout |
-| `~/orca/workspaces/DailyCheck/` | Orca worktrees |
-| `http://hub01:3000/eric/dailycheck` | Gitea repo |
-| `~/.config/gitea/token` or `~/.config/gitea-token` | Dev token |
-| `~/.local/state/dailycheck/automation/state/` | queue / owner / dispatch state |
-| `~/.local/state/dailycheck/automation/<YYYY-MM-DD>/` | report / outcome / triage |
-| `~/.local/state/dailycheck/automation/bin/dc_state.py` | state manager |
-| `~/.local/state/dailycheck/automation/bin/dc_delivery.py` | delivery verdict |
-| `wdg_vps:/root/DailyCheck` | production worktree |
-| `wdg_vps:/var/lib/dailycheck-deploy/` | blue-green state |
-| `wdg_vps:/var/lib/dailycheck-prod-agent/inbox.jsonl` | Prod Agent wake queue |
-| `wdg_vps:/var/log/dailycheck/` | deploy / webhook logs |
-| `wdg_vps:/root/.hermes/logs/` | Hermes / Prod Agent logs |
-
----
-
-## 8. Coupling map
-
-| Contract | Orca side | DailyCheck side |
-|---|---|---|
-| Dispatch | `worker-start` / Task / Dispatch / worktree | Dev Agent role, one writer per worktree |
-| Settlement | `worker_done`, `worker-show`, `check` | PR, CI, evidence gate |
-| Model | `orca-model-routing` | adoption recorded in §5 |
-| Automation | Orca automation scheduler + wake | queue / owner / triage state, Gitea |
-| Method | `pstack-orca` | project overlay in §6 |
-
-Not Orca: CI, merge, blue-green deploy, delivery state machine, owner approval.
-`worker_done` is an Orca settlement, not a project delivery.
+For this GitHub checkout, `origin` is `https://github.com/DUIDUI-Studio/DailyCheck.git`.
+Always recheck the active remote and live configuration before acting. The old
+Gitea repository and its credentials are not the default for GitHub work items.
+See [`workflow.md`](workflow.md) for platform-specific contracts and
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md) for deployment paths and safeguards.
+Local automation state remains under `~/.local/state/dailycheck/automation/`;
+actual scheduler settings come from Orca. These paths do not grant production access.

@@ -6,7 +6,7 @@
 - 目标场景：手机端优先的库存日常操作，覆盖品类管理、库存品管理、入库、出库、盘点、补货申请、生产录入；并通过 MCP 协议向 AI Agent 开放数据访问。
 - 权威文档：
   - [`CLAUDE.md`](CLAUDE.md)（详尽）
-  - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（**项目技术架构图**，必读）
+  - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（先读概览与所改子系统章节）
   - [`docs/DEV_ENV.md`](docs/DEV_ENV.md)（dev 环境）
   - [`docs/mcp-configuration.md`](docs/mcp-configuration.md)（MCP 配置）
   - 本文件（AGENT.md）为精简开发指南
@@ -99,7 +99,7 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 
 ## 提交规范建议
 - 功能提交前至少验证：
-  - **必读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** —— 改动子系统前先看
+  - **必读 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 的概览与相关章节** —— 改动子系统前先看
   - 关键页面可访问（`/`、`/items`、`/stock-in`、`/stocktake`、`/restock`）
   - 盘点流程可走通（开始盘点 → 提交 → 回滚）
   - `pytest` 测试通过、`ruff check .` 无错
@@ -116,4 +116,5 @@ docker exec wdg-systemd bash /opt/dailycheck/scripts/install-in-wdg-systemd.sh
 - 框架文档：[`docs/agent-framework/v0.1.md`](docs/agent-framework/v0.1.md)
 - 报告模板：`docs/agent-framework/templates/`（01 需求对齐 / 02 测试 / 03 代码质量 / 04 本地部署预演 / 05 生产验证）
 - 蓝绿脚本骨架：`scripts/blue_green/`（up / verify / switch / rollback / down）
-- 状态：v0.1 骨架，Phase 1 落地验证待启动
+- 当前流程以 [`workflow.md`](docs/agent-framework/workflow.md) 为准，v0.1 是历史设计。
+- 默认由同一主执行者完成诊断、设计、相关修改、验证和交付跟进；前后端、测试、规划不自动拆成多个 agent。独立 Reviewer 只读；merge、部署、Issue 关闭仍由 Prod Agent 执行。
