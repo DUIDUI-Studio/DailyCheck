@@ -16,12 +16,31 @@ import pytest
 
 from scripts.blue_green import deploy_state as ds
 from scripts.prod_agent import relay_git
+from scripts.prod_agent.native_pipeline import ProtectedPipeline
 from scripts.prod_agent.relay_pipeline import RelayPipeline, _route
 from scripts.prod_agent.relay_protocol import lock_file
 from scripts.prod_agent.relay_vps import Server, StageFailure
 from tests.blue_green_testenv import install_fake_systemctl
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("pipeline_type", [ProtectedPipeline, RelayPipeline])
+def test_sim_user_uses_single_preview_transport_after_environment_reset(tmp_path, monkeypatch, pipeline_type):
+    pipeline = object.__new__(pipeline_type)
+    pipeline.policy = SimpleNamespace(authority=tmp_path)
+    monkeypatch.delenv("DC_RELAY_MODE", raising=False)
+    monkeypatch.setattr(pipeline, "path", lambda key: tmp_path / key)
+    calls = []
+
+    def lower(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(pipeline, "_lower", lower)
+    assert pipeline._sim_user(tmp_path, "fixture", "synthetic") == 0
+    assert calls[1] == [str(tmp_path / "scripts/playwright/sim_user.py"),
+                        "--base-url", "http://localhost:8091"]
 
 
 def test_incremental_bundle_does_not_pack_base_delta_objects(tmp_path):

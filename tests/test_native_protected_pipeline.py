@@ -293,7 +293,7 @@ def test_green_update_collector_uses_actual_http_and_value_content(tmp_path, dam
             requests.append((self.path, body))
             if self.path == "/login":
                 self.send_response(302)
-                self.send_header("Location", "/users")
+                self.send_header("Location", "/select-warehouse")
                 self.end_headers()
                 return
             if self.path == "/select-warehouse/1":
@@ -321,14 +321,15 @@ def test_green_update_collector_uses_actual_http_and_value_content(tmp_path, dam
     thread = threading.Thread(target=server.serve_forever)
     thread.start()
     port = object.__new__(ProtectedPipeline)
+    port.policy = SimpleNamespace(authority=Path(__file__).resolve().parents[1])
     monkeypatch.setattr(port, "path", lambda key: {"green_db": green, "source_db": blue}[key])
     monkeypatch.setenv("SIM_USER_USER", "fixture")
     monkeypatch.setenv("SIM_USER_PASSWORD", "synthetic")
 
     def local_child(args, **kwargs):
-        code = args[1].replace("http://127.0.0.1:8091", f"http://127.0.0.1:{server.server_port}")
-        return subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True,
-                              env=kwargs["extra"])
+        code = args[1].replace("http://localhost:8091", f"http://localhost:{server.server_port}")
+        return subprocess.run([sys.executable, "-I", "-B", "-c", code, args[2]],
+                              capture_output=True, text=True, env=kwargs["extra"])
 
     monkeypatch.setattr(port, "_lower", local_child)
     monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: "" if damage == "missing-log" else log.getvalue())

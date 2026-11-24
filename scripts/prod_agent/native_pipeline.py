@@ -367,43 +367,33 @@ def validate_dryrun(before, after, response, journal):
         raise ValueError("green intended UPDATE not proven isolated")
 
 
-# This imports only stdlib and runs under the application UID. It makes an
-# intended UPDATE to the disposable green verification user's password.
+# The separate native dry-run evidence path shares the same pinned local
+# session client. The current relay uses read-only preview-storage checks.
 DRYRUN_HTTP = r'''
-import html,http.cookiejar,json,os,re,urllib.parse,urllib.request
-opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-base='http://127.0.0.1:8091'
-def get(path):
- with opener.open(base+path,timeout=15) as r:
-  if r.status!=200: raise ValueError('green page unavailable')
-  return r.read(2*1024*1024).decode()
+import html,json,os,re,runpy,sys,tempfile,urllib.parse
+Probe=runpy.run_path(sys.argv[1])['Probe']
 def csrf(body):
  m=re.search(r'name="csrf_token"[^>]*value="([^"]+)"',body)
  if not m: raise ValueError('green CSRF unavailable')
  return html.unescape(m[1])
-def post(path,data):
- req=urllib.request.Request(base+path,data=urllib.parse.urlencode(data).encode())
- with opener.open(req,timeout=15) as r:
-  if r.status!=200 or urllib.parse.urlsplit(r.url).path!= '/users':
-   raise ValueError('green write route did not finish')
-  return r.read(2*1024*1024).decode()
-body=get('/login')
-req=urllib.request.Request(base+'/login',data=urllib.parse.urlencode({
- 'username':os.environ['SIM_USER_USER'],'password':os.environ['SIM_USER_PASSWORD'],
- 'csrf_token':csrf(body)}).encode())
-with opener.open(req,timeout=15) as r:
- if r.status!=200 or urllib.parse.urlsplit(r.url).path=='/login': raise ValueError('login failed')
-body=get('/select-warehouse')
-warehouse=re.search(r'/select-warehouse/(\d+)',body)
-if not warehouse: raise ValueError('green warehouse prerequisite absent')
-req=urllib.request.Request(base+'/select-warehouse/'+warehouse[1],data=urllib.parse.urlencode({
- 'csrf_token':csrf(body)}).encode())
-with opener.open(req,timeout=15) as r:
- if r.status!=200 or urllib.parse.urlsplit(r.url).path!='/land': raise ValueError('warehouse selection failed')
-body=get('/users')
-body=post('/users/'+os.environ['DC_PROBE_USER_ID']+'/reset-password',{
- 'password':os.environ['DC_PROBE_CHALLENGE'],'csrf_token':csrf(body)})
-if '已重置' not in body or '的密码' not in body: raise ValueError('intended reset absent')
+def checked(result,expected):
+ status,url,body=result
+ if status!=200 or urllib.parse.urlsplit(url).path!=expected:
+  raise ValueError('green route did not finish')
+ return body
+with tempfile.TemporaryDirectory(prefix='dc-native-probe-') as directory:
+ probe=Probe('http://localhost:8091',directory)
+ probe.csrf=csrf(checked(probe.get('/login'),'/login'))
+ body=checked(probe.post('/login',{
+  'username':os.environ['SIM_USER_USER'],'password':os.environ['SIM_USER_PASSWORD']}),'/select-warehouse')
+ warehouse=re.search(r'/select-warehouse/(\d+)',body)
+ if not warehouse: raise ValueError('green warehouse prerequisite absent')
+ probe.csrf=csrf(body)
+ checked(probe.post('/select-warehouse/'+warehouse[1],{}),'/land')
+ probe.csrf=csrf(checked(probe.get('/users'),'/users'))
+ body=checked(probe.post('/users/'+os.environ['DC_PROBE_USER_ID']+'/reset-password',{
+  'password':os.environ['DC_PROBE_CHALLENGE']}),'/users')
+ if '已重置' not in body or '的密码' not in body: raise ValueError('intended reset absent')
 print(json.dumps({'login':True,'reset':True}))
 '''
 
@@ -790,12 +780,9 @@ class ProtectedPipeline:
                              db=self.path("green_db"), scratch=scratch)
         if result.returncode:
             return result.returncode
-        args = [str(self.policy.authority / "scripts/playwright/sim_user.py"),
-                "--base-url", "http://127.0.0.1:8091"]
-        if os.environ.get("DC_RELAY_MODE") == "1":
-            args = [str(self.policy.authority / "scripts/playwright/sim_user.py"),
-                    "--base-url", "http://localhost:8091", "--local-preview"]
-        result = self._lower(args, db=self.path("green_db"), scratch=scratch, extra=env)
+        result = self._lower([str(self.policy.authority / "scripts/playwright/sim_user.py"),
+                              "--base-url", "http://localhost:8091"],
+                             db=self.path("green_db"), scratch=scratch, extra=env)
         # The probe logs only route outcomes, not request payloads or credentials.
         if result.stdout:
             print(result.stdout, end="")
@@ -814,7 +801,9 @@ class ProtectedPipeline:
         if len(rows) != 1:
             raise ValueError("actual green verification user required")
         since = str(int(time.time()))
-        result = self._lower(["-c", DRYRUN_HTTP], db=db, scratch=scratch, extra={**env,
+        result = self._lower(["-c", DRYRUN_HTTP,
+                              str(self.policy.authority / "scripts/playwright/sim_user.py")],
+                             db=db, scratch=scratch, extra={**env,
             "DC_PROBE_USER_ID": str(rows[0][0]), "DC_PROBE_CHALLENGE": "dc" + os.urandom(24).hex()})
         if result.returncode:
             raise ValueError("actual intended green probe failed")
