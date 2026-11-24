@@ -5,6 +5,12 @@ import datetime
 import sqlite3
 from decimal import Decimal
 
+from production_snapshots import (
+    outbound_production_expression,
+    outbound_snapshot_query,
+    outbound_unit_metadata,
+)
+
 
 def list_items(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
@@ -234,13 +240,14 @@ def count_outbound(conn: sqlite3.Connection) -> int:
 def list_outbound(
     conn: sqlite3.Connection, limit: int = 100, offset: int = 0
 ) -> list[dict]:
+    projection, join = outbound_snapshot_query(conn)
     rows = conn.execute(
-        """SELECT o.id, o.item_id, i.name AS item_name,
+        f"""SELECT o.id, o.item_id, i.name AS item_name,
                   o.requested_quantity AS quantity, o.reason,
                   o.status, o.rolled_back, o.created_at, o.doc_no, o.line_no,
-                  o.input_quantity, o.factor
+                  o.input_quantity, o.factor, {projection}
            FROM outbound_requests o
-           LEFT JOIN items i ON i.id = o.item_id
+           LEFT JOIN items i ON i.id = o.item_id {join}
            ORDER BY o.created_at DESC, o.id DESC
            LIMIT ? OFFSET ?""",
         (limit, offset),
@@ -249,6 +256,9 @@ def list_outbound(
     for item in items:
         text = item["factor"]
         item["factor"] = float(text) if "." in text else int(text)
+        if item.pop("is_production"):
+            item.update(outbound_unit_metadata(item))
+        del item["unit_snapshot"], item["calculation_version"]
     return items
 
 
@@ -257,14 +267,16 @@ def rollback_outbound(conn: sqlite3.Connection, req_id: int) -> dict:
 
     Mirrors blueprints/outbound.py rollback() exactly.
     """
-    import datetime
+    production = outbound_production_expression(conn)
     req = conn.execute(
-        """SELECT item_id, requested_quantity, rolled_back
-           FROM outbound_requests WHERE id = ?""",
+        f"""SELECT item_id, requested_quantity, rolled_back, {production} AS is_production
+           FROM outbound_requests o WHERE id = ?""",
         (req_id,),
     ).fetchone()
     if req is None:
         raise ValueError("outbound_request_not_found")
+    if req["is_production"]:
+        raise ValueError("production_requires_run_reversal")
     if int(req["rolled_back"]) == 1:
         raise ValueError("already_rolled_back")
     changed = conn.execute(
@@ -286,7 +298,7 @@ def rollback_outbound(conn: sqlite3.Connection, req_id: int) -> dict:
            VALUES (?, '出库回退', ?, ?, ?)""",
         (int(req["item_id"]), qty, f"回退出库记录#{req_id}", now),
     )
-    return dict(req)
+    return {key: req[key] for key in ("item_id", "requested_quantity", "rolled_back")}
 
 
 # ---------------------------------------------------------------------------

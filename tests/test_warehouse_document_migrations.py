@@ -49,7 +49,7 @@ def test_migration_old_and_historical_defaults(tmp_path, version):
     path = legacy(tmp_path / "old.db", version)
     db.migrate_warehouse_db_columns(path)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.WAREHOUSE_SCHEMA_VERSION
         assert conn.execute(
             "SELECT doc_no,line_no,input_quantity,factor,requested_quantity FROM restock_requests"
         ).fetchone() == (None, None, None, "1", 0.25)
@@ -65,7 +65,7 @@ def test_migration_old_and_historical_defaults(tmp_path, version):
             assert "WHERE doc_no IS NOT NULL AND line_no IS NOT NULL" in sql
             assert "COLLATE BINARY" in sql
     backups = list((tmp_path / "backups/migrations").glob("*.db"))
-    assert len(backups) == (2 if version < 6 else 1)
+    assert len(backups) == (3 if version < 6 else 2)
     for backup in backups:
         with sqlite3.connect(backup) as conn:
             assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -78,7 +78,7 @@ def test_migration_old_and_historical_defaults(tmp_path, version):
 def test_migration_new_partial_and_no_repeat_alter(tmp_path, monkeypatch):
     path = tmp_path / "new.db"
     db.init_warehouse_db(path)
-    assert snapshot(path)[0] == 7
+    assert snapshot(path)[0] == db.WAREHOUSE_SCHEMA_VERSION
     partial = legacy(tmp_path / "partial.db")
     with sqlite3.connect(partial) as conn:
         conn.execute("ALTER TABLE restock_requests ADD COLUMN doc_no TEXT DEFAULT NULL")
@@ -98,7 +98,7 @@ def test_migration_new_partial_and_no_repeat_alter(tmp_path, monkeypatch):
 def test_migration_mcp_first_read_and_write_without_web(tmp_path):
     path = legacy(tmp_path / "mcp.db")
     with warehouse_connection(str(path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.WAREHOUSE_SCHEMA_VERSION
         assert conn.execute("SELECT factor FROM restock_requests").fetchone()[0] == "1"
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("UPDATE restock_requests SET input_quantity='0.25' WHERE id=1")
@@ -127,7 +127,7 @@ def test_migration_race_symlink_and_target_isolation(tmp_path):
     ]
     for worker in workers:
         worker.start()
-    assert [queue.get(timeout=25) for _ in workers] == [7, 7]
+    assert [queue.get(timeout=25) for _ in workers] == [8, 8]
     for worker in workers:
         worker.join(timeout=10)
         assert worker.exitcode == 0
@@ -170,7 +170,7 @@ def test_migration_failure_ddl_index_stamp_atomic(tmp_path, monkeypatch, point):
     assert snapshot(path) == before
     monkeypatch.setattr(runner, "connect_existing", original)
     db.migrate_warehouse_db_columns(path)
-    assert snapshot(path)[0] == 7
+    assert snapshot(path)[0] == db.WAREHOUSE_SCHEMA_VERSION
 
 
 def test_migration_failure_wrong_column_and_index(tmp_path):
@@ -206,7 +206,7 @@ def test_migration_backup_restore_and_down_refusal(tmp_path):
     )
     assert result.returncode != 0 and "verified backup restore required" in result.stderr
     assert snapshot(path) == after
-    backup = next((tmp_path / "backups/migrations").glob("*.db"))
+    backup = next((tmp_path / "backups/migrations").glob("*-v6-to-7-*.db"))
     restored = tmp_path / "restored-isolated.db"
     with sqlite3.connect(backup) as source, sqlite3.connect(restored) as target:
         source.backup(target)
@@ -227,7 +227,7 @@ def test_target_master_future_missing_schema_cli(tmp_path, monkeypatch):
     wrong = tmp_path / "wrong.db"
     with sqlite3.connect(wrong) as conn:
         conn.execute("CREATE TABLE arbitrary(x)")
-    future = legacy(tmp_path / "future.db", 8)
+    future = legacy(tmp_path / "future.db", 9)
     for path in (master, missing, wrong, future):
         for command in ("status", "up"):
             result = subprocess.run(
@@ -240,7 +240,7 @@ def test_target_master_future_missing_schema_cli(tmp_path, monkeypatch):
     with sqlite3.connect(master) as conn:
         assert list(conn.iterdump()) == original
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
-    assert snapshot(future)[0] == 8
+    assert snapshot(future)[0] == 9
     from migrations.feedback_receipts import registered_up as master_feedback_receipts_up
     from migrations.mcp_policy_presets import registered_up as master_mcp_policy_presets_up
     from migrations.order_changes import registered_up as master_order_changes_up
@@ -253,7 +253,7 @@ def test_target_master_future_missing_schema_cli(tmp_path, monkeypatch):
     assert all(m[2] is not up_document_lines for m in MIGRATIONS)
     assert all(m[2] is not master_order_changes_up for m in WAREHOUSE_MIGRATIONS)
     assert all(m[2] is not master_mcp_policy_presets_up for m in WAREHOUSE_MIGRATIONS)
-    assert db.WAREHOUSE_SCHEMA_VERSION == 7
+    assert db.WAREHOUSE_SCHEMA_VERSION == 8
     assert WAREHOUSE_MIGRATIONS[0][0] == 7
     assert "doc_no" not in db.WAREHOUSE_SCHEMA and "document_write_keys" not in db.WAREHOUSE_SCHEMA
 
@@ -269,7 +269,7 @@ def test_migration_mcp_first_service_write(tmp_path, monkeypatch):
     )
     assert created["quantity"] == 1.25
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.WAREHOUSE_SCHEMA_VERSION
         assert conn.execute("SELECT quantity FROM items").fetchone()[0] == 101.25
         assert conn.execute("SELECT count(*) FROM document_write_keys").fetchone()[0] == 1
 
@@ -281,6 +281,6 @@ def test_migration_old_v5_without_op_no(tmp_path):
         conn.execute("ALTER TABLE products DROP COLUMN is_hidden")
     db.migrate_warehouse_db_columns(path)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.WAREHOUSE_SCHEMA_VERSION
         assert "op_no" in [r[1] for r in conn.execute("PRAGMA table_info(stock_movements)")]
         assert "is_hidden" in [r[1] for r in conn.execute("PRAGMA table_info(products)")]

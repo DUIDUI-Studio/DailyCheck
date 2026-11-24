@@ -901,6 +901,21 @@
                   },
                   "rolled_back": {
                     "type": "integer"
+                  },
+                  "snapshot_source": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "unit": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "unit_status": {
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -2795,6 +2810,75 @@
                           "null"
                         ]
                       },
+                      "unit_groups": {
+                        "items": {
+                          "properties": {
+                            "canonical_item_id": {
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "conversion_mode": {
+                              "type": "string"
+                            },
+                            "grams_per_unit": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            },
+                            "item_sku": {
+                              "type": "string"
+                            },
+                            "line_count": {
+                              "type": "integer"
+                            },
+                            "manual_qty": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            },
+                            "measurement_revision": {
+                              "type": "integer"
+                            },
+                            "planned_qty": {
+                              "type": "number"
+                            },
+                            "system_default_qty": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            },
+                            "unit": {
+                              "type": "string"
+                            },
+                            "unknown_qty": {
+                              "type": [
+                                "number",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "unit",
+                            "item_sku",
+                            "canonical_item_id",
+                            "conversion_mode",
+                            "grams_per_unit",
+                            "measurement_revision",
+                            "line_count",
+                            "planned_qty",
+                            "manual_qty",
+                            "system_default_qty",
+                            "unknown_qty"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
                       "unknown_count": {
                         "type": "integer"
                       },
@@ -2803,6 +2887,12 @@
                           "number",
                           "null"
                         ]
+                      },
+                      "unknown_unit_count": {
+                        "type": "integer"
+                      },
+                      "unknown_unit_fraction": {
+                        "type": "number"
                       },
                       "warehouse_code": {
                         "type": "string"
@@ -2821,7 +2911,10 @@
                       "manual_qty",
                       "system_default_qty",
                       "unknown_qty",
-                      "sample"
+                      "sample",
+                      "unit_groups",
+                      "unknown_unit_count",
+                      "unknown_unit_fraction"
                     ],
                     "type": "object"
                   },
@@ -2838,6 +2931,18 @@
                 "lines": {
                   "items": {
                     "properties": {
+                      "bom_qty_per_unit": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "bom_row_id": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
                       "booked_qty": {
                         "type": "number"
                       },
@@ -2849,14 +2954,56 @@
                         ],
                         "type": "string"
                       },
+                      "calculation_version": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "canonical_item_id": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "conversion_mode": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "created_at": {
                         "type": "string"
+                      },
+                      "grams_per_unit": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
                       },
                       "item_id": {
                         "type": "integer"
                       },
+                      "item_sku": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "line_id": {
                         "type": "integer"
+                      },
+                      "measurement_revision": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "output_unit": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
                       },
                       "planned_qty": {
                         "type": "number"
@@ -2864,11 +3011,20 @@
                       "run_id": {
                         "type": "integer"
                       },
+                      "snapshot_source": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
                       "unit": {
                         "type": [
                           "string",
                           "null"
                         ]
+                      },
+                      "unit_status": {
+                        "type": "string"
                       },
                       "warehouse_code": {
                         "type": "string"
@@ -2880,6 +3036,17 @@
                       "unit",
                       "planned_qty",
                       "booked_qty",
+                      "unit_status",
+                      "snapshot_source",
+                      "output_unit",
+                      "item_sku",
+                      "canonical_item_id",
+                      "bom_row_id",
+                      "bom_qty_per_unit",
+                      "conversion_mode",
+                      "grams_per_unit",
+                      "calculation_version",
+                      "measurement_revision",
                       "booked_source",
                       "run_id",
                       "line_id",
@@ -2958,7 +3125,8 @@
         }
       },
       "tests": [
-        "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk"
+        "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk",
+        "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_snapshots_sdk"
       ],
       "title": "Read Store Production Consumption"
     }

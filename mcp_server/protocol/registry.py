@@ -43,18 +43,34 @@ BOOLEAN = {"type": "boolean"}
 NULLABLE_STRING = {"type": ["string", "null"]}
 ROW = {"type": "object"}
 NULLABLE_NUMBER = {"type": ["number", "null"]}
+NULLABLE_INTEGER = {"type": ["integer", "null"]}
 PRODUCTION_REFERENCE = obj(run_id=INTEGER, line_id=INTEGER, created_at=STRING)
+PRODUCTION_UNIT_GROUP = obj(
+    unit=STRING, item_sku=STRING, canonical_item_id=NULLABLE_INTEGER,
+    conversion_mode=STRING, grams_per_unit=NULLABLE_NUMBER, measurement_revision=INTEGER,
+    line_count=INTEGER, planned_qty=NUMBER, manual_qty=NULLABLE_NUMBER,
+    system_default_qty=NULLABLE_NUMBER, unknown_qty=NULLABLE_NUMBER,
+)
 PRODUCTION_SUMMARY = obj(
     warehouse_code=STRING, period_start=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
     planned_count=INTEGER, manual_count=INTEGER, system_default_count=INTEGER, unknown_count=INTEGER,
     planned_qty=NULLABLE_NUMBER, manual_qty=NULLABLE_NUMBER,
     system_default_qty=NULLABLE_NUMBER, unknown_qty=NULLABLE_NUMBER, sample=PRODUCTION_REFERENCE,
+    unit_groups=array(PRODUCTION_UNIT_GROUP), unknown_unit_count=INTEGER, unknown_unit_fraction=NUMBER,
 )
 PRODUCTION_LINE = obj(
     warehouse_code=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
     planned_qty=NUMBER, booked_qty=NUMBER,
+    unit_status=STRING, snapshot_source=NULLABLE_STRING, output_unit=NULLABLE_STRING,
+    item_sku=NULLABLE_STRING, canonical_item_id=NULLABLE_INTEGER, bom_row_id=NULLABLE_INTEGER,
+    bom_qty_per_unit=NULLABLE_NUMBER, conversion_mode=NULLABLE_STRING, grams_per_unit=NULLABLE_NUMBER,
+    calculation_version=NULLABLE_INTEGER, measurement_revision=NULLABLE_INTEGER,
     booked_source={"type": "string", "enum": ["manual", "system_default", "unknown"]},
     **PRODUCTION_REFERENCE["properties"],
+)
+OUTBOUND_LIST_ROW = obj(id=INTEGER, item_id=INTEGER, quantity=NUMBER, rolled_back=INTEGER)
+OUTBOUND_LIST_ROW["properties"].update(
+    unit=NULLABLE_STRING, unit_status=STRING, snapshot_source=NULLABLE_STRING,
 )
 ITEM = obj(id=INTEGER, name=STRING, current_stock=NUMBER)
 CANONICAL = obj(id=INTEGER, canonical_sku=STRING, name=STRING, unit=STRING, status=STRING)
@@ -421,7 +437,7 @@ REGISTRY = (
         ),
         domain='outbound', handler=outbound.outbound_list_impl,
         access=AccessContract('GET', '/api/v1/outbound', 'handler', 'warehouse_code checked in service'),
-        output_shape=page("items", obj(id=INTEGER, item_id=INTEGER, quantity=NUMBER, rolled_back=INTEGER)),
+        output_shape=page("items", OUTBOUND_LIST_ROW),
         external_subset=True, bot_approved=True,
         tests=("tests/test_mcp_registry.py::test_registered_tool_real_serialized_shape[outbound_list]",),
     ),
@@ -1129,7 +1145,10 @@ REGISTRY = (
             "oneOf": [obj(summary=array(PRODUCTION_SUMMARY)), obj(lines=array(PRODUCTION_LINE))],
         },
         external_subset=False, bot_approved=False,
-        tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk",),
+        tests=(
+            "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk",
+            "tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_snapshots_sdk",
+        ),
         compatibility="new-policy-only-StreamableHTTP-TextContent-JSON; legacy discovery and calls unchanged",
         policy_action=PRODUCTION_CONSUMPTION_READ, policy_only=True,
     ),
