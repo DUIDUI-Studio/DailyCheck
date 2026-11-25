@@ -915,6 +915,74 @@ else: os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
     return sb
 
 
+def _install_continuity_git(sb):
+    """Continuity-only git shim that refreshes the owned candidate's stat info.
+
+    The real guard compares the candidate with `git diff-index --quiet <sha> --`,
+    which is stat-sensitive: a checkout written on a coarse/racy timestamp can
+    report drift even though index and worktree bytes equal the commit (Peter's
+    after_write/lost_response reproductions).  For the exact guard argv against
+    the physically verified candidate checkout only, this shim refreshes stat
+    metadata before handing the untouched original argv to real Git.  The refresh
+    never restages content, so staged/worktree/mode changes and HEAD drift still
+    fail; any non-zero refresh result exits non-zero (fail closed).  Every other
+    invocation delegates to ordinary_candidate's unchanged shim, so the shared
+    ordinary pipeline test group keeps its original Git behaviour.
+    """
+    real_git = shutil.which("git")
+    ordinary = sb["tmp"] / "bin" / "git"
+    cbin = sb["tmp"] / "bin-continuity"
+    cbin.mkdir(exist_ok=True)
+    git = cbin / "git"
+    git.write_text(f'''#!{sys.executable}
+import os, sys, subprocess
+
+REAL_GIT = {real_git!r}
+ORDINARY_SHIM = {str(ordinary)!r}
+CANDIDATE_REPO = {str(sb["repo"])!r}
+CANDIDATE_SHA = {sb["sha"]!r}
+REFRESH_FAIL_ENV = "DAILYCHECK_FIXTURE_GIT_REFRESH_FAIL"
+
+
+def _delegate(argv):
+    os.execv(ORDINARY_SHIM, [ORDINARY_SHIM, *argv])
+
+
+def _owned_checkout(argv):
+    # Only the exact guard invocation, against the physically verified checkout.
+    if (len(argv) != 6 or argv[0] != "-C" or argv[2] != "diff-index"
+            or argv[3] != "--quiet" or argv[4] != CANDIDATE_SHA or argv[5] != "--"):
+        return None
+    path = os.path.realpath(argv[1])
+    if path != os.path.realpath(CANDIDATE_REPO) or not os.path.isdir(path):
+        return None
+    root = subprocess.run([REAL_GIT, "-C", argv[1], "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True)
+    if root.returncode != 0 or os.path.realpath(root.stdout.strip()) != path:
+        return None
+    return argv[1]
+
+
+args = sys.argv[1:]
+checkout = _owned_checkout(args)
+if checkout is None:
+    _delegate(args)
+if os.environ.get(REFRESH_FAIL_ENV) == "1":
+    sys.stderr.write("synthetic fixture refresh failure; refusing candidate check\\n")
+    sys.exit(128)
+refresh = subprocess.run([REAL_GIT, "-C", checkout, "update-index", "-q", "--refresh"],
+                         capture_output=True, text=True)
+if refresh.returncode != 0:
+    sys.stderr.write(refresh.stderr)
+    sys.stderr.write("candidate index refresh failed rc=%d\\n" % refresh.returncode)
+    sys.exit(refresh.returncode)
+_delegate(args)
+''')
+    git.chmod(0o755)
+    sb["continuity_bin"] = cbin
+    return cbin
+
+
 @pytest.mark.parametrize("unconfirmed", [False, True])
 def test_ordinary_candidate_frozen_base_and_confirmed_release(ordinary_candidate, unconfirmed):
     from tests.test_github_transport import proof
@@ -957,12 +1025,12 @@ def test_github_pipeline_rejects_disabled_or_incomplete_lane(sandbox, lane, args
     assert not _calls(sandbox) and not _state(sandbox)
 
 
-@pytest.mark.parametrize("case", ["stable", "promote", "switch", "observe", "tree",
-                                   "before_write", "after_write", "lost_response"])
-def test_verified_candidate_continuity_with_actual_finalizer(ordinary_candidate, case):
+def _continuity_harness(ordinary_candidate, case):
+    """Lay out the real finalizer harness for one continuity case/control."""
     from tests import test_github_transport as t
 
     sb = ordinary_candidate
+    _install_continuity_git(sb)
     for name in ("deploy_merge.py", "deploy_report.py"):
         shutil.copy2(BG_DIR / name, sb["dir"] / name)
     reader = sb["tmp"] / "scripts/prod_agent"
@@ -1009,7 +1077,9 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
         (sb["dir"] / "switch.sh").write_text(
             f'#!/bin/sh\necho "switch.sh $*" >> \'{sb["calls"]}\'\n'
             + 'if [ "$1" = green ]; then\n' + drift + "fi\n")
-    extra = {**sb["ordinary_env"], "DAILYCHECK_DEPLOY_MERGE_BIN": str(sb["dir"] / "deploy_merge.py"),
+    extra = {**sb["ordinary_env"],
+        "PATH": str(sb["continuity_bin"]) + os.pathsep + sb["ordinary_env"]["PATH"],
+        "DAILYCHECK_DEPLOY_MERGE_BIN": str(sb["dir"] / "deploy_merge.py"),
         "DAILYCHECK_CURL": str(curl), "DAILYCHECK_GITHUB_READ_TOKEN": "synthetic-read",
         "DAILYCHECK_GITHUB_FINALIZE_TOKEN_FILE": str(fake / "finalize-token"),
         "FAKE_TABLE": str(fake / "table"), "FAKE_STATE": str(fake / "api-state"),
@@ -1020,6 +1090,15 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
         journal = Path(extra["DAILYCHECK_PIPELINE_JOURNALCTL"])
         journal.write_text("#!/bin/sh\n" + (drift if case == "observe" else
             f"echo changed >> '{sb['repo'] / 'app.py'}'\n"))
+    return sb, fake, extra
+
+
+@pytest.mark.parametrize("case", ["stable", "promote", "switch", "observe", "tree",
+                                   "before_write", "after_write", "lost_response"])
+def test_verified_candidate_continuity_with_actual_finalizer(ordinary_candidate, case):
+    from tests import test_github_transport as t
+
+    sb, fake, extra = _continuity_harness(ordinary_candidate, case)
     result = _pipe(sb, "42", sb["sha"], "--candidate", "--merge-pr", **extra)
     state = _state(sb)
     actual_main = _git(["rev-parse", "main"], sb["origin"])
@@ -1046,3 +1125,151 @@ if (url.path.endswith('/git/ref/heads/main') and state.get(key) == 3
         assert state["last_attempt"]["result"] == "failed"
         assert not any(o["result"] == "success" for o in state["outcomes"].values())
         assert "switch.sh blue 100" in _calls(sb)
+
+
+def _guarded_comparison(sb, sha, **env_extra):
+    """Replay the guard's exact two Git commands through the fixture shim.
+
+    Returns (accepted, head, diff) with the native return statuses untouched, so a
+    rejection here is the same predicate `_verified_candidate` evaluates.
+    """
+    cbin = sb.get("continuity_bin") or _install_continuity_git(sb)
+    env = {**os.environ,
+           "PATH": str(cbin) + os.pathsep + str(sb["tmp"] / "bin") + os.pathsep
+                   + os.environ["PATH"],
+           **env_extra}
+    head = subprocess.run(["git", "-C", str(sb["repo"]), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, env=env)
+    diff = subprocess.run(["git", "-C", str(sb["repo"]), "diff-index", "--quiet", sha, "--"],
+                          capture_output=True, text=True, env=env)
+    accepted = (head.returncode == 0 and head.stdout.strip() == sha
+                and diff.returncode == 0)
+    return accepted, head, diff
+
+
+def _native_diff(sb, sha):
+    """The same comparison with real Git and no fixture shim on PATH."""
+    return subprocess.run([shutil.which("git"), "-C", str(sb["repo"]),
+                           "diff-index", "--quiet", sha, "--"],
+                          capture_output=True, text=True)
+
+
+def _ordinary_diff(sb, sha):
+    """The shared ordinary shim's comparison, with the continuity fault hook set."""
+    env = {**os.environ,
+           "PATH": str(sb["tmp"] / "bin") + os.pathsep + os.environ["PATH"],
+           "DAILYCHECK_FIXTURE_GIT_REFRESH_FAIL": "1"}
+    return subprocess.run(["git", "-C", str(sb["repo"]), "diff-index", "--quiet", sha, "--"],
+                          capture_output=True, text=True, env=env)
+
+
+def test_candidate_guard_controls_reject_real_drift_and_refresh_failure(ordinary_candidate):
+    """The stat refresh must keep every real drift rejection the guard had."""
+    sb = ordinary_candidate
+    repo, sha, base = sb["repo"], sb["sha"], sb["base"]
+    native = ["git", "-C", str(repo)]
+
+    def reset():
+        subprocess.run([*native, "reset", "-q", "--hard", sha], check=True,
+                       capture_output=True, text=True)
+        subprocess.run([*native, "checkout", "-q", "-f", "--detach", sha], check=True,
+                       capture_output=True, text=True)
+
+    def stage():
+        subprocess.run([*native, "add", "app.py"], check=True, capture_output=True, text=True)
+
+    reset()
+    assert _guarded_comparison(sb, sha)[0], "clean candidate rejected"
+
+    # Worktree-only content change (same shape as the existing "tree" case).
+    (repo / "app.py").write_text("dirty\n", encoding="utf-8")
+    assert not _guarded_comparison(sb, sha)[0], "worktree drift accepted"
+    reset()
+
+    # Staged content differs from H, worktree still shows the staged bytes.
+    (repo / "app.py").write_text("staged\n", encoding="utf-8")
+    stage()
+    assert not _guarded_comparison(sb, sha)[0], "staged drift accepted"
+    reset()
+
+    # Staged content differs from H while the worktree was restored to H bytes.
+    (repo / "app.py").write_text("staged\n", encoding="utf-8")
+    stage()
+    (repo / "app.py").write_text("v2\n", encoding="utf-8")
+    assert not _guarded_comparison(sb, sha)[0], "restored worktree hid staged drift"
+    reset()
+
+    # Tracked mode change (real tree-object difference, not a stat artifact).
+    (repo / "app.py").chmod(0o755)
+    assert not _guarded_comparison(sb, sha)[0], "mode drift accepted"
+    reset()
+
+    # HEAD drift to base while the target stays H.
+    subprocess.run([*native, "checkout", "-q", "--detach", base], check=True,
+                   capture_output=True, text=True)
+    assert not _guarded_comparison(sb, sha)[0], "HEAD drift accepted"
+    reset()
+
+    # A real rc=1 from update-index --refresh (unmerged index) is also fail-closed,
+    # so the guard rejects without running a comparison that could look clean.
+    subprocess.run([*native, "checkout", "-q", "--detach", base], check=True,
+                   capture_output=True, text=True)
+    (repo / "app.py").write_text("side\n", encoding="utf-8")
+    stage()
+    subprocess.run([*native, "commit", "-qm", "side"], check=True,
+                   capture_output=True, text=True)
+    side = subprocess.run([*native, "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    subprocess.run([*native, "checkout", "-q", "--detach", sha], check=True,
+                   capture_output=True, text=True)
+    merged = subprocess.run([*native, "merge", "--no-edit", side],
+                            capture_output=True, text=True)
+    assert merged.returncode != 0, "expected a conflicting merge"
+    accepted, head, diff = _guarded_comparison(sb, sha)
+    assert not accepted and head.stdout.strip() == sha and diff.returncode == 1
+    assert "candidate index refresh failed rc=1" in diff.stderr
+    reset()
+
+    # A refresh error is fail-closed, not swallowed into a clean comparison.
+    accepted, head, diff = _guarded_comparison(
+        sb, sha, DAILYCHECK_FIXTURE_GIT_REFRESH_FAIL="1")
+    assert not accepted and diff.returncode == 128 and not diff.stdout
+    assert head.returncode == 0 and head.stdout.strip() == sha
+
+    # The refresh hook is scoped to the exact candidate argv: a different sha on
+    # the same path still executes the untouched original command.
+    subprocess.run([*native, "checkout", "-q", "--detach", base], check=True,
+                   capture_output=True, text=True)
+    _, head, diff = _guarded_comparison(
+        sb, base, DAILYCHECK_FIXTURE_GIT_REFRESH_FAIL="1")
+    assert head.stdout.strip() == base
+    assert diff.returncode == _native_diff(sb, base).returncode
+    assert "synthetic fixture refresh failure" not in diff.stderr
+    reset()
+
+    # The shared ordinary shim (no continuity dir on PATH) is byte-for-byte the
+    # original fixture: the refresh and its fault hook cannot apply to unrelated
+    # ordinary-candidate tests.
+    diff = _ordinary_diff(sb, sha)
+    assert diff.returncode == _native_diff(sb, sha).returncode
+    assert "synthetic fixture refresh failure" not in diff.stderr
+
+
+def test_candidate_guard_fails_closed_when_refresh_fails(ordinary_candidate):
+    """A refresh failure reaches the existing candidate-drift rejection, zero POSTs."""
+    sb, fake, extra = _continuity_harness(ordinary_candidate, "stable")
+    result = _pipe(sb, "42", sb["sha"], "--candidate", "--merge-pr",
+                   **{**extra, "DAILYCHECK_FIXTURE_GIT_REFRESH_FAIL": "1"})
+    state = _state(sb)
+    actual_main = _git(["rev-parse", "main"], sb["origin"])
+    catchup = _ds(sb, "catchup", "--main-sha", actual_main)
+    posts = [r for r in map(json.loads, (fake / "log").read_text().splitlines())
+             if r["method"] == "POST"]
+    assert result.returncode == 26, result.stdout + result.stderr
+    assert "verified candidate changed at promote-before" in result.stdout
+    assert state["deployed"]["sha"] == sb["base"]
+    assert posts == []
+    assert actual_main == sb["base"] and catchup.returncode == 0
+    assert state["last_attempt"]["result"] == "failed"
+    assert not any(o["result"] == "success" for o in state["outcomes"].values())
+    assert "switch.sh blue 100" in _calls(sb)
