@@ -1,6 +1,8 @@
 """Installed relay port for DailyCheck's protected blue/green shell helpers."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -46,6 +48,103 @@ UNITS = {
     "blue": ["dailycheck.service", "dailycheck-mcp.service"],
     "green": ["dailycheck-green.service", "dailycheck-green-mcp.service"],
 }
+GREEN_WEB_PORT = 8091
+ROUTING_PROOF_FILE = STATE_PATH.parent / "routing-proof.env"
+ROUTING_PROOF_CREDENTIAL = "dailycheck-routing-proof"
+ROUTING_PROOF_KEY = "DAILYCHECK_ROUTING_PROBE_SECRET"
+ROUTING_PROOF_PORT = "DAILYCHECK_ROUTING_WEB_PORT"
+ROUTING_MODE_KEY = "DAILYCHECK_MULTI_WAREHOUSE"
+ROUTING_KEY_PATTERN = rb"DAILYCHECK_ROUTING_PROBE_SECRET=([A-Za-z0-9_-]{32,128})\n"
+
+# The systemd unit already starts as root to run the fixed setpriv command.
+# This isolated stdlib launcher projects the original allowlisted environment
+# and reads just the credential staged by the unit manager. It passes the key
+# in execve's environment so it never becomes a command-line argument.
+_ROUTING_EXEC = (
+    "import os,re,sys; "
+    "cut=sys.argv.index('--'); "
+    "pairs=[word.partition('=') for word in sys.argv[1:cut]]; "
+    "env={key: value if sep else os.environ[key] for key,sep,value in pairs}; "
+    f"path=os.path.join(os.environ['CREDENTIALS_DIRECTORY'],'{ROUTING_PROOF_CREDENTIAL}'); "
+    "raw=open(path,'rb').read(256); "
+    f"match=re.fullmatch({ROUTING_KEY_PATTERN!r},raw); "
+    "match or sys.exit('invalid routing proof credential'); "
+    f"env['{ROUTING_PROOF_KEY}']=match[1].decode('ascii'); "
+    "argv=sys.argv[cut+1:]; os.execve(argv[0],argv,env)"
+)
+
+
+def _routing_proof_key(profile):
+    enabled = profile.get("routing_mode_proof", False)
+    require(type(enabled) is bool, "invalid routing proof opt-in")
+    if not enabled:
+        return None
+    path = ROUTING_PROOF_FILE
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600
+            and info.st_nlink == 1, "unprotected routing proof credential")
+    raw = read_protected(path, 0)
+    match = re.fullmatch(ROUTING_KEY_PATTERN, raw)
+    require(match and os.path.samestat(info, path.lstat()), "invalid routing proof credential")
+    return match[1]
+
+
+def _routing_unit(content, unit, control_python):
+    prefix, marker, command = content.partition("ExecStart=/usr/bin/env -i ")
+    line, newline, suffix = command.partition("\n")
+    assignments, separator, launch = line.partition(" /usr/bin/setpriv ")
+    require(marker and newline and separator and unit in UNITS["green"], "unexpected routing unit recipe")
+    require(re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(control_python)),
+            "invalid routing launcher interpreter")
+    if unit == UNITS["green"][0]:
+        require(f" --bind 127.0.0.1:{GREEN_WEB_PORT} " in launch, "routing Web port changed")
+    selected = []
+    for word in assignments.split():
+        key, equal, value = word.partition("=")
+        require(equal and (value == "${" + key + "}" or "$" not in value),
+                "unexpected application input reference")
+        if key != ROUTING_MODE_KEY:
+            selected.append(key if value.startswith("${") else word)
+    selected.append(f"{ROUTING_MODE_KEY}=true")
+    if unit == UNITS["green"][1]:
+        selected.append(f"{ROUTING_PROOF_PORT}={GREEN_WEB_PORT}")
+    environment = " ".join(selected)
+    program = _ROUTING_EXEC.replace("\\", "\\\\").replace('"', '\\"')
+    return (prefix + f"LoadCredential={ROUTING_PROOF_CREDENTIAL}:{ROUTING_PROOF_FILE}\n"
+            + f'ExecStart={control_python} -I -S -B -c "{program}" {environment} -- '
+            + "/usr/bin/setpriv " + launch + newline + suffix)
+
+
+def _verify_routing_environment(environment, key, web):
+    expected = {
+        ROUTING_PROOF_KEY: key,
+        ROUTING_MODE_KEY: b"true",
+        ROUTING_PROOF_PORT: None if web else str(GREEN_WEB_PORT).encode(),
+    }
+    for name, value in expected.items():
+        prefix = name.encode() + b"="
+        require([entry for entry in environment if entry.startswith(prefix)] ==
+                ([] if value is None else [prefix + value]), "runtime routing proof input mismatch")
+
+
+def _verify_routing_witness(master, key):
+    nonce = secrets.token_hex(32)
+    challenge = hmac.digest(key, b"request:" + nonce.encode() + b":", "sha256").hex()
+    code, body = _http(GREEN_WEB_PORT, "/health", headers={
+        "X-DailyCheck-Routing-Nonce": nonce, "X-DailyCheck-Routing-Proof": challenge,
+    })
+    try:
+        envelope = json.loads(body)
+        snapshot = envelope["snapshot"].encode()
+        signature = hmac.digest(key, b"response:" + nonce.encode() + b":" + snapshot, "sha256").hex()
+        info = master.stat()
+        inode = hashlib.sha256(f"{info.st_dev}:{info.st_ino}".encode()).hexdigest()
+        mode = json.loads(snapshot)
+        require(code == 200 and hmac.compare_digest(signature, envelope["proof"])
+                and mode["database"] == inode and mode["multi_warehouse"] is True
+                and mode["dry_run"] is False, "runtime routing witness mismatch")
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise ValueError("runtime routing witness mismatch") from None
 
 
 def verification_uid(profile):
@@ -185,10 +284,20 @@ class RelayPipeline(ProtectedPipeline):
         access = super()._candidate_access_log(promoted=promoted)
         return access if promoted else access.with_name("dailycheck-relay-preview-access.log")
 
+    def _candidate_routing_proof(self):
+        key = _routing_proof_key(self.server.profile)
+        if key is not None:
+            require(self._stockout_release(self.server.expected["head"]),
+                    "routing proof requires a stockout release")
+            require(self.app_env.get(ROUTING_MODE_KEY, "").lower() in {"true", "on", "1", "yes"},
+                    "routing proof requires explicit multi-warehouse mode")
+        return key
+
     def _candidate_units(self, candidate, *, promoted=False):
         db = self.path("source_db" if promoted else "green_db")
         require(re.fullmatch(r"/[a-zA-Z0-9_./-]+", str(db)) and ".." not in db.parts,
                 "invalid protected database launch path")
+        proof = promoted and self._candidate_routing_proof() is not None
         for unit, content in super()._candidate_units(candidate, promoted=promoted):
             # The legacy up/promote shell calls inspect both Environment and
             # ExecStart. Render these two fixed policy values literally in both
@@ -199,7 +308,7 @@ class RelayPipeline(ProtectedPipeline):
                 require(content.count(reference) == 1 and f"Environment={key}={value}\n" in content,
                         "unexpected protected unit declaration")
                 content = content.replace(reference, f"{key}={value}", 1)
-            yield unit, content
+            yield unit, _routing_unit(content, unit, self.policy.python.resolve()) if proof else content
 
     def _candidate_role_settings(self, settings, role, *, promoted):
         access_log = self._candidate_access_log(promoted=promoted)
@@ -391,7 +500,7 @@ class RelayPipeline(ProtectedPipeline):
     def prepare(self, repo):
         candidate = self._owned()
         with self._routing_switch_guard("candidate"):
-            pass
+            self._candidate_routing_proof()
         self._admin_audit_log()
         expected = self.server.expected
         require(repo == self.policy.location("repo"), "wrong protected source store")
@@ -562,11 +671,13 @@ def candidate_operation(operation):
     return 0
 
 
-def _http(port, path, token=None):
+def _http(port, path, token=None, *, headers=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
-        headers = {"Authorization": "Bearer " + token} if token else {}
-        connection.request("GET", path, headers=headers)
+        request_headers = dict(headers or ())
+        if token:
+            request_headers["Authorization"] = "Bearer " + token
+        connection.request("GET", path, headers=request_headers)
         response = connection.getresponse()
         return response.status, response.read(65537)
     finally:
@@ -698,6 +809,7 @@ def live_route(server, role):
             "nonroot runtime principal required")
     env_path = protected_path(Path(pipeline["app_environment_file"]), 0, private=True)
     app_env = parse_application_environment(env_path.read_bytes())
+    routing_key = _routing_proof_key(server.profile) if candidate else None
     web_unit = UNITS[color][0]
     web_gid = shipment_export_web_gid(app_env, pipeline["app_gid"])
     observer = SystemdObserver(exact_unit=True, expected_gids={web_unit: web_gid})
@@ -746,16 +858,20 @@ def live_route(server, role):
                 prefix = os.fsencode(key + "=")
                 require([x for x in environment if x.startswith(prefix)] ==
                         [prefix + os.fsencode(value)], "runtime is not on the approved write route")
+            if routing_key is not None:
+                _verify_routing_environment(environment, routing_key, row["unit"] == web_unit)
             require(database_identity(source_db, external, view=proc / "root") == db_identity,
                     "process mount DB identity changed")
 
     verify_data()
-    app_port, mcp_port = (8090, 5100) if color == "blue" else (8091, 5101)
+    app_port, mcp_port = (8090, 5100) if color == "blue" else (GREEN_WEB_PORT, 5101)
     token = app_env["DAILYCHECK_MCP_TOKEN"]
     for port, credential in ((app_port, None), (mcp_port, token)):
         code, body = _http(port, "/health", credential)
         require(code == 200 and len(body) <= 65536, "direct app/MCP health failed")
     require(_http(mcp_port, "/health")[0] == 401, "direct MCP auth exclusion failed")
+    if routing_key is not None:
+        _verify_routing_witness(source_db / "master.db", routing_key)
     if role not in {"standby", "candidate-standby"}:
         nonce = ("dc_relay_" + secrets.token_hex(16)).encode()
         code, body = _http(8080, "/health?" + nonce.decode() + "=1")
@@ -788,6 +904,7 @@ def live_route(server, role):
     require(observer.observe(policy) == processes and _route(config.read_text()) == active,
             "runtime changed during observation")
     verify_data()
-    return {"sha": sha, "route": color,
-            "identity": digest({"tree": tree, "processes": processes, "database": db_identity,
-                                "admin_audit": audit_id})}
+    identity = {"tree": tree, "processes": processes, "database": db_identity, "admin_audit": audit_id}
+    if routing_key is not None:
+        identity["routing_proof"] = True
+    return {"sha": sha, "route": color, "identity": digest(identity)}

@@ -64,7 +64,7 @@ def test_relay_preview_and_live_units_use_separate_database_and_access_log(tmp_p
     audit, access = root / "logs" / "admin_audit.log", root / "logs" / "green-access.log"
     live_env = root / "control" / "live.env"
     pipeline = object.__new__(port.RelayPipeline)
-    pipeline.server = SimpleNamespace(work=root / "control" / "attempt")
+    pipeline.server = SimpleNamespace(work=root / "control" / "attempt", profile={})
     pipeline.policy = SimpleNamespace(value={"app_uid": 996}, owner=0, anchor=None)
     pipeline.python = Path("/usr/bin/python3")
     pipeline.value = {"source_db": str(source), "green_db": str(green), "app_gid": 988,
@@ -93,6 +93,20 @@ def test_relay_preview_and_live_units_use_separate_database_and_access_log(tmp_p
         assert f"ReadWritePaths={source} {external} {access}" in content
         assert str(green) not in content
         assert (str(audit) in content) == (key == port.UNITS["green"][0])
+
+    assert all("LoadCredential=" not in content for content in (*preview.values(), *live.values()))
+    pipeline.policy.python = Path("/usr/bin/python3")
+    monkeypatch.setattr(pipeline, "_candidate_routing_proof", lambda: b"synthetic-proof")
+    opted_in = dict(pipeline._candidate_units({}, promoted=True))
+    assert dict(pipeline._candidate_units({})) == preview
+    for unit, content in opted_in.items():
+        assert f"LoadCredential={port.ROUTING_PROOF_CREDENTIAL}:{port.ROUTING_PROOF_FILE}" in content
+        assert "synthetic-proof" not in content
+        assert "DAILYCHECK_MULTI_WAREHOUSE=true" in content
+        assert f"DAILYCHECK_DB_DIR={source}" in content
+        assert (f"DAILYCHECK_ROUTING_WEB_PORT={port.GREEN_WEB_PORT}" in content) == (
+            unit == port.UNITS["green"][1]
+        )
 
 
 def test_relay_requires_the_confirmed_blue_runtime_before_stopping_green(monkeypatch):
