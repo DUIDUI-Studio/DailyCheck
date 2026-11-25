@@ -220,9 +220,10 @@ def test_local_fixture_profile_and_budget_remain_exact():
 
 
 def test_hosted_pytest_owns_disk_scratch_and_long_budget():
-    assert producer.capture_budget(MANIFEST, "pytest") == (2700, True)
+    assert producer.capture_budget(MANIFEST, "pytest") == (3600, True)
     assert producer.capture_budget(MANIFEST, "lint") == (180, False)
     assert producer.capture_budget(MANIFEST, "report-generate") == (180, False)
+    assert producer.capture_budget(MANIFEST, "report-verify") == (180, False)
 
 
 @pytest.mark.parametrize("damage", [
@@ -919,10 +920,11 @@ def test_workflow_uses_arm_runner_and_skips_only_github_push():
     assert "github.event_name != 'push'" in test["if"]
     assert reports["if"].startswith("always()")
     assert "pull_request" in reports["if"] and "merge_group" in reports["if"]
-    assert test["timeout-minutes"] == "60" and reports["timeout-minutes"] == "60"
     native_env = workflow["env"]["CI_NATIVE_PRODUCER"]
     assert "github.server_url == 'https://github.com'" in native_env
     assert "pull_request" in native_env and "merge_group" in native_env
+    assert test["timeout-minutes"] == native_env.removesuffix(" }}") + " && 75 || 60 }}"
+    assert reports["timeout-minutes"] == "60"
     assert workflow["on"]["push"]["branches"] == ["main"]
 
 
@@ -1433,14 +1435,24 @@ def test_capture_takes_custody_before_timeout_rejection(tmp_path, monkeypatch, m
                                     diagnostic_source=tmp_path)
     cid = "a" * 64
     calls = []
+    wait_timeouts = []
+    elapsed = 0
+    killed = False
     raw = b"candidate private output canary"
 
-    def call(command, *args, **kwargs):
+    def call(command, *args, timeout=30):
+        nonlocal elapsed, killed
         calls.append(command)
         if command == "create":
             return cid.encode()
         assert args == (cid,)
+        if command == "kill":
+            killed = True
         if command == "wait":
+            if mode == "timeout" and not killed:
+                wait_timeouts.append(timeout)
+                elapsed += timeout
+                raise subprocess.TimeoutExpired(command, timeout)
             return b"137"
         if command == "inspect":
             return json.dumps([{
@@ -1450,18 +1462,14 @@ def test_capture_takes_custody_before_timeout_rejection(tmp_path, monkeypatch, m
                           "ExitCode": 137, "OOMKilled": mode == "oom", "Error": ""}}]).encode()
         return b""
 
-    def wait(*args):
-        if mode == "timeout":
-            raise producer._CaptureTimeout
-        return 137
-
     def logs(command, **kwargs):
         assert command == ["docker", "logs", cid]
         calls.append("logs")
         return SimpleNamespace(returncode=0, stdout=raw, stderr=b"")
 
     monkeypatch.setattr(runner, "call", call)
-    monkeypatch.setattr(runner, "_wait", wait)
+    monkeypatch.setattr(producer, "time", SimpleNamespace(
+        monotonic=lambda: elapsed, monotonic_ns=lambda: elapsed * 1_000_000_000))
     monkeypatch.setattr(producer.subprocess, "run", logs)
     monkeypatch.setattr(producer.shutil, "disk_usage", lambda _: SimpleNamespace(
         free=producer.SCRATCH_RESERVE + producer.HOST_FREE_MARGIN))
@@ -1470,19 +1478,21 @@ def test_capture_takes_custody_before_timeout_rejection(tmp_path, monkeypatch, m
     producer.retain_pytest_diagnostics(work, runner.pytest_diagnostics)
     directory = work / producer.PYTEST_DIAGNOSTIC_DIR
     if mode == "uncertain":
-        assert calls == ["create", "start", "inspect"]
+        assert calls == ["create", "start", "wait", "inspect"]
         assert list((work / "scratch").iterdir())
     else:
         assert calls[-3:] == ["inspect", "logs", "rm"]
         assert next(work.glob("*/stdout.bin")).read_bytes() == raw
         assert not list((work / "scratch").iterdir())
     if mode == "timeout":
-        assert calls[2:4] == ["kill", "wait"]
+        assert wait_timeouts == [30] * 120
+        assert calls[2:-3] == ["wait"] * 120 + ["kill", "wait"]
         assert {path.name for path in directory.iterdir()} == {"status.json"}
         status = (directory / "status.json").read_bytes()
         assert raw not in status
         parsed = json.loads(status)
         assert parsed["timed_out"] and parsed["removed"] and parsed["native_exit"] == 137
+        assert parsed["elapsed_ms"] == 3_600_000
         assert parsed["progress"] == {"status": "missing"}
     else:
         assert not directory.exists()

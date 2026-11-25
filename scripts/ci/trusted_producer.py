@@ -51,7 +51,7 @@ ARCHIVE_ROUTES = (
     re.compile(re.escape(ASSET_API_PREFIX) + r"[1-9][0-9]{0,18}"),
 )
 DEFAULT_SECONDS = 180
-HOSTED_PYTEST_SECONDS = 2700
+HOSTED_PYTEST_SECONDS = 3600
 # Measured full suite retained 3.5 GiB; never run it on an in-memory tmpfs.
 SCRATCH_RESERVE = 4 * 1024 ** 3
 HOST_FREE_MARGIN = 2 * 1024 ** 3

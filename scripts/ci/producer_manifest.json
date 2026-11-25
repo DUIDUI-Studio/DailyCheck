@@ -11,7 +11,7 @@
     "scripts/ci/merge_group.py": "7a9fd1368f3fda144006308637ef4d58e5fce66d",
     "scripts/ci/pytest_evidence.py": "dd3d80b1a0e92b58d5c6c69b76660c789aa68202",
     "scripts/ci/pytest_summary.py": "4a5abc5d1a174c697508688103cddefdd049e5b9",
-    "scripts/ci/trusted_producer.py": "04c5efbff5e5daa42c68a8d46baa272a30bff7ac",
+    "scripts/ci/trusted_producer.py": "a57b408b5b5471bbd955e529d373b2f150329857",
     "scripts/dev_smoke_t11_e2e.py": "4be5629cffe7e33ab4c82fa0d1e37f6ea59c8c40",
     "scripts/hosting.py": "76d3c0fd14a67be3a1a731c927ce08daef5aefdc",
     "scripts/mcp_contracts.py": "6482e136fd74265ffa1bfc591dc2138b6e275ee3",
