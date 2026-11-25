@@ -53,7 +53,7 @@ class WmsConfig:
         return f"WmsConfig(host={self.host!r}, port={self.port}, db={self.database!r})"
 
 
-def load_config() -> WmsConfig:
+def load_config(*, strict_customer: bool = False) -> WmsConfig:
     """从环境变量读配置；缺关键项抛 wms_not_configured。"""
     host = (os.environ.get("DAILYCHECK_WMS_HOST") or "").strip()
     user = (os.environ.get("DAILYCHECK_WMS_USER") or "").strip()
@@ -70,7 +70,9 @@ def load_config() -> WmsConfig:
         port = _DEFAULT_PORT
     try:
         customer_id = int(os.environ.get("DAILYCHECK_WMS_CUSTOMER_ID") or _DEFAULT_CUSTOMER_ID)
-    except ValueError:
+    except ValueError as exc:
+        if strict_customer:
+            raise McpError("wms_owner_unconfirmed", "WMS owner configuration does not match", 503) from exc
         customer_id = _DEFAULT_CUSTOMER_ID
     return WmsConfig(
         host=host,

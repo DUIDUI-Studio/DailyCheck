@@ -1309,29 +1309,19 @@ def _run_native_pytest(tmp_path, *, include_error):
     return candidate, junit, raw, session, capture
 
 
-def test_native_pytest_junit_keeps_traceback_and_copy_is_exact(tmp_path):
+def test_native_pytest_junit_and_session_remain_private_gate_inputs(tmp_path):
     candidate, junit, raw, session, capture = _run_native_pytest(tmp_path, include_error=True)
-    xml = junit.read_bytes()
-    assert b"<error" in xml
-    assert b"tests.test_error" in xml and b'name="test_uses_broken"' in xml
-    assert b"setup boom from fixture" in xml
+    assert b"setup boom from fixture" in junit.read_bytes()
+    assert b"tests.test_error" in junit.read_bytes()
     work = tmp_path / "work"
     work.mkdir()
-    status = producer.retain_pytest_diagnostics(candidate, work, capture, session, raw)
+    status = {"version": 1, "progress": {"status": "missing"}, "output_bytes": len(raw)}
+    producer.retain_pytest_diagnostics(work, status)
     directory = work / producer.PYTEST_DIAGNOSTIC_DIR
-    assert (directory / producer.DIAGNOSTIC_JUNIT_NAME).read_bytes() == xml
-    assert not (directory / producer.PYTEST_JUNIT_NAME).exists()
-    assert status["junit_name"] == producer.DIAGNOSTIC_JUNIT_NAME
-    assert not producer.DIAGNOSTIC_JUNIT_NAME.startswith(".")
-    assert (directory / "pytest-output-tail.txt").read_bytes() == raw[-producer.MAX_RAW_TAIL_BYTES:]
-    session_bytes = (json.dumps(session, sort_keys=True) + "\n").encode()
-    assert (directory / "session.json").read_bytes() == session_bytes
-    assert (directory / "capture.json").read_bytes() == (
-        json.dumps(capture, sort_keys=True) + "\n").encode()
-    assert status["junit"] == "present" and status["junit_bytes"] == len(xml)
-    assert status["junit_sha256"] == hashlib.sha256(xml).hexdigest()
-    assert status["session_sha256"] == hashlib.sha256(session_bytes).hexdigest()
-    # Raw/session gate semantics are unchanged: the H6 ERROR signature remains.
+    assert {path.name for path in directory.iterdir()} == {"status.json"}
+    assert json.loads((directory / "status.json").read_text()) == status
+    assert "setup boom" not in (directory / "status.json").read_text()
+    assert (candidate / producer.PYTEST_JUNIT_NAME).is_file()
     with pytest.raises(producer.EvidenceValidationError) as caught:
         producer.make_test_envelope(raw, session, capture, {"version": 3, "phase": "H"})
     assert (caught.value.reason, caught.value.subreason) == ("raw-session-invalid", "errors")
@@ -1340,101 +1330,176 @@ def test_native_pytest_junit_keeps_traceback_and_copy_is_exact(tmp_path):
 def test_native_pytest_positive_control_envelope_is_unchanged(tmp_path):
     candidate, junit, raw, session, capture = _run_native_pytest(tmp_path, include_error=False)
     assert capture["native_exit"] == 0
-    assert b"<testsuite" in junit.read_bytes() and b"test_ok" in junit.read_bytes()
-    work = tmp_path / "work"
-    work.mkdir()
+    assert b"test_ok" in junit.read_bytes()
     binding = {"version": 3, "phase": "H"}
     envelope = producer.make_test_envelope(raw, session, capture, binding)
-    status = producer.retain_pytest_diagnostics(candidate, work, capture, session, raw)
-    assert status["junit"] == "present"
-    directory = work / producer.PYTEST_DIAGNOSTIC_DIR
-    (directory / producer.DIAGNOSTIC_JUNIT_NAME).write_bytes(b"mutated diagnostic")
-    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"mutated candidate diagnostic")
+    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"mutated private diagnostic")
     assert producer.make_test_envelope(raw, session, capture, binding) == envelope
+    assert not (tmp_path / "attestation.json").exists()
+
+
+@pytest.fixture
+def progress_file(tmp_path):
+    source = tmp_path / "source"
+    (source / "tests").mkdir(parents=True)
+    (source / "tests/test_fixture.py").write_text(
+        "def test_first(): pass\n\nclass TestSuite:\n    def test_next(self): pass\n")
+    git = ["git", "-C", str(source), "-c", "core.hooksPath=/dev/null"]
+    for command in (["init", "-q"], ["add", "."],
+                    ["-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                     "commit", "-qm", "fixture"]):
+        subprocess.run([*git, *command], check=True, capture_output=True)
+    head = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+    path = tmp_path / ".current-capture.json"
+    value = {
+        "version": 1, "capture": path.name, "selected": 3, "collection_ms": 20,
+        "started": 2, "completed": 1,
+        "last_started": {"node": "tests/test_fixture.py::TestSuite::test_next", "ms": 50},
+        "last_completed": {"node": "tests/test_fixture.py::test_first", "ms": 40},
+    }
+    return path, value, source, head
+
+
+@pytest.mark.parametrize(("elapsed_ms", "observation"), [
+    (70, "recent-teardown-progress"),
+    (70_000, "no-recent-teardown-test-in-progress"),
+])
+def test_progress_projects_only_frozen_canonical_locations(progress_file, elapsed_ms, observation):
+    path, value, source, head = progress_file
+    path.write_text(json.dumps(value))
+    (source / "tests/test_fixture.py").write_text("working copy does not affect provenance")
+    result = producer._pytest_progress(path.parent, path.name, elapsed_ms, True, source, head)
+    assert result == {"status": "advisory", "observation": observation,
+                      **{key: item for key, item in value.items() if key != "capture"}}
+
+
+@pytest.mark.parametrize("case", [
+    "invalid-json", "unknown-field", "duplicate-field", "stale-tag", "oversized",
+    "symlink", "hardlink", "fifo", "forged-location", "parameter", "traversal",
+    "future", "reversed-teardown", "false-count", "mismatched-teardown",
+])
+def test_candidate_progress_fail_closed(progress_file, case):
+    path, value, source, head = progress_file
+    outside = path.with_name("outside")
+    if case in ("symlink", "hardlink", "fifo"):
+        outside.write_text(json.dumps(value))
+        if case == "symlink":
+            path.symlink_to(outside)
+        elif case == "hardlink":
+            path.hardlink_to(outside)
+        else:
+            os.mkfifo(path)
+    else:
+        if case == "unknown-field":
+            value["raw"] = "candidate canary"
+        if case == "stale-tag":
+            value["capture"] = ".other-capture.json"
+        if case == "forged-location":
+            value["last_started"]["node"] = "tests/test_fixture.py::test_candidate_canary"
+        if case == "parameter":
+            value["last_started"]["node"] += "[candidate canary]"
+        if case == "traversal":
+            value["last_started"]["node"] = "tests/../tests/test_fixture.py::test_first"
+        if case == "future":
+            value["last_started"]["ms"] = 100
+        if case == "reversed-teardown":
+            value["last_completed"]["ms"] = 51
+        if case == "false-count":
+            value["completed"] = True
+        if case == "mismatched-teardown":
+            value["started"] = value["completed"]
+            value["last_completed"]["ms"] = value["last_started"]["ms"]
+        raw = json.dumps(value)
+        raw = {"invalid-json": "{candidate canary", "oversized": raw + " " * 4096,
+               "duplicate-field": '{"version":1,' + raw[1:]}.get(case, raw)
+        path.write_text(raw)
+    assert producer._pytest_progress(path.parent, path.name, 95, True, source, head) == {
+        "status": "rejected"}
+
+
+def test_missing_progress_has_no_candidate_data(progress_file):
+    path, _, source, head = progress_file
+    assert producer._pytest_progress(path.parent, path.name, 100, True, source, head) == {
+        "status": "missing"}
+
+
+@pytest.mark.parametrize("mode", ["timeout", "oom", "uncertain"])
+def test_capture_takes_custody_before_timeout_rejection(tmp_path, monkeypatch, mode):
+    candidate, authority, work = (tmp_path / name for name in ("candidate", "authority", "work"))
+    for path in (candidate, authority, work):
+        path.mkdir()
+    (authority / "dc_approved_evidence.py").write_bytes(EVIDENCE_PLUGIN.read_bytes())
+    runner = producer.DockerCapture(["docker"], MANIFEST, authority, work,
+                                    diagnostic_source=tmp_path)
+    cid = "a" * 64
+    calls = []
+    raw = b"candidate private output canary"
+
+    def call(command, *args, **kwargs):
+        calls.append(command)
+        if command == "create":
+            return cid.encode()
+        assert args == (cid,)
+        if command == "wait":
+            return b"137"
+        if command == "inspect":
+            return json.dumps([{
+                "Image": GRAPH["index_digest"],
+                "State": {"Running": mode == "uncertain",
+                          "Status": "running" if mode == "uncertain" else "exited",
+                          "ExitCode": 137, "OOMKilled": mode == "oom", "Error": ""}}]).encode()
+        return b""
+
+    def wait(*args):
+        if mode == "timeout":
+            raise producer._CaptureTimeout
+        return 137
+
+    def logs(command, **kwargs):
+        assert command == ["docker", "logs", cid]
+        calls.append("logs")
+        return SimpleNamespace(returncode=0, stdout=raw, stderr=b"")
+
+    monkeypatch.setattr(runner, "call", call)
+    monkeypatch.setattr(runner, "_wait", wait)
+    monkeypatch.setattr(producer.subprocess, "run", logs)
+    monkeypatch.setattr(producer.shutil, "disk_usage", lambda _: SimpleNamespace(
+        free=producer.SCRATCH_RESERVE + producer.HOST_FREE_MARGIN))
+    with pytest.raises(ValueError):
+        runner.capture(candidate, {"tested_sha": "a" * 40}, "pytest", "test", [], {})
+    producer.retain_pytest_diagnostics(work, runner.pytest_diagnostics)
+    directory = work / producer.PYTEST_DIAGNOSTIC_DIR
+    if mode == "uncertain":
+        assert calls == ["create", "start", "inspect"]
+        assert list((work / "scratch").iterdir())
+    else:
+        assert calls[-3:] == ["inspect", "logs", "rm"]
+        assert next(work.glob("*/stdout.bin")).read_bytes() == raw
+        assert not list((work / "scratch").iterdir())
+    if mode == "timeout":
+        assert calls[2:4] == ["kill", "wait"]
+        assert {path.name for path in directory.iterdir()} == {"status.json"}
+        status = (directory / "status.json").read_bytes()
+        assert raw not in status
+        parsed = json.loads(status)
+        assert parsed["timed_out"] and parsed["removed"] and parsed["native_exit"] == 137
+        assert parsed["progress"] == {"status": "missing"}
+    else:
+        assert not directory.exists()
     assert not (work / "attestation.json").exists()
 
 
-def test_diagnostic_retention_negative_controls(tmp_path, monkeypatch):
-    candidate = tmp_path / "candidate"
-    candidate.mkdir()
-    work = tmp_path / "work"
-    work.mkdir()
-    directory = work / producer.PYTEST_DIAGNOSTIC_DIR
-    raw = b"candidate raw output with ::error::MARKER"
-    capture = {"native_exit": 1}
-
-    status = producer.retain_pytest_diagnostics(candidate, work, capture, None, raw)
-    assert status["junit"] == "missing" and not (
-        directory / producer.DIAGNOSTIC_JUNIT_NAME).exists()
-
-    canary = tmp_path / "host-canary.txt"
-    canary.write_text("HOST-CANARY-SECRET")
-    (candidate / producer.PYTEST_JUNIT_NAME).symlink_to(canary)
-    status = producer.retain_pytest_diagnostics(candidate, work, capture, None, raw)
-    assert status["junit"] == "unsafe"
-    assert not (directory / producer.DIAGNOSTIC_JUNIT_NAME).exists()
-    assert all("HOST-CANARY-SECRET" not in path.read_text(errors="replace")
-               for path in directory.iterdir() if path.is_file())
-    (candidate / producer.PYTEST_JUNIT_NAME).unlink()
-
-    outside = tmp_path / "outside.xml"
-    outside.write_text("<?xml version='1.0'?><testsuites/>")
-    assert producer._read_candidate_diagnostic(outside, candidate, 1024) == ("unsafe", None, 0)
-
-    monkeypatch.setattr(producer, "MAX_JUNIT_BYTES", 16)
-    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"<?xml " + b"x" * 20)
-    assert producer.retain_pytest_diagnostics(
-        candidate, work, capture, None, raw)["junit"] == "oversized"
-    monkeypatch.setattr(producer, "MAX_JUNIT_BYTES", 8 * 1024 * 1024)
-    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(b"not xml")
-    assert producer.retain_pytest_diagnostics(
-        candidate, work, capture, None, raw)["junit"] == "malformed"
-    assert not (directory / producer.DIAGNOSTIC_JUNIT_NAME).exists()
-
-    (candidate / "secret.txt").write_text("candidate-secret")
-    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(
-        b"<?xml version='1.0'?><testsuites/>")
-    status = producer.retain_pytest_diagnostics(
-        candidate, work, capture, {"a": 1}, raw)
-    assert status["junit"] == "present"
-    assert {path.name for path in directory.iterdir()} == {
-        producer.DIAGNOSTIC_JUNIT_NAME, "pytest-output-tail.txt", "status.json",
-        "session.json", "capture.json"}
-    assert all("candidate-secret" not in path.read_text(errors="replace")
-               for path in directory.iterdir() if path.is_file())
-
-
-def test_retention_never_prints_candidate_text(tmp_path, capsys):
-    candidate = tmp_path / "candidate"
-    candidate.mkdir()
-    (candidate / producer.PYTEST_JUNIT_NAME).write_bytes(
-        b"<?xml version='1.0'?><testsuites><error>candidate-secret</error></testsuites>")
-    work = tmp_path / "work"
-    work.mkdir()
-    producer.retain_pytest_diagnostics(
-        candidate, work, {"native_exit": 1}, None,
-        b"::error::CANDIDATE-MARKER candidate-secret\n1 error in 1s\n")
-    captured = capsys.readouterr()
-    assert "candidate-secret" not in captured.out + captured.err
-    assert "::error::" not in captured.out + captured.err
-
-
-def test_retained_junit_name_is_visible_for_default_upload():
-    # The candidate input stays hidden, but the retained artifact file must be
-    # visible: upload-artifact v4 defaults include-hidden-files=false.
-    assert producer.PYTEST_JUNIT_NAME.startswith(".")
-    assert producer.DIAGNOSTIC_JUNIT_NAME == "junit.xml"
-    assert not producer.DIAGNOSTIC_JUNIT_NAME.startswith(".")
-    for retained in (producer.DIAGNOSTIC_JUNIT_NAME, "pytest-output-tail.txt",
-                     "session.json", "capture.json", "status.json"):
-        assert not retained.startswith(".")
-    workflow = _workflow()
-    uploads = [step for job in workflow["jobs"].values() for step in job["steps"]
-               if str(step.get("uses", "")).startswith("actions/upload-artifact@")]
-    assert len(uploads) == 2
-    for step in uploads:
-        assert "include-hidden-files" not in step["with"]
-        assert step["with"]["path"] == "${{ env.CI_ROOT }}/native-diagnostics"
+def test_always_reports_explicitly_rejects_failed_or_missing_test():
+    reports = _workflow()["jobs"]["agent-framework-reports"]
+    assert reports["needs"] == "test"
+    assert reports["if"].startswith("always()")
+    guard = reports["steps"][0]
+    assert guard["name"] == "Require successful complete upstream"
+    for upstream, expected in (("success", 0), ("failure", 1), ("skipped", 1),
+                               ("cancelled", 1), ("", 1)):
+        result = subprocess.run(["sh", "-c", guard["run"]],
+                                env={"UPSTREAM_RESULT": upstream}, check=False)
+        assert result.returncode == expected
 
 
 def test_failure_diagnostics_upload_is_narrow_pinned_and_failure_only():
@@ -1474,5 +1539,5 @@ def test_job_pytest_command_keeps_full_selection_and_one_junit():
         assert forbidden not in source
     assert source.index("clear_pytest_junit(candidate)") < source.index(
         "runner.capture(candidate, binding, \"pytest\"")
-    assert source.index("retain_pytest_diagnostics(candidate") < source.index(
-        '_stage("evidence")')
+    assert source.index('runner.capture(candidate, binding, "pytest"') < source.index(
+        '_stage("evidence")') < source.index("retain_pytest_diagnostics(work")

@@ -20,11 +20,18 @@ from mcp_server.protocol.tools import (
     inventory,
     outbound,
     procurement,
+    production_consumption,
     routing,
     store_order,
     wms,
 )
-from mcp_server.service.policy import ROUTING_FIELDS, SAFE_FIELDS
+from mcp_server.service.policy import (
+    PRODUCTION_CONSUMPTION_READ,
+    ROUTING_FIELDS,
+    SAFE_FIELDS,
+    WMS_LINES_ACTION,
+    WMS_LINES_FIELDS,
+)
 
 
 def obj(**properties: dict) -> dict:
@@ -42,6 +49,20 @@ STRING = {"type": "string"}
 BOOLEAN = {"type": "boolean"}
 NULLABLE_STRING = {"type": ["string", "null"]}
 ROW = {"type": "object"}
+NULLABLE_NUMBER = {"type": ["number", "null"]}
+PRODUCTION_REFERENCE = obj(run_id=INTEGER, line_id=INTEGER, created_at=STRING)
+PRODUCTION_SUMMARY = obj(
+    warehouse_code=STRING, period_start=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
+    planned_count=INTEGER, manual_count=INTEGER, system_default_count=INTEGER, unknown_count=INTEGER,
+    planned_qty=NULLABLE_NUMBER, manual_qty=NULLABLE_NUMBER,
+    system_default_qty=NULLABLE_NUMBER, unknown_qty=NULLABLE_NUMBER, sample=PRODUCTION_REFERENCE,
+)
+PRODUCTION_LINE = obj(
+    warehouse_code=STRING, item_id=INTEGER, unit=NULLABLE_STRING,
+    planned_qty=NUMBER, booked_qty=NUMBER,
+    booked_source={"type": "string", "enum": ["manual", "system_default", "unknown"]},
+    **PRODUCTION_REFERENCE["properties"],
+)
 ITEM = obj(id=INTEGER, name=STRING, current_stock=NUMBER)
 CANONICAL = obj(id=INTEGER, canonical_sku=STRING, name=STRING, unit=STRING, status=STRING)
 DOCUMENT = obj(
@@ -83,10 +104,7 @@ class ToolRegistration:
     tests: tuple[str, ...]
     compatibility: str = "preserved-input-description-and-TextContent-JSON"
     policy_action: str | None = None
-
-    @property
-    def policy_only(self) -> bool:
-        return self.policy_action in ROUTING_FIELDS
+    policy_only: bool = False
 
     @property
     def name(self) -> str:
@@ -134,7 +152,7 @@ def _routing_entry(name, action, handler, schema, description, shape):
         ),
         output_shape=shape, external_subset=False, bot_approved=False,
         tests=("tests/test_routing_stockout_http.py::test_gene_storefront_stockout",),
-        policy_action=f"routing.{action}",
+        policy_action=f"routing.{action}", policy_only=True,
     )
 
 
@@ -1148,6 +1166,75 @@ REGISTRY = (
         "Restore the original warehouse against its active pause and a new positive allocatable confirmation.",
         _ROUTING_RECEIPT,
     ),
+    ToolRegistration(
+        tool=Tool(
+            name="wms_document_lines",
+            title="Read Puyu WMS document lines",
+            description=(
+                "Read original inbound (in) or outbound (out) lines in authorized "
+                "Puyu cold-storage warehouse 1. "
+                "Use the exact case-sensitive original document number. Lines are in source order, "
+                "with base-unit quantities as decimal strings or null. Status: complete, empty, "
+                "not_found, ambiguous, or truncated. At most 2000 lines, with no continuation."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["in", "out"]},
+                    "doc_no": {"type": "string", "minLength": 1, "maxLength": wms.MAX_DOC_NO_LENGTH},
+                },
+                "required": ["direction", "doc_no"],
+                "additionalProperties": False,
+            },
+        ),
+        domain="wms", handler=wms.wms_document_lines_impl,
+        access=AccessContract(
+            "GET", "/api/v1/wms/document-lines", "StreamableHTTP bound policy only",
+            "explicit external WMS cold-storage warehouse 1 and fixed tenant 155 / RTS012",
+        ),
+        output_shape=obj(
+            status={"enum": ["complete", "empty", "not_found", "ambiguous", "truncated"]},
+            document={"anyOf": [obj(direction=STRING, doc_no=STRING), {"type": "null"}]},
+            lines=array({
+                **obj(**dict.fromkeys(WMS_LINES_FIELDS, NULLABLE_STRING)),
+                "additionalProperties": False,
+            }),
+        ),
+        external_subset=False, bot_approved=False,
+        compatibility="new read-only bound-policy tool; legacy catalogs and ACLs unchanged",
+        policy_action=WMS_LINES_ACTION, policy_only=True,
+        tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_puyu_document_lines",),
+    ),
+    ToolRegistration(
+        tool=Tool(
+            name="production_consumption",
+            title="Read Store Production Consumption",
+            description=(
+                "Read production consumption by Beijing day, Monday-based week, or batch line "
+                "within an explicit half-open date range (up to 92 days). Separate results per "
+                "authorized store. Group counts and traceable raw quantities preserve unknown provenance "
+                "and historical units. Use the same request with next_cursor to continue."
+            ),
+            inputSchema=production_consumption.INPUT_SCHEMA,
+        ),
+        domain="production_consumption", handler=production_consumption.production_consumption_impl,
+        access=AccessContract(
+            "GET", "/api/mcp/", "StreamableHTTP bound policy action and view grant only",
+            "granted storefronts within wh_002, wh_003, wh_004, wh_006",
+        ),
+        output_shape={
+            **obj(
+                view=STRING, warehouses=array(STRING), start_date=STRING, end_date=STRING, timezone=STRING,
+                unit_status=STRING, cross_store_rollup=STRING, range_empty=BOOLEAN, page_empty=BOOLEAN,
+                limit=INTEGER, truncated=BOOLEAN, next_cursor=NULLABLE_STRING,
+            ),
+            "oneOf": [obj(summary=array(PRODUCTION_SUMMARY)), obj(lines=array(PRODUCTION_LINE))],
+        },
+        external_subset=False, bot_approved=False,
+        tests=("tests/mcp_server/test_protocol/test_policy_presets_http.py::test_production_consumption_sdk",),
+        compatibility="new-policy-only-StreamableHTTP-TextContent-JSON; legacy discovery and calls unchanged",
+        policy_action=PRODUCTION_CONSUMPTION_READ, policy_only=True,
+    ),
 )
 
 
@@ -1174,15 +1261,16 @@ def validate_registry(registrations: tuple[ToolRegistration, ...] | None = None)
         if not entry.tests or not entry.compatibility or not entry.output_shape:
             raise ValueError(f"incomplete contract: {entry.name}")
         if entry.access.method not in {"GET", "POST"} or not all((
-            entry.access.path.startswith("/api/v1/"),
+            entry.access.path.startswith("/api/v1/") or (entry.policy_only and entry.access.path == "/api/mcp/"),
             entry.access.path_enforcement, entry.access.warehouse_scope,
         )):
             raise ValueError(f"incomplete access contract: {entry.name}")
         action = entry.policy_action
+        if entry.policy_only and (action is None or entry.external_subset or entry.bot_approved):
+            raise ValueError(f"invalid policy-only exposure: {entry.name}")
         if action is not None:
             if (action not in SAFE_FIELDS | ROUTING_FIELDS or action in policy_actions
-                    or (not entry.policy_only and entry.mode != "read")
-                    or (entry.policy_only and (entry.bot_approved or entry.external_subset))):
+                    or (not entry.policy_only and entry.mode != "read")):
                 raise ValueError(f"invalid scoped policy action: {entry.name}")
             policy_actions.add(action)
 

@@ -9,6 +9,7 @@ The image ID below is a local fixture runtime, not a hosted installation.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import hashlib
 import importlib.util
@@ -732,18 +733,16 @@ class _CaptureTimeout(Exception):
     pass
 
 
-# Failure-only pytest diagnostics. These are opaque, bounded copies of
-# untrusted candidate data for human diagnosis; they never feed the gate and
-# never create or change an attestation. The candidate input stays hidden at
-# .dc-junit.xml, but the retained copy is visible junit.xml because the pinned
-# upload-artifact v4 default (include-hidden-files=false) omits dot files.
+# Failure-only diagnostics project bounded fields. JUnit, stdout and the
+# formal session stay private to the capture and its existing evidence gate.
 PYTEST_JUNIT_NAME = ".dc-junit.xml"
-DIAGNOSTIC_JUNIT_NAME = "junit.xml"
 PYTEST_DIAGNOSTIC_DIR = "native-diagnostics"
-MAX_JUNIT_BYTES = 8 * 1024 * 1024
-MAX_RAW_TAIL_BYTES = 1024 * 1024
-MAX_METADATA_BYTES = 256 * 1024
-JUNIT_PREFIXES = (b"<?xml", b"<testsuites", b"<testsuite")
+MAX_PROGRESS_BYTES = 2048
+MAX_TEST_SOURCE_BYTES = 1024 * 1024
+MAX_PROGRESS_TESTS = 1_000_000
+PROGRESS_RECENT_MS = 60_000
+PROGRESS_KEYS = {"version", "capture", "selected", "started", "completed",
+                 "collection_ms", "last_started", "last_completed"}
 
 
 def clear_pytest_junit(candidate: Path) -> None:
@@ -757,120 +756,128 @@ def clear_pytest_junit(candidate: Path) -> None:
         pass
 
 
-def _unlink_diagnostic(path: Path) -> None:
+def _read_stopped_file(root: Path, name: str, limit: int) -> bytes:
+    """Read one fixed child name without following links or blocking on a FIFO."""
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def _read_candidate_diagnostic(path: Path, root: Path, limit: int):
-    """Opaque bounded read; never follow a symlink out of the candidate root."""
-    if path.is_symlink():
-        return "unsafe", None, 0
-    try:
-        resolved, root_resolved = path.resolve(), root.resolve()
-    except OSError:
-        return "error", None, 0
-    if not resolved.is_relative_to(root_resolved):
-        return "unsafe", None, 0
-    if not path.exists():
-        return "missing", None, 0
-    if not path.is_file():
-        return "unsafe", None, 0
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as handle:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+                raise ValueError("unsafe or oversized stopped file")
             raw = handle.read(limit + 1)
-    except OSError:
-        return "error", None, 0
-    if len(raw) > limit:
-        return "oversized", None, size
-    return "present", raw, len(raw)
+            if len(raw) > limit:
+                raise ValueError("oversized stopped file")
+            return raw
+    finally:
+        os.close(directory)
 
 
-def _write_diagnostic(path: Path, raw: bytes) -> None:
-    path.write_bytes(raw)
-    path.chmod(0o644)
+def _unique_progress_keys(pairs):
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("duplicate progress field")
+    return value
 
 
-def _safe_metadata(name: str, value, directory: Path):
-    if value is None:
-        return "missing", 0, None
+def _bounded_int(value, lower: int, upper: int) -> bool:
+    return type(value) is int and lower <= value <= upper
+
+
+def _source_test_location(repo: Path, head: str, location: str) -> bool:
+    """Resolve a display name against frozen source, never the writable copy."""
+    path, *names = location.split("::")
+    ref = head + ":" + path
+    git = ["git", "--no-replace-objects", "-C", str(repo), "cat-file"]
+    size = int(subprocess.check_output([*git, "-s", ref], stderr=subprocess.DEVNULL, timeout=5))
+    if not 0 < size <= MAX_TEST_SOURCE_BYTES:
+        return False
+    raw = subprocess.check_output([*git, "blob", ref], stderr=subprocess.DEVNULL, timeout=5)
+    members = ast.parse(raw).body
+    if len(names) == 2:
+        members = [member for cls in members if isinstance(cls, ast.ClassDef) and cls.name == names[0]
+                   for member in cls.body]
+    return any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and member.name == names[-1] for member in members)
+
+
+def _progress_event(event, count: int, elapsed_ms: int) -> int | None:
+    if count == 0 and event is None:
+        return None
+    if (count == 0 or not isinstance(event, dict) or set(event) != {"node", "ms"}
+            or not _bounded_int(event["ms"], 0, elapsed_ms)
+            or (event["node"] is not None and _safe_test_location(event["node"]) != event["node"])):
+        raise ValueError("invalid progress event")
+    return event["ms"]
+
+
+def _pytest_progress(root: Path, name: str, elapsed_ms: int, timed_out: bool,
+                     repo: Path, head: str) -> dict:
     try:
-        payload = (json.dumps(value, sort_keys=True) + "\n").encode()
-    except (TypeError, ValueError):
-        return "invalid", 0, None
-    if len(payload) > MAX_METADATA_BYTES:
-        return "oversized", len(payload), hashlib.sha256(payload).hexdigest()
-    try:
-        _write_diagnostic(directory / name, payload)
-    except OSError:
-        return "error", len(payload), None
-    return "present", len(payload), hashlib.sha256(payload).hexdigest()
-
-
-def retain_pytest_diagnostics(candidate: Path, work: Path, capture: dict,
-                              session, raw: bytes) -> dict:
-    """Best-effort bounded copies; diagnostic problems never fail the gate."""
-    directory = work / PYTEST_DIAGNOSTIC_DIR
-    status = {"schema_version": 1, "kind": "pytest", "junit": "missing",
-              "junit_name": DIAGNOSTIC_JUNIT_NAME,
-              "junit_bytes": 0, "junit_sha256": None,
-              "raw_tail": "missing", "raw_tail_bytes": 0,
-              "raw_tail_sha256": None, "raw_total_bytes": len(raw or b""),
-              "raw_tail_trimmed": 0, "session": "missing", "session_bytes": 0,
-              "session_sha256": None, "capture": "missing", "capture_bytes": 0,
-              "capture_sha256": None}
-    try:
-        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            directory.unlink()
-        directory.mkdir(mode=0o755, exist_ok=True)
-        directory.chmod(0o755)
-    except OSError:
-        return status
-
-    state, data, size = _read_candidate_diagnostic(
-        candidate / PYTEST_JUNIT_NAME, candidate, MAX_JUNIT_BYTES)
-    if state == "present" and not data.lstrip().startswith(JUNIT_PREFIXES):
-        state = "malformed"
-    if state == "present":
-        try:
-            _write_diagnostic(directory / DIAGNOSTIC_JUNIT_NAME, data)
-        except OSError:
-            state = "error"
+        raw = _read_stopped_file(root, name, MAX_PROGRESS_BYTES)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_progress_keys)
+        if (not isinstance(value, dict) or set(value) != PROGRESS_KEYS
+                or not _bounded_int(value["version"], 1, 1) or value["capture"] != name):
+            raise ValueError("invalid progress identity")
+        selected, started, completed = (value[key] for key in ("selected", "started", "completed"))
+        collection_ms = value["collection_ms"]
+        if selected is None:
+            if collection_ms is not None:
+                raise ValueError("invalid collection progress")
+            total = 0
         else:
-            status.update(junit="present", junit_bytes=len(data),
-                          junit_sha256=hashlib.sha256(data).hexdigest())
-    if status["junit"] != "present":
-        status.update(junit=state, junit_bytes=size)
-        _unlink_diagnostic(directory / DIAGNOSTIC_JUNIT_NAME)
-
-    tail = (raw or b"")[-MAX_RAW_TAIL_BYTES:]
-    if tail:
-        try:
-            _write_diagnostic(directory / "pytest-output-tail.txt", tail)
-            status.update(raw_tail="present", raw_tail_bytes=len(tail),
-                          raw_tail_sha256=hashlib.sha256(tail).hexdigest(),
-                          raw_tail_trimmed=int(len(tail) < len(raw or b"")))
-        except OSError:
-            status["raw_tail"] = "error"
+            if not (_bounded_int(selected, 0, MAX_PROGRESS_TESTS)
+                    and _bounded_int(collection_ms, 0, elapsed_ms)):
+                raise ValueError("invalid collection progress")
+            total = selected
+        if (not _bounded_int(started, 0, total) or not _bounded_int(completed, 0, started)
+                or started - completed > 1):
+            raise ValueError("invalid progress counts")
+        start = _progress_event(value["last_started"], started, elapsed_ms)
+        done = _progress_event(value["last_completed"], completed, elapsed_ms)
+        if start is not None and start < collection_ms:
+            raise ValueError("invalid start time")
+        if done is not None:
+            if started == completed:
+                if done < start or value["last_started"]["node"] != value["last_completed"]["node"]:
+                    raise ValueError("invalid completed test")
+            elif not collection_ms <= done <= start:
+                raise ValueError("invalid previous teardown")
+        locations = {event["node"] for event in (value["last_started"], value["last_completed"])
+                     if event is not None and event["node"] is not None}
+        if not all(_source_test_location(repo, head, location) for location in locations):
+            raise ValueError("unverified progress location")
+    except FileNotFoundError:
+        return {"status": "missing"}
+    except (OSError, ValueError, SyntaxError, RecursionError, subprocess.SubprocessError):
+        return {"status": "rejected"}
+    del value["capture"]
+    if selected is None:
+        observation = "collection-incomplete"
+    elif not timed_out:
+        observation = "pytest-exited"
+    elif done is not None and elapsed_ms - done <= PROGRESS_RECENT_MS:
+        observation = "recent-teardown-progress"
+    elif started > completed:
+        observation = "no-recent-teardown-test-in-progress"
     else:
-        _unlink_diagnostic(directory / "pytest-output-tail.txt")
+        observation = "no-recent-teardown-between-tests"
+    return {"status": "advisory", "observation": observation, **value}
 
-    for key, name, value in (("session", "session.json", session),
-                             ("capture", "capture.json", capture)):
-        state, size, sha = _safe_metadata(name, value, directory)
-        status.update({key: state, key + "_bytes": size, key + "_sha256": sha})
-        if state != "present":
-            _unlink_diagnostic(directory / name)
 
+def retain_pytest_diagnostics(work: Path, status: dict | None) -> None:
+    if status is None:
+        return
     try:
-        _write_diagnostic(directory / "status.json",
-                          (json.dumps(status, sort_keys=True) + "\n").encode())
+        directory = work / PYTEST_DIAGNOSTIC_DIR
+        directory.mkdir(mode=0o755, exist_ok=True)
+        if directory.is_symlink():
+            raise OSError("unsafe diagnostic directory")
+        with (directory / "status.json").open("x", encoding="utf-8") as handle:
+            json.dump(status, handle, sort_keys=True)
+            handle.write("\n")
     except OSError:
-        return status
-    return status
+        print("[ci-producer] pytest_diagnostics=unavailable", file=sys.stderr)
 
 
 class DockerCapture:
@@ -881,9 +888,11 @@ class DockerCapture:
     is always a failure; uncertain exit/cleanup also forbids an attestation.
     """
     def __init__(self, docker: list[str], manifest: dict, authority: Path, output: Path, *,
-                 image: str | None = None):
+                 image: str | None = None, diagnostic_source: Path | None = None):
         self.docker, self.manifest, self.authority, self.output = docker, manifest, authority, output
         self.image = image or manifest["runtime"]["image"]
+        self.diagnostic_source = diagnostic_source
+        self.pytest_diagnostics = None
 
     def call(self, *args, timeout=30):
         result = subprocess.run([*self.docker, *args], capture_output=True, timeout=timeout)
@@ -910,6 +919,8 @@ class DockerCapture:
                 argv: list[str], env: dict[str, str], *, trusted_scripts=False, readonly=False,
                 inputs: Path | None = None):
         name = "dc-native-ci-b2-" + uuid.uuid4().hex
+        self.pytest_diagnostics = None
+        progress_name = None
         runtime = self.manifest["runtime"]
         timeout, disk_scratch = capture_budget(self.manifest, kind)
         scratch = None
@@ -955,6 +966,9 @@ class DockerCapture:
             plugin_file.write_bytes(raw_plugin)
             plugin_file.chmod(0o644)
             args += ["--mount", f"type=bind,src={plugin_dir},dst=/trusted-evidence,readonly"]
+            if self.diagnostic_source is not None:
+                progress_name = "." + name + "-pytest-progress.json"
+                argv = [*argv, "--dc-progress=/candidate/" + progress_name]
         clean_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp",
                      "PYTHONPATH": "/trusted-evidence" if plugin_dir else "/authority",
                      "PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1",
@@ -976,6 +990,7 @@ class DockerCapture:
         (run_dir / "command.json").write_text(json.dumps([*self.docker, *args], indent=2))
         timed_out = False
         try:
+            started_at = time.monotonic_ns()
             self.call("start", cid)
             try:
                 native = self._wait(cid, timeout, scratch)
@@ -983,6 +998,7 @@ class DockerCapture:
                 timed_out = True
                 self.call("kill", cid)
                 native = int(self.call("wait", cid).decode().strip())
+            elapsed_ms = (time.monotonic_ns() - started_at) // 1_000_000
             inspection = json.loads(self.call("inspect", cid))[0]
             (run_dir / "inspect.json").write_text(json.dumps(inspection, indent=2))
             state = inspection["State"]
@@ -997,21 +1013,36 @@ class DockerCapture:
                 raise ValueError("candidate logs unavailable")
             raw = logs.stdout + logs.stderr
             (run_dir / "stdout.bin").write_bytes(raw)
+            image_approved = inspection["Image"] in approved_images(self.manifest)
+            valid_runtime = (native == state["ExitCode"] and not state["OOMKilled"]
+                             and not state["Error"] and image_approved)
+            if progress_name is not None and valid_runtime:
+                progress = _pytest_progress(candidate, progress_name, elapsed_ms,
+                                            timed_out, self.diagnostic_source, binding["tested_sha"])
             self.call("rm", cid)
             # Only a proven exited and removed owned capture may delete scratch.
             if scratch is not None:
                 shutil.rmtree(scratch)
-            image_approved = inspection["Image"] in approved_images(self.manifest)
-            if (timed_out or native != state["ExitCode"] or state["OOMKilled"]
-                    or state["Error"] or not image_approved):
+            if progress_name is not None and valid_runtime:
+                self.pytest_diagnostics = {
+                    "version": 1, "kind": "pytest", "timed_out": timed_out,
+                    "binding": binding, "elapsed_ms": elapsed_ms,
+                    "native_exit": native, "exited": True, "removed": True,
+                    "oom_killed": False, "runtime_error": False, "image_approved": True,
+                    "output_bytes": len(raw), "session": "unavailable", "progress": progress,
+                }
+            if timed_out or not valid_runtime:
                 print(f"[ci-producer] operation={OPERATION} "
                       + _native_failure_details(kind, timed_out, native, state,
                                                 image_approved), file=sys.stderr)
                 raise ValueError("candidate timeout/runtime/native capture failure")
             session = None
             if kind == "pytest":
-                session = json.loads(read_data(candidate / ".dc-session.json", candidate))
+                session = json.loads(_read_stopped_file(
+                    candidate, ".dc-session.json", 16 * 1024 * 1024))
                 (run_dir / "session.json").write_text(json.dumps(session, sort_keys=True))
+                if self.pytest_diagnostics is not None:
+                    self.pytest_diagnostics["session"] = "captured-unvalidated"
             capture = {"version": 1, "container_id": cid, "image": inspection["Image"],
                        "kind": kind, "context": context, "binding_sha256": digest(binding),
                        "native_exit": native, "stdout_sha256": hashlib.sha256(raw).hexdigest(),
@@ -1203,7 +1234,7 @@ def job(args):
         docker += ["-H", args.docker_host]
     image = (ensure_approved_runtime(docker, manifest, work) if hosted
              else manifest["runtime"]["image"])
-    runner = DockerCapture(docker, manifest, AUTHORITY, work, image=image)
+    runner = DockerCapture(docker, manifest, AUTHORITY, work, image=image, diagnostic_source=repo)
     if args.context == "test":
         base = binding["CI_BASE_SHA"]
         changed = subprocess.check_output(["git", "diff", "--name-only", "--diff-filter=d", "-z",
@@ -1217,14 +1248,16 @@ def job(args):
             raise ValueError("actual changed-file Ruff gate failed")
         _stage("pytest-capture")
         clear_pytest_junit(candidate)
-        capture, output, session = runner.capture(candidate, binding, "pytest", "test",
-            ["python3", "-P", "-m", "pytest", "--basetemp=/tmp/pytest", "-q", "--tb=no", "-rfE", "--color=no",
-             "-p", "dc_approved_evidence", "--dc-evidence=/candidate/.dc-session.json",
-             "--junitxml=/candidate/" + PYTEST_JUNIT_NAME], {})
-        # Bounded opaque copies for failure diagnosis; never part of the proof.
-        retain_pytest_diagnostics(candidate, work, capture, session, output)
-        _stage("evidence")
-        envelope = make_test_envelope(output, session, capture, binding)
+        try:
+            capture, output, session = runner.capture(candidate, binding, "pytest", "test",
+                ["python3", "-P", "-m", "pytest", "--basetemp=/tmp/pytest", "-q", "--tb=no", "-rfE", "--color=no",
+                 "-p", "dc_approved_evidence", "--dc-evidence=/candidate/.dc-session.json",
+                 "--junitxml=/candidate/" + PYTEST_JUNIT_NAME], {})
+            _stage("evidence")
+            envelope = make_test_envelope(output, session, capture, binding)
+        except Exception:
+            retain_pytest_diagnostics(work, runner.pytest_diagnostics)
+            raise
         producer = {"identity": identity(manifest, manifest_blob), "lint_capture": lint,
                     "test_capture": capture, "gates": []}
     else:

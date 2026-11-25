@@ -13,6 +13,7 @@
   </ul>
   {% if 'items_detail' in tools %}<p>库存限所选门店的库存品。</p>{% endif %}
   {% if 'store_order_list' in tools %}<p>订单限所选门店发起的普通订单。</p>{% endif %}
+  {% if 'wms_document_lines' in tools %}<p>外部 WMS 范围限朴宇冷库（1）、蜜可诗（155 / RTS012）的原单明细。</p>{% endif %}
   <p>所有写入均拒绝。</p>
   <p>旧版读取路径 <code>[]</code> · 旧版写入路径 <code>[]</code> · 旧版仓库范围 <code>[]</code>。</p>
   <p>回退到旧版本时，即使仍显示工具目录，此令牌也无法读取业务数据和仓库名称，或执行写入。</p>
@@ -51,7 +52,9 @@
   <h3>确认策略令牌</h3>
   <p>{{ policy_preview.token_name }} · {{ policy_preview.preset }} v{{ policy_preview.version }}</p>
   <p>签发人 #{{ policy_preview.user_id }}</p>
+  {% if policy_preview.warehouses is not mapping %}
   <p>数据范围限所选门店 {{ policy_preview.warehouses|join(', ') }}。</p>
+  {% endif %}
   {{ policy_permissions(policy_preview.tools) }}
   <form id="mcp-policy-confirm" method="post" action="{{ url_for('agent_tokens.create_token') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -77,6 +80,9 @@
     {% for action, fields in policy_fields.items() %}
     <fieldset>
       <legend>{{ action }}</legend>
+      {% if action == policy_wms_action %}
+      <p>外部 WMS 独立预设。选齐下列字段，门店读取字段留空。</p>
+      {% endif %}
       {% for field in fields %}
       <label><input type="checkbox" name="field_{{ action }}" value="{{ field }}" /> {{ field }}</label>
       {% endfor %}
@@ -106,6 +112,12 @@
         {{ warehouse.name }} ({{ warehouse.code }})
       </label>
       {% endfor %}
+    </fieldset>
+    <fieldset>
+      <legend>外部 WMS 范围</legend>
+      <label><input type="checkbox" name="policy_wms_warehouse" value="{{ policy_wms_warehouse }}" />
+        朴宇冷库（{{ policy_wms_warehouse }}）· 蜜可诗（155 / RTS012）
+      </label>
     </fieldset>
     <button type="submit" class="btn primary">预览权限</button>
   </form>

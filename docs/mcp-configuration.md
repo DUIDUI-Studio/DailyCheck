@@ -138,7 +138,7 @@ curl -H "Authorization: Bearer your_token" http://YOUR_HOST_IP:5100/health
 
 Policy tokens use the same StreamableHTTP endpoint, `/api/mcp/`. On
 **Agent Token 管理**, a platform administrator publishes a named preset by
-selecting return fields for `inventory.read`, `orders.read`, or both.
+selecting return fields for the actions below.
 Publishing the same name creates another immutable version. Each action
 requires at least one safe field.
 
@@ -159,6 +159,7 @@ legacy token field.
 |---|---|---|
 | `inventory.read` | `items_detail` | Exact authorized `warehouse_code` and positive `item_id`. Possible fields are `sku`, book quantity `current_stock`, `unit`, and source `updated_at`. |
 | `orders.read` | `store_order_list` | Ordinary orders whose initiating `store_warehouse_code` is authorized. Optional exact warehouse, status, limit and offset filters. The policy controls order number, initiating store, status, order dates and `fulfillment`. |
+| `production_consumption.read` | `production_consumption` | Separate storefront production reports and traceable source lines. Grant `summary` (day/week), `lines`, or both. The bound storefronts must be a nonempty subset of `wh_002`, `wh_003`, `wh_004`, `wh_006`. |
 
 An omitted order warehouse filters to all explicitly bound storefronts.
 Requests can use only declared input arguments. Disallowed actions, extra
@@ -198,6 +199,90 @@ the database header before connecting. Keep the journal mode and registered
 paths stable during requests. The pre-open check cannot synchronize a
 concurrent operator change. Routine tool metadata may be appended to the
 existing access log.
+
+### Puyu WMS document lines
+
+Publish a standalone preset for `wms.document_lines.read` with all four fields
+`goods_code`, `goods_name`, `qty`, and `unit`. In the preview select only
+external Puyu cold-storage warehouse 1, which is bound to owner 155 / RTS012.
+Old bindings and previews that name any other warehouse, including warehouse 3,
+are rejected before the upstream query. Confirm and revoke through the same
+Agent Token page. Use the issued policy token on
+`/api/mcp/` to call `wms_document_lines` with `direction` (`in` or `out`) and
+the exact original `doc_no`. Quantities are decimal strings or null. The tool
+returns up to 2000 rows in source order and reports truncation explicitly.
+
+### Production consumption
+
+Publish a policy preset with `production_consumption.read` on the existing
+admin Token page. Preview the selected storefronts and view grants, then
+confirm issuance or revoke through the existing page. Use the resulting
+identity on `/api/mcp/`. The tool is available exclusively through a bound
+policy. Existing credentials retain their previous tool access.
+
+```json
+{
+  "start_date": "2026-11-16",
+  "end_date": "2026-11-23",
+  "view": "week",
+  "warehouse_code": "wh_002",
+  "limit": 50
+}
+```
+
+- Dates are Beijing calendar dates, inclusive start and exclusive end.
+  An explicit range spans 1–92 days. For `week`, both dates must be Mondays.
+  The source writer stores server-local `YYYY-MM-DD HH:MM:SS`. This tool
+  interprets those strings as Beijing time, regardless of the reader's
+  process time zone. Verify the actual source time zone and timestamp format
+  before enabling a production preset. UTC dev fixtures must seed explicit
+  Beijing wall times. Unsupported timestamps selected by the lexical date
+  window produce `source_unavailable`.
+- Omit `warehouse_code` for all bound stores, still returned separately.
+  Optional `item_id` selects the local item ID. A material identity is
+  `warehouse_code` + `item_id`. Historical unit and cross-store mappings
+  are absent from the production facts. `unit` and group quantities are
+  `null`, with `unit_status=historical_unit_unavailable` and
+  `cross_store_rollup=historical_mapping_unavailable`.
+- `summary` rows contain the store, `period_start`, material, four line
+  counts and four nullable quantities. `planned_count` counts all eligible
+  lines. `manual_count`, `system_default_count`, and `unknown_count`
+  partition the booked source counts. Each group has one deterministic
+  `sample` with `run_id`, `line_id`, and `created_at`. Query `view=lines`
+  with its warehouse and originating date range to retrieve the batch
+  (`run_id`) or exact line (`run_id` + `line_id`).
+- `lines` returns per-line `planned_qty`, `booked_qty` and `booked_source`.
+  These are original numeric database values in the historical stock unit
+  of that line, with no conversion. Explicit `planned_default=0` identifies
+  manual input, including zero. `planned_default=1` is classified as
+  `system_default` when its unique outbound link corroborates the item,
+  batch, completed production outbound status and absence of rollback.
+  The planned, booked and linked outbound quantities must also agree
+  with the writer's defaulting invariant. Quantity equality alone does
+  not establish the source. Remaining sources are `unknown`. Summing
+  outbound or stock-movement quantities would duplicate these production facts.
+- Summary sorts by warehouse, period start and local item ID. Lines sort by
+  warehouse, created time, batch ID and line ID. Each call opens one read
+  snapshot per warehouse in sequence. The page size is 1–200 (default 50)
+  and the range may match at most 20,000 input lines across the warehouses.
+  Complete groups are formed before pagination. `range_too_dense` asks the
+  client to submit a smaller date or store range.
+- `range_empty` refers to the effective filtered range and `page_empty`
+  refers to the returned array. A true recorded zero remains numeric in a
+  line. `truncated=true` supplies `next_cursor`; replay with the same
+  parameters and identity to continue. The last page has a null cursor.
+  Any change to the measured facts gives `stale_cursor`, and another server
+  process or a restart gives `invalid_cursor`. In both cases restart at
+  page one. No database snapshot is kept open between requests.
+- An invalid or unauthorized request returns a protocol tool error.
+  Missing, unreadable, incompatible-schema and WAL sources return
+  `source_unavailable` for the entire request. Before any warehouse opens,
+  the server uses file metadata to compare the targets of every registered
+  warehouse. It rejects a requested store that shares a physical file with
+  another, including hard links. External symlinks to distinct files work,
+  and an absent file for a different warehouse does not block the request.
+  Reads use existing-only SQLite policy connections. MCP calls append to
+  the normal access log.
 
 ## Available Tools
 

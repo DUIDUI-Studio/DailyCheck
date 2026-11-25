@@ -11,8 +11,14 @@ from starlette.concurrency import run_in_threadpool
 from mcp_server.infra.errors import ForbiddenError, McpError, ValidationError
 from mcp_server.protocol.registry import REGISTRY, get_policy_actions
 from mcp_server.service.auth import _current_auth
-from mcp_server.service.policy import MAX_SQLITE_ID, BoundPolicy
+from mcp_server.service.policy import (
+    MAX_SQLITE_ID,
+    PRODUCTION_CONSUMPTION_READ,
+    WMS_LINES_ACTION,
+    BoundPolicy,
+)
 from mcp_server.service.policy_reads import get_inventory, list_orders
+from mcp_server.service.production_consumption import VIEW_FIELDS
 from mcp_server.service.store_order import DEFAULT_LIMIT, MAX_LIMIT
 
 _INPUT_SCHEMAS = {
@@ -56,8 +62,11 @@ def _validate_arguments(schema: dict, arguments: dict) -> None:
                 raise ValidationError("invalid_arguments")
         elif spec["type"] == "object":
             _validate_arguments(spec, value)
-        elif (not isinstance(value, str) or not value or len(value) > spec.get("maxLength", float("inf"))
-              or ("enum" in spec and value not in spec["enum"])):
+        elif (
+            not isinstance(value, str) or not value
+            or ("enum" in spec and value not in spec["enum"])
+            or ("maxLength" in spec and len(value) > spec["maxLength"])
+        ):
             raise ValidationError("invalid_arguments")
 
 
@@ -72,12 +81,17 @@ def _policy_tools(policy: BoundPolicy, actions: dict[str, str]) -> list[types.To
     tools = []
     for name, action in actions.items():
         if fields := policy.fields(action):
-            if name in _POLICY_ONLY:
+            if name in _POLICY_ONLY and action != PRODUCTION_CONSUMPTION_READ:
                 tools.append(_POLICY_ONLY[name].tool.model_copy(deep=True))
                 continue
+            entry = _POLICY_ONLY.get(name)
+            description = f"Read authorized storefront data. Returned record fields: {', '.join(fields)}."
+            if entry:
+                views = ", ".join(view for view, field in VIEW_FIELDS.items() if field in fields)
+                description = f"{entry.tool.description} Granted views: {views}."
             tools.append(types.Tool(
                 name=name, inputSchema=_input_schema(name, fields),
-                description=f"Read authorized storefront data. Returned record fields: {', '.join(fields)}.",
+                description=description,
             ))
     return tools
 
@@ -99,12 +113,13 @@ def bind_policy_dispatch(server: Server, audit) -> None:
     async def call_tool(request: types.CallToolRequest):
         ctx = _current_auth.get()
         name = request.params.name
-        policy = ctx.policy if ctx else None
+        policy = ctx.policy if ctx is not None else None
+        action = actions.get(name)
         if policy is None and name not in _POLICY_ONLY:
             return await legacy_call(request)
 
         started_ns = time.perf_counter_ns()
-        fields = policy.fields(actions.get(name)) if policy else ()
+        fields = policy.fields(action) if policy is not None else ()
         status = 500
         try:
             if not fields:
@@ -113,7 +128,10 @@ def bind_policy_dispatch(server: Server, audit) -> None:
             if request.params.model_extra:
                 raise ValidationError("invalid_arguments")
             _validate_arguments(_input_schema(name, fields), arguments)
-            payload = await run_in_threadpool(_HANDLERS[name], policy, fields, **arguments)
+            if action == WMS_LINES_ACTION:
+                payload = await run_in_threadpool(_HANDLERS[name], arguments, ctx=ctx)
+            else:
+                payload = await run_in_threadpool(_HANDLERS[name], policy, fields, **arguments)
             status = 200
         except McpError as exc:
             payload = exc.to_dict()

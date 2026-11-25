@@ -2,7 +2,7 @@
 
 Source: `mcp_server/protocol/registry.py`. Regenerate with `python -m scripts.mcp_contracts --write`; verify in CI with `python -m scripts.mcp_contracts --check`.
 
-Runtime: **35** tools; external integration subset: **19**; Bot approved: **22**; business writes: **12**.
+Runtime: **37** tools; external integration subset: **19**; Bot approved: **22**; business writes: **12**.
 
 `registry.json` contains every input declaration, handler, minimum output JSON shape, ACL enforcement/scope, test reference and compatibility status. `tools.json` intentionally publishes only the external integration subset. Neither file grants permissions.
 
@@ -45,3 +45,5 @@ Read/write classifies business intent; legacy HTTP/stdio reads may run migration
 | `routing_item_status` | routing | read | `GET /api/v1/item-routing/read` | bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint | exact authorized tenant/canonical/warehouse pair; transitions require original source | no | no |
 | `routing_pause_item` | routing | write | `POST /api/v1/item-routing/pause` | bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint | exact authorized tenant/canonical/warehouse pair; transitions require original source | no | no |
 | `routing_restore_item` | routing | write | `POST /api/v1/item-routing/restore` | bound Gene policy only on StreamableHTTP /api/mcp/; no standalone REST endpoint | exact authorized tenant/canonical/warehouse pair; transitions require original source | no | no |
+| `wms_document_lines` | wms | read | `GET /api/v1/wms/document-lines` | StreamableHTTP bound policy only | explicit external WMS cold-storage warehouse 1 and fixed tenant 155 / RTS012 | no | no |
+| `production_consumption` | production_consumption | read | `GET /api/mcp/` | StreamableHTTP bound policy action and view grant only | granted storefronts within wh_002, wh_003, wh_004, wh_006 | no | no |

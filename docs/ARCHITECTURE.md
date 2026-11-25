@@ -74,7 +74,7 @@ flowchart TB
     subgraph MCPProc["MCP 进程 (uvicorn)"]
         AuthMW["AuthMiddleware<br/>Bearer → agent_tokens"]
         Streamable["StreamableHTTP / SSE"]
-        Tools["32 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail / wms_stock_list)"]
+        Tools["37 个 MCP 工具<br/>(items_list / outbound_create / ... / store_order_detail / wms_stock_list)"]
     end
 
     subgraph Storage["SQLite 文件 (bind mount)"]
@@ -1827,13 +1827,22 @@ attestation。native capture 只在退出
 no-attestation 语义不变。
 
 hosted pytest 捕获额外以固定 `--junitxml=/candidate/.dc-junit.xml` 生成 JUnit（`-q/--tb=no`
-与完整选择不变），执行前删除候选预置的该文件。proven child exit 后由 controller 把 JUnit
-以可见名 `junit.xml`（候选输入仍为隐藏 `.dc-junit.xml`；upload-artifact v4 默认
-`include-hidden-files=false`，不启用 hidden 文件上传）、raw tail（≤1 MiB）、
-session/capture metadata（≤256 KiB）复制到固定
-`$CI_ROOT/native-diagnostics`；只允许这些固定文件名，缺失/超大/畸形/符号链接逃逸记为
-controller-owned `status.json` 的固定状态、大小与 SHA256。这些副本是 untrusted diagnostic
-data，不参与 gate/attestation，也不能把有效 native proof 变成失败。GitHub 的 test/
+与完整选择不变），执行前删除候选预置的该文件。JUnit、原始 stdout/stderr 和完整
+session 留在私有 capture，现有证据门禁继续使用原始数据。
+
+Issue #41 的失败诊断由固定插件在加载初始 conftest 前写入本次 capture 的随机路径，
+并在收集结束、用例开始、收到 teardown report 时原子替换快照。controller 取得
+wait/inspect 与原始日志后，在清理前读取最多 2 KiB 的快照。它拒绝链接、非普通文件、
+过大文件、旧 capture 标记、额外/重复字段、无效计数和时间。可展示的用例名剥去参数值，
+并对照精确被测 Git 树中已经声明的路径和符号。运行期间由测试代码动态生成的名字可能
+无法核验。快照缺失或拒绝时只记录固定状态。
+
+已确认退出、镜像及 runtime 状态匹配且已清理的 pytest 若超时或未通过证据门禁，
+controller 将 run/attempt/H 或 G/B、退出状态、单调耗时和有界进度写入
+`$CI_ROOT/native-diagnostics/status.json`。最近 60 秒的 teardown 表示接近超时时仍有推进。
+长时间没有 teardown 时，收集未结束、用例仍在执行和用例之间停留分别标记。
+快照与被测代码同进程，合规快照仍只能作诊断线索。gate、attestation 和 reports
+上游复用只接受现有正式证据。GitHub 的 test/
 agent-framework-reports job 各自只在 native producer 失败时，用固定 SHA 的
 `actions/upload-artifact` 上传该目录（retention 2 天、唯一 run/attempt/job 名、
 `if-no-files-found: ignore`）；权限、job/event/runner/runtime 与 Gitea 路径不变。
@@ -2775,7 +2784,7 @@ SQL 工具无 Flask 上下文依赖，供后续列表、报表与 MCP 统一复�
 UoW 与无缓存采购在默认应用分支显式提供代码根和配置数据根，使已有嵌套目录的
 代码相对注册可逆；显式 Bot 根仍关闭配置根映射，SQLite 只读和 ACL 边界不变。
 
-> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（32 个工具里 10 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
+> **哪些场景不该走 MCP**：MCP 是给 Claude / Cursor 这类外部 AI 客户端协商工具用的协议，不是给人用的 HTTP API；它同时也是**写操作的入口**（37 个工具里 12 个会改数据）。面向员工的自然语言查询走 §3.12 的独立机器人进程，PR1 只暴露 9 项 LLM schema；#80 PR2 按 §3.12 显式复用批准的 MCP handler，查询连接仍 `mode=ro`，七项 canonical 写仍禁止 bot 执行。#78 D4 批准的三写仅能通过独立护栏通道，缺少真实身份或范围策略时仍拒绝执行；不能仅为「复用」接入其他 MCP 写工具。批准边界见 [`docs/integrations/dailycheck-bot-runtime-contract.md`](integrations/dailycheck-bot-runtime-contract.md)。
 
 ### 9.1 进程拓扑
 
@@ -2796,7 +2805,7 @@ flowchart LR
     Data --> Config["config.py (root)<br/>共享路径常量"]
 ```
 
-### 9.2 35 个 MCP 工具
+### 9.2 37 个 MCP 工具
 
 **Bot PR2 调用接线**：22 个批准 handler 接受可选的显式 `ctx`，原 HTTP/stdio 未传时保留原鉴权链。bot 永远显式传入，读上下文携带 `read_only=True`，三写仅在护栏通过后构造最小权限上下文。MCP 本身 32 项注册不变，bot 不对七个 canonical 写接线。`AuthContext.warehouse_base_dir` 仅是受信数据根，bot 一律设为 `db_dir().parent`；共享 `warehouse_paths` 供旧工具、UoW、采购和 canonical bindings 使用，解决独立代码/CWD 下相对元数据路径的歧义。消费 handler 自身执行既有路径 ACL（Issue #103），bot adapter 的固定路径矩阵仍保留；采购 hub 聚合前按仓范围过滤。只读连接、采购无缓存 adapter、canonical bindings 无迁移模式的参数均保留主站/MCP 的既有默认行为。
 
@@ -2805,7 +2814,8 @@ flowchart LR
 内部可验证输出 JSON shape、外部子集/Bot批准状态及回归引用。`tools.get_tools()` 深复制声明，
 `server._tool_map` 从登记派生；启动时拒绝重名/无效handler，检查命令另扫描全部工具模块，
 拒绝漏注册实现、漏实现和错误绑定。Bot 的显式批准白名单仍由 `bot/tool_contract.py` 独立持有，
-仅做一致性核对，不从动态发现授予权限；32运行项、19外部集成子集、22 Bot批准项、七canonical写禁用不变。
+仅做一致性核对，不从动态发现授予权限。37 项登记含 32 项普通工具和 5 项仅策略工具；
+外部集成子集 19 项、Bot 批准 22 项。
 
 完整清单由 [`integrations/dailycheck-mcp/registry.md`](integrations/dailycheck-mcp/registry.md)
 及 `registry.json` 生成，替代这里的手工平行表；既有 `tools.json` 保留19项子集，不是完整注册表。
@@ -2888,7 +2898,7 @@ MCP rollback与Web outbound rollback/delete、restock status/delete均在写锁�
 warehouse commit后才失效master缓存；失败返回cache_invalidation_failed、committed=true/request_id/
 retry_safe（有键true）；带键重试修缓存不补库存，无键不得自动重做，不承诺跨库原子。
 
-#### 9.2.1 外部 WMS 只读桥接（3 项）
+#### 9.2.1 外部 WMS 只读桥接（4 项）
 
 **Issue #140 Web 独立范围**：新增 `mcp_server/service/wms_web.py`，只复用 WMS
 连接、环境配置与安全错误包装，不改变下述 MCP 单货主函数、注册、schema 或 Bot 池。
@@ -2925,6 +2935,26 @@ ROW_NUMBER 分页及 CTE 同范围计数支持超过 500 条，编码/货主筛�
 标为不完整。有效头无明细单独提示；缺失或越界单据 404；无效条件 400；未配置/缺驱动/
 连接或范围不可用详情 503、查询失败详情 502。列表页在上游故障时仍 200 展示错误状态以保持
 导航可达，全部固定安全提示/no-store，不展示半次结果或上游错误。
+
+**GitHub #47 朴宇单据明细**：`wms_document_lines` 只由 `/api/mcp/` 策略调度器发现
+和执行。独立动作 `wms.document_lines.read` 固定四个行字段，禁止与门店动作合并。
+签发和认证复用同一范围校验，按动作区分外仓快照和门店编码列表。合成 HTTP SDK 测试
+在同一进程签发两种令牌，验证各自的发现与调用、跨范围拒绝和写入拒绝。
+管理员在既有预设页选择外部朴宇冷库 1，经预览与签名确认写入不可变绑定。外仓快照保存为
+`{"wms_warehouse_id": 1}`，门店快照沿用编码列表。旧版按仓 3 写出的外仓快照不属于新能力，
+重新校验时直接拒绝，不进入上游查询。令牌的三项旧 ACL 全为空，旧版预设校验
+拒绝未知动作。普通目录仍为 32 项，原 3 项 WMS 工具的契约和权限沿用原实现。
+
+方向只选择固定入库或出库表。按冷库 1、配置需匹配的货主 155 和原单号精确匹配，
+在同一条 SELECT 验证 RTS012，唯一头才读行。二进制排序规则和 Unicode 字节长度保留
+大小写与尾空格，通配符号按字面比较。新查询用 HOLDLOCK 保护匹配和明细读取，重复检测
+最多取两个候选。Web 与 MCP 共用行表、
+按货主限定的货品关联、基础单位及源明细 ID 排序。行数量沿用 Web 的 DECIMAL(18,4)
+口径，以 SQL 十进制文本保留精度，
+货号、品名、基础单位的空串和纯空白在共用明细结果中统一为 null，非空文本保留原样。
+Web 明细用破折号展示缺失。数量继续区分 null 和零。MCP 仅返回方向、原号和四个字段
+`goods_code`、`goods_name`、`qty`、`unit`。完整、空单、未找到、范围内重号及截断
+各有独立状态。最多 2000 行，无续查参数。拒绝发生在上游查询前。
 
 ### MCP 变更影响门禁（Issue #105）
 
@@ -2981,6 +3011,25 @@ CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确�
 明文只进入签发响应；事务在绑定中保留签发和撤销的人及时间。演练模式拒绝撤销，
 保留原有令牌状态。发布新版本不改动旧绑定。
 详见 [MCP 配置与策略预设](mcp-configuration.md#storefront-read-policy-presets)。
+
+#### 四店生产耗料只读（GitHub #48）
+
+`production_consumption.read` 复用该策略预设和同一 StreamableHTTP dispatcher。
+预览、签发、认证均验证实际 storefront，范围限 `wh_002`、`wh_003`、`wh_004`、
+`wh_006` 的非空子集。调用在打开仓库文件前验证所请求仓及视图权限。
+`summary` 授权按日/周查看计数和样本引用，`lines` 授权按仓、批次和行追溯原始量。
+仅策略工具登记排除在普通 MCP 发现和调用、外部工具子集及 Bot 批准池之外。
+
+使用 `resolve_warehouse_path` 解析登记路径。打开任何业务库前比较所有登记仓已存在
+目标的设备号与 inode；请求仓与另一登记仓共享文件时拒绝查询。外置符号链接按目标核对，
+非请求仓的目标不存在时仍可读其他仓。
+每个仓库每次请求通过策略只读连接固定各自的 SQLite 读事务。事实来自未回滚的生产
+批次及耗料行。代填写入同时要求现代结构化出库关联和计划、入账、关联出库数量一致。
+出库只用于来源校验，库存流水不参与。原始行没有历史单位或跨店映射快照，分组数量返回
+`null`，分店保留来源计数和批次引用，原始计划量和入账量在明细逐行返回。
+按北京时间日期半开范围读取服务端本地秒级时间文本，生产启用前核实源时间口径。
+整组计算后分页，游标签名绑定身份、请求和明细指纹，数据变化或进程重启须从首
+页重查。范围、来源、字段和错误契约见 [生产耗料配置](mcp-configuration.md#production-consumption)。
 
 #### Gene 单品停订策略（GitHub #45）
 

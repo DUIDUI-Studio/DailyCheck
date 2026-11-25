@@ -7,6 +7,13 @@ from dataclasses import dataclass
 
 POLICY_TOKEN_PREFIX = "mp."
 MAX_SQLITE_ID = 2**63 - 1
+WMS_LINES_ACTION = "wms.document_lines.read"
+WMS_LINES_FIELDS = ("goods_code", "goods_name", "qty", "unit")
+# Dedicated document-lines capability reads cold storage only. The owner-confirmed
+# warehouse mapping lives with the Web scope in wms_web.MULTI_OWNER_WAREHOUSE_IDS.
+PUYU_COLD_STORAGE_WAREHOUSE_ID = 1
+PRODUCTION_CONSUMPTION_READ = "production_consumption.read"
+PRODUCTION_STORES = frozenset({"wh_002", "wh_003", "wh_004", "wh_006"})
 
 # Values are trusted SQL fragments. An administrator selects keys only.
 INVENTORY_COLUMNS = {"sku": "sku", "current_stock": "quantity AS current_stock",
@@ -18,6 +25,8 @@ ORDER_COLUMNS = {
 SAFE_FIELDS = {
     "inventory.read": tuple(INVENTORY_COLUMNS),
     "orders.read": (*ORDER_COLUMNS, "fulfillment"),
+    WMS_LINES_ACTION: WMS_LINES_FIELDS,
+    PRODUCTION_CONSUMPTION_READ: ("summary", "lines"),
 }
 
 
@@ -43,6 +52,8 @@ def canonical_grants(grants: object, *, routing: bool = False) -> dict[str, list
         ):
             raise ValueError("Invalid policy fields")
         result[action] = [field for field in allowed if field in fields]
+    if WMS_LINES_ACTION in result and result != {WMS_LINES_ACTION: list(WMS_LINES_FIELDS)}:
+        raise ValueError("WMS lines require a standalone preset with the fixed projection")
     return result
 
 
@@ -50,7 +61,7 @@ def encode_grants(grants: object, *, routing: bool = False) -> str:
     return json.dumps(canonical_grants(grants, routing=routing), sort_keys=True, separators=(",", ":"))
 
 
-def storefront_scope(conn: sqlite3.Connection, codes: object) -> tuple[str, ...]:
+def storefront_scope(conn: sqlite3.Connection, codes: object, grants: dict) -> tuple[str, ...]:
     if (
         not isinstance(codes, list) or not codes
         or not all(isinstance(code, str) and code and code.strip() == code and "*" not in code
@@ -65,6 +76,8 @@ def storefront_scope(conn: sqlite3.Connection, codes: object) -> tuple[str, ...]
     )
     if {row[0] for row in rows} != set(codes):
         raise ValueError("Invalid storefront selection")
+    if PRODUCTION_CONSUMPTION_READ in grants and not PRODUCTION_STORES.issuperset(codes):
+        raise ValueError("Invalid production consumption storefront selection")
     return tuple(sorted(codes))
 
 
@@ -115,10 +128,24 @@ class BoundPolicy:
     token_id: int
     warehouses: tuple[str, ...]
     grants: tuple[tuple[str, tuple[str, ...]], ...]
+    wms_warehouse_id: int | None = None
     routing: RoutingScope | None = None
 
     def fields(self, action: str | None) -> tuple[str, ...]:
         return next((fields for permitted, fields in self.grants if permitted == action), ())
+
+
+def binding_scope(conn: sqlite3.Connection, grants: dict, selection: object) -> list[str] | dict:
+    """Storefront scopes keep their original list. External WMS uses a distinct snapshot."""
+    if WMS_LINES_ACTION not in grants:
+        return list(storefront_scope(conn, selection, grants))
+    if (
+        not isinstance(selection, dict) or selection.keys() != {"wms_warehouse_id"}
+        or type(selection["wms_warehouse_id"]) is not int
+        or selection["wms_warehouse_id"] != PUYU_COLD_STORAGE_WAREHOUSE_ID
+    ):
+        raise ValueError("Invalid external WMS warehouse selection")
+    return {"wms_warehouse_id": PUYU_COLD_STORAGE_WAREHOUSE_ID}
 
 
 def load_binding(conn: sqlite3.Connection, token_id: int) -> BoundPolicy | None:
@@ -138,10 +165,15 @@ def load_binding(conn: sqlite3.Connection, token_id: int) -> BoundPolicy | None:
         grants = canonical_grants(raw, routing=routing)
         if row["grants_json"] != encode_grants(grants, routing=routing) or row["preset_grants"] != row["grants_json"]:
             return None
-        scope = _routing_scope(conn, token_id) if routing else None
-        if routing and (scope is None or row["warehouse_codes_json"] != "[]"):
+        routing_scope = _routing_scope(conn, token_id) if routing else None
+        if routing and (routing_scope is None or row["warehouse_codes_json"] != "[]"):
             return None
-        warehouses = () if routing else storefront_scope(conn, json.loads(row["warehouse_codes_json"]))
+        scope = [] if routing else binding_scope(conn, grants, json.loads(row["warehouse_codes_json"]))
     except (TypeError, ValueError):
         return None
-    return BoundPolicy(token_id, warehouses, tuple((action, tuple(fields)) for action, fields in grants.items()), scope)
+    return BoundPolicy(
+        token_id, tuple(scope) if isinstance(scope, list) else (),
+        tuple((action, tuple(fields)) for action, fields in grants.items()),
+        wms_warehouse_id=scope["wms_warehouse_id"] if isinstance(scope, dict) else None,
+        routing=routing_scope,
+    )
