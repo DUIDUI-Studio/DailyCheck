@@ -1734,7 +1734,11 @@ daemon socket/credentials/host PID 的固定 image 容器运行一次完整 pyte
 待核验数据；容器退出并删除后才验证/发布。candidate 日志绝不原样进入 Actions log command
 或 attestation channel。timeout/OOM/不明 exit/缺 session/logs 均失败，controller 死亡无 proof。
 hosted pytest 每次 capture 使用独立 disk-backed untrusted scratch（与 authority/evidence 分开），
-预算 2700s（job timeout 60min）；create 前、wait 中、退出后都要求 host 至少保留 2GiB free。
+pytest wait 预算 3600s，只用于正式 GitHub `pull_request` / `merge_group` 的 hosted capture。
+这两种事件的 `test` job 为 75min，普通 Gitea 和 GitHub 非 native `test` 保留 60min。
+reports job 保留 60min，report-generate、report-verify、lint 与本地 fixture 单次捕获各 180s。
+75min 为 pytest wait 留出名义 900s 的外部开销，冷启动下载或镜像加载可能耗尽这段余量。
+create 前、wait 中、退出后都要求 host 至少保留 2GiB free。
 capture 只删除已证明 exited+removed 的 owned container 与 owned scratch，不 prune。GitHub
 standard VM 上固定 trusted producer 以 passwordless sudo 运行，仅保留显式 required CI/event/
 upstream/read-token 变量（值不进 argv），使用 `python3 -I` 且不继承 PYTHONPATH/venv，以便
@@ -1755,7 +1759,7 @@ evidence plugin 路径；不改变 producer/verifier 的启动环境，也不把
 加入 candidate imports。snapshot 的 `origin/main` 固定为已验证 binding 的 `CI_BASE_SHA`，
 不依赖 source checkout 是否有 main branch，不额外导入任何 source/private history。
 hosted pytest 使用 Docker `--init` 回收 Git auto-maintenance 及 reporter 死亡后的孤儿，
-固定 256 pids/2 CPU/2 GiB/2700s 等限制不变；低 UID owned fixture 的合成 app UID 必须
+固定 256 pids/2 CPU/2 GiB；低 UID owned fixture 的合成 app UID 必须
 与 fixture owner 不同且非 root，合成 runtime record 同步该身份，InstalledPolicy 与真实
 kernel UID/root 控制保持不变。Linux65532 小探针验证上述差异，不等同 hosted 全仓验收。
 只构造 Docker argv 的 synthetic capture fixture 自带容量事实，不依赖测试宿主的 tmpfs
@@ -1952,7 +1956,8 @@ Gitea 继续只查既有 inbox 的 delivery IDs，不改变其 processed 文件�
 
 **CI 共存**（workflow 红线，准备不等于获准落地）：同一两个 required jobs 和现有报告、redline、
 hygiene、MCP contracts/impact、零新增失败门禁保留。GitHub native job 用标准
-`ubuntu-24.04-arm`（`runs-on` 表达式在 Gitea 保持原 `ubuntu-latest`），两个 job timeout 60min；
+`ubuntu-24.04-arm`（`runs-on` 表达式在 Gitea 保持原 `ubuntu-latest`）。只有 GitHub native
+`test` job timeout 为 75min，其他 `test` 与所有 reports 保留 60min；
 GitHub main push 跳过冗余 full test，Gitea push 不变。GitHub 用官方 checkout/setup-python v7，
 Gitea 用原生 Git 和 runner 自带 Python；绝对 `uses: http://...` 即使条件不成立也不合法，
 因此源 checkout 用 transient Git config 的 scoped auth，既不落 config 也不入 argv。
