@@ -11,6 +11,7 @@ from threading import Barrier
 import pytest
 
 import db
+from blueprints import canonical_pure
 from db import warehouse_migrate as migration
 from mcp_server.data import unit_of_work
 from mcp_server.infra.errors import ForbiddenError, ValidationError
@@ -34,6 +35,17 @@ def _stock_state(conn):
         conn.execute("SELECT COUNT(*) FROM production_run_items").fetchone()[0],
         conn.execute("SELECT COUNT(*) FROM stock_movements").fetchone()[0],
     )
+
+
+def _revision(conn, item_id):
+    return conn.execute(
+        "SELECT revision FROM production_item_measurement_revisions WHERE item_id=?", (item_id,),
+    ).fetchone()[0]
+
+
+def _form_basis(client, product):
+    html = client.get(f"/production/session?product_id={product}").get_data(as_text=True)
+    return re.search(r'name="measurement_basis" value="([0-9a-f]{64})"', html)[1]
 
 
 def _policy_reader(monkeypatch, master, code):
@@ -231,6 +243,7 @@ def test_migrate_restore_and_legacy_code_compatibility(logged_client, tmp_path):
         conn.executemany("INSERT INTO production_run_items(run_id, item_id, planned_qty, actual_qty, outbound_req_id) "
                          "VALUES (1, ?, ?, ?, 1)", [(item, 4, 4), (item, 4, 4)])
         original = _stock_state(conn)
+        original_item = dict(conn.execute("SELECT * FROM items").fetchone())
     assert production_consumption._read_lines(path.resolve(), "wh_002", "2026-11-16", "2026-11-17", {}, 8)[0]["unit"] is None
     migration.upgrade(path)
     migration.upgrade(path)
@@ -244,12 +257,27 @@ def test_migrate_restore_and_legacy_code_compatibility(logged_client, tmp_path):
     with closing(_wh(path)) as conn:
         assert _stock_state(conn) == original
         assert conn.execute("SELECT unit_snapshot, calculation_version FROM production_run_items").fetchone()[:] == (None, None)
+        assert dict(conn.execute("SELECT * FROM items").fetchone()) == original_item
+        assert _revision(conn, item) == 0
 
     client, candidate_path = logged_client
     current = _seed_item(candidate_path, "现行原料", "罐", 20, 0)
     recipe = _seed_product_with_bom(candidate_path, "现行配方", [(current, 2)])
     _submit(client, recipe)
     migration.downgrade(candidate_path, 7)
+    with closing(sqlite3.connect(":memory:")) as attached:
+        attached.execute("PRAGMA user_version=8")
+        attached.execute("ATTACH DATABASE ? AS store", (str(candidate_path),))
+        attached.execute("CREATE TABLE main.production_item_measurement_revisions(item_id, revision)")
+        attached.execute("UPDATE store.items SET quantity=quantity+40")
+        with pytest.raises(sqlite3.IntegrityError, match="snapshot-aware software"):
+            attached.execute("UPDATE store.outbound_requests SET rolled_back=1")
+        assert not attached.in_transaction
+        assert attached.execute("SELECT quantity FROM store.items").fetchone() == (16,)
+        attached.execute("UPDATE store.items SET unit='桶', sku='changed', gram_per_unit=100")
+        attached.execute("UPDATE store.items SET unit='罐', sku='T-现行原料', gram_per_unit=0")
+        assert attached.execute("SELECT COUNT(*) FROM main.production_item_measurement_revisions").fetchone() == (0,)
+        attached.commit()
     with closing(_wh(candidate_path)) as conn, conn:
         assert migration.validate(candidate_path) == 7
         before = _stock_state(conn)
@@ -267,6 +295,30 @@ def test_migrate_restore_and_legacy_code_compatibility(logged_client, tmp_path):
         assert [tuple(r) for r in conn.execute("SELECT unit_snapshot, calculation_version FROM production_run_items")] == [
             ("罐", 1), (None, None),
         ]
+        assert _revision(conn, current) == 2
+        before = _stock_state(conn)
+    assert client.post("/production/runs/1/rollback").status_code == 302
+    with closing(_wh(candidate_path)) as conn:
+        assert _stock_state(conn) == before
+    _submit(client, recipe)
+    assert client.post("/production/runs/3/rollback").status_code == 302
+    with closing(_wh(candidate_path)) as conn:
+        assert conn.execute("SELECT quantity FROM items").fetchone()[0] == 16
+        assert conn.execute("SELECT rolled_back FROM production_runs WHERE id=3").fetchone()[0] == 1
+
+    # A withdrawn preview stamped v8 with the revision on items is outside the
+    # supported migration path. The original v7 backup can still be upgraded.
+    with closing(_wh(restored)) as preview, preview:
+        preview.execute("ALTER TABLE items ADD COLUMN production_measurement_revision INTEGER NOT NULL DEFAULT 0")
+        preview.execute("PRAGMA user_version=8")
+    with pytest.raises(RuntimeError, match="unreleased preview"):
+        migration.upgrade(restored)
+    with closing(sqlite3.connect(backup)) as source, closing(sqlite3.connect(restored)) as target:
+        source.backup(target)
+    migration.upgrade(restored)
+    with closing(_wh(restored)) as conn:
+        assert migration.validate(restored) == 8
+        assert _stock_state(conn) == original and _revision(conn, item) == 0
 
 
 def test_stale_production_form_cannot_relabel_displayed_quantity(logged_client):
@@ -274,11 +326,7 @@ def test_stale_production_form_cannot_relabel_displayed_quantity(logged_client):
     item = _seed_item(path, "测试", "桶", 20, 200)
     product = _seed_product_with_bom(path, "生产", [(item, 200)])
 
-    def form_basis():
-        html = client.get(f"/production/session?product_id={product}").get_data(as_text=True)
-        return re.search(r'name="measurement_basis" value="([0-9a-f]{64})"', html)[1]
-
-    before = form_basis()
+    before = _form_basis(client, product)
     with closing(_wh(path)) as conn, conn:
         conn.execute("UPDATE items SET unit='罐', gram_per_unit=100")
     stale = client.post("/production/submit", data={
@@ -287,9 +335,121 @@ def test_stale_production_form_cannot_relabel_displayed_quantity(logged_client):
     assert stale.status_code == 302 and stale.location.startswith("/production/session?")
     with closing(_wh(path)) as conn:
         assert _stock_state(conn) == ([20], [], [], 0, 0)
-    _submit(client, product, measurement_basis=form_basis(), **{f"actual_{item}": 4})
+    _submit(client, product, measurement_basis=_form_basis(client, product), **{f"actual_{item}": 4})
     with closing(_wh(path)) as conn:
         assert conn.execute("SELECT unit_snapshot, actual_qty FROM production_run_items").fetchone()[:] == ("罐", 4)
+
+
+def test_production_preview_cannot_book_into_a_different_warehouse(logged_client):
+    client, path = logged_client
+    item = _seed_item(path, "原料", "桶", 20, 0)
+    product = _seed_product_with_bom(path, "配方", [(item, 2)])
+    basis = _form_basis(client, product)
+    other = path.with_name("synthetic-other.db")
+    with closing(sqlite3.connect(path)) as source, closing(sqlite3.connect(other)) as target:
+        source.backup(target)
+    with closing(sqlite3.connect(path.parent.parent / "master.db")) as master, master:
+        master.execute("INSERT INTO warehouses(id, code, name, db_path, created_at) "
+                       "VALUES(2, 'other', 'Fixture', ?, datetime('now'))", (str(other),))
+    with client.session_transaction() as session:
+        session["warehouse_id"] = 2
+    stale = client.post("/production/submit", data={
+        "product_id": product, "output_qty": 2, "measurement_basis": basis,
+    })
+    assert stale.status_code == 302 and stale.location.startswith("/production/session?")
+    with closing(_wh(other)) as conn:
+        assert _stock_state(conn) == ([20], [], [], 0, 0)
+    _submit(client, product, measurement_basis=_form_basis(client, product))
+    with closing(_wh(path)) as conn:
+        assert _stock_state(conn) == ([20], [], [], 0, 0)
+
+
+def test_unclaim_and_reclaim_advance_only_private_revision(logged_client, monkeypatch):
+    client, path = logged_client
+    item = _seed_item(path, "绑定原料", "桶", 20, 200)
+    product = _seed_product_with_bom(path, "绑定配方", [(item, 200)])
+    master_path = path.parent.parent / "master.db"
+    monkeypatch.setattr(canonical_pure, "BACKUP_WAREHOUSE_DIR", master_path.parent / "canonical-backups")
+    claim = dict(warehouse_code="wh_test", local_item_id=item, canonical_id=1, submitted_by=1)
+    with closing(sqlite3.connect(master_path)) as master, closing(_wh(path)) as conn:
+        master.execute("INSERT INTO canonical_items(id, canonical_sku, name, unit, created_at, updated_at) "
+                       "VALUES (1, 'fixture', '绑定原料', '桶', datetime('now'), datetime('now'))")
+        master.commit()
+        canonical_pure.claim_item(master, conn, **claim)
+        assert _revision(conn, item) == 1
+        _submit(client, product)
+        basis = _form_basis(client, product)
+        before = dict(conn.execute("SELECT * FROM items WHERE id=?", (item,)).fetchone())
+        canonical_pure.unclaim_item(master, conn, warehouse_code="wh_test", local_item_id=item, reviewed_by=1)
+        assert _revision(conn, item) == 2
+        canonical_pure.claim_item(master, conn, **claim)
+        after = dict(conn.execute("SELECT * FROM items WHERE id=?", (item,)).fetchone())
+        assert before.keys() == after.keys() and "production_measurement_revision" not in after
+        assert {k: v for k, v in before.items() if k != "updated_at"} == {
+            k: v for k, v in after.items() if k != "updated_at"
+        }
+        assert _revision(conn, item) == 3
+        state = _stock_state(conn)
+        assert client.post("/production/runs/1/rollback").status_code == 302
+        stale = client.post("/production/submit", data={
+            "product_id": product, "output_qty": 2, "measurement_basis": basis,
+        })
+        assert stale.status_code == 302 and stale.location.startswith("/production/session?")
+        assert _stock_state(conn) == state
+
+
+@pytest.mark.parametrize("action", ["delete_and_insert", "replace"])
+def test_reusing_item_id_cannot_reuse_its_snapshot_revision(logged_client, action):
+    client, path = logged_client
+    item = _seed_item(path, "重建原料", "桶", 20, 0)
+    product = _seed_product_with_bom(path, "重建配方", [(item, 2)])
+    _submit(client, product)
+    basis = _form_basis(client, product)
+    with closing(_wh(path)) as conn, conn:
+        data = tuple(conn.execute("SELECT * FROM items WHERE id=?", (item,)).fetchone())
+        if action == "delete_and_insert":
+            conn.execute("DELETE FROM items WHERE id=?", (item,))
+        conn.execute(f"INSERT OR REPLACE INTO items VALUES ({','.join('?' for _ in data)})", data)
+        assert _revision(conn, item) == 1
+        state = _stock_state(conn)
+    assert client.post("/production/runs/1/rollback").status_code == 302
+    assert _form_basis(client, product) != basis
+    with closing(_wh(path)) as conn:
+        assert _stock_state(conn) == state
+
+
+def test_zero_return_after_unit_change_preserves_balance(logged_client):
+    client, path = logged_client
+    item = _seed_item(path, "零用量", "桶", 20, 100)
+    product = _seed_product_with_bom(path, "零用量配方", [(item, 100)])
+    _submit(client, product, **{f"actual_{item}": "0"})
+    with closing(_wh(path)) as conn, conn:
+        conn.execute("UPDATE items SET unit='罐', gram_per_unit=50")
+    assert client.post("/production/runs/1/rollback").status_code == 302
+    with closing(_wh(path)) as conn:
+        assert _stock_state(conn) == ([20], [(1, 1)], [(1, 1)], 1, 2)
+
+
+def test_adjustment_displays_unknown_and_blocks_direct_reversals(logged_client, monkeypatch):
+    client, path = logged_client
+    item = _seed_item(path, "历史原料", "桶", 20, 100)
+    with closing(_wh(path)) as conn, conn:
+        conn.execute("""INSERT INTO outbound_requests
+            (item_id, requested_quantity, reason, status, created_at, source_type)
+            VALUES (?, 1, '生产补录', '出库', '2026-11-17 10:00:00', 'production')""", (item,))
+        state = _stock_state(conn)
+    body = client.get("/outbound").get_data(as_text=True)
+    assert "生产补录" in body and "单位未留存" in body and "生产领料" not in body
+    assert "/outbound/1/delete" not in body
+    for operation in ("rollback", "delete"):
+        assert client.post(f"/outbound/1/{operation}").status_code == 302
+    monkeypatch.setattr(outbound, "resolve_warehouse", lambda _: {"db_path": str(path)})
+    with pytest.raises(ValidationError, match="production_requires_run_reversal"):
+        outbound.rollback_outbound(1, "wh_test", AuthContext(1, [], [], None))
+    with pytest.raises(ForbiddenError):
+        outbound.rollback_outbound(1, "wh_test", AuthContext(1, [], [], ["other"]))
+    with closing(_wh(path)) as conn:
+        assert _stock_state(conn) == state
 
 
 def test_concurrent_production_reversal_and_manual_outbound(logged_client):

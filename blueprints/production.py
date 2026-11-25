@@ -323,8 +323,9 @@ def _read_bom(db, product_id):
     return db.execute(
         """SELECT b.id AS bom_id, b.item_id, b.qty_per_unit,
                   i.name AS item_name, i.quantity AS stock, i.gram_per_unit,
-                  i.unit, i.sku, i.canonical_id, i.production_measurement_revision
+                  i.unit, i.sku, i.canonical_id, m.revision AS production_measurement_revision
            FROM product_bom b JOIN items i ON i.id = b.item_id
+           LEFT JOIN production_item_measurement_revisions m ON m.item_id = i.id
            WHERE b.product_id = ? ORDER BY b.id""",
         (product_id,),
     ).fetchall()
@@ -332,7 +333,7 @@ def _read_bom(db, product_id):
 
 def _measurement_basis(product, bom):
     inputs = ("bom_id", "item_id", "qty_per_unit", "unit", "gram_per_unit", "production_measurement_revision")
-    data = [CALCULATION_VERSION, product["id"], product["unit"],
+    data = [CALCULATION_VERSION, g.warehouse["id"], product["id"], product["unit"],
             [tuple(row[field] for field in inputs) for row in bom]]
     return hashlib.sha256(json.dumps(data, ensure_ascii=False).encode()).hexdigest()
 
@@ -379,6 +380,9 @@ def _submit_locked(db, product_id, output_qty, note):
     # prevent — see _helpers.py:50.
     plan = []
     for b in bom_rows:
+        if b["production_measurement_revision"] is None:
+            flash(f"原料 {b['item_name']} 的计量修订无法核实", "error")
+            return redirect(url_for("production.session", product_id=product_id))
         gpu = float(b["gram_per_unit"] or 0)
         if not math.isfinite(gpu) or not math.isfinite(b["qty_per_unit"]):
             flash(f"原料 {b['item_name']} 的配方或换算值无效")
@@ -587,8 +591,9 @@ def _reverse_run_locked(db, run_id, rolled_back, delete):
     reason = f"生产领料(run=#{run_id})"
     lines = db.execute(
         """SELECT li.*, i.id AS current_item_id, i.unit, i.sku, i.canonical_id, i.gram_per_unit,
-                  i.production_measurement_revision, ob.id AS verified_outbound_id
+                  m.revision AS production_measurement_revision, ob.id AS verified_outbound_id
              FROM production_run_items li LEFT JOIN items i ON i.id = li.item_id
+             LEFT JOIN production_item_measurement_revisions m ON m.item_id = i.id
              LEFT JOIN outbound_requests ob ON ob.id = li.outbound_req_id
                   AND ob.item_id = li.item_id AND ob.requested_quantity = li.actual_qty
                   AND ob.rolled_back = ? AND ob.reason = ? AND ob.status = '出库'

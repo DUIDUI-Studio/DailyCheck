@@ -40,7 +40,9 @@
         <span class="muted">随订单发货，不可单独回退</span>
       {% elif r.rolled_back == 0 %}
         {% if r.is_production %}
-          <span class="muted">生产领料</span>
+          {% if r.reason and r.reason.startswith('生产领料(run=#') %}
+            <span class="muted">生产领料</span>
+          {% endif %}
         {% else %}
           {% if current_role != 'staff' %}
           <form method="post" action="{{ url_for('outbound.delete', req_id=r.id) }}" class="inline" data-ajax data-ajax-confirm="确认删除该出库记录？">

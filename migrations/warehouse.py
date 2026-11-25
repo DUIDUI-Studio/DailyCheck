@@ -16,6 +16,7 @@ def down_document_lines(conn: sqlite3.Connection) -> None:
 
 
 PRODUCTION_RUN_SNAPSHOT = {"output_unit_snapshot": "TEXT"}
+PRODUCTION_ITEM_REVISIONS = "production_item_measurement_revisions"
 PRODUCTION_LINE_SNAPSHOT = {
     "unit_snapshot": "TEXT",
     "sku_snapshot": "TEXT",
@@ -30,10 +31,12 @@ PRODUCTION_LINE_SNAPSHOT = {
 
 
 def up_production_snapshots(conn: sqlite3.Connection) -> None:
+    if "production_measurement_revision" in {row[1] for row in conn.execute("PRAGMA table_info(items)")}:
+        raise RuntimeError("recreate the unreleased production snapshot preview from its v7 backup")
+    _create_production_item_revisions(conn)
     for table, fields in (
         ("production_runs", PRODUCTION_RUN_SNAPSHOT),
         ("production_run_items", PRODUCTION_LINE_SNAPSHOT),
-        ("items", {"production_measurement_revision": "INTEGER NOT NULL DEFAULT 0"}),
     ):
         existing = {row[1]: row for row in conn.execute(f"PRAGMA table_info({table})")}
         for column, kind in fields.items():
@@ -58,39 +61,68 @@ def up_production_snapshots(conn: sqlite3.Connection) -> None:
         BEFORE UPDATE OF outbound_req_id ON production_run_items
         WHEN OLD.calculation_version IS NOT NULL AND OLD.outbound_req_id IS NOT NEW.outbound_req_id
         BEGIN SELECT RAISE(ABORT, 'production snapshot association is immutable'); END""")
+    _production_compatibility_guards(conn, enable=False)
 
-    # A return to the old label or factor after an intervening edit does not
-    # establish continuity of the stock unit or item identity.
-    conn.execute("""CREATE TRIGGER IF NOT EXISTS items_production_measurement_revision
-        AFTER UPDATE OF unit, sku, canonical_id, gram_per_unit ON items
-        WHEN OLD.unit IS NOT NEW.unit OR OLD.sku IS NOT NEW.sku
-          OR OLD.canonical_id IS NOT NEW.canonical_id
-          OR OLD.gram_per_unit IS NOT NEW.gram_per_unit
+
+def _create_production_item_revisions(conn: sqlite3.Connection) -> None:
+    table = PRODUCTION_ITEM_REVISIONS
+    if conn.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (table,)).fetchone() is None:
+        if "measurement_revision_snapshot" in {
+            row[1] for row in conn.execute("PRAGMA table_info(production_run_items)")
+        }:
+            raise RuntimeError("production item revision history is missing")
+        # Keep retired item IDs so reusing an ID or REPLACE cannot resurrect
+        # an earlier measurement revision. No foreign key cascades these rows.
+        conn.execute(f"""CREATE TABLE {table} (
+            item_id INTEGER PRIMARY KEY,
+            revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0)
+        )""")
+        conn.execute(f"INSERT INTO {table}(item_id, revision) SELECT id, 0 FROM items")
+
+    advance = f"""INSERT INTO {table}(item_id, revision) VALUES (NEW.id, 0)
+                 ON CONFLICT(item_id) DO UPDATE SET revision = revision + 1;"""
+    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS items_production_measurement_insert
+        AFTER INSERT ON items BEGIN {advance} END""")
+    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS items_production_measurement_update
+        AFTER UPDATE OF id, unit, sku, canonical_id, gram_per_unit ON items
+        WHEN OLD.id IS NOT NEW.id OR OLD.unit IS NOT NEW.unit OR OLD.sku IS NOT NEW.sku
+          OR OLD.canonical_id IS NOT NEW.canonical_id OR OLD.gram_per_unit IS NOT NEW.gram_per_unit
         BEGIN
-            UPDATE items SET production_measurement_revision = OLD.production_measurement_revision + 1
-            WHERE id = NEW.id;
+            SELECT RAISE(ABORT, 'production item revision history is missing')
+            WHERE NOT EXISTS (SELECT 1 FROM {table} WHERE item_id = OLD.id);
+            {advance}
         END""")
 
+
+def _production_compatibility_guards(conn: sqlite3.Connection, *, enable: bool) -> None:
     # Old Web/MCP writers may still submit after a compatibility restamp, but
     # their reversal paths have no snapshot validation. Abort their entire
-    # transaction, including any earlier inventory UPDATE.
+    # transaction, including any earlier inventory UPDATE. Install the guards
+    # in the restamp transaction so they work even in an attached warehouse.
+    production = """COALESCE(OLD.source_type = 'production', EXISTS (
+        SELECT 1 FROM production_run_items WHERE outbound_req_id = OLD.id
+    ))"""
     for table, operation, predicate in (
         ("production_runs", "UPDATE OF rolled_back", "OLD.rolled_back <> NEW.rolled_back"),
         ("production_runs", "DELETE", "1"),
-        ("outbound_requests", "UPDATE OF rolled_back", "OLD.rolled_back <> NEW.rolled_back AND OLD.source_type = 'production'"),
-        ("outbound_requests", "DELETE", "OLD.source_type = 'production'"),
+        ("outbound_requests", "UPDATE OF rolled_back", f"OLD.rolled_back <> NEW.rolled_back AND {production}"),
+        ("outbound_requests", "DELETE", production),
     ):
         verb = operation.split()[0].lower()
-        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {table}_snapshot_compat_{verb}
-            BEFORE {operation} ON {table}
-            WHEN ({predicate}) AND (SELECT user_version FROM pragma_user_version) < 8
-            BEGIN SELECT RAISE(ROLLBACK, 'production reversal requires snapshot-aware software'); END""")
+        name = f"{table}_snapshot_compat_{verb}"
+        if enable:
+            conn.execute(f"""CREATE TRIGGER {name} BEFORE {operation} ON {table}
+                WHEN {predicate}
+                BEGIN SELECT RAISE(ROLLBACK, 'production reversal requires snapshot-aware software'); END""")
+        else:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
 
 
 def down_production_snapshots(conn: sqlite3.Connection) -> None:
     """The runner restamps the version after backing up; retain v8 facts and guards."""
     if "calculation_version" not in {row[1] for row in conn.execute("PRAGMA table_info(production_run_items)")}:
         raise RuntimeError("production snapshot schema missing")
+    _production_compatibility_guards(conn, enable=True)
 
 
 WAREHOUSE_MIGRATIONS = [

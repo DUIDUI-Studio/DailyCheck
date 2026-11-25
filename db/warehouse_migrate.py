@@ -11,7 +11,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from migrations.warehouse import WAREHOUSE_MIGRATIONS
+from migrations.warehouse import PRODUCTION_ITEM_REVISIONS, WAREHOUSE_MIGRATIONS
 
 
 def connect_existing(path: Path) -> sqlite3.Connection:
@@ -33,6 +33,8 @@ def validate(path: Path) -> int:
 
         if version > WAREHOUSE_SCHEMA_VERSION:
             raise RuntimeError("unknown future warehouse version")
+        if version == 8 and PRODUCTION_ITEM_REVISIONS not in tables:
+            raise RuntimeError("production item revision history is missing or from an unreleased preview")
         return version
 
 
