@@ -2263,20 +2263,20 @@ flowchart LR
     Start["get_warehouse_db()<br/>每个请求调"] --> ReadVersion{"PRAGMA<br/>user_version<br/>>= WAREHOUSE_SCHEMA_VERSION?"}
     ReadVersion -->|Yes| Skip["跳过（只读目标/版本检查）"]
     ReadVersion -->|No| Migrate["migrate_warehouse_db_columns()<br/>PRAGMA table_info 守卫<br/>+ idempotent ALTER<br/>+ 创建索引"]
-    Migrate --> Stamp["legacy ≤6 → registered v7<br/>BEGIN IMMEDIATE + stamp + commit"]
+    Migrate --> Stamp["legacy ≤6 → registered v7 → v8<br/>BEGIN IMMEDIATE + stamp + commit per step"]
     Stamp --> Skip
 ```
 
-- **`WAREHOUSE_SCHEMA_VERSION = 7`**，改了 ALTER 块必须 bump。
+- **`WAREHOUSE_SCHEMA_VERSION = 8`**，改了 ALTER 块必须 bump。
 - **新增 items 列只加到 `migrate_warehouse_db_columns()`，不加进 `WAREHOUSE_SCHEMA`**（tests 断言 WAREHOUSE_SCHEMA 不含 is_orderable）。
 - **`init_master_db()`** 用 `fcntl.flock` 保护 gunicorn 多 worker 并发 ALTER。
 - **所有绕过 `get_warehouse_db()` 直连 sqlite3 的代码（CLI / 测试 / MCP）必须先调 migrate**。
-- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v9**（MCP 策略预设及身份绑定；仓库仍为 v7，互不混用）。
+- **P0-6（2026-10-10 起）**：master.db 显式迁移走 `flask migrate status|up|down`（`migrations/__init__.py` 注册表 + `migrations_runner.py`，PRAGMA user_version 门控，每步前 sqlite3 backup API 热备到 `backups/migrations/`）。`init_master_db()` 幂等 ALTER 降级为兜底；**新 schema 变更一律加迁移条目**。回归 `tests/test_migration_runner.py`（9 用例）。当前 master 注册表到 **v10**（原仓停订和恢复记录）；仓库有独立的 v8 注册表。
 
 ---
 
 master 从 v7 显式升级时，v8 送达回执表先落库，随后以包含该表和既有反馈的 v8 快照
-备份，再应用 v9 MCP 策略迁移。每步的备份和版本独立于仓库迁移。
+备份，再应用 v9 MCP 策略迁移及 v10 原仓停订迁移。每步的备份和版本独立于仓库迁移。
 
 **warehouse v7（Issue #87）**：独立 `migrations/warehouse.py:WAREHOUSE_MIGRATIONS`
 （不进入 master MIGRATIONS/v6），`db/warehouse_migrate.py` 为显式单仓 status/up/down 入口，
@@ -2287,7 +2287,13 @@ master 从 v7 显式升级时，v8 送达回执表先落库，随后以包含该
 同事务stamp7。v7失败全回滚；旧baseline可能留部分DDL，可重试补齐。v7 down安全拒绝，
 首选保留schema/data的代码回退；备份恢复只在Prod协调停写与来源checkpoint后执行。
 MCP warehouse_connection非只读路径在connect/yield前调wrapper，无需Web预热，mode=rw拒绝静默建空库；bot显式read_only路径不触发迁移，直接mode=ro打开已初始化仓库，保留查询零写入边界；
-master_connection不迁移warehouse。软链共享真实路径锁，绿副本独立迁移；已v7不重复备份/ALTER。
+master_connection不迁移warehouse。软链共享真实路径锁，绿副本独立迁移；到当前版本后跳过备份和 ALTER。
+
+**warehouse v8（GitHub #53）** 在单仓事务中添加生产批次产出单位、可空耗料计量快照和品项计量修订号。
+快照列旧值保持 NULL，迁移保留原批次、品项、库存和历史时间。`production_item_measurement_revisions` 保存单仓私有修订号，普通 `items` 行保持原列。单位、SKU、主数据绑定或克重变更使修订递增，品项 ID 重用也递增。快照和已记录的出库关联受 SQLite update 触发器保护。
+v7→v8 与保留数据的 v8→v7 版本回标都使用单仓迁移锁与 SQLite 热备。回标保留快照及修订触发器，并安装生产反向写入守卫，与版本回标一同提交。重新升级在同一事务撤除旧版守卫，仓库附挂时仍以该仓本地触发器为准。
+v7 旧代码可在回标后读取、新增批次，新行的快照为 NULL。既有 v7 仍是首次升级基线。未发布、直接在 `items` 保存计量修订号的预演库应从原 v7 备份重新建立。
+切换与回退都要求现场证明共享库访问顺序，详见 [生产计量快照的发布与回退](production-unit-snapshots.md)。
 
 ## 5. 应用层模块图
 
@@ -3030,8 +3036,11 @@ CLI裸入口默认stdio，HTTP默认bind `127.0.0.1:5100`；仓内systemd明确�
 非请求仓的目标不存在时仍可读其他仓。
 每个仓库每次请求通过策略只读连接固定各自的 SQLite 读事务。事实来自未回滚的生产
 批次及耗料行。代填写入同时要求现代结构化出库关联和计划、入账、关联出库数量一致。
-出库只用于来源校验，库存流水不参与。原始行没有历史单位或跨店映射快照，分组数量返回
-`null`，分店保留来源计数和批次引用，原始计划量和入账量在明细逐行返回。
+出库只用于来源校验，库存流水不参与。耗料明细返回原始计划量、入账量及当次快照；旧行的单位为 `null`。
+日周在整组已知且计量身份一致时返回总量，混合或部分未知的组保留各可比计量分组、未知单位覆盖率、原来源
+计数与批次引用。各仓独立聚合。生成快照的事务与 Web 历史、CSV、自动出库的关联读取见
+[生产计量快照](production-unit-snapshots.md)。
+普通 `outbound_list` 保留现有工具声明，生产出库的计量字段通过可选返回字段交付。
 按北京时间日期半开范围读取服务端本地秒级时间文本，生产启用前核实源时间口径。
 整组计算后分页，游标签名绑定身份、请求和明细指纹，数据变化或进程重启须从首
 页重查。范围、来源、字段和错误契约见 [生产耗料配置](mcp-configuration.md#production-consumption)。

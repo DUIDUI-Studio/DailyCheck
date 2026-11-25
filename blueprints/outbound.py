@@ -7,6 +7,11 @@ from flask import Blueprint, flash, g, redirect, render_template, request, url_f
 
 from db import get_master_db, get_warehouse_db
 from permissions import require_login, require_permission, require_role
+from production_snapshots import (
+    outbound_production_expression,
+    outbound_snapshot_query,
+    outbound_unit_metadata,
+)
 
 from . import canonical_pure as cp
 from . import store_ordering_pure as sop
@@ -113,14 +118,17 @@ def _list_order_shipments(db) -> list[dict]:
 def outbound_list():
     db = get_warehouse_db()
     warehouse_type = g.warehouse["warehouse_type"] if g.get("warehouse") else None
+    projection, join = outbound_snapshot_query(db)
     manual_rows = db.execute(
-        """SELECT o.*, i.name AS item_name, i.unit
-           FROM outbound_requests o JOIN items i ON i.id = o.item_id
+        f"""SELECT o.*, i.name AS item_name, i.unit, {projection}
+           FROM outbound_requests o JOIN items i ON i.id = o.item_id {join}
            ORDER BY o.id DESC LIMIT 100"""
     ).fetchall()
     requests_data = []
     for row in manual_rows:
         record = dict(row)
+        if row["is_production"]:
+            record.update(outbound_unit_metadata(row))
         record.update({
             "is_order_shipment": False,
             "source_label": _SOURCE_LABELS.get(record.get("source_type"), "其他来源"),
@@ -224,13 +232,17 @@ def rollback(req_id: int):
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("BEGIN IMMEDIATE")
     try:
+        production = outbound_production_expression(db)
         req = db.execute(
-            """SELECT item_id, requested_quantity, rolled_back
-               FROM outbound_requests WHERE id = ? AND status = '出库'""",
+            f"""SELECT item_id, requested_quantity, rolled_back, {production} AS is_production
+               FROM outbound_requests o WHERE id = ? AND status = '出库'""",
             (req_id,),
         ).fetchone()
         if req is None:
             flash("出库记录不存在")
+            return redirect(url_for("outbound.outbound_list"))
+        if req["is_production"]:
+            flash("请从生产记录回退生产领料", "error")
             return redirect(url_for("outbound.outbound_list"))
         if int(req["rolled_back"]) == 1:
             flash("该记录已回退，无需重复操作")
@@ -273,13 +285,17 @@ def delete(req_id: int):
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("BEGIN IMMEDIATE")
     try:
+        production = outbound_production_expression(db)
         req = db.execute(
-            """SELECT item_id, requested_quantity, rolled_back
-               FROM outbound_requests WHERE id = ?""",
+            f"""SELECT item_id, requested_quantity, rolled_back, {production} AS is_production
+               FROM outbound_requests o WHERE id = ?""",
             (req_id,),
         ).fetchone()
         if req is None:
             flash("出库记录不存在")
+            return redirect(url_for("outbound.outbound_list"))
+        if req["is_production"]:
+            flash("请从生产记录删除生产领料", "error")
             return redirect(url_for("outbound.outbound_list"))
 
         if int(req["rolled_back"]) == 0:

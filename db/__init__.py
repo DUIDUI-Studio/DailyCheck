@@ -1618,7 +1618,8 @@ def init_warehouse_db(db_path: Path, seed_categories=None) -> None:
 #        列表默认隐藏、管理员可切换，2026-10-25）
 #   v6 → stock_movements.op_no（多仓履约发货/收货回链）
 #   v7 → document line identity/conversion and permanent write journal (#87)
-WAREHOUSE_SCHEMA_VERSION = 7
+#   v8 → production run and ingredient measurement snapshots (#53)
+WAREHOUSE_SCHEMA_VERSION = 8
 
 
 def migrate_warehouse_db_columns(db_path: Path) -> None:

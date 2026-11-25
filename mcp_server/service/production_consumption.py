@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 from collections import Counter
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 from itsdangerous import BadData, URLSafeSerializer
 
@@ -15,6 +16,7 @@ import config
 from mcp_server.data.unit_of_work import policy_master_connection, policy_read_connection
 from mcp_server.infra.errors import ForbiddenError, McpError, ValidationError
 from mcp_server.service.policy import PRODUCTION_STORES, BoundPolicy
+from production_snapshots import CALCULATION_VERSION, recorded_text, snapshot_select, table_columns
 from warehouse_paths import resolve_warehouse_path
 
 DEFAULT_LIMIT = 50
@@ -24,6 +26,19 @@ MAX_SOURCE_LINES = 20_000
 MAX_CURSOR_LENGTH = 512
 VIEW_FIELDS = {"day": "summary", "week": "summary", "lines": "lines"}
 _CURSORS = URLSafeSerializer(secrets.token_bytes(32), salt="production-consumption-v1")
+_LINE_SNAPSHOT = {
+    "unit": "unit_snapshot",
+    "item_sku": "sku_snapshot",
+    "canonical_item_id": "canonical_id_snapshot",
+    "bom_row_id": "bom_row_id_snapshot",
+    "bom_qty_per_unit": "bom_qty_per_unit_snapshot",
+    "conversion_mode": "conversion_mode_snapshot",
+    "grams_per_unit": "grams_per_unit_snapshot",
+    "calculation_version": "calculation_version",
+    "measurement_revision": "measurement_revision_snapshot",
+}
+_MEASURE_FIELDS = ("unit", "item_sku", "canonical_item_id", "conversion_mode",
+                   "grams_per_unit", "measurement_revision")
 
 
 def _json_digest(value) -> str:
@@ -69,10 +84,9 @@ def _warehouse_paths(codes: tuple[str, ...]) -> dict:
     return paths
 
 
-def _source_expression(conn: sqlite3.Connection) -> tuple[str, str]:
+def _source_expression(conn: sqlite3.Connection, columns: set[str]) -> tuple[str, str]:
     # Pre-v4 schemas have neither provenance column. Read their facts without
     # migrating, and recognize only provenance that the schema can corroborate.
-    columns = {col[0] for col in conn.execute("SELECT * FROM production_run_items LIMIT 0").description}
     if "planned_default" not in columns:
         return "'unknown'", ""
     outbound = {col[0] for col in conn.execute("SELECT * FROM outbound_requests LIMIT 0").description}
@@ -98,10 +112,16 @@ def _source_expression(conn: sqlite3.Connection) -> tuple[str, str]:
 def _read_lines(path, code, start, end, filters, budget) -> list[dict]:
     with policy_read_connection(path) as conn:
         conn.execute("BEGIN")
-        source, join = _source_expression(conn)
+        columns = table_columns(conn, "production_run_items")
+        source, join = _source_expression(conn, columns)
+        line_snapshot = snapshot_select(columns, "li", _LINE_SNAPSHOT)
+        run_snapshot = snapshot_select(table_columns(conn, "production_runs"), "r", {
+            "output_unit": "output_unit_snapshot",
+        })
         rows = conn.execute(
             f"""SELECT r.created_at, r.id AS run_id, li.id AS line_id, li.item_id,
-                       li.planned_qty, li.actual_qty AS booked_qty, {source} AS booked_source
+                       li.planned_qty, li.actual_qty AS booked_qty, {source} AS booked_source,
+                       {line_snapshot}, {run_snapshot}
                   FROM production_runs r
                   JOIN production_run_items li ON li.run_id = r.id
                   {join}
@@ -122,8 +142,25 @@ def _read_lines(path, code, start, end, filters, budget) -> list[dict]:
             raise ValueError("Invalid production quantity")
         record = dict(row)
         record["created_at"] = timestamp.replace(" ", "T") + "+08:00"
-        records.append({"warehouse_code": code, "unit": None, **record})
+        version = record["calculation_version"]
+        record["unit"] = recorded_text(record["unit"]) if version == CALCULATION_VERSION else None
+        record["snapshot_source"] = "production_write" if version == CALCULATION_VERSION else None
+        record["unit_status"] = "snapshotted" if record["unit"] else "historical_unit_unavailable"
+        records.append({"warehouse_code": code, **record})
     return records
+
+
+def _quantities(lines: list[dict]) -> dict:
+    planned = Decimal(0)
+    booked = {}
+    for line in lines:
+        planned += Decimal(str(line["planned_qty"]))
+        source = line["booked_source"]
+        booked[source] = booked.get(source, Decimal(0)) + Decimal(str(line["booked_qty"]))
+    return {"planned_qty": float(planned), **{
+        f"{source}_qty": float(booked[source]) if source in booked else None
+        for source in ("manual", "system_default", "unknown")
+    }}
 
 
 def _summary(lines: list[dict], view: str) -> list[dict]:
@@ -132,20 +169,32 @@ def _summary(lines: list[dict], view: str) -> list[dict]:
         day = date.fromisoformat(line["created_at"][:10])
         period = day - timedelta(days=day.weekday()) if view == "week" else day
         key = (line["warehouse_code"], period.isoformat(), line["item_id"])
-        if key not in groups:
-            reference = {name: line[name] for name in ("run_id", "line_id", "created_at")}
-            groups[key] = (Counter(), reference)
-        groups[key][0][line["booked_source"]] += 1
-    return [
-        {
-            "warehouse_code": code, "period_start": period, "item_id": item_id, "unit": None,
-            "planned_count": sum(counts.values()), "manual_count": counts["manual"],
+        groups.setdefault(key, []).append(line)
+    results = []
+    for (code, period, item_id), group in sorted(groups.items()):
+        counts = Counter(line["booked_source"] for line in group)
+        buckets = {}
+        for line in group:
+            if line["unit"] and line["item_sku"] and line["measurement_revision"] is not None:
+                measure = tuple(line[field] for field in _MEASURE_FIELDS)
+                buckets.setdefault(measure, []).append(line)
+        unit_groups = [
+            {**dict(zip(_MEASURE_FIELDS, measure, strict=True)), "line_count": len(bucket),
+             **_quantities(bucket)}
+            for measure, bucket in buckets.items()
+        ]
+        unknown = len(group) - sum(bucket["line_count"] for bucket in unit_groups)
+        whole = unit_groups[0] if len(unit_groups) == 1 and unknown == 0 else {}
+        results.append({
+            "warehouse_code": code, "period_start": period, "item_id": item_id, "unit": whole.get("unit"),
+            "planned_count": len(group), "manual_count": counts["manual"],
             "system_default_count": counts["system_default"], "unknown_count": counts["unknown"],
-            "planned_qty": None, "manual_qty": None, "system_default_qty": None, "unknown_qty": None,
-            "sample": reference,
-        }
-        for (code, period, item_id), (counts, reference) in sorted(groups.items())
-    ]
+            **{field: whole.get(field) for field in ("planned_qty", "manual_qty", "system_default_qty", "unknown_qty")},
+            "sample": {name: group[0][name] for name in ("run_id", "line_id", "created_at")},
+            "unit_groups": unit_groups, "unknown_unit_count": unknown,
+            "unknown_unit_fraction": unknown / len(group),
+        })
+    return results
 
 
 def read_production_consumption(
@@ -200,7 +249,10 @@ def read_production_consumption(
     return {
         field: page, "view": view, "warehouses": list(codes),
         "start_date": start_date, "end_date": end_date, "timezone": "Asia/Shanghai",
-        "unit_status": "historical_unit_unavailable",
+        "unit_status": (
+            ("partially_snapshotted" if any(not line["unit"] for line in lines) else "snapshotted")
+            if any(line["unit"] for line in lines) else "historical_unit_unavailable"
+        ),
         "cross_store_rollup": "historical_mapping_unavailable",
         "range_empty": not records, "page_empty": not page,
         "limit": limit, "truncated": truncated, "next_cursor": next_cursor,

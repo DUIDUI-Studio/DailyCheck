@@ -29,7 +29,7 @@
   <div class="runs-row" data-row>
     <div class="runs-head">
       <span class="runs-time">{{ r['created_at'] }}</span>
-      <span class="runs-product">{{ r['product_name'] }} <small class="muted">产出 {{ r['output_qty'] | fmt_qty }} {{ r['product_unit'] }}</small></span>
+      <span class="runs-product">{{ r['product_name'] }} <small class="muted">产出 {{ r['output_qty'] | fmt_qty }} {{ r['product_unit'] or '单位未留存' }}</small></span>
       {% if r['rolled_back'] == 1 %}<span class="status-pill warn">已回退</span>{% endif %}
       <span class="runs-actions">
         {% if r['rolled_back'] == 0 %}
@@ -53,7 +53,7 @@
       {% for it in r['items'] %}
       <tr>
         <td class="bom-name">{{ it['item_name'] }}</td>
-        <td class="bom-qty">{{ it['actual_qty'] | fmt_qty }} {{ it['unit'] }}</td>
+        <td class="bom-qty">{{ it['actual_qty'] | fmt_qty }} {{ it['unit'] or '单位未留存' }}</td>
       </tr>
       {% endfor %}
     </table>

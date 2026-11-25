@@ -11,7 +11,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from migrations.warehouse import WAREHOUSE_MIGRATIONS
+from migrations.warehouse import PRODUCTION_ITEM_REVISIONS, WAREHOUSE_MIGRATIONS
 
 
 def connect_existing(path: Path) -> sqlite3.Connection:
@@ -33,6 +33,8 @@ def validate(path: Path) -> int:
 
         if version > WAREHOUSE_SCHEMA_VERSION:
             raise RuntimeError("unknown future warehouse version")
+        if version == 8 and PRODUCTION_ITEM_REVISIONS not in tables:
+            raise RuntimeError("production item revision history is missing or from an unreleased preview")
         return version
 
 
@@ -98,6 +100,25 @@ def upgrade(db_path: Path | str) -> None:
             version = target
 
 
+def downgrade(path: Path, target: int) -> None:
+    """Restamp v8 as v7 for a quiesced code rollback, preserving all columns."""
+    path = path.resolve()
+    with migration_lock(path):
+        version = validate(path)
+        if target == 6 and version >= 7:
+            with closing(connect_existing(path)) as conn:
+                WAREHOUSE_MIGRATIONS[0][3](conn)
+        if (version, target) != (8, 7):
+            raise RuntimeError("unsupported warehouse downgrade")
+        backup(path, version, target)
+        with closing(connect_existing(path)) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != version:
+                raise RuntimeError("warehouse version changed during migration")
+            WAREHOUSE_MIGRATIONS[1][3](conn)
+            conn.execute("PRAGMA user_version=7")
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path)
@@ -114,10 +135,8 @@ def main(argv=None) -> None:
             upgrade(path)
             version = validate(path)
         elif args.command == "down":
-            if args.target != 6 or version != 7:
-                raise RuntimeError("unsupported warehouse downgrade")
-            with closing(connect_existing(path)) as conn:
-                WAREHOUSE_MIGRATIONS[0][3](conn)
+            downgrade(path, args.target)
+            version = validate(path)
         print(f"warehouse user_version={version}")
     except (RuntimeError, OSError, sqlite3.Error) as exc:
         parser.exit(1, f"{exc}\n")

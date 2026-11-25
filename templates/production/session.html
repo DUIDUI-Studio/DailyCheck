@@ -16,6 +16,7 @@
 <form method="post" action="{{ url_for('production.submit') }}" class="session-form" id="prod-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <input type="hidden" name="product_id" value="{{ chosen['id'] }}" />
+  <input type="hidden" name="measurement_basis" value="{{ measurement_basis }}" />
 
   <div class="session-grid">
     {# 左: 配方卡 (静态, 显示每单位用量) #}
