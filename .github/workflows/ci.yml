@@ -65,6 +65,58 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Admit GitHub PR against current main
+        if: github.server_url == 'https://github.com' && github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_READ_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PYCODE'
+          import base64, os, re, subprocess
+
+          # Actions expression comparisons ignore case, but Git refs do not.
+          if os.environ.get("PR_BASE_REF") != "main":
+              raise SystemExit(0)
+          token = os.environ.pop("PR_BASE_READ_TOKEN", "")
+
+          def git_output(args, operation, **kwargs):
+              try:
+                  return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL, **kwargs)
+              except subprocess.TimeoutExpired:
+                  raise SystemExit(f"PR base admission: {operation} timed out")
+              except (OSError, subprocess.CalledProcessError):
+                  raise SystemExit(f"PR base admission: {operation} failed")
+
+          sha = r"(?!0{40})[0-9a-f]{40}"
+          head, base = (os.environ.get(key, "") for key in ("PR_HEAD_SHA", "PR_BASE_SHA"))
+          if not re.fullmatch(sha, head) or not re.fullmatch(sha, base):
+              raise SystemExit("PR base admission: invalid event H/B")
+          if git_output(["rev-parse", "--verify", "HEAD"], "checkout HEAD lookup", timeout=5) != (head + "\n").encode():
+              raise SystemExit(f"PR base admission: checkout HEAD does not match event H={head}")
+
+          # Query the canonical repository from outside the candidate checkout.
+          remote = "https://github.com/DUIDUI-Studio/DailyCheck.git"
+          if not token:
+              raise SystemExit("PR base admission: missing GitHub read token")
+          auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+          env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_COUNT": "1",
+                 "GIT_CONFIG_KEY_0": f"http.{remote}.extraheader",
+                 "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic " + auth}
+          ref = "refs/heads/main"
+          output = git_output(["-c", "http.followRedirects=false", "ls-remote", "--exit-code", "--refs", remote, ref],
+                              "canonical main lookup", cwd=os.environ["CI_ROOT"], env=env, timeout=15)
+          match = re.fullmatch(fr"({sha})\t{ref}\n".encode(), output)
+          if not match:
+              raise SystemExit("PR base admission: invalid main ref response")
+          main = match[1].decode()
+          if base != main:
+              raise SystemExit(f"PR base admission: stale event base B={base}; current main={main}")
+          print(f"PR base admission: checkout H={head}; event B matches current main={main}")
+          PYCODE
+
       - name: Checkout candidate H on Gitea
         if: github.server_url != 'https://github.com'
         env:
