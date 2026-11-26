@@ -645,17 +645,17 @@ webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人�
 
 ### 3.9 外部通知通道（企业微信群机器人，2026-10-16 起）
 
-站内通知（`notifications` 表 + 通知中心页，§10.3 的 fan-out）只覆盖登录用户——门店提交订货单后，DC 审批人未必正在看页面。本节补的是**系统第一条对外推送通道**：新订货单提交 → 企微工作群机器人，秒级提醒。
+门店提交订货单、配送中心审批通过后，各向同一个企微订货工作群推送一条通知。驳回、发货、收货及配送中心调货不触发这两条群通知。
 
-**链路**：`blueprints/store_ordering.py::submit_order_route`（`sop.notify_order_event(...)` 站内 fan-out 之后）→ `_notify_wecom_new_order(order)` → `blueprints/wecom_notify_pure.py` → `urllib` POST 群机器人 webhook。**站内通知与对外推送互不依赖**：任一条链路失败都不回滚订单（订单已 commit），对外推送失败最多留一条 WARNING 日志。
+**链路**：`blueprints/store_ordering.py` 的 `submit_order_route` 与 `review_order_route` 在订单提交或审批通过落库后，调用 `blueprints/wecom_notify_pure.py` 后台 POST 群机器人 webhook。对外推送失败只记日志，不影响已落库的订单。
 
 **组件**（`blueprints/wecom_notify_pure.py`，纯标准库 `urllib`，不引 `requests`）：
 
-- `build_store_order_markdown(order, item_count, total_qty, submitted_at, base_url)` —— 锁定模板：标题 + 单号 / 门店 / 品项 / 时间 + 单据链接，**不含金额**（订货金额属敏感信息，工作群不需要）。计数取订单行项目（`order["order_items"]`），取不到就**省略**「品项」行，不编造；时间容错解析（19 字符 / 16 字符 / ISO-T 三形态，见 §13.8），都解析不出就省略该行。门店标识与全站页面一致用 warehouse code（`order["store_name"]` 存在时优先用名称）。
+- `build_store_order_markdown(...)` —— 标题为「新订货单待处理」或「订货单审批通过」，均带单号、门店中文名称、品项计数、总金额、事件时间和单据链接。门店名称取自订单详情的 `store_warehouse_name`，缺名称时显示「未知门店」。金额和订单详情页一致，使用含运费的 `total_amount`；缺历史价格数据时显示「待核对」。计数或事件时间取不到时省略对应行。
 - `send_webhook_markdown(webhook_url, markdown, timeout=3, retries=1)` —— POST `{"msgtype":"markdown"}`，超时 3s；HTTP 异常 / 非 JSON 响应 / `errcode != 0`（key 失效、机器人被移出群等业务错）**均判失败**并重试 1 次（最多 2 次尝试）；返回 bool，**绝不抛异常**。
 - `notify_store_order_event(event_type, ...)` —— 事件 → 通道分发入口。`background=True`（默认）用 `threading.Thread(daemon=True)` 发送，**不阻塞下单请求**（webhook 慢 / 挂不影响用户提交）。
 - `mask_webhook_url()` —— 日志脱敏：保留 host + path，查询串一律打码成 `key=***`。**webhook 的 `key=` 就是密钥**，完整 URL 不得出现在任何日志 / 异常信息里（与 §3.5 的 `WEBHOOK_SECRET` 同一口径）。
-- **扩展位**：`WEBHOOK_EVENT_MAP` 一行一事件，v1 只登记 `store_order_submitted`。后续要推「审批通过 / 已发货」时加一行即可复用整条链路；未登记的事件在 `webhook_for_event()` 处返回空串 → 静默跳过（不报错）。
+- `WEBHOOK_EVENT_MAP` 将 `store_order_submitted` 和 `store_order_approved` 指向同一订货群配置；未登记的事件静默跳过。
 
 **配置**（`config.py`，全部由服务器 env 注入，**不进 git**）：
 
@@ -666,7 +666,7 @@ webhook 快通道整体失效时，这是**唯一**还能发现「有 PR 没人�
 
 **生产侧**：`WECOM_STORE_ORDER_WEBHOOK` 写 `/etc/dailycheck/app.env`（0600）后重启进程生效；群里「添加机器人」拿到的地址即用。**机器人被移出群 / key 轮换后旧地址失效**，此时推送失败只记 errcode（`wecom_notify_dropped`），无兜底重发队列（见 §14）。
 
-**测试**（三份，共 65 用例）：`tests/test_wecom_notify_pure.py`（57 用例：模板字段与链接 / `base_url` 尾斜杠收敛 / 无 base_url 不发链接 / 金额不出现 / 计数缺失即省略 / 时间三形态 / 空 webhook 不发送 / `errcode=0` 成功 / `errcode≠0` 失败 / **`errcode` 为 bool 判失败** / 首败重试成功（2 次调用）/ HTTP·超时·非 JSON 各自 False 且不抛 / `retries=0` 仅一次 / `background=False` 直发一次 / `background=True` 走 daemon 线程 / 通道异常只记 WARNING / **成功日志 WARNING 级** / 日志不含 key / **畸形 URL 四形态（缺 scheme·scheme 拼错·带引号·ftp）只返回 False 且不泄露 key** / P0 无 emoji）+ `tests/test_wecom_notify_hook.py`（4 用例：提交点计数接线、后台语义、通道异常不外溢、空订单 no-op）+ `tests/test_wecom_notify_route_wiring.py`（4 用例：**从 HTTP 入口**验证「恰好一次 + 计数正确」/「独立连接可见订单，即 commit 先于通知」/「被业务校验拦下的提交不推送」/「通知抛异常时订单仍落库且响应 200」）。**全部用例 monkeypatch `urllib.request.urlopen` 或挂钩出口，不透网**；关键断言逐条经变异验证真 FAIL（去重试 / errcode 当成功 / 日志漏 key / 改同步发送 / `base_url` 不收敛尾斜杠 / 编造计数 / 不吞异常 / **删掉视图里的 `_notify_wecom_new_order(order)`** 各自对应测试 FAIL）。
+**测试**：`tests/test_wecom_notify_pure.py` 覆盖两种模板、实际总金额与历史金额缺失、脱敏、重试及后台发送；`tests/test_wecom_notify_hook.py` 覆盖提交挂钩的计数和异常隔离；`tests/test_wecom_notify_route_wiring.py` 从 HTTP 入口验证提交与审批后才通知、同群的中文门店名和含运费总金额，以及拒绝或重复审批不增加推送。测试替换网络发送出口，不连接企微。
 
 ---
 
@@ -4256,7 +4256,7 @@ with app.test_client() as c, c.session_transaction() as s:
 - **`PUBLIC_BASE_URL` 必须是公网域名**：消息里的「查看单据」是给人点的，`127.0.0.1` / 内网地址在群里点不开；改部署布局（域名迁移）时同步改 env。
 - **提交点接线必须有路由级用例**：`tests/test_wecom_notify_hook.py` 直接调悬挂挂钩函数，覆盖不到「视图里那一行有没有被删」；`tests/test_wecom_notify_route_wiring.py` 从 HTTP 入口断言「恰好调用 1 次 / 独立连接可见订单（commit 先于通知）/ 被拦提交不推送 / 通知异常不下沉」，删除 `submit_order_route` 中的 `_notify_wecom_new_order(order)` 即实战红（2026-10-17 补，QA 阻断项）。
 
-- **开关粒度**：v1 是「一个事件一个 webhook」。要做多群 / 多事件时在 `WEBHOOK_EVENT_MAP` 登记新的 config 属性，不要在视图里写 `if 群A ... else 群B`。
+- **开关粒度**：提交和审批通过共用 `WECOM_STORE_ORDER_WEBHOOK`；事件与 webhook 的对应关系在 `WEBHOOK_EVENT_MAP` 中维护。
 
 ### 13.11 品项级误差归因口径（2026-10-20 起）
 

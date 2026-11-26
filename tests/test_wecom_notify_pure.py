@@ -20,7 +20,11 @@ import pytest
 
 import config
 from blueprints import wecom_notify_pure as wn
-from blueprints.store_ordering_pure import EVENT_ORDER_APPROVED, EVENT_ORDER_SUBMITTED
+from blueprints.store_ordering_pure import (
+    EVENT_ORDER_APPROVED,
+    EVENT_ORDER_REJECTED,
+    EVENT_ORDER_SUBMITTED,
+)
 
 # 运行期拼接的假地址（刻意拆开，避免被密钥扫描规则误判为真实 webhook）
 FAKE_KEY = "fake" + "-" + "0" * 20
@@ -96,9 +100,11 @@ def _order(**over):
         "id": 42,
         "order_no": "SO-20261016-0007",
         "store_warehouse_code": "wh_003",
+        "store_warehouse_name": "新世界店",
         "dc_warehouse_code": "wh_000",
         "created_at": "2026-10-16 09:07:05",
         "shipping_fee": 987.65,
+        "total_amount": "1234.50",
         "order_items": [
             {"canonical_id": 1, "quantity": 2},
             {"canonical_id": 2, "quantity": 10.5},
@@ -121,8 +127,9 @@ def test_markdown_full_template():
     assert md.splitlines() == [
         "## 新订货单待处理",
         "> 单号：SO-20261016-0007",
-        "> 门店：wh_003",
+        "> 门店：新世界店",
         "> 品项：2 项 / 共 12.5 件",
+        "> 总金额：¥1,234.50",
         "> 时间：10-16 09:07",
         "[查看单据](https://kjtang.cn/store-ordering/orders/42)",
     ]
@@ -147,11 +154,15 @@ def test_markdown_without_base_url_omits_link():
     assert "> 单号：SO-20261016-0007" in md
 
 
-def test_markdown_has_no_amount():
-    md = wn.build_store_order_markdown(_order(shipping_fee=987.65))
+def test_markdown_marks_unknown_amount_for_legacy_order():
+    md = wn.build_store_order_markdown(_order(total_amount=None))
+    assert "> 总金额：待核对" in md
     assert "987.65" not in md
-    assert "金额" not in md
-    assert "¥" not in md
+
+
+def test_markdown_keeps_zero_amount():
+    md = wn.build_store_order_markdown(_order(total_amount="0.00"))
+    assert "> 总金额：¥0.00" in md
 
 
 def test_markdown_omits_counts_when_unavailable():
@@ -177,8 +188,14 @@ def test_markdown_counts_variants(kwargs, expected):
 
 
 def test_markdown_prefers_store_name_over_code():
-    md = wn.build_store_order_markdown(_order(store_name="新世界店"))
+    md = wn.build_store_order_markdown(_order(store_warehouse_name=None, store_name="新世界店"))
     assert "> 门店：新世界店" in md
+    assert "wh_003" not in md
+
+
+def test_markdown_does_not_show_store_code_when_name_missing():
+    md = wn.build_store_order_markdown(_order(store_warehouse_name=None))
+    assert "> 门店：未知门店" in md
     assert "wh_003" not in md
 
 
@@ -376,9 +393,9 @@ def test_build_order_url_requires_base():
 # 业务入口
 # ---------------------------------------------------------------------------
 
-def test_event_map_registers_submitted_only():
+def test_order_events_share_webhook():
     assert wn.WEBHOOK_EVENT_MAP[EVENT_ORDER_SUBMITTED] == "WECOM_STORE_ORDER_WEBHOOK"
-    assert EVENT_ORDER_APPROVED not in wn.WEBHOOK_EVENT_MAP
+    assert wn.WEBHOOK_EVENT_MAP[EVENT_ORDER_APPROVED] == "WECOM_STORE_ORDER_WEBHOOK"
 
 
 def test_notify_disabled_when_webhook_empty(monkeypatch, urlopen):
@@ -393,6 +410,19 @@ def test_notify_sync_sends_once(enabled, urlopen):
     content = _payload(urlopen.calls[0])["markdown"]["content"]
     assert "SO-20261016-0007" in content
     assert "https://example.invalid/store-ordering/orders/42" in content
+
+
+def test_notify_approval_uses_approval_title_and_time(enabled, urlopen):
+    order = _order(approved_at="2026-10-17 10:18:00")
+    wn.notify_store_order_event(EVENT_ORDER_APPROVED, order, background=False)
+
+    assert len(urlopen.calls) == 1
+    assert urlopen.calls[0]["url"] == enabled
+    content = _payload(urlopen.calls[0])["markdown"]["content"]
+    assert content.startswith("## 订货单审批通过\n")
+    assert "> 时间：10-17 10:18" in content
+    assert "> 门店：新世界店" in content
+    assert "> 总金额：¥1,234.50" in content
 
 
 def test_notify_background_uses_daemon_thread(enabled, urlopen, monkeypatch):
@@ -436,7 +466,7 @@ def test_notify_swallows_internal_error(enabled, caplog, monkeypatch):
 
 
 def test_notify_unregistered_event_is_noop(enabled, urlopen):
-    wn.notify_store_order_event(EVENT_ORDER_APPROVED, _order(), background=False)
+    wn.notify_store_order_event(EVENT_ORDER_REJECTED, _order(), background=False)
     assert urlopen.calls == []  # 扩展位未登记 → 不推送
 
 

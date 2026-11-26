@@ -171,7 +171,7 @@ MULTI_WAREHOUSE_FULFILLMENT = (
 # ─────────────────────────────────────────────────────────────────────
 # 外部通知通道（企业微信群机器人，2026-10-16 起）
 #
-# 门店提交订货单时推一条 markdown 到工作群，见
+# 门店提交订货单及审批通过时各推一条 markdown 到工作群，见
 # blueprints/wecom_notify_pure.py 与 docs/ARCHITECTURE.md §3.9。
 #
 # - 两个值都由**服务器 env 注入**（生产写 /etc/dailycheck/app.env），

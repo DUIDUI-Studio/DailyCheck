@@ -1,9 +1,7 @@
 """企业微信群机器人推送（系统首个对外通知通道）。
 
 设计要点：
-- v1 只登记「门店新订货单提交」一个事件（``EVENT_ORDER_SUBMITTED``）。
-  其他事件（审批 / 发货 / 取消）不推送，但事件→通道映射
-  ``WEBHOOK_EVENT_MAP`` 是扩展位：新增事件只需在该表登记一行，
+- 门店订货单提交与审批通过共用同一个工作群 webhook。
   发送链路（构建 → 发送 → 后台线程 → 日志脱敏）完全复用。
 - 纯标准库（``urllib``），不引入 ``requests``。
 - 本模块**绝不向上抛异常**：对外通道故障不得影响下单事务。含畸形 URL——
@@ -23,11 +21,12 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
 
 import config
-from blueprints.store_ordering_pure import EVENT_ORDER_SUBMITTED
+from blueprints.store_ordering_pure import EVENT_ORDER_APPROVED, EVENT_ORDER_SUBMITTED
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +37,9 @@ WECOM_TIMEOUT_SECONDS: float = 3.0
 WECOM_MAX_RETRIES: int = 1
 
 # 事件 → config 属性名（值 = webhook URL，空串 = 该事件未启用）。
-# 扩展位：后续要做「审批通过 / 已发货」推送时，在这里加一行
-# EVENT_ORDER_APPROVED: "WECOM_STORE_ORDER_WEBHOOK" 即可，无需改发送链路。
 WEBHOOK_EVENT_MAP: dict[str, str] = {
     EVENT_ORDER_SUBMITTED: "WECOM_STORE_ORDER_WEBHOOK",
+    EVENT_ORDER_APPROVED: "WECOM_STORE_ORDER_WEBHOOK",
 }
 
 
@@ -78,26 +76,24 @@ def build_store_order_markdown(
     total_qty: float | None = None,
     submitted_at: str | datetime | None = None,
     base_url: str = "",
+    *,
+    event_type: str = EVENT_ORDER_SUBMITTED,
 ) -> str:
-    """渲染「新订货单待处理」企微 markdown。
+    """渲染订货单提交或审批通过的企微 markdown。
 
-    模板（锁定）：标题 + 单号 / 门店 / 品项 / 时间 + 单据链接。
-    **不含金额**——订货金额属于敏感信息，工作群不需要。
-    ``item_count`` / ``total_qty`` 任一缺失即省略对应文案；
-    ``submitted_at`` 缺省时回退订单 ``created_at``，都解析不出来就省略该行。
+    金额取订单详情的含运费合计；历史金额未知时显示「待核对」。
+    计数或事件时间缺失时省略对应文案。
     """
     order = order if isinstance(order, dict) else {}
-    lines: list[str] = ["## 新订货单待处理"]
+    approved = event_type == EVENT_ORDER_APPROVED
+    lines = ["## 订货单审批通过" if approved else "## 新订货单待处理"]
 
     order_no = str(order.get("order_no") or "").strip()
     if order_no:
         lines.append(f"> 单号：{order_no}")
 
-    # 全站页面显示的门店标识就是 warehouse code；若调用方额外提供了
-    # 门店名称（order["store_name"]）则优先用名称，没有就用 code。
-    store_label = str(order.get("store_name") or order.get("store_warehouse_code") or "").strip()
-    if store_label:
-        lines.append(f"> 门店：{store_label}")
+    store_name = str(order.get("store_warehouse_name") or order.get("store_name") or "").strip()
+    lines.append(f"> 门店：{store_name or '未知门店'}")
 
     if item_count is None and total_qty is None:
         item_count, total_qty = order_item_counts(order)
@@ -105,7 +101,14 @@ def build_store_order_markdown(
     if counts:
         lines.append(f"> 品项：{counts}")
 
-    when = _parse_timestamp(submitted_at) or _parse_timestamp(order.get("created_at"))
+    total_amount = order.get("total_amount")
+    amount_text = "待核对" if total_amount is None else f"¥{Decimal(str(total_amount)):,.2f}"
+    lines.append(f"> 总金额：{amount_text}")
+
+    if approved:
+        when = _parse_timestamp(order.get("approved_at"))
+    else:
+        when = _parse_timestamp(submitted_at) or _parse_timestamp(order.get("created_at"))
     if when is not None:
         lines.append(f"> 时间：{when.strftime('%m-%d %H:%M')}")
 
@@ -358,7 +361,7 @@ def notify_store_order_event(
     total_qty: float | None = None,
     background: bool = True,
 ) -> None:
-    """事件 → 通道分发入口（扩展位：新事件登记进 WEBHOOK_EVENT_MAP 即可）。"""
+    """通过配置的工作群 webhook 分发订货单事件。"""
     order_no = ""
     try:
         order = order if isinstance(order, dict) else {}
@@ -374,6 +377,7 @@ def notify_store_order_event(
             item_count=item_count,
             total_qty=total_qty,
             base_url=str(getattr(config, "PUBLIC_BASE_URL", "") or ""),
+            event_type=event_type,
         )
         if background:
             threading.Thread(
