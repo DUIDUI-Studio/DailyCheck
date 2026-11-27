@@ -11,14 +11,18 @@
 3. 被业务校验拦下的提交（门店未绑定品项）→ 不触发通知，避免群消息刷屏；
 4. 通知函数抛异常 → 下单仍成功返回 200 且订单落库（外部通道隔离）。
 
-所有用例都 monkeypatch ``wecom_notify_pure.notify_store_order_submitted``
-（挂钩层唯一的调用出口），因此**零网络**、不需要真实 webhook env。
+提交与审批的联合用例捕获最终 Markdown。所有用例都替换挂钩或发送出口，
+因此**零网络**、不需要真实 webhook env。
 """
 from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
+import pytest
+
+import config
 from blueprints import wecom_notify_pure as wn
 from tests import test_store_ordering_store_route as _store_route_module
 
@@ -172,3 +176,57 @@ def test_order_persists_when_notify_raises(store_env, monkeypatch):
     assert row is not None, "通知异常导致订单没落库（事务被回滚）"
     assert row["status"] == "pending"
     assert row["order_no"].startswith("SO-")
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_order_notifications_show_store_name_and_total(store_env, monkeypatch, decision):
+    """Run both HTTP entrypoints with a recorded delivery and real order data."""
+    with sqlite3.connect(store_env["dc_path"]) as dc:
+        dc.execute("UPDATE items SET selling_price=2.50 WHERE canonical_id=101")
+    with sqlite3.connect(store_env["master_path"]) as master:
+        master.execute("UPDATE shipping_rules SET active=0")
+        master.execute(
+            "INSERT INTO shipping_rules (name, base_fee, created_at, updated_at) "
+            "VALUES ('测试运费', 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+
+    deliveries = []
+    webhook = "https://example.invalid/wecom"
+    monkeypatch.setattr(config, "WECOM_STORE_ORDER_WEBHOOK", webhook)
+    monkeypatch.setattr(
+        wn, "threading",
+        SimpleNamespace(Thread=lambda target, args, **kwargs: SimpleNamespace(
+            start=lambda: target(*args),
+        )),
+    )
+
+    def record(url, markdown, order_no):
+        row = _fetch_order_by_no(store_env["master_path"], order_no)
+        deliveries.append((url, markdown, row))
+
+    monkeypatch.setattr(wn, "_send_safely", record)
+    client = store_env["client"]
+    _add_item(client)
+    assert "提交成功" in _submit(client).text
+    assert len(deliveries) == 1
+    submitted_order = deliveries[0][2]
+    order_id = submitted_order["id"]
+
+    _store_route_module._login_as(client, 2, 1)
+    for _ in range(2):  # retrying a completed review must not push again
+        response = client.post(
+            f"/store-ordering/orders/{order_id}/review",
+            data={"decision": decision, "note": "测试审批"},
+        )
+        assert response.status_code == 302
+
+    assert _fetch_order_by_no(store_env["master_path"], submitted_order["order_no"])["status"] == decision
+    expected = [("## 新订货单待处理", "pending")]
+    if decision == "approved":
+        expected.append(("## 订货单审批通过", "approved"))
+    assert [(md.splitlines()[0], row["status"]) for _, md, row in deliveries] == expected
+    for url, markdown, _ in deliveries:
+        assert url == webhook
+        assert "> 门店：测试门店" in markdown
+        assert "store_test" not in markdown
+        assert "> 总金额：¥15.50" in markdown  # 5 × 2.50 + 3.00 运费

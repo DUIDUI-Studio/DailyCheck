@@ -583,7 +583,7 @@ def clear_cart_route() -> str:
 
 
 def _notify_wecom_new_order(order: dict[str, Any] | None) -> None:
-    """新单提交 → 企微工作群（外部通道，v1 唯一事件）。
+    """新单提交 → 企微工作群。
 
     契约：**绝不影响下单事务**。企微不可达 / 未配置 / 内部异常都在这里
     吞掉，最多留一条 WARNING；订单已经落库，通知失败不回滚、不报错。
@@ -1425,6 +1425,8 @@ def review_order_route(order_id: int) -> str:
         else sop.EVENT_ORDER_REJECTED
     )
     sop.notify_order_event(master, event, order, g.user["id"])
+    if event == sop.EVENT_ORDER_APPROVED and order.get("flow_type") != sop.FLOW_DC_TRANSFER:
+        wecom_notify.notify_store_order_event(event, order)
     flash("审批已处理")
     return redirect(url_for("store_ordering.review_list"))
 
