@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
+import math
 import sqlite3
 from datetime import datetime
 from decimal import Decimal
@@ -11,6 +14,7 @@ from flask import Blueprint, flash, g, redirect, request, url_for
 
 from db import get_warehouse_db
 from permissions import require_login, require_platform_admin, require_role
+from production_snapshots import CALCULATION_VERSION, UNKNOWN_UNIT, recorded_text
 
 from . import canonical_pure as cp
 from ._helpers import grams_to_stock, now, parse_qty, render
@@ -296,27 +300,42 @@ def session():
     bom = []
     chosen = None
     if product_id:
+        db.execute("BEGIN")
         chosen = db.execute(
             "SELECT * FROM products WHERE id = ?", (product_id,)
         ).fetchone()
         if chosen is not None:
-            bom = db.execute(
-                """SELECT b.id AS bom_id, b.qty_per_unit, b.item_id,
-                          i.name AS item_name, i.unit, i.quantity AS stock,
-                          i.gram_per_unit
-                   FROM product_bom b JOIN items i ON i.id = b.item_id
-                   WHERE b.product_id = ? ORDER BY b.id""",
-                (product_id,),
-            ).fetchall()
+            bom = _read_bom(db, product_id)
+        db.rollback()
     return render(
         "production/session.html",
         products=products_data,
         chosen=chosen,
         bom=bom,
+        measurement_basis=_measurement_basis(chosen, bom) if chosen else None,
         # 禁用产品下拉: 卡片点入 = 锁定产品;session.html 收到 chosen 后只展示该产品的配方。
         lock_product=bool(chosen),
         no_sidebar=True,
     )
+
+
+def _read_bom(db, product_id):
+    return db.execute(
+        """SELECT b.id AS bom_id, b.item_id, b.qty_per_unit,
+                  i.name AS item_name, i.quantity AS stock, i.gram_per_unit,
+                  i.unit, i.sku, i.canonical_id, m.revision AS production_measurement_revision
+           FROM product_bom b JOIN items i ON i.id = b.item_id
+           LEFT JOIN production_item_measurement_revisions m ON m.item_id = i.id
+           WHERE b.product_id = ? ORDER BY b.id""",
+        (product_id,),
+    ).fetchall()
+
+
+def _measurement_basis(product, bom):
+    inputs = ("bom_id", "item_id", "qty_per_unit", "unit", "gram_per_unit", "production_measurement_revision")
+    data = [CALCULATION_VERSION, g.warehouse["id"], product["id"], product["unit"],
+            [tuple(row[field] for field in inputs) for row in bom]]
+    return hashlib.sha256(json.dumps(data, ensure_ascii=False).encode()).hexdigest()
 
 
 @bp.route("/production/submit", methods=["POST"])
@@ -327,10 +346,19 @@ def submit():
     output_qty = parse_qty(request.form.get("output_qty", "0"))
     note = request.form.get("note", "").strip()
 
-    if not product_id or output_qty <= 0:
+    if not product_id or not math.isfinite(output_qty) or output_qty <= 0:
         flash("请选择产品并填写大于 0 的产出量")
         return redirect(url_for("production.session"))
 
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        return _submit_locked(db, product_id, output_qty, note)
+    finally:
+        if db.in_transaction:
+            db.rollback()
+
+
+def _submit_locked(db, product_id, output_qty, note):
     product = db.execute(
         "SELECT id, name, unit FROM products WHERE id = ?", (product_id,)
     ).fetchone()
@@ -338,15 +366,13 @@ def submit():
         flash("产品不存在")
         return redirect(url_for("production.session"))
 
-    bom_rows = db.execute(
-        """SELECT b.id AS bom_id, b.item_id, b.qty_per_unit,
-                  i.name AS item_name, i.quantity AS stock, i.gram_per_unit
-           FROM product_bom b JOIN items i ON i.id = b.item_id
-           WHERE b.product_id = ? ORDER BY b.id""",
-        (product_id,),
-    ).fetchall()
+    bom_rows = _read_bom(db, product_id)
     if not bom_rows:
         flash("该产品尚未配置配方")
+        return redirect(url_for("production.session", product_id=product_id))
+    displayed_basis = request.form.get("measurement_basis")
+    if displayed_basis is not None and displayed_basis != _measurement_basis(product, bom_rows):
+        flash("产出单位或原料配方已变化，请核对后重新提交", "error")
         return redirect(url_for("production.session", product_id=product_id))
 
     # Build planned & actual. Use Decimal for qty_per_unit × output_qty
@@ -354,7 +380,13 @@ def submit():
     # prevent — see _helpers.py:50.
     plan = []
     for b in bom_rows:
+        if b["production_measurement_revision"] is None:
+            flash(f"原料 {b['item_name']} 的计量修订无法核实", "error")
+            return redirect(url_for("production.session", product_id=product_id))
         gpu = float(b["gram_per_unit"] or 0)
+        if not math.isfinite(gpu) or not math.isfinite(b["qty_per_unit"]):
+            flash(f"原料 {b['item_name']} 的配方或换算值无效")
+            return redirect(url_for("production.session", product_id=product_id))
         # qty_per_unit: 启用克时是克/件，否则是库存单位/件。
         # 先乘产出量得本批配方量，再一次性折算成库存单位（避免逐件累积误差）。
         batch_recipe_qty = float(
@@ -368,35 +400,27 @@ def submit():
         # （docs/2026-10-20-production-loss-design.md §0）。
         planned_default = 1 if raw == "" else 0
         actual = parse_qty(raw) if raw != "" else planned  # 表单已传库存单位
-        if actual < 0:
-            flash(f"原料 {b['item_name']} 实际消耗不能为负")
+        if not math.isfinite(actual) or actual < 0:
+            flash(f"原料 {b['item_name']} 实际消耗须为有效的非负数")
             return redirect(url_for("production.session", product_id=product_id))
-        plan.append((int(b["item_id"]), b["item_name"], float(b["stock"]),
-                     planned, actual, planned_default))
-
-    # 硬性拦截: 库存不足
-    for _item_id, name, stock, _planned, actual, _pd in plan:
+        stock = float(b["stock"])
         if actual > stock:
-            flash(f"原料 {name} 库存不足（需 {actual}，现有 {stock}）")
+            flash(f"原料 {b['item_name']} 库存不足（需 {actual}，现有 {stock}）")
             return redirect(url_for("production.session", product_id=product_id))
+        plan.append((b, planned, actual, planned_default, gpu))
 
     created_by = g.user["username"] if g.get("user") else None
+    timestamp = now()
     cur = db.execute(
         """INSERT INTO production_runs
-           (product_id, output_qty, note, rolled_back, created_by, created_at)
-           VALUES (?, ?, ?, 0, ?, ?)""",
-        (product_id, output_qty, note, created_by, now()),
+           (product_id, output_qty, note, rolled_back, created_by, created_at, output_unit_snapshot)
+           VALUES (?, ?, ?, 0, ?, ?, ?)""",
+        (product_id, output_qty, note, created_by, timestamp, recorded_text(product["unit"])),
     )
     run_id = int(cur.lastrowid)
 
-    for item_id, _name, _stock, planned, actual, planned_default in plan:
-        cur_pri = db.execute(
-            """INSERT INTO production_run_items
-               (run_id, item_id, planned_qty, actual_qty, planned_default)
-               VALUES (?, ?, ?, ?, ?)""",
-            (run_id, item_id, planned, actual, planned_default),
-        )
-        pri_id = int(cur_pri.lastrowid)
+    for bom, planned, actual, planned_default, gpu in plan:
+        item_id = bom["item_id"]
         # 双写 outbound_requests 让 /outbound 出库记录页面也能看到生产领料
         # reason 标识生产 run id 以便回退时定位
         cur_ob = db.execute(
@@ -404,21 +428,29 @@ def submit():
                (item_id, requested_quantity, reason, status, rolled_back,
                 created_at, source_type)
                VALUES (?, ?, ?, '出库', 0, ?, 'production')""",
-            (item_id, actual, f"生产领料(run=#{run_id})", now()),
+            (item_id, actual, f"生产领料(run=#{run_id})", timestamp),
         )
         # 显式外键，归因引擎不再靠 reason 字符串解析（脆弱且不可索引）
         db.execute(
-            "UPDATE production_run_items SET outbound_req_id = ? WHERE id = ?",
-            (int(cur_ob.lastrowid), pri_id),
+            """INSERT INTO production_run_items
+               (run_id, item_id, planned_qty, actual_qty, planned_default, outbound_req_id,
+                unit_snapshot, sku_snapshot, canonical_id_snapshot, bom_row_id_snapshot,
+                bom_qty_per_unit_snapshot, conversion_mode_snapshot, grams_per_unit_snapshot,
+                calculation_version, measurement_revision_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, item_id, planned, actual, planned_default, cur_ob.lastrowid,
+             recorded_text(bom["unit"]), recorded_text(bom["sku"]), bom["canonical_id"],
+             bom["bom_id"], bom["qty_per_unit"], "grams" if gpu > 0 else "stock_unit",
+             gpu if gpu > 0 else None, CALCULATION_VERSION, bom["production_measurement_revision"]),
         )
         db.execute(
             "UPDATE items SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
-            (actual, now(), item_id),
+            (actual, timestamp, item_id),
         )
         db.execute(
             """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
                VALUES (?, '生产消耗', ?, ?, ?)""",
-            (item_id, -actual, f"生产记录#{run_id}领料", now()),
+            (item_id, -actual, f"生产记录#{run_id}领料", timestamp),
         )
 
     db.commit()
@@ -452,9 +484,9 @@ def runs_list():
     flat = db.execute(
         f"""SELECT r.id AS run_id, r.output_qty, r.note AS run_note,
                   r.rolled_back, r.created_at, r.created_by,
-                  p.name AS product_name, p.unit AS product_unit,
+                  p.name AS product_name, r.output_unit_snapshot AS product_unit,
                   pri.id AS pri_id, pri.planned_qty, pri.actual_qty,
-                  i.name AS item_name, i.unit AS item_unit
+                  i.name AS item_name, pri.unit_snapshot AS item_unit
            FROM production_runs r
            JOIN products p ON p.id = r.product_id
            LEFT JOIN production_run_items pri ON pri.run_id = r.id
@@ -500,95 +532,114 @@ def runs_list():
 @bp.route("/production/runs/<int:run_id>/rollback", methods=["POST"])
 @require_role("staff")
 def rollback(run_id: int):
-    db = get_warehouse_db()
-    run = db.execute(
-        "SELECT id, rolled_back FROM production_runs WHERE id = ?", (run_id,),
-    ).fetchone()
-    if run is None:
-        flash("生产记录不存在")
-        return redirect(url_for("production.runs_list"))
-    if int(run["rolled_back"]) == 1:
-        flash("该记录已回退")
-        return redirect(url_for("production.runs_list"))
-
-    items = db.execute(
-        "SELECT item_id, actual_qty FROM production_run_items WHERE run_id = ?",
-        (run_id,),
-    ).fetchall()
-    qty_total = 0.0
-    for it in items:
-        qty = parse_qty(it["actual_qty"])
-        qty_total += qty
-        # 标记该 run 对应的 outbound_requests 为已回退 — 库存和汇总口径同步
-        db.execute(
-            "UPDATE outbound_requests SET rolled_back = 1 WHERE reason = ? AND rolled_back = 0",
-            (f"生产领料(run=#{run_id})",),
-        )
-        db.execute(
-            "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-            (qty, now(), int(it["item_id"])),
-        )
-        db.execute(
-            """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
-               VALUES (?, '生产消耗回退', ?, ?, ?)""",
-            (int(it["item_id"]), qty, f"回退生产记录#{run_id}", now()),
-        )
-    db.execute("UPDATE production_runs SET rolled_back = 1 WHERE id = ?", (run_id,))
-    db.commit()
-    audit("production.run.rollback", "run", run_id, {"qty_total": qty_total})
-    flash("生产记录已回退")
-    return redirect(url_for("production.runs_list"))
+    return _reverse_run(run_id, delete=False)
 
 
 @bp.route("/production/runs/<int:run_id>/delete", methods=["POST"])
 @require_role("staff")
 def delete_run(run_id: int):
+    return _reverse_run(run_id, delete=True)
+
+
+def _return_quantity(row):
+    quantity = row["actual_qty"]
+    if (row["current_item_id"] is None or type(quantity) not in (int, float)
+            or not math.isfinite(quantity) or quantity < 0):
+        raise ValueError("生产耗料品项或数量无法核实")
+    # Returning zero needs no unit equivalence. For any positive quantity the
+    # item revision must still match the recorded measure and identity.
+    if quantity == 0:
+        return quantity
+    if (row["calculation_version"] != CALCULATION_VERSION or not row["unit_snapshot"]
+            or not row["sku_snapshot"] or row["measurement_revision_snapshot"] is None):
+        raise ValueError("生产耗料单位或品项身份未留存")
+    current_factor = row["gram_per_unit"] if (row["gram_per_unit"] or 0) > 0 else None
+    if (row["unit_snapshot"], row["sku_snapshot"], row["canonical_id_snapshot"],
+        row["grams_per_unit_snapshot"], row["measurement_revision_snapshot"]) != (
+        row["unit"], row["sku"], row["canonical_id"], current_factor,
+        row["production_measurement_revision"],
+    ):
+        # Item edits do not record whether/how the balance was rebased. A
+        # ratio between two gram factors alone cannot prove an inverse.
+        raise ValueError("库存单位、换算或品项身份已变化，缺少可核实的返库换算")
+    return quantity
+
+
+def _reverse_run(run_id: int, *, delete: bool):
     db = get_warehouse_db()
-    run = db.execute(
-        "SELECT id, rolled_back FROM production_runs WHERE id = ?", (run_id,),
-    ).fetchone()
-    if run is None:
-        flash("生产记录不存在")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        run = db.execute("SELECT rolled_back FROM production_runs WHERE id = ?", (run_id,)).fetchone()
+        if run is None or (run["rolled_back"] and not delete):
+            flash("生产记录不存在" if run is None else "该记录已回退")
+            return redirect(url_for("production.runs_list"))
+        rows = _reverse_run_locked(db, run_id, bool(run["rolled_back"]), delete)
+        db.commit()
+    except ValueError as exc:
+        flash(f"{exc}，请联系库存负责人核查", "error")
         return redirect(url_for("production.runs_list"))
-
-    qty_total = 0.0
-    if int(run["rolled_back"]) == 0:
-        items = db.execute(
-            "SELECT item_id, actual_qty FROM production_run_items WHERE run_id = ?",
-            (run_id,),
-        ).fetchall()
-        for it in items:
-            qty = parse_qty(it["actual_qty"])
-            qty_total += qty
-            db.execute(
-                "UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
-                (qty, now(), int(it["item_id"])),
-            )
-            db.execute(
-                """INSERT INTO stock_movements (item_id, action, delta, note, created_at)
-                   VALUES (?, '生产消耗回退', ?, ?, ?)""",
-                (int(it["item_id"]), qty, f"删除生产记录#{run_id}回滚", now()),
-            )
-        # 直接删除 run 对应的 outbound_requests（语义：删除生产记录 ≡ 删除出库记录）
-        db.execute(
-            "DELETE FROM outbound_requests WHERE reason = ?",
-            (f"生产领料(run=#{run_id})",),
-        )
-    else:
-        # 已回退的 outbound_requests 已 rolled_back=1，删除 run 时把它们也清掉
-        db.execute(
-            "DELETE FROM outbound_requests WHERE reason = ?",
-            (f"生产领料(run=#{run_id})",),
-        )
-
-    db.execute("DELETE FROM production_runs WHERE id = ?", (run_id,))
-    db.commit()
-    audit("production.run.delete", "run", run_id, {
-        "rolled_back": int(run["rolled_back"]),
-        "qty_total": qty_total,
-    })
-    flash("生产记录已删除" + ("，库存已归还" if int(run["rolled_back"]) == 0 else ""))
+    finally:
+        if db.in_transaction:
+            db.rollback()
+    audit("production.run.delete" if delete else "production.run.rollback", "run", run_id,
+          {"rolled_back": run["rolled_back"], "rows": rows})
+    flash("生产记录已删除" if delete else "生产记录已回退")
     return redirect(url_for("production.runs_list"))
+
+
+def _reverse_run_locked(db, run_id, rolled_back, delete):
+    reason = f"生产领料(run=#{run_id})"
+    lines = db.execute(
+        """SELECT li.*, i.id AS current_item_id, i.unit, i.sku, i.canonical_id, i.gram_per_unit,
+                  m.revision AS production_measurement_revision, ob.id AS verified_outbound_id
+             FROM production_run_items li LEFT JOIN items i ON i.id = li.item_id
+             LEFT JOIN production_item_measurement_revisions m ON m.item_id = i.id
+             LEFT JOIN outbound_requests ob ON ob.id = li.outbound_req_id
+                  AND ob.item_id = li.item_id AND ob.requested_quantity = li.actual_qty
+                  AND ob.rolled_back = ? AND ob.reason = ? AND ob.status = '出库'
+                  AND ob.source_type = 'production'
+                  AND NOT EXISTS (SELECT 1 FROM production_run_items other
+                                   WHERE other.outbound_req_id = ob.id AND other.id <> li.id)
+            WHERE li.run_id = ? ORDER BY li.id""",
+        (rolled_back, reason, run_id),
+    ).fetchall()
+    outbound_ids = []
+    returns = []
+    for line in lines:
+        if not rolled_back:
+            returns.append((_return_quantity(line), line["item_id"]))
+        outbound_id = line["verified_outbound_id"]
+        if outbound_id is None and (not rolled_back or line["outbound_req_id"] is not None):
+            raise ValueError("生产耗料与自动出库记录无法唯一核对")
+        if outbound_id is not None:
+            outbound_ids.append((outbound_id,))
+
+    if not rolled_back:
+        active_outbounds = db.execute("""SELECT COUNT(*) FROM outbound_requests
+                                        WHERE reason = ? AND source_type = 'production' AND rolled_back = 0""",
+                                      (reason,)).fetchone()[0]
+        if active_outbounds != len(outbound_ids):
+            raise ValueError("存在无法与生产耗料核对的自动出库记录")
+
+    timestamp = now()
+    note = f"删除生产记录#{run_id}回滚" if delete else f"回退生产记录#{run_id}"
+    for qty, item_id in returns:
+        db.execute("UPDATE items SET quantity = quantity + ?, updated_at = ? WHERE id = ?",
+                   (qty, timestamp, item_id))
+        db.execute("""INSERT INTO stock_movements (item_id, action, delta, note, created_at)
+                       VALUES (?, '生产消耗回退', ?, ?, ?)""", (item_id, qty, note, timestamp))
+    if delete:
+        db.executemany("DELETE FROM outbound_requests WHERE id = ?", outbound_ids)
+        if rolled_back:
+            # Clean only already-reversed, unlinked legacy automatic rows for this exact run.
+            db.execute("""DELETE FROM outbound_requests WHERE reason = ? AND source_type = 'production'
+                          AND rolled_back = 1 AND NOT EXISTS (SELECT 1 FROM production_run_items li
+                              WHERE li.outbound_req_id = outbound_requests.id)""", (reason,))
+        db.execute("DELETE FROM production_runs WHERE id = ?", (run_id,))
+    else:
+        db.executemany("UPDATE outbound_requests SET rolled_back = 1 WHERE id = ?", outbound_ids)
+        db.execute("UPDATE production_runs SET rolled_back = 1 WHERE id = ?", (run_id,))
+    return len(lines)
 
 
 @bp.route("/production/runs.csv", methods=["GET"])
@@ -605,13 +656,13 @@ def runs_csv():
     rows = db.execute(
         """SELECT pr.id AS run_id, pr.created_at, pr.created_by,
                   pr.output_qty, pr.note AS run_note, pr.rolled_back,
-                  p.name AS product_name, p.unit AS product_unit,
+                  p.name AS product_name, pr.output_unit_snapshot AS product_unit,
                   pri.planned_qty, pri.actual_qty,
-                  i.sku AS item_sku, i.name AS item_name, i.unit AS item_unit
+                  pri.sku_snapshot AS item_sku, i.name AS item_name, pri.unit_snapshot AS item_unit
            FROM production_runs pr
            JOIN products p ON p.id = pr.product_id
            JOIN production_run_items pri ON pri.run_id = pr.id
-           JOIN items i ON i.id = pri.item_id
+           LEFT JOIN items i ON i.id = pri.item_id
            ORDER BY pr.id DESC, pri.id"""
     ).fetchall()
     audit("production.runs_export", "report", None, {"rows": len(rows)})
@@ -626,9 +677,9 @@ def runs_csv():
     for r in rows:
         writer.writerow([
             r["run_id"], r["created_at"], r["created_by"] or "",
-            r["product_name"], r["output_qty"], r["product_unit"],
+            r["product_name"], r["output_qty"], r["product_unit"] or UNKNOWN_UNIT,
             r["item_sku"], r["item_name"], r["planned_qty"], r["actual_qty"],
-            r["item_unit"], r["rolled_back"], r["run_note"] or "",
+            r["item_unit"] or UNKNOWN_UNIT, r["rolled_back"], r["run_note"] or "",
         ])
     today = datetime.now().strftime("%Y%m%d")
     response = current_app.response_class(

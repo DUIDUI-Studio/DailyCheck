@@ -670,6 +670,7 @@ def production_stores(storefronts, policy_admin):
     # An earlier schema must remain readable without a migration or backfill.
     path = paths["wh_006"]
     _db_update(path, "DROP INDEX IF EXISTS idx_pruni_outbound")
+    _db_update(path, "DROP TRIGGER IF EXISTS production_snapshot_outbound_immutable")
     _db_update(path, "ALTER TABLE production_run_items DROP COLUMN outbound_req_id")
     _db_update(path, "ALTER TABLE production_run_items DROP COLUMN planned_default")
     return env, paths, admin
@@ -776,6 +777,9 @@ def test_production_consumption_sdk(production_tokens, monkeypatch):
             assert all(set(row) == {
                 "warehouse_code", "item_id", "unit", "run_id", "line_id", "created_at",
                 "planned_qty", "booked_qty", "booked_source",
+                "unit_status", "snapshot_source", "output_unit", "item_sku", "canonical_item_id",
+                "bom_row_id", "bom_qty_per_unit", "conversion_mode", "grams_per_unit",
+                "calculation_version", "measurement_revision",
             } for row in records.values())
             sample = day["summary"][0]["sample"]
             linked = await _call(session, PRODUCTION_TOOL, {
@@ -834,6 +838,47 @@ def test_production_consumption_sdk(production_tokens, monkeypatch):
         }).status_code == 302
         assert http.post(url, headers=_headers(full), json=INITIALIZE).status_code == 401
         assert http.post(url, headers=_headers(partial), json=INITIALIZE).status_code == 200
+
+
+def test_production_consumption_snapshots_sdk(production_tokens):
+    env, paths, _, full, partial, _ = production_tokens
+    path = paths["wh_002"]
+    with closing(sqlite3.connect(path)) as conn, conn:
+        for run, factor in ((20, 100), (21, 200)):
+            conn.execute(
+                "INSERT INTO production_runs(id, product_id, output_qty, created_at, output_unit_snapshot) "
+                "VALUES (?, 1, 1, '2026-11-16 12:00:00', '份')", (run,),
+            )
+            conn.execute(
+                "INSERT INTO production_run_items(run_id, item_id, planned_qty, actual_qty, planned_default, "
+                "unit_snapshot, sku_snapshot, canonical_id_snapshot, bom_row_id_snapshot, bom_qty_per_unit_snapshot, "
+                "conversion_mode_snapshot, grams_per_unit_snapshot, calculation_version, measurement_revision_snapshot) "
+                "VALUES (?, 1, 1, 0, 0, '罐', 'synthetic-snapshot', 101, 6, ?, 'grams', ?, 1, ?)",
+                (run, factor, factor, run - 20),
+            )
+    before = _snapshot(env["root"])
+
+    async def exercise(url):
+        async with _session(url, full) as session, _session(url, partial) as narrow:
+            args = {**PRODUCTION_ARGS, "warehouse_code": "wh_002", "view": "week"}
+            week = await _call(session, PRODUCTION_TOOL, args)
+            validate(week, PRODUCTION_SHAPE)
+            group, = week["summary"]
+            assert week["unit_status"] == "partially_snapshotted"
+            assert group["unit"] is None and group["unknown_unit_count"] == 13
+            assert [(g["unit"], g["grams_per_unit"], g["manual_qty"]) for g in group["unit_groups"]] == [
+                ("罐", 100, 0), ("罐", 200, 0),
+            ]
+            lines = await _call(session, PRODUCTION_TOOL, {**args, "view": "lines", "run_id": 21})
+            validate(lines, PRODUCTION_SHAPE)
+            line, = lines["lines"]
+            assert (line["output_unit"], line["unit"], line["snapshot_source"]) == ("份", "罐", "production_write")
+            assert line["measurement_revision"] == 1 and line["canonical_item_id"] == 101
+            await _call(narrow, PRODUCTION_TOOL, args, error="forbidden")
+
+    with _listener() as url:
+        asyncio.run(exercise(url))
+    assert _snapshot(env["root"]) == before
 
 
 def test_production_consumption_scope_and_source_fail_closed(production_tokens, monkeypatch):

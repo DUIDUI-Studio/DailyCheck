@@ -31,6 +31,17 @@ _SUMMARY_TOTAL_COST_COLS = {1, 2, 3, 4}  # 进货/消耗/库存金额 + 周转�
 _SUMMARY_CAT_COST_COLS = {1, 2, 3, 4, 5}  # 品类段：全部金额列 + 周转率
 _SUMMARY_TOP_COST_COLS = {4}             # 消耗 Top 段：消耗金额
 
+# The legacy totals keep their movement-based scope. This annotation uses
+# the writer's exact movement note, item, quantity and timestamp; it supplies
+# no unit to the total and never duplicates a movement in the aggregation.
+_PRODUCTION_UNIT_MISSING = """m.action = '生产消耗' AND NOT EXISTS (
+    SELECT 1 FROM production_run_items li JOIN production_runs r ON r.id = li.run_id
+    WHERE r.id = CAST(substr(m.note, length('生产记录#') + 1) AS INTEGER)
+      AND m.note = '生产记录#' || r.id || '领料' AND li.item_id = m.item_id
+      AND r.created_at = m.created_at AND li.actual_qty = -m.delta
+      AND li.calculation_version IS NOT NULL AND li.unit_snapshot IS NOT NULL
+)"""
+
 
 def _cost_visible() -> bool:
     """调用者是否可见成本金额：平台超管 或 持 report.cost.view。"""
@@ -55,41 +66,51 @@ def outbound():
 
     if scope == "all":
         raw = db.execute(
-            """SELECT i.name AS item_name, i.unit, ABS(m.delta) AS qty, m.created_at
+            f"""SELECT i.name AS item_name, i.unit, ABS(m.delta) AS qty, m.created_at,
+                       m.action = '生产消耗' AS has_production,
+                       {_PRODUCTION_UNIT_MISSING} AS production_unit_missing
                FROM stock_movements m JOIN items i ON i.id = m.item_id
                WHERE m.action IN ('出库', '生产消耗') ORDER BY m.created_at ASC"""
         ).fetchall()
         # 口径:每个品项 × 每个日期的出库量,缺失日补 0
         daily: dict[tuple[str, str], int] = {}
+        production_days = {}
         for r in raw:
             d = r["created_at"][:10]
             key = (r["item_name"], d)
             daily[key] = daily.get(key, 0) + r["qty"]
+            if r["has_production"]:
+                production_days[key] = production_days.get(key, False) or bool(r["production_unit_missing"])
         all_items_rows = db.execute("SELECT name, unit FROM items ORDER BY id").fetchall()
         item_names_order = [r["name"] for r in all_items_rows]
         all_items = {r["name"]: r["unit"] for r in all_items_rows}
         all_dates = sorted({r["created_at"][:10] for r in raw})
         records = []
         for item in item_names_order:
-            row: dict = {"item_name": item, "unit": all_items[item]}
+            row: dict = {"item_name": item, "unit": all_items[item], "production_days": {}}
             for d in all_dates:
                 row[d] = daily.get((item, d), 0)
+                if (item, d) in production_days:
+                    row["production_days"][d] = production_days[item, d]
             records.append(row)
         return render_template(
             "report_outbound.html", records=records, date=today, scope=scope,
-            dates=all_dates,
+            dates=all_dates, has_production=bool(production_days),
         )
 
     records = db.execute(
-        """SELECT m.item_id, i.name AS item_name, i.unit,
+        f"""SELECT m.item_id, i.name AS item_name, i.unit,
                   ABS(SUM(m.delta)) AS total_qty, COUNT(*) AS times,
-                  MAX(m.created_at) AS last_time
+                  MAX(m.created_at) AS last_time,
+                  MAX(m.action = '生产消耗') AS has_production,
+                  MAX({_PRODUCTION_UNIT_MISSING}) AS production_unit_missing
            FROM stock_movements m JOIN items i ON i.id = m.item_id
            WHERE m.action IN ('出库', '生产消耗') AND m.created_at LIKE ? || '%'
            GROUP BY m.item_id ORDER BY last_time DESC""",
         (today,),
     ).fetchall()
-    return render_template("report_outbound.html", records=records, date=today, scope=scope)
+    return render_template("report_outbound.html", records=records, date=today, scope=scope,
+                           has_production=any(row["has_production"] for row in records))
 
 
 # ---------------------------------------------------------------------------

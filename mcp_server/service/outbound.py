@@ -104,6 +104,8 @@ def rollback_outbound(
                                            (request_id,)).fetchone()
                     elif "not_found" in str(exc):
                         raise NotFoundError("outbound_request_not_found") from None
+                    elif str(exc) == "production_requires_run_reversal":
+                        raise ValidationError("production_requires_run_reversal") from None
                     else:
                         raise
                 conn.commit()

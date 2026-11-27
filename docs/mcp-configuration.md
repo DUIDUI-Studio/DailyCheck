@@ -240,10 +240,10 @@ policy. Existing credentials retain their previous tool access.
   window produce `source_unavailable`.
 - Omit `warehouse_code` for all bound stores, still returned separately.
   Optional `item_id` selects the local item ID. A material identity is
-  `warehouse_code` + `item_id`. Historical unit and cross-store mappings
-  are absent from the production facts. `unit` and group quantities are
-  `null`, with `unit_status=historical_unit_unavailable` and
-  `cross_store_rollup=historical_mapping_unavailable`.
+  `warehouse_code` + `item_id`. `cross_store_rollup` remains
+  `historical_mapping_unavailable`. Range `unit_status` is `snapshotted`,
+  `partially_snapshotted`, or `historical_unit_unavailable`, based on the
+  entire filtered range before pagination.
 - `summary` rows contain the store, `period_start`, material, four line
   counts and four nullable quantities. `planned_count` counts all eligible
   lines. `manual_count`, `system_default_count`, and `unknown_count`
@@ -251,6 +251,14 @@ policy. Existing credentials retain their previous tool access.
   `sample` with `run_id`, `line_id`, and `created_at`. Query `view=lines`
   with its warehouse and originating date range to retrieve the batch
   (`run_id`) or exact line (`run_id` + `line_id`).
+- `unit_groups` lists comparable quantities within each summary row. A
+  comparable group shares the snapshotted unit, SKU, optional canonical
+  identity, conversion basis and item measurement revision. A change in
+  the measurement basis can split two groups with the same display unit.
+  `unknown_unit_count` and `unknown_unit_fraction` describe the lines that
+  could not enter a comparable group. The old `unit` and four quantity
+  fields are populated only for a fully known, homogeneous row. A source
+  with no lines has a null quantity, while a booked zero remains zero.
 - `lines` returns per-line `planned_qty`, `booked_qty` and `booked_source`.
   These are original numeric database values in the historical stock unit
   of that line, with no conversion. Explicit `planned_default=0` identifies
@@ -261,6 +269,18 @@ policy. Existing credentials retain their previous tool access.
   with the writer's defaulting invariant. Quantity equality alone does
   not establish the source. Remaining sources are `unknown`. Summing
   outbound or stock-movement quantities would duplicate these production facts.
+- Snapshotted lines add `output_unit`, `unit`, `unit_status`, `snapshot_source`,
+  `item_sku`, `canonical_item_id`, `bom_row_id`, `bom_qty_per_unit`,
+  `conversion_mode`, `grams_per_unit`, `calculation_version` and
+  `measurement_revision`. `grams_per_unit` is null for `stock_unit` mode.
+  `snapshot_source=production_write` identifies a v1 writer snapshot. An
+  older line has null snapshot metadata and `historical_unit_unavailable`.
+- Legacy `outbound_list` exposes `unit`, `unit_status` and `snapshot_source`
+  on automatic production rows. A unique verified association supplies the
+  same snapshot. Legacy/ambiguous rows retain a null unit. The existing
+  `factor` remains the document-line field. Reverse production stock from
+  the production run. The standalone `outbound_rollback` returns
+  `production_requires_run_reversal` for these rows.
 - Summary sorts by warehouse, period start and local item ID. Lines sort by
   warehouse, created time, batch ID and line ID. Each call opens one read
   snapshot per warehouse in sequence. The page size is 1–200 (default 50)
