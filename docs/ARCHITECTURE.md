@@ -1966,6 +1966,23 @@ venv、测试 DB、pytest basetemp、证据和报告临时文件；Gitea 无 run
 实际目录仍唯一。`scripts/ci/candidate_binding.py` 核对真实 checkout H、base commit 存在、
 event SHA、repository、run/attempt；紧凑摘要 v2 携带并在 reports job 比较该 identity，同时
 重验真实 native exit/session/hash，v1 仅供已有直接调用，绑定请求不接受降级。
+
+**GitHub PR base 前置检查（Issue #41）**：GitHub `pull_request` 目标为 `main` 时，`test`
+在 candidate checkout 后、Python setup 和全量测试前验证事件 H/B 格式及实际 `HEAD == H`。
+随后从 job 临时目录用只读 Actions token 对固定的 `DUIDUI-Studio/DailyCheck` GitHub 仓库执行
+一次 `git ls-remote`（15 秒超时），只接受唯一一行 `refs/heads/main` 的完整 SHA。
+PR REST/GraphQL base 和本地 refs 不参与本次读取。读取失败、空或畸形响应、或实时 main 与
+事件 B 不一致均令 `test` 失败；`agent-framework-reports` 通过原 upstream guard 显式失败。
+Run `45625354178` 的事件 B 为 `b0b09719`，当时 canonical main 为 `921fab6`，原流程全量测试
+成功后才在 reports 失败。前置检查只反映读取瞬间，main 仍可能在测试、报告或发布期间前进。
+若重跑沿用旧事件 B，仍需产生带当前 B 的新 PR 事件。报告门禁与发布时的 H/B、双 CI 和保护
+规则复核继续执行。Gitea、push、`workflow_dispatch`、`merge_group` 沿用原流程。
+
+普通 GitHub 发布核对 workflow ID/path、实际 H 的最新两项检查、Actions App 及当时的 H/B，
+CI 文件改动仍走现有 owner 红线审批及报告门禁。Native H/G 验证还独立校验已批准的 workflow
+blob；本次 YAML 变更产生新 blob，即使 producer manifest、闭包、身份及路径相同，旧 workflow
+pin 也无法接受新字节。采用新 blob 需要单独批准的 native policy 更新。
+
 只按同一 PR 取消过时 CI；push/dispatch 各自独立，不配置部署 concurrency。
 无 artifact-v4 依赖，不把 canceled/skipped 当成成功。CI 测试依赖显式固定 PyYAML 6.0.3，
 用于 workflow fixture 解析，避免 test job 隐式依赖 reports job 的 bandit 间接安装。
