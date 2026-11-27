@@ -244,7 +244,7 @@ pytest tests/mcp_server/ -v
 | `flask create-agent-token <name>` | 创建 Agent 令牌（支持 `--read-paths`、`--write-paths`、`--warehouses`） |
 
 ## 部署
-- ⚠️ **自动部署已禁用**（2026-10-11 Eric 拍板）：push 到 main **不**触发部署，deploy job 仅 `workflow_dispatch`。生产发版走 Prod Agent 蓝绿流程（见 `docs/agent-framework/workflow.md` §五）。
+- GitHub Actions 的 `workflow_dispatch` 用于 CI。生产发版由 Prod Agent 按 [协作工作流](docs/agent-framework/workflow.md) §四、§五执行候选蓝绿部署、合并和生产验证。
 - 旧的手动部署流程（tar → SSH → 重启 gunicorn）已被蓝绿部署取代，仅作应急参考
 - 数据库文件（`master.db`、`db/warehouses/*.db`）保留在服务端，不随部署推送
 
